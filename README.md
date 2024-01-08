@@ -98,10 +98,12 @@ You can find more examples at [examples/quick_start](examples/quick_start).
 ### Multi Modality
 ```python
 @sgl.function
-def multi_turn_question(s, image_file, question):
+def image_qa(s, image_file, question):
     s += sgl.user(sgl.image(image_file) + question)
     s += sgl.assistant(sgl.gen("answer_1", max_tokens=256))
 ```
+
+### Constrained decoding
 
 ### Batching
 
@@ -142,12 +144,12 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 - Mistral
 - Mixtral
 - LLaVA
+  - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --port 30000`
 
 ## Benchmark And Performance
 
 ## Roadmap
 - [ ] Function call
-- [ ] Constrained decoding
 - [ ] Quantization
 - [ ] S-LoRA
 - [ ] More models
