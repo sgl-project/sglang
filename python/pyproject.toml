@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang"
+version = "0.1.0"
+description = "A structured generation langauge for LLMs." 
+readme = "README.md"
+requires-python = ">=3.8"
+license = {file = "LICENSE"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "requests",
+]
+
+[project.optional-dependencies]
+srt = ["fastapi", "psutil", "rpyc", "torch", "uvloop", "uvicorn", "zmq", "vllm>=0.2.5",
+       "interegular", "lark"]
+openai = ["openai>=1.0"]
+anthropic = ["anthropic"]
+all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]"]
+
+[tool.setuptools.packages.find]
+exclude = ["assets*", "benchmark*", "docs*", "dist*", "playground*", "scripts*", "tests*"]
+
+[tool.wheel]
+exclude = ["assets*", "benchmark*", "docs*", "dist*", "playground*", "scripts*", "tests*"]
