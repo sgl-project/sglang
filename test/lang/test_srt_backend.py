@@ -6,7 +6,7 @@ import unittest
 
 from sglang.test.test_programs import (
     test_decode_int,
-    test_decode_json,
+    test_decode_json_regex,
     test_expert_answer,
     test_few_shot_qa,
     test_mt_bench,
@@ -43,6 +43,9 @@ class TestSRTBackend(unittest.TestCase):
 
     def test_decode_int(self):
         test_decode_int()
+
+    def test_decode_json_regex(self):
+        test_decode_json_regex()
 
     def test_expert_answer(self):
         test_expert_answer()
