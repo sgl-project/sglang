@@ -105,7 +105,7 @@ def test_decode_int():
 def test_decode_json_regex():
     @sgl.function
     def decode_json(s):
-        from sglang.srt.constrained import REGEX_STRING, REGEX_INT
+        from sglang.srt.constrained import REGEX_STRING, REGEX_INT, REGEX_FLOAT
 
         s += "Generate a JSON object to describe the basic information of a city.\n"
 
@@ -114,6 +114,7 @@ def test_decode_json_regex():
             s += '  "name": ' + sgl.gen(regex=REGEX_STRING + ",") + "\n"
             s += '  "population": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
             s += '  "area": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
+            s += '  "latitude": ' + sgl.gen(regex=REGEX_FLOAT + ",") + "\n"
             s += '  "country": ' + sgl.gen(regex=REGEX_STRING + ",") + "\n"
             s += '  "timezone": ' + sgl.gen(regex=REGEX_STRING) + "\n"
             s += "}"
