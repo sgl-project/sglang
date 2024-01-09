@@ -102,6 +102,29 @@ def test_decode_int():
     assert int(ret["days"]) == 365, ret.text
 
 
+def test_decode_json_regex():
+    @sgl.function
+    def decode_json(s):
+        from sglang.lang.ir import REGEX_FLOAT, REGEX_INT, REGEX_STRING
+
+        s += "Generate a JSON object to describe the basic information of a city.\n"
+
+        with s.var_scope("json_output"):
+            s += "{\n"
+            s += '  "name": ' + sgl.gen(regex=REGEX_STRING + ",") + "\n"
+            s += '  "population": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
+            s += '  "area": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
+            s += '  "latitude": ' + sgl.gen(regex=REGEX_FLOAT + ",") + "\n"
+            s += '  "country": ' + sgl.gen(regex=REGEX_STRING + ",") + "\n"
+            s += '  "timezone": ' + sgl.gen(regex=REGEX_STRING) + "\n"
+            s += "}"
+
+    ret = decode_json.run()
+    js_obj = json.loads(ret["json_output"])
+    assert isinstance(js_obj["name"], str)
+    assert isinstance(js_obj["population"], int)
+
+
 def test_decode_json():
     @sgl.function
     def decode_json(s):

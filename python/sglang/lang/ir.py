@@ -6,6 +6,11 @@ from typing import List, Optional, Union
 
 from sglang.global_config import global_config
 
+REGEX_INT = r"[-+]?[0-9]+"
+REGEX_FLOAT = r"[-+]?[0-9]*\.?[0-9]+"
+REGEX_BOOL = r"(True|False)"
+REGEX_STRING = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
+
 
 @dataclasses.dataclass
 class SamplingParams:
