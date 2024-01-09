@@ -45,7 +45,7 @@ class TestSRTBackend(unittest.TestCase):
         test_decode_int()
 
     def test_decode_json_regex(self):
-        test_decode_int()
+        test_decode_json_regex()
 
     def test_expert_answer(self):
         test_expert_answer()
