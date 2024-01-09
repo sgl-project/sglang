@@ -18,9 +18,12 @@ The core features of SGLang include:
 
 ## Install
 
-### Method 1: With Pip
+### Method 1: With pip
+```
+pip install "sglang[all]"
+```
 
-### Method 2: From Source
+### Method 2: From source
 ```
 git clone git@github.com:sgl-project/sglang.git
 cd sglang
