@@ -38,6 +38,26 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop, url, n=1):
     return pred
 
 
+def call_generate_outlines(
+    prompt, temperature, max_tokens, url, stop=[], regex=None, n=1
+):
+    data = {
+        "prompt": prompt,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stop": stop,
+        "regex": regex,
+        "n": n,
+    }
+    res = requests.post(url, json=data)
+    assert res.status_code == 200
+    if n == 1:
+        pred = res.json()["text"][0][len(prompt) :]
+    else:
+        pred = [x[len(prompt) :] for x in res.json()["text"]]
+    return pred
+
+
 def call_generate_srt_raw(prompt, temperature, max_tokens, stop, url):
     data = {
         "text": prompt,
@@ -134,6 +154,7 @@ def select_sglang_backend(args):
             global_config.enable_parallel_decoding = False
             global_config.enable_parallel_encoding = False
         backend = RuntimeEndpoint(f"{args.host}:{args.port}")
+        # function call: backend.config()
     elif args.backend.startswith("gpt"):
         backend = OpenAI(args.backend)
     else:
