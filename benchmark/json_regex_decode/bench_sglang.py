@@ -12,6 +12,7 @@ from sglang.utils import dump_state_text, read_jsonl
 
 REGEX_LIST = r"\[(" + REGEX_STRING + ", )*" + REGEX_STRING + r"\]"
 
+# fmt: off
 @sgl.function
 def json_decode(s, document):
     s += "Please extract the information of a city from the following wikipedia page.\n"
@@ -25,6 +26,7 @@ def json_decode(s, document):
         s += '  "population": ' + sgl.gen("population", max_tokens=8, regex=REGEX_INT + ",") + "\n"
         s += '  "top 3 landmarks": ' + sgl.gen( "landmarks", max_tokens=24, regex=REGEX_LIST) + "\n"
         s += "}\n"
+# fmt: on
 
 
 def main(args):
@@ -59,7 +61,7 @@ def main(args):
 
     with open(args.result_file, "a") as fout:
         value = {
-            "task": "long_json_decode",
+            "task": "json_regex_decode",
             "backend": args.backend,
             "num_gpus": 1,
             "latency": round(latency, 3),
