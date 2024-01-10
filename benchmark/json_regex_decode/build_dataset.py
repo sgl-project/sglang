@@ -3,7 +3,6 @@ import json
 import transformers
 import wikipedia
 
-
 model_path = "meta-llama/Llama-2-7b-chat-hf"
 t = transformers.AutoTokenizer.from_pretrained(model_path)
 city_names = [
