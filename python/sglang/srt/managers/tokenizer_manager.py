@@ -18,7 +18,6 @@ from sglang.srt.hf_transformers_utils import (
 from sglang.srt.managers.io_struct import (
     BatchStrOut,
     GenerateReqInput,
-    BackendConfig,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.sampling_params import SamplingParams
@@ -100,9 +99,6 @@ class TokenizerManager:
 
         self.to_create_loop = True
         self.rid_to_state = {}  # Dict[str -> ReqState]
-
-    async def reset_backend_config(self, obj: BackendConfig):
-        self.send_to_router.send_pyobj(obj)
 
     async def get_pixel_values(self, image_data):
         if self.executor is not None:

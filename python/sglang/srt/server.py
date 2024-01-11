@@ -20,7 +20,7 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
-from sglang.srt.managers.io_struct import GenerateReqInput, BackendConfig
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.openai_protocol import CompletionRequest
 from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -40,13 +40,6 @@ async def get_model_info():
         "model_path": tokenizer_manager.model_path,
     }
     return result
-
-
-@app.post("/reset_backend_config")
-async def config_backend(obj: BackendConfig):
-    obj.post_init()
-    await tokenizer_manager.reset_backend_config(obj)
-    return {}
 
 
 @app.post("/generate")

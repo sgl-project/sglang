@@ -79,7 +79,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, default="questions.jsonl")
     parser.add_argument("--num-questions", type=int, default=20)
-    # parser.add_argument("--model-rpc-sleep-time", type=float, default=0.03)
-    # parser.add_argument("--backend-config-timeout", type=float, default=60.0)
     args = add_common_sglang_args_and_parse(parser)
     main(args)

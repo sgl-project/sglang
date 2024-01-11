@@ -1,15 +1,13 @@
 import asyncio
 import logging
-from typing import List, Tuple
-import time
 
 import uvloop
 import zmq
 import zmq.asyncio
 from sglang.srt.managers.router.model_rpc import ModelRpcClient
-from sglang.srt.managers.io_struct import BackendConfig, DEFAULT_BACKEND_CONFIG
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_exception_traceback
+from sglang.srt.backend_config import GLOBAL_BACKEND_CONFIG
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -30,9 +28,8 @@ class RouterManager:
         self.model_client = model_client
         self.recv_reqs = []
 
-        self.model_rpc_sleep_time = DEFAULT_BACKEND_CONFIG.model_rpc_sleep_time  # 0.001
-        self.adjust_time_out = DEFAULT_BACKEND_CONFIG.backend_adjust_timeout  # 60.0
-        self.last_config_time = time.time()
+        # Init Some Configs
+        self.extend_dependency_time = GLOBAL_BACKEND_CONFIG.extend_dependency_time
 
     async def loop_for_forward(self):
         while True:
@@ -43,29 +40,16 @@ class RouterManager:
             for obj in out_pyobjs:
                 self.send_to_detokenizer.send_pyobj(obj)
 
+            # async sleep for recving the subsequent request, and avoiding cache miss
             if len(out_pyobjs) != 0:
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(self.extend_dependency_time)
 
-            # if timeout, reset backend config
-            if time.time() - self.last_config_time > self.adjust_time_out:
-                print("reset backend config to default")
-                self.model_rpc_sleep_time = DEFAULT_BACKEND_CONFIG.model_rpc_sleep_time
-                self.adjust_time_out = DEFAULT_BACKEND_CONFIG.backend_adjust_timeout
-                self.last_config_time = time.time()
-
-            # await for a while to accept input requests
-            await asyncio.sleep(self.model_rpc_sleep_time)
+            await asyncio.sleep(0.001)
 
     async def loop_for_recv_requests(self):
         while True:
             recv_req = await self.recv_from_tokenizer.recv_pyobj()
-            if isinstance(recv_req, BackendConfig):
-                print(f"reset backend config. {recv_req}")
-                self.model_rpc_sleep_time = recv_req.model_rpc_sleep_time
-                self.adjust_time_out = recv_req.backend_adjust_timeout
-                self.last_config_time = time.time()
-            else:
-                self.recv_reqs.append(recv_req)
+            self.recv_reqs.append(recv_req)
 
 
 def start_router_process(

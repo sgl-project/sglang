@@ -169,15 +169,3 @@ class RuntimeEndpoint(BaseBackend):
         if s.images_:
             assert len(s.images_) == 1, "Only support one image."
             data["image_data"] = s.images_[0][1]
-
-    def reset_backend_config(
-        self,
-        model_rpc_sleep_time: Optional[float] = None,
-        backend_adjust_timeout: Optional[float] = None,
-    ):
-        data = {
-            "model_rpc_sleep_time": model_rpc_sleep_time,
-            "backend_adjust_timeout": backend_adjust_timeout,
-        }
-        res = http_request(self.base_url + "/reset_backend_config", json=data)
-        assert res.status_code == 200
