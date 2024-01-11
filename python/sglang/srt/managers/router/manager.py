@@ -43,6 +43,9 @@ class RouterManager:
             for obj in out_pyobjs:
                 self.send_to_detokenizer.send_pyobj(obj)
 
+            if len(out_pyobjs) != 0:
+                await asyncio.sleep(0.03)
+
             # if timeout, reset backend config
             if time.time() - self.last_config_time > self.adjust_time_out:
                 print("reset backend config to default")
