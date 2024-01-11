@@ -11,7 +11,7 @@ python bench_sglang.py --tokenizer meta-llama/Llama-2-7b-chat-hf
 ### Benchmark vLLM
 
 ```
-python3 -m vllm.entrypoints.api_server --tokenizer-mode auto --model meta-llama/Llama-2-7b-chat-hf  --disable-log-requests --port 21000 --gpu 0.97
+python3 -m vllm.entrypoints.api_server --tokenizer-mode auto --model meta-llama/Llama-2-7b-chat-hf  --disable-log-requests --port 21000
 ```
 
 ```

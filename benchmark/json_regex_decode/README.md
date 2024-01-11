@@ -21,7 +21,7 @@ python3 bench_sglang.py --num-questions 5
 
 ### Benchmark vllm
 ```
-python3 -m outlines.serve.serve --tokenizer-mode auto --model meta-llama/Llama-2-7b-chat-hf  --disable-log-requests --port 21000 --gpu 0.97
+python3 -m outlines.serve.serve --tokenizer-mode auto --model meta-llama/Llama-2-7b-chat-hf  --disable-log-requests --port 21000
 ```
 
 ```
