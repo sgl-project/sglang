@@ -6,6 +6,21 @@ from sglang.srt.sampling_params import SamplingParams
 
 
 @dataclass
+class BackendConfig:
+    model_rpc_sleep_time: Optional[float] = None
+    backend_adjust_timeout: Optional[float] = None
+
+    def post_init(self):
+        if self.model_rpc_sleep_time is None:
+            self.model_rpc_sleep_time = DEFAULT_BACKEND_CONFIG.model_rpc_sleep_time
+        if self.backend_adjust_timeout is None:
+            self.backend_adjust_timeout = DEFAULT_BACKEND_CONFIG.backend_adjust_timeout
+
+
+DEFAULT_BACKEND_CONFIG = BackendConfig(0.001, 60.0)
+
+
+@dataclass
 class GenerateReqInput:
     text: Union[List[str], str]
     image_data: Optional[Union[List[str], str]] = None

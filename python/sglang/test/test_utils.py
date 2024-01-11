@@ -154,7 +154,13 @@ def select_sglang_backend(args):
             global_config.enable_parallel_decoding = False
             global_config.enable_parallel_encoding = False
         backend = RuntimeEndpoint(f"{args.host}:{args.port}")
-        # function call: backend.config()
+        if hasattr(args, "model_rpc_sleep_time"):
+            backend.reset_backend_config(
+                args.model_rpc_sleep_time,
+                None
+                if not hasattr(args, "backend_config_timeout")
+                else args.backend_config_timeout,
+            )
     elif args.backend.startswith("gpt"):
         backend = OpenAI(args.backend)
     else:

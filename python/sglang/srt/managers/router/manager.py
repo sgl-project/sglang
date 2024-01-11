@@ -1,11 +1,13 @@
 import asyncio
 import logging
 from typing import List, Tuple
+import time
 
 import uvloop
 import zmq
 import zmq.asyncio
 from sglang.srt.managers.router.model_rpc import ModelRpcClient
+from sglang.srt.managers.io_struct import BackendConfig, DEFAULT_BACKEND_CONFIG
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_exception_traceback
 
@@ -28,6 +30,10 @@ class RouterManager:
         self.model_client = model_client
         self.recv_reqs = []
 
+        self.model_rpc_sleep_time = DEFAULT_BACKEND_CONFIG.model_rpc_sleep_time  # 0.001
+        self.adjust_time_out = DEFAULT_BACKEND_CONFIG.backend_adjust_timeout  # 60.0
+        self.last_config_time = time.time()
+
     async def loop_for_forward(self):
         while True:
             next_step_input = list(self.recv_reqs)
@@ -37,13 +43,26 @@ class RouterManager:
             for obj in out_pyobjs:
                 self.send_to_detokenizer.send_pyobj(obj)
 
+            # if timeout, reset backend config
+            if time.time() - self.last_config_time > self.adjust_time_out:
+                print("reset backend config to default")
+                self.model_rpc_sleep_time = DEFAULT_BACKEND_CONFIG.model_rpc_sleep_time
+                self.adjust_time_out = DEFAULT_BACKEND_CONFIG.backend_adjust_timeout
+                self.last_config_time = time.time()
+
             # await for a while to accept input requests
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(self.model_rpc_sleep_time)
 
     async def loop_for_recv_requests(self):
         while True:
             recv_req = await self.recv_from_tokenizer.recv_pyobj()
-            self.recv_reqs.append(recv_req)
+            if isinstance(recv_req, BackendConfig):
+                print(f"reset backend config. {recv_req}")
+                self.model_rpc_sleep_time = recv_req.model_rpc_sleep_time
+                self.adjust_time_out = recv_req.backend_adjust_timeout
+                self.last_config_time = time.time()
+            else:
+                self.recv_reqs.append(recv_req)
 
 
 def start_router_process(
