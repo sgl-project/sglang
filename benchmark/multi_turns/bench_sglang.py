@@ -85,7 +85,7 @@ def main(args):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--turns", type=int, default=4)
-    parser.add_argument("--num-qa", type=int, default=20)
+    parser.add_argument("--num-qa", type=int, default=10)
     parser.add_argument("--min-len", type=int, default=256)
     parser.add_argument("--max-len", type=int, default=512)
     parser.add_argument("--tokenizer", type=str, required=True)
