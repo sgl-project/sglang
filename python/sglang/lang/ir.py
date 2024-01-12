@@ -13,7 +13,7 @@ REGEX_STRING = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
 
 
 @dataclasses.dataclass
-class SamplingParams:
+class SglSamplingParams:
     max_new_tokens: int = 16
     stop: Union[str, List[str]] = ()
     temperature: float = 1.0
@@ -27,7 +27,7 @@ class SamplingParams:
     regex: Optional[str] = None
 
     def clone(self):
-        return SamplingParams(
+        return SglSamplingParams(
             self.max_new_tokens,
             self.stop,
             self.temperature,
@@ -104,7 +104,7 @@ class SglFunction:
     ):
         from sglang.lang.interpreter import run_program
 
-        default_sampling_para = SamplingParams(
+        default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
             stop=stop,
             temperature=temperature,
@@ -138,7 +138,7 @@ class SglFunction:
             return []
         assert isinstance(batch_kwargs[0], dict)
 
-        default_sampling_para = SamplingParams(
+        default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
             stop=stop,
             temperature=temperature,
@@ -322,7 +322,7 @@ class SglGen(SglExpr):
     ):
         super().__init__()
         self.name = name
-        self.sampling_params = SamplingParams(
+        self.sampling_params = SglSamplingParams(
             max_new_tokens=max_new_tokens,
             stop=stop,
             temperature=temperature,

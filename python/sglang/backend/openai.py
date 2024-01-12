@@ -4,7 +4,7 @@ import numpy as np
 from sglang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template
 from sglang.lang.interpreter import StreamExecutor
-from sglang.lang.ir import SamplingParams
+from sglang.lang.ir import SglSamplingParams
 
 try:
     import openai
@@ -73,7 +73,7 @@ class OpenAI(BaseBackend):
     def generate(
         self,
         s: StreamExecutor,
-        sampling_params: SamplingParams,
+        sampling_params: SglSamplingParams,
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
@@ -122,7 +122,7 @@ class OpenAI(BaseBackend):
     def generate_stream(
         self,
         s: StreamExecutor,
-        sampling_params: SamplingParams,
+        sampling_params: SglSamplingParams,
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:

@@ -7,7 +7,7 @@ from typing import List, Optional, Union
 from sglang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.lang.interpreter import StreamExecutor
-from sglang.lang.ir import SamplingParams
+from sglang.lang.ir import SglSamplingParams
 from sglang.utils import http_request
 
 
@@ -138,7 +138,7 @@ class TGI(BaseBackend):
         self,
         s: StreamExecutor,
         choices: List[str],
-        sampling_params: SamplingParams,
+        sampling_params: SglSamplingParams,
     ):
         decision = self.retry_for_expected(
             s.text_,
@@ -152,7 +152,7 @@ class TGI(BaseBackend):
         s: StreamExecutor,
         max_tokens: int,
         stop: Union[str, List[str]],
-        sampling_params: SamplingParams,
+        sampling_params: SglSamplingParams,
         dtype: Optional[str] = None,
     ):
         if dtype is None:
