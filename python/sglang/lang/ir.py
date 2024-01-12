@@ -21,6 +21,7 @@ class SglSamplingParams:
     top_k: int = -1  # -1 means disable
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
+    ignore_eos: bool = False
 
     # for constrained generation, not included in to_xxx_kwargs
     dtype: Optional[str] = None
@@ -67,6 +68,7 @@ class SglSamplingParams:
             "top_k": self.top_k,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
+            "ignore_eos": self.ignore_eos,
             "regex": self.regex,
         }
 
@@ -98,6 +100,7 @@ class SglFunction:
         top_k: int = -1,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        ignore_eos: bool = False,
         stream: bool = False,
         backend=None,
         **kwargs,
@@ -112,6 +115,7 @@ class SglFunction:
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            ignore_eos=ignore_eos,
         )
         backend = backend or global_config.default_backend
         return run_program(self, backend, args, kwargs, default_sampling_para, stream)
@@ -127,6 +131,7 @@ class SglFunction:
         top_k: int = -1,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        ignore_eos: bool = False,
         backend=None,
         num_threads: Union[str, int] = "auto",
         progress_bar: bool = False,
@@ -146,6 +151,7 @@ class SglFunction:
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            ignore_eos=ignore_eos,
         )
         backend = backend or global_config.default_backend
         return run_program_batch(
@@ -317,6 +323,7 @@ class SglGen(SglExpr):
         top_k,
         frequency_penalty,
         presence_penalty,
+        ignore_eos,
         dtype,
         regex,
     ):
@@ -330,6 +337,7 @@ class SglGen(SglExpr):
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            ignore_eos=ignore_eos,
             dtype=dtype,
             regex=regex,
         )

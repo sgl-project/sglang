@@ -37,6 +37,7 @@ def gen(
     top_k: Optional[int] = None,
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
+    ignore_eos: Optional[bool] = None,
     dtype: Optional[type] = None,
     choices: Optional[List[str]] = None,
     regex: Optional[str] = None,
@@ -60,6 +61,7 @@ def gen(
         top_k,
         frequency_penalty,
         presence_penalty,
+        ignore_eos,
         dtype,
         regex,
     )
@@ -74,6 +76,7 @@ def gen_int(
     top_k: Optional[int] = None,
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
+    ignore_eos: Optional[bool] = None,
 ):
     return SglGen(
         name,
@@ -84,6 +87,7 @@ def gen_int(
         top_k,
         frequency_penalty,
         presence_penalty,
+        ignore_eos,
         int,
         None,
     )
@@ -98,6 +102,7 @@ def gen_string(
     top_k: Optional[int] = None,
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
+    ignore_eos: Optional[bool] = None,
 ):
     return SglGen(
         name,
@@ -108,6 +113,7 @@ def gen_string(
         top_k,
         frequency_penalty,
         presence_penalty,
+        ignore_eos,
         str,
         None,
     )

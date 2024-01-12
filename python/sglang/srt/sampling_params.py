@@ -7,13 +7,13 @@ _SAMPLING_EPS = 1e-6
 class SamplingParams:
     def __init__(
         self,
+        max_new_tokens: int = 16,
+        stop: Optional[Union[str, List[str]]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
-        stop: Optional[Union[str, List[str]]] = None,
-        max_new_tokens: int = 16,
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
         dtype: Optional[str] = None,
