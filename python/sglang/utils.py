@@ -67,7 +67,7 @@ def dump_state_text(filename, states, mode="w"):
             if isinstance(s, str):
                 pass
             elif isinstance(s, ProgramState):
-                s = s.text().strip()
+                s = s.text()
             else:
                 s = str(s)
 

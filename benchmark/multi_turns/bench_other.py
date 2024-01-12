@@ -1,6 +1,4 @@
 import json
-import random
-import string
 import time
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
@@ -11,36 +9,10 @@ from sglang.utils import dump_state_text
 from tqdm import tqdm
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
-
-def gen_prompt(tokenizer, token_num):
-    cha_set = string.ascii_letters + string.digits
-    ret = "".join(random.choices(cha_set, k=token_num))
-    while len(tokenizer(ret).input_ids) < token_num:
-        ret += random.choice(cha_set)
-    return ret
+from data_gen import gen_arguments
 
 
-def gen_arguments(args, tokenizer):
-    multi_qas = [{} for _ in range(args.num_qa)]
-    for i in range(args.num_qa):
-        prompt_len = random.randint(args.min_len, args.max_len)
-        new_tokens = random.randint(args.min_len, args.max_len)
-        multi_qas[i] = {
-            "prompt": gen_prompt(tokenizer, prompt_len),
-            "new_tokens": new_tokens,
-        }
-
-    return multi_qas
-
-
-def main(args):
-    print(args)
-    random.seed(args.seed)
-
-    tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=args.trust_remote_code)
-
-    multi_qas = gen_arguments(args, tokenizer)
-
+def get_generate(args):
     # Select backend
     if args.backend == "vllm":
         url = f"{args.host}:{args.port}/generate"
@@ -81,14 +53,28 @@ def main(args):
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
-    def multi_turns(generate, prompt, new_tokens):
-        s = ""
-        for _ in range(args.turns):
-            s += prompt
-            s += generate(s, max_tokens=new_tokens)
-        return s
+    return generate
+
+
+def multi_turns(generate, qas):
+    s = ""
+    for qa in qas:
+        s += qa["prompt"]
+        s += generate(s, max_tokens=qa["new_tokens"]) 
+
+    return s
+
+
+def main(args):
+    print(args)
+
+    tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=args.trust_remote_code)
+
+    multi_qas = gen_arguments(args, tokenizer)
 
     states = [None] * args.num_qa
+
+    generate = get_generate(args)
 
     def get_one_answer(i):
         states[i] = multi_turns(generate=generate, **multi_qas[i])
@@ -128,11 +114,18 @@ def main(args):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--turns", type=int, default=4)
-    parser.add_argument("--num-qa", type=int, default=10)
-    parser.add_argument("--min-len", type=int, default=256)
-    parser.add_argument("--max-len", type=int, default=512)
+    parser.add_argument("--num-qa", type=int, default=20)
+    parser.add_argument("--min-len-q", type=int, default=256)
+    parser.add_argument("--max-len-q", type=int, default=512)
+    parser.add_argument("--min-len-a", type=int, default=4)
+    parser.add_argument("--max-len-a", type=int, default=8)
     parser.add_argument("--tokenizer", type=str, required=True)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--long", action="store_true")
     args = add_common_other_args_and_parse(parser)
+
+    if args.long:
+        args.min_len_a = 256
+        args.max_len_a = 512
+        args.num_qa = 10
     main(args)
