@@ -40,7 +40,8 @@ def extract_prefix_by_tracing(program, backend):
     try:
         with TracingScope(tracer):
             tracer.ret_value = program.func(tracer, **arguments)
-    except StopTracing:
+    except (StopTracing, TypeError):
+        # Some exceptions may not be catched
         pass
 
     # Run and cache prefix

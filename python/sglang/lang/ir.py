@@ -114,7 +114,6 @@ class SglFunction:
             presence_penalty=presence_penalty,
         )
         backend = backend or global_config.default_backend
-        kwargs = {k: SglArgument(k, v) for k, v in kwargs.items()}
         return run_program(self, backend, args, kwargs, default_sampling_para, stream)
 
     def run_batch(
@@ -149,9 +148,6 @@ class SglFunction:
             presence_penalty=presence_penalty,
         )
         backend = backend or global_config.default_backend
-        batch_kwargs = [
-            {k: SglArgument(k, v) for k, v in kwargs.items()} for kwargs in batch_kwargs
-        ]
         return run_program_batch(
             self,
             backend,
