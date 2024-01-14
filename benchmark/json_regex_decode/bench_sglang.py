@@ -68,7 +68,6 @@ def main(args):
             "latency": round(latency, 3),
             "num_requests": args.num_questions,
             "other": {
-                "num_questions": args.num_questions,
                 "parallel": args.parallel,
             },
         }

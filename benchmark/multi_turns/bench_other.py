@@ -49,7 +49,8 @@ def get_generate(args):
             return out["answer"]
 
         # warmup
-        generate("Hello!", max_tokens=8, stop=None)
+        for _ in range(3):
+            generate("Hello!" * 10, max_tokens=64, stop=None)
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
@@ -106,6 +107,7 @@ def main(args):
             "num_turns": args.turns,
             "other": {
                 "parallel": args.parallel,
+                "output_mode": "long" if args.long else "short",
             },
         }
         fout.write(json.dumps(value) + "\n")

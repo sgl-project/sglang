@@ -51,6 +51,7 @@ def main(args):
             "num_turns": args.turns,
             "other": {
                 "parallel": args.parallel,
+                "output_mode": "long" if args.long else "short",
             },
         }
         fout.write(json.dumps(value) + "\n")

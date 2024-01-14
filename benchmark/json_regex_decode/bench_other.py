@@ -76,7 +76,8 @@ def main(args):
             return out["answer"]
 
         # warmup
-        generate("Hello!", max_tokens=8, stop=None)
+        for _ in range(3):
+            generate("Hello!" * 10, max_tokens=64, stop=None)
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
@@ -110,7 +111,6 @@ def main(args):
             "latency": round(latency, 3),
             "num_requests": args.num_questions,
             "other": {
-                "num_questions": args.num_questions,
                 "parallel": args.parallel,
             },
         }
