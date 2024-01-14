@@ -1,5 +1,11 @@
 ## Run benchmark
 
+### Build dataset
+```
+pip install wikipedia
+python3 build_dataset.py
+```
+
 ### Dependencies
 
 ```
@@ -10,33 +16,46 @@ outlines                  0.0.22
 ```
 
 ### Benchmark sglang
+
+Run llama-7b
+
 ```
 python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 
 ```
 
+Run mixtral-8x7b
+(When there is a CUDA out-of-memory error, try to reduce the `--mem-fraction-static`)
+
 ```
-python3 bench_sglang.py --num-questions 5
+python3 -m sglang.launch_server --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 --port 30000 --tp-size 8
+```
+
+Benchmark
+
+```
+python3 bench_sglang.py --num-questions 10
 ```
 
 
 ### Benchmark vllm
+
+Run llama-7b
+
 ```
 python3 -m outlines.serve.serve --tokenizer-mode auto --model meta-llama/Llama-2-7b-chat-hf  --disable-log-requests --port 21000
 ```
 
+Benchmark
+
 ```
-python3 bench_other.py --backend vllm --num-questions 5
+python3 bench_other.py --backend vllm --num-questions 10
 ```
 
 
 ### Benchmark guidance
-```
-python3 bench_other.py --backend guidance --num-questions 5 --parallel 1
-```
 
+Run llama-7b and benchmark
 
-### Build dataset
 ```
-pip install wikipedia
-python3 build_dataset.py
+python3 bench_other.py --backend guidance --num-questions 10 --parallel 1
 ```
