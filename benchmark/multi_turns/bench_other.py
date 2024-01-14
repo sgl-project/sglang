@@ -127,5 +127,5 @@ if __name__ == "__main__":
     if args.long:
         args.min_len_a = 256
         args.max_len_a = 512
-        args.num_qa = 10
+        args.num_qa = 20
     main(args)
