@@ -163,9 +163,12 @@ class ModelRpcServer(rpyc.Service):
                     self.token_to_kv_pool.available_size()
                     + self.tree_cache.evictable_size()
                 )
-                assert (
-                    available_size == self.max_total_num_token
-                ), f"Inner Error: available_size={available_size}, max_total_num_token={self.max_total_num_token}"
+                if available_size != self.max_total_num_token:
+                    logger.warning(
+                        "Warning: "
+                        f"available_size={available_size}, max_total_num_token={self.max_total_num_token}\n"
+                        "KV cache pool leak detected!"
+                    )
 
         if self.running_batch is not None and self.tp_rank == 0:
             if self.decode_forward_ct >= 20:

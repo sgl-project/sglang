@@ -24,6 +24,8 @@ class ServerArgs:
     def __post_init__(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+        if self.tp_size > 1:
+            self.mem_fraction_static = 0.8
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
