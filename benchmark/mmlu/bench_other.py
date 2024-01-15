@@ -95,6 +95,9 @@ def evaluate(args, subject, dev_df, test_df):
                 max_tokens=max_tokens, temperature=0)
             return out["answer"]
 
+        # warmup
+        call_generate("Hello,", temperature=1.0, max_tokens=8)
+
     elif args.backend == "lmql":
         import lmql
         model = lmql.model("meta-llama/Llama-2-7b-chat-hf",

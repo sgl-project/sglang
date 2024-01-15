@@ -4,6 +4,8 @@
 
 ### Install flashinfer
 
+Note: The compilation can take a very long time.
+
 ```bash
 git submodule update --init --recursive
 pip install 3rdparty/flashinfer/python
