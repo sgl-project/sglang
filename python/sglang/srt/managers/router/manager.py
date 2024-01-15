@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from typing import List, Tuple
 
 import uvloop
 import zmq
@@ -8,6 +7,7 @@ import zmq.asyncio
 from sglang.srt.managers.router.model_rpc import ModelRpcClient
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_exception_traceback
+from sglang.srt.backend_config import GLOBAL_BACKEND_CONFIG
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -28,6 +28,9 @@ class RouterManager:
         self.model_client = model_client
         self.recv_reqs = []
 
+        # Init Some Configs
+        self.extend_dependency_time = GLOBAL_BACKEND_CONFIG.extend_dependency_time
+
     async def loop_for_forward(self):
         while True:
             next_step_input = list(self.recv_reqs)
@@ -37,7 +40,12 @@ class RouterManager:
             for obj in out_pyobjs:
                 self.send_to_detokenizer.send_pyobj(obj)
 
-            # await for a while to accept input requests
+            # async sleep for recving the subsequent request, and avoiding cache miss
+            if len(out_pyobjs) != 0:
+                has_finished = any([obj.finished for obj in out_pyobjs])
+                if has_finished:
+                    await asyncio.sleep(self.extend_dependency_time)
+
             await asyncio.sleep(0.001)
 
     async def loop_for_recv_requests(self):

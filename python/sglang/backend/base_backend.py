@@ -2,7 +2,7 @@ from typing import Callable, List, Optional, Union
 
 from sglang.lang.chat_template import get_chat_template
 from sglang.lang.interpreter import StreamExecutor
-from sglang.lang.ir import SamplingParams
+from sglang.lang.ir import SglSamplingParams
 
 
 class BaseBackend:
@@ -48,14 +48,14 @@ class BaseBackend:
     def generate(
         self,
         s: StreamExecutor,
-        sampling_params: SamplingParams,
+        sampling_params: SglSamplingParams,
     ):
         raise NotImplementedError()
 
     def generate_stream(
         self,
         s: StreamExecutor,
-        sampling_params: SamplingParams,
+        sampling_params: SglSamplingParams,
     ):
         raise NotImplementedError()
 

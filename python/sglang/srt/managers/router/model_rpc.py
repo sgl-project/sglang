@@ -19,7 +19,6 @@ from sglang.srt.managers.router.model_runner import ModelRunner
 from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.managers.router.scheduler import Scheduler
 from sglang.srt.model_config import ModelConfig
-from sglang.srt.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     get_exception_traceback,
@@ -158,6 +157,18 @@ class ModelRpcServer(rpyc.Service):
                     if self.running_batch.is_empty():
                         self.running_batch = None
                         break
+            else:
+                # check the available size
+                available_size = (
+                    self.token_to_kv_pool.available_size()
+                    + self.tree_cache.evictable_size()
+                )
+                if available_size != self.max_total_num_token:
+                    logger.warning(
+                        "Warning: "
+                        f"available_size={available_size}, max_total_num_token={self.max_total_num_token}\n"
+                        "KV cache pool leak detected!"
+                    )
 
         if self.running_batch is not None and self.tp_rank == 0:
             if self.decode_forward_ct >= 20:
@@ -408,7 +419,9 @@ class ModelRpcServer(rpyc.Service):
                 token_ids = tuple(req.input_ids + req.output_ids)
                 seq_len = len(token_ids) - 1
                 indices = self.req_to_token_pool.req_to_token[req_pool_idx, :seq_len]
-                prefix_len = self.tree_cache.insert(token_ids, indices.clone())
+                prefix_len = self.tree_cache.insert(
+                    token_ids[:seq_len], indices.clone()
+                )
 
                 self.token_to_kv_pool.free(indices[:prefix_len])
                 self.req_to_token_pool.free(req_pool_idx)
