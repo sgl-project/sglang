@@ -64,8 +64,6 @@ def main(args):
     # Run requests
     tic = time.time()
     states = json_decode.run_batch(arguments, temperature=0, num_threads=args.parallel)
-    for state in states:
-        state.sync()
     latency = time.time() - tic
 
     # Compute accuracy

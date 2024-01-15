@@ -1,6 +1,6 @@
 ## Run benchmark
 
-NOTE: This is an implementation for replaying a given trace for benchmark purposes. It is not an actual ReAct agent implementation.
+NOTE: This is an implementation for replaying a given trace for throughput/latency benchmark purposes. It is not an actual ReAct agent implementation.
 
 ### Benchmark sglang
 ```
