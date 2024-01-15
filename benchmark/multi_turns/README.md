@@ -36,7 +36,7 @@ python3 -m vllm.entrypoints.api_server --tokenizer-mode auto --model meta-llama/
 Run mixtral-8x7b
 
 ```
-python3 -m vllm.entrypoints.api_server --tokenizer-mode auto --model mistralai/Mixtral-8x7B-Instruct-v0.1 --disable-log-requests --port 21000
+python3 -m vllm.entrypoints.api_server --tokenizer-mode auto --model mistralai/Mixtral-8x7B-Instruct-v0.1 --disable-log-requests --port 21000 --tensor-parallel-size 8
 ```
 
 Benchmark(short output)

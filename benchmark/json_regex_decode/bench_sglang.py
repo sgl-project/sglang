@@ -14,6 +14,21 @@ REGEX_LIST = r"\[(" + REGEX_STRING + ", )*" + REGEX_STRING + r"\]"
 
 # fmt: off
 @sgl.function
+def json_warm_up(s):
+    s += "The information about Hogwarts is in the following JSON format.\n"
+    with s.var_scope("json_output"):
+        s += "{\n"
+        s += '  "name": ' + sgl.gen("name", max_tokens=8, regex=REGEX_STRING + ",") + "\n"
+        s += '  "country": ' + sgl.gen("country", max_tokens=8, regex=REGEX_STRING + ",") + "\n"
+        s += '  "latitude": ' + sgl.gen("latitude", max_tokens=8, regex=REGEX_FLOAT + ",") + "\n"
+        s += '  "population": ' + sgl.gen("population", max_tokens=8, regex=REGEX_INT + ",") + "\n"
+        s += '  "top 3 landmarks": ' + sgl.gen( "landmarks", max_tokens=24, regex=REGEX_LIST) + "\n"
+        s += "}\n"
+    print(f'The warmp up json result is:\n{s["json_output"]}')
+# fmt: on
+
+# fmt: off
+@sgl.function
 def json_decode(s, document):
     s += "Please extract the information of a city from the following wikipedia page.\n"
     s += "Page begin.\n" + document + "Page end.\n"
@@ -42,6 +57,9 @@ def main(args):
     # Select backend
     backend = select_sglang_backend(args)
     sgl.set_default_backend(backend)
+
+    # Warm up
+    json_warm_up.run().sync()
 
     # Run requests
     tic = time.time()
