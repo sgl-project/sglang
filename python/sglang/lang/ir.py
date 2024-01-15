@@ -48,6 +48,16 @@ class SglSamplingParams:
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
         }
+    
+    def to_gemini_kwargs(self):
+        return {
+            "candidate_count": 1,
+            "max_output_tokens": self.max_new_tokens,
+            "stop_sequences": self.stop,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": 1,
+        }
 
     def to_anthropic_kwargs(self):
         # Anthropic does not support frequency_penalty or presence_penalty, so we drop it here

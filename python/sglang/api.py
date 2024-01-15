@@ -5,6 +5,7 @@ from typing import Callable, List, Optional, Union
 from sglang.backend.anthropic import Anthropic
 from sglang.backend.base_backend import BaseBackend
 from sglang.backend.openai import OpenAI
+from sglang.backend.gemini import Gemini
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.global_config import global_config
 from sglang.lang.ir import (
@@ -156,6 +157,8 @@ def user(expr: Optional[SglExpr] = None):
 def assistant(expr: Optional[SglExpr] = None):
     return _role_common("assistant", expr)
 
+def model(expr: Optional[SglExpr] = None):
+    return _role_common("model", expr)
 
 def user_begin():
     return SglRoleBegin("user")

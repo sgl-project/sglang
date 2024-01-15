@@ -86,6 +86,17 @@ register_chat_template(
     )
 )
 
+# Reference: https://cloud.google.com/vertex-ai/docs/generative-ai/model-reference/gemini#chat
+register_chat_template(
+    ChatTemplate(
+        name="gemini",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "user": ("USER: ", "\n"),
+            "model": ("MODEL: ", "\n"),
+        },
+    )
+)
 
 register_chat_template(
     ChatTemplate(
