@@ -12,7 +12,6 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import tqdm
 from sglang.global_config import global_config
 from sglang.lang.ir import (
-    SglArgument,
     SglCommitLazy,
     SglConcateAndAppend,
     SglConstantText,
@@ -89,7 +88,7 @@ def run_program_batch(
         for arguments in batch_arguments:
             rets.append(
                 run_program(
-                    program, backend, (), arguments, default_sampling_para, False, False
+                    program, backend, (), arguments, default_sampling_para, False, True
                 )
             )
     else:
@@ -108,7 +107,7 @@ def run_program_batch(
                         arguments,
                         default_sampling_para,
                         False,
-                        False,
+                        True,
                     )
                 )
                 if progress_bar:
@@ -478,7 +477,7 @@ class StreamExecutor:
             "top_k",
             "frequency_penalty",
             "presence_penalty",
-            "ignore_eos", 
+            "ignore_eos",
             "dtype",
             "regex",
         ]:

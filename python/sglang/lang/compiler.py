@@ -6,10 +6,10 @@ from typing import List, Union
 from sglang.global_config import global_config
 from sglang.lang.interpreter import ProgramState, StreamExecutor, pin_program
 from sglang.lang.ir import (
-    SglSamplingParams,
     SglArgument,
     SglConstantText,
     SglExpr,
+    SglSamplingParams,
     SglVariable,
 )
 
@@ -137,7 +137,6 @@ class CompiledFunction:
     ):
         backend = backend or global_config.default_backend
 
-        kwargs = {k: SglArgument(k, v) for k, v in kwargs.items()}
         kwargs.update(self.function.bind_arguments)
 
         default_sampling_para = SglSamplingParams(
@@ -182,9 +181,6 @@ class CompiledFunction:
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
         )
-        batch_kwargs = [
-            {k: SglArgument(k, v) for k, v in kwargs.items()} for kwargs in batch_kwargs
-        ]
 
         # Extract prefix by tracing and cache it
         if len(batch_kwargs) > 1:

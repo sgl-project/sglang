@@ -174,7 +174,7 @@ def test_tool_use():
     def tool_use(s, lhs, rhs):
         s += "Please perform computations using a calculator. You can use calculate(expression) to get the results.\n"
         s += "For example,\ncalculate(1+2)=3\ncalculate(3*4)=12\n"
-        s += "Question: What is the product of " + lhs + " and " + rhs + "?\n"
+        s += "Question: What is the product of " + str(lhs) + " and " + str(rhs) + "?\n"
         s += (
             "Answer: The answer is calculate("
             + sgl.gen("expression", stop=")")
