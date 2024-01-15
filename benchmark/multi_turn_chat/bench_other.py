@@ -99,7 +99,7 @@ def main(args):
 
     with open(args.result_file, "a") as fout:
         value = {
-            "task": "multi_turns",
+            "task": "multi_turn_chat",
             "backend": args.backend,
             "num_gpus": 1,
             "latency": round(latency, 3),
