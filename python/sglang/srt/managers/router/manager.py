@@ -42,7 +42,9 @@ class RouterManager:
 
             # async sleep for recving the subsequent request, and avoiding cache miss
             if len(out_pyobjs) != 0:
-                await asyncio.sleep(self.extend_dependency_time)
+                has_finished = any([obj.finished for obj in out_pyobjs])
+                if has_finished:
+                    await asyncio.sleep(self.extend_dependency_time)
 
             await asyncio.sleep(0.001)
 
