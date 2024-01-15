@@ -141,6 +141,9 @@ def main(args):
                     rets.append(out["answer"])
                 return rets
 
+        # warmup
+        call_generate("Hello,", 1.0, 8, ".", 1)
+
     # Run requests
     states = [None] * len(questions)
     def get_one_answer(i):
