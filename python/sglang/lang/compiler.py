@@ -137,7 +137,6 @@ class CompiledFunction:
     ):
         backend = backend or global_config.default_backend
 
-        kwargs = {k: SglArgument(k, v) for k, v in kwargs.items()}
         kwargs.update(self.function.bind_arguments)
 
         default_sampling_para = SglSamplingParams(
@@ -182,9 +181,6 @@ class CompiledFunction:
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
         )
-        batch_kwargs = [
-            {k: SglArgument(k, v) for k, v in kwargs.items()} for kwargs in batch_kwargs
-        ]
 
         # Extract prefix by tracing and cache it
         if len(batch_kwargs) > 1:
