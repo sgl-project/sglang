@@ -12,7 +12,7 @@ class ServerArgs:
     load_format: str = "auto"
     tokenizer_mode: str = "auto"
     trust_remote_code: bool = True
-    mem_fraction_static: float = 0.91
+    mem_fraction_static: Optional[float] = None
     tp_size: int = 1
     model_mode: List[str] = ()
     schedule_heuristic: str = "lpm"
@@ -24,8 +24,11 @@ class ServerArgs:
     def __post_init__(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
-        if self.tp_size > 1:
-            self.mem_fraction_static = 0.8
+        if self.mem_fraction_static is None:
+            if self.tp_size > 1:
+                self.mem_fraction_static = 0.8
+            else:
+                self.mem_fraction_static = 0.9
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

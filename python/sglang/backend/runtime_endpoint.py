@@ -7,7 +7,7 @@ from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.lang.interpreter import StreamExecutor
-from sglang.lang.ir import SglSamplingParams, SglArgument
+from sglang.lang.ir import SglArgument, SglSamplingParams
 from sglang.utils import encode_image_base64, find_printable_text, http_request
 
 
