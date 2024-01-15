@@ -6,10 +6,10 @@ from typing import List, Union
 from sglang.global_config import global_config
 from sglang.lang.interpreter import ProgramState, StreamExecutor, pin_program
 from sglang.lang.ir import (
-    SglSamplingParams,
     SglArgument,
     SglConstantText,
     SglExpr,
+    SglSamplingParams,
     SglVariable,
 )
 
