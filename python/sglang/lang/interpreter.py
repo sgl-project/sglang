@@ -292,7 +292,7 @@ class StreamExecutor:
 
         assert isinstance(other, SglExpr), f"{other}"
 
-        if isinstance(other, (SglConstantText, SglArgument)):
+        if isinstance(other, SglConstantText):
             self._execute_fill(other.value)
         elif isinstance(other, SglGen):
             self._execute_gen(other)
@@ -332,8 +332,6 @@ class StreamExecutor:
 
     def _execute_image(self, expr: SglImage):
         path = expr.path
-        if isinstance(path, SglArgument):
-            path = path.value
 
         base64_data = encode_image_base64(path)
 
@@ -419,7 +417,7 @@ class StreamExecutor:
                 "role": expr.role,
                 "content": [{"type": "text", "text": new_text}],
             }
-            for (image_path, image_base64_data) in self.cur_images:
+            for image_path, image_base64_data in self.cur_images:
                 last_msg["content"].append(
                     {
                         "type": "image_url",
@@ -480,6 +478,7 @@ class StreamExecutor:
             "top_k",
             "frequency_penalty",
             "presence_penalty",
+            "ignore_eos", 
             "dtype",
             "regex",
         ]:

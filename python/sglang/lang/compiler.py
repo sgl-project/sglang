@@ -6,7 +6,7 @@ from typing import List, Union
 from sglang.global_config import global_config
 from sglang.lang.interpreter import ProgramState, StreamExecutor, pin_program
 from sglang.lang.ir import (
-    SamplingParams,
+    SglSamplingParams,
     SglArgument,
     SglConstantText,
     SglExpr,
@@ -140,7 +140,7 @@ class CompiledFunction:
         kwargs = {k: SglArgument(k, v) for k, v in kwargs.items()}
         kwargs.update(self.function.bind_arguments)
 
-        default_sampling_para = SamplingParams(
+        default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
             stop=stop,
             temperature=temperature,
@@ -173,7 +173,7 @@ class CompiledFunction:
 
         backend = backend or global_config.default_backend
 
-        default_sampling_para = SamplingParams(
+        default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
             stop=stop,
             temperature=temperature,

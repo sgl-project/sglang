@@ -13,7 +13,7 @@ REGEX_STRING = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
 
 
 @dataclasses.dataclass
-class SamplingParams:
+class SglSamplingParams:
     max_new_tokens: int = 16
     stop: Union[str, List[str]] = ()
     temperature: float = 1.0
@@ -21,13 +21,14 @@ class SamplingParams:
     top_k: int = -1  # -1 means disable
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
+    ignore_eos: bool = False
 
     # for constrained generation, not included in to_xxx_kwargs
     dtype: Optional[str] = None
     regex: Optional[str] = None
 
     def clone(self):
-        return SamplingParams(
+        return SglSamplingParams(
             self.max_new_tokens,
             self.stop,
             self.temperature,
@@ -67,6 +68,7 @@ class SamplingParams:
             "top_k": self.top_k,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
+            "ignore_eos": self.ignore_eos,
             "regex": self.regex,
         }
 
@@ -98,13 +100,14 @@ class SglFunction:
         top_k: int = -1,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        ignore_eos: bool = False,
         stream: bool = False,
         backend=None,
         **kwargs,
     ):
         from sglang.lang.interpreter import run_program
 
-        default_sampling_para = SamplingParams(
+        default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
             stop=stop,
             temperature=temperature,
@@ -112,9 +115,9 @@ class SglFunction:
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            ignore_eos=ignore_eos,
         )
         backend = backend or global_config.default_backend
-        kwargs = {k: SglArgument(k, v) for k, v in kwargs.items()}
         return run_program(self, backend, args, kwargs, default_sampling_para, stream)
 
     def run_batch(
@@ -128,6 +131,7 @@ class SglFunction:
         top_k: int = -1,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        ignore_eos: bool = False,
         backend=None,
         num_threads: Union[str, int] = "auto",
         progress_bar: bool = False,
@@ -139,7 +143,7 @@ class SglFunction:
             return []
         assert isinstance(batch_kwargs[0], dict)
 
-        default_sampling_para = SamplingParams(
+        default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
             stop=stop,
             temperature=temperature,
@@ -147,11 +151,9 @@ class SglFunction:
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            ignore_eos=ignore_eos,
         )
         backend = backend or global_config.default_backend
-        batch_kwargs = [
-            {k: SglArgument(k, v) for k, v in kwargs.items()} for kwargs in batch_kwargs
-        ]
         return run_program_batch(
             self,
             backend,
@@ -321,12 +323,13 @@ class SglGen(SglExpr):
         top_k,
         frequency_penalty,
         presence_penalty,
+        ignore_eos,
         dtype,
         regex,
     ):
         super().__init__()
         self.name = name
-        self.sampling_params = SamplingParams(
+        self.sampling_params = SglSamplingParams(
             max_new_tokens=max_new_tokens,
             stop=stop,
             temperature=temperature,
@@ -334,6 +337,7 @@ class SglGen(SglExpr):
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            ignore_eos=ignore_eos,
             dtype=dtype,
             regex=regex,
         )
