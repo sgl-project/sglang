@@ -88,7 +88,7 @@ def run_program_batch(
         for arguments in batch_arguments:
             rets.append(
                 run_program(
-                    program, backend, (), arguments, default_sampling_para, False, False
+                    program, backend, (), arguments, default_sampling_para, False, True
                 )
             )
     else:
@@ -107,7 +107,7 @@ def run_program_batch(
                         arguments,
                         default_sampling_para,
                         False,
-                        False,
+                        True,
                     )
                 )
                 if progress_bar:

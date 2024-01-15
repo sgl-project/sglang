@@ -1,0 +1,60 @@
+{"image": "001.jpg", "text": "What is the name of this famous sight in the photo?", "category": "conv", "question_id": 0}
+{"image": "001.jpg", "text": "Describe this photo in detail.", "category": "detail", "question_id": 1}
+{"image": "001.jpg", "text": "What are the possible reasons of the formation of this sight?", "category": "complex", "question_id": 2}
+{"image": "001.jpg", "text": "Compose an engaging travel blog post about a recent trip to this place, highlighting cultural experiences and must-see attractions, including both the attraction seen in the photo and other must-see attractions as well.", "category": "complex", "question_id": 3}
+{"image": "002.jpg", "text": "What type of fruit is this?", "category": "conv", "question_id": 4}
+{"image": "002.jpg", "text": "How many uncut fruits are in the image?", "category": "conv", "question_id": 5}
+{"image": "002.jpg", "text": "Describe this photo in detail.", "category": "detail", "question_id": 6}
+{"image": "002.jpg", "text": "Imagine the fragrance of the fruits in the image. How would you describe this to someone who has never had this fruit before?", "category": "complex", "question_id": 7}
+{"image": "003.jpg", "text": "Describe this photo in detail.", "category": "detail", "question_id": 8}
+{"image": "003.jpg", "text": "What might be the intended effect of this painting?", "category": "complex", "question_id": 9}
+{"image": "003.jpg", "text": "Discuss how this creative twist on a classic work of art might be interpreted differently by various audiences.", "category": "complex", "question_id": 10}
+{"image": "004.jpg", "text": "What is the name of the man in the photo?", "category": "conv", "question_id": 11}
+{"image": "004.jpg", "text": "Which iconic movie scene is being parodied in the meme?", "category": "conv", "question_id": 12}
+{"image": "004.jpg", "text": "How does this meme reflect or comment on Elon Musk's public image, personality, or actions?", "category": "complex", "question_id": 13}
+{"image": "005.jpg", "text": "Please explain the meme in detail.", "category": "detail", "question_id": 14}
+{"image": "005.jpg", "text": "In what other ways might someone express the same sentiment that this meme is expressing?", "category": "complex", "question_id": 15}
+{"image": "006.jpg", "text": "Do you know who paint this?", "category": "conv", "question_id": 16}
+{"image": "006.jpg", "text": "Describe this painting in detail.", "category": "detail", "question_id": 17}
+{"image": "006.jpg", "text": "Discuss the historical impact and the significance of this painting in the art world.", "category": "complex", "question_id": 18}
+{"image": "007.jpg", "text": "Describe this photo in detail.", "category": "detail", "question_id": 19}
+{"image": "007.jpg", "text": "What's the best weather, season, time of the day of visiting this place?  Is the time when this photo was taken a good time to visit this place?", "category": "complex", "question_id": 20}
+{"image": "008.jpg", "text": "What is the name of the character in the image?", "category": "conv", "question_id": 21}
+{"image": "008.jpg", "text": "What's the personality of this character? Explain what elements or aspects of the character's design may have contributed to its popularity.", "category": "complex", "question_id": 22}
+{"image": "009.jpg", "text": "What are the things I should be cautious about when I visit here?", "category": "complex", "question_id": 23}
+{"image": "009.jpg", "text": "If you were a photographer looking to capture this location's essence, what time of day and weather conditions would you choose? Describe the reasons behind your choice.", "category": "complex", "question_id": 24}
+{"image": "010.jpg", "text": "Describe this photo in detail.", "category": "detail", "question_id": 25}
+{"image": "010.jpg", "text": "What is unusual about this image?", "category": "complex", "question_id": 26}
+{"image": "011.jpg", "text": "What fruit is in the left part of the fridge?", "category": "conv", "question_id": 27}
+{"image": "011.jpg", "text": "What is the brand of the yogurt flavored with blueberry?", "category": "conv", "question_id": 28}
+{"image": "011.jpg", "text": "Is there any strawberry-flavored yogurt in the fridge?", "category": "conv", "question_id": 29}
+{"image": "011.jpg", "text": "Describe this photo in detail.", "category": "detail", "question_id": 30}
+{"image": "011.jpg", "text": "What are the meals that I can cook with these?", "category": "complex", "question_id": 31}
+{"image": "012.jpg", "text": "How many coffee mugs are in the set?", "category": "conv", "question_id": 32}
+{"image": "012.jpg", "text": "Write an attractive product description for this.", "category": "complex", "question_id": 33}
+{"image": "013.jpg", "text": "Show the detailed recipe for this dish.", "category": "complex", "question_id": 34}
+{"image": "014.jpg", "text": "Can you explain this meme in detail?", "category": "complex", "question_id": 35}
+{"image": "015.jpg", "text": "What are the two machine learning concepts mentioned in the meme?", "category": "conv", "question_id": 36}
+{"image": "015.jpg", "text": "Give a detailed description of this meme.", "category": "detail", "question_id": 37}
+{"image": "015.jpg", "text": "Can you explain why this is funny. Think about it step-by-step.", "category": "complex", "question_id": 38}
+{"image": "016.jpg", "text": "Give a detailed description of this image.  Describe it panel by panel.", "category": "detail", "question_id": 39}
+{"image": "016.jpg", "text": "What is funny about this image? Describe it panel by panel.", "category": "complex", "question_id": 40}
+{"image": "017.jpg", "text": "What material appears to make up the creature?", "category": "conv", "question_id": 41}
+{"image": "017.jpg", "text": "This is the logo of LLaVA, Large Language and Vision Assistant, based on the LLaMA architecture. Please explain this logo in detail, and how do you think of its design.", "category": "complex", "question_id": 42}
+{"image": "018.jpg", "text": "What are the animals in the painting and what are they doing?", "category": "conv", "question_id": 43}
+{"image": "018.jpg", "text": "Write a fairy tale based on this painting.", "category": "complex", "question_id": 44}
+{"image": "019.jpg", "text": "Describe this sketch in detail.", "category": "detail", "question_id": 45}
+{"image": "019.jpg", "text": "Write brief HTML/JS to turn this mock-up into a colorful website, where the jokes are replaced by two real jokes.", "category": "complex", "question_id": 46}
+{"image": "020.jpg", "text": "Describe this sketch in detail.", "category": "detail", "question_id": 47}
+{"image": "020.jpg", "text": "Write brief HTML/JS to turn this mock-up into a colorful and interactive website, where the joke is replaced by a real joke.", "category": "complex", "question_id": 48}
+{"image": "021.jpg", "text": "What's the ending of this movie?", "category": "conv", "question_id": 49}
+{"image": "021.jpg", "text": "What is the significance of this scene in the context of the movie?", "category": "complex", "question_id": 50}
+{"image": "022.jpg", "text": "What's the name of the restaurant serving these dishes?", "category": "conv", "question_id": 51}
+{"image": "022.jpg", "text": "Describe this photo in detail.", "category": "detail", "question_id": 52}
+{"image": "022.jpg", "text": "If someone were to recommend a new flavor or topping to the dish, describe the reason for this change and how it might alter the overall taste.", "category": "complex", "question_id": 53}
+{"image": "023.jpg", "text": "What brand is featured in this advertisement?", "category": "conv", "question_id": 54}
+{"image": "023.jpg", "text": "Describe this photo in detail.", "category": "detail", "question_id": 55}
+{"image": "023.jpg", "text": "Show me a detailed recipe for cooking this at home.", "category": "complex", "question_id": 56}
+{"image": "024.jpg", "text": "Describe this photo in detail.", "category": "detail", "question_id": 57}
+{"image": "024.jpg", "text": "What is the problem this city might be facing? What are some possible solutions?", "category": "complex", "question_id": 58}
+{"image": "024.jpg", "text": "Explain all the cues that indicate the current traffic conditions.", "category": "complex", "question_id": 59}
