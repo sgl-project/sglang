@@ -17,11 +17,17 @@ from sglang.lang.ir import (
     SglRoleEnd,
     SglSelect,
 )
-from sglang.srt.server import Runtime
 
 
 def function(func: Callable):
     return SglFunction(func)
+
+
+def Runtime(*args, **kwargs):
+    # Avoid importing unnecessary dependency
+    from sglang.srt.server import Runtime
+
+    return Runtime(*args, **kwargs)
 
 
 def set_default_backend(backend: BaseBackend):
