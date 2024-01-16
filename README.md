@@ -36,6 +36,12 @@ pip install -e "python[all]"
 The example below shows how to use sglang to answer a mulit-turn question.
 
 ### Using OpenAI Models
+Set the OpenAI API Key
+```
+export OPENAI_API_KEY=sk-xxxxxx
+```
+
+Then, answer a multi-turn question.
 ```python
 from sglang import function, system, user, assistant, gen, set_default_backend, OpenAI
 
@@ -99,7 +105,7 @@ To begin with, import sglang.
 import sglang as sgl
 ```
 
-`sglang` provides some simple primitives such as `gen`, `select`, `fork`.
+`sglang` provides some simple primitives such as `gen`, `select`, `fork`, `image`.
 You can implement your prompt flow in a function decorated by `sgl.function`.
 You can then invoke the function with `run` or `run_batch`.
 The system will manage the state, chat template, and parallelism for you.
