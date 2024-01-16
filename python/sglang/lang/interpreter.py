@@ -545,9 +545,6 @@ class ProgramState:
     def assistant(self, expr: Optional[SglExpr] = None):
         return self._role_common("assistant", expr)
 
-    def model(self, expr: Optional[SglExpr] = None):
-        return self._role_common("model", expr)
-
     @contextmanager
     def var_scope(self, name: str):
         self.stream_executor.submit(SglVarScopeBegin(name))

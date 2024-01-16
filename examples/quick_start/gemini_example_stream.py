@@ -1,13 +1,13 @@
-from sglang import function, user, model, gen, set_default_backend, Gemini
+from sglang import function, user, assistant, gen, set_default_backend, Gemini
 
 
 @function
 def multi_turn_question(s, question_1, question_2):
     # s += system("You are a helpful assistant.")
     s += user(question_1)
-    s += model(gen("answer_1", max_tokens=256))
+    s += assistant(gen("answer_1", max_tokens=256))
     s += user(question_2)
-    s += model(gen("answer_2", max_tokens=256))
+    s += assistant(gen("answer_2", max_tokens=256))
 
 set_default_backend(Gemini("gemini-pro"))
 

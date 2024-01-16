@@ -158,10 +158,6 @@ def assistant(expr: Optional[SglExpr] = None):
     return _role_common("assistant", expr)
 
 
-def model(expr: Optional[SglExpr] = None):
-    return _role_common("model", expr)
-
-
 def user_begin():
     return SglRoleBegin("user")
 
@@ -176,11 +172,3 @@ def assistant_begin():
 
 def assistant_end():
     return SglRoleEnd("assistant")
-
-
-def model_begin():
-    return SglRoleBegin("model")
-
-
-def model_end():
-    return SglRoleEnd("model")

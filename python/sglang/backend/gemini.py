@@ -36,7 +36,7 @@ class Gemini(BaseBackend):
 
         self.name = "gemini"
         self.model_name = model_name
-        self.chat_template = get_chat_template("gemini")
+        self.chat_template = get_chat_template("default")
 
     def get_chat_template(self):
         return self.chat_template
