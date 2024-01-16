@@ -209,7 +209,7 @@ def load_image(image_file):
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
-        image_file = image_url.split(",")[1]
+        image_file = image_file.split(",")[1]
         image = Image.open(BytesIO(base64.b64decode(image_file)))
     else:
         image = Image.open(BytesIO(base64.b64decode(image_file)))
