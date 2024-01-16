@@ -32,6 +32,10 @@ pip install --upgrade pip
 pip install -e "python[all]"
 ```
 
+### Notes
+- If you are using older GPUs (NVIDIA T4, V100), please use `pip install "triton>=2.2.0"` to avoid some bugs in the Triton.
+- If you only need to use the OpenAI backend, you can avoid installing other dependency by using `pip install sglang[openai]`
+
 ## Quick Start
 The example below shows how to use sglang to answer a mulit-turn question.
 
