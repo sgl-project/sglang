@@ -36,6 +36,11 @@ pip install -e "python[all]"
 The example below shows how to use sglang to answer a mulit-turn question.
 
 ### Using OpenAI Models
+Set your OpenAI API Key.
+```
+export OPENAI_API_KEY=sk-xxxxxx
+```
+
 ```python
 from sglang import function, system, user, assistant, gen, set_default_backend, OpenAI
 
