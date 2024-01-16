@@ -225,6 +225,10 @@ curl http://localhost:30000/v1/completions \
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --tp 2
 ```
+- If you see out-of-memory errors during serving, please try to reduce the memory usage of KV cache pool by setting a smaller value of `--mem-fraction-static`. The default value is `0.9`.
+```
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --mem-fraction-static 0.7
+```
 
 ### Supported Models
 - Llama
