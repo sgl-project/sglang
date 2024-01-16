@@ -57,6 +57,8 @@ def main(args):
             out = model + context + select(choices, name="answer")
             return choices.index(out["answer"])
 
+        call_select("Hello,", ["world", "earth"])
+
     elif args.backend == "lmql":
         import lmql
         model = lmql.model("meta-llama/Llama-2-7b-chat-hf",
@@ -135,6 +137,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-shot", type=int, default=20)
     parser.add_argument("--data-path", type=str, default="hellaswag_val.jsonl")
-    parser.add_argument("--num-questions", type=int, default=100)
+    parser.add_argument("--num-questions", type=int, default=200)
     args = add_common_other_args_and_parse(parser)
     main(args)

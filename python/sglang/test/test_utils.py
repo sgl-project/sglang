@@ -99,7 +99,7 @@ def call_select_vllm(context, choices, url):
         }
         res = requests.post(url, json=data)
         assert res.status_code == 200
-        scores.append(res.json()["prompt_score"])
+        scores.append(res.json().get("prompt_score", 0))
     return np.argmax(scores)
 
     """
@@ -112,7 +112,7 @@ def call_select_vllm(context, choices, url):
 
 
 def add_common_other_args_and_parse(parser):
-    parser.add_argument("--parallel", type=int, default=96)
+    parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument(

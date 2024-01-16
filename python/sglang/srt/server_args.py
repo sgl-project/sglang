@@ -93,7 +93,8 @@ class ServerArgs:
             type=str,
             default=[],
             nargs="+",
-            help="Model mode: [flashinfer, no-cache, aggressive-new-fill]",
+            choices=["flashinfer", "no-cache"],
+            help="Model mode: [flashinfer, no-cache]",
         )
         parser.add_argument(
             "--schedule-heuristic",

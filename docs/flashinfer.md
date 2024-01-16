@@ -1,17 +1,20 @@
 ## Flashinfer Mode
 
-[`flashinfer`](https://github.com/flashinfer-ai/flashinfer) is a kernel library for LLM serving; we use it here to support our attention computation.
+[flashinfer](https://github.com/flashinfer-ai/flashinfer) is a kernel library for LLM serving.
+It can be used in SGLang runtime to accelerate attention computation.
 
 ### Install flashinfer
+
+Note: The compilation can take a very long time.
 
 ```bash
 git submodule update --init --recursive
 pip install 3rdparty/flashinfer/python
 ```
 
-### Run Sever With Flashinfer Mode
+### Run a Server With Flashinfer Mode
 
-Add through `--model_mode` argument from the command line.
+Add `--model-mode flashinfer` argument to enable flashinfer when launching a server.
 
 Example:
 
