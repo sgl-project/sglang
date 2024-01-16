@@ -9,7 +9,11 @@ from sglang.lang.ir import SamplingParams
 
 try:
     import vertexai
-    from vertexai.preview.generative_models import GenerativeModel, GenerationConfig
+    from vertexai.preview.generative_models import (
+        GenerationConfig,
+        GenerativeModel,
+        Image,
+    )
 except ImportError as e:
     GenerativeModel = e
 
@@ -32,9 +36,9 @@ class Gemini(BaseBackend):
         location = "us-central1"
         vertexai.init(project=project_id, location=location)
 
+        self.name = "gemini"
         self.model_name = model_name
         self.chat_template = get_chat_template("gemini")
-        # self.chat = GenerativeModel(model_name).start_chat()
 
     def get_chat_template(self):
         return self.chat_template
@@ -44,13 +48,17 @@ class Gemini(BaseBackend):
         s: StreamExecutor,
         sampling_params: SamplingParams,
     ):
-        if self.model_name in ["gemini-pro"]:
-            prompt = s.text_
-        elif self.model_name in ["gemini-pro-vision"]:
-            # TODO: add image support
-            prompt = s.text_
+        if s.messages_:
+            prompt = s.messages_
+        else:
+            # single-turn
+            prompt = (
+                self.to_gemini_input(s.text_, s.cur_images) if s.cur_images else s.text_
+            )
+        # print("prompt:", prompt)
         ret = GenerativeModel(self.model_name).generate_content(
-            prompt, generation_config=GenerationConfig(**sampling_params.to_gemini_kwargs())
+            prompt,
+            generation_config=GenerationConfig(**sampling_params.to_gemini_kwargs()),
         )
 
         comp = ret.text
@@ -62,11 +70,13 @@ class Gemini(BaseBackend):
         s: StreamExecutor,
         sampling_params: SamplingParams,
     ):
-        if self.model_name in ["gemini-pro"]:
-            prompt = s.text_
-        elif self.model_name in ["gemini-pro-vision"]:
-            # TODO: add image support
-            prompt = s.text_
+        if s.messages_:
+            prompt = s.messages_
+        else:
+            # single-turn
+            prompt = (
+                self.to_gemini_input(s.text_, s.cur_images) if s.cur_images else s.text_
+            )
         generator = GenerativeModel(self.model_name).generate_content(
             prompt,
             stream=True,
@@ -74,3 +84,17 @@ class Gemini(BaseBackend):
         )
         for ret in generator:
             yield ret.text, {}
+
+    def to_gemini_input(self, text, images):
+        input = []
+        # split with image token
+        text_segs = text.split(self.chat_template.image_token)
+        for image_path, image_base64_data in images:
+            text_seg = text_segs.pop(0)
+            if text_seg != "":
+                input.append(text_seg)
+            input.append(Image.from_bytes(image_base64_data))
+        text_seg = text_segs.pop(0)
+        if text_seg != "":
+            input.append(text_seg)
+        return input

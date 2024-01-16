@@ -48,7 +48,7 @@ class SglSamplingParams:
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
         }
-    
+
     def to_gemini_kwargs(self):
         return {
             "candidate_count": 1,
