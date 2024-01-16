@@ -94,25 +94,99 @@ You can find more examples at [examples/quick_start](examples/quick_start).
 
 ## Frontend: Structured Generation Langauge (SGLang)
 
+To begin with, import sglang.
+```python
+import sglang as sgl
+```
+
+`sglang` provides some simple primitives such as `gen`, `select`, `fork`.
+You can implement your prompt flow in a function decorated by `sgl.function`.
+You can then invoke the function with `run` or `run_batch`.
+The system will manage the state, chat template, and parallelism for you.
+
 ### Control Flow
+```python
+@sgl.function
+def control_flow(s, question):
+    s += "To answer this question: " + question + ", "
+    s += "I need to use a " + sgl.gen("tool", choices=["calculator", "web browser"]) + ". "
+
+    # You can use if or nested function calls
+    if s["tool"] == "calculator":
+        s += "The math expression is" + sgl.gen("expression")
+    elif s["tool"] == "web browser":
+        s += "The website url is" + sgl.gen("url")
+```
 
 ### Parallelism
+```python
+@sgl.function
+def tip_suggestion(s):
+    s += (
+        "Here are two tips for staying healthy: "
+        "1. Balanced Diet. 2. Regular Exercise.\n\n"
+    )
+
+    forks = s.fork(2)  # Launch parallel prompts
+    for i, f in enumerate(forks):
+        f += f"Now, expand tip {i+1} into a paragraph:\n"
+        f += sgl.gen(f"detailed_tip", max_tokens=256, stop="\n\n")
+
+    s += "Tip 1:" + forks[0]["detailed_tip"] + "\n"
+    s += "Tip 2:" + forks[1]["detailed_tip"] + "\n"
+    s += "In summary" + sgl.gen("summary")
+```
 
 ### Multi Modality
 ```python
 @sgl.function
 def image_qa(s, image_file, question):
     s += sgl.user(sgl.image(image_file) + question)
-    s += sgl.assistant(sgl.gen("answer_1", max_tokens=256))
+    s += sgl.assistant(sgl.gen("answer", max_tokens=256)
 ```
 
-### Constrained decoding
+### Constrained Decoding
+```python
+@function
+def regular_expression_gen(s):
+    s += "Q: What is the IP address of the Google DNS servers?\n"
+    s += "A: " + gen(
+        "answer",
+        temperature=0,
+        regex=r"((25[0-5]|2[0-4]\d|[01]?\d\d?).){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)",
+    )
+```
 
 ### Batching
+```python
+@sgl.function
+def text_qa(s, question):
+    s += "Q: " + question + "\n"
+    s += "A:" + sgl.gen("answer", stop="\n")
+
+states = text_qa.run_batch(
+    [
+        {"question": "What is the capital of the United Kingdom?"},
+        {"question": "What is the capital of France?"},
+        {"question": "What is the capital of Japan?"},
+    ],
+)
+```
 
 ### Streaming
+```python
+@sgl.function
+def text_qa(s, question):
+    s += "Q: " + question + "\n"
+    s += "A:" + sgl.gen("answer", stop="\n")
 
-### Other Backends
+states = text_qa.run(
+    question="What is the capital of France?",
+    temperature=0.1)
+
+for out in state.text_iter():
+    print(out, end="", flush=True)
+```
 
 ## Backend: SGLang Runtime (SRT)
 The SGLang Runtime (SRT) is designed to work best with the SGLang frontend.
@@ -150,6 +224,14 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
   - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --port 30000`
 
 ## Benchmark And Performance
+
+- Llama-7B on NVIDIA A10G, FP16, Tensor Parallelism=1
+![llama_7b](assets/llama_7b.jpg)
+
+- Mixtral-8x7B on NVIDIA A10G, FP16, Tensor Parallelism=8
+![mixtral_8x7b](assets/mixtral_8x7b.jpg)
+
+Learn more [here]().
 
 ## Roadmap
 - [ ] Function call
