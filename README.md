@@ -32,6 +32,10 @@ pip install --upgrade pip
 pip install -e "python[all]"
 ```
 
+### Notes
+- If you are using older GPUs (NVIDIA T4, V100), please use `pip install "triton>=2.2.0"` to avoid some bugs in the triton compiler
+- If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install sglang[openai]`
+
 ## Quick Start
 The example below shows how to use sglang to answer a mulit-turn question.
 
@@ -197,7 +201,7 @@ for out in state.text_iter():
 ## Backend: SGLang Runtime (SRT)
 The SGLang Runtime (SRT) is designed to work best with the SGLang frontend.
 However, it can also be used as a standalone API server.
-In this case, the [RadixAttention](https://arxiv.org/abs/2312.07104) can still greatly accelerate many use cases.
+In this case, the [RadixAttention](https://arxiv.org/abs/2312.07104) can still greatly accelerate many use cases with automatic KV cache reuse.
 
 ### Usage
 Launch a server
@@ -220,6 +224,10 @@ curl http://localhost:30000/v1/completions \
 - Add `--tp 2` to enable tensor parallelism.
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --tp 2
+```
+- If you see out-of-memory errors during serving, please try to reduce the memory usage of the KV cache pool by setting a smaller value of `--mem-fraction-static`. The default value is `0.9`
+```
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --mem-fraction-static 0.7
 ```
 
 ### Supported Models

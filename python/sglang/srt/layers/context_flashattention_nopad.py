@@ -6,6 +6,9 @@ import triton.language as tl
 from sglang.srt.utils import wrap_kernel_launcher
 
 
+CUDA_CAPABILITY = torch.cuda.get_device_capability()
+
+
 @triton.jit
 def _fwd_kernel(
     Q,
@@ -120,7 +123,11 @@ cached_kernel = None
 
 
 def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
-    BLOCK = 128
+    if CUDA_CAPABILITY[0] >= 8:
+        BLOCK = 128
+    else:
+        BLOCK = 64
+
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64, 128}
