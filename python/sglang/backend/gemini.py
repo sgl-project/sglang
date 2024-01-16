@@ -53,7 +53,6 @@ class Gemini(BaseBackend):
             prompt = (
                 self.to_gemini_input(s.text_, s.cur_images) if s.cur_images else s.text_
             )
-        # print("prompt:", prompt)
         ret = GenerativeModel(self.model_name).generate_content(
             prompt,
             generation_config=GenerationConfig(**sampling_params.to_gemini_kwargs()),

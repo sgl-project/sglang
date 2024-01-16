@@ -5,8 +5,6 @@ from sglang import function, user, assistant, gen, image, set_default_backend, G
 def image_qa(s, image_file1, image_file2, question):
     s += user(image(image_file1) + image(image_file2) + question)
     s += assistant(gen("answer_1", max_tokens=256))
-    # s += image(image_file1) + image(image_file2) + question
-    # s += gen("answer_1", max_tokens=256)
 
 set_default_backend(Gemini("gemini-pro-vision"))
 

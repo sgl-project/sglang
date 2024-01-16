@@ -56,7 +56,7 @@ class SglSamplingParams:
             "stop_sequences": self.stop,
             "temperature": self.temperature,
             "top_p": self.top_p,
-            "top_k": 1,
+            "top_k": self.top_k if self.top_k > 0 else None,
         }
 
     def to_anthropic_kwargs(self):
