@@ -5,6 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple, Union
+import warnings
 
 import numpy as np
 import rpyc
@@ -164,7 +165,7 @@ class ModelRpcServer(rpyc.Service):
                     + self.tree_cache.evictable_size()
                 )
                 if available_size != self.max_total_num_token:
-                    logger.warning(
+                    warnings.warn(
                         "Warning: "
                         f"available_size={available_size}, max_total_num_token={self.max_total_num_token}\n"
                         "KV cache pool leak detected!"
