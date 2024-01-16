@@ -197,7 +197,7 @@ for out in state.text_iter():
 ## Backend: SGLang Runtime (SRT)
 The SGLang Runtime (SRT) is designed to work best with the SGLang frontend.
 However, it can also be used as a standalone API server.
-In this case, the RadixAttention can still greatly accelerate many use cases.
+In this case, the [RadixAttention](https://arxiv.org/abs/2312.07104) can still greatly accelerate many use cases.
 
 ### Usage
 Launch a server
