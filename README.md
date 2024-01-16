@@ -221,7 +221,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 - Mixtral-8x7B on NVIDIA A10G, FP16, Tensor Parallelism=8
 ![mixtral_8x7b](assets/mixtral_8x7b.jpg)
 
-Learn more [here](http://ec2-35-90-245-251.us-west-2.compute.amazonaws.com:3000/blog/2024-01-16-sglang/#benchmark).
+Learn more [here]().
 
 ## Roadmap
 - [ ] Function call
