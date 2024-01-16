@@ -82,9 +82,10 @@ Action 3: Finish[yes]
 """ + question)
     for i in range(1, len(triplets) + 2):
         s += "Thought " + str(i) + ":"
+        # NOTE: This is an implementation for replaying a given trace for benchmark purposes. It is not an actual ReAct agent implementation.
         ss = s.fork(1)
         ss[0] += sgl.gen(name="thought_action", max_tokens=200, stop="Observation")
-        # ss.join()
+        ss.join()
         # to verify the correctness of output, this should be collected
         # print(ss[0]["thought_action"])
         if i > len(triplets):

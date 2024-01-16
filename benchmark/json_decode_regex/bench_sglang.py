@@ -64,8 +64,6 @@ def main(args):
     # Run requests
     tic = time.time()
     states = json_decode.run_batch(arguments, temperature=0, num_threads=args.parallel)
-    for state in states:
-        state.sync()
     latency = time.time() - tic
 
     # Compute accuracy
@@ -80,7 +78,7 @@ def main(args):
 
     with open(args.result_file, "a") as fout:
         value = {
-            "task": "json_regex_decode",
+            "task": "json_decode_regex",
             "backend": args.backend,
             "num_gpus": 1,
             "latency": round(latency, 3),

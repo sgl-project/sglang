@@ -5,13 +5,15 @@ wget https://raw.githubusercontent.com/openai/grade-school-math/master/grade_sch
 
 ## Run benchmark
 
+NOTE: This is an implementation for throughput/latency benchmark purposes. The prompts are not tuned to achieve good accuracy on the GSM-8K tasks.
+
 ### Benchmark sglang
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 ```
 
 ```
-python3 bench_sglang.py --num-questions 32 --parallel 8
+python3 bench_sglang.py --num-questions 32
 python3 bench_sglang.py --num-questions 16 --parallel 1
 ```
 

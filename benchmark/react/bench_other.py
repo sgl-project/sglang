@@ -124,6 +124,9 @@ def main(args):
             ))
             return out["result"]
 
+        # warmup
+        call_generate("Hello,", 1.0, 8, ".")
+
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 

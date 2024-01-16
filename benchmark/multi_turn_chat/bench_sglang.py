@@ -21,8 +21,6 @@ def multi_turns(s, qas):
 
 
 def main(args):
-    print(args)
-
     tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=args.trust_remote_code)
 
     multi_qas = gen_arguments(args, tokenizer)
@@ -33,8 +31,6 @@ def main(args):
     states = multi_turns.run_batch(
         multi_qas, temperature=0, backend=backend, num_threads=args.parallel
     )
-    for state in states:
-        state.sync()
     latency = time.time() - tic
 
     print(f"Latency: {latency:.3f}")
@@ -43,7 +39,7 @@ def main(args):
 
     with open(args.result_file, "a") as fout:
         value = {
-            "task": "multi_turns",
+            "task": "multi_turn_chat",
             "backend": args.backend,
             "num_gpus": 1,
             "latency": round(latency, 3),
@@ -74,4 +70,6 @@ if __name__ == "__main__":
         args.min_len_a = 256
         args.max_len_a = 512
         args.num_qa = 20
+
+    print(args)
     main(args)

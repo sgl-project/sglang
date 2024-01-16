@@ -91,6 +91,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-shot", type=int, default=20)
     parser.add_argument("--data-path", type=str, default="hellaswag_val.jsonl")
-    parser.add_argument("--num-questions", type=int, default=100)
+    parser.add_argument("--num-questions", type=int, default=200)
     args = add_common_sglang_args_and_parse(parser)
     main(args)
