@@ -2,6 +2,10 @@ import torch
 import triton
 import triton.language as tl
 from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
+from sglang.srt.utils import wrap_kernel_launcher
+
+
+CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
 @triton.jit
@@ -153,6 +157,9 @@ def _fwd_kernel(
     tl.store(O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None])
 
 
+cached_kernel = None
+
+
 def extend_attention_fwd(
     q_extend,
     k_extend,
@@ -175,7 +182,11 @@ def extend_attention_fwd(
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
-    BLOCK_M, BLOCK_N = 128, 128
+    if CUDA_CAPABILITY[0] >= 8:
+        BLOCK_M, BLOCK_N = 128, 128
+    else:
+        BLOCK_M, BLOCK_N = 64, 64
+
     Lq, Lk, Lv, Lo = (
         q_extend.shape[-1],
         k_extend.shape[-1],
@@ -192,6 +203,40 @@ def extend_attention_fwd(
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_warps = 4 if Lk <= 64 else 8
     num_stages = 1
+
+    global cached_kernel
+    if cached_kernel:
+        cached_kernel(
+            grid,
+            num_warps,
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            req_to_tokens,
+            b_req_idx,
+            b_seq_len,
+            b_start_loc_extend,
+            b_seq_len_extend,
+            sm_scale,
+            kv_group_num,
+            q_extend.stride(0),
+            q_extend.stride(1),
+            k_extend.stride(0),
+            k_extend.stride(1),
+            v_extend.stride(0),
+            v_extend.stride(1),
+            o_extend.stride(0),
+            o_extend.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(0),
+            v_buffer.stride(1),
+            req_to_tokens.stride(0),
+        )
+        return
 
     _fwd_kernel[grid](
         q_extend,
@@ -226,6 +271,7 @@ def extend_attention_fwd(
         num_warps=num_warps,
         num_stages=num_stages,
     )
+    cached_kernel = wrap_kernel_launcher(_fwd_kernel)
 
 
 def redundant_attention(
