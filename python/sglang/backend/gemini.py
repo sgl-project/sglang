@@ -5,7 +5,7 @@ import numpy as np
 from sglang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template
 from sglang.lang.interpreter import StreamExecutor
-from sglang.lang.ir import SamplingParams
+from sglang.lang.ir import SglSamplingParams
 
 try:
     import vertexai
@@ -30,10 +30,8 @@ class Gemini(BaseBackend):
         if isinstance(GenerativeModel, Exception):
             raise GenerativeModel
 
-        # project_id = os.environ["GCP_PROJECT_ID"]
-        # location = os.environ["GCP_LOCATION"]
-        project_id = "alpa-373720"
-        location = "us-central1"
+        project_id = os.environ["GCP_PROJECT_ID"]
+        location = os.environ["GCP_LOCATION"]
         vertexai.init(project=project_id, location=location)
 
         self.name = "gemini"
@@ -46,7 +44,7 @@ class Gemini(BaseBackend):
     def generate(
         self,
         s: StreamExecutor,
-        sampling_params: SamplingParams,
+        sampling_params: SglSamplingParams,
     ):
         if s.messages_:
             prompt = s.messages_
@@ -68,7 +66,7 @@ class Gemini(BaseBackend):
     def generate_stream(
         self,
         s: StreamExecutor,
-        sampling_params: SamplingParams,
+        sampling_params: SglSamplingParams,
     ):
         if s.messages_:
             prompt = s.messages_
