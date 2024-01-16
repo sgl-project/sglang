@@ -23,7 +23,7 @@ def stream_a_variable():
 
     for out in state.text_iter(var_name="answer_2"):
         print(out, end="", flush=True)
-    print()
+    print("\n")
 
 
 async def async_stream():
@@ -35,7 +35,7 @@ async def async_stream():
 
     async for out in state.text_async_iter(var_name="answer_2"):
         print(out, end="", flush=True)
-    print()
+    print("\n")
 
 
 if __name__ == "__main__":
