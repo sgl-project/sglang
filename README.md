@@ -41,6 +41,7 @@ Set your OpenAI API Key.
 export OPENAI_API_KEY=sk-xxxxxx
 ```
 
+Run the code.
 ```python
 from sglang import function, system, user, assistant, gen, set_default_backend, OpenAI
 
