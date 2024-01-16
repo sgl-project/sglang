@@ -153,10 +153,10 @@ def image_qa(s, image_file, question):
 
 ### Constrained Decoding
 ```python
-@function
+@sgl.function
 def regular_expression_gen(s):
     s += "Q: What is the IP address of the Google DNS servers?\n"
-    s += "A: " + gen(
+    s += "A: " + sgl.gen(
         "answer",
         temperature=0,
         regex=r"((25[0-5]|2[0-4]\d|[01]?\d\d?).){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)",
@@ -197,7 +197,7 @@ for out in state.text_iter():
 ## Backend: SGLang Runtime (SRT)
 The SGLang Runtime (SRT) is designed to work best with the SGLang frontend.
 However, it can also be used as a standalone API server.
-In this case, the RadixAttention can still greatly accelerate many use cases.
+In this case, the [RadixAttention](https://arxiv.org/abs/2312.07104) can still greatly accelerate many use cases.
 
 ### Usage
 Launch a server
@@ -237,7 +237,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 - Mixtral-8x7B on NVIDIA A10G, FP16, Tensor Parallelism=8
 ![mixtral_8x7b](assets/mixtral_8x7b.jpg)
 
-Learn more [here]().
+Learn more [here](docs/benchmark_results.md).
 
 ## Roadmap
 - [ ] Function call
