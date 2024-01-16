@@ -12,7 +12,6 @@ def multi_turn_question(s, question_1, question_2):
 
 
 sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo"))
-#sgl.set_default_backend(sgl.RuntimeEndpoint("http://localhost:30000"))
 
 
 def stream_a_variable():
@@ -24,7 +23,7 @@ def stream_a_variable():
 
     for out in state.text_iter(var_name="answer_2"):
         print(out, end="", flush=True)
-    print()
+    print("\n")
 
 
 async def async_stream():
@@ -36,9 +35,9 @@ async def async_stream():
 
     async for out in state.text_async_iter(var_name="answer_2"):
         print(out, end="", flush=True)
-    print()
+    print("\n")
 
 
 if __name__ == "__main__":
-    #stream_a_variable()
+    stream_a_variable()
     asyncio.run(async_stream())
