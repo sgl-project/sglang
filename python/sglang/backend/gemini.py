@@ -1,4 +1,5 @@
 import os
+import warnings
 from typing import List, Optional, Union
 
 import numpy as np
@@ -103,19 +104,35 @@ class Gemini(BaseBackend):
         gemini_message = []
         # from openai message format to gemini message format
         for msg in messages:
+            if isinstance(msg["content"], str):
+                text = msg["content"]
+            else:
+                text = msg["content"][0]["text"]
+
+            if msg["role"] == "system":
+                warnings.warn("Warning: system prompt is not supported in Gemini.")
+                gemini_message.append({
+                    "role": "user",
+                    "parts": [{"text": "System prompt: " + text}],
+                })
+                gemini_message.append({
+                    "role": "model",
+                    "parts": [{"text": "Understood."}],
+                })
+                continue
             if msg["role"] == "user":
                 gemini_msg = {
                     "role": "user",
-                    "parts": [{"text": msg["content"][0]["text"]}],
+                    "parts": [{"text": text}],
                 }
             elif msg["role"] == "assistant":
                 gemini_msg = {
                     "role": "model",
-                    "parts": [{"text": msg["content"][0]["text"]}],
+                    "parts": [{"text": text}],
                 }
 
             # images
-            if len(msg["content"]) > 1:
+            if isinstance(msg["content"], list) and len(msg["content"]) > 1:
                 for image in msg["content"][1:]:
                     assert image["type"] == "image_url"
                     gemini_msg["parts"].append(
