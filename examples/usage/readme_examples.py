@@ -53,6 +53,7 @@ def driver_batching():
             {"question": "What is the capital of France?"},
             {"question": "What is the capital of Japan?"},
         ],
+        progress_bar=True
     )
 
     for s in states:
@@ -63,7 +64,9 @@ def driver_batching():
 def driver_stream():
     state = text_qa.run(
         question="What is the capital of France?",
-        temperature=0.1)
+        temperature=0.1,
+        stream=True
+    )
 
     for out in state.text_iter():
         print(out, end="", flush=True)
