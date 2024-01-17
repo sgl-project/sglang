@@ -5,7 +5,6 @@ import triton
 import triton.language as tl
 from sglang.srt.utils import wrap_kernel_launcher
 
-
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 

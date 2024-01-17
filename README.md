@@ -115,7 +115,8 @@ You can then invoke the function with `run` or `run_batch`.
 The system will manage the state, chat template, and parallelism for you.
 
 ### Control Flow
-You can use any python code with in the function body, including control flow, nested function calls, and external libraries.
+You can use any Python code within the function body, including control flow, nested function calls, and external libraries.
+
 ```python
 @sgl.function
 def control_flow(s, question):
@@ -129,7 +130,7 @@ def control_flow(s, question):
 ```
 
 ### Parallelism
-You can use `fork` to launch parallel prompts.
+Use `fork` to launch parallel prompts.
 Because `sgl.gen` is non-blocking, the for loop below issues two generation calls in parallel.
 
 ```python
@@ -151,7 +152,7 @@ def tip_suggestion(s):
 ```
 
 ### Multi Modality
-You can use `sgl.image` to pass an image as input.
+Use `sgl.image` to pass an image as input.
 
 ```python
 @sgl.function
@@ -161,7 +162,7 @@ def image_qa(s, image_file, question):
 ```
 
 ### Constrained Decoding
-You can use `regex=` to specify a regular expression as a decoding constraint.
+Use `regex=` to specify a regular expression as a decoding constraint.
 
 ```python
 @sgl.function
@@ -175,7 +176,7 @@ def regular_expression_gen(s):
 ```
 
 ### Batching
-You can use `run_batch` to run a batch of requests with continuous batching.
+Use `run_batch` to run a batch of requests with continuous batching.
 
 ```python
 @sgl.function
@@ -184,12 +185,12 @@ def text_qa(s, question):
     s += "A:" + sgl.gen("answer", stop="\n")
 
 states = text_qa.run_batch(
-	[
-		{"question": "What is the capital of the United Kingdom?"},
-		{"question": "What is the capital of France?"},
-		{"question": "What is the capital of Japan?"},
-	],
-	progress_bar=True
+    [
+        {"question": "What is the capital of the United Kingdom?"},
+        {"question": "What is the capital of France?"},
+        {"question": "What is the capital of Japan?"},
+    ],
+    progress_bar=True
 )
 ```
 
@@ -205,7 +206,7 @@ def text_qa(s, question):
 states = text_qa.run(
     question="What is the capital of France?",
     temperature=0.1,
-	stream=True
+    stream=True
 )
 
 for out in state.text_iter():
