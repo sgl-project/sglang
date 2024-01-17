@@ -26,10 +26,14 @@ class ServerArgs:
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
         if self.mem_fraction_static is None:
-            if self.tp_size > 1:
-                self.mem_fraction_static = 0.8
+            if self.tp_size >= 8:
+                self.mem_fraction_static = 0.80
+            elif self.tp_size >= 4:
+                self.mem_fraction_static = 0.85
+            elif self.tp_size >= 2:
+                self.mem_fraction_static = 0.85
             else:
-                self.mem_fraction_static = 0.9
+                self.mem_fraction_static = 0.90
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
