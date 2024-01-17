@@ -278,7 +278,7 @@ class ModelRunner:
                 load_format=self.load_format,
                 revision=None,
             )
-        self.model = model
+        self.model = model.eval()
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(
