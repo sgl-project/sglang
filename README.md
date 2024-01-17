@@ -1,5 +1,5 @@
 # SGLang
-| [Blog](https://lmsys.org/blog/2024-01-17-sglang/) | [Paper](https://arxiv.org/abs/2312.07104) |
+| [**Blog**](https://lmsys.org/blog/2024-01-17-sglang/) | [**Paper**](https://arxiv.org/abs/2312.07104) |
 
 SGLang is a structured generation language designed for large language models (LLMs).
 It makes your interaction with LLMs faster and more controllable by co-designing the frontend language and the runtime system.
@@ -43,7 +43,7 @@ The example below shows how to use sglang to answer a mulit-turn question.
 ### Using OpenAI Models
 Set the OpenAI API Key
 ```
-export OPENAI_API_KEY=sk-xxxxxx
+export OPENAI_API_KEY=sk-******
 ```
 
 Then, answer a multi-turn question.
@@ -101,6 +101,7 @@ for m in state.messages():
 
 ### More Examples
 
+We also support Anthropic and VertexAI (Gemini) backend.
 You can find more examples at [examples/quick_start](examples/quick_start).
 
 ## Frontend: Structured Generation Langauge (SGLang)

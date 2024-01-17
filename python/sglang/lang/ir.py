@@ -2,6 +2,7 @@
 
 import dataclasses
 import inspect
+import warnings
 from typing import List, Optional, Union
 
 from sglang.global_config import global_config
@@ -40,6 +41,8 @@ class SglSamplingParams:
 
     def to_openai_kwargs(self):
         # OpenAI does not support top_k, so we drop it here
+        if self.regex is not None:
+            warnings.warn("Regular expression is not supported in the OpenAI backend.")
         return {
             "max_tokens": self.max_new_tokens,
             "stop": self.stop or None,
@@ -49,7 +52,9 @@ class SglSamplingParams:
             "presence_penalty": self.presence_penalty,
         }
 
-    def to_gemini_kwargs(self):
+    def to_vertexai_kwargs(self):
+        if self.regex is not None:
+            warnings.warn("Regular expression is not supported in the VertexAI backend.")
         return {
             "candidate_count": 1,
             "max_output_tokens": self.max_new_tokens,
@@ -61,6 +66,8 @@ class SglSamplingParams:
 
     def to_anthropic_kwargs(self):
         # Anthropic does not support frequency_penalty or presence_penalty, so we drop it here
+        if self.regex is not None:
+            warnings.warn("Regular expression is not supported in the Anthropic backend.")
         return {
             "max_tokens_to_sample": self.max_new_tokens,
             "stop_sequences": self.stop,
