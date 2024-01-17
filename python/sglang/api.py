@@ -4,7 +4,7 @@ from typing import Callable, List, Optional, Union
 
 from sglang.backend.anthropic import Anthropic
 from sglang.backend.base_backend import BaseBackend
-from sglang.backend.gemini import Gemini
+from sglang.backend.vertexai import VertexAI
 from sglang.backend.openai import OpenAI
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.global_config import global_config
