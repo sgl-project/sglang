@@ -304,7 +304,10 @@ def test_image_qa():
         temperature=0,
         max_new_tokens=64,
     )
-    assert "taxi" in state.messages()[-1]["content"] or "car" in state.messages()[-1]["content"]
+    assert (
+        "taxi" in state.messages()[-1]["content"]
+        or "car" in state.messages()[-1]["content"]
+    )
 
 
 def test_stream():

@@ -111,14 +111,18 @@ class Gemini(BaseBackend):
 
             if msg["role"] == "system":
                 warnings.warn("Warning: system prompt is not supported in Gemini.")
-                gemini_message.append({
-                    "role": "user",
-                    "parts": [{"text": "System prompt: " + text}],
-                })
-                gemini_message.append({
-                    "role": "model",
-                    "parts": [{"text": "Understood."}],
-                })
+                gemini_message.append(
+                    {
+                        "role": "user",
+                        "parts": [{"text": "System prompt: " + text}],
+                    }
+                )
+                gemini_message.append(
+                    {
+                        "role": "model",
+                        "parts": [{"text": "Understood."}],
+                    }
+                )
                 continue
             if msg["role"] == "user":
                 gemini_msg = {
