@@ -1,4 +1,4 @@
-from sglang import function, user, assistant, gen, set_default_backend, Gemini
+from sglang import function, user, assistant, gen, set_default_backend, VertexAI
 
 
 @function
@@ -8,7 +8,7 @@ def multi_turn_question(s, question_1, question_2):
     s += user(question_2)
     s += assistant(gen("answer_2", max_tokens=256))
 
-set_default_backend(Gemini("gemini-pro"))
+set_default_backend(VertexAI("gemini-pro"))
 
 state = multi_turn_question.run(
     question_1="What is the capital of the United States?",

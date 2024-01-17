@@ -17,6 +17,7 @@ class ServerArgs:
     model_mode: List[str] = ()
     schedule_heuristic: str = "lpm"
     random_seed: int = 42
+    stream_interval: int = 2
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     log_level: str = "info"
@@ -107,6 +108,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.random_seed,
             help="Random seed.",
+        )
+        parser.add_argument(
+            "--stream-interval",
+            type=int,
+            default=ServerArgs.random_seed,
+            help="The interval in terms of token length for streaming",
         )
         parser.add_argument(
             "--log-level",

@@ -10,10 +10,10 @@ from sglang.test.test_programs import (
     test_stream,
 )
 
-from sglang import Gemini, set_default_backend
+from sglang import VertexAI, set_default_backend
 
 
-class TestGeminiBackend(unittest.TestCase):
+class TestVertexAIBackend(unittest.TestCase):
     backend = None
     chat_backend = None
     chat_vision_backend = None
@@ -22,9 +22,9 @@ class TestGeminiBackend(unittest.TestCase):
         cls = type(self)
 
         if cls.backend is None:
-            cls.backend = Gemini("gemini-pro")
-            cls.chat_backend = Gemini("gemini-pro")
-            cls.chat_vision_backend = Gemini("gemini-pro-vision")
+            cls.backend = VertexAI("gemini-pro")
+            cls.chat_backend = VertexAI("gemini-pro")
+            cls.chat_vision_backend = VertexAI("gemini-pro-vision")
 
     def test_few_shot_qa(self):
         set_default_backend(self.backend)
@@ -61,6 +61,6 @@ if __name__ == "__main__":
     # from sglang.global_config import global_config
 
     # global_config.verbosity = 2
-    # t = TestGeminiBackend()
+    # t = TestVertexAIBackend()
     # t.setUp()
     # t.test_stream()

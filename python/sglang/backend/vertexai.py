@@ -18,13 +18,8 @@ try:
 except ImportError as e:
     GenerativeModel = e
 
-GEMINI_MODEL_NAMES = [
-    "gemini-pro",
-    "gemini-pro-vision",
-]
 
-
-class Gemini(BaseBackend):
+class VertexAI(BaseBackend):
     def __init__(self, model_name):
         super().__init__()
 
@@ -32,7 +27,7 @@ class Gemini(BaseBackend):
             raise GenerativeModel
 
         project_id = os.environ["GCP_PROJECT_ID"]
-        location = os.environ["GCP_LOCATION"]
+        location = os.environ.get("GCP_LOCATION")
         vertexai.init(project=project_id, location=location)
 
         self.model_name = model_name
@@ -47,17 +42,17 @@ class Gemini(BaseBackend):
         sampling_params: SglSamplingParams,
     ):
         if s.messages_:
-            prompt = self.messages_to_gemini_input(s.messages_)
+            prompt = self.messages_to_vertexai_input(s.messages_)
         else:
             # single-turn
             prompt = (
-                self.text_to_gemini_input(s.text_, s.cur_images)
+                self.text_to_vertexai_input(s.text_, s.cur_images)
                 if s.cur_images
                 else s.text_
             )
         ret = GenerativeModel(self.model_name).generate_content(
             prompt,
-            generation_config=GenerationConfig(**sampling_params.to_gemini_kwargs()),
+            generation_config=GenerationConfig(**sampling_params.to_vertexai_kwargs()),
         )
 
         comp = ret.text
@@ -70,23 +65,23 @@ class Gemini(BaseBackend):
         sampling_params: SglSamplingParams,
     ):
         if s.messages_:
-            prompt = self.messages_to_gemini_input(s.messages_)
+            prompt = self.messages_to_vertexai_input(s.messages_)
         else:
             # single-turn
             prompt = (
-                self.text_to_gemini_input(s.text_, s.cur_images)
+                self.text_to_vertexai_input(s.text_, s.cur_images)
                 if s.cur_images
                 else s.text_
             )
         generator = GenerativeModel(self.model_name).generate_content(
             prompt,
             stream=True,
-            generation_config=GenerationConfig(**sampling_params.to_gemini_kwargs()),
+            generation_config=GenerationConfig(**sampling_params.to_vertexai_kwargs()),
         )
         for ret in generator:
             yield ret.text, {}
 
-    def text_to_gemini_input(self, text, images):
+    def text_to_vertexai_input(self, text, images):
         input = []
         # split with image token
         text_segs = text.split(self.chat_template.image_token)
@@ -100,9 +95,9 @@ class Gemini(BaseBackend):
             input.append(text_seg)
         return input
 
-    def messages_to_gemini_input(self, messages):
-        gemini_message = []
-        # from openai message format to gemini message format
+    def messages_to_vertexai_input(self, messages):
+        vertexai_message = []
+        # from openai message format to vertexai message format
         for msg in messages:
             if isinstance(msg["content"], str):
                 text = msg["content"]
@@ -110,14 +105,14 @@ class Gemini(BaseBackend):
                 text = msg["content"][0]["text"]
 
             if msg["role"] == "system":
-                warnings.warn("Warning: system prompt is not supported in Gemini.")
-                gemini_message.append(
+                warnings.warn("Warning: system prompt is not supported in VertexAI.")
+                vertexai_message.append(
                     {
                         "role": "user",
                         "parts": [{"text": "System prompt: " + text}],
                     }
                 )
-                gemini_message.append(
+                vertexai_message.append(
                     {
                         "role": "model",
                         "parts": [{"text": "Understood."}],
@@ -125,12 +120,12 @@ class Gemini(BaseBackend):
                 )
                 continue
             if msg["role"] == "user":
-                gemini_msg = {
+                vertexai_msg = {
                     "role": "user",
                     "parts": [{"text": text}],
                 }
             elif msg["role"] == "assistant":
-                gemini_msg = {
+                vertexai_msg = {
                     "role": "model",
                     "parts": [{"text": text}],
                 }
@@ -139,7 +134,7 @@ class Gemini(BaseBackend):
             if isinstance(msg["content"], list) and len(msg["content"]) > 1:
                 for image in msg["content"][1:]:
                     assert image["type"] == "image_url"
-                    gemini_msg["parts"].append(
+                    vertexai_msg["parts"].append(
                         {
                             "inline_data": {
                                 "data": image["image_url"]["url"].split(",")[1],
@@ -148,5 +143,5 @@ class Gemini(BaseBackend):
                         }
                     )
 
-            gemini_message.append(gemini_msg)
-        return gemini_message
+            vertexai_message.append(vertexai_msg)
+        return vertexai_message
