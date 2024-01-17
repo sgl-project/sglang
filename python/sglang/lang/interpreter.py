@@ -428,6 +428,7 @@ class StreamExecutor:
             self.messages_.append(last_msg)
             self.cur_images = []
         else:
+            # OpenAI chat API format
             self.messages_.append({"role": expr.role, "content": new_text})
 
         self.cur_role = None
