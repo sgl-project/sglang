@@ -1,4 +1,5 @@
 # SGLang
+| [Blog](https://lmsys.org/blog/2024-01-17-sglang/) | [Paper](https://arxiv.org/abs/2312.07104) |
 
 SGLang is a structured generation language designed for large language models (LLMs).
 It makes your interaction with LLMs faster and more controllable by co-designing the frontend language and the runtime system.
