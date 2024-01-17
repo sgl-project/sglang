@@ -117,6 +117,7 @@ class Gemini(BaseBackend):
             # images
             if len(msg["content"]) > 1:
                 for image in msg["content"][1:]:
+                    assert image["type"] == "image_url"
                     gemini_msg["parts"].append(
                         {
                             "inline_data": {
