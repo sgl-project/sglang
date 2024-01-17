@@ -29,7 +29,7 @@ class ServerArgs:
             if self.tp_size >= 8:
                 self.mem_fraction_static = 0.80
             elif self.tp_size >= 4:
-                self.mem_fraction_static = 0.85
+                self.mem_fraction_static = 0.82
             elif self.tp_size >= 2:
                 self.mem_fraction_static = 0.85
             else:
