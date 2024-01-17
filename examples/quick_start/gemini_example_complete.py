@@ -1,4 +1,4 @@
-from sglang import function, gen, set_default_backend, Gemini
+from sglang import function, gen, set_default_backend, VertexAI
 
 
 @function
@@ -16,7 +16,7 @@ A: Rome
     s += "A:" + gen("answer", stop="\n", temperature=0)
 
 
-set_default_backend(Gemini("gemini-pro"))
+set_default_backend(VertexAI("gemini-pro"))
 
 state = few_shot_qa.run(question="What is the capital of the United States?")
 answer = state["answer"].strip().lower()

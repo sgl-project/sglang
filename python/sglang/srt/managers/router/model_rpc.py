@@ -108,7 +108,7 @@ class ModelRpcServer(rpyc.Service):
         self.running_batch: Batch = None
         self.out_pyobjs = []
         self.decode_forward_ct = 0
-        self.stream_interval = 2
+        self.stream_interval = server_args.stream_interval
 
         # Init the FSM cache for constrained generation
         self.regex_fsm_cache = FSMCache(self.tokenizer)
