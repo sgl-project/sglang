@@ -266,11 +266,10 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 Learn more [here](docs/benchmark_results.md).
 
 ## Roadmap
-- [ ] Function call
-- [ ] Quantization
+- [ ] Function call APIs
 - [ ] S-LoRA
-- [ ] More models
-- [ ] More hardware backend
+- [ ] Support more models
+- [ ] Support more hardware backends
 
 ## Citation And Acknowledgment
 ```
