@@ -632,11 +632,7 @@ class ProgramState:
         self.stream_executor.end()
 
     def __repr__(self) -> str:
-        msgs = self.messages()
-        ret = ""
-        for msg in msgs:
-            ret += msg["role"] + ":\n" + msg["content"] + "\n"
-        return ret
+        return f"ProgramState({self.text()})"
 
 
 class ProgramStateGroup:

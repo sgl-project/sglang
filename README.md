@@ -115,13 +115,14 @@ You can then invoke the function with `run` or `run_batch`.
 The system will manage the state, chat template, and parallelism for you.
 
 ### Control Flow
+You can use any Python code within the function body, including control flow, nested function calls, and external libraries.
+
 ```python
 @sgl.function
 def control_flow(s, question):
     s += "To answer this question: " + question + ", "
     s += "I need to use a " + sgl.gen("tool", choices=["calculator", "web browser"]) + ". "
 
-    # You can use if or nested function calls
     if s["tool"] == "calculator":
         s += "The math expression is" + sgl.gen("expression")
     elif s["tool"] == "web browser":
@@ -129,6 +130,9 @@ def control_flow(s, question):
 ```
 
 ### Parallelism
+Use `fork` to launch parallel prompts.
+Because `sgl.gen` is non-blocking, the for loop below issues two generation calls in parallel.
+
 ```python
 @sgl.function
 def tip_suggestion(s):
@@ -137,7 +141,7 @@ def tip_suggestion(s):
         "1. Balanced Diet. 2. Regular Exercise.\n\n"
     )
 
-    forks = s.fork(2)  # Launch parallel prompts
+    forks = s.fork(2)
     for i, f in enumerate(forks):
         f += f"Now, expand tip {i+1} into a paragraph:\n"
         f += sgl.gen(f"detailed_tip", max_tokens=256, stop="\n\n")
@@ -148,6 +152,8 @@ def tip_suggestion(s):
 ```
 
 ### Multi Modality
+Use `sgl.image` to pass an image as input.
+
 ```python
 @sgl.function
 def image_qa(s, image_file, question):
@@ -156,6 +162,8 @@ def image_qa(s, image_file, question):
 ```
 
 ### Constrained Decoding
+Use `regex=` to specify a regular expression as a decoding constraint.
+
 ```python
 @sgl.function
 def regular_expression_gen(s):
@@ -168,6 +176,8 @@ def regular_expression_gen(s):
 ```
 
 ### Batching
+Use `run_batch` to run a batch of requests with continuous batching.
+
 ```python
 @sgl.function
 def text_qa(s, question):
@@ -180,10 +190,13 @@ states = text_qa.run_batch(
         {"question": "What is the capital of France?"},
         {"question": "What is the capital of Japan?"},
     ],
+    progress_bar=True
 )
 ```
 
 ### Streaming
+Add `stream=True` to enable streaming.
+
 ```python
 @sgl.function
 def text_qa(s, question):
@@ -192,7 +205,9 @@ def text_qa(s, question):
 
 states = text_qa.run(
     question="What is the capital of France?",
-    temperature=0.1)
+    temperature=0.1,
+    stream=True
+)
 
 for out in state.text_iter():
     print(out, end="", flush=True)
