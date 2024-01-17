@@ -10,8 +10,8 @@ set_default_backend(Gemini("gemini-pro-vision"))
 
 state = image_qa.run(
     image_file1="./images/cat.jpeg",
-    image_file2="./images/rat.jpeg",
-    question="Describe difference of the 2 images using one sentence.",
+    image_file2="./images/dog.jpeg",
+    question="Describe difference of the 2 images in one sentence.",
     stream=True
 )
 

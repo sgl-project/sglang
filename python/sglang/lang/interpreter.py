@@ -169,7 +169,7 @@ class StreamExecutor:
         self.text_ = ""  # The full text
 
         # For chat
-        self.messages_ = []  # The messages in the OpenAI/Gemini API format
+        self.messages_ = []  # The messages in the OpenAI API format
         self.chat_template = chat_template or self.backend.get_chat_template()
         self.cur_role = None
         self.cur_role_begin_pos = None
@@ -411,47 +411,25 @@ class StreamExecutor:
         self._execute_fill(suffix)
 
         if self.cur_images:
-            if hasattr(self.backend, "name") and self.backend.name == "gemini":
-                # Gemini vision API format
-                last_msg = {
-                    "role": expr.role,
-                    "parts": [{"text": new_text}],
-                }
-                for image_path, image_base64_data in self.cur_images:
-                    last_msg["parts"].append(
-                        {
-                            "inline_data": {
-                                "data": image_base64_data,
-                                "mime_type": "image/jpeg",
-                            },
-                        }
-                    )
-            else:
-                # OpenAI vision API format
-                last_msg = {
-                    "role": expr.role,
-                    "content": [{"type": "text", "text": new_text}],
-                }
-                for image_path, image_base64_data in self.cur_images:
-                    last_msg["content"].append(
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64_data}"
-                            },
-                        }
-                    )
+            # OpenAI vision API format
+            last_msg = {
+                "role": expr.role,
+                "content": [{"type": "text", "text": new_text}],
+            }
+            for image_path, image_base64_data in self.cur_images:
+                last_msg["content"].append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_base64_data}"
+                        },
+                    }
+                )
             self.messages_.append(last_msg)
             self.cur_images = []
         else:
-            if hasattr(self.backend, "name") and self.backend.name == "gemini":
-                # Gemini chat API format
-                self.messages_.append(
-                    {"role": expr.role, "parts": [{"text": new_text}]}
-                )
-            else:
-                # OpenAI chat API format
-                self.messages_.append({"role": expr.role, "content": new_text})
+            # OpenAI chat API format
+            self.messages_.append({"role": expr.role, "content": new_text})
 
         self.cur_role = None
 

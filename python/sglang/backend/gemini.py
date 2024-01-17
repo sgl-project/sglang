@@ -34,7 +34,6 @@ class Gemini(BaseBackend):
         location = os.environ["GCP_LOCATION"]
         vertexai.init(project=project_id, location=location)
 
-        self.name = "gemini"
         self.model_name = model_name
         self.chat_template = get_chat_template("default")
 
@@ -47,11 +46,13 @@ class Gemini(BaseBackend):
         sampling_params: SglSamplingParams,
     ):
         if s.messages_:
-            prompt = s.messages_
+            prompt = self.messages_to_gemini_input(s.messages_)
         else:
             # single-turn
             prompt = (
-                self.to_gemini_input(s.text_, s.cur_images) if s.cur_images else s.text_
+                self.text_to_gemini_input(s.text_, s.cur_images)
+                if s.cur_images
+                else s.text_
             )
         ret = GenerativeModel(self.model_name).generate_content(
             prompt,
@@ -68,11 +69,13 @@ class Gemini(BaseBackend):
         sampling_params: SglSamplingParams,
     ):
         if s.messages_:
-            prompt = s.messages_
+            prompt = self.messages_to_gemini_input(s.messages_)
         else:
             # single-turn
             prompt = (
-                self.to_gemini_input(s.text_, s.cur_images) if s.cur_images else s.text_
+                self.text_to_gemini_input(s.text_, s.cur_images)
+                if s.cur_images
+                else s.text_
             )
         generator = GenerativeModel(self.model_name).generate_content(
             prompt,
@@ -82,7 +85,7 @@ class Gemini(BaseBackend):
         for ret in generator:
             yield ret.text, {}
 
-    def to_gemini_input(self, text, images):
+    def text_to_gemini_input(self, text, images):
         input = []
         # split with image token
         text_segs = text.split(self.chat_template.image_token)
@@ -95,3 +98,33 @@ class Gemini(BaseBackend):
         if text_seg != "":
             input.append(text_seg)
         return input
+
+    def messages_to_gemini_input(self, messages):
+        gemini_message = []
+        # from openai message format to gemini message format
+        for msg in messages:
+            if msg["role"] == "user":
+                gemini_msg = {
+                    "role": "user",
+                    "parts": [{"text": msg["content"][0]["text"]}],
+                }
+            elif msg["role"] == "assistant":
+                gemini_msg = {
+                    "role": "model",
+                    "parts": [{"text": msg["content"][0]["text"]}],
+                }
+
+            # images
+            if len(msg["content"]) > 1:
+                for image in msg["content"][1:]:
+                    gemini_msg["parts"].append(
+                        {
+                            "inline_data": {
+                                "data": image["image_url"]["url"].split(",")[1],
+                                "mime_type": "image/jpeg",
+                            }
+                        }
+                    )
+
+            gemini_message.append(gemini_msg)
+        return gemini_message
