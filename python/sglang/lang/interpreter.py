@@ -365,10 +365,9 @@ class StreamExecutor:
             for comp, meta_info in generator:
                 self.text_ += comp
                 self.variables[name] += comp
+                self.meta_info[name] = meta_info
                 self.stream_var_event[name].set()
                 self.stream_text_event.set()
-
-            self.meta_info[name] = meta_info
 
             self.variable_event[name].set()
             self.stream_var_event[name].set()
@@ -583,7 +582,7 @@ class ProgramState:
             else:
                 yield self.get_var(name)
 
-    async def text_async_iter(self, var_name=None):
+    async def text_async_iter(self, var_name=None, return_meta_data=False):
         loop = asyncio.get_running_loop()
 
         if self.stream_executor.stream:
@@ -607,7 +606,10 @@ class ProgramState:
                     out = str(self.stream_executor.variables[var_name][prev:])
                     prev += len(out)
                     if out:
-                        yield out
+                        if return_meta_data:
+                            yield out, self.stream_executor.meta_info[var_name]
+                        else:
+                            yield out
                     if self.stream_executor.variable_event[var_name].is_set():
                         break
         else:
