@@ -101,7 +101,7 @@ for m in state.messages():
 
 ### More Examples
 
-We also support Anthropic and VertexAI (Gemini) backend.
+Anthropic and VertexAI (Gemini) models are also supported.
 You can find more examples at [examples/quick_start](examples/quick_start).
 
 ## Frontend: Structured Generation Langauge (SGLang)
