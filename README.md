@@ -270,6 +270,7 @@ Learn more [here](docs/benchmark_results.md).
 - [ ] Quantization
 - [ ] S-LoRA
 - [ ] More models
+- [ ] More hardware backend
 
 ## Citation And Acknowledgment
 ```
