@@ -1,5 +1,5 @@
 ## Sampling Parameters of SGLang Runtime
-This doc describes the sampling parameters or the SGLang Runtime.
+This doc describes the sampling parameters of the SGLang Runtime.
 
 The `/generate` endpoint accepts the following arguments in the JSON format.
 
@@ -41,7 +41,7 @@ class SamplingParams:
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 ```
 
-```
+```python
 import requests
 
 response = requests.post(
@@ -59,7 +59,7 @@ print(response.json())
 
 ### Streaming
 
-```
+```python
 import requests, json
 
 response = requests.post(
