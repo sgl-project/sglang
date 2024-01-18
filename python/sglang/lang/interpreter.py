@@ -190,6 +190,10 @@ class StreamExecutor:
 
         # For completion
         self.text_ = ""  # The full text
+        
+        # For speculative execution
+        self.last_comp = "" # The last completion message returned 
+        self.speculate_text_prefix = "" # The speculated text prefix 
 
         # For chat
         self.messages_ = []  # The messages in the OpenAI API format
@@ -341,7 +345,13 @@ class StreamExecutor:
 
     def _execute_fill(self, value: str):
         value = str(value)
-        self.text_ += value
+        if value.strip() in self.last_comp:
+            # speculative execution worked
+            # print(f"speculate_text_prefix: {value}")
+            self.speculate_text_prefix = value.strip()
+        else:
+            self.text_ += value
+            self.speculate_text_prefix = ""
 
     def _execute_image(self, expr: SglImage):
         path = expr.path
@@ -360,10 +370,18 @@ class StreamExecutor:
         name = expr.name
 
         if not self.stream:
-            comp, meta_info = self.backend.generate(
-                self, sampling_params=sampling_params
-            )
-            self.text_ += comp
+            if self.last_comp != "" and self.speculate_text_prefix != "":
+                last_comp, _, comp = self.last_comp.partition(self.speculate_text_prefix) 
+                self.variables[self.last_name] = last_comp
+                meta_info = {}
+            else:
+                comp, meta_info = self.backend.generate(
+                    self, sampling_params=sampling_params
+                )
+                self.text_ += comp
+
+            self.last_comp = comp
+            self.last_name = name
 
             self.variables[name] = comp
             self.meta_info[name] = meta_info
