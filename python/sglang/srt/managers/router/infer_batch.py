@@ -1,5 +1,6 @@
 from enum import Enum, auto
 from typing import List
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -81,27 +82,56 @@ class Req:
         return f"rid(n={self.rid}, " f"input_ids={self.input_ids}, "
 
 
+@dataclass
 class Batch:
-    def __init__(
-        self,
-        reqs: List[Req],
-        req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool: TokenToKVPool,
-        tree_cache: RadixCache,
-    ):
-        self.reqs = reqs
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool = token_to_kv_pool
-        self.tree_cache = tree_cache
+    reqs: List[Req]
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool: TokenToKVPool
+    tree_cache: RadixCache
 
-        self.return_normalized_logprob = any(
-            req.return_normalized_logprob for req in reqs
+    # batched arguments to model runner
+    input_ids: torch.Tensor = None
+    req_pool_indices: torch.Tensor = None
+    seq_lens: torch.Tensor = None
+    prefix_lens: torch.Tensor = None
+    position_ids_offsets: torch.Tensor = None
+    out_cache_loc: torch.Tensor = None
+    out_cache_cont_start: torch.Tensor = None
+    out_cache_cont_end: torch.Tensor = None
+    return_normalized_logprob: bool = False
+
+    # for multimodal
+    pixel_values: List[torch.Tensor] = None
+    image_offsets: List[int] = None
+
+    # other arguments for control
+    output_ids: torch.Tensor = None
+    extend_num_tokens: int = None
+
+    # batched sampling params
+    temperatures: torch.Tensor = None
+    top_ps: torch.Tensor = None
+    top_ks: torch.Tensor = None
+    frequency_penalties: torch.Tensor = None
+    presence_penalties: torch.Tensor = None
+    logit_bias: torch.Tensor = None
+
+    @classmethod
+    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+        return_normalized_logprob = any(req.return_normalized_logprob for req in reqs)
+
+        return cls(
+            reqs=reqs,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool=token_to_kv_pool,
+            tree_cache=tree_cache,
+            return_normalized_logprob=return_normalized_logprob,
         )
 
     def is_empty(self):
         return len(self.reqs) == 0
 
-    def init_extend_batch(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+    def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
         device = "cuda"
         bs = len(self.reqs)
         reqs = self.reqs
@@ -196,7 +226,7 @@ class Batch:
         )
         self.logit_bias = logit_bias
 
-    def update_for_decode(self, input_ids=None):
+    def prepare_for_decode(self, input_ids=None):
         if input_ids is None:
             input_ids = [
                 r.output_ids[-1] if r.output_ids else r.input_ids[-1] for r in self.reqs

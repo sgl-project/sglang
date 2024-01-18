@@ -308,7 +308,7 @@ class ModelRpcServer(rpyc.Service):
                 f"#running_req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
             )
 
-        new_batch = Batch(
+        new_batch = Batch.init_new(
             can_run_list,
             self.req_to_token_pool,
             self.token_to_kv_pool,
@@ -319,7 +319,7 @@ class ModelRpcServer(rpyc.Service):
 
     def forward_fill_batch(self, batch: Batch):
         # Build batch tensors
-        batch.init_extend_batch(self.model_config.vocab_size, self.int_token_logit_bias)
+        batch.prepare_for_extend(self.model_config.vocab_size, self.int_token_logit_bias)
         if batch.extend_num_tokens != 0:
             # Forward
             logits, normalized_logprobs = self.model_runner.forward(
@@ -349,7 +349,7 @@ class ModelRpcServer(rpyc.Service):
     def forward_decode_batch(self, batch: Batch):
         # Update batch tensors
         self.decode_forward_ct += 1
-        batch.update_for_decode()
+        batch.prepare_for_decode()
 
         # Forward
         logits = self.model_runner.forward(batch, ForwardMode.DECODE)
