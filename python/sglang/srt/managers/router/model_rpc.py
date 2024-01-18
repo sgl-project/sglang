@@ -319,7 +319,9 @@ class ModelRpcServer(rpyc.Service):
 
     def forward_fill_batch(self, batch: Batch):
         # Build batch tensors
-        batch.prepare_for_extend(self.model_config.vocab_size, self.int_token_logit_bias)
+        batch.prepare_for_extend(
+            self.model_config.vocab_size, self.int_token_logit_bias
+        )
         if batch.extend_num_tokens != 0:
             # Forward
             logits, normalized_logprobs = self.model_runner.forward(
@@ -348,7 +350,7 @@ class ModelRpcServer(rpyc.Service):
 
     def forward_decode_batch(self, batch: Batch):
         # check if decode out of memory
-        if self.token_to_kv_pool.available_size() < len(batch.reqs):
+        if not batch.check_decode_mem():
             suspended_reqs = batch.suspend_for_decode()
             self.forward_queue.extend(suspended_reqs)
 

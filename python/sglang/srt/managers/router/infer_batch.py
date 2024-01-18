@@ -227,6 +227,18 @@ class Batch:
         )
         self.logit_bias = logit_bias
 
+    def check_decode_mem(self):
+        bs = len(self.reqs)
+        avai_size = self.token_to_kv_pool.available_size()
+        if avai_size >= bs:
+            return True
+
+        self.tree_cache.evict(bs - avai_size, self.token_to_kv_pool.free)
+        if self.token_to_kv_pool.available_size() >= bs:
+            return True
+
+        return False
+
     def suspend_for_decode(self):
         sorted_indices = [i for i in range(len(self.reqs))]
         sorted_indices.sort(
@@ -247,6 +259,7 @@ class Batch:
             req = self.reqs[idx]
             suspended_reqs.append(req)
 
+            self.tree_cache.dec_ref_counter(req.last_node)
             req.prefix_indices = None
             req.last_node = None
             req.adjust_input_len = 0
