@@ -54,7 +54,9 @@ class SglSamplingParams:
 
     def to_vertexai_kwargs(self):
         if self.regex is not None:
-            warnings.warn("Regular expression is not supported in the VertexAI backend.")
+            warnings.warn(
+                "Regular expression is not supported in the VertexAI backend."
+            )
         return {
             "candidate_count": 1,
             "max_output_tokens": self.max_new_tokens,
@@ -67,7 +69,9 @@ class SglSamplingParams:
     def to_anthropic_kwargs(self):
         # Anthropic does not support frequency_penalty or presence_penalty, so we drop it here
         if self.regex is not None:
-            warnings.warn("Regular expression is not supported in the Anthropic backend.")
+            warnings.warn(
+                "Regular expression is not supported in the Anthropic backend."
+            )
         return {
             "max_tokens_to_sample": self.max_new_tokens,
             "stop_sequences": self.stop,
