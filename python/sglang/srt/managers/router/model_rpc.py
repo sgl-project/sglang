@@ -45,6 +45,7 @@ class ModelRpcServer(rpyc.Service):
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.schedule_heuristic = server_args.schedule_heuristic
+        self.schedule_conservativeness = server_args.schedule_conservativeness
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -248,7 +249,9 @@ class ModelRpcServer(rpyc.Service):
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        new_ratio = self.scheduler.new_token_estimation_ratio()
+        new_ratio = (
+            self.scheduler.new_token_estimation_ratio() * self.schedule_conservativeness
+        )
         if self.running_batch:
             available_size -= sum(
                 [
