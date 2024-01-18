@@ -50,7 +50,7 @@ def gen(
     regex: Optional[str] = None,
 ):
     if choices:
-        return SglSelect(name, choices, temperature)
+        return SglSelect(name, choices, 0.0 if temperature is None else temperature)
 
     # check regex is valid
     if regex is not None:
