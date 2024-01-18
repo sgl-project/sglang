@@ -228,14 +228,18 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 
 Send a request
 ```
-curl http://localhost:30000/v1/completions \
+curl http://localhost:30000/generate \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Say this is a test",
-    "max_tokens": 16,
-    "temperature": 0
+    "text": "Once upon a time,",
+    "parameters": {
+      "max_new_tokens": 16,
+      "temperature": 0
+    }
   }'
 ```
+
+Learn more about the argument format [here](docs/sampling_params.md).
 
 ### Additional Arguments
 - Add `--tp 2` to enable tensor parallelism.
