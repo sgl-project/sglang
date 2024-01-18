@@ -347,6 +347,11 @@ class ModelRpcServer(rpyc.Service):
         self.handle_finished_requests(batch)
 
     def forward_decode_batch(self, batch: Batch):
+        # check if decode out of memory
+        if self.token_to_kv_pool.available_size() < len(batch.reqs):
+            suspended_reqs = batch.suspend_for_decode()
+            self.forward_queue.extend(suspended_reqs)
+
         # Update batch tensors
         self.decode_forward_ct += 1
         batch.prepare_for_decode()

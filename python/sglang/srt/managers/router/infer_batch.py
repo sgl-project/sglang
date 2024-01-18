@@ -39,6 +39,7 @@ class Req:
 
         self.adjust_input_len = 0
         self.prefix_indices = []
+        self.last_node = None
 
         self.normalized_logprob = None
 
@@ -225,6 +226,39 @@ class Batch:
             device=device,
         )
         self.logit_bias = logit_bias
+
+    def suspend_for_decode(self):
+        sorted_indices = [i for i in range(len(self.reqs))]
+        sorted_indices.sort(
+            key=lambda i: (len(self.reqs[i].output_ids), -len(self.reqs[i].input_ids)),
+            reverse=True,
+        )
+
+        for i in range(len(self.reqs)):
+            print(
+                f"input: {len(self.reqs[i].input_ids)}, output: {len(self.reqs[i].output_ids)}"
+            )
+
+        suspended_reqs = []
+        seq_lens_np = self.seq_lens.cpu().numpy()
+        req_pool_indices_np = self.req_pool_indices.cpu().numpy()
+        while self.token_to_kv_pool.available_size() < len(self.reqs):
+            idx = sorted_indices.pop()
+            req = self.reqs[idx]
+            suspended_reqs.append(req)
+
+            req.prefix_indices = None
+            req.last_node = None
+            req.adjust_input_len = 0
+
+            token_indices = self.req_to_token_pool.req_to_token[
+                req_pool_indices_np[idx]
+            ][: seq_lens_np[idx]]
+            self.token_to_kv_pool.free(token_indices)
+
+        self.filter_batch(sorted_indices)
+
+        return suspended_reqs
 
     def prepare_for_decode(self, input_ids=None):
         if input_ids is None:
