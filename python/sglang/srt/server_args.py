@@ -16,6 +16,7 @@ class ServerArgs:
     tp_size: int = 1
     model_mode: List[str] = ()
     schedule_heuristic: str = "lpm"
+    schedule_conservativeness: float = 1.0
     random_seed: int = 42
     stream_interval: int = 2
     disable_log_stats: bool = False
@@ -85,7 +86,7 @@ class ServerArgs:
             "--mem-fraction-static",
             type=float,
             default=ServerArgs.mem_fraction_static,
-            help="The fraction of the memory used for static allocation (model weights and KV cache memory pool)",
+            help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
         )
         parser.add_argument(
             "--tp-size",
@@ -106,6 +107,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.schedule_heuristic,
             help="Schudule mode: [lpm, weight, random, fcfs]",
+        )
+        parser.add_argument(
+            "--schedule-conservativeness",
+            type=float,
+            default=ServerArgs.schedule_conservativeness,
+            help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see out-of-memory errors.",
         )
         parser.add_argument(
             "--random-seed",
