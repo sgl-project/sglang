@@ -19,7 +19,7 @@ python3 -m vllm.entrypoints.api_server --model meta-llama/Llama-2-7b-chat-hf --d
 ```
 
 ```
-python3 bench_throughput.py --backend vllm --tokenizer meta-llama/Llama-2-7b-chat-hf --dataset ShareGPT_V3_unfiltered_cleaned_split.json --num-prompts 10 --request-rate 10
+python3 bench_throughput.py --backend vllm --tokenizer meta-llama/Llama-2-7b-chat-hf --dataset ShareGPT_V3_unfiltered_cleaned_split.json --num-prompts 10 --request-rate 10 --port 21000
 ```
 
 
