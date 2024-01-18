@@ -355,6 +355,10 @@ class ModelRpcServer(rpyc.Service):
         # check if decode out of memory
         if not batch.check_decode_mem():
             suspended_reqs = batch.suspend_for_decode()
+            logger.info(
+                "decode out of memory happened, "
+                f"#suspended_reqs: {len(suspended_reqs)}"
+            )
             self.forward_queue.extend(suspended_reqs)
 
         # Update batch tensors
