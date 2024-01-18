@@ -116,7 +116,7 @@ class ServerArgs:
         parser.add_argument(
             "--stream-interval",
             type=int,
-            default=ServerArgs.random_seed,
+            default=ServerArgs.stream_interval,
             help="The interval in terms of token length for streaming",
         )
         parser.add_argument(
