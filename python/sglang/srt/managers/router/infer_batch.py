@@ -246,11 +246,6 @@ class Batch:
             reverse=True,
         )
 
-        for i in range(len(self.reqs)):
-            print(
-                f"input: {len(self.reqs[i].input_ids)}, output: {len(self.reqs[i].output_ids)}"
-            )
-
         suspended_reqs = []
         seq_lens_np = self.seq_lens.cpu().numpy()
         req_pool_indices_np = self.req_pool_indices.cpu().numpy()
@@ -289,13 +284,9 @@ class Batch:
             self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
             if self.out_cache_loc is None:
-                self.tree_cache.evict(bs, self.token_to_kv_pool.free)
-                self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
-
-                if self.out_cache_loc is None:
-                    print("Decode out of memory.")
-                    self.tree_cache.pretty_print()
-                    exit()
+                print("Decode out of memory. This should nerver happen.")
+                self.tree_cache.pretty_print()
+                exit()
 
             self.out_cache_cont_start = None
             self.out_cache_cont_end = None
