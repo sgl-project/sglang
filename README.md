@@ -248,6 +248,8 @@ In addition, the server supports an experimental OpenAI-compatible API.
 import openai
 client = openai.Client(
     base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+# Text completion
 response = client.completions.create(
 	model="default",
 	prompt="The capital of France is",
@@ -255,21 +257,8 @@ response = client.completions.create(
 	max_tokens=32,
 )
 print(response)
-```
 
-Moreover, you can also specify a chat template for chat completion API when launching the server:
-
-```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
---chat-template llama-2
-```
-
-Then you can make a chat request as follows:
-
-```python
-import openai
-
-client = openai.Client(api_key="EMPTY", base_url="http://localhost:3000/v1")
+# Chat completion
 response = client.chat.completions.create(
     model="default",
     messages=[
@@ -279,7 +268,15 @@ response = client.chat.completions.create(
     temperature=0,
     max_tokens=64,
 )
-print(response.choices[0].message.content)
+print(response)
+```
+
+In above example, the server uses the chat template specified in the model tokenizer.
+You can override the chat template if needed when launching the server:
+
+```
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+--chat-template llama-2
 ```
 
 If the chat template you are looking for is missing, you are welcome to contribute it.
