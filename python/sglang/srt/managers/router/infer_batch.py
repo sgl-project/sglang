@@ -1,6 +1,6 @@
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List
-from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -172,7 +172,7 @@ class Batch:
             out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
 
             if out_cache_loc is None:
-                print("Prefill out of memory.")
+                print("Prefill out of memory. This should nerver happen.")
                 self.tree_cache.pretty_print()
                 exit()
 
