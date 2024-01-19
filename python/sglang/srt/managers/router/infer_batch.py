@@ -258,6 +258,8 @@ class Batch:
             req.prefix_indices = None
             req.last_node = None
             req.adjust_input_len = 0
+            req.output_ids = []
+            # TODO: apply more fine-grained retraction
 
             token_indices = self.req_to_token_pool.req_to_token[
                 req_pool_indices_np[idx]
