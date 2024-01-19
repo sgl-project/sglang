@@ -45,7 +45,6 @@ class ModelRpcServer(rpyc.Service):
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.schedule_heuristic = server_args.schedule_heuristic
-        self.schedule_conservativeness = server_args.schedule_conservativeness
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -113,6 +112,11 @@ class ModelRpcServer(rpyc.Service):
 
         # Init the FSM cache for constrained generation
         self.regex_fsm_cache = FSMCache(self.tokenizer)
+
+        # Init new token estimation
+        self.new_token_ratio = min(0.4 * server_args.schedule_conservativeness, 1.0)
+        self.min_new_token_ratio = min(0.2 * server_args.schedule_conservativeness, 1.0)
+        self.new_token_ratio_step = (0.0001, 0.05)  # (down, up)
 
     def exposed_step(self, recv_reqs):
         if self.tp_size != 1:
@@ -244,13 +248,10 @@ class ModelRpcServer(rpyc.Service):
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        new_ratio = (
-            self.scheduler.new_token_estimation_ratio() * self.schedule_conservativeness
-        )
         if self.running_batch:
             available_size -= sum(
                 [
-                    (r.max_new_tokens() - len(r.output_ids)) * new_ratio
+                    (r.max_new_tokens() - len(r.output_ids)) * self.new_token_ratio
                     for r in self.running_batch.reqs
                 ]
             )
@@ -356,12 +357,21 @@ class ModelRpcServer(rpyc.Service):
     def forward_decode_batch(self, batch: Batch):
         # check if decode out of memory
         if not batch.check_decode_mem():
+            old_ratio = self.new_token_ratio
+            self.new_token_ratio = min(old_ratio + self.new_token_ratio_step[1], 1.0)
+
             retracted_reqs = batch.retract_decode()
             logger.info(
                 "decode out of memory happened, "
-                f"#retracted_reqs: {len(retracted_reqs)}"
+                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
             self.forward_queue.extend(retracted_reqs)
+        else:
+            self.new_token_ratio = max(
+                self.new_token_ratio - self.new_token_ratio_step[0],
+                self.min_new_token_ratio,
+            )
 
         # Update batch tensors
         self.decode_forward_ct += 1
