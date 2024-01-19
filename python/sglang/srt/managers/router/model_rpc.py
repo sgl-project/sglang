@@ -45,7 +45,6 @@ class ModelRpcServer(rpyc.Service):
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.schedule_heuristic = server_args.schedule_heuristic
-        self.schedule_conservativeness = server_args.schedule_conservativeness
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -113,6 +112,11 @@ class ModelRpcServer(rpyc.Service):
 
         # Init the FSM cache for constrained generation
         self.regex_fsm_cache = FSMCache(self.tokenizer)
+
+        # Init new token estimation
+        self.new_token_ratio = min(0.4 * server_args.schedule_conservativeness, 1.0)
+        self.min_new_token_ratio = min(0.2 * server_args.schedule_conservativeness, 1.0)
+        self.new_token_ratio_step = (0.0001, 0.05)  # (down, up)
 
     def exposed_step(self, recv_reqs):
         if self.tp_size != 1:
@@ -209,11 +213,6 @@ class ModelRpcServer(rpyc.Service):
         req.stream = recv_req.stream
         req.tokenizer = self.tokenizer
 
-        # init the regex fsm
-        if req.sampling_params.regex is not None:
-            req.regex_fsm_state = 0
-            req.regex_fsm = self.regex_fsm_cache.get_fsm(req.sampling_params.regex)
-
         # Truncate long prompts
         req.input_ids = req.input_ids[: self.model_config.context_len - 1]
         req.sampling_params.max_new_tokens = min(
@@ -249,13 +248,10 @@ class ModelRpcServer(rpyc.Service):
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        new_ratio = (
-            self.scheduler.new_token_estimation_ratio() * self.schedule_conservativeness
-        )
         if self.running_batch:
             available_size -= sum(
                 [
-                    (r.max_new_tokens() - len(r.output_ids)) * new_ratio
+                    (r.max_new_tokens() - len(r.output_ids)) * self.new_token_ratio
                     for r in self.running_batch.reqs
                 ]
             )
@@ -311,7 +307,7 @@ class ModelRpcServer(rpyc.Service):
                 f"#running_req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
             )
 
-        new_batch = Batch(
+        new_batch = Batch.init_new(
             can_run_list,
             self.req_to_token_pool,
             self.token_to_kv_pool,
@@ -322,7 +318,16 @@ class ModelRpcServer(rpyc.Service):
 
     def forward_fill_batch(self, batch: Batch):
         # Build batch tensors
-        batch.init_extend_batch(self.model_config.vocab_size, self.int_token_logit_bias)
+        batch.prepare_for_extend(
+            self.model_config.vocab_size, self.int_token_logit_bias
+        )
+
+        # init the regex fsm before first sampling
+        for req in batch.reqs:
+            if req.sampling_params.regex is not None:
+                req.regex_fsm_state = 0
+                req.regex_fsm = self.regex_fsm_cache.get_fsm(req.sampling_params.regex)
+
         if batch.extend_num_tokens != 0:
             # Forward
             logits, normalized_logprobs = self.model_runner.forward(
@@ -350,9 +355,27 @@ class ModelRpcServer(rpyc.Service):
         self.handle_finished_requests(batch)
 
     def forward_decode_batch(self, batch: Batch):
+        # check if decode out of memory
+        if not batch.check_decode_mem():
+            old_ratio = self.new_token_ratio
+            self.new_token_ratio = min(old_ratio + self.new_token_ratio_step[1], 1.0)
+
+            retracted_reqs = batch.retract_decode()
+            logger.info(
+                "decode out of memory happened, "
+                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
+            )
+            self.forward_queue.extend(retracted_reqs)
+        else:
+            self.new_token_ratio = max(
+                self.new_token_ratio - self.new_token_ratio_step[0],
+                self.min_new_token_ratio,
+            )
+
         # Update batch tensors
         self.decode_forward_ct += 1
-        batch.update_for_decode()
+        batch.prepare_for_decode()
 
         # Forward
         logits = self.model_runner.forward(batch, ForwardMode.DECODE)
