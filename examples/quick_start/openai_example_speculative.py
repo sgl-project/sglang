@@ -1,5 +1,6 @@
 from sglang import function, gen, set_default_backend, OpenAI
-@function
+
+@function(spec_tokens=512)
 def example(s):
   s += "Construct a character. Here is an example:\n"
   s += "Name: Steve Jobs. Birthday: February 24, 1955. Job: Apple CEO.\n"

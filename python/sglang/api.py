@@ -19,10 +19,12 @@ from sglang.lang.ir import (
     SglSelect,
 )
 
-
-def function(func: Callable):
-    return SglFunction(func)
-
+def function(func=None,**bind_arguments):
+    if func:
+        return SglFunction(func, bind_arguments)
+    def decorator(func):
+        return SglFunction(func, bind_arguments)
+    return decorator
 
 def Runtime(*args, **kwargs):
     # Avoid importing unnecessary dependency

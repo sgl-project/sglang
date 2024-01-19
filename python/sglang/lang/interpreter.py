@@ -51,11 +51,11 @@ def run_program(
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
     assert backend is not None, "Please specify a backend"
-
-    func_kwargs.update(program.bind_arguments)
+    # func_kwargs.update(program.bind_arguments)
     stream_executor = StreamExecutor(
         backend, func_kwargs, default_sampling_para, chat_template=None, stream=stream
     )
+    stream_executor.bind_arguments = program.bind_arguments
     state = ProgramState(stream_executor)
 
     if stream:
@@ -193,7 +193,8 @@ class StreamExecutor:
         
         # For speculative execution
         self.last_comp = "" # The last completion message returned 
-        self.speculate_text_prefix = "" # The speculated text prefix 
+        self.speculate_text_prefix = "" # The speculated text prefix
+        self.bind_arguments = {}
 
         # For chat
         self.messages_ = []  # The messages in the OpenAI API format
@@ -375,6 +376,11 @@ class StreamExecutor:
                 self.variables[self.last_name] = last_comp
                 meta_info = {}
             else:
+                if self.last_comp == "" and 'spec_tokens' in self.bind_arguments:
+                    spec_tokens_value = self.bind_arguments['spec_tokens']
+                    sampling_params.max_new_tokens = spec_tokens_value
+                    sampling_params.stop = None
+
                 comp, meta_info = self.backend.generate(
                     self, sampling_params=sampling_params
                 )
