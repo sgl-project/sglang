@@ -40,7 +40,7 @@ def extract_prefix_by_tracing(program, backend):
     try:
         with TracingScope(tracer):
             tracer.ret_value = program.func(tracer, **arguments)
-    except (StopTracing, TypeError):
+    except (StopTracing, TypeError, AttributeError):
         # Some exceptions may not be catched
         pass
 
