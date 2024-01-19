@@ -238,8 +238,22 @@ curl http://localhost:30000/generate \
     }
   }'
 ```
-
 Learn more about the argument format [here](docs/sampling_params.md).
+
+### OpenAI Compatible API
+
+In addition, it also supports an OpenAI-compatible API.
+```
+import openai
+client = openai.Client(base_url="http://127.0.0.1:30000/v1")
+response = client.completions.create(
+	model="default",
+	prompt="The capital of France is",
+	temperature=0,
+	max_tokens=32,
+)
+print(response)
+```
 
 ### Additional Arguments
 - Add `--tp 2` to enable tensor parallelism.
