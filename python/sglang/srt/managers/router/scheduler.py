@@ -17,9 +17,6 @@ class Scheduler:
         self.max_total_num_token = max_total_num_token
         self.tree_cache = tree_cache
 
-    def new_token_estimation_ratio(self):
-        return 0.5 if self.schedule_heuristic != "fcfs" else 0.6
-
     def get_priority_queue(self, forward_queue):
         if self.schedule_heuristic == "lpm":
             # longest prefix match

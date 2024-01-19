@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List
 
@@ -38,6 +39,7 @@ class Req:
 
         self.adjust_input_len = 0
         self.prefix_indices = []
+        self.last_node = None
 
         self.normalized_logprob = None
 
@@ -81,27 +83,56 @@ class Req:
         return f"rid(n={self.rid}, " f"input_ids={self.input_ids}, "
 
 
+@dataclass
 class Batch:
-    def __init__(
-        self,
-        reqs: List[Req],
-        req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool: TokenToKVPool,
-        tree_cache: RadixCache,
-    ):
-        self.reqs = reqs
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool = token_to_kv_pool
-        self.tree_cache = tree_cache
+    reqs: List[Req]
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool: TokenToKVPool
+    tree_cache: RadixCache
 
-        self.return_normalized_logprob = any(
-            req.return_normalized_logprob for req in reqs
+    # batched arguments to model runner
+    input_ids: torch.Tensor = None
+    req_pool_indices: torch.Tensor = None
+    seq_lens: torch.Tensor = None
+    prefix_lens: torch.Tensor = None
+    position_ids_offsets: torch.Tensor = None
+    out_cache_loc: torch.Tensor = None
+    out_cache_cont_start: torch.Tensor = None
+    out_cache_cont_end: torch.Tensor = None
+    return_normalized_logprob: bool = False
+
+    # for multimodal
+    pixel_values: List[torch.Tensor] = None
+    image_offsets: List[int] = None
+
+    # other arguments for control
+    output_ids: torch.Tensor = None
+    extend_num_tokens: int = None
+
+    # batched sampling params
+    temperatures: torch.Tensor = None
+    top_ps: torch.Tensor = None
+    top_ks: torch.Tensor = None
+    frequency_penalties: torch.Tensor = None
+    presence_penalties: torch.Tensor = None
+    logit_bias: torch.Tensor = None
+
+    @classmethod
+    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+        return_normalized_logprob = any(req.return_normalized_logprob for req in reqs)
+
+        return cls(
+            reqs=reqs,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool=token_to_kv_pool,
+            tree_cache=tree_cache,
+            return_normalized_logprob=return_normalized_logprob,
         )
 
     def is_empty(self):
         return len(self.reqs) == 0
 
-    def init_extend_batch(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+    def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
         device = "cuda"
         bs = len(self.reqs)
         reqs = self.reqs
@@ -141,7 +172,7 @@ class Batch:
             out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
 
             if out_cache_loc is None:
-                print("Prefill out of memory.")
+                print("Prefill out of memory. This should nerver happen.")
                 self.tree_cache.pretty_print()
                 exit()
 
@@ -196,7 +227,50 @@ class Batch:
         )
         self.logit_bias = logit_bias
 
-    def update_for_decode(self, input_ids=None):
+    def check_decode_mem(self):
+        bs = len(self.reqs)
+        avai_size = self.token_to_kv_pool.available_size()
+        if avai_size >= bs:
+            return True
+
+        self.tree_cache.evict(bs, self.token_to_kv_pool.free)
+        if self.token_to_kv_pool.available_size() >= bs:
+            return True
+
+        return False
+
+    def retract_decode(self):
+        sorted_indices = [i for i in range(len(self.reqs))]
+        sorted_indices.sort(
+            key=lambda i: (len(self.reqs[i].output_ids), -len(self.reqs[i].input_ids)),
+            reverse=True,
+        )
+
+        retracted_reqs = []
+        seq_lens_np = self.seq_lens.cpu().numpy()
+        req_pool_indices_np = self.req_pool_indices.cpu().numpy()
+        while self.token_to_kv_pool.available_size() < len(self.reqs):
+            idx = sorted_indices.pop()
+            req = self.reqs[idx]
+            retracted_reqs.append(req)
+
+            self.tree_cache.dec_ref_counter(req.last_node)
+            req.prefix_indices = None
+            req.last_node = None
+            req.adjust_input_len = 0
+            req.output_ids = []
+            # TODO: apply more fine-grained retraction
+
+            token_indices = self.req_to_token_pool.req_to_token[
+                req_pool_indices_np[idx]
+            ][: seq_lens_np[idx]]
+            self.token_to_kv_pool.free(token_indices)
+
+        self.filter_batch(sorted_indices)
+
+        return retracted_reqs
+
+    def prepare_for_decode(self, input_ids=None):
         if input_ids is None:
             input_ids = [
                 r.output_ids[-1] if r.output_ids else r.input_ids[-1] for r in self.reqs
@@ -212,13 +286,9 @@ class Batch:
             self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
             if self.out_cache_loc is None:
-                self.tree_cache.evict(bs, self.token_to_kv_pool.free)
-                self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
-
-                if self.out_cache_loc is None:
-                    print("Decode out of memory.")
-                    self.tree_cache.pretty_print()
-                    exit()
+                print("Decode out of memory. This should nerver happen.")
+                self.tree_cache.pretty_print()
+                exit()
 
             self.out_cache_cont_start = None
             self.out_cache_cont_end = None
@@ -240,6 +310,9 @@ class Batch:
         self.prefix_lens = None
         self.position_ids_offsets = self.position_ids_offsets[new_indices]
         self.out_cache_loc = self.out_cache_cont_start = self.out_cache_cont_end = None
+        self.return_normalized_logprob = any(
+            req.return_normalized_logprob for req in self.reqs
+        )
 
         for item in [
             "temperatures",
@@ -263,6 +336,9 @@ class Batch:
             [self.position_ids_offsets, other.position_ids_offsets]
         )
         self.out_cache_loc = self.out_cache_cont_start = self.out_cache_cont_end = None
+        self.return_normalized_logprob = any(
+            req.return_normalized_logprob for req in self.reqs
+        )
 
         for item in [
             "temperatures",
