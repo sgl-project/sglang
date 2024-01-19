@@ -35,7 +35,7 @@ def test_generate_worker(model_path, tp_rank, tp_size):
 
     # Prefill
     batch = Batch.init_new(reqs, model.req_to_token_pool, model.token_to_kv_pool, None)
-    batch.prepare_for_extend(model.model_config.vocab_size(), None)
+    batch.prepare_for_extend(model.model_config.vocab_size, None)
     logits, _ = model.forward(batch, ForwardMode.EXTEND)
     next_token_ids, next_token_probs = batch.sample(logits)
     print("extend logits (first)", logits)
@@ -48,7 +48,7 @@ def test_generate_worker(model_path, tp_rank, tp_size):
             batch.req_pool_indices[i], :cut_num
         ]
     batch = Batch.init_new(reqs, model.req_to_token_pool, model.token_to_kv_pool, None)
-    batch.prepare_for_extend(model.model_config.vocab_size(), None)
+    batch.prepare_for_extend(model.model_config.vocab_size, None)
     logits, _ = model.forward(batch, ForwardMode.EXTEND)
     next_token_ids, next_token_probs = batch.sample(logits)
 
