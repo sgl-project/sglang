@@ -82,7 +82,7 @@ class ServerArgs:
             "--chat-template",
             type=str,
             default=ServerArgs.chat_template,
-            help="The buliltin chat template name or the path of the chat template file.",
+            help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server",
         )
         parser.add_argument(
             "--trust-remote-code",
