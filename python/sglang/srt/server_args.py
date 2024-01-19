@@ -11,6 +11,7 @@ class ServerArgs:
     port: int = 30000
     load_format: str = "auto"
     tokenizer_mode: str = "auto"
+    chat_template: Optional[str] = None
     trust_remote_code: bool = True
     mem_fraction_static: Optional[float] = None
     tp_size: int = 1
@@ -76,6 +77,12 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--chat-template",
+            type=str,
+            default=ServerArgs.chat_template,
+            help="The buliltin chat template name or the path of the chat template file.",
         )
         parser.add_argument(
             "--trust-remote-code",

@@ -240,6 +240,7 @@ curl http://localhost:30000/generate \
 ```
 Learn more about the argument format [here](docs/sampling_params.md).
 
+
 ### OpenAI Compatible API
 
 In addition, the server supports an experimental OpenAI-compatible API.
@@ -255,6 +256,51 @@ response = client.completions.create(
 	max_tokens=32,
 )
 print(response)
+```
+
+Moreover, you can also specify a chat template for chat completion API when launching the server:
+
+```
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+--chat-template llama-2
+```
+
+Then you can make a chat request as follows:
+
+```python
+import openai
+
+client = openai.Client(api_key="EMPTY", base_url="http://localhost:3000/v1")
+response = client.chat.completions.create(
+    model="default",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "List 3 countries and their capitals."},
+    ],
+    temperature=0,
+    max_tokens=64,
+)
+print(response.choices[0].message.content)
+```
+
+If the chat template you are looking for is missing, you are welcome to contribute it.
+Meanwihle, you can also temporaryy register your chat template as follows:
+
+```json
+{
+  "name": "my_model",
+  "system": "<|im_start|>system",
+  "user": "<|im_start|>user",
+  "assistant": "<|im_start|>assistant",
+  "sep_style": "CHATML",
+  "sep": "<|im_end|>",
+  "stop_str": ["<|im_end|>", "<|im_start|>"]
+}
+```
+
+```
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+--chat-template ./my_model_template.json
 ```
 
 ### Additional Arguments
