@@ -283,7 +283,7 @@ print(response.choices[0].message.content)
 ```
 
 If the chat template you are looking for is missing, you are welcome to contribute it.
-Meanwihle, you can also temporaryy register your chat template as follows:
+Meanwhile, you can also temporary register your chat template as follows:
 
 ```json
 {
