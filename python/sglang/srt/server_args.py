@@ -112,7 +112,7 @@ class ServerArgs:
             "--schedule-conservativeness",
             type=float,
             default=ServerArgs.schedule_conservativeness,
-            help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being suspended frequently.",
+            help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
         parser.add_argument(
             "--random-seed",

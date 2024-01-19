@@ -242,20 +242,20 @@ class Batch:
 
         return False
 
-    def suspend_for_decode(self):
+    def retract_decode(self):
         sorted_indices = [i for i in range(len(self.reqs))]
         sorted_indices.sort(
             key=lambda i: (len(self.reqs[i].output_ids), -len(self.reqs[i].input_ids)),
             reverse=True,
         )
 
-        suspended_reqs = []
+        retracted_reqs = []
         seq_lens_np = self.seq_lens.cpu().numpy()
         req_pool_indices_np = self.req_pool_indices.cpu().numpy()
         while self.token_to_kv_pool.available_size() < len(self.reqs):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            suspended_reqs.append(req)
+            retracted_reqs.append(req)
 
             self.tree_cache.dec_ref_counter(req.last_node)
             req.prefix_indices = None
@@ -269,7 +269,7 @@ class Batch:
 
         self.filter_batch(sorted_indices)
 
-        return suspended_reqs
+        return retracted_reqs
 
     def prepare_for_decode(self, input_ids=None):
         if input_ids is None:
