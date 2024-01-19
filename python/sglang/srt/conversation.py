@@ -1,9 +1,10 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
-from sglang.srt.managers.openai_protocol import ChatCompletionRequest
-from enum import IntEnum, auto
 import dataclasses
+from enum import IntEnum, auto
 from typing import Dict, List, Tuple, Union
+
+from sglang.srt.managers.openai_protocol import ChatCompletionRequest
 
 
 class SeparatorStyle(IntEnum):
@@ -109,7 +110,11 @@ class Conversation:
             ret = system_prompt
             for i, (role, message) in enumerate(self.messages):
                 if message:
-                    ret += role + ": " + message.replace("\r\n", "\n").replace("\n\n", "\n")
+                    ret += (
+                        role
+                        + ": "
+                        + message.replace("\r\n", "\n").replace("\n\n", "\n")
+                    )
                     ret += "\n\n"
                 else:
                     ret += role + ":"
@@ -310,7 +315,9 @@ chat_templates: Dict[str, Conversation] = {}
 def register_conv_template(template: Conversation, override: bool = False):
     """Register a new conversation template."""
     if not override:
-        assert template.name not in chat_templates, f"{template.name} has been registered."
+        assert (
+            template.name not in chat_templates
+        ), f"{template.name} has been registered."
 
     chat_templates[template.name] = template
 
@@ -319,7 +326,9 @@ def chat_template_exists(template_name: str) -> bool:
     return template_name in chat_templates
 
 
-def generate_chat_conv(request: ChatCompletionRequest, template_name: str) -> Conversation:
+def generate_chat_conv(
+    request: ChatCompletionRequest, template_name: str
+) -> Conversation:
     conv = chat_templates[template_name].copy()
     conv = Conversation(
         name=conv.name,

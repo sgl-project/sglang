@@ -275,8 +275,7 @@ In above example, the server uses the chat template specified in the model token
 You can override the chat template if needed when launching the server:
 
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
---chat-template llama-2
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --chat-template llama-2
 ```
 
 If the chat template you are looking for is missing, you are welcome to contribute it.
@@ -295,8 +294,7 @@ Meanwhile, you can also temporary register your chat template as follows:
 ```
 
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
---chat-template ./my_model_template.json
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --chat-template ./my_model_template.json
 ```
 
 ### Additional Arguments

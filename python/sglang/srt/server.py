@@ -224,7 +224,9 @@ async def v1_chat_completions(raw_request: Request):
                         finish_reason=None,
                     )
                     chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"], choices=[choice_data], model=request.model
+                        id=content["meta_info"]["id"],
+                        choices=[choice_data],
+                        model=request.model,
                     )
                     yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
 
@@ -235,7 +237,9 @@ async def v1_chat_completions(raw_request: Request):
                     index=0, delta=DeltaMessage(content=delta), finish_reason=None
                 )
                 chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"], choices=[choice_data], model=request.model
+                    id=content["meta_info"]["id"],
+                    choices=[choice_data],
+                    model=request.model,
                 )
                 yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
@@ -293,7 +297,9 @@ def launch_server(server_args, pipe_finish_writer):
                 try:
                     sep_style = SeparatorStyle[template["sep_style"]]
                 except KeyError:
-                    raise ValueError(f"Unknown separator style: {template['sep_style']}") from None
+                    raise ValueError(
+                        f"Unknown separator style: {template['sep_style']}"
+                    ) from None
                 register_conv_template(
                     Conversation(
                         name=template["name"],
