@@ -243,9 +243,10 @@ Learn more about the argument format [here](docs/sampling_params.md).
 ### OpenAI Compatible API
 
 In addition, it also supports an OpenAI-compatible API.
-```
+```python
 import openai
-client = openai.Client(base_url="http://127.0.0.1:30000/v1")
+client = openai.Client(
+    base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
 response = client.completions.create(
 	model="default",
 	prompt="The capital of France is",
