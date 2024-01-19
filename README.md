@@ -240,7 +240,6 @@ curl http://localhost:30000/generate \
 ```
 Learn more about the argument format [here](docs/sampling_params.md).
 
-
 ### OpenAI Compatible API
 
 In addition, the server supports an experimental OpenAI-compatible API.
