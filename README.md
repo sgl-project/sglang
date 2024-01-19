@@ -242,7 +242,8 @@ Learn more about the argument format [here](docs/sampling_params.md).
 
 ### OpenAI Compatible API
 
-In addition, it also supports an OpenAI-compatible API.
+In addition, the server supports an experimental OpenAI-compatible API.
+
 ```python
 import openai
 client = openai.Client(
