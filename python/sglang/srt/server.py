@@ -173,19 +173,22 @@ async def v1_chat_completions(raw_request: Request):
     # TODO: Validate the request and return HTTPStatus.BAD_REQUEST if invalid.
     assert request.n == 1
 
-    if chat_template_name is None:
-        raise RuntimeError("Chat template is not specified.")
-
     if not isinstance(request.messages, str):
         # Apply chat template and its stop strings.
-        conv = generate_chat_conv(request, chat_template_name)
-        prompt = conv.get_prompt()
-        stop = conv.stop_str or []
-        if request.stop:
-            if isinstance(request.stop, str):
-                stop.append(request.stop)
-            else:
-                stop.extend(request.stop)
+        if chat_template_name is None:
+            prompt = tokenizer_manager.tokenizer.apply_chat_template(
+                request.messages, tokenize=False, add_generation_prompt=True
+            )
+            stop = request.stop
+        else:
+            conv = generate_chat_conv(request, chat_template_name)
+            prompt = conv.get_prompt()
+            stop = conv.stop_str or []
+            if request.stop:
+                if isinstance(request.stop, str):
+                    stop.append(request.stop)
+                else:
+                    stop.extend(request.stop)
     else:
         # Use the raw prompt and stop strings if the messages is already a string.
         prompt = request.messages
@@ -226,8 +229,6 @@ async def v1_chat_completions(raw_request: Request):
                     yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
 
                 text = content["text"]
-                prompt_tokens = content["meta_info"]["prompt_tokens"]
-                completion_tokens = content["meta_info"]["completion_tokens"]
                 delta = text[len(stream_buffer) :]
                 stream_buffer = text
                 choice_data = ChatCompletionResponseStreamChoice(

@@ -335,22 +335,20 @@ def generate_chat_conv(request: ChatCompletionRequest, template_name: str) -> Co
     )
 
     if isinstance(request.messages, str):
-        prompt = request.messages
-    else:
-        for message in request.messages:
-            msg_role = message["role"]
-            if msg_role == "system":
-                conv.system_message = message["content"]
-            elif msg_role == "user":
-                conv.append_message(conv.roles[0], message["content"])
-            elif msg_role == "assistant":
-                conv.append_message(conv.roles[1], message["content"])
-            else:
-                raise ValueError(f"Unknown role: {msg_role}")
+        raise ValueError("The messages should be a list of dict.")
+    for message in request.messages:
+        msg_role = message["role"]
+        if msg_role == "system":
+            conv.system_message = message["content"]
+        elif msg_role == "user":
+            conv.append_message(conv.roles[0], message["content"])
+        elif msg_role == "assistant":
+            conv.append_message(conv.roles[1], message["content"])
+        else:
+            raise ValueError(f"Unknown role: {msg_role}")
 
-        # Add a blank message for the assistant.
-        conv.append_message(conv.roles[1], None)
-        prompt = conv.get_prompt()
+    # Add a blank message for the assistant.
+    conv.append_message(conv.roles[1], None)
 
     return conv
 
