@@ -168,10 +168,7 @@ class Batch:
         extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
-            avai_size = self.token_to_kv_pool.available_size()
-            self.tree_cache.evict(
-                extend_num_tokens - avai_size, self.token_to_kv_pool.free
-            )
+            self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
             out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
 
             if out_cache_loc is None:
@@ -236,7 +233,7 @@ class Batch:
         if avai_size >= bs:
             return True
 
-        self.tree_cache.evict(bs - avai_size, self.token_to_kv_pool.free)
+        self.tree_cache.evict(bs, self.token_to_kv_pool.free)
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 
