@@ -111,7 +111,13 @@ class ModelRpcServer(rpyc.Service):
         self.stream_interval = server_args.stream_interval
 
         # Init the FSM cache for constrained generation
-        self.regex_fsm_cache = FSMCache(self.tokenizer)
+        self.regex_fsm_cache = FSMCache(
+            server_args.tokenizer_path,
+            {
+                "tokenizer_mode": server_args.tokenizer_mode,
+                "trust_remote_code": server_args.trust_remote_code,
+            },
+        )
 
         # Init new token estimation
         self.new_token_ratio = min(0.4 * server_args.schedule_conservativeness, 1.0)

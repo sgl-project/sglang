@@ -12,14 +12,15 @@ _enable_disk_cache = True
 
 
 class FSMCache:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer_path, tokenizer_args_dict):
         self.cache = {}
-        self.tokenizer = tokenizer
+        self.outlines_tokenizer = TransformerTokenizer(
+            tokenizer_path, **tokenizer_args_dict
+        )
 
     def init_fsm(self, regex):
         if regex not in self.cache:
-            outlines_tokenizer = TransformerTokenizer(self.tokenizer)
-            fsm = RegexFSM(regex, outlines_tokenizer)
+            fsm = RegexFSM(regex, self.outlines_tokenizer)
             self.cache[regex] = fsm
 
         return self.cache[regex]

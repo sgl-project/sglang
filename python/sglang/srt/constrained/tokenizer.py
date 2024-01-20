@@ -93,9 +93,14 @@ def get_llama_tokenizer_types():
 class TransformerTokenizer(Tokenizer):
     """Represents a tokenizer for models in the `transformers` library."""
 
-    def __init__(self, tokenizer):
+    def __init__(self, model_name: str, **kwargs):
+        from transformers import AutoTokenizer
+
+        kwargs.setdefault("padding_side", "left")
+        self.model_name = model_name
         # TODO: Do something to make this hashable?
-        self.tokenizer = tokenizer
+        self.kwargs = kwargs
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.eos_token = self.tokenizer.eos_token
 
@@ -137,9 +142,7 @@ class TransformerTokenizer(Tokenizer):
 
     def __eq__(self, other):
         if isinstance(other, type(self)):
-            return False
-            # TODO(lsyin): the lru_cache for the TransoformerTokenizer is useless ?
-            # return other.model_name == self.model_name and other.kwargs == self.kwargs
+            return other.model_name == self.model_name and other.kwargs == self.kwargs
         return NotImplemented
 
     def __hash__(self):
