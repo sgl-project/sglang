@@ -297,6 +297,11 @@ class ModelRunner:
 
     def init_memory_pool(self, total_gpu_memory):
         self.max_total_num_token = self.profile_max_num_token(total_gpu_memory)
+
+        if self.max_total_num_token <= 0:
+            raise RuntimeError("Not enought memory. "
+                "Please try to increase --mem-fraction-static.")
+
         self.req_to_token_pool = ReqToTokenPool(
             int(self.max_total_num_token / self.model_config.context_len * 256),
             self.model_config.context_len + 8,
