@@ -1,20 +1,14 @@
-import threading
+import os
+
+from diskcache import Cache
 
 from sglang.srt.constrained.fsm import RegexFSM
 from sglang.srt.constrained.tokenizer import TransformerTokenizer
 
-
-def get_fsm(regex, tokenizer, fsm_cache_entry):
-    outlines_tokenizer = TransformerTokenizer(tokenizer)
-    fsm = RegexFSM(regex, outlines_tokenizer)
-    fsm_cache_entry.fsm = fsm
-    fsm_cache_entry.event.set()
-
-
-class FSMCacheEntry:
-    def __init__(self):
-        self.fsm = None
-        self.event = threading.Event()
+home_dir = os.path.expanduser("~")
+cache_dir = os.environ.get("SGLANG_CACHE_DIR", f"{home_dir}/.cache/sglang")
+disk_fsm_cache = Cache(cache_dir, eviction_policy="none", cull_limit=0)
+_enable_disk_cache = True
 
 
 class FSMCache:
@@ -22,20 +16,10 @@ class FSMCache:
         self.cache = {}
         self.tokenizer = tokenizer
 
-    def init_fsm_in_background(self, regex):
+    def init_fsm(self, regex):
         if regex not in self.cache:
-            self.cache[regex] = FSMCacheEntry()
-            threading.Thread(
-                target=get_fsm,
-                args=(
-                    regex,
-                    self.tokenizer,
-                    self.cache[regex],
-                ),
-            ).start()
+            outlines_tokenizer = TransformerTokenizer(self.tokenizer)
+            fsm = RegexFSM(regex, outlines_tokenizer)
+            self.cache[regex] = fsm
 
-    def get_fsm(self, regex):
-        self.init_fsm_in_background(regex)
-        entry = self.cache[regex]
-        entry.event.wait()
-        return entry.fsm
+        return self.cache[regex]

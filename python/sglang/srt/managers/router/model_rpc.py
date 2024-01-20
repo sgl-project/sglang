@@ -213,6 +213,10 @@ class ModelRpcServer(rpyc.Service):
         req.stream = recv_req.stream
         req.tokenizer = self.tokenizer
 
+        # Init regex fsm
+        if req.sampling_params.regex is not None:
+            req.regex_fsm = self.regex_fsm_cache.init_fsm(req.sampling_params.regex)
+
         # Truncate long prompts
         req.input_ids = req.input_ids[: self.model_config.context_len - 1]
         req.sampling_params.max_new_tokens = min(
@@ -322,11 +326,10 @@ class ModelRpcServer(rpyc.Service):
             self.model_config.vocab_size, self.int_token_logit_bias
         )
 
-        # init the regex fsm before first sampling
+        # Reset regex fsm state before first sampling due to retractions
         for req in batch.reqs:
             if req.sampling_params.regex is not None:
                 req.regex_fsm_state = 0
-                req.regex_fsm = self.regex_fsm_cache.get_fsm(req.sampling_params.regex)
 
         if batch.extend_num_tokens != 0:
             # Forward
