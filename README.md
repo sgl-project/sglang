@@ -11,7 +11,7 @@ The core features of SGLang include:
 ## Contents
 - [Install](#install)
 - [Quick Start](#quick-start)
-- [Frontend: Structured Generation Langauge (SGLang)](#frontend-structured-generation-langauge-sglang)
+- [Frontend: Structured Generation Language (SGLang)](#frontend-structured-generation-language-sglang)
 - [Backend: SGLang Runtime (SRT)](#backend-sglang-runtime-srt)
 - [Benchmark And Performance](#benchmark-and-performance)
 - [Roadmap](#roadmap)
@@ -104,7 +104,7 @@ for m in state.messages():
 Anthropic and VertexAI (Gemini) models are also supported.
 You can find more examples at [examples/quick_start](examples/quick_start).
 
-## Frontend: Structured Generation Langauge (SGLang)
+## Frontend: Structured Generation Language (SGLang)
 
 To begin with, import sglang.
 ```python
