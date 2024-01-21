@@ -69,8 +69,7 @@ def compute_normalized_logprobs(all_logprobs, input_ids, seq_lens, start_loc):
     ]
     logprobs_cumsum = torch.cumsum(logprobs, dim=0, dtype=torch.float32)
 
-    len_cumsum = torch.cumsum(seq_lens, dim=0)
-    start = torch.cat((torch.tensor([0], device="cuda"), len_cumsum[:-1]), 0)
+    start = start_loc.clone()
     end = start + seq_lens - 2
     start.clamp_(min=0, max=logprobs.shape[0] - 1)
     end.clamp_(min=0, max=logprobs.shape[0] - 1)
