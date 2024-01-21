@@ -11,6 +11,7 @@ from sglang.srt.constrained.regex import (
     make_deterministic_fsm,
 )
 from sglang.srt.constrained.tokenizer import Tokenizer
+from sglang.srt.constrained.disk_cache import disk_cache
 
 FSMState = NewType("FSMState", int)
 
@@ -105,6 +106,7 @@ class RegexFSM(FSM):
         regex_string: str,
         tokenizer: "Tokenizer",
     ):
+        @disk_cache()
         def create_states_mapping(
             regex_string: str, cacheable_vocabulary: Tuple[Tuple[str, int]]
         ) -> Tuple[dict, set, set]:
