@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List
+import logging
 
 import numpy as np
 import torch
@@ -11,6 +12,10 @@ from sglang.utils import get_available_gpu_memory
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
+
+
+logger = logging.getLogger("model_runner")
+
 
 # for model_mode
 global_model_mode: List[str] = []
@@ -257,6 +262,8 @@ class ModelRunner:
         if model_class is None:
             raise ValueError(f"Unsupported architectures: {architectures}")
 
+        logger.info("load weight begin.")
+
         # Load weights
         linear_method = None
         with _set_default_torch_dtype(torch.float16):
@@ -267,7 +274,7 @@ class ModelRunner:
                 if hf_quant_config is not None:
                     # TODO: config quantization awq etc
                     quant_config = AWQConfig.from_config(hf_quant_config)
-                    print(f"quant_config: {quant_config}")
+                    logger.info(f"quant_config: {quant_config}")
                     linear_method = quant_config.get_linear_method()
                 model = model_class(
                     config=self.model_config.hf_config, linear_method=linear_method
@@ -279,6 +286,8 @@ class ModelRunner:
                 revision=None,
             )
         self.model = model.eval()
+
+        logger.info("load weight end.")
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(
