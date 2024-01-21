@@ -261,7 +261,7 @@ class ModelRunner:
         if model_class is None:
             raise ValueError(f"Unsupported architectures: {architectures}")
 
-        logger.info("load weight begin.")
+        logger.info(f"Rank {self.tp_rank}: load weight begin.")
 
         # Load weights
         linear_method = None
@@ -286,7 +286,7 @@ class ModelRunner:
             )
         self.model = model.eval()
 
-        logger.info("load weight end.")
+        logger.info(f"Rank {self.tp_rank}: load weight end.")
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(
