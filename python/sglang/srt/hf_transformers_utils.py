@@ -72,7 +72,7 @@ def get_tokenizer(
     tokenizer_name: str,
     *args,
     tokenizer_mode: str = "auto",
-    trust_remote_code: bool = False,
+    trust_remote_code: bool = True,
     tokenizer_revision: Optional[str] = None,
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:

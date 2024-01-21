@@ -20,8 +20,11 @@ class ModelConfig:
         # Unify the config keys for hf_config
         self.context_len = get_context_length(self.hf_config)
         self.head_dim = self.hf_config.hidden_size // self.hf_config.num_attention_heads
-        self.num_key_value_heads = self.hf_config.num_key_value_heads
         self.num_attention_heads = self.hf_config.num_attention_heads
+        try:
+            self.num_key_value_heads = self.hf_config.num_key_value_heads
+        except Exception as e:
+            self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_config.hidden_size
         self.num_hidden_layers = self.hf_config.num_hidden_layers
         self.vocab_size = self.hf_config.vocab_size
