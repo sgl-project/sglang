@@ -2,15 +2,7 @@
 # https://github.com/outlines-dev/outlines/blob/0355ab4272a5d7e4d94c4a53a52593f885b81a61/outlines/models/tokenizer.py
 # https://github.com/outlines-dev/outlines/blob/0355ab4272a5d7e4d94c4a53a52593f885b81a61/outlines/models/transformers.py
 from abc import abstractmethod
-from typing import (
-    Dict,
-    Hashable,
-    List,
-    Protocol,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import Dict, Hashable, List, Protocol, Set, Tuple, Union
 
 import numpy as np
 import torch

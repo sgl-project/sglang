@@ -4,6 +4,7 @@ from typing import List, NewType, Protocol, Tuple
 
 import interegular
 from lark import Lark
+from sglang.srt.constrained.disk_cache import disk_cache
 
 # from outlines.fsm.parsing import PartialLark
 from sglang.srt.constrained.regex import (
@@ -11,7 +12,6 @@ from sglang.srt.constrained.regex import (
     make_deterministic_fsm,
 )
 from sglang.srt.constrained.tokenizer import Tokenizer
-from sglang.srt.constrained.disk_cache import disk_cache
 
 FSMState = NewType("FSMState", int)
 
