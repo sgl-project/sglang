@@ -10,10 +10,7 @@ async def generate(
     tokenizer = engine.get_tokenizer()
 
     messages = [
-        {
-            "role": "system",
-            "content": "You will be given question answer tasks.",
-        },
+        {"role": "system", "content": "You will be given question answer tasks.",},
         {"role": "user", "content": prompt},
     ]
 
@@ -25,6 +22,7 @@ async def generate(
 
     async for output in stream:
         print(output, end="", flush=True)
+    print()
 
 
 if __name__ == "__main__":

@@ -420,6 +420,9 @@ class Runtime:
             log_level=log_level,
         )
         self.url = self.server_args.url()
+        self.generate_url = (
+            f"http://{self.server_args.host}:{self.server_args.port}/generate"
+        )
 
         self.pid = None
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
@@ -457,7 +460,6 @@ class Runtime:
         prompt: str,
         sampling_params,
     ) -> None:
-        url = f"http://{self.server_args.host}:{self.server_args.port}/generate"
 
         json_data = {
             "text": prompt,
@@ -469,14 +471,17 @@ class Runtime:
 
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.post(url, json=json_data) as response:
+            async with session.post(self.generate_url, json=json_data) as response:
                 async for chunk, _ in response.content.iter_chunks():
-                    chunk = chunk[:-1]
-                    obj = json.loads(chunk.decode("utf-8"))
-                    cur = obj["text"][pos:]
-                    if cur:
-                        yield cur
-                    pos += len(cur)
+                    chunk = chunk.decode("utf-8")
+                    if chunk and chunk.startswith("data:"):
+                        if chunk == "data: [DONE]\n\n":
+                            break
+                        data = json.loads(chunk[5:].strip("\n"))
+                        cur = data["text"][pos:]
+                        if cur:
+                            yield cur
+                        pos += len(cur)
 
     def __del__(self):
         self.shutdown()
