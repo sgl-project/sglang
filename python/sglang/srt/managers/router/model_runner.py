@@ -1,7 +1,7 @@
+import logging
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List
-import logging
 
 import numpy as np
 import torch
@@ -12,7 +12,6 @@ from sglang.utils import get_available_gpu_memory
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
-
 
 logger = logging.getLogger("model_runner")
 
@@ -308,8 +307,9 @@ class ModelRunner:
         self.max_total_num_token = self.profile_max_num_token(total_gpu_memory)
 
         if self.max_total_num_token <= 0:
-            raise RuntimeError("Not enought memory. "
-                "Please try to increase --mem-fraction-static.")
+            raise RuntimeError(
+                "Not enought memory. " "Please try to increase --mem-fraction-static."
+            )
 
         self.req_to_token_pool = ReqToTokenPool(
             int(self.max_total_num_token / self.model_config.context_len * 256),

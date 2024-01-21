@@ -55,7 +55,7 @@ class LogitsProcessor(nn.Module):
                 all_logprobs,
                 input_ids,
                 input_metadata.extend_seq_lens,
-                input_metadata.extend_start_loc
+                input_metadata.extend_start_loc,
             )
 
             last_logits = logits[last_index]
@@ -65,7 +65,8 @@ class LogitsProcessor(nn.Module):
 def compute_normalized_logprobs(all_logprobs, input_ids, seq_lens, start_loc):
     logprobs = all_logprobs[
         torch.arange(all_logprobs.shape[0], device="cuda"),
-        torch.cat([input_ids[1:], torch.tensor([0], device="cuda")])]
+        torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
+    ]
     logprobs_cumsum = torch.cumsum(logprobs, dim=0, dtype=torch.float32)
 
     len_cumsum = torch.cumsum(seq_lens, dim=0)
@@ -90,7 +91,8 @@ if __name__ == "__main__":
 
     logprobs = all_logprobs[
         torch.arange(all_logprobs.shape[0], device="cuda"),
-        torch.cat([input_ids[1:], torch.tensor([0], device="cuda")])]
+        torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
+    ]
     logprobs_cumsum = torch.cumsum(logprobs, dim=0, dtype=torch.float32)
 
     len_cumsum = torch.cumsum(seq_lens, dim=0)
