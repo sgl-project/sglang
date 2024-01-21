@@ -164,7 +164,8 @@ def image_qa(s, image_file, question):
 ```
 
 ### Constrained Decoding
-Use `regex=` to specify a regular expression as a decoding constraint.
+Use `regex` to specify a regular expression as a decoding constraint.
+This is only supported for local models.
 
 ```python
 @sgl.function
