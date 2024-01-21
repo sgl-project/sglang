@@ -51,11 +51,11 @@ CHAT_MODEL_NAMES = [
 class OpenAI(BaseBackend):
     def __init__(self, model_name, *args, **kwargs):
         super().__init__()
-        self.client = openai.OpenAI(*args, **kwargs)
 
         if isinstance(openai, Exception):
-            raise e
+            raise openai
 
+        self.client = openai.OpenAI(*args, **kwargs)
         self.model_name = model_name
         self.tokenizer = tiktoken.encoding_for_model(model_name)
         self.logit_bias_int = create_logit_bias_int(self.tokenizer)
