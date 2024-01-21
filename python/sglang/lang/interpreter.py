@@ -80,7 +80,7 @@ def run_program_batch(
 
     # Run all programs
     if num_threads == "auto":
-        num_threads = min(64, multiprocessing.cpu_count() * 8)
+        num_threads = max(64, multiprocessing.cpu_count() * 8)
     num_threads = min(num_threads, len(batch_arguments))
 
     if num_threads == 1:
