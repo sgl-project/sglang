@@ -111,7 +111,13 @@ class ModelRpcServer(rpyc.Service):
         self.stream_interval = server_args.stream_interval
 
         # Init the FSM cache for constrained generation
-        self.regex_fsm_cache = FSMCache(self.tokenizer)
+        self.regex_fsm_cache = FSMCache(
+            server_args.tokenizer_path,
+            {
+                "tokenizer_mode": server_args.tokenizer_mode,
+                "trust_remote_code": server_args.trust_remote_code,
+            },
+        )
 
         # Init new token estimation
         self.new_token_ratio = min(0.4 * server_args.schedule_conservativeness, 1.0)
@@ -212,6 +218,10 @@ class ModelRpcServer(rpyc.Service):
         req.normalized_logprob_start_len = recv_req.normalized_logprob_start_len
         req.stream = recv_req.stream
         req.tokenizer = self.tokenizer
+
+        # Init regex fsm
+        if req.sampling_params.regex is not None:
+            req.regex_fsm = self.regex_fsm_cache.init_fsm(req.sampling_params.regex)
 
         # Truncate long prompts
         req.input_ids = req.input_ids[: self.model_config.context_len - 1]
@@ -322,11 +332,10 @@ class ModelRpcServer(rpyc.Service):
             self.model_config.vocab_size, self.int_token_logit_bias
         )
 
-        # init the regex fsm before first sampling
+        # Reset regex fsm state before first sampling due to retractions
         for req in batch.reqs:
             if req.sampling_params.regex is not None:
                 req.regex_fsm_state = 0
-                req.regex_fsm = self.regex_fsm_cache.get_fsm(req.sampling_params.regex)
 
         if batch.extend_num_tokens != 0:
             # Forward

@@ -45,7 +45,7 @@ class Req:
 
         # for constrained decoding
         self.regex_fsm = None
-        self.regex_fsm_state = None
+        self.regex_fsm_state = 0
 
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
