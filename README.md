@@ -312,6 +312,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 - Mistral
 - Mixtral
 - LLaVA
+- Qwen
   - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --port 30000`
 - AWQ quantization
 
