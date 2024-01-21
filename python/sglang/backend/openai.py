@@ -78,8 +78,10 @@ class OpenAI(BaseBackend):
         if sampling_params.dtype is None:
             if self.is_chat_model:
                 if not s.text_.endswith("ASSISTANT:"):
-                    raise RuntimeError("This use case is not supported. "
-                        "For OpenAI chat models, sgl.gen must be right after sgl.assistant")
+                    raise RuntimeError(
+                        "This use case is not supported. "
+                        "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
+                    )
                 prompt = s.messages_
             else:
                 prompt = s.text_

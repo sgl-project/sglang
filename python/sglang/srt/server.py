@@ -466,7 +466,7 @@ class Runtime:
         }
 
         pos = 0
-   
+
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.post(url, json=json_data) as response:
@@ -477,7 +477,6 @@ class Runtime:
                     if cur:
                         yield cur
                     pos += len(cur)
-
 
     def __del__(self):
         self.shutdown()
