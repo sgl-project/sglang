@@ -1,7 +1,7 @@
+import logging
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List
-import logging
 
 import numpy as np
 import torch
@@ -12,7 +12,6 @@ from sglang.utils import get_available_gpu_memory
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
-
 
 logger = logging.getLogger("model_runner")
 
@@ -112,7 +111,7 @@ class InputMetadata:
     def init_extend_args(self):
         self.extend_seq_lens = self.seq_lens - self.prefix_lens
         self.extend_start_loc = torch.zeros_like(self.seq_lens)
-        self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], 0)
+        self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
         self.max_extend_len = int(torch.max(self.extend_seq_lens))
 
     @classmethod
@@ -262,7 +261,7 @@ class ModelRunner:
         if model_class is None:
             raise ValueError(f"Unsupported architectures: {architectures}")
 
-        logger.info("load weight begin.")
+        logger.info(f"Rank {self.tp_rank}: load weight begin.")
 
         # Load weights
         linear_method = None
@@ -287,7 +286,7 @@ class ModelRunner:
             )
         self.model = model.eval()
 
-        logger.info("load weight end.")
+        logger.info(f"Rank {self.tp_rank}: load weight end.")
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(
@@ -308,8 +307,9 @@ class ModelRunner:
         self.max_total_num_token = self.profile_max_num_token(total_gpu_memory)
 
         if self.max_total_num_token <= 0:
-            raise RuntimeError("Not enought memory. "
-                "Please try to increase --mem-fraction-static.")
+            raise RuntimeError(
+                "Not enought memory. " "Please try to increase --mem-fraction-static."
+            )
 
         self.req_to_token_pool = ReqToTokenPool(
             int(self.max_total_num_token / self.model_config.context_len * 256),
