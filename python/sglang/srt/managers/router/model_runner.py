@@ -112,7 +112,7 @@ class InputMetadata:
     def init_extend_args(self):
         self.extend_seq_lens = self.seq_lens - self.prefix_lens
         self.extend_start_loc = torch.zeros_like(self.seq_lens)
-        self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], 0)
+        self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
         self.max_extend_len = int(torch.max(self.extend_seq_lens))
 
     @classmethod
