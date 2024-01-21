@@ -75,7 +75,7 @@ def compute_normalized_logprobs(all_logprobs, input_ids, seq_lens, start_loc):
     start.clamp_(min=0, max=logprobs.shape[0] - 1)
     end.clamp_(min=0, max=logprobs.shape[0] - 1)
     sum_logp = logprobs_cumsum[end] - logprobs_cumsum[start] + logprobs[start]
-    return sum_logp / seq_lens
+    return sum_logp / ((seq_lens - 1).clamp(min=1))
 
 
 if __name__ == "__main__":
