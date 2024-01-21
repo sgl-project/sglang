@@ -197,16 +197,7 @@ class StreamExecutor:
             self.stream_var_event = None
 
     def submit(self, expr: SglExpr):
-        if isinstance(expr, (SglGen, SglSelect, SglVarScopeBegin)):
-            self.variable_event[expr.name] = threading.Event()
-            if self.stream:
-                self.stream_var_event[expr.name] = threading.Event()
-        elif isinstance(expr, SglExprList):
-            for e in expr.expr_list:
-                if isinstance(e, (SglGen, SglSelect, SglVarScopeBegin)):
-                    self.variable_event[e.name] = threading.Event()
-                    if self.stream:
-                        self.stream_var_event[e.name] = threading.Event()
+        self._init_var_event(expr)
 
         if self.use_thread:
             self.queue.put(expr)
@@ -466,6 +457,15 @@ class StreamExecutor:
 
         src_rids = [state.stream_executor.sid for state in expr.states]
         self.backend.concatenate_and_append(src_rids, self.sid)
+
+    def _init_var_event(self, expr):
+        if isinstance(expr, (SglGen, SglSelect, SglVarScopeBegin)):
+            self.variable_event[expr.name] = threading.Event()
+            if self.stream:
+                self.stream_var_event[expr.name] = threading.Event()
+        elif isinstance(expr, SglExprList):
+            for e in expr.expr_list:
+                self._init_var_event(e)
 
     def _resolve_sampling_params(self, sampling_params):
         clone = None
