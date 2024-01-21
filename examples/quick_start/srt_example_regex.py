@@ -1,13 +1,16 @@
 from sglang import function, gen, set_default_backend, Runtime
 
 
+IP_ADDR_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
+
+
 @function
 def regex_gen(s):
     s += "Q: What is the IP address of the Google DNS servers?\n"
     s += "A: " + gen(
         "answer",
         temperature=0,
-        regex=r"((25[0-5]|2[0-4]\d|[01]?\d\d?).){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)",
+        regex=IP_ADDR_REGEX,
     )
 
 
