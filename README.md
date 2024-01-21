@@ -327,7 +327,7 @@ Learn more [here](docs/benchmark_results.md).
 
 ## Roadmap
 - [ ] Function call APIs
-- [ ] S-LoRA
+- [ ] S-LoRA (expect by Feb. 5)
 - [ ] Support more models
 - [ ] Support more hardware backends
 
