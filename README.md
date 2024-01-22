@@ -34,7 +34,9 @@ pip install -e "python[all]"
 ```
 
 ### Notes
-- If you are using older GPUs (NVIDIA T4, V100), please use `pip install "triton>=2.2.0"` to avoid some bugs in the triton compiler
+- If you are using older GPUs (NVIDIA V100, T4), please pick the correct triton compiler version to avoid some known bugs.
+  - For NVIDIA T4, please use `pip install "triton>=2.2.0"`.
+  - For NVIDIA V100, please install the [nightly](https://triton-lang.org/main/getting-started/installation.html) version.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install sglang[openai]`
 
 ## Quick Start
