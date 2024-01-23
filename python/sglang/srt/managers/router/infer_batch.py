@@ -311,9 +311,7 @@ class Batch:
         self.prefix_lens = None
         self.position_ids_offsets = self.position_ids_offsets[new_indices]
         self.out_cache_loc = self.out_cache_cont_start = self.out_cache_cont_end = None
-        self.return_logprob = any(
-            req.return_logprob for req in self.reqs
-        )
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
 
         for item in [
             "temperatures",
@@ -337,9 +335,7 @@ class Batch:
             [self.position_ids_offsets, other.position_ids_offsets]
         )
         self.out_cache_loc = self.out_cache_cont_start = self.out_cache_cont_end = None
-        self.return_logprob = any(
-            req.return_logprob for req in self.reqs
-        )
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
 
         for item in [
             "temperatures",

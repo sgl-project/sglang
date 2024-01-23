@@ -436,9 +436,7 @@ class ModelRunner:
             image_offsets,
         )
 
-    def forward(
-        self, batch: Batch, forward_mode: ForwardMode, return_logprob=False
-    ):
+    def forward(self, batch: Batch, forward_mode: ForwardMode, return_logprob=False):
         if self.is_multimodal_model and forward_mode == ForwardMode.EXTEND:
             kwargs = {
                 "input_ids": batch.input_ids,

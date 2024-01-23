@@ -361,7 +361,7 @@ class ModelRpcServer(rpyc.Service):
             req.check_finished()
 
             if logprobs is not None:
-                req.logprob = logprobs[pt:pt + req.extend_input_len-1]
+                req.logprob = logprobs[pt : pt + req.extend_input_len - 1]
                 req.normalized_logprob = normalized_logprobs[i]
                 pt += req.extend_input_len
 

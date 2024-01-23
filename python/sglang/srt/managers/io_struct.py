@@ -53,9 +53,7 @@ class GenerateReqInput:
             if self.logprob_start_len is None:
                 self.logprob_start_len = [0] * num
             elif not isinstance(self.logprob_start_len, list):
-                self.logprob_start_len = [
-                    self.logprob_start_len
-                ] * num
+                self.logprob_start_len = [self.logprob_start_len] * num
 
 
 @dataclass

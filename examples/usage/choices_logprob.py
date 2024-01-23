@@ -25,7 +25,7 @@ def main():
     # Run a batch
     questions = [
         "What is 5 + 6?",
-        "Who is Micheal Jordan?",
+        "Who is Michael Jordan?",
     ]
     states = tool_use.run_batch([{"question": q} for q in questions])
     for question, state in zip(questions, states):

@@ -62,7 +62,9 @@ class LogitsProcessor(nn.Module):
             start.clamp_(min=0, max=logprobs.shape[0] - 1)
             end.clamp_(min=0, max=logprobs.shape[0] - 1)
             sum_logp = logprobs_cumsum[end] - logprobs_cumsum[start] + logprobs[start]
-            normalized_logprobs = sum_logp / ((input_metadata.extend_seq_lens - 1).clamp(min=1))
+            normalized_logprobs = sum_logp / (
+                (input_metadata.extend_seq_lens - 1).clamp(min=1)
+            )
 
             last_logits = logits[last_index]
             return last_logits, logprobs, normalized_logprobs

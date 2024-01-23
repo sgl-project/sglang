@@ -157,7 +157,9 @@ class RuntimeEndpoint(BaseBackend):
         res = http_request(self.base_url + "/generate", json=data)
         assert res.status_code == 200
         obj = res.json()
-        normalized_prompt_logprob = [r["meta_info"]["normalized_prompt_logprob"] for r in obj]
+        normalized_prompt_logprob = [
+            r["meta_info"]["normalized_prompt_logprob"] for r in obj
+        ]
         prompt_logprob = [r["meta_info"]["prompt_logprob"] for r in obj]
 
         decision = choices[np.argmax(normalized_prompt_logprob)]
