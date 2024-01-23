@@ -33,7 +33,7 @@ class LogitsProcessor(nn.Module):
             if self.tp_size > 1:
                 last_logits = tensor_model_parallel_all_gather(last_logits)
             last_logits = last_logits[:, : self.config.vocab_size]
-            return last_logits, None, None
+            return last_logits, (None, None)
         else:
             assert input_metadata.forward_mode != ForwardMode.DECODE
             last_index = (
@@ -67,7 +67,7 @@ class LogitsProcessor(nn.Module):
             )
 
             last_logits = logits[last_index]
-            return last_logits, logprobs, normalized_logprobs
+            return last_logits, (logprobs, normalized_logprobs)
 
 
 if __name__ == "__main__":

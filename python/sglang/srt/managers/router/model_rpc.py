@@ -339,7 +339,7 @@ class ModelRpcServer(rpyc.Service):
 
         if batch.extend_num_tokens != 0:
             # Forward
-            logits, logprobs, normalized_logprobs = self.model_runner.forward(
+            logits, (logprobs, normalized_logprobs) = self.model_runner.forward(
                 batch, ForwardMode.EXTEND, batch.return_logprob
             )
             # print("extend logits", logits)
