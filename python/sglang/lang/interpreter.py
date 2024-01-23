@@ -486,6 +486,12 @@ class StreamExecutor:
                 if clone is None:
                     clone = self.default_sampling_para.clone()
                 setattr(clone, item, value)
+
+        if self.chat_template.stop_str:
+            if not clone:
+                clone = self.default_sampling_para.clone()
+            clone.stop += self.chat_template.stop_str
+
         return clone or self.default_sampling_para
 
     def __del__(self):

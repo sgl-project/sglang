@@ -1,6 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple, Optional
 
 
 class ChatTemplateStyle(Enum):
@@ -13,6 +13,7 @@ class ChatTemplate:
     name: str
     default_system_prompt: str
     role_prefix_and_suffix: Dict[str, Tuple[str]]
+    stop_str: List[str] = ()
     image_token: str = "<image>"
     style: ChatTemplateStyle = ChatTemplateStyle.PLAIN
 
@@ -110,6 +111,7 @@ register_chat_template(
             "assistant": ("<|im_start|>assistant\n", "\n<|im_end|>\n"),
         },
         style=ChatTemplateStyle.PLAIN,
+        stop_str=('<|im_end|>',)
     )
 )
 
