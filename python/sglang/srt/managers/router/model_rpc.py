@@ -356,7 +356,7 @@ class ModelRpcServer(rpyc.Service):
         # Check finish condition
         reqs = batch.reqs
         pt = 0
-        for i, req in enumerqte(reqs):
+        for i, req in enumerate(reqs):
             req.output_ids = [next_token_ids[i]]
             req.check_finished()
 
