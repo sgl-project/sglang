@@ -240,6 +240,7 @@ class ModelRunner:
         from sglang.srt.models.llama2 import LlamaForCausalLM
         from sglang.srt.models.llava import LlavaLlamaForCausalLM
         from sglang.srt.models.mixtral import MixtralForCausalLM
+        from sglang.srt.models.qwen import QWenLMHeadModel
 
         # Select model class
         architectures = getattr(self.model_config.hf_config, "architectures", [])
@@ -257,6 +258,9 @@ class ModelRunner:
                 break
             if arch == "MixtralForCausalLM":
                 model_class = MixtralForCausalLM
+                break
+            if arch == "QWenLMHeadModel":
+                model_class = QWenLMHeadModel
                 break
         if model_class is None:
             raise ValueError(f"Unsupported architectures: {architectures}")
