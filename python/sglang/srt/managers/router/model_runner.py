@@ -45,7 +45,7 @@ class InputMetadata:
     out_cache_cont_end: torch.Tensor = None
 
     other_kv_index: torch.Tensor = None
-    return_normalized_logprob: bool = False
+    return_logprob: bool = False
 
     # for flashinfer
     use_flashinfer: bool = False
@@ -127,7 +127,7 @@ class InputMetadata:
         out_cache_loc,
         out_cache_cont_start=None,
         out_cache_cont_end=None,
-        return_normalized_logprob=False,
+        return_logprob=False,
     ):
         batch_size = len(req_pool_indices)
         start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
@@ -175,7 +175,7 @@ class InputMetadata:
             out_cache_loc=out_cache_loc,
             out_cache_cont_start=out_cache_cont_start,
             out_cache_cont_end=out_cache_cont_end,
-            return_normalized_logprob=return_normalized_logprob,
+            return_logprob=return_logprob,
             other_kv_index=other_kv_index,
         )
 
@@ -337,7 +337,7 @@ class ModelRunner:
         prefix_lens,
         position_ids_offsets,
         out_cache_loc,
-        return_normalized_logprob,
+        return_logprob,
     ):
         input_metadata = InputMetadata.create(
             self,
@@ -348,7 +348,7 @@ class ModelRunner:
             prefix_lens=prefix_lens,
             position_ids_offsets=position_ids_offsets,
             out_cache_loc=out_cache_loc,
-            return_normalized_logprob=return_normalized_logprob,
+            return_logprob=return_logprob,
         )
         return self.model.forward(input_ids, input_metadata.positions, input_metadata)
 
@@ -361,7 +361,7 @@ class ModelRunner:
         prefix_lens,
         position_ids_offsets,
         out_cache_loc,
-        return_normalized_logprob,
+        return_logprob,
     ):
         input_metadata = InputMetadata.create(
             self,
@@ -372,7 +372,7 @@ class ModelRunner:
             prefix_lens=prefix_lens,
             position_ids_offsets=position_ids_offsets,
             out_cache_loc=out_cache_loc,
-            return_normalized_logprob=return_normalized_logprob,
+            return_logprob=return_logprob,
         )
         return self.model.forward(input_ids, input_metadata.positions, input_metadata)
 
@@ -415,7 +415,7 @@ class ModelRunner:
         prefix_lens,
         position_ids_offsets,
         out_cache_loc,
-        return_normalized_logprob,
+        return_logprob,
     ):
         input_metadata = InputMetadata.create(
             self,
@@ -426,7 +426,7 @@ class ModelRunner:
             prefix_lens=prefix_lens,
             position_ids_offsets=position_ids_offsets,
             out_cache_loc=out_cache_loc,
-            return_normalized_logprob=return_normalized_logprob,
+            return_logprob=return_logprob,
         )
         return self.model.forward(
             input_ids,
@@ -436,9 +436,7 @@ class ModelRunner:
             image_offsets,
         )
 
-    def forward(
-        self, batch: Batch, forward_mode: ForwardMode, return_normalized_logprob=False
-    ):
+    def forward(self, batch: Batch, forward_mode: ForwardMode, return_logprob=False):
         if self.is_multimodal_model and forward_mode == ForwardMode.EXTEND:
             kwargs = {
                 "input_ids": batch.input_ids,
@@ -450,7 +448,7 @@ class ModelRunner:
                 "position_ids_offsets": batch.position_ids_offsets,
                 "out_cache_loc": batch.out_cache_loc,
             }
-            kwargs["return_normalized_logprob"] = return_normalized_logprob
+            kwargs["return_logprob"] = return_logprob
             return self.forward_extend_multi_modal(**kwargs)
         else:
             kwargs = {
@@ -467,10 +465,10 @@ class ModelRunner:
             kwargs["out_cache_cont_end"] = batch.out_cache_cont_end
             return self.forward_decode(**kwargs)
         elif forward_mode == ForwardMode.EXTEND:
-            kwargs["return_normalized_logprob"] = return_normalized_logprob
+            kwargs["return_logprob"] = return_logprob
             return self.forward_extend(**kwargs)
         elif forward_mode == ForwardMode.PREFILL:
-            kwargs["return_normalized_logprob"] = return_normalized_logprob
+            kwargs["return_logprob"] = return_logprob
             return self.forward_prefill(**kwargs)
         else:
             raise ValueError(f"Invaid forward mode: {forward_mode}")

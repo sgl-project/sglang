@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable, Dict, List, Tuple, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 
 class ChatTemplateStyle(Enum):
@@ -111,7 +111,7 @@ register_chat_template(
             "assistant": ("<|im_start|>assistant\n", "\n<|im_end|>\n"),
         },
         style=ChatTemplateStyle.PLAIN,
-        stop_str=('<|im_end|>',)
+        stop_str=("<|im_end|>",),
     )
 )
 

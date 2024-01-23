@@ -9,8 +9,8 @@ class GenerateReqInput:
     image_data: Optional[Union[List[str], str]] = None
     sampling_params: Union[List[Dict], Dict] = None
     rid: Optional[Union[List[str], str]] = None
-    return_normalized_logprob: Optional[Union[List[bool], bool]] = None
-    normalized_logprob_start_len: Optional[Union[List[int], int]] = None
+    return_logprob: Optional[Union[List[bool], bool]] = None
+    logprob_start_len: Optional[Union[List[int], int]] = None
     stream: bool = False
 ```
 
