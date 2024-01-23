@@ -21,7 +21,7 @@ class ModelConfig:
         self.context_len = get_context_length(self.hf_config)
         self.head_dim = self.hf_config.hidden_size // self.hf_config.num_attention_heads
         self.num_attention_heads = self.hf_config.num_attention_heads
-        num_key_value_heads = getattr(self.hf_config, "num_key_value_heads", None)
+        self.num_key_value_heads = getattr(self.hf_config, "num_key_value_heads", None)
         if num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_config.hidden_size
