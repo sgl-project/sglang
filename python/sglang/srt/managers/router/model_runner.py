@@ -257,6 +257,7 @@ class ModelRunner:
                 break
             if arch == "QWenLMHeadModel":
                 model_class = QWenLMHeadModel
+                break
         if model_class is None:
             raise ValueError(f"Unsupported architectures: {architectures}")
 
