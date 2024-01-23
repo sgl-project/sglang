@@ -151,15 +151,17 @@ class RuntimeEndpoint(BaseBackend):
             "text": [s.text_ + c for c in choices],
             "sampling_params": {"max_new_tokens": 0},
             "return_logprob": True,
-            "logprob_start_len": prompt_len,
+            "logprob_start_len": max(prompt_len - 2, 0),
         }
         self._add_images(s, data)
         res = http_request(self.base_url + "/generate", json=data)
         assert res.status_code == 200
-        logps = [r["meta_info"]["normalized_prompt_logprob"] for r in res.json()]
+        obj = res.json()
+        normalized_prompt_logprob = [r["meta_info"]["normalized_prompt_logprob"] for r in obj]
+        prompt_logprob = [r["meta_info"]["prompt_logprob"] for r in obj]
 
-        decision = choices[np.argmax(logps)]
-        return decision, logps
+        decision = choices[np.argmax(normalized_prompt_logprob)]
+        return decision, normalized_prompt_logprob, prompt_logprob
 
     def concatenate_and_append(self, src_rids: List[str], dst_rid: str):
         res = http_request(

@@ -209,7 +209,7 @@ class OpenAI(BaseBackend):
             prompt_tokens.append(ret_token)
 
         decision = choices[np.argmax(scores)]
-        return decision, scores
+        return decision, scores, scores
 
 
 def openai_completion(client, is_chat=None, prompt=None, **kwargs):

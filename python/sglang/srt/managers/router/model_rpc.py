@@ -351,7 +351,7 @@ class ModelRpcServer(rpyc.Service):
             next_token_ids = next_token_ids.cpu().tolist()
         else:
             next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
-            normalized_logprobs = None
+            logprobs = normalized_logprobs = None
 
         # Check finish condition
         reqs = batch.reqs

@@ -80,7 +80,7 @@ def run_program_batch(
 
     # Run all programs
     if num_threads == "auto":
-        num_threads = max(64, multiprocessing.cpu_count() * 8)
+        num_threads = max(96, multiprocessing.cpu_count() * 16)
     num_threads = min(num_threads, len(batch_arguments))
 
     if num_threads == 1:
@@ -364,10 +364,14 @@ class StreamExecutor:
             self.stream_var_event[name].set()
 
     def _execute_select(self, expr: SglSelect):
-        decision, scores = self.backend.select(self, expr.choices, expr.temperature)
+        decision, normalized_prompt_logprob, prompt_logprob = self.backend.select(self, expr.choices, expr.temperature)
         if expr.name is not None:
             name = expr.name
             self.variables[name] = decision
+            self.meta_info[name] = {
+                "normalized_prompt_logprob": normalized_prompt_logprob,
+                "prompt_logprob": prompt_logprob,
+            }
             self.variable_event[name].set()
         self.text_ += decision
 
