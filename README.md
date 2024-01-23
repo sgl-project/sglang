@@ -235,7 +235,7 @@ curl http://localhost:30000/generate \
   -H "Content-Type: application/json" \
   -d '{
     "text": "Once upon a time,",
-    "parameters": {
+    "sampling_params": {
       "max_new_tokens": 16,
       "temperature": 0
     }
