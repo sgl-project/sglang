@@ -69,6 +69,8 @@ state = multi_turn_question.run(
 
 for m in state.messages():
     print(m["role"], ":", m["content"])
+
+print(state["answer_1"])
 ```
 
 ### Using Local Models
@@ -99,6 +101,8 @@ state = multi_turn_question.run(
 
 for m in state.messages():
     print(m["role"], ":", m["content"])
+
+print(state["answer_1"])
 ```
 
 ### More Examples

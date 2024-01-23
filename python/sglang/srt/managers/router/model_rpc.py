@@ -214,8 +214,8 @@ class ModelRpcServer(rpyc.Service):
                 req.input_ids, pad_value
             )
         req.sampling_params = recv_req.sampling_params
-        req.return_normalized_logprob = recv_req.return_normalized_logprob
-        req.normalized_logprob_start_len = recv_req.normalized_logprob_start_len
+        req.return_logprob = recv_req.return_logprob
+        req.logprob_start_len = recv_req.logprob_start_len
         req.stream = recv_req.stream
         req.tokenizer = self.tokenizer
 
@@ -240,9 +240,9 @@ class ModelRpcServer(rpyc.Service):
 
         for req in self.forward_queue:
             prefix_indices, last_node = self.tree_cache.match_prefix(req.input_ids)
-            if req.return_normalized_logprob:
-                prefix_indices = prefix_indices[: req.normalized_logprob_start_len]
-            req.adjust_input_len = len(req.input_ids) - len(prefix_indices)
+            if req.return_logprob:
+                prefix_indices = prefix_indices[: req.logprob_start_len]
+            req.extend_input_len = len(req.input_ids) - len(prefix_indices)
             req.prefix_indices = prefix_indices
             req.last_node = last_node
 
@@ -267,32 +267,32 @@ class ModelRpcServer(rpyc.Service):
             )
 
         for req in self.forward_queue:
-            if req.return_normalized_logprob:
+            if req.return_logprob:
                 # Need at least two tokens to compute normalized logprob
-                if req.adjust_input_len < 2:
-                    delta = 2 - req.adjust_input_len
-                    req.adjust_input_len += delta
+                if req.extend_input_len < 2:
+                    delta = 2 - req.extend_input_len
+                    req.extend_input_len += delta
                     req.prefix_indices = req.prefix_indices[:-delta]
                     if req.image_offset is not None:
                         req.image_offset += delta
-            if req.adjust_input_len == 0 and req.max_new_tokens() > 0:
+            if req.extend_input_len == 0 and req.max_new_tokens() > 0:
                 # Need at least one token to compute logits
-                req.adjust_input_len = 1
+                req.extend_input_len = 1
                 req.prefix_indices = req.prefix_indices[:-1]
                 if req.image_offset is not None:
                     req.image_offset += 1
 
             if (
-                req.adjust_input_len + req.max_new_tokens() + new_batch_total_tokens
+                req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
                 < available_size
-                and req.adjust_input_len + new_batch_input_tokens
+                and req.extend_input_len + new_batch_input_tokens
                 < self.max_prefill_num_token
             ):
                 delta = self.tree_cache.inc_ref_counter(req.last_node)
                 available_size += delta
 
                 if not (
-                    req.adjust_input_len + req.max_new_tokens() + new_batch_total_tokens
+                    req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
                     < available_size
                 ):
                     delta = self.tree_cache.dec_ref_counter(req.last_node)
@@ -301,9 +301,9 @@ class ModelRpcServer(rpyc.Service):
                     self.token_to_kv_pool.add_refs(req.prefix_indices)
                     can_run_list.append(req)
                     new_batch_total_tokens += (
-                        req.adjust_input_len + req.max_new_tokens()
+                        req.extend_input_len + req.max_new_tokens()
                     )
-                    new_batch_input_tokens += req.adjust_input_len
+                    new_batch_input_tokens += req.extend_input_len
 
         if len(can_run_list) == 0:
             return None
@@ -339,27 +339,31 @@ class ModelRpcServer(rpyc.Service):
 
         if batch.extend_num_tokens != 0:
             # Forward
-            logits, normalized_logprobs = self.model_runner.forward(
-                batch, ForwardMode.EXTEND, batch.return_normalized_logprob
+            logits, (logprobs, normalized_logprobs) = self.model_runner.forward(
+                batch, ForwardMode.EXTEND, batch.return_logprob
             )
             # print("extend logits", logits)
-            if normalized_logprobs is not None:
+            if logprobs is not None:
+                logprobs = logprobs.cpu().tolist()
                 normalized_logprobs = normalized_logprobs.cpu().tolist()
 
             next_token_ids, next_token_probs = batch.sample(logits)
             next_token_ids = next_token_ids.cpu().tolist()
         else:
             next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
-            normalized_logprobs = None
+            logprobs = normalized_logprobs = None
 
         # Check finish condition
         reqs = batch.reqs
-        for i in range(len(reqs)):
-            reqs[i].output_ids = [next_token_ids[i]]
-            reqs[i].check_finished()
+        pt = 0
+        for i, req in enumerate(reqs):
+            req.output_ids = [next_token_ids[i]]
+            req.check_finished()
 
-            if normalized_logprobs is not None:
-                reqs[i].normalized_logprob = normalized_logprobs[i]
+            if logprobs is not None:
+                req.logprob = logprobs[pt : pt + req.extend_input_len - 1]
+                req.normalized_logprob = normalized_logprobs[i]
+                pt += req.extend_input_len
 
         self.handle_finished_requests(batch)
 
@@ -427,8 +431,9 @@ class ModelRpcServer(rpyc.Service):
                     "prompt_tokens": len(req.input_ids),
                     "completion_tokens": len(req.output_ids),
                 }
-                if req.return_normalized_logprob:
-                    meta_info["normalized_logprob"] = req.normalized_logprob
+                if req.return_logprob:
+                    meta_info["prompt_logprob"] = req.logprob
+                    meta_info["normalized_prompt_logprob"] = req.normalized_logprob
                 output_meta_info.append(meta_info)
                 output_finished.append(req.finished)
 

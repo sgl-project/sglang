@@ -28,8 +28,8 @@ class Req:
         self.pixel_values = None
         self.image_offset = 0
         self.sampling_params = None
-        self.return_normalized_logprob = False
-        self.normalized_logprob_start_len = 0
+        self.return_logprob = False
+        self.logprob_start_len = 0
         self.stream = False
 
         self.tokenizer = None
@@ -37,10 +37,11 @@ class Req:
         self.finish_reason = None
         self.hit_stop_str = None
 
-        self.adjust_input_len = 0
+        self.extend_input_len = 0
         self.prefix_indices = []
         self.last_node = None
 
+        self.logprob = None
         self.normalized_logprob = None
 
         # for constrained decoding
@@ -99,7 +100,7 @@ class Batch:
     out_cache_loc: torch.Tensor = None
     out_cache_cont_start: torch.Tensor = None
     out_cache_cont_end: torch.Tensor = None
-    return_normalized_logprob: bool = False
+    return_logprob: bool = False
 
     # for multimodal
     pixel_values: List[torch.Tensor] = None
@@ -119,14 +120,14 @@ class Batch:
 
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
-        return_normalized_logprob = any(req.return_normalized_logprob for req in reqs)
+        return_logprob = any(req.return_logprob for req in reqs)
 
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
-            return_normalized_logprob=return_normalized_logprob,
+            return_logprob=return_logprob,
         )
 
     def is_empty(self):
@@ -257,7 +258,7 @@ class Batch:
             self.tree_cache.dec_ref_counter(req.last_node)
             req.prefix_indices = None
             req.last_node = None
-            req.adjust_input_len = 0
+            req.extend_input_len = 0
             req.output_ids = []
             # TODO: apply more fine-grained retraction
 
@@ -310,9 +311,7 @@ class Batch:
         self.prefix_lens = None
         self.position_ids_offsets = self.position_ids_offsets[new_indices]
         self.out_cache_loc = self.out_cache_cont_start = self.out_cache_cont_end = None
-        self.return_normalized_logprob = any(
-            req.return_normalized_logprob for req in self.reqs
-        )
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
 
         for item in [
             "temperatures",
@@ -336,9 +335,7 @@ class Batch:
             [self.position_ids_offsets, other.position_ids_offsets]
         )
         self.out_cache_loc = self.out_cache_cont_start = self.out_cache_cont_end = None
-        self.return_normalized_logprob = any(
-            req.return_normalized_logprob for req in self.reqs
-        )
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
 
         for item in [
             "temperatures",
