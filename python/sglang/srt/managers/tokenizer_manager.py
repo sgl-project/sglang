@@ -132,8 +132,8 @@ class TokenizerManager:
                 pixel_values=pixel_values,
                 image_hash=image_hash,
                 sampling_params=sampling_params,
-                return_normalized_logprob=obj.return_normalized_logprob,
-                normalized_logprob_start_len=obj.normalized_logprob_start_len,
+                return_logprob=obj.return_logprob,
+                logprob_start_len=obj.logprob_start_len,
                 stream=obj.stream,
             )
             self.send_to_router.send_pyobj(tokenized_obj)
@@ -173,8 +173,8 @@ class TokenizerManager:
                     pixel_values=pixel_values,
                     image_hash=image_hash,
                     sampling_params=sampling_params,
-                    return_normalized_logprob=obj.return_normalized_logprob[i],
-                    normalized_logprob_start_len=obj.normalized_logprob_start_len[i],
+                    return_logprob=obj.return_logprob[i],
+                    logprob_start_len=obj.logprob_start_len[i],
                     stream=obj.stream,
                 )
                 self.send_to_router.send_pyobj(tokenized_obj)

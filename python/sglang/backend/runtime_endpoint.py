@@ -150,13 +150,13 @@ class RuntimeEndpoint(BaseBackend):
         data = {
             "text": [s.text_ + c for c in choices],
             "sampling_params": {"max_new_tokens": 0},
-            "return_normalized_logprob": True,
-            "normalized_logprob_start_len": prompt_len,
+            "return_logprob": True,
+            "logprob_start_len": prompt_len,
         }
         self._add_images(s, data)
         res = http_request(self.base_url + "/generate", json=data)
         assert res.status_code == 200
-        logps = [r["meta_info"]["normalized_logprob"] for r in res.json()]
+        logps = [r["meta_info"]["normalized_prompt_logprob"] for r in res.json()]
 
         decision = choices[np.argmax(logps)]
         return decision, logps
