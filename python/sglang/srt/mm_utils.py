@@ -1,7 +1,8 @@
+# Source: https://github.com/haotian-liu/LLaVA/blob/main/llava/mm_utils.py
+import ast
 import base64
 import math
 from io import BytesIO
-import ast
 
 import numpy as np
 from PIL import Image
@@ -140,7 +141,7 @@ def process_anyres_image(image, processor, grid_pinpoints):
     best_resolution = select_best_resolution(image.size, possible_resolutions)
     image_padded = resize_and_pad_image(image, best_resolution)
 
-    patches = divide_to_patches(image_padded, processor.crop_size['height'])
+    patches = divide_to_patches(image_padded, processor.crop_size["height"])
 
     image_original_resize = image.resize(
         (processor.size["shortest_edge"], processor.size["shortest_edge"])
