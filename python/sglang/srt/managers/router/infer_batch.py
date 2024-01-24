@@ -26,6 +26,7 @@ class Req:
         self.input_ids = []
         self.output_ids = []
         self.pixel_values = None
+        self.image_size = None
         self.image_offset = 0
         self.sampling_params = None
         self.return_logprob = False
@@ -104,6 +105,7 @@ class Batch:
 
     # for multimodal
     pixel_values: List[torch.Tensor] = None
+    image_sizes: List[List[int]] = None
     image_offsets: List[int] = None
 
     # other arguments for control
@@ -195,6 +197,7 @@ class Batch:
             flatten_input_ids, dtype=torch.int32, device=device
         )
         self.pixel_values = [r.pixel_values for r in reqs]
+        self.image_sizes = [r.image_size for r in reqs]
         self.image_offsets = [
             r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
         ]
