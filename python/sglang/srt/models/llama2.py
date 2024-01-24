@@ -222,13 +222,6 @@ class LlamaModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # for llava-hd
-        if hasattr(config, "mm_vision_tower"):
-            if "unpad" in getattr(config, "mm_patch_merge_type", ""):
-                self.image_newline = nn.Parameter(
-                    torch.empty(config.hidden_size, dtype=torch.float16)
-                )
-
     def forward(
         self,
         input_ids: torch.Tensor,

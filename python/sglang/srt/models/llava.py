@@ -1,7 +1,5 @@
 """Inference-only LLaVa model compatible with HuggingFace weights."""
-import json
-import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -12,15 +10,43 @@ from sglang.srt.mm_utils import (
     unpad_image,
     unpad_image_shape,
 )
-from sglang.srt.models.llama2 import LlamaForCausalLM
+from sglang.srt.models.llama2 import LlamaForCausalLM, LlamaModel
 from torch import nn
-from transformers import CLIPImageProcessor, CLIPVisionModel, LlavaConfig
+from transformers import CLIPVisionModel, LlamaConfig, LlavaConfig
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
+
+
+class LlamaModelLlava(LlamaModel):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        linear_method: Optional[LinearMethodBase] = None,
+    ) -> None:
+        super().__init__(config, linear_method)
+
+        # llava-hd
+        if hasattr(config, "mm_vision_tower"):
+            if "unpad" in getattr(config, "mm_patch_merge_type", ""):
+                self.image_newline = nn.Parameter(
+                    torch.empty(config.hidden_size, dtype=torch.float16)
+                )
+
+
+class LlamaForCausalLMLlava(LlamaForCausalLM):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        linear_method: Optional[LinearMethodBase] = None,
+    ) -> None:
+        super().__init__(config, linear_method)
+
+        # Replace the standard model with the llava version
+        self.model = LlamaModelLlava(config, linear_method)
 
 
 class LlavaLlamaForCausalLM(nn.Module):
@@ -35,7 +61,7 @@ class LlavaLlamaForCausalLM(nn.Module):
         self.config.vision_config.hidden_size = config.mm_hidden_size
         self.config.text_config.hidden_size = config.hidden_size
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = LlamaForCausalLM(config, linear_method)
+        self.language_model = LlamaForCausalLMLlava(config, linear_method)
 
     def pad_input_ids(self, input_ids, pad_value, pt_shape=None, image_size=None):
         new_image_feature_len = self.image_feature_len
