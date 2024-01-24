@@ -263,13 +263,14 @@ class LlavaLlamaForCausalLM(nn.Module):
         projector_weights = {
             "model.mm_projector.0": "multi_modal_projector.linear_1",
             "model.mm_projector.2": "multi_modal_projector.linear_2",
+            "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
         }
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in hf_model_weights_iterator(
             model_name_or_path, cache_dir, load_format, revision
         ):
             # FIXME: why projector weights read two times?
-            if "projector" in name:
+            if "projector" in name or "vision_tower" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
