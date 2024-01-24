@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import dataclasses
+import multiprocessing as mp
 import os
 from typing import List
 
@@ -101,7 +102,9 @@ class TokenizerManager:
             self.tokenizer = self.processor.tokenizer
             os.environ["TOKENIZERS_PARALLELISM"] = "false"
             self.executor = concurrent.futures.ProcessPoolExecutor(
-                initializer=init_global_processor, initargs=(server_args,)
+                initializer=init_global_processor,
+                mp_context=mp.get_context("fork"),
+                initargs=(server_args,),
             )
         else:
             self.tokenizer = get_tokenizer(

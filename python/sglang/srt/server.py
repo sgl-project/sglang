@@ -425,8 +425,6 @@ class Runtime:
             random_seed=random_seed,
             log_level=log_level,
         )
-        import torch
-        torch.multiprocessing.set_start_method("spawn", force=True)
 
         self.url = self.server_args.url()
         self.generate_url = (

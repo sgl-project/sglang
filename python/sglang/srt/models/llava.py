@@ -34,9 +34,10 @@ class LlavaLlamaForCausalLM(nn.Module):
         self.config.text_config.hidden_size = config.hidden_size
         self.multi_modal_projector = LlavaMultiModalProjector(config)
         self.language_model = LlamaForCausalLM(config, linear_method)
-        if "unpad" in getattr(config, "mm_patch_merge_type"):
+        if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
-                    torch.empty(config.text_config.hidden_size, dtype=torch.float16))
+                torch.empty(config.text_config.hidden_size, dtype=torch.float16)
+            )
 
     def pad_input_ids(self, input_ids, pad_value, pt_shape=None, image_size=None):
         new_image_feature_len = self.image_feature_len
