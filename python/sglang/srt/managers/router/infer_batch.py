@@ -23,6 +23,7 @@ class FinishReason(Enum):
 class Req:
     def __init__(self, rid):
         self.rid = rid
+        self.input_text = None
         self.input_ids = []
         self.output_ids = []
         self.pixel_values = None
@@ -48,9 +49,43 @@ class Req:
         # for constrained decoding
         self.regex_fsm = None
         self.regex_fsm_state = 0
+        self.fast_forward_map = None
+        self.output_and_fast_forward_str = ""
 
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
+
+    def tokenize_fast_forward(self, fast_forward_str, next_state):
+        old_output_str = self.tokenizer.decode(self.output_ids)
+        if self.tokenizer.convert_ids_to_tokens(self.output_ids[0]).startswith("▁"):
+            old_output_str = " " + old_output_str
+        new_input_string = (
+            self.input_text
+            + self.output_and_fast_forward_str
+            + old_output_str
+            + fast_forward_str
+        )
+        new_input_ids = self.tokenizer.encode(new_input_string)
+        fast_forward_tokens_len = (
+            len(new_input_ids) - len(self.input_ids) - len(self.output_ids)
+        )
+        # print("=" * 100)
+        # print(f"Catch fast forward:\n{fast_forward_str}")
+        # print(self.tokenizer.convert_ids_to_tokens(self.input_ids))
+        # print(self.tokenizer.convert_ids_to_tokens(new_input_ids))
+
+        self.input_ids = new_input_ids
+        self.output_ids = []
+        self.sampling_params.max_new_tokens = max(
+            self.sampling_params.max_new_tokens - fast_forward_tokens_len, 0
+        )
+        self.regex_fsm_state = next_state
+        self.output_and_fast_forward_str = (
+            self.output_and_fast_forward_str + old_output_str + fast_forward_str
+        )
+
+        # print(f"Output and fast forward str:\n{self.output_and_fast_forward_str}")
+        # print("*" * 100)
 
     def check_finished(self):
         if self.finished:
@@ -263,6 +298,8 @@ class Batch:
             req.last_node = None
             req.extend_input_len = 0
             req.output_ids = []
+            req.regex_fsm_state = 0
+
             # TODO: apply more fine-grained retraction
 
             token_indices = self.req_to_token_pool.req_to_token[
@@ -273,6 +310,46 @@ class Batch:
         self.filter_batch(sorted_indices)
 
         return retracted_reqs
+
+    def check_for_fast_forward(self):
+        fast_forward_reqs = []
+        filter_indices = [i for i in range(len(self.reqs))]
+
+        req_pool_indices_cpu = None
+
+        for i, req in enumerate(self.reqs):
+            if req.fast_forward_map is not None:
+                res = req.fast_forward_map.fast_forward(req.regex_fsm_state)
+                if res is not None:
+                    fast_forward_str, next_state = res
+                    if len(fast_forward_str) <= 1:
+                        continue
+
+                    # insert the old request into tree_cache
+                    token_ids_in_memory = tuple(req.input_ids + req.output_ids)[:-1]
+                    if req_pool_indices_cpu is None:
+                        req_pool_indices_cpu = self.req_pool_indices.cpu().tolist()
+                    req_pool_idx = req_pool_indices_cpu[i]
+                    indices = self.req_to_token_pool.req_to_token[
+                        req_pool_idx, : len(token_ids_in_memory)
+                    ]
+                    prefix_len = self.tree_cache.insert(
+                        token_ids_in_memory, indices.clone()
+                    )
+                    self.token_to_kv_pool.free(indices[:prefix_len])
+                    self.req_to_token_pool.free(req_pool_idx)
+                    self.tree_cache.dec_ref_counter(req.last_node)
+
+                    # fast forward
+                    req.tokenize_fast_forward(fast_forward_str, next_state)
+
+                    fast_forward_reqs.append(req)
+                    filter_indices.remove(i)
+
+        if len(filter_indices) < len(self.reqs):
+            self.filter_batch(filter_indices)
+
+        return fast_forward_reqs
 
     def prepare_for_decode(self, input_ids=None):
         if input_ids is None:

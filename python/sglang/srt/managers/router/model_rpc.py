@@ -21,6 +21,7 @@ from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.managers.router.scheduler import Scheduler
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.constrained.fast_forward import FastForwardCache
 from sglang.srt.utils import (
     get_exception_traceback,
     get_int_token_logit_bias,
@@ -45,6 +46,7 @@ class ModelRpcServer(rpyc.Service):
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.schedule_heuristic = server_args.schedule_heuristic
+        self.no_regex_fast_forward = server_args.no_regex_fast_forward
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -118,6 +120,7 @@ class ModelRpcServer(rpyc.Service):
                 "trust_remote_code": server_args.trust_remote_code,
             },
         )
+        self.fast_forward_cache = FastForwardCache()
 
         # Init new token estimation
         self.new_token_ratio = min(0.4 * server_args.schedule_conservativeness, 1.0)
@@ -201,6 +204,7 @@ class ModelRpcServer(rpyc.Service):
         recv_req: TokenizedGenerateReqInput,
     ):
         req = Req(recv_req.rid)
+        req.input_text = recv_req.input_text
         req.input_ids = recv_req.input_ids
         req.pixel_values = recv_req.pixel_values
         req.image_size = recv_req.image_size
@@ -223,6 +227,10 @@ class ModelRpcServer(rpyc.Service):
         # Init regex fsm
         if req.sampling_params.regex is not None:
             req.regex_fsm = self.regex_fsm_cache.init_fsm(req.sampling_params.regex)
+            if not self.no_regex_fast_forward:
+                req.fast_forward_map = self.fast_forward_cache.init_fast_forward_map(
+                    req.sampling_params.regex
+                )
 
         # Truncate long prompts
         req.input_ids = req.input_ids[: self.model_config.context_len - 1]
@@ -334,11 +342,6 @@ class ModelRpcServer(rpyc.Service):
             self.model_config.vocab_size, self.int_token_logit_bias
         )
 
-        # Reset regex fsm state before first sampling due to retractions
-        for req in batch.reqs:
-            if req.sampling_params.regex is not None:
-                req.regex_fsm_state = 0
-
         if batch.extend_num_tokens != 0:
             # Forward
             logits, (logprobs, normalized_logprobs) = self.model_runner.forward(
@@ -388,6 +391,13 @@ class ModelRpcServer(rpyc.Service):
                 self.min_new_token_ratio,
             )
 
+        if not self.no_regex_fast_forward:
+            # check for fast forward
+            fast_forward_reqs = batch.check_for_fast_forward()
+            self.forward_queue.extend(fast_forward_reqs)
+            if batch.is_empty():
+                return
+
         # Update batch tensors
         self.decode_forward_ct += 1
         batch.prepare_for_decode()
@@ -408,6 +418,7 @@ class ModelRpcServer(rpyc.Service):
     def handle_finished_requests(self, batch: Batch):
         output_rids = []
         output_tokens = []
+        output_and_fast_forward_strs = []
         output_hit_stop_str = []
         output_skip_special_tokens = []
         output_meta_info = []
@@ -425,6 +436,7 @@ class ModelRpcServer(rpyc.Service):
             ):
                 output_rids.append(req.rid)
                 output_tokens.append(req.output_ids)
+                output_and_fast_forward_strs.append(req.output_and_fast_forward_str)
                 output_hit_stop_str.append(req.hit_stop_str)
                 output_skip_special_tokens.append(
                     req.sampling_params.skip_special_tokens
@@ -445,6 +457,7 @@ class ModelRpcServer(rpyc.Service):
                 BatchTokenIDOut(
                     output_rids,
                     output_tokens,
+                    output_and_fast_forward_strs,
                     output_hit_stop_str,
                     output_skip_special_tokens,
                     output_meta_info,
