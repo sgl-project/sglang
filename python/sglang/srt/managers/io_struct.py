@@ -59,6 +59,7 @@ class GenerateReqInput:
 @dataclass
 class TokenizedGenerateReqInput:
     rid: str
+    input_text: str
     input_ids: List[int]
     pixel_values: List[float]
     image_hash: int
@@ -73,6 +74,7 @@ class TokenizedGenerateReqInput:
 class BatchTokenIDOut:
     rids: List[str]
     output_tokens: List[List[int]]
+    output_and_fast_forward_strs: List[str]
     hit_stop_str: List[Optional[str]]
     skip_special_tokens: List[bool]
     meta_info: List[Dict]

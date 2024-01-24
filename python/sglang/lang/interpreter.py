@@ -91,12 +91,32 @@ def run_program_batch(
 
     if num_threads == 1:
         rets = []
-        for arguments in batch_arguments:
-            rets.append(
-                run_program(
-                    program, backend, (), arguments, default_sampling_para, False, True
+        if progress_bar:
+            for arguments in tqdm.tqdm(batch_arguments):
+                rets.append(
+                    run_program(
+                        program,
+                        backend,
+                        (),
+                        arguments,
+                        default_sampling_para,
+                        False,
+                        True,
+                    )
                 )
-            )
+        else:
+            for arguments in batch_arguments:
+                rets.append(
+                    run_program(
+                        program,
+                        backend,
+                        (),
+                        arguments,
+                        default_sampling_para,
+                        False,
+                        True,
+                    )
+                )
     else:
         if progress_bar:
             pbar = tqdm.tqdm(total=len(batch_arguments))
