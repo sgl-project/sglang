@@ -460,7 +460,6 @@ class Runtime:
         prompt: str,
         sampling_params,
     ) -> None:
-
         json_data = {
             "text": prompt,
             "sampling_params": sampling_params,

@@ -1,9 +1,9 @@
-from PIL import Image
-from io import BytesIO
 import base64
+import math
+from io import BytesIO
 
 import numpy as np
-import math
+from PIL import Image
 
 
 def select_best_resolution(original_size, possible_resolutions):
@@ -20,15 +20,22 @@ def select_best_resolution(original_size, possible_resolutions):
     original_width, original_height = original_size
     best_fit = None
     max_effective_resolution = 0
-    min_wasted_resolution = float('inf')
+    min_wasted_resolution = float("inf")
 
     for width, height in possible_resolutions:
         scale = min(width / original_width, height / original_height)
-        downscaled_width, downscaled_height = int(original_width * scale), int(original_height * scale)
-        effective_resolution = min(downscaled_width * downscaled_height, original_width * original_height)
+        downscaled_width, downscaled_height = int(original_width * scale), int(
+            original_height * scale
+        )
+        effective_resolution = min(
+            downscaled_width * downscaled_height, original_width * original_height
+        )
         wasted_resolution = (width * height) - effective_resolution
 
-        if effective_resolution > max_effective_resolution or (effective_resolution == max_effective_resolution and wasted_resolution < min_wasted_resolution):
+        if effective_resolution > max_effective_resolution or (
+            effective_resolution == max_effective_resolution
+            and wasted_resolution < min_wasted_resolution
+        ):
             max_effective_resolution = effective_resolution
             min_wasted_resolution = wasted_resolution
             best_fit = (width, height)
@@ -63,7 +70,7 @@ def resize_and_pad_image(image, target_resolution):
     # Resize the image
     resized_image = image.resize((new_width, new_height))
 
-    new_image = Image.new('RGB', (target_width, target_height), (0, 0, 0))
+    new_image = Image.new("RGB", (target_width, target_height), (0, 0, 0))
     paste_x = (target_width - new_width) // 2
     paste_y = (target_height - new_height) // 2
     new_image.paste(resized_image, (paste_x, paste_y))
@@ -105,7 +112,8 @@ def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size=224):
     Returns:
         tuple: The shape of the image patch grid in the format (width, height).
     """
-    import ast # pylint: disable=C0415
+    import ast  # pylint: disable=C0415
+
     possible_resolutions = ast.literal_eval(grid_pinpoints)
     width, height = select_best_resolution(image_size, possible_resolutions)
     return width // patch_size, height // patch_size
@@ -123,19 +131,23 @@ def process_anyres_image(image, processor, grid_pinpoints):
     Returns:
         np.array: An np array containing the processed image patches.
     """
-    import ast # pylint: disable=C0415
+    import ast  # pylint: disable=C0415
+
     possible_resolutions = ast.literal_eval(grid_pinpoints)
     best_resolution = select_best_resolution(image.size, possible_resolutions)
-    print("best_resolution", best_resolution)
     image_padded = resize_and_pad_image(image, best_resolution)
 
     patches = divide_to_patches(image_padded)
 
-    image_original_resize = image.resize((processor.size['shortest_edge'], processor.size['shortest_edge']))
+    image_original_resize = image.resize(
+        (processor.size["shortest_edge"], processor.size["shortest_edge"])
+    )
 
     image_patches = [image_original_resize] + patches
-    image_patches = [processor.preprocess(image_patch)['pixel_values'][0]
-                     for image_patch in image_patches]
+    image_patches = [
+        processor.preprocess(image_patch)["pixel_values"][0]
+        for image_patch in image_patches
+    ]
     return np.stack(image_patches, axis=0)
 
 
@@ -156,73 +168,80 @@ def expand2square(pil_img, background_color):
         result.paste(pil_img, ((height - width) // 2, 0))
         return result
 
+
 def unpad_image(tensor, original_size):
-        """
-        Unpads a PyTorch tensor of a padded and resized image.
+    """
+    Unpads a PyTorch tensor of a padded and resized image.
 
-        Args:
-        tensor (torch.Tensor): The image tensor, assumed to be in CxHxW format.
-        original_size (tuple): The original size of the image (height, width).
+    Args:
+    tensor (torch.Tensor): The image tensor, assumed to be in CxHxW format.
+    original_size (tuple): The original size of the image (height, width).
 
-        Returns:
-        torch.Tensor: The unpadded image tensor.
-        """
-        original_width, original_height = original_size
-        current_height, current_width = tensor.shape[1:]
+    Returns:
+    torch.Tensor: The unpadded image tensor.
+    """
+    original_width, original_height = original_size
+    current_height, current_width = tensor.shape[1:]
 
-        original_aspect_ratio = original_width / original_height
-        current_aspect_ratio = current_width / current_height
+    original_aspect_ratio = original_width / original_height
+    current_aspect_ratio = current_width / current_height
 
-        if original_aspect_ratio > current_aspect_ratio:
-            scale_factor = current_width / original_width
-            new_height = int(original_height * scale_factor)
-            padding = (current_height - new_height) // 2
-            unpadded_tensor = tensor[:, padding:current_height - padding, :]
-        else:
-            scale_factor = current_height / original_height
-            new_width = int(original_width * scale_factor)
-            padding = (current_width - new_width) // 2
-            unpadded_tensor = tensor[:, :, padding:current_width - padding]
+    if original_aspect_ratio > current_aspect_ratio:
+        scale_factor = current_width / original_width
+        new_height = int(original_height * scale_factor)
+        padding = (current_height - new_height) // 2
+        unpadded_tensor = tensor[:, padding : current_height - padding, :]
+    else:
+        scale_factor = current_height / original_height
+        new_width = int(original_width * scale_factor)
+        padding = (current_width - new_width) // 2
+        unpadded_tensor = tensor[:, :, padding : current_width - padding]
 
-        return unpadded_tensor
+    return unpadded_tensor
+
 
 def unpad_image_shape(current_height, current_width, original_size):
-        """
-        Unpads a PyTorch tensor of a padded and resized image
-        and returns the new shape.
-        """
-        original_width, original_height = original_size
+    """
+    Unpads a PyTorch tensor of a padded and resized image
+    and returns the new shape.
+    """
+    original_width, original_height = original_size
 
-        original_aspect_ratio = original_width / original_height
-        current_aspect_ratio = current_width / current_height
+    original_aspect_ratio = original_width / original_height
+    current_aspect_ratio = current_width / current_height
 
-        if original_aspect_ratio > current_aspect_ratio:
-            scale_factor = current_width / original_width
-            new_height = int(original_height * scale_factor)
-            padding = (current_height - new_height) // 2
-            new_shape = (current_height - 2*padding, current_width)
-        else:
-            scale_factor = current_height / original_height
-            new_width = int(original_width * scale_factor)
-            padding = (current_width - new_width) // 2
-            new_shape = (current_height, current_width - 2*padding)
+    if original_aspect_ratio > current_aspect_ratio:
+        scale_factor = current_width / original_width
+        new_height = int(original_height * scale_factor)
+        padding = (current_height - new_height) // 2
+        new_shape = (current_height - 2 * padding, current_width)
+    else:
+        scale_factor = current_height / original_height
+        new_width = int(original_width * scale_factor)
+        padding = (current_width - new_width) // 2
+        new_shape = (current_height, current_width - 2 * padding)
 
-        return new_shape
+    return new_shape
+
 
 def process_images(images, image_processor, model_cfg):
     image_aspect_ratio = getattr(model_cfg, "image_aspect_ratio", None)
     new_images = []
-    if image_aspect_ratio == 'pad':
+    if image_aspect_ratio == "pad":
         for image in images:
-            image = expand2square(image, tuple(int(x*255) for x in image_processor.image_mean))
-            image = image_processor.preprocess(image)['pixel_values'][0]
+            image = expand2square(
+                image, tuple(int(x * 255) for x in image_processor.image_mean)
+            )
+            image = image_processor.preprocess(image)["pixel_values"][0]
             new_images.append(image)
     elif image_aspect_ratio == "anyres":
         for image in images:
-            image = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints)
+            image = process_anyres_image(
+                image, image_processor, model_cfg.image_grid_pinpoints
+            )
             new_images.append(image)
     else:
-        return image_processor(images)['pixel_values']
+        return image_processor(images)["pixel_values"]
     if all(x.shape == new_images[0].shape for x in new_images):
         new_images = np.stack(new_images, axis=0)
     return new_images

@@ -20,11 +20,10 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_exception_traceback, is_multimodal_model, load_image
-from sglang.srt.mm_utils import process_anyres_image, expand2square
-from transformers import CLIPImageProcessor
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -53,18 +52,18 @@ def init_global_processor(server_args: ServerArgs):
 def get_pixel_values(image_data, model_cfg, processor=None):
     image_aspect_ratio = getattr(model_cfg, "image_aspect_ratio", None)
     try:
-        # processor = processor or global_processor
-        # hack clean
-        processor = processor
+        processor = processor or global_processor
         image = load_image(image_data)
         image_hash = hash(image_data)
-        if image_aspect_ratio == 'pad':
-            image = expand2square(image, tuple(int(x*255) for x in processor.image_processor.image_mean))
-            pixel_values = processor.image_processor(image)['pixel_values'][0]
+        if image_aspect_ratio == "pad":
+            image = expand2square(
+                image, tuple(int(x * 255) for x in processor.image_processor.image_mean)
+            )
+            pixel_values = processor.image_processor(image)["pixel_values"][0]
         elif image_aspect_ratio == "anyres":
-            # hack clean
-            # pixel_values = process_anyres_image(image, processor.image_processor, model_cfg.image_grid_pinpoints)
-            pixel_values = process_anyres_image(image, processor, model_cfg.image_grid_pinpoints)
+            pixel_values = process_anyres_image(
+                image, processor.image_processor, model_cfg.image_grid_pinpoints
+            )
         else:
             pixel_values = processor.image_processor(image)["pixel_values"][0]
         pixel_values = pixel_values.astype(np.float16)
@@ -91,14 +90,6 @@ class TokenizerManager:
             self.model_path, trust_remote_code=server_args.trust_remote_code
         )
 
-        # hack config -- delete later
-        # self.hf_config.mm_patch_merge_type = 'spatial_unpad'
-        # self.hf_config.image_aspect_ratio = 'anyres'
-        # self.hf_config.image_grid_pinpoints = '[(448, 672), (672, 448), (1344, 224), (224, 1344)]'
-        # self.image_processor = CLIPImageProcessor.from_pretrained(
-        #                             "openai/clip-vit-large-patch14"
-        #                         )
-        # ######
         self.context_len = get_context_length(self.hf_config)
 
         if is_multimodal_model(self.model_path):
@@ -125,9 +116,8 @@ class TokenizerManager:
     async def get_pixel_values(self, image_data):
         if self.executor is not None:
             loop = asyncio.get_event_loop()
-            # hack clean
             return await loop.run_in_executor(
-                self.executor, get_pixel_values, image_data, self.hf_config, self.processor #self.image_processor
+                self.executor, get_pixel_values, image_data, self.hf_config
             )
         else:
             return get_pixel_values(image_data, self.hf_config, self.processor)
@@ -148,7 +138,9 @@ class TokenizerManager:
             if obj.image_data is None:
                 pixel_values, image_hash, image_size = None, None, None
             else:
-                pixel_values, image_hash, image_size = await self.get_pixel_values(obj.image_data)
+                pixel_values, image_hash, image_size = await self.get_pixel_values(
+                    obj.image_data
+                )
             tokenized_obj = TokenizedGenerateReqInput(
                 rid=rid,
                 input_ids=input_ids,

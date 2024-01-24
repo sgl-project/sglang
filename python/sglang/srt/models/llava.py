@@ -7,7 +7,11 @@ import numpy as np
 import torch
 from sglang.srt.managers.router.infer_batch import ForwardMode
 from sglang.srt.managers.router.model_runner import InputMetadata
-from sglang.srt.mm_utils import get_anyres_image_grid_shape, unpad_image, unpad_image_shape
+from sglang.srt.mm_utils import (
+    get_anyres_image_grid_shape,
+    unpad_image,
+    unpad_image_shape,
+)
 from sglang.srt.models.llama2 import LlamaForCausalLM
 from torch import nn
 from transformers import CLIPImageProcessor, CLIPVisionModel, LlavaConfig
@@ -34,20 +38,20 @@ class LlavaLlamaForCausalLM(nn.Module):
         self.language_model = LlamaForCausalLM(config, linear_method)
 
     def pad_input_ids(self, input_ids, pad_value, pt_shape=None, image_size=None):
-        
         new_image_feature_len = self.image_feature_len
         # now only support spatial_unpad + anyres
-        if self.mm_patch_merge_type.startswith('spatial'):
+        if self.mm_patch_merge_type.startswith("spatial"):
             height = width = self.num_patches_per_side
             if pt_shape[0] > 1:
-                if self.image_aspect_ratio == 'anyres':
-                    num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_size, self.image_grid_pinpoints)
-                if 'unpad' in self.mm_patch_merge_type:
+                if self.image_aspect_ratio == "anyres":
+                    num_patch_width, num_patch_height = get_anyres_image_grid_shape(
+                        image_size, self.image_grid_pinpoints
+                    )
+                if "unpad" in self.mm_patch_merge_type:
                     h = num_patch_height * height
                     w = num_patch_width * width
                     new_h, new_w = unpad_image_shape(h, w, image_size)
                     new_image_feature_len += new_h * (new_w + 1)
-                    print("new_image_feature_len", new_image_feature_len)
 
         pad_ids = pad_value * (
             (new_image_feature_len + len(pad_value)) // len(pad_value)
@@ -56,20 +60,16 @@ class LlavaLlamaForCausalLM(nn.Module):
         # old_len + pad_len - 1, because we need to remove image_token_id
         new_input_ids = (
             input_ids[:offset]
-            + pad_ids[: new_image_feature_len]
+            + pad_ids[:new_image_feature_len]
             + input_ids[offset + 1 :]
         )
         return new_input_ids, offset
-    
+
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        image_outputs = self.vision_tower(
-            pixel_values, output_hidden_states=True
-        )
+        image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
         # NOTE: This is not memory efficient. (output_hidden_states=True) will save all the hidden stated.
 
-        selected_image_feature = image_outputs.hidden_states[
-            self.vision_feature_layer
-        ]
+        selected_image_feature = image_outputs.hidden_states[self.vision_feature_layer]
         if self.vision_feature_select_strategy in ["default", "patch"]:
             selected_image_feature = selected_image_feature[:, 1:]
         elif self.vision_feature_select_strategy == "full":
@@ -114,11 +114,12 @@ class LlavaLlamaForCausalLM(nn.Module):
                 )
 
                 ########## Encode Image ########
-                
-                print("pixel_values.shape", pixel_values.shape)
+
                 if pixel_values.ndim == 5:
                     # llava-hd: BS, num_patch, C=3, H=336, W=336, num_patch obtained from process_images
-                    concat_images = torch.cat([image for image in pixel_values], dim=0) # ndim=4
+                    concat_images = torch.cat(
+                        [image for image in pixel_values], dim=0
+                    )  # ndim=4
                     image_features = self.encode_images(concat_images)
                     split_sizes = [image.shape[0] for image in pixel_values]
                     image_features = torch.split(image_features, split_sizes, dim=0)
@@ -128,7 +129,7 @@ class LlavaLlamaForCausalLM(nn.Module):
                     image_features = self.encode_images(pixel_values)
                     # image_features: BS, 576, 4096
 
-                if self.mm_patch_merge_type.startswith('spatial'):
+                if self.mm_patch_merge_type.startswith("spatial"):
                     new_image_features = []
                     for image_idx, image_feature in enumerate(image_features):
                         if image_feature.shape[0] > 1:
@@ -136,31 +137,58 @@ class LlavaLlamaForCausalLM(nn.Module):
                             image_feature = image_feature[1:]
                             height = width = self.num_patches_per_side
                             assert height * width == base_image_feature.shape[0]
-                            if self.image_aspect_ratio == 'anyres':
-                                num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.image_grid_pinpoints)
-                                image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
+                            if self.image_aspect_ratio == "anyres":
+                                (
+                                    num_patch_width,
+                                    num_patch_height,
+                                ) = get_anyres_image_grid_shape(
+                                    image_sizes[image_idx], self.image_grid_pinpoints
+                                )
+                                image_feature = image_feature.view(
+                                    num_patch_height, num_patch_width, height, width, -1
+                                )
                             else:
                                 raise NotImplementedError
-                            if 'unpad' in self.mm_patch_merge_type:
-                                image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-                                image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-                                image_feature = unpad_image(image_feature, image_sizes[image_idx])
-                                image_feature = torch.cat((
-                                    image_feature,
-                                    self.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1)
-                                ), dim=-1)
-                                image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+                            if "unpad" in self.mm_patch_merge_type:
+                                image_feature = image_feature.permute(
+                                    4, 0, 2, 1, 3
+                                ).contiguous()
+                                image_feature = image_feature.flatten(1, 2).flatten(
+                                    2, 3
+                                )
+                                image_feature = unpad_image(
+                                    image_feature, image_sizes[image_idx]
+                                )
+                                image_feature = torch.cat(
+                                    (
+                                        image_feature,
+                                        self.language_model.model.image_newline[
+                                            :, None, None
+                                        ].expand(*image_feature.shape[:-1], 1),
+                                    ),
+                                    dim=-1,
+                                )
+                                image_feature = image_feature.flatten(1, 2).transpose(
+                                    0, 1
+                                )
                             else:
-                                image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
+                                image_feature = image_feature.permute(
+                                    0, 2, 1, 3, 4
+                                ).contiguous()
                                 image_feature = image_feature.flatten(0, 3)
-                            image_feature = torch.cat((base_image_feature, image_feature), dim=0)
+                            image_feature = torch.cat(
+                                (base_image_feature, image_feature), dim=0
+                            )
                         else:
                             image_feature = image_feature[0]
-                            if 'unpad' in self.mm_patch_merge_type:
-                                image_feature = torch.cat((
-                                    image_feature,
-                                    self.image_newline[None]
-                                ), dim=0)
+                            if "unpad" in self.mm_patch_merge_type:
+                                image_feature = torch.cat(
+                                    (
+                                        image_feature,
+                                        self.language_model.model.image_newline[None],
+                                    ),
+                                    dim=0,
+                                )
                         new_image_features.append(image_feature)
                     image_features = new_image_features
 
@@ -171,7 +199,7 @@ class LlavaLlamaForCausalLM(nn.Module):
                         continue
 
                     start_idx = extend_start_loc_cpu[i]
-                    pad_len, pad_dim = image_features[pt].shape # 576, 4096
+                    pad_len, pad_dim = image_features[pt].shape  # 576, 4096
                     dim = input_embeds.shape[1]
                     assert (
                         pad_dim == dim
@@ -208,8 +236,6 @@ class LlavaLlamaForCausalLM(nn.Module):
         # load clip vision model by cfg['mm_vision_tower']:
         #   huggingface_name or path_of_clip_relative_to_llava_model_dir
         vision_path = self.config.mm_vision_tower
-        # hack, clean
-        # vision_path = "openai/clip-vit-large-patch14"
         self.vision_tower = CLIPVisionModel.from_pretrained(
             vision_path, torch_dtype=torch.float16
         ).cuda()
@@ -220,17 +246,9 @@ class LlavaLlamaForCausalLM(nn.Module):
         self.image_size = self.vision_tower.config.image_size
         self.patch_size = self.vision_tower.config.patch_size
 
-        self.mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
-        self.image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
-        self.image_grid_pinpoints = getattr(self.config, 'image_grid_pinpoints', None)
-        # hack, clean
-        # self.mm_patch_merge_type = 'spatial_unpad'
-        # self.image_aspect_ratio = 'anyres'
-        # self.image_grid_pinpoints = '[(448, 672), (672, 448), (1344, 224), (224, 1344)]'
-        if 'unpad' in self.mm_patch_merge_type:
-            embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=torch.float16))
-            self.image_newline = torch.randn(self.config.hidden_size, dtype=torch.float16, device=self.vision_tower.device) * embed_std
-            
+        self.mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
+        self.image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
+        self.image_grid_pinpoints = getattr(self.config, "image_grid_pinpoints", None)
 
         self.image_feature_len = int((self.image_size / self.patch_size) ** 2)
         if self.vision_feature_select_strategy == "patch":
@@ -265,7 +283,7 @@ class LlavaLlamaForCausalLM(nn.Module):
         )
 
         monkey_path_clip_vision_embed_forward()
-    
+
     @property
     def num_patches_per_side(self):
         return self.image_size // self.patch_size
