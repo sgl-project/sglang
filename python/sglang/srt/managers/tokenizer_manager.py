@@ -50,8 +50,7 @@ def init_global_processor(server_args: ServerArgs):
     )
 
 
-def get_pixel_values(image_data, model_cfg, processor=None):
-    image_aspect_ratio = getattr(model_cfg, "image_aspect_ratio", None)
+def get_pixel_values(image_data, image_aspect_ratio=None, image_grid_pinpoints=None, processor=None):
     try:
         processor = processor or global_processor
         image = load_image(image_data)
@@ -63,7 +62,7 @@ def get_pixel_values(image_data, model_cfg, processor=None):
             pixel_values = processor.image_processor(image)["pixel_values"][0]
         elif image_aspect_ratio == "anyres":
             pixel_values = process_anyres_image(
-                image, processor.image_processor, model_cfg.image_grid_pinpoints
+                image, processor.image_processor, image_grid_pinpoints
             )
         else:
             pixel_values = processor.image_processor(image)["pixel_values"][0]
@@ -117,13 +116,15 @@ class TokenizerManager:
         self.rid_to_state = {}  # Dict[str -> ReqState]
 
     async def get_pixel_values(self, image_data):
+        aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
+        grid_pinpoints = self.hf_config.image_grid_pinpoints if aspect_ratio == "anyres" else None
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
-                self.executor, get_pixel_values, image_data, self.hf_config
+                self.executor, get_pixel_values, image_data, aspect_ratio, grid_pinpoints
             )
         else:
-            return get_pixel_values(image_data, self.hf_config, self.processor)
+            return get_pixel_values(image_data, aspect_ratio, grid_pinpoints, self.processor)
 
     async def generate_request(self, obj: GenerateReqInput):
         if self.to_create_loop:
