@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-srt = ["fastapi", "psutil", "rpyc", "torch", "uvloop", "uvicorn",
+srt = ["aiohttp", "fastapi", "psutil", "rpyc", "torch", "uvloop", "uvicorn",
        "zmq", "vllm>=0.2.5", "interegular", "lark", "numba",
        "pydantic", "diskcache", "cloudpickle"]
 openai = ["openai>=1.0", "numpy"]
