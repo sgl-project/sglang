@@ -409,6 +409,7 @@ class ModelRunner:
         self,
         input_ids,
         pixel_values,
+        image_sizes,
         image_offsets,
         req_pool_indices,
         seq_lens,
@@ -433,6 +434,7 @@ class ModelRunner:
             input_metadata.positions,
             input_metadata,
             pixel_values,
+            image_sizes,
             image_offsets,
         )
 
@@ -441,6 +443,7 @@ class ModelRunner:
             kwargs = {
                 "input_ids": batch.input_ids,
                 "pixel_values": batch.pixel_values,
+                "image_sizes": batch.image_sizes,
                 "image_offsets": batch.image_offsets,
                 "req_pool_indices": batch.req_pool_indices,
                 "seq_lens": batch.seq_lens,
