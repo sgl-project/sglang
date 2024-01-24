@@ -8,6 +8,7 @@ image benchmark source: https://huggingface.co/datasets/liuhaotian/llava-bench-i
 
 ### Other Dependency
 ```
+pip3 install "sglang[all]"
 pip3 install "torch>=2.1.2" "transformers>=4.36" pillow
 ```
 
