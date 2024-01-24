@@ -229,6 +229,7 @@ class ModelRpcServer(rpyc.Service):
         req.sampling_params.max_new_tokens = min(
             req.sampling_params.max_new_tokens,
             self.model_config.context_len - 1 - len(req.input_ids),
+            self.max_total_num_token - 128 - len(req.input_ids),
         )
         self.forward_queue.append(req)
 
