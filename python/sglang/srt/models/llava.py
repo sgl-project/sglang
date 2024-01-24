@@ -45,7 +45,7 @@ class LlavaLlamaForCausalLM(nn.Module):
             if pt_shape[0] > 1:
                 if self.image_aspect_ratio == "anyres":
                     num_patch_width, num_patch_height = get_anyres_image_grid_shape(
-                        image_size, self.image_grid_pinpoints
+                        image_size, self.image_grid_pinpoints, self.vision_tower.config.image_size
                     )
                 if "unpad" in self.mm_patch_merge_type:
                     h = num_patch_height * height
@@ -142,7 +142,7 @@ class LlavaLlamaForCausalLM(nn.Module):
                                     num_patch_width,
                                     num_patch_height,
                                 ) = get_anyres_image_grid_shape(
-                                    image_sizes[image_idx], self.image_grid_pinpoints
+                                    image_sizes[image_idx], self.image_grid_pinpoints, self.vision_tower.config.image_size
                                 )
                                 image_feature = image_feature.view(
                                     num_patch_height, num_patch_width, height, width, -1

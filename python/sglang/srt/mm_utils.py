@@ -1,6 +1,7 @@
 import base64
 import math
 from io import BytesIO
+import ast
 
 import numpy as np
 from PIL import Image
@@ -78,13 +79,13 @@ def resize_and_pad_image(image, target_resolution):
     return new_image
 
 
-def divide_to_patches(image, patch_size=224):
+def divide_to_patches(image, patch_size):
     """
     Divides an image into patches of a specified size.
 
     Args:
         image (PIL.Image.Image): The input image.
-        patch_size (int): The size of each patch. Defaults to 224.
+        patch_size (int): The size of each patch.
 
     Returns:
         list: A list of PIL.Image.Image objects representing the patches.
@@ -100,7 +101,7 @@ def divide_to_patches(image, patch_size=224):
     return patches
 
 
-def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size=224):
+def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size):
     """
     Calculate the shape of the image patch grid after the preprocessing for images of any resolution.
 
@@ -112,9 +113,10 @@ def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size=224):
     Returns:
         tuple: The shape of the image patch grid in the format (width, height).
     """
-    import ast  # pylint: disable=C0415
-
-    possible_resolutions = ast.literal_eval(grid_pinpoints)
+    if type(grid_pinpoints) is list:
+        possible_resolutions = grid_pinpoints
+    else:
+        possible_resolutions = ast.literal_eval(grid_pinpoints)
     width, height = select_best_resolution(image_size, possible_resolutions)
     return width // patch_size, height // patch_size
 
@@ -131,13 +133,14 @@ def process_anyres_image(image, processor, grid_pinpoints):
     Returns:
         np.array: An np array containing the processed image patches.
     """
-    import ast  # pylint: disable=C0415
-
-    possible_resolutions = ast.literal_eval(grid_pinpoints)
+    if type(grid_pinpoints) is list:
+        possible_resolutions = grid_pinpoints
+    else:
+        possible_resolutions = ast.literal_eval(grid_pinpoints)
     best_resolution = select_best_resolution(image.size, possible_resolutions)
     image_padded = resize_and_pad_image(image, best_resolution)
 
-    patches = divide_to_patches(image_padded)
+    patches = divide_to_patches(image_padded, processor.crop_size['height'])
 
     image_original_resize = image.resize(
         (processor.size["shortest_edge"], processor.size["shortest_edge"])
