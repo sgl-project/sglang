@@ -330,3 +330,5 @@ def monkey_path_clip_vision_embed_forward():
         "forward",
         clip_vision_embed_forward,
     )
+
+EntryClass = LlavaLlamaForCausalLM
