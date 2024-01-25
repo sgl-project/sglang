@@ -13,8 +13,7 @@ def gen_character_spec(s):
 set_default_backend(OpenAI("gpt-3.5-turbo-instruct"))
 
 state = gen_character_spec.run()
-print(state.text())
 
-print("name###", state["name"])
-print("birthday###", state["birthday"])
-print("job###", state["job"])
+print("name:", state["name"])
+print("birthday:", state["birthday"])
+print("job:", state["job"])
