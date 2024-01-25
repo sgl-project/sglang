@@ -390,7 +390,7 @@ class StreamExecutor:
                 def find_stop():
                     if isinstance(stop, str):
                         return self.speculated_text.find(stop), len(stop)
-                    elif isinstance(stop, tuple) or isinstance(stop, list):
+                    elif isinstance(stop, (tuple, list)):
                         pos = -1
                         stop_len = 0
                         for stop_str in stop:
