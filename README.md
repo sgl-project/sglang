@@ -37,7 +37,7 @@ pip install -e "python[all]"
 - If you are using older GPUs (NVIDIA V100, T4), please pick the correct triton compiler version to avoid some known bugs.
   - For NVIDIA T4, please use `pip install "triton>=2.2.0"`.
   - For NVIDIA V100, please install the [nightly](https://triton-lang.org/main/getting-started/installation.html) version.
-- If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install sglang[openai]`
+- If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`
 
 ## Quick Start
 The example below shows how to use sglang to answer a mulit-turn question.
