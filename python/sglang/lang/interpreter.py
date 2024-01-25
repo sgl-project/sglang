@@ -407,11 +407,7 @@ class StreamExecutor:
                         regen()
                     comp = self.speculated_text[:max_new_tokens]
                     self.speculated_text = self.speculated_text[max_new_tokens:]
-                elif (
-                    isinstance(stop, str)
-                    or isinstance(stop, tuple)
-                    or isinstance(stop, list)
-                ):
+                elif isinstance(stop, (str, list, tuple)):
                     if self.speculated_text == "":
                         regen()
                     stop_pos, stop_len = find_stop()
@@ -426,7 +422,7 @@ class StreamExecutor:
                     comp = self.speculated_text[:stop_pos]
                     self.speculated_text = self.speculated_text[stop_pos:]
                 else:
-                    raise Exception("Wrong type of stop in sampling parameters.")
+                    raise ValueError("Wrong type of stop in sampling parameters.")
             else:
                 comp, meta_info = self.backend.generate(
                     self, sampling_params=sampling_params
