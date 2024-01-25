@@ -1,10 +1,13 @@
+import importlib
 import logging
 from dataclasses import dataclass
-from enum import Enum, auto
+from functools import lru_cache
+from pathlib import Path
 from typing import List
 
 import numpy as np
 import torch
+import sglang
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.utils import is_multimodal_model
@@ -18,6 +21,32 @@ logger = logging.getLogger("model_runner")
 
 # for model_mode
 global_model_mode: List[str] = []
+
+
+@lru_cache()
+def import_model_classes():
+    model_arch_name_to_cls = {}
+    for module_path in (Path(sglang.__file__).parent / "srt" / "models").glob("*.py"):
+        module = importlib.import_module(f"sglang.srt.models.{module_path.stem}")
+        if hasattr(module, "EntryClass"):
+            model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
+    return model_arch_name_to_cls
+
+
+def get_model_cls_by_arch_name(model_arch_names):
+    model_arch_name_to_cls = import_model_classes()
+
+    model_class = None
+    for arch in model_arch_names:
+        if arch in model_arch_name_to_cls:
+            model_class = model_arch_name_to_cls[arch]
+            break
+    else:
+        raise ValueError(
+            f"Unsupported architectures: {arch}. "
+            f"Supported list: {list(model_arch_name_to_cls.keys())}"
+        )
+    return model_class
 
 
 @dataclass
@@ -237,34 +266,9 @@ class ModelRunner:
 
     def load_model(self):
         """See also vllm/model_executor/model_loader.py::get_model"""
-        from sglang.srt.models.llama2 import LlamaForCausalLM
-        from sglang.srt.models.llava import LlavaLlamaForCausalLM
-        from sglang.srt.models.mixtral import MixtralForCausalLM
-        from sglang.srt.models.qwen import QWenLMHeadModel
-
         # Select model class
         architectures = getattr(self.model_config.hf_config, "architectures", [])
-
-        model_class = None
-        for arch in architectures:
-            if arch == "LlamaForCausalLM":
-                model_class = LlamaForCausalLM
-                break
-            if arch == "MistralForCausalLM":
-                model_class = LlamaForCausalLM
-                break
-            if arch == "LlavaLlamaForCausalLM":
-                model_class = LlavaLlamaForCausalLM
-                break
-            if arch == "MixtralForCausalLM":
-                model_class = MixtralForCausalLM
-                break
-            if arch == "QWenLMHeadModel":
-                model_class = QWenLMHeadModel
-                break
-        if model_class is None:
-            raise ValueError(f"Unsupported architectures: {architectures}")
-
+        model_class = get_model_cls_by_arch_name(architectures)
         logger.info(f"Rank {self.tp_rank}: load weight begin.")
 
         # Load weights

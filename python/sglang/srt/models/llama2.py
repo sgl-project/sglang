@@ -318,3 +318,5 @@ class LlamaForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+EntryClass = LlamaForCausalLM
