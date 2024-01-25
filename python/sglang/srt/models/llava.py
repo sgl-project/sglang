@@ -113,6 +113,7 @@ class LlavaLlamaForCausalLM(nn.Module):
 
             if need_vision.any():
                 pixel_values = [pixel_values[i] for i in range(bs) if need_vision[i]]
+                image_sizes = [image_sizes[i] for i in range(bs) if need_vision[i]]
 
                 ########## Encode Image ########
 
