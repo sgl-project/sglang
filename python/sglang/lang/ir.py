@@ -95,8 +95,9 @@ class SglSamplingParams:
 
 
 class SglFunction:
-    def __init__(self, func, bind_arguments=None):
+    def __init__(self, func, api_num_spec_tokens=None, bind_arguments=None):
         self.func = func
+        self.api_num_spec_tokens = api_num_spec_tokens
         self.bind_arguments = bind_arguments or {}
         self.pin_prefix_rid = None
 

@@ -12,6 +12,7 @@ import rpyc
 import torch
 from rpyc.utils.classic import obtain
 from rpyc.utils.server import ThreadedServer
+from sglang.srt.constrained.fast_forward import FastForwardCache
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import BatchTokenIDOut, TokenizedGenerateReqInput
@@ -21,7 +22,6 @@ from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.managers.router.scheduler import Scheduler
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.constrained.fast_forward import FastForwardCache
 from sglang.srt.utils import (
     get_exception_traceback,
     get_int_token_logit_bias,
