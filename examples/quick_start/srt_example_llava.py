@@ -1,3 +1,6 @@
+"""
+Usage: python3 srt_example_llava.py
+"""
 import sglang as sgl
 
 
@@ -12,7 +15,24 @@ runtime = sgl.Runtime(model_path="liuhaotian/llava-v1.5-7b",
 sgl.set_default_backend(runtime)
 
 
-state = image_qa.run(image_path="images/cat.jpeg", question="What is this?")
-print(state["answer"])
+# Single
+state = image_qa.run(
+    image_path="images/cat.jpeg",
+    question="What is this?",
+    max_new_tokens=64)
+print(state["answer"], "\n")
+
+
+# Batch
+states = image_qa.run_batch(
+    [
+        {"image_path": "images/cat.jpeg", "question":"What is this?"},
+        {"image_path": "images/dog.jpeg", "question":"What is this?"},
+    ],
+    max_new_tokens=64,
+)
+for s in states:
+    print(s["answer"], "\n")
+
 
 runtime.shutdown()

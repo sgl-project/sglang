@@ -154,6 +154,9 @@ def find_printable_text(text):
     # If the last token is a CJK character, we print the characters.
     elif len(text) > 0 and _is_chinese_char(ord(text[-1])):
         return text
+    # Otherwise if the penultimate token is a CJK character, we print the characters except for the last one.
+    elif len(text) > 1 and _is_chinese_char(ord(text[-2])):
+        return text[:-1]
     # Otherwise, prints until the last space char (simple heuristic to avoid printing incomplete words,
     # which may change with the subsequent token -- there are probably smarter ways to do this!)
     else:

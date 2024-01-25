@@ -26,6 +26,8 @@ if __name__ == "__main__":
                 "temperature": 0,
                 "max_new_tokens": 32,
             },
+            # "return_logprob": True,
+            # "logprob_start_len": 0,
         },
     )
     print(response.json())

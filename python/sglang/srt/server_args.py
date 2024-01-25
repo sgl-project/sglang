@@ -23,6 +23,7 @@ class ServerArgs:
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     log_level: str = "info"
+    no_regex_fast_forward: bool = False
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -149,6 +150,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.log_stats_interval,
             help="Log stats interval in second.",
+        )
+        parser.add_argument(
+            "--no-regex-fast-forward",
+            action="store_true",
+            help="Disable regex fast forward",
         )
 
     @classmethod

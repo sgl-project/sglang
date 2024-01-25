@@ -55,8 +55,12 @@ class DetokenizerManager:
                         first_token = self.tokenizer.convert_ids_to_tokens(
                             int(output_tokens[i][0])
                         )
+                        if not isinstance(first_token, str):
+                            first_token = first_token.decode("utf-8")
                         if first_token.startswith("▁"):
                             output_strs[i] = " " + output_strs[i]
+
+                    output_strs[i] = recv_obj.output_and_fast_forward_strs[i] + output_strs[i]
 
                 self.send_to_tokenizer.send_pyobj(
                     BatchStrOut(

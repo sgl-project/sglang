@@ -61,7 +61,6 @@ class RadixAttention(nn.Module):
     def extend_forward_triton(self, q, k, v, input_metadata: InputMetadata):
         o = torch.empty_like(q)
         self.store_kv_cache(k, v, input_metadata)
-
         extend_attention_fwd(
             q.view(-1, self.tp_q_head_num, self.head_dim),
             k.contiguous(),

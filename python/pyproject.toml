@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.1.7"
+version = "0.1.9"
 description = "A structured generation langauge for LLMs." 
 readme = "README.md"
 requires-python = ">=3.8"
@@ -18,10 +18,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-srt = ["fastapi", "psutil", "rpyc", "torch", "uvloop", "uvicorn", "zmq", "vllm>=0.2.5",
-       "interegular", "lark", "numba", "pydantic", "diskcache", "cloudpickle"]
-openai = ["openai>=1.0"]
-anthropic = ["anthropic"]
+srt = ["aiohttp", "fastapi", "psutil", "rpyc", "torch", "uvloop", "uvicorn",
+       "zmq", "vllm>=0.2.5", "interegular", "lark", "numba",
+       "pydantic", "diskcache", "cloudpickle"]
+openai = ["openai>=1.0", "numpy"]
+anthropic = ["anthropic", "numpy"]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]"]
 
 [project.urls]
