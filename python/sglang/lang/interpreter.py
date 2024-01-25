@@ -51,11 +51,11 @@ def run_program(
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
     assert backend is not None, "Please specify a backend"
-    # func_kwargs.update(program.bind_arguments)
+    func_kwargs.update(program.bind_arguments)
     stream_executor = StreamExecutor(
-        backend, func_kwargs, default_sampling_para, chat_template=None, stream=stream
+        backend, func_kwargs, default_sampling_para, chat_template=None, stream=stream,
+        api_num_spec_tokens=program.api_num_spec_tokens,
     )
-    stream_executor.bind_arguments = program.bind_arguments
     state = ProgramState(stream_executor)
 
     if stream:
@@ -175,6 +175,7 @@ class StreamExecutor:
         default_sampling_para,
         chat_template,
         stream,
+        api_num_spec_tokens=None,
         use_thread=True,
     ):
         self.sid = uuid.uuid4().hex
@@ -182,6 +183,7 @@ class StreamExecutor:
         self.arguments: Dict[str, Any] = arguments
         self.default_sampling_para = default_sampling_para
         self.stream = stream
+        self.api_num_spec_tokens = api_num_spec_tokens
 
         self.variables = {}  # Dict[name: str -> value: str]
         self.variable_event = {}  # Dict[name: str -> event: threading.Event]
@@ -192,9 +194,7 @@ class StreamExecutor:
         self.text_ = ""  # The full text
         
         # For speculative execution
-        self.last_comp = "" # The last completion message returned 
-        self.speculate_text_prefix = "" # The speculated text prefix
-        self.bind_arguments = {}
+        self.speculated_text = ""
 
         # For chat
         self.messages_ = []  # The messages in the OpenAI API format
@@ -346,13 +346,11 @@ class StreamExecutor:
 
     def _execute_fill(self, value: str):
         value = str(value)
-        if value.strip() in self.last_comp:
-            # speculative execution worked
-            # print(f"speculate_text_prefix: {value}")
-            self.speculate_text_prefix = value.strip()
+        if self.speculated_text.startswith(value):
+            self.speculated_text = self.speculated_text[len(value):]
         else:
-            self.text_ += value
-            self.speculate_text_prefix = ""
+            self.speculated_text = ""
+        self.text_ += value
 
     def _execute_image(self, expr: SglImage):
         path = expr.path
@@ -371,24 +369,25 @@ class StreamExecutor:
         name = expr.name
 
         if not self.stream:
-            if self.last_comp != "" and self.speculate_text_prefix != "":
-                last_comp, _, comp = self.last_comp.partition(self.speculate_text_prefix) 
-                self.variables[self.last_name] = last_comp
-                meta_info = {}
-            else:
-                if self.last_comp == "" and 'spec_tokens' in self.bind_arguments:
-                    spec_tokens_value = self.bind_arguments['spec_tokens']
-                    sampling_params.max_new_tokens = spec_tokens_value
-                    sampling_params.stop = None
-
-                comp, meta_info = self.backend.generate(
+            stop = expr.sampling_params.stop
+            stop_pos = self.speculated_text.find(stop)
+            if stop_pos == -1:
+                sampling_params.max_new_tokens = max(
+                        sampling_params.max_new_tokens, self.api_num_spec_tokens)
+                sampling_params.stop = None
+                self.speculated_text, meta_info = self.backend.generate(
                     self, sampling_params=sampling_params
                 )
-                self.text_ += comp
+            else:
+                meta_info = {}
 
-            self.last_comp = comp
-            self.last_name = name
+            stop_pos = self.speculated_text.find(stop)
+            if stop_pos == -1: stop_pos = len(self.speculated_text)
+            comp = self.speculated_text[:stop_pos + 1]
+            self.speculated_text = self.speculated_text[stop_pos + 1:]
 
+            self.text_ += comp
+ 
             self.variables[name] = comp
             self.meta_info[name] = meta_info
             self.variable_event[name].set()

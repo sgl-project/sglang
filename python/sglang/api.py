@@ -19,12 +19,15 @@ from sglang.lang.ir import (
     SglSelect,
 )
 
-def function(func=None,**bind_arguments):
+
+def function(func=None, api_num_spec_tokens=None):
     if func:
-        return SglFunction(func, bind_arguments)
+        return SglFunction(func, api_num_spec_tokens=api_num_spec_tokens)
+
     def decorator(func):
-        return SglFunction(func, bind_arguments)
+        return SglFunction(func, api_num_spec_tokens=api_num_spec_tokens)
     return decorator
+
 
 def Runtime(*args, **kwargs):
     # Avoid importing unnecessary dependency
