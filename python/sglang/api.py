@@ -20,12 +20,15 @@ from sglang.lang.ir import (
 )
 
 
-def function(func: Optional[Callable] = None, api_num_spec_tokens: Optional[int] = None):
+def function(
+    func: Optional[Callable] = None, api_num_spec_tokens: Optional[int] = None
+):
     if func:
         return SglFunction(func, api_num_spec_tokens=api_num_spec_tokens)
 
     def decorator(func):
         return SglFunction(func, api_num_spec_tokens=api_num_spec_tokens)
+
     return decorator
 
 

@@ -53,7 +53,11 @@ def run_program(
     assert backend is not None, "Please specify a backend"
     func_kwargs.update(program.bind_arguments)
     stream_executor = StreamExecutor(
-        backend, func_kwargs, default_sampling_para, chat_template=None, stream=stream,
+        backend,
+        func_kwargs,
+        default_sampling_para,
+        chat_template=None,
+        stream=stream,
         api_num_spec_tokens=program.api_num_spec_tokens,
     )
     state = ProgramState(stream_executor)
@@ -192,7 +196,7 @@ class StreamExecutor:
 
         # For completion
         self.text_ = ""  # The full text
-        
+
         # For speculative execution
         self.speculated_text = ""
 
@@ -347,7 +351,7 @@ class StreamExecutor:
     def _execute_fill(self, value: str):
         value = str(value)
         if self.speculated_text.startswith(value):
-            self.speculated_text = self.speculated_text[len(value):]
+            self.speculated_text = self.speculated_text[len(value) :]
         else:
             self.speculated_text = ""
         self.text_ += value
@@ -376,7 +380,8 @@ class StreamExecutor:
 
                 def regen():
                     sampling_params.max_new_tokens = max(
-                        sampling_params.max_new_tokens, self.api_num_spec_tokens)
+                        sampling_params.max_new_tokens, self.api_num_spec_tokens
+                    )
                     sampling_params.stop = None
                     self.speculated_text, meta_info = self.backend.generate(
                         self, sampling_params=sampling_params
@@ -398,15 +403,26 @@ class StreamExecutor:
                         raise Exception("Wrong type of stop in sampling parameters.")
 
                 if stop is None:
-                    if len(self.speculated_text) < max_new_tokens: regen()
+                    if len(self.speculated_text) < max_new_tokens:
+                        regen()
                     comp = self.speculated_text[:max_new_tokens]
                     self.speculated_text = self.speculated_text[max_new_tokens:]
-                elif isinstance(stop, str) or isinstance(stop, tuple) or isinstance(stop, list):
-                    if self.speculated_text == "": regen()
+                elif (
+                    isinstance(stop, str)
+                    or isinstance(stop, tuple)
+                    or isinstance(stop, list)
+                ):
+                    if self.speculated_text == "":
+                        regen()
                     stop_pos, stop_len = find_stop()
                     if stop_pos == -1:
-                        stop_pos, stop_len = min(
-                            sampling_params.max_new_tokens, len(self.speculated_text)), 0
+                        stop_pos, stop_len = (
+                            min(
+                                sampling_params.max_new_tokens,
+                                len(self.speculated_text),
+                            ),
+                            0,
+                        )
                     comp = self.speculated_text[:stop_pos]
                     self.speculated_text = self.speculated_text[stop_pos:]
                 else:
@@ -415,10 +431,9 @@ class StreamExecutor:
                 comp, meta_info = self.backend.generate(
                     self, sampling_params=sampling_params
                 )
-             
 
             self.text_ += comp
- 
+
             self.variables[name] = comp
             self.meta_info[name] = meta_info
             self.variable_event[name].set()

@@ -1,4 +1,4 @@
-from sglang import function, gen, set_default_backend, OpenAI
+from sglang import OpenAI, function, gen, set_default_backend
 
 
 @function()
@@ -31,7 +31,9 @@ def gen_character_no_stop(s):
 @function(api_num_spec_tokens=512)
 def gen_character_multi_stop(s):
     s += "Construct a character within the following format:\n"
-    s += "Name: Steve Jobs.###Birthday: February 24, 1955.###Job: Apple CEO.\nWelcome.\n"
+    s += (
+        "Name: Steve Jobs.###Birthday: February 24, 1955.###Job: Apple CEO.\nWelcome.\n"
+    )
     s += "\nPlease generate new Name, Birthday and Job.\n"
     s += "Name:" + gen("name", stop=["\n", "###"])
     s += "###Birthday:" + gen("birthday", stop=["\n", "###"])
