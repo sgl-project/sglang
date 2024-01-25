@@ -13,9 +13,9 @@ def example(s):
 
 set_default_backend(OpenAI("gpt-3.5-turbo-instruct"))
 
-state = example.run()
-print(state.text())
+state = example.run_batch([{}, {}, {}])
+print(state[0].text())
 
-print("name:", state["name"])
-print("birthday:", state["birthday"])
-print("job:", state["job"])
+print("name:", state[0]["name"])
+print("birthday:", state[0]["birthday"])
+print("job:", state[0]["job"])
