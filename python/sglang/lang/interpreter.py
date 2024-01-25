@@ -402,12 +402,11 @@ class StreamExecutor:
                     comp = self.speculated_text[:max_new_tokens]
                     self.speculated_text = self.speculated_text[max_new_tokens:]
                 elif isinstance(stop, str) or isinstance(stop, tuple) or isinstance(stop, list):
-                    stop_pos, stop_len = find_stop()
+                    if self.speculated_text == "": regen()
                     stop_pos, stop_len = find_stop()
                     if stop_pos == -1:
-                        regen()
-                        stop_pos, stop_len = find_stop()
-                    if stop_pos == -1: stop_pos, stop_len = len(self.speculated_text), 0
+                        stop_pos, stop_len = min(
+                            sampling_params.max_new_tokens, len(self.speculated_text)), 0
                     comp = self.speculated_text[:stop_pos]
                     self.speculated_text = self.speculated_text[stop_pos:]
                 else:

@@ -229,6 +229,12 @@ def openai_completion(client, is_chat=None, prompt=None, **kwargs):
         print(f"OpenAI Error: {e}")
         raise e
 
+    # print("call begin")
+    # print(prompt)
+    # print("-----")
+    # print(comp)
+    # print("call end")
+
     return comp
 
 
