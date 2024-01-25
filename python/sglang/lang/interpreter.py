@@ -371,21 +371,47 @@ class StreamExecutor:
         if not self.stream:
             if self.api_num_spec_tokens is not None:
                 stop = sampling_params.stop
-                stop_pos = self.speculated_text.find(stop)
-                if stop_pos == -1:
+                max_new_tokens = sampling_params.max_new_tokens
+                meta_info = {}
+
+                def regen():
                     sampling_params.max_new_tokens = max(
                         sampling_params.max_new_tokens, self.api_num_spec_tokens)
                     sampling_params.stop = None
                     self.speculated_text, meta_info = self.backend.generate(
                         self, sampling_params=sampling_params
                     )
-                else:
-                    meta_info = {}
 
-                stop_pos = self.speculated_text.find(stop)
-                if stop_pos == -1: stop_pos = len(self.speculated_text)
-                comp = self.speculated_text[:stop_pos]
-                self.speculated_text = self.speculated_text[stop_pos + 1:]
+                def find_stop():
+                    if isinstance(stop, str):
+                        return self.speculated_text.find(stop), len(stop)
+                    elif isinstance(stop, tuple) or isinstance(stop, list):
+                        pos = -1
+                        stop_len = 0
+                        for stop_str in stop:
+                            stop_pos = self.speculated_text.find(stop_str)
+                            if stop_pos != -1 and (pos == -1 or stop_pos < pos):
+                                pos = stop_pos
+                                stop_len = len(stop_str)
+                        return pos, stop_len
+                    else:
+                        raise Exception("Wrong type of stop in sampling parameters.")
+
+                if stop is None:
+                    if len(self.speculated_text) < max_new_tokens: regen()
+                    comp = self.speculated_text[:max_new_tokens]
+                    self.speculated_text = self.speculated_text[max_new_tokens:]
+                elif isinstance(stop, str) or isinstance(stop, tuple) or isinstance(stop, list):
+                    stop_pos, stop_len = find_stop()
+                    stop_pos, stop_len = find_stop()
+                    if stop_pos == -1:
+                        regen()
+                        stop_pos, stop_len = find_stop()
+                    if stop_pos == -1: stop_pos, stop_len = len(self.speculated_text), 0
+                    comp = self.speculated_text[:stop_pos]
+                    self.speculated_text = self.speculated_text[stop_pos:]
+                else:
+                    raise Exception("Wrong type of stop in sampling parameters.")
             else:
                 comp, meta_info = self.backend.generate(
                     self, sampling_params=sampling_params
