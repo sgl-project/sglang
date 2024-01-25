@@ -220,9 +220,6 @@ class QWenLMHeadModel(nn.Module):
         )
         return next_tokens
 
-    _column_parallel_weights = []
-    _row_parallel_weights = ["c_proj.weight"]
-
     def load_weights(
         self,
         model_name_or_path: str,
