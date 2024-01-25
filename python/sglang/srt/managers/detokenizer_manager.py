@@ -60,7 +60,9 @@ class DetokenizerManager:
                         if first_token.startswith("▁"):
                             output_strs[i] = " " + output_strs[i]
 
-                    output_strs[i] = recv_obj.output_and_fast_forward_strs[i] + output_strs[i]
+                    output_strs[i] = (
+                        recv_obj.output_and_fast_forward_strs[i] + output_strs[i]
+                    )
 
                 self.send_to_tokenizer.send_pyobj(
                     BatchStrOut(

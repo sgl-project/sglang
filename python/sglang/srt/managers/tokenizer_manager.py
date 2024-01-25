@@ -200,6 +200,7 @@ class TokenizerManager:
                     )
                 tokenized_obj = TokenizedGenerateReqInput(
                     rid=rid,
+                    input_text=obj.text[i],
                     input_ids=input_ids,
                     pixel_values=pixel_values,
                     image_hash=image_hash,
