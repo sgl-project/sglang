@@ -1,5 +1,4 @@
 import torch
-from sglang.srt.layers.get_selected_logprob import get_selected_logprob
 from sglang.srt.managers.router.model_runner import ForwardMode, InputMetadata
 from torch import nn
 from vllm.model_executor.parallel_utils.communication_op import (
@@ -15,7 +14,7 @@ class LogitsProcessor(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward(self, input_ids, hidden_states, weight, input_metadata):
-        if not input_metadata.return_normalized_logprob:
+        if not input_metadata.return_logprob:
             if input_metadata.forward_mode == ForwardMode.DECODE:
                 last_hidden = hidden_states
             else:
@@ -34,7 +33,7 @@ class LogitsProcessor(nn.Module):
             if self.tp_size > 1:
                 last_logits = tensor_model_parallel_all_gather(last_logits)
             last_logits = last_logits[:, : self.config.vocab_size]
-            return last_logits, None
+            return last_logits, (None, None)
         else:
             assert input_metadata.forward_mode != ForwardMode.DECODE
             last_index = (
@@ -52,26 +51,51 @@ class LogitsProcessor(nn.Module):
             logits = logits[:, : self.config.vocab_size]
             all_logprobs = torch.log(torch.softmax(logits.float(), dim=-1) + 1e-6)
 
-            normalized_logprobs = compute_normalized_logprobs(
-                all_logprobs,
-                input_metadata.seq_lens - input_metadata.prefix_lens,
-                input_ids,
+            logprobs = all_logprobs[
+                torch.arange(all_logprobs.shape[0], device="cuda"),
+                torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
+            ]
+            logprobs_cumsum = torch.cumsum(logprobs, dim=0, dtype=torch.float32)
+
+            start = input_metadata.extend_start_loc.clone()
+            end = start + input_metadata.extend_seq_lens - 2
+            start.clamp_(min=0, max=logprobs.shape[0] - 1)
+            end.clamp_(min=0, max=logprobs.shape[0] - 1)
+            sum_logp = logprobs_cumsum[end] - logprobs_cumsum[start] + logprobs[start]
+            normalized_logprobs = sum_logp / (
+                (input_metadata.extend_seq_lens - 1).clamp(min=1)
             )
 
             last_logits = logits[last_index]
-            return last_logits, normalized_logprobs
+            return last_logits, (logprobs, normalized_logprobs)
 
 
-def compute_normalized_logprobs(all_logprobs, len_add_1, input_ids):
-    # assert all_logprobs.shape[0] == torch.sum(len_add_1) == input_ids.shape[0]
-    logprobs = torch.zeros(
-        (all_logprobs.shape[0] - len_add_1.shape[0]), dtype=torch.float32, device="cuda"
+if __name__ == "__main__":
+    all_logprobs = torch.tensor(
+        #       s                     s                s
+        [[0, 1, 2, 3], [1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6], [4, 5, 6, 7]],
+        dtype=torch.float32,
+        device="cuda",
     )
-    get_selected_logprob(all_logprobs, len_add_1, input_ids, logprobs)
-    cumsum = torch.cumsum(logprobs, dim=0, dtype=torch.float32)
-    end = torch.cumsum(len_add_1.sub_(1), dim=0)
-    start = torch.cat((torch.tensor([0], device="cuda"), end[:-1]), 0)
-    end.sub_(1)
-    sum_logp = cumsum[end] - cumsum[start] + logprobs[start]
-    res = sum_logp / len_add_1
-    return res
+    seq_lens = torch.tensor([2, 0, 3, 0], dtype=torch.int32, device="cuda")
+    input_ids = torch.tensor([1, 2, 3, 0, 1], dtype=torch.int32, device="cuda")
+    logprobs = torch.zeros(5, dtype=torch.float32, device="cuda")
+
+    logprobs = all_logprobs[
+        torch.arange(all_logprobs.shape[0], device="cuda"),
+        torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
+    ]
+    logprobs_cumsum = torch.cumsum(logprobs, dim=0, dtype=torch.float32)
+
+    len_cumsum = torch.cumsum(seq_lens, dim=0)
+    start = torch.cat((torch.tensor([0], device="cuda"), len_cumsum[:-1]), 0)
+    end = start + seq_lens - 2
+    start.clamp_(min=0, max=logprobs.shape[0] - 1)
+    end.clamp_(min=0, max=logprobs.shape[0] - 1)
+    sum_logp = logprobs_cumsum[end] - logprobs_cumsum[start] + logprobs[start]
+
+    # assert logprobs == [2, _, 2, 4, _]
+    print("logprobs", logprobs)
+    print("start", start)
+    print("end", end)
+    print("sum_logp", sum_logp)

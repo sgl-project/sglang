@@ -2,13 +2,12 @@ import argparse
 import random
 import string
 
+import sglang as sgl
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
 from vllm.transformers_utils.tokenizer import get_tokenizer
-
-import sglang as sgl
 
 TOKENIZER = None
 RANDOM_PREFILL_LEN = None

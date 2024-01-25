@@ -23,13 +23,15 @@ class FinishReason(Enum):
 class Req:
     def __init__(self, rid):
         self.rid = rid
+        self.input_text = None
         self.input_ids = []
         self.output_ids = []
         self.pixel_values = None
+        self.image_size = None
         self.image_offset = 0
         self.sampling_params = None
-        self.return_normalized_logprob = False
-        self.normalized_logprob_start_len = 0
+        self.return_logprob = False
+        self.logprob_start_len = 0
         self.stream = False
 
         self.tokenizer = None
@@ -37,18 +39,53 @@ class Req:
         self.finish_reason = None
         self.hit_stop_str = None
 
-        self.adjust_input_len = 0
+        self.extend_input_len = 0
         self.prefix_indices = []
         self.last_node = None
 
+        self.logprob = None
         self.normalized_logprob = None
 
         # for constrained decoding
         self.regex_fsm = None
-        self.regex_fsm_state = None
+        self.regex_fsm_state = 0
+        self.fast_forward_map = None
+        self.output_and_fast_forward_str = ""
 
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
+
+    def tokenize_fast_forward(self, fast_forward_str, next_state):
+        old_output_str = self.tokenizer.decode(self.output_ids)
+        if self.tokenizer.convert_ids_to_tokens(self.output_ids[0]).startswith("▁"):
+            old_output_str = " " + old_output_str
+        new_input_string = (
+            self.input_text
+            + self.output_and_fast_forward_str
+            + old_output_str
+            + fast_forward_str
+        )
+        new_input_ids = self.tokenizer.encode(new_input_string)
+        fast_forward_tokens_len = (
+            len(new_input_ids) - len(self.input_ids) - len(self.output_ids)
+        )
+        # print("=" * 100)
+        # print(f"Catch fast forward:\n{fast_forward_str}")
+        # print(self.tokenizer.convert_ids_to_tokens(self.input_ids))
+        # print(self.tokenizer.convert_ids_to_tokens(new_input_ids))
+
+        self.input_ids = new_input_ids
+        self.output_ids = []
+        self.sampling_params.max_new_tokens = max(
+            self.sampling_params.max_new_tokens - fast_forward_tokens_len, 0
+        )
+        self.regex_fsm_state = next_state
+        self.output_and_fast_forward_str = (
+            self.output_and_fast_forward_str + old_output_str + fast_forward_str
+        )
+
+        # print(f"Output and fast forward str:\n{self.output_and_fast_forward_str}")
+        # print("*" * 100)
 
     def check_finished(self):
         if self.finished:
@@ -99,10 +136,11 @@ class Batch:
     out_cache_loc: torch.Tensor = None
     out_cache_cont_start: torch.Tensor = None
     out_cache_cont_end: torch.Tensor = None
-    return_normalized_logprob: bool = False
+    return_logprob: bool = False
 
     # for multimodal
     pixel_values: List[torch.Tensor] = None
+    image_sizes: List[List[int]] = None
     image_offsets: List[int] = None
 
     # other arguments for control
@@ -119,14 +157,14 @@ class Batch:
 
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
-        return_normalized_logprob = any(req.return_normalized_logprob for req in reqs)
+        return_logprob = any(req.return_logprob for req in reqs)
 
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
-            return_normalized_logprob=return_normalized_logprob,
+            return_logprob=return_logprob,
         )
 
     def is_empty(self):
@@ -194,6 +232,7 @@ class Batch:
             flatten_input_ids, dtype=torch.int32, device=device
         )
         self.pixel_values = [r.pixel_values for r in reqs]
+        self.image_sizes = [r.image_size for r in reqs]
         self.image_offsets = [
             r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
         ]
@@ -257,8 +296,10 @@ class Batch:
             self.tree_cache.dec_ref_counter(req.last_node)
             req.prefix_indices = None
             req.last_node = None
-            req.adjust_input_len = 0
+            req.extend_input_len = 0
             req.output_ids = []
+            req.regex_fsm_state = 0
+
             # TODO: apply more fine-grained retraction
 
             token_indices = self.req_to_token_pool.req_to_token[
@@ -269,6 +310,46 @@ class Batch:
         self.filter_batch(sorted_indices)
 
         return retracted_reqs
+
+    def check_for_fast_forward(self):
+        fast_forward_reqs = []
+        filter_indices = [i for i in range(len(self.reqs))]
+
+        req_pool_indices_cpu = None
+
+        for i, req in enumerate(self.reqs):
+            if req.fast_forward_map is not None:
+                res = req.fast_forward_map.fast_forward(req.regex_fsm_state)
+                if res is not None:
+                    fast_forward_str, next_state = res
+                    if len(fast_forward_str) <= 1:
+                        continue
+
+                    # insert the old request into tree_cache
+                    token_ids_in_memory = tuple(req.input_ids + req.output_ids)[:-1]
+                    if req_pool_indices_cpu is None:
+                        req_pool_indices_cpu = self.req_pool_indices.cpu().tolist()
+                    req_pool_idx = req_pool_indices_cpu[i]
+                    indices = self.req_to_token_pool.req_to_token[
+                        req_pool_idx, : len(token_ids_in_memory)
+                    ]
+                    prefix_len = self.tree_cache.insert(
+                        token_ids_in_memory, indices.clone()
+                    )
+                    self.token_to_kv_pool.free(indices[:prefix_len])
+                    self.req_to_token_pool.free(req_pool_idx)
+                    self.tree_cache.dec_ref_counter(req.last_node)
+
+                    # fast forward
+                    req.tokenize_fast_forward(fast_forward_str, next_state)
+
+                    fast_forward_reqs.append(req)
+                    filter_indices.remove(i)
+
+        if len(filter_indices) < len(self.reqs):
+            self.filter_batch(filter_indices)
+
+        return fast_forward_reqs
 
     def prepare_for_decode(self, input_ids=None):
         if input_ids is None:
@@ -310,9 +391,7 @@ class Batch:
         self.prefix_lens = None
         self.position_ids_offsets = self.position_ids_offsets[new_indices]
         self.out_cache_loc = self.out_cache_cont_start = self.out_cache_cont_end = None
-        self.return_normalized_logprob = any(
-            req.return_normalized_logprob for req in self.reqs
-        )
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
 
         for item in [
             "temperatures",
@@ -336,9 +415,7 @@ class Batch:
             [self.position_ids_offsets, other.position_ids_offsets]
         )
         self.out_cache_loc = self.out_cache_cont_start = self.out_cache_cont_end = None
-        self.return_normalized_logprob = any(
-            req.return_normalized_logprob for req in self.reqs
-        )
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
 
         for item in [
             "temperatures",

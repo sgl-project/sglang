@@ -5,7 +5,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.router.model_runner import InputMetadata
 from torch import nn
-from vllm.transformers_utils.configs.qwen import QWenConfig
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -26,9 +25,10 @@ from vllm.model_executor.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
+from vllm.transformers_utils.configs.qwen import QWenConfig
+
 
 class QWenMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -49,8 +49,10 @@ class QWenMLP(nn.Module):
             input_is_parallel=True,
         )
         if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}. "
-                             "Only silu is supported for now.")
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
+            )
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -59,31 +61,28 @@ class QWenMLP(nn.Module):
         x, _ = self.c_proj(x)
         return x
 
-class QWenAttention(nn.Module):
 
-    def __init__(self,
-                 hidden_size: int,
-                 num_heads: int,
-                 max_position_embeddings: int,
-                 layer_id: int = 0,
-                 rope_theta: float = 10000,
-                 rope_scaling: Optional[Dict[str, Any]] = None):
+class QWenAttention(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        max_position_embeddings: int,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__()
         self.hidden_size = hidden_size
-        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size(
-        )
+        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tensor_model_parallel_world_size == 0
-        self.num_heads = (self.total_num_heads //
-                          tensor_model_parallel_world_size)
+        self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
         self.head_dim = hidden_size // self.total_num_heads
 
         # pylint: disable=invalid-name
         self.c_attn = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            bias=True
+            hidden_size, self.head_dim, self.total_num_heads, bias=True
         )
         self.c_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -120,20 +119,22 @@ class QWenAttention(nn.Module):
         output, _ = self.c_proj(attn_output)
         return output
 
-class QWenBlock(nn.Module):
 
-    def __init__(self, config: QWenConfig,layer_id):
+class QWenBlock(nn.Module):
+    def __init__(self, config: QWenConfig, layer_id):
         super().__init__()
         self.ln_1 = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        self.attn = QWenAttention(config.hidden_size,
-                                  config.num_attention_heads,
-                                  config.max_position_embeddings,
-                                  rope_theta=rope_theta,
-                                  rope_scaling=rope_scaling,
-                                  layer_id=layer_id)
+        self.attn = QWenAttention(
+            config.hidden_size,
+            config.num_attention_heads,
+            config.max_position_embeddings,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            layer_id=layer_id,
+        )
 
         self.ln_2 = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
@@ -161,10 +162,10 @@ class QWenBlock(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
-    
-class QWenModel(nn.Module):
 
-    def __init__(self, config:QWenConfig):
+
+class QWenModel(nn.Module):
+    def __init__(self, config: QWenConfig):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -175,7 +176,8 @@ class QWenModel(nn.Module):
             config.hidden_size,
         )
         self.h = nn.ModuleList(
-            [QWenBlock(config, i) for i in range(config.num_hidden_layers)])
+            [QWenBlock(config, i) for i in range(config.num_hidden_layers)]
+        )
         self.ln_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
@@ -195,30 +197,30 @@ class QWenModel(nn.Module):
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
 
-class QWenLMHeadModel(nn.Module):
 
-    def __init__(self, config: QWenConfig,linear_method=None):
+class QWenLMHeadModel(nn.Module):
+    def __init__(self, config: QWenConfig, linear_method=None):
         super().__init__()
         self.config = config
         self.transformer = QWenModel(config)
         vocab_size = ((config.vocab_size + 63) // 64) * 64
-        self.lm_head = ParallelLMHead(
-            vocab_size,
-            config.hidden_size
-        )
+        self.lm_head = ParallelLMHead(vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata
+        input_metadata: InputMetadata,
     ):
-        hidden_states = self.transformer(input_ids, positions,input_metadata)
+        hidden_states = self.transformer(input_ids, positions, input_metadata)
         next_tokens = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
         return next_tokens
+
+    _column_parallel_weights = []
+    _row_parallel_weights = ["c_proj.weight"]
 
     def load_weights(
         self,

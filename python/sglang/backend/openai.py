@@ -51,11 +51,11 @@ CHAT_MODEL_NAMES = [
 class OpenAI(BaseBackend):
     def __init__(self, model_name, *args, **kwargs):
         super().__init__()
-        self.client = openai.OpenAI(*args, **kwargs)
 
         if isinstance(openai, Exception):
-            raise e
+            raise openai
 
+        self.client = openai.OpenAI(*args, **kwargs)
         self.model_name = model_name
         self.tokenizer = tiktoken.encoding_for_model(model_name)
         self.logit_bias_int = create_logit_bias_int(self.tokenizer)
@@ -77,7 +77,11 @@ class OpenAI(BaseBackend):
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
-                assert s.text_.endswith("ASSISTANT:")
+                if not s.text_.endswith("ASSISTANT:"):
+                    raise RuntimeError(
+                        "This use case is not supported. "
+                        "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
+                    )
                 prompt = s.messages_
             else:
                 prompt = s.text_
@@ -149,6 +153,12 @@ class OpenAI(BaseBackend):
         choices: List[str],
         temperature: float,
     ):
+        if self.is_chat_model:
+            raise NotImplementedError(
+                "select/choices is not supported for chat models. "
+                "Please try to use a non-chat model such as gpt-3.5-turbo-instruct"
+            )
+
         n_choices = len(choices)
         token_ids = [self.tokenizer.encode(x) for x in choices]
         scores = [0] * n_choices
@@ -199,7 +209,7 @@ class OpenAI(BaseBackend):
             prompt_tokens.append(ret_token)
 
         decision = choices[np.argmax(scores)]
-        return decision, scores
+        return decision, scores, scores
 
 
 def openai_completion(client, is_chat=None, prompt=None, **kwargs):
