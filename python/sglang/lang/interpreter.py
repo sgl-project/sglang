@@ -369,22 +369,28 @@ class StreamExecutor:
         name = expr.name
 
         if not self.stream:
-            stop = expr.sampling_params.stop
-            stop_pos = self.speculated_text.find(stop)
-            if stop_pos == -1:
-                sampling_params.max_new_tokens = max(
+            if self.api_num_spec_tokens is not None:
+                stop = sampling_params.stop
+                stop_pos = self.speculated_text.find(stop)
+                if stop_pos == -1:
+                    sampling_params.max_new_tokens = max(
                         sampling_params.max_new_tokens, self.api_num_spec_tokens)
-                sampling_params.stop = None
-                self.speculated_text, meta_info = self.backend.generate(
+                    sampling_params.stop = None
+                    self.speculated_text, meta_info = self.backend.generate(
+                        self, sampling_params=sampling_params
+                    )
+                else:
+                    meta_info = {}
+
+                stop_pos = self.speculated_text.find(stop)
+                if stop_pos == -1: stop_pos = len(self.speculated_text)
+                comp = self.speculated_text[:stop_pos]
+                self.speculated_text = self.speculated_text[stop_pos + 1:]
+            else:
+                comp, meta_info = self.backend.generate(
                     self, sampling_params=sampling_params
                 )
-            else:
-                meta_info = {}
-
-            stop_pos = self.speculated_text.find(stop)
-            if stop_pos == -1: stop_pos = len(self.speculated_text)
-            comp = self.speculated_text[:stop_pos + 1]
-            self.speculated_text = self.speculated_text[stop_pos + 1:]
+             
 
             self.text_ += comp
  
