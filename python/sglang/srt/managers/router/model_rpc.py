@@ -135,7 +135,7 @@ class ModelRpcServer(rpyc.Service):
         if len(self.forward_queue) == 0 and (
             self.running_batch is None or len(self.running_batch.reqs) == 0
         ):
-            self.tree_cache.clear()
+            self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()
