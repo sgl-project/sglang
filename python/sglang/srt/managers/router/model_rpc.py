@@ -138,9 +138,10 @@ class ModelRpcServer(rpyc.Service):
             self.tree_cache.clear()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
+            torch.cuda.empty_cache()
             logger.info("Cache flushed.")
         else:
-            logger.info(
+            warnings.warn(
                 "Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.forward_queue)}, "
                 f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
