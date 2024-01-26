@@ -38,6 +38,13 @@ class RadixCache:
         self.disable = disable
 
     ##### Public API #####
+
+    def clear(self):
+        self.root_node = TreeNode()
+        self.root_node.value = []
+        self.root_node.ref_counter = 1
+        self.evictable_size_ = 0
+
     def match_prefix(self, key):
         if self.disable:
             return [], self.root_node
