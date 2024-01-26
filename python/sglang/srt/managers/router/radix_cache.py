@@ -176,8 +176,9 @@ class RadixCache:
         for k, v in node.parent.children.items():
             if v == node:
                 break
+        value = node.value
         del node.parent.children[k]
-        self.evictable_size_ -= len(k)
+        self.evictable_size_ -= len(value)
 
     def _total_size_helper(self, node):
         x = len(node.value)
