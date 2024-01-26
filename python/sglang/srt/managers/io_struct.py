@@ -87,3 +87,8 @@ class BatchStrOut:
     output_str: List[str]
     meta_info: List[Dict]
     finished: List[bool]
+
+
+@dataclass
+class FlushCacheReq:
+    pass

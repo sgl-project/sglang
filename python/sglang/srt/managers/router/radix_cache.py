@@ -30,14 +30,17 @@ def match(key, seq):
 
 class RadixCache:
     def __init__(self, disable=False):
+        self.reset()
+        self.disable = disable
+
+    ##### Public API #####
+
+    def reset(self):
         self.root_node = TreeNode()
         self.root_node.value = []
         self.root_node.ref_counter = 1
         self.evictable_size_ = 0
 
-        self.disable = disable
-
-    ##### Public API #####
     def match_prefix(self, key):
         if self.disable:
             return [], self.root_node
