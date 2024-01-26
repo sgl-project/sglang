@@ -70,10 +70,14 @@ async def get_model_info():
     }
     return result
 
+
 @app.get("/flush_cache")
 async def flush_cache():
     await tokenizer_manager.flush_cache()
-    return Response(status_code=200)
+    return Response(
+        content="Cache flushed.\nPlease check backend logs for more details. (When there are running or waiting requests, the operation will not be performed.)\n",
+        status_code=200,
+    )
 
 
 async def stream_generator(obj):
