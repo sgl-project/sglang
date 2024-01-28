@@ -1,4 +1,5 @@
 """Inference-only Yi-VL model."""
+import os
 from typing import List, Optional
 
 import torch
@@ -15,7 +16,7 @@ from sglang.srt.models.llava import LlavaLlamaForCausalLM, clip_vision_embed_for
 class YiVLForCausalLM(LlavaLlamaForCausalLM):
     def __init__(self, *args, **kwargs):
         self.config = kwargs["config"]
-        self.config.image_token_index = 49408
+        self.config.image_token_index = 64002
         super().__init__(self.config)
 
         self.multi_modal_projector = YiVLMultiModalProjector(self.config)
@@ -72,12 +73,27 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
             model_name_or_path, cache_dir, load_format, revision
         ):
             if "projector" in name or "vision_tower" in name:
+                print(name)
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+        # print(self.vision_tower.vision_model.encoder.layers[0].self_attn.k_proj.weight)
+        for i, obj in enumerate([
+            self.multi_modal_projector.linear_1.bias,
+            self.multi_modal_projector.linear_1.weight,
+            self.multi_modal_projector.ln_1.bias,
+            self.multi_modal_projector.ln_1.weight,
+            self.multi_modal_projector.linear_2.bias,
+            self.multi_modal_projector.linear_2.weight,
+            self.multi_modal_projector.ln_2.bias,
+            self.multi_modal_projector.ln_2.weight,
+        ]):
+            print(i)
+            print(obj)
 
         # load language model
         self.language_model.load_weights(
