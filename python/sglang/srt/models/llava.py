@@ -319,7 +319,6 @@ def clip_vision_embed_forward(self, pixel_values: torch.FloatTensor) -> torch.Te
 
     class_embeds = self.class_embedding.expand(batch_size, 1, -1)
     embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
-    print(self.position_ids.shape)
     embeddings = embeddings + self.position_embedding(self.position_ids)
     return embeddings
 
