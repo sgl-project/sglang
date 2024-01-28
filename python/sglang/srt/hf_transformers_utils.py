@@ -74,6 +74,7 @@ def get_tokenizer(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
+    model_path: str = "",
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
@@ -83,6 +84,7 @@ def get_tokenizer(
             *args,
             trust_remote_code=trust_remote_code,
             tokenizer_revision=tokenizer_revision,
+            model_path=model_path,
             **kwargs,
         )
         tokenizer = processor.tokenizer
@@ -152,6 +154,7 @@ def get_processor(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
+    model_path: str = "",
     **kwargs,
 ):
     processor = AutoProcessor.from_pretrained(
@@ -161,4 +164,12 @@ def get_processor(
         tokenizer_revision=tokenizer_revision,
         **kwargs,
     )
+    
+    if "yi-vl" in model_path.lower():
+        processor.image_processor.size = 448
+        processor.image_processor.crop_size = 448
+        processor.tokenizer.add_tokens(
+            ["<image_placeholder>"], special_tokens=True
+        )
+
     return processor

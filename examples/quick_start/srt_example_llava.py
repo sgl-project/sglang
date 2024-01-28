@@ -10,8 +10,11 @@ def image_qa(s, image_path, question):
     s += sgl.assistant(sgl.gen("answer"))
 
 
-runtime = sgl.Runtime(model_path="liuhaotian/llava-v1.5-7b",
-                      tokenizer_path="llava-hf/llava-1.5-7b-hf")
+runtime = sgl.Runtime(model_path="01-ai/Yi-VL-6B",
+# runtime = sgl.Runtime(model_path="liuhaotian/llava-v1.5-7b",
+                    #   tokenizer_path="01-ai/Yi-VL-6B")
+                    # tokenizer_path="llava-hf/llava-1.5-7b-hf")
+                    tokenizer_path="laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
 sgl.set_default_backend(runtime)
 
 

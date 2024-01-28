@@ -28,6 +28,7 @@ class DetokenizerManager:
             server_args.tokenizer_path,
             tokenizer_mode=server_args.tokenizer_mode,
             trust_remote_code=server_args.trust_remote_code,
+            model_path=server_args.model_path,
         )
 
     async def handle_loop(self):
@@ -36,6 +37,7 @@ class DetokenizerManager:
 
             if isinstance(recv_obj, BatchTokenIDOut):
                 output_tokens = recv_obj.output_tokens
+                print(f"Output tokens: {output_tokens}")
 
                 # TODO(lmzheng): handle skip_special_tokens per request
                 output_strs = self.tokenizer.batch_decode(

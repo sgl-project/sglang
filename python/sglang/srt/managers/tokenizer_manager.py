@@ -48,6 +48,7 @@ def init_global_processor(server_args: ServerArgs):
         server_args.tokenizer_path,
         tokenizer_mode=server_args.tokenizer_mode,
         trust_remote_code=server_args.trust_remote_code,
+        model_path=server_args.model_path,
     )
 
 
@@ -59,6 +60,7 @@ def get_pixel_values(
         image = load_image(image_data)
         image_hash = hash(image_data)
         if image_aspect_ratio == "pad":
+            print(f"The processor's crop size and image size: {processor.image_processor.crop_size}, {processor.image_processor.size}")
             image = expand2square(
                 image, tuple(int(x * 255) for x in processor.image_processor.image_mean)
             )
@@ -70,6 +72,7 @@ def get_pixel_values(
         else:
             pixel_values = processor.image_processor(image)["pixel_values"][0]
         pixel_values = pixel_values.astype(np.float16)
+        print(f"After processing, the pixel vaues are {pixel_values.shape}")
         return pixel_values, image_hash, image.size
     except Exception:
         print("Exception in TokenizerManager:\n" + get_exception_traceback())
@@ -100,6 +103,7 @@ class TokenizerManager:
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
+                model_path=server_args.model_path,
             )
             self.tokenizer = self.processor.tokenizer
             os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -113,6 +117,7 @@ class TokenizerManager:
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
+                model_path=server_args.model_path,
             )
 
         self.to_create_loop = True
@@ -145,6 +150,7 @@ class TokenizerManager:
 
         if is_single:
             rid = obj.rid
+            print(f"The text that was inserted: {obj.text}")
             input_ids = self.tokenizer.encode(obj.text)
             sampling_params = SamplingParams(**obj.sampling_params)
             if sampling_params.max_new_tokens != 0:

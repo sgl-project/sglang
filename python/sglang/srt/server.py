@@ -470,6 +470,7 @@ class Runtime:
             self.server_args.tokenizer_path,
             tokenizer_mode=self.server_args.tokenizer_mode,
             trust_remote_code=self.server_args.trust_remote_code,
+            model_path=self.server_args.model_path,
         )
 
     async def add_request(
