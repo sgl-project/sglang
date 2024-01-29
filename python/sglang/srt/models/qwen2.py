@@ -1,5 +1,4 @@
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/671af2b1c0b3ed6d856d37c21a561cc429a10701/vllm/model_executor/models/Qwen2.py#L1
+# Adapted from llama2.py
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 from typing import Any, Dict, List, Optional, Tuple
