@@ -197,9 +197,11 @@ async def v1_chat_completions(raw_request: Request):
                 request.messages, tokenize=False, add_generation_prompt=True
             )
             stop = request.stop
+            image_data = None
         else:
             conv = generate_chat_conv(request, chat_template_name)
             prompt = conv.get_prompt()
+            image_data = conv.image_data
             stop = conv.stop_str or []
             if request.stop:
                 if isinstance(request.stop, str):
@@ -210,9 +212,11 @@ async def v1_chat_completions(raw_request: Request):
         # Use the raw prompt and stop strings if the messages is already a string.
         prompt = request.messages
         stop = request.stop
+        image_data = None
 
     adapted_request = GenerateReqInput(
         text=prompt,
+        image_data=image_data,
         sampling_params={
             "temperature": request.temperature,
             "max_new_tokens": request.max_tokens,
@@ -303,6 +307,7 @@ def launch_server(server_args, pipe_finish_writer):
 
     # Load chat template if needed
     if server_args.chat_template is not None:
+        print(server_args.chat_template)
         if not chat_template_exists(server_args.chat_template):
             if not os.path.exists(server_args.chat_template):
                 raise RuntimeError(
