@@ -6,7 +6,7 @@ import os
 import sys
 import threading
 import time
-from typing import List, Optional
+from typing import List, Optional, Union
 
 # Fix a Python bug
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -47,7 +47,7 @@ from sglang.srt.managers.openai_protocol import (
 from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import alloc_usable_network_port
+from sglang.srt.utils import alloc_usable_network_port, handle_port_init
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -289,16 +289,17 @@ def launch_server(server_args, pipe_finish_writer):
     global tokenizer_manager
     global chat_template_name
 
-    # Allocate ports
-    can_use_ports = alloc_usable_network_port(
-        num=4 + server_args.tp_size, used_list=(server_args.port,)
+    # Handle ports
+    server_args.port, server_args.additional_ports = handle_port_init(
+        server_args.port, server_args.additional_ports, server_args.tp_size
     )
+
     port_args = PortArgs(
-        tokenizer_port=can_use_ports[0],
-        router_port=can_use_ports[1],
-        detokenizer_port=can_use_ports[2],
-        nccl_port=can_use_ports[3],
-        model_rpc_ports=can_use_ports[4:],
+        tokenizer_port=server_args.additional_ports[0],
+        router_port=server_args.additional_ports[1],
+        detokenizer_port=server_args.additional_ports[2],
+        nccl_port=server_args.additional_ports[3],
+        model_rpc_ports=server_args.additional_ports[4:],
     )
 
     # Load chat template if needed
@@ -417,14 +418,19 @@ class Runtime:
         schedule_heuristic: str = "lpm",
         random_seed: int = 42,
         log_level: str = "error",
+        port: Optional[int] = None,
+        additional_ports: Optional[Union[List[int], int]] = None,
     ):
         host = "127.0.0.1"
-        port = alloc_usable_network_port(1)[0]
+        port, additional_ports = handle_port_init(
+            port, additional_ports, tp_size
+        )
         self.server_args = ServerArgs(
             model_path=model_path,
             tokenizer_path=tokenizer_path,
             host=host,
             port=port,
+            additional_ports=additional_ports,
             load_format=load_format,
             tokenizer_mode=tokenizer_mode,
             trust_remote_code=trust_remote_code,
