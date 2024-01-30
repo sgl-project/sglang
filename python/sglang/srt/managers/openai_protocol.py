@@ -1,8 +1,8 @@
 import time
 from typing import Dict, List, Optional, Union
-from typing_extensions import Literal
 
 from pydantic import BaseModel, Field
+from typing_extensions import Literal
 
 
 class LogProbs(BaseModel):

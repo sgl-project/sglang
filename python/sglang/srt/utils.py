@@ -6,6 +6,7 @@ import sys
 import time
 import traceback
 from io import BytesIO
+from typing import List, Optional
 
 import numpy as np
 import requests
@@ -108,10 +109,16 @@ def check_port(port):
             return False
 
 
-def handle_port_init(port: Optional[int] = None, additional_ports: Optional[List[int]] = None, tp_size: int = 1):
+def handle_port_init(
+    port: Optional[int] = None,
+    additional_ports: Optional[List[int]] = None,
+    tp_size: int = 1,
+):
     port = 30000 if port is None else port
     additional_ports = [] if additional_ports is None else additional_ports
-    additional_ports = [additional_ports] if isinstance(additional_ports, int) else additional_ports
+    additional_ports = (
+        [additional_ports] if isinstance(additional_ports, int) else additional_ports
+    )
     # first check on server port
     if not check_port(port):
         new_port = alloc_usable_network_port(1, used_list=[port])[0]
@@ -129,9 +136,10 @@ def handle_port_init(port: Optional[int] = None, additional_ports: Optional[List
             num=4 + tp_size - num_specified_ports, used_list=can_use_ports + [port]
         )
         can_use_ports.extend(addtional_can_use_ports)
-    
-    additional_ports = can_use_ports[:4 + tp_size]
+
+    additional_ports = can_use_ports[: 4 + tp_size]
     return port, additional_ports
+
 
 def get_exception_traceback():
     etype, value, tb = sys.exc_info()
