@@ -30,21 +30,8 @@ def create_logit_bias_int(tokenizer):
     return mask
 
 
-CHAT_MODEL_NAMES = [
-    # GPT-4
-    "gpt-4",
-    "gpt-4-32k",
-    "gpt-4-1106-preview",
-    "gpt-4-vision-preview",
-    "gpt-4-0613",
-    "gpt-4-0314",
-    # GPT-3.5
-    "gpt-3.5-turbo",
-    "gpt-3.5-turbo-16k",
-    "gpt-3.5-turbo-1106",
-    "gpt-3.5-turbo-16k-0613",
-    "gpt-3.5-turbo-0613",
-    "gpt-3.5-turbo-0301",
+INSTRUCT_MODEL_NAMES = [
+    "gpt-3.5-turbo-instruct",
 ]
 
 
@@ -60,10 +47,10 @@ class OpenAI(BaseBackend):
         self.tokenizer = tiktoken.encoding_for_model(model_name)
         self.logit_bias_int = create_logit_bias_int(self.tokenizer)
 
-        if model_name in CHAT_MODEL_NAMES:
-            self.is_chat_model = True
-        else:
+        if model_name in INSTRUCT_MODEL_NAMES:
             self.is_chat_model = False
+        else:
+            self.is_chat_model = True
 
         self.chat_template = get_chat_template("default")
 
@@ -235,6 +222,8 @@ def openai_completion(client, is_chat=None, prompt=None, **kwargs):
 def openai_completion_stream(client, is_chat=None, prompt=None, **kwargs):
     try:
         if is_chat:
+            if kwargs["stop"] is None:
+                kwargs.pop("stop")
             generator = client.chat.completions.create(
                 messages=prompt, stream=True, **kwargs
             )

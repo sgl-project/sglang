@@ -172,6 +172,8 @@ def image_qa(s, image_file, question):
     s += sgl.assistant(sgl.gen("answer", max_tokens=256)
 ```
 
+See also [srt_example_llava.py](examples/quick_start/srt_example_llava.py).
+
 ### Constrained Decoding
 Use `regex` to specify a regular expression as a decoding constraint.
 This is only supported for local models.
