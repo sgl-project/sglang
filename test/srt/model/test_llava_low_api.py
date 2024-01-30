@@ -112,6 +112,7 @@ def test_generate_worker(
     prefill_params = (
         torch.tensor(np.array(input_ids)).cuda(),
         np.array(pixel_values),
+        [None],
         [offset],
         *params,
     )

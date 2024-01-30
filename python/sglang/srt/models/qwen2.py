@@ -1,21 +1,20 @@
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/d0215a58e78572d91dadafe9d832a2db89b09a13/vllm/model_executor/models/mixtral.py#L1
-"""Inference-only Mixtral model."""
-from typing import List, Optional, Tuple
+# Adapted from llama2.py
+# Modify details for the adaptation of Qwen2 model.
+"""Inference-only Qwen2 model compatible with HuggingFace weights."""
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.router.model_runner import InputMetadata
 from torch import nn
-from transformers import MixtralConfig
+from transformers import Qwen2Config
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -23,11 +22,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.parallel_utils.communication_op import (
-    tensor_model_parallel_all_reduce,
-)
 from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.weight_utils import (
@@ -36,117 +31,49 @@ from vllm.model_executor.weight_utils import (
 )
 
 
-class MixtralMLP(nn.Module):
+class Qwen2MLP(nn.Module):
     def __init__(
         self,
-        num_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        hidden_act: str,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
-        self.num_experts = num_experts
-        self.ffn_dim = intermediate_size
-        self.hidden_dim = hidden_size
-
-        self.w1 = ReplicatedLinear(
-            self.hidden_dim, self.ffn_dim, bias=False, linear_method=linear_method
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            linear_method=linear_method,
         )
-        self.w2 = ReplicatedLinear(
-            self.ffn_dim, self.hidden_dim, bias=False, linear_method=linear_method
+        self.down_proj = RowParallelLinear(
+            intermediate_size, hidden_size, bias=False, linear_method=linear_method
         )
-        self.w3 = ReplicatedLinear(
-            self.hidden_dim, self.ffn_dim, bias=False, linear_method=linear_method
-        )
-
-        # TODO: Use vllm's SiluAndMul
-        self.act_fn = nn.SiLU()
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        w1_out, _ = self.w1(hidden_states)
-        w1_out = self.act_fn(w1_out)
-        w3_out, _ = self.w3(hidden_states)
-        current_hidden_states = w1_out * w3_out
-        current_hidden_states, _ = self.w2(current_hidden_states)
-        return current_hidden_states
-
-
-class MixtralMoE(nn.Module):
-    def __init__(
-        self,
-        config: MixtralConfig,
-        linear_method: Optional[LinearMethodBase] = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.num_total_experts = config.num_local_experts
-        self.top_k = config.num_experts_per_tok
-        if self.tp_size > self.num_total_experts:
+        if hidden_act != "silu":
             raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {self.num_total_experts}."
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
             )
-        # Split experts equally between ranks
-        self.expert_indicies = np.array_split(
-            range(self.num_total_experts), self.tp_size
-        )[self.rank].tolist()
-        if not self.expert_indicies:
-            raise ValueError(f"Rank {self.rank} has no experts assigned to it.")
+        self.act_fn = SiluAndMul()
 
-        self.experts = nn.ModuleList(
-            [
-                MixtralMLP(
-                    self.num_total_experts,
-                    config.hidden_size,
-                    config.intermediate_size,
-                    linear_method=linear_method,
-                )
-                if idx in self.expert_indicies
-                else None
-                for idx in range(self.num_total_experts)
-            ]
-        )
-        self.gate = ReplicatedLinear(
-            config.hidden_size, self.num_total_experts, bias=False, linear_method=None
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits, _ = self.gate(hidden_states)
-
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
-        final_hidden_states = None
-        for expert_idx in self.expert_indicies:
-            expert_layer = self.experts[expert_idx]
-            expert_mask = selected_experts == expert_idx
-            expert_weights = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
-
-            current_hidden_states = expert_layer(hidden_states).mul_(expert_weights)
-            if final_hidden_states is None:
-                final_hidden_states = current_hidden_states
-            else:
-                final_hidden_states.add_(current_hidden_states)
-
-        return tensor_model_parallel_all_reduce(final_hidden_states)
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
 
 
-class MixtralAttention(nn.Module):
+class Qwen2Attention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
         layer_id: int = 0,
-        max_position: int = 4096 * 32,
-        rope_theta: float = 10000,
+        rope_theta: float = 1000000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 32768,
         linear_method: Optional[LinearMethodBase] = None,
-        sliding_window: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -169,14 +96,14 @@ class MixtralAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
-        self.sliding_window = sliding_window
+        self.max_position_embeddings = max_position_embeddings
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=False,
+            bias=True,
             linear_method=linear_method,
         )
         self.o_proj = RowParallelLinear(
@@ -185,12 +112,13 @@ class MixtralAttention(nn.Module):
             bias=False,
             linear_method=linear_method,
         )
+
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=int(self.rope_theta),
-            is_neox_style=True,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -214,28 +142,34 @@ class MixtralAttention(nn.Module):
         return output
 
 
-class MixtralDecoderLayer(nn.Module):
+class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
-        config: MixtralConfig,
+        config: Qwen2Config,
         layer_id: int = 0,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Requires transformers > 4.32.0
-        rope_theta = getattr(config, "rope_theta", 10000)
-        self.self_attn = MixtralAttention(
+        rope_theta = getattr(config, "rope_theta", 1000000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+        self.self_attn = Qwen2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            max_position=config.max_position_embeddings,
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
             rope_theta=rope_theta,
-            sliding_window=config.sliding_window,
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
             linear_method=linear_method,
         )
-        self.block_sparse_moe = MixtralMoE(config=config, linear_method=linear_method)
+        self.mlp = Qwen2MLP(
+            hidden_size=self.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            linear_method=linear_method,
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -247,7 +181,7 @@ class MixtralDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
         residual: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -262,28 +196,27 @@ class MixtralDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
-class MixtralModel(nn.Module):
+class Qwen2Model(nn.Module):
     def __init__(
         self,
-        config: MixtralConfig,
+        config: Qwen2Config,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
+        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
         )
-        # config.num_hidden_layers=16
         self.layers = nn.ModuleList(
             [
-                MixtralDecoderLayer(config, i, linear_method=linear_method)
+                Qwen2DecoderLayer(config, i, linear_method)
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -304,22 +237,25 @@ class MixtralModel(nn.Module):
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions, hidden_states, input_metadata, residual
+                positions,
+                hidden_states,
+                input_metadata,
+                residual,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
-class MixtralForCausalLM(nn.Module):
+class Qwen2ForCausalLM(nn.Module):
     def __init__(
         self,
-        config: MixtralConfig,
+        config: Qwen2Config,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.model = MixtralModel(config, linear_method)
+        self.model = Qwen2Model(config, linear_method)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
 
@@ -347,13 +283,18 @@ class MixtralForCausalLM(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
         ]
-
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in hf_model_weights_iterator(
             model_name_or_path, cache_dir, load_format, revision
         ):
-            if "rotary_emb.inv_freq" in name:
+            if "rotary_emb.inv_freq" in name or "projector" in name:
+                continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -370,12 +311,9 @@ class MixtralForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip experts that are not assigned to this worker.
-                if "block_sparse_moe.experts." in name and name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = MixtralForCausalLM
+EntryClass = Qwen2ForCausalLM
