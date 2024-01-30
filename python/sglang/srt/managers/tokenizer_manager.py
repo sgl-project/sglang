@@ -150,12 +150,17 @@ class TokenizerManager:
             if sampling_params.max_new_tokens != 0:
                 sampling_params.normalize(self.tokenizer)
                 sampling_params.verify()
-            if obj.image_data is None:
-                pixel_values, image_hash, image_size = None, None, None
-            else:
+
+            if isinstance(obj.image_data, list) and len(obj.image_data) > 0:
+                pixel_values, image_hash, image_size = await self.get_pixel_values(
+                    obj.image_data[0]
+                )
+            elif isinstance(obj.image_data, str):
                 pixel_values, image_hash, image_size = await self.get_pixel_values(
                     obj.image_data
                 )
+            else:
+                pixel_values, image_hash, image_size = None, None, None
             tokenized_obj = TokenizedGenerateReqInput(
                 rid=rid,
                 input_text=obj.text,

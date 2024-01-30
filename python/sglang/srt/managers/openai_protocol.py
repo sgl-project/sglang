@@ -1,5 +1,6 @@
 import time
 from typing import Dict, List, Optional, Union
+from typing_extensions import Literal
 
 from pydantic import BaseModel, Field
 
@@ -68,9 +69,44 @@ class CompletionStreamResponse(BaseModel):
     usage: UsageInfo
 
 
+class ChatCompletionMessageGenericParam(BaseModel):
+    role: Literal["system", "assistant"]
+    content: str
+
+
+class ChatCompletionMessageContentTextPart(BaseModel):
+    type: Literal["text"]
+    text: str
+
+
+class ChatCompletionMessageContentImageURL(BaseModel):
+    url: str
+    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+
+
+class ChatCompletionMessageContentImagePart(BaseModel):
+    type: Literal["image_url"]
+    image_url: ChatCompletionMessageContentImageURL
+
+
+ChatCompletionMessageContentPart = Union[
+    ChatCompletionMessageContentTextPart, ChatCompletionMessageContentImagePart
+]
+
+
+class ChatCompletionMessageUserParam(BaseModel):
+    role: Literal["user"]
+    content: Union[str, List[ChatCompletionMessageContentPart]]
+
+
+ChatCompletionMessageParam = Union[
+    ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam
+]
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: Union[str, List[Dict[str, str]]]
+    messages: Union[str, List[ChatCompletionMessageParam]]
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
