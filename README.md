@@ -39,39 +39,9 @@ pip install -e "python[all]"
   - For NVIDIA V100, please install the [nightly](https://triton-lang.org/main/getting-started/installation.html) version.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`
 
+
 ## Quick Start
 The example below shows how to use sglang to answer a mulit-turn question.
-
-### Using OpenAI Models
-Set the OpenAI API Key
-```
-export OPENAI_API_KEY=sk-******
-```
-
-Then, answer a multi-turn question.
-```python
-from sglang import function, system, user, assistant, gen, set_default_backend, OpenAI
-
-@function
-def multi_turn_question(s, question_1, question_2):
-    s += system("You are a helpful assistant.")
-    s += user(question_1)
-    s += assistant(gen("answer_1", max_tokens=256))
-    s += user(question_2)
-    s += assistant(gen("answer_2", max_tokens=256))
-
-set_default_backend(OpenAI("gpt-3.5-turbo"))
-
-state = multi_turn_question.run(
-    question_1="What is the capital of the United States?",
-    question_2="List two local attractions.",
-)
-
-for m in state.messages():
-    print(m["role"], ":", m["content"])
-
-print(state["answer_1"])
-```
 
 ### Using Local Models
 First, launch a server with
@@ -105,6 +75,37 @@ for m in state.messages():
 print(state["answer_1"])
 ```
 
+### Using OpenAI Models
+Set the OpenAI API Key
+```
+export OPENAI_API_KEY=sk-******
+```
+
+Then, answer a multi-turn question.
+```python
+from sglang import function, system, user, assistant, gen, set_default_backend, OpenAI
+
+@function
+def multi_turn_question(s, question_1, question_2):
+    s += system("You are a helpful assistant.")
+    s += user(question_1)
+    s += assistant(gen("answer_1", max_tokens=256))
+    s += user(question_2)
+    s += assistant(gen("answer_2", max_tokens=256))
+
+set_default_backend(OpenAI("gpt-3.5-turbo"))
+
+state = multi_turn_question.run(
+    question_1="What is the capital of the United States?",
+    question_2="List two local attractions.",
+)
+
+for m in state.messages():
+    print(m["role"], ":", m["content"])
+
+print(state["answer_1"])
+```
+
 ### More Examples
 
 Anthropic and VertexAI (Gemini) models are also supported.
@@ -120,7 +121,7 @@ import sglang as sgl
 `sglang` provides some simple primitives such as `gen`, `select`, `fork`, `image`.
 You can implement your prompt flow in a function decorated by `sgl.function`.
 You can then invoke the function with `run` or `run_batch`.
-The system will manage the state, chat template, and parallelism for you.
+The system will manage the state, chat template, parallelism and batching for you.
 
 ### Control Flow
 You can use any Python code within the function body, including control flow, nested function calls, and external libraries.
