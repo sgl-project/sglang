@@ -1,7 +1,11 @@
-from sglang import function, gen, set_default_backend, Runtime
+"""
+Usage:
+python3 srt_example_complete.py
+"""
+import sglang as sgl
 
 
-@function
+@sgl.function
 def few_shot_qa(s, question):
     s += (
 """The following are questions with answers.
@@ -13,16 +17,52 @@ Q: What is the capital of Italy?
 A: Rome
 """)
     s += "Q: " + question + "\n"
-    s += "A:" + gen("answer", stop="\n", temperature=0)
+    s += "A:" + sgl.gen("answer", stop="\n", temperature=0)
 
 
-runtime = Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
-set_default_backend(runtime)
+def single():
+    state = few_shot_qa.run(question="What is the capital of the United States?")
+    answer = state["answer"].strip().lower()
 
-state = few_shot_qa.run(question="What is the capital of the United States?")
+    assert "washington" in answer, f"answer: {state['answer']}"
 
-answer = state["answer"].strip().lower()
-assert "washington" in answer, f"answer: {state['answer']}"
-print(state.text())
+    print(state.text())
 
-runtime.shutdown()
+
+def stream():
+    state = few_shot_qa.run(
+        question="What is the capital of the United States?",
+        stream=True)
+
+    for out in state.text_iter("answer"):
+        print(out, end="", flush=True)
+    print()
+
+
+def batch():
+    states = few_shot_qa.run_batch([
+        {"question": "What is the capital of the United States?"},
+        {"question": "What is the capital of China?"},
+    ])
+
+    for s in states:
+        print(s["answer"])
+
+
+if __name__ == "__main__":
+    runtime = sgl.Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
+    sgl.set_default_backend(runtime)
+
+    # Run a single request
+    print("\n========== single ==========\n")
+    single()
+
+    # Stream output
+    print("\n========== stream ==========\n")
+    stream()
+
+    # Run a batch of requests
+    print("\n========== batch ==========\n")
+    batch()
+
+    runtime.shutdown()
