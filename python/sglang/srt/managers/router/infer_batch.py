@@ -21,14 +21,17 @@ class FinishReason(Enum):
 
 
 class Req:
-    def __init__(self, rid):
+    def __init__(self, rid, input_text, input_ids):
         self.rid = rid
-        self.input_text = None
-        self.input_ids = []
+        self.input_text = input_text
+        self.input_ids = input_ids
         self.output_ids = []
+
+        # For vision input
         self.pixel_values = None
         self.image_size = None
         self.image_offset = 0
+
         self.sampling_params = None
         self.return_logprob = False
         self.logprob_start_len = 0
@@ -46,7 +49,7 @@ class Req:
         self.logprob = None
         self.normalized_logprob = None
 
-        # for constrained decoding
+        # For constrained decoding
         self.regex_fsm = None
         self.regex_fsm_state = 0
         self.fast_forward_map = None

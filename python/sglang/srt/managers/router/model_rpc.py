@@ -195,7 +195,7 @@ class ModelRpcServer(rpyc.Service):
                         self.running_batch = None
                         break
 
-                    if self.out_pyobjs:
+                    if self.out_pyobjs and self.running_batch.reqs[0].stream:
                         break
             else:
                 # check the available size
@@ -227,11 +227,8 @@ class ModelRpcServer(rpyc.Service):
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        req = Req(recv_req.rid)
-        req.input_text = recv_req.input_text
-        req.input_ids = recv_req.input_ids
+        req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.pixel_values = recv_req.pixel_values
-        req.image_size = recv_req.image_size
         if req.pixel_values is not None:
             pad_value = [
                 (recv_req.image_hash) % self.model_config.vocab_size,
@@ -242,6 +239,7 @@ class ModelRpcServer(rpyc.Service):
             req.input_ids, req.image_offset = self.model_runner.model.pad_input_ids(
                 req.input_ids, pad_value, req.pixel_values.shape, req.image_size
             )
+            req.image_size = recv_req.image_size
         req.sampling_params = recv_req.sampling_params
         req.return_logprob = recv_req.return_logprob
         req.logprob_start_len = recv_req.logprob_start_len
@@ -329,9 +327,11 @@ class ModelRpcServer(rpyc.Service):
                     req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
                     < available_size
                 ):
+                    # Undo the insertion
                     delta = self.tree_cache.dec_ref_counter(req.last_node)
                     available_size += delta
                 else:
+                    # Add this request to the running batch
                     self.token_to_kv_pool.add_refs(req.prefix_indices)
                     can_run_list.append(req)
                     new_batch_total_tokens += (
