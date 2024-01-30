@@ -682,7 +682,9 @@ class ProgramState:
             else:
                 yield self.get_var(name)
 
-    async def text_async_iter(self, var_name: Optional[str] = None, return_meta_data: bool = False):
+    async def text_async_iter(
+        self, var_name: Optional[str] = None, return_meta_data: bool = False
+    ):
         loop = asyncio.get_running_loop()
 
         if self.stream_executor.stream:

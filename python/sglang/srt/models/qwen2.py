@@ -29,7 +29,6 @@ from vllm.model_executor.weight_utils import (
     hf_model_weights_iterator,
 )
 
-
 Qwen2Config = None
 
 
