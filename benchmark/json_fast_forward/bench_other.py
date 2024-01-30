@@ -34,7 +34,7 @@ character_regex = (
 
 # fmt: off
 def character_gen(name, generate):
-    s = name+ " is a character in Harry Potter. Please fill in the following information about him/her.\n"
+    s = name + " is a character in Harry Potter. Please fill in the following information about this character.\n"
     s += generate(s, max_tokens=256, regex=character_regex)
     return s
 # fmt: on

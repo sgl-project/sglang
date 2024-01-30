@@ -7,12 +7,19 @@ from sglang.srt.sampling_params import SamplingParams
 
 @dataclass
 class GenerateReqInput:
+    # The input prompt
     text: Union[List[str], str]
+    # The image input
     image_data: Optional[Union[List[str], str]] = None
+    # The sampling_params
     sampling_params: Union[List[Dict], Dict] = None
+    # The request id
     rid: Optional[Union[List[str], str]] = None
+    # Whether return logprobs of the prompts
     return_logprob: Optional[Union[List[bool], bool]] = None
+    # The start location of the prompt for return_logprob
     logprob_start_len: Optional[Union[List[int], int]] = None
+    # Whether to stream output
     stream: bool = False
 
     def post_init(self):
