@@ -56,7 +56,7 @@ class DetokenizerManager:
                             int(output_tokens[i][0])
                         )
                         if not isinstance(first_token, str):
-                            first_token = first_token.decode("utf-8")
+                            first_token = first_token.decode("utf-8", errors="ignore")
                         if first_token.startswith("▁"):
                             output_strs[i] = " " + output_strs[i]
 
