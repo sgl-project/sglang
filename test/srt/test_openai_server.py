@@ -71,6 +71,36 @@ def test_chat_completion(args):
     assert response.usage.total_tokens > 0
 
 
+def test_chat_completion_image(args):
+    client = openai.Client(api_key="EMPTY", base_url=args.base_url)
+    response = client.chat.completions.create(
+        model="default",
+        messages=[
+            {"role": "system", "content": "You are a helpful AI assistant"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/mixtral_8x7b.jpg"
+                        },
+                    },
+                ],
+            },
+        ],
+        temperature=0,
+        max_tokens=32,
+    )
+    print(response.choices[0].message.content)
+    assert response.id
+    assert response.created
+    assert response.usage.prompt_tokens > 0
+    assert response.usage.completion_tokens > 0
+    assert response.usage.total_tokens > 0
+
+
 def test_chat_completion_stream(args):
     client = openai.Client(api_key="EMPTY", base_url=args.base_url)
     response = client.chat.completions.create(
@@ -100,9 +130,14 @@ def test_chat_completion_stream(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:30000/v1")
+    parser.add_argument(
+        "--test-image", action="store_true", help="Enables testing image inputs"
+    )
     args = parser.parse_args()
 
     test_completion(args)
     test_completion_stream(args)
     test_chat_completion(args)
     test_chat_completion_stream(args)
+    if args.test_image:
+        test_chat_completion_image(args)
