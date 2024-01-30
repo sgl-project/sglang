@@ -320,7 +320,7 @@ def launch_server(server_args, pipe_finish_writer):
 
     # Load chat template if needed
     if server_args.chat_template is not None:
-        print(server_args.chat_template)
+        print(f"Use chat template: {server_args.chat_template}")
         if not chat_template_exists(server_args.chat_template):
             if not os.path.exists(server_args.chat_template):
                 raise RuntimeError(
