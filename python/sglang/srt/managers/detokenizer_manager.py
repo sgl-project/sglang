@@ -28,7 +28,6 @@ class DetokenizerManager:
             server_args.tokenizer_path,
             tokenizer_mode=server_args.tokenizer_mode,
             trust_remote_code=server_args.trust_remote_code,
-            model_path=server_args.model_path,
         )
 
     async def handle_loop(self):
