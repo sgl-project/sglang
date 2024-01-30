@@ -268,7 +268,6 @@ class ModelRunner:
         """See also vllm/model_executor/model_loader.py::get_model"""
         # Select model class
         architectures = getattr(self.model_config.hf_config, "architectures", [])
-
         model_class = get_model_cls_by_arch_name(architectures)
         logger.info(f"Rank {self.tp_rank}: load weight begin.")
 

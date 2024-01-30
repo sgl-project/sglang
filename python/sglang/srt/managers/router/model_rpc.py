@@ -71,7 +71,6 @@ class ModelRpcServer(rpyc.Service):
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
-                model_path=server_args.model_path,
             )
             self.tokenizer = self.processor.tokenizer
         else:
@@ -79,7 +78,6 @@ class ModelRpcServer(rpyc.Service):
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
-                model_path=server_args.model_path,
             )
         self.eos_token_id = self.tokenizer.eos_token_id
         self.max_total_num_token = self.model_runner.max_total_num_token
