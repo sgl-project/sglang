@@ -7,7 +7,6 @@ from typing import List
 
 import numpy as np
 import torch
-import sglang
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.utils import is_multimodal_model
@@ -15,6 +14,8 @@ from sglang.utils import get_available_gpu_memory
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
+
+import sglang
 
 logger = logging.getLogger("model_runner")
 

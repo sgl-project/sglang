@@ -19,7 +19,7 @@ class ServerArgs:
     schedule_heuristic: str = "lpm"
     schedule_conservativeness: float = 1.0
     random_seed: int = 42
-    stream_interval: int = 2
+    stream_interval: int = 8
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     log_level: str = "info"
@@ -132,7 +132,7 @@ class ServerArgs:
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
-            help="The interval in terms of token length for streaming",
+            help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
         )
         parser.add_argument(
             "--log-level",

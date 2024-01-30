@@ -1,5 +1,7 @@
 """
+Usage:
 python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --port 30000
+python3 test_httpserver_llava.py
 
 Output:
 The image features a man standing on the back of a yellow taxi cab, holding
@@ -64,9 +66,12 @@ def test_streaming(args):
     )
 
     prev = 0
-    for chunk in response.iter_lines(decode_unicode=False, delimiter=b"\0"):
-        if chunk:
-            data = json.loads(chunk.decode())
+    for chunk in response.iter_lines(decode_unicode=False):
+        chunk = chunk.decode("utf-8")
+        if chunk and chunk.startswith("data:"):
+            if chunk == "data: [DONE]":
+                break
+            data = json.loads(chunk[5:].strip("\n"))
             output = data["text"].strip()
             print(output[prev:], end="", flush=True)
             prev = len(output)

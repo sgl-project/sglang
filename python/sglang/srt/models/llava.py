@@ -158,7 +158,7 @@ class LlavaLlamaForCausalLM(nn.Module):
                                     num_patch_height, num_patch_width, height, width, -1
                                 )
                             else:
-                                raise NotImplementedError
+                                raise NotImplementedError()
                             if "unpad" in self.mm_patch_merge_type:
                                 image_feature = image_feature.permute(
                                     4, 0, 2, 1, 3

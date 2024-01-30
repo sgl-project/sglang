@@ -40,7 +40,7 @@ class RouterManager:
             for obj in out_pyobjs:
                 self.send_to_detokenizer.send_pyobj(obj)
 
-            # async sleep for recving the subsequent request, and avoiding cache miss
+            # async sleep for receiving the subsequent request and avoiding cache miss
             if len(out_pyobjs) != 0:
                 has_finished = any([obj.finished for obj in out_pyobjs])
                 if has_finished:
