@@ -28,7 +28,7 @@ def test_generate_worker(model_path, tp_rank, tp_size):
 
     reqs = []
     for i in range(len(prompts)):
-        req = Req(i)
+        req = Req(i, None, None)
         req.input_ids = tokenizer.encode(prompts[i])[:cut_num]
         req.sampling_params = sampling_params
         reqs.append(req)
