@@ -1,6 +1,6 @@
 import argparse
 import dataclasses
-from typing import List, Optional
+from typing import List, Optional, Union
 
 
 @dataclasses.dataclass
@@ -9,6 +9,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     host: str = "127.0.0.1"
     port: int = 30000
+    additional_ports: Optional[Union[List[int], int]] = None
     load_format: str = "auto"
     tokenizer_mode: str = "auto"
     chat_template: Optional[str] = None
@@ -37,6 +38,10 @@ class ServerArgs:
                 self.mem_fraction_static = 0.85
             else:
                 self.mem_fraction_static = 0.90
+        if isinstance(self.additional_ports, int):
+            self.additional_ports = [self.additional_ports]
+        elif self.additional_ports is None:
+            self.additional_ports = []
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -54,6 +59,14 @@ class ServerArgs:
         )
         parser.add_argument("--host", type=str, default=ServerArgs.host)
         parser.add_argument("--port", type=int, default=ServerArgs.port)
+        # we want to be able to pass a list of ports
+        parser.add_argument(
+            "--additional-ports",
+            type=int,
+            nargs="*",
+            default=[],
+            help="Additional ports specified for launching server.",
+        )
         parser.add_argument(
             "--load-format",
             type=str,
