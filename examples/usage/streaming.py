@@ -1,3 +1,7 @@
+"""
+Usage:
+python3 streaming.py
+"""
 import asyncio
 import sglang as sgl
 

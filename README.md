@@ -123,19 +123,21 @@ You can implement your prompt flow in a function decorated by `sgl.function`.
 You can then invoke the function with `run` or `run_batch`.
 The system will manage the state, chat template, parallelism and batching for you.
 
+The complete code for the examples below can be found at [readme_examples.py](examples/usage/readme_examples.py)
+
 ### Control Flow
 You can use any Python code within the function body, including control flow, nested function calls, and external libraries.
 
 ```python
 @sgl.function
-def control_flow(s, question):
-    s += "To answer this question: " + question + ", "
-    s += "I need to use a " + sgl.gen("tool", choices=["calculator", "web browser"]) + ". "
+def tool_use(s, question):
+    s += "To answer this question: " + question + ". "
+    s += "I need to use a " + sgl.gen("tool", choices=["calculator", "search engine"]) + ". "
 
     if s["tool"] == "calculator":
         s += "The math expression is" + sgl.gen("expression")
-    elif s["tool"] == "web browser":
-        s += "The website url is" + sgl.gen("url")
+    elif s["tool"] == "search engine":
+        s += "The key word to search is" + sgl.gen("word")
 ```
 
 ### Parallelism
