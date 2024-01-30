@@ -130,10 +130,14 @@ def test_chat_completion_stream(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:30000/v1")
+    parser.add_argument(
+        "--test-image", action="store_true", help="Enables testing image inputs"
+    )
     args = parser.parse_args()
 
     test_completion(args)
     test_completion_stream(args)
     test_chat_completion(args)
-    test_chat_completion_image(args)
     test_chat_completion_stream(args)
+    if args.test_image:
+        test_chat_completion_image(args)
