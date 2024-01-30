@@ -61,7 +61,7 @@ def pydantic_wizard_gen(s):
         "character",
         max_tokens=128,
         temperature=0,
-        regex=build_regex_from_object(Wizard),  # Requires pydantic > 2.0
+        regex=build_regex_from_object(Wizard),  # Requires pydantic >= 2.0
     )
 
 
