@@ -1,14 +1,13 @@
 """
 Usage:
-export OPENAI_API_KEY=sk-******
-python3 openai_example_chat.py
+export GCP_PROJECT_ID=******
+python3 gemini_example_chat.py
 """
 import sglang as sgl
 
 
 @sgl.function
 def multi_turn_question(s, question_1, question_2):
-    s += sgl.system("You are a helpful assistant.")
     s += sgl.user(question_1)
     s += sgl.assistant(sgl.gen("answer_1", max_tokens=256))
     s += sgl.user(question_2)
@@ -53,7 +52,7 @@ def batch():
 
 
 if __name__ == "__main__":
-    sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo"))
+    sgl.set_default_backend(sgl.VertexAI("gemini-pro"))
 
     # Run a single request
     print("\n========== single ==========\n")

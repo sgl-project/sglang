@@ -1,19 +1,29 @@
-from sglang import function, user, assistant, gen, image, set_default_backend, VertexAI
+"""
+Usage:
+export GCP_PROJECT_ID=******
+python3 gemini_example_multimodal_chat.py
+"""
+import sglang as sgl
 
 
-@function
+@sgl.function
 def image_qa(s, image_file1, image_file2, question):
-    s += user(image(image_file1) + image(image_file2) + question)
-    s += assistant(gen("answer_1", max_tokens=256))
+    s += sgl.user(sgl.image(image_file1) + sgl.image(image_file2) + question)
+    s += sgl.assistant(sgl.gen("answer", max_tokens=256))
 
-set_default_backend(VertexAI("gemini-pro-vision"))
 
-state = image_qa.run(
-    image_file1="./images/cat.jpeg",
-    image_file2="./images/dog.jpeg",
-    question="Describe difference of the 2 images in one sentence.",
-    stream=True
-)
+if __name__ == "__main__":
+    sgl.set_default_backend(sgl.VertexAI("gemini-pro-vision"))
 
-for out in state.text_iter():
-    print(out, end="", flush=True)
+    state = image_qa.run(
+        image_file1="./images/cat.jpeg",
+        image_file2="./images/dog.jpeg",
+        question="Describe difference of the two images in one sentence.",
+        stream=True
+    )
+
+    for out in state.text_iter("answer"):
+        print(out, end="", flush=True)
+    print()
+
+    print(state["answer"])
