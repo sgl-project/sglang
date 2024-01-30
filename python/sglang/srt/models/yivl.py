@@ -20,9 +20,7 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
         super().__init__(self.config)
 
         self.multi_modal_projector = YiVLMultiModalProjector(self.config)
-        self.vision_tower_subfolder = self.config.mm_vision_tower[2:] # Everything after "./"
-
-        print(self.multi_modal_projector)
+        self.vision_tower_subfolder = self.config.mm_vision_tower.replace("./", "") # Everything after "./"
 
     def load_weights(
         self,
@@ -73,27 +71,12 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
             model_name_or_path, cache_dir, load_format, revision
         ):
             if "projector" in name or "vision_tower" in name:
-                print(name)
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-        # print(self.vision_tower.vision_model.encoder.layers[0].self_attn.k_proj.weight)
-        for i, obj in enumerate([
-            self.multi_modal_projector.linear_1.bias,
-            self.multi_modal_projector.linear_1.weight,
-            self.multi_modal_projector.ln_1.bias,
-            self.multi_modal_projector.ln_1.weight,
-            self.multi_modal_projector.linear_2.bias,
-            self.multi_modal_projector.linear_2.weight,
-            self.multi_modal_projector.ln_2.bias,
-            self.multi_modal_projector.ln_2.weight,
-        ]):
-            print(i)
-            print(obj)
 
         # load language model
         self.language_model.load_weights(

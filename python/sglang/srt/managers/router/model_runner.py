@@ -269,10 +269,6 @@ class ModelRunner:
         # Select model class
         architectures = getattr(self.model_config.hf_config, "architectures", [])
 
-        # HACK(chris): Yi-VL on huggingface states that its architecture is Llava, but we want to route to our own Yi-VL
-        if "yi" in self.model_config.path.lower():
-            architectures = ["YiVLForCausalLM"]
-
         model_class = get_model_cls_by_arch_name(architectures)
         logger.info(f"Rank {self.tp_rank}: load weight begin.")
 

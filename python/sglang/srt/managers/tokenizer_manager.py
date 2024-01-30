@@ -148,7 +148,6 @@ class TokenizerManager:
 
         if is_single:
             rid = obj.rid
-            print(f"The text that was inserted: {obj.text}")
             input_ids = self.tokenizer.encode(obj.text)
             sampling_params = SamplingParams(**obj.sampling_params)
             if sampling_params.max_new_tokens != 0:
