@@ -1,3 +1,7 @@
+"""
+Usage:
+python3 openai_speculative.py
+"""
 from sglang import function, gen, set_default_backend, OpenAI
 
 

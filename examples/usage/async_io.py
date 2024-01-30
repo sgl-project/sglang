@@ -1,3 +1,7 @@
+"""
+Usage:
+python3 async_io.py
+"""
 import asyncio
 from sglang import Runtime
 
@@ -27,8 +31,8 @@ async def generate(
 
 if __name__ == "__main__":
     runtime = Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
-    print("runtime ready")
-    
+    print("--- runtime ready ---\n")
+
     prompt = "Who is Alan Turing?"
     sampling_params = {"max_new_tokens": 128}
     asyncio.run(generate(runtime, prompt, sampling_params))
