@@ -4,8 +4,7 @@ import multiprocessing
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List
 
 import numpy as np
 import rpyc
@@ -251,9 +250,9 @@ class ModelRpcServer(rpyc.Service):
 
         # Init regex fsm
         if req.sampling_params.regex is not None:
-            req.regex_fsm = self.regex_fsm_cache.init_fsm(req.sampling_params.regex)
+            req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)
             if not self.no_regex_fast_forward:
-                req.fast_forward_map = self.fast_forward_cache.init_fast_forward_map(
+                req.fast_forward_map = self.fast_forward_cache.query(
                     req.sampling_params.regex
                 )
 
@@ -358,9 +357,13 @@ class ModelRpcServer(rpyc.Service):
                 f"#new_token: {new_batch_input_tokens}. "
                 f"#remaining_req: {len(self.forward_queue) - len(can_run_list)}. "
                 f"#running_req: {running_req}. "
-                f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%. "
+                f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%."
+            )
+            logger.debug(
                 f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
                 f"fsm_cache_avg_init_time: {self.regex_fsm_cache.get_avg_init_time():.2f}s. "
+                f"ff_cache_hit_rate: {100.0 * self.fast_forward_cache.get_cache_hit_rate():.2f}%. "
+                f"ff_cache_avg_init_time: {self.fast_forward_cache.get_avg_init_time():.2f}s. "
             )
 
         new_batch = Batch.init_new(
