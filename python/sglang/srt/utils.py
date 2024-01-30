@@ -98,6 +98,7 @@ def alloc_usable_network_port(num, used_list=()):
                 return port_list
     return None
 
+
 def check_port(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
