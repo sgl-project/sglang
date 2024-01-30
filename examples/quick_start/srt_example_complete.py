@@ -1,9 +1,7 @@
 """
 Usage:
-export GCP_PROJECT_ID=******
-python3 gemini_example_complete.py
+python3 srt_example_complete.py
 """
-
 import sglang as sgl
 
 
@@ -52,7 +50,8 @@ def batch():
 
 
 if __name__ == "__main__":
-    sgl.set_default_backend(sgl.VertexAI("gemini-pro"))
+    runtime = sgl.Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
+    sgl.set_default_backend(runtime)
 
     # Run a single request
     print("\n========== single ==========\n")
@@ -65,3 +64,5 @@ if __name__ == "__main__":
     # Run a batch of requests
     print("\n========== batch ==========\n")
     batch()
+
+    runtime.shutdown()

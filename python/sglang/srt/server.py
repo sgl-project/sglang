@@ -445,18 +445,26 @@ class Runtime:
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
         proc = mp.Process(target=launch_server, args=(self.server_args, pipe_writer))
         proc.start()
+        pipe_writer.close()
         self.pid = proc.pid
 
-        init_state = pipe_reader.recv()
+        try:
+            init_state = pipe_reader.recv()
+        except EOFError:
+            init_state = ""
+
         if init_state != "init ok":
             self.shutdown()
-            raise RuntimeError("Launch failed")
+            raise RuntimeError("Launch failed. Please see the error messages above.")
 
         self.endpoint = RuntimeEndpoint(self.url)
 
     def shutdown(self):
         if self.pid is not None:
-            parent = psutil.Process(self.pid)
+            try:
+                parent = psutil.Process(self.pid)
+            except psutil.NoSuchProcess:
+                return
             children = parent.children(recursive=True)
             for child in children:
                 child.kill()
