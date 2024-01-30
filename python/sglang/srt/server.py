@@ -440,9 +440,7 @@ class Runtime:
         additional_ports: Optional[Union[List[int], int]] = None,
     ):
         host = "127.0.0.1"
-        port, additional_ports = handle_port_init(
-            port, additional_ports, tp_size
-        )
+        port, additional_ports = handle_port_init(port, additional_ports, tp_size)
         self.server_args = ServerArgs(
             model_path=model_path,
             tokenizer_path=tokenizer_path,

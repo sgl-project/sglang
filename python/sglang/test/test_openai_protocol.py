@@ -1,8 +1,8 @@
 from sglang.srt.managers.openai_protocol import (
-    ChatCompletionMessageGenericParam,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentImageURL,
     ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageGenericParam,
     ChatCompletionMessageUserParam,
     ChatCompletionRequest,
 )

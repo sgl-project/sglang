@@ -1,9 +1,9 @@
 from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.managers.openai_protocol import (
-    ChatCompletionMessageGenericParam,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentImageURL,
     ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageGenericParam,
     ChatCompletionMessageUserParam,
     ChatCompletionRequest,
 )
