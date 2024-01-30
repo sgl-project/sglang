@@ -191,7 +191,7 @@ def regular_expression_gen(s):
 
 ### JSON Decoding
 
-```
+```python
 character_regex = (
     r"""\{\n"""
     + r"""    "name": "[\w\d\s]{1,16}",\n"""
