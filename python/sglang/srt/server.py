@@ -16,7 +16,7 @@ import psutil
 import requests
 import uvicorn
 import uvloop
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.conversation import (
@@ -198,6 +198,14 @@ async def v1_chat_completions(raw_request: Request):
     if not isinstance(request.messages, str):
         # Apply chat template and its stop strings.
         if chat_template_name is None:
+            # This flow doesn't support the full OpenAI spec.  Verify messages
+            # has the right type before proceeding:
+            for m in request.messages:
+                if not isinstance(m.content, str):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Structured content requests not supported with HuggingFace Chat Templates.  Make sure the server specifies a sglang chat template.",
+                    )
             prompt = tokenizer_manager.tokenizer.apply_chat_template(
                 request.messages, tokenize=False, add_generation_prompt=True
             )
