@@ -365,7 +365,7 @@ def generate_chat_conv(
                 for content in message.content:
                     if content.type == "text":
                         real_content += content.text
-                    if content.type == "image_url":
+                    elif content.type == "image_url":
                         real_content += "<image>"
                         conv.append_image(content.image_url.url)
                 conv.append_message(conv.roles[0], real_content)

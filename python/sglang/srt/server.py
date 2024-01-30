@@ -190,6 +190,11 @@ async def v1_chat_completions(raw_request: Request):
     # TODO: Validate the request and return HTTPStatus.BAD_REQUEST if invalid.
     assert request.n == 1
 
+    # Prep the data needed for the underlying GenerateReqInput:
+    #  - prompt: The full prompt string.
+    #  - stop: Custom stop tokens.
+    #  - image_data: None or a list of image strings (URLs or base64 strings).
+    #    None skips any image processing in GenerateReqInput.
     if not isinstance(request.messages, str):
         # Apply chat template and its stop strings.
         if chat_template_name is None:
