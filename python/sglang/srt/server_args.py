@@ -19,7 +19,7 @@ class ServerArgs:
     schedule_heuristic: str = "lpm"
     schedule_conservativeness: float = 1.0
     random_seed: int = 42
-    stream_interval: int = 2
+    stream_interval: int = 6
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     log_level: str = "info"

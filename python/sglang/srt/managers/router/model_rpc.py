@@ -17,8 +17,8 @@ from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
-    TokenizedGenerateReqInput,
     FlushCacheReq,
+    TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode, Req
 from sglang.srt.managers.router.model_runner import ModelRunner
@@ -194,6 +194,9 @@ class ModelRpcServer(rpyc.Service):
                     if self.running_batch.is_empty():
                         self.running_batch = None
                         break
+
+                    if self.out_pyobjs:
+                        break
             else:
                 # check the available size
                 available_size = (
@@ -208,8 +211,7 @@ class ModelRpcServer(rpyc.Service):
                     )
 
         if self.running_batch is not None and self.tp_rank == 0:
-            if self.decode_forward_ct >= 20:
-                self.decode_forward_ct = 0
+            if self.decode_forward_ct % 20 == 0:
                 num_used = self.max_total_num_token - (
                     self.token_to_kv_pool.available_size()
                     + self.tree_cache.evictable_size()
@@ -421,7 +423,7 @@ class ModelRpcServer(rpyc.Service):
                 return
 
         # Update batch tensors
-        self.decode_forward_ct += 1
+        self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         batch.prepare_for_decode()
 
         # Forward
@@ -454,7 +456,13 @@ class ModelRpcServer(rpyc.Service):
                 unfinished_indices.append(i)
 
             if req.finished or (
-                req.stream and self.decode_forward_ct % self.stream_interval == 0
+                (
+                    req.stream
+                    and (
+                        self.decode_forward_ct % self.stream_interval == 0
+                        or len(req.output_ids) == 1
+                    )
+                )
             ):
                 output_rids.append(req.rid)
                 output_tokens.append(req.output_ids)
