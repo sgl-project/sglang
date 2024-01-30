@@ -107,6 +107,7 @@ def check_port(port):
         except socket.error:
             return False
 
+
 def handle_port_init(port: Optional[int] = None, additional_ports: Optional[List[int]] = None, tp_size: int = 1):
     port = 30000 if port is None else port
     additional_ports = [] if additional_ports is None else additional_ports
