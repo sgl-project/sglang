@@ -63,7 +63,9 @@ class Req:
         # FIXME: This logic does not really solve the problem of determining whether
         # there should be a leading space.
         first_token = self.tokenizer.convert_ids_to_tokens(self.output_ids[0])
-        first_token = first_token.decode() if isinstance(first_token, bytes) else first_token
+        first_token = (
+            first_token.decode() if isinstance(first_token, bytes) else first_token
+        )
         if first_token.startswith("▁"):
             old_output_str = " " + old_output_str
         new_input_string = (
