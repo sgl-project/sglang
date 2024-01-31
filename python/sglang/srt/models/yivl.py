@@ -16,7 +16,6 @@ from sglang.srt.models.llava import LlavaLlamaForCausalLM, clip_vision_embed_for
 class YiVLForCausalLM(LlavaLlamaForCausalLM):
     def __init__(self, *args, **kwargs):
         self.config = kwargs["config"]
-        self.config.image_token_index = 64002
         super().__init__(self.config)
 
         self.multi_modal_projector = YiVLMultiModalProjector(self.config)
@@ -29,10 +28,6 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
         load_format: str = "auto",
         revision: Optional[str] = None,
     ):
-        # load clip vision model by cfg['mm_vision_tower']:
-        #   huggingface_name or path_of_clip_relative_to_llava_model_dir
-        vision_path = self.config.mm_vision_tower
-
         # We have to use the subfolder of the main model directory (e.g. 01-ai/Yi-VL-6B)
         self.vision_tower = CLIPVisionModel.from_pretrained(
             model_name_or_path, torch_dtype=torch.float16, subfolder=self.vision_tower_subfolder

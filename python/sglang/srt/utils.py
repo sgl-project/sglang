@@ -195,7 +195,8 @@ def is_multimodal_model(model):
     from sglang.srt.model_config import ModelConfig
 
     if isinstance(model, ModelConfig):
-        return "llava" in model.path.lower() or "yi-vl" in model.path.lower()
+        model_path = model_path.lower()
+        return "llava" in model_path  or "yi-vl" in model_path
     raise Exception("unrecognized type")
 
 
