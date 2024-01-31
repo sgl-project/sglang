@@ -4,8 +4,7 @@ import multiprocessing
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List
 
 import numpy as np
 import rpyc
@@ -99,6 +98,7 @@ class ModelRpcServer(rpyc.Service):
 
         # Init cache
         self.tree_cache = RadixCache(disable="no-cache" in self.model_mode)
+        self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.scheduler = Scheduler(
             self.schedule_heuristic,
             self.max_num_running_seq,
@@ -136,6 +136,8 @@ class ModelRpcServer(rpyc.Service):
             self.running_batch is None or len(self.running_batch.reqs) == 0
         ):
             self.tree_cache.reset()
+            self.tree_cache_metrics = {"total": 0, "hit": 0}
+            self.regex_fsm_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()
@@ -248,9 +250,9 @@ class ModelRpcServer(rpyc.Service):
 
         # Init regex fsm
         if req.sampling_params.regex is not None:
-            req.regex_fsm = self.regex_fsm_cache.init_fsm(req.sampling_params.regex)
+            req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)
             if not self.no_regex_fast_forward:
-                req.fast_forward_map = self.fast_forward_cache.init_fast_forward_map(
+                req.fast_forward_map = self.fast_forward_cache.query(
                     req.sampling_params.regex
                 )
 
@@ -285,7 +287,6 @@ class ModelRpcServer(rpyc.Service):
         can_run_list = []
         new_batch_total_tokens = 0
         new_batch_input_tokens = 0
-        new_batch_prefix_tokens = 0
 
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
@@ -343,12 +344,26 @@ class ModelRpcServer(rpyc.Service):
             return None
 
         if self.tp_rank == 0:
+            running_req = 0 if self.running_batch is None else len(self.running_batch.reqs)
+            hit_tokens = sum(len(x.prefix_indices) for x in can_run_list)
+            self.tree_cache_metrics["total"] += (hit_tokens + new_batch_input_tokens) / 10**9
+            self.tree_cache_metrics["hit"] += hit_tokens / 10**9
+            tree_cache_hit_rate = (
+                self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
+            )
             logger.info(
                 f"new fill batch. #seq: {len(can_run_list)}. "
-                f"#cached_token: {sum(len(x.prefix_indices) for x in can_run_list)}. "
+                f"#cached_token: {hit_tokens}. "
                 f"#new_token: {new_batch_input_tokens}. "
                 f"#remaining_req: {len(self.forward_queue) - len(can_run_list)}. "
-                f"#running_req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
+                f"#running_req: {running_req}. "
+                f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%."
+            )
+            logger.debug(
+                f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
+                f"fsm_cache_avg_init_time: {self.regex_fsm_cache.get_avg_init_time():.2f}s. "
+                f"ff_cache_hit_rate: {100.0 * self.fast_forward_cache.get_cache_hit_rate():.2f}%. "
+                f"ff_cache_avg_init_time: {self.fast_forward_cache.get_avg_init_time():.2f}s. "
             )
 
         new_batch = Batch.init_new(

@@ -1,4 +1,5 @@
 import interegular
+from sglang.srt.constrained.base_cache import BaseCache
 from sglang.srt.constrained.disk_cache import disk_cache
 from sglang.srt.constrained.regex import FSMInfo, make_deterministic_fsm
 
@@ -56,15 +57,12 @@ class FastForwardMap:
         return fast_forward_str, next_state
 
 
-class FastForwardCache:
+class FastForwardCache(BaseCache):
     def __init__(self):
-        self.cache = {}
+        super().__init__()
 
-    def init_fast_forward_map(self, regex_string):
-        if regex_string not in self.cache:
-            fast_forward_map = FastForwardMap(regex_string)
-            self.cache[regex_string] = fast_forward_map
-        return self.cache[regex_string]
+    def init_value(self, regex):
+        return FastForwardMap(regex)
 
 
 def test_main():
