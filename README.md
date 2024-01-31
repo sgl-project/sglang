@@ -39,39 +39,9 @@ pip install -e "python[all]"
   - For NVIDIA V100, please install the [nightly](https://triton-lang.org/main/getting-started/installation.html) version.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`
 
+
 ## Quick Start
 The example below shows how to use sglang to answer a mulit-turn question.
-
-### Using OpenAI Models
-Set the OpenAI API Key
-```
-export OPENAI_API_KEY=sk-******
-```
-
-Then, answer a multi-turn question.
-```python
-from sglang import function, system, user, assistant, gen, set_default_backend, OpenAI
-
-@function
-def multi_turn_question(s, question_1, question_2):
-    s += system("You are a helpful assistant.")
-    s += user(question_1)
-    s += assistant(gen("answer_1", max_tokens=256))
-    s += user(question_2)
-    s += assistant(gen("answer_2", max_tokens=256))
-
-set_default_backend(OpenAI("gpt-3.5-turbo"))
-
-state = multi_turn_question.run(
-    question_1="What is the capital of the United States?",
-    question_2="List two local attractions.",
-)
-
-for m in state.messages():
-    print(m["role"], ":", m["content"])
-
-print(state["answer_1"])
-```
 
 ### Using Local Models
 First, launch a server with
@@ -105,6 +75,37 @@ for m in state.messages():
 print(state["answer_1"])
 ```
 
+### Using OpenAI Models
+Set the OpenAI API Key
+```
+export OPENAI_API_KEY=sk-******
+```
+
+Then, answer a multi-turn question.
+```python
+from sglang import function, system, user, assistant, gen, set_default_backend, OpenAI
+
+@function
+def multi_turn_question(s, question_1, question_2):
+    s += system("You are a helpful assistant.")
+    s += user(question_1)
+    s += assistant(gen("answer_1", max_tokens=256))
+    s += user(question_2)
+    s += assistant(gen("answer_2", max_tokens=256))
+
+set_default_backend(OpenAI("gpt-3.5-turbo"))
+
+state = multi_turn_question.run(
+    question_1="What is the capital of the United States?",
+    question_2="List two local attractions.",
+)
+
+for m in state.messages():
+    print(m["role"], ":", m["content"])
+
+print(state["answer_1"])
+```
+
 ### More Examples
 
 Anthropic and VertexAI (Gemini) models are also supported.
@@ -120,21 +121,23 @@ import sglang as sgl
 `sglang` provides some simple primitives such as `gen`, `select`, `fork`, `image`.
 You can implement your prompt flow in a function decorated by `sgl.function`.
 You can then invoke the function with `run` or `run_batch`.
-The system will manage the state, chat template, and parallelism for you.
+The system will manage the state, chat template, parallelism and batching for you.
+
+The complete code for the examples below can be found at [readme_examples.py](examples/usage/readme_examples.py)
 
 ### Control Flow
 You can use any Python code within the function body, including control flow, nested function calls, and external libraries.
 
 ```python
 @sgl.function
-def control_flow(s, question):
-    s += "To answer this question: " + question + ", "
-    s += "I need to use a " + sgl.gen("tool", choices=["calculator", "web browser"]) + ". "
+def tool_use(s, question):
+    s += "To answer this question: " + question + ". "
+    s += "I need to use a " + sgl.gen("tool", choices=["calculator", "search engine"]) + ". "
 
     if s["tool"] == "calculator":
         s += "The math expression is" + sgl.gen("expression")
-    elif s["tool"] == "web browser":
-        s += "The website url is" + sgl.gen("url")
+    elif s["tool"] == "search engine":
+        s += "The key word to search is" + sgl.gen("word")
 ```
 
 ### Parallelism
@@ -169,6 +172,8 @@ def image_qa(s, image_file, question):
     s += sgl.assistant(sgl.gen("answer", max_tokens=256)
 ```
 
+See also [srt_example_llava.py](examples/quick_start/srt_example_llava.py).
+
 ### Constrained Decoding
 Use `regex` to specify a regular expression as a decoding constraint.
 This is only supported for local models.
@@ -183,6 +188,35 @@ def regular_expression_gen(s):
         regex=r"((25[0-5]|2[0-4]\d|[01]?\d\d?).){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)",
     )
 ```
+
+### JSON Decoding
+
+```python
+character_regex = (
+    r"""\{\n"""
+    + r"""    "name": "[\w\d\s]{1,16}",\n"""
+    + r"""    "house": "(Gryffindor|Slytherin|Ravenclaw|Hufflepuff)",\n"""
+    + r"""    "blood status": "(Pure-blood|Half-blood|Muggle-born)",\n"""
+    + r"""    "occupation": "(student|teacher|auror|ministry of magic|death eater|order of the phoenix)",\n"""
+    + r"""    "wand": \{\n"""
+    + r"""        "wood": "[\w\d\s]{1,16}",\n"""
+    + r"""        "core": "[\w\d\s]{1,16}",\n"""
+    + r"""        "length": [0-9]{1,2}\.[0-9]{0,2}\n"""
+    + r"""    \},\n"""
+    + r"""    "alive": "(Alive|Deceased)",\n"""
+    + r"""    "patronus": "[\w\d\s]{1,16}",\n"""
+    + r"""    "bogart": "[\w\d\s]{1,16}"\n"""
+    + r"""\}"""
+)
+
+@sgl.function
+def character_gen(s, name):
+    s += name + " is a character in Harry Potter. Please fill in the following information about him/her.\n"
+    s += sgl.gen("json_output", max_tokens=256, regex=character_regex)
+```
+
+See also [json_decode.py](examples/usage/json_decode.py).
+
 
 ### Batching
 Use `run_batch` to run a batch of requests with continuous batching.
@@ -317,14 +351,15 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --mem-fraction-static 0.7
 ```
+- You can turn on [flashinfer](docs/flashinfer.md) to acclerate the inference by using highly optimized CUDA kernels.
 
 ### Supported Models
 - Llama
 - Mistral
 - Mixtral
 - LLaVA
-  - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --port 30000`
-- Qwen
+  - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
+- Qwen / Qwen 2
 - AWQ quantization
 
 ## Benchmark And Performance

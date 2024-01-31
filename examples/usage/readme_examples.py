@@ -1,14 +1,20 @@
+"""
+Usage:
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python readme_examples.py
+"""
 import sglang as sgl
 
 
 @sgl.function
 def tool_use(s, question):
-    s += "To answer this question: " + question + ", "
-    s += "I need to use a " + sgl.gen("tool", choices=["calculator", "web browser"]) + ". "
+    s += "To answer this question: " + question + ". "
+    s += "I need to use a " + sgl.gen("tool", choices=["calculator", "search engine"]) + ". "
+
     if s["tool"] == "calculator":
         s += "The math expression is" + sgl.gen("expression")
-    elif s["tool"] == "web browser":
-        s += "The website url is" + sgl.gen("url")
+    elif s["tool"] == "search engine":
+        s += "The key word to search is" + sgl.gen("word")
 
 
 @sgl.function
@@ -29,6 +35,16 @@ def tip_suggestion(s):
 
 
 @sgl.function
+def regular_expression_gen(s):
+    s += "Q: What is the IP address of the Google DNS servers?\n"
+    s += "A: " + sgl.gen(
+        "answer",
+        temperature=0,
+        regex=r"((25[0-5]|2[0-4]\d|[01]?\d\d?).){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)",
+    )
+
+
+@sgl.function
 def text_qa(s, question):
     s += "Q: " + question + "\n"
     s += "A:" + sgl.gen("answer", stop="\n")
@@ -42,6 +58,12 @@ def driver_tool_use():
 
 def driver_tip_suggestion():
     state = tip_suggestion.run()
+    print(state.text())
+    print("\n")
+
+
+def driver_regex():
+    state = regular_expression_gen.run()
     print(state.text())
     print("\n")
 
@@ -74,9 +96,11 @@ def driver_stream():
 
 
 if __name__ == "__main__":
-    sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo-instruct"))
+    #sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo-instruct"))
+    sgl.set_default_backend(sgl.RuntimeEndpoint("http://localhost:30000"))
 
     driver_tool_use()
     driver_tip_suggestion()
+    driver_regex()
     driver_batching()
     driver_stream()

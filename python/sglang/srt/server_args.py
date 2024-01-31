@@ -1,6 +1,6 @@
 import argparse
 import dataclasses
-from typing import List, Optional
+from typing import List, Optional, Union
 
 
 @dataclasses.dataclass
@@ -9,6 +9,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     host: str = "127.0.0.1"
     port: int = 30000
+    additional_ports: Optional[Union[List[int], int]] = None
     load_format: str = "auto"
     tokenizer_mode: str = "auto"
     chat_template: Optional[str] = None
@@ -19,7 +20,7 @@ class ServerArgs:
     schedule_heuristic: str = "lpm"
     schedule_conservativeness: float = 1.0
     random_seed: int = 42
-    stream_interval: int = 2
+    stream_interval: int = 8
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     log_level: str = "info"
@@ -37,6 +38,10 @@ class ServerArgs:
                 self.mem_fraction_static = 0.85
             else:
                 self.mem_fraction_static = 0.90
+        if isinstance(self.additional_ports, int):
+            self.additional_ports = [self.additional_ports]
+        elif self.additional_ports is None:
+            self.additional_ports = []
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -54,6 +59,14 @@ class ServerArgs:
         )
         parser.add_argument("--host", type=str, default=ServerArgs.host)
         parser.add_argument("--port", type=int, default=ServerArgs.port)
+        # we want to be able to pass a list of ports
+        parser.add_argument(
+            "--additional-ports",
+            type=int,
+            nargs="*",
+            default=[],
+            help="Additional ports specified for launching server.",
+        )
         parser.add_argument(
             "--load-format",
             type=str,
@@ -132,7 +145,7 @@ class ServerArgs:
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
-            help="The interval in terms of token length for streaming",
+            help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
         )
         parser.add_argument(
             "--log-level",

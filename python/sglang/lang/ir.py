@@ -74,7 +74,9 @@ class SglSamplingParams:
             )
         return {
             "max_tokens_to_sample": self.max_new_tokens,
-            "stop_sequences": self.stop,
+            "stop_sequences": self.stop
+            if isinstance(self.stop, (list, tuple))
+            else [self.stop],
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,
@@ -95,8 +97,9 @@ class SglSamplingParams:
 
 
 class SglFunction:
-    def __init__(self, func, bind_arguments=None):
+    def __init__(self, func, api_num_spec_tokens=None, bind_arguments=None):
         self.func = func
+        self.api_num_spec_tokens = api_num_spec_tokens
         self.bind_arguments = bind_arguments or {}
         self.pin_prefix_rid = None
 

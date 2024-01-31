@@ -6,7 +6,7 @@ import os
 import sys
 import threading
 import time
-from typing import List, Optional
+from typing import List, Optional, Union
 
 # Fix a Python bug
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -16,7 +16,7 @@ import psutil
 import requests
 import uvicorn
 import uvloop
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.conversation import (
@@ -47,7 +47,7 @@ from sglang.srt.managers.openai_protocol import (
 from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import alloc_usable_network_port
+from sglang.srt.utils import alloc_usable_network_port, handle_port_init
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -69,6 +69,15 @@ async def get_model_info():
         "model_path": tokenizer_manager.model_path,
     }
     return result
+
+
+@app.get("/flush_cache")
+async def flush_cache():
+    await tokenizer_manager.flush_cache()
+    return Response(
+        content="Cache flushed.\nPlease check backend logs for more details. (When there are running or waiting requests, the operation will not be performed.)\n",
+        status_code=200,
+    )
 
 
 async def stream_generator(obj):
@@ -181,16 +190,31 @@ async def v1_chat_completions(raw_request: Request):
     # TODO: Validate the request and return HTTPStatus.BAD_REQUEST if invalid.
     assert request.n == 1
 
+    # Prep the data needed for the underlying GenerateReqInput:
+    #  - prompt: The full prompt string.
+    #  - stop: Custom stop tokens.
+    #  - image_data: None or a list of image strings (URLs or base64 strings).
+    #    None skips any image processing in GenerateReqInput.
     if not isinstance(request.messages, str):
         # Apply chat template and its stop strings.
         if chat_template_name is None:
+            # This flow doesn't support the full OpenAI spec.  Verify messages
+            # has the right type before proceeding:
+            for m in request.messages:
+                if not isinstance(m.content, str):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Structured content requests not supported with HuggingFace Chat Templates.  Make sure the server specifies a sglang chat template.",
+                    )
             prompt = tokenizer_manager.tokenizer.apply_chat_template(
                 request.messages, tokenize=False, add_generation_prompt=True
             )
             stop = request.stop
+            image_data = None
         else:
             conv = generate_chat_conv(request, chat_template_name)
             prompt = conv.get_prompt()
+            image_data = conv.image_data
             stop = conv.stop_str or []
             if request.stop:
                 if isinstance(request.stop, str):
@@ -201,9 +225,11 @@ async def v1_chat_completions(raw_request: Request):
         # Use the raw prompt and stop strings if the messages is already a string.
         prompt = request.messages
         stop = request.stop
+        image_data = None
 
     adapted_request = GenerateReqInput(
         text=prompt,
+        image_data=image_data,
         sampling_params={
             "temperature": request.temperature,
             "max_new_tokens": request.max_tokens,
@@ -280,20 +306,22 @@ def launch_server(server_args, pipe_finish_writer):
     global tokenizer_manager
     global chat_template_name
 
-    # Allocate ports
-    can_use_ports = alloc_usable_network_port(
-        num=4 + server_args.tp_size, used_list=(server_args.port,)
+    # Handle ports
+    server_args.port, server_args.additional_ports = handle_port_init(
+        server_args.port, server_args.additional_ports, server_args.tp_size
     )
+
     port_args = PortArgs(
-        tokenizer_port=can_use_ports[0],
-        router_port=can_use_ports[1],
-        detokenizer_port=can_use_ports[2],
-        nccl_port=can_use_ports[3],
-        model_rpc_ports=can_use_ports[4:],
+        tokenizer_port=server_args.additional_ports[0],
+        router_port=server_args.additional_ports[1],
+        detokenizer_port=server_args.additional_ports[2],
+        nccl_port=server_args.additional_ports[3],
+        model_rpc_ports=server_args.additional_ports[4:],
     )
 
     # Load chat template if needed
     if server_args.chat_template is not None:
+        print(f"Use chat template: {server_args.chat_template}")
         if not chat_template_exists(server_args.chat_template):
             if not os.path.exists(server_args.chat_template):
                 raise RuntimeError(
@@ -408,14 +436,17 @@ class Runtime:
         schedule_heuristic: str = "lpm",
         random_seed: int = 42,
         log_level: str = "error",
+        port: Optional[int] = None,
+        additional_ports: Optional[Union[List[int], int]] = None,
     ):
         host = "127.0.0.1"
-        port = alloc_usable_network_port(1)[0]
+        port, additional_ports = handle_port_init(port, additional_ports, tp_size)
         self.server_args = ServerArgs(
             model_path=model_path,
             tokenizer_path=tokenizer_path,
             host=host,
             port=port,
+            additional_ports=additional_ports,
             load_format=load_format,
             tokenizer_mode=tokenizer_mode,
             trust_remote_code=trust_remote_code,
@@ -436,18 +467,26 @@ class Runtime:
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
         proc = mp.Process(target=launch_server, args=(self.server_args, pipe_writer))
         proc.start()
+        pipe_writer.close()
         self.pid = proc.pid
 
-        init_state = pipe_reader.recv()
+        try:
+            init_state = pipe_reader.recv()
+        except EOFError:
+            init_state = ""
+
         if init_state != "init ok":
             self.shutdown()
-            raise RuntimeError("Launch failed")
+            raise RuntimeError("Launch failed. Please see the error messages above.")
 
         self.endpoint = RuntimeEndpoint(self.url)
 
     def shutdown(self):
         if self.pid is not None:
-            parent = psutil.Process(self.pid)
+            try:
+                parent = psutil.Process(self.pid)
+            except psutil.NoSuchProcess:
+                return
             children = parent.children(recursive=True)
             for child in children:
                 child.kill()

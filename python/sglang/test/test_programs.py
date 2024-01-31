@@ -296,7 +296,7 @@ def test_parallel_encoding(check_answer=True):
 def test_image_qa():
     @sgl.function
     def image_qa(s, question):
-        s += sgl.user(sgl.image("image.png") + question)
+        s += sgl.user(sgl.image("test_image.png") + question)
         s += sgl.assistant(sgl.gen("answer"))
 
     state = image_qa.run(

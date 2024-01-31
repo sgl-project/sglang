@@ -1,3 +1,7 @@
+"""
+Usage:
+python3 parallel_sample.py
+"""
 import sglang as sgl
 
 

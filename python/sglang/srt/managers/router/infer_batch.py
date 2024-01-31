@@ -21,14 +21,17 @@ class FinishReason(Enum):
 
 
 class Req:
-    def __init__(self, rid):
+    def __init__(self, rid, input_text, input_ids):
         self.rid = rid
-        self.input_text = None
-        self.input_ids = []
+        self.input_text = input_text
+        self.input_ids = input_ids
         self.output_ids = []
+
+        # For vision input
         self.pixel_values = None
         self.image_size = None
         self.image_offset = 0
+
         self.sampling_params = None
         self.return_logprob = False
         self.logprob_start_len = 0
@@ -46,7 +49,7 @@ class Req:
         self.logprob = None
         self.normalized_logprob = None
 
-        # for constrained decoding
+        # For constrained decoding
         self.regex_fsm = None
         self.regex_fsm_state = 0
         self.fast_forward_map = None
@@ -57,7 +60,13 @@ class Req:
 
     def tokenize_fast_forward(self, fast_forward_str, next_state):
         old_output_str = self.tokenizer.decode(self.output_ids)
-        if self.tokenizer.convert_ids_to_tokens(self.output_ids[0]).startswith("▁"):
+        # FIXME: This logic does not really solve the problem of determining whether
+        # there should be a leading space.
+        first_token = self.tokenizer.convert_ids_to_tokens(self.output_ids[0])
+        first_token = (
+            first_token.decode() if isinstance(first_token, bytes) else first_token
+        )
+        if first_token.startswith("▁"):
             old_output_str = " " + old_output_str
         new_input_string = (
             self.input_text

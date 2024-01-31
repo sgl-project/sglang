@@ -2,7 +2,7 @@
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 import dataclasses
 from enum import IntEnum, auto
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from sglang.srt.managers.openai_protocol import ChatCompletionRequest
 
@@ -52,6 +52,7 @@ class Conversation:
     sep2: str = None
     # Stop criteria (the default one is EOS token)
     stop_str: Union[str, List[str]] = None
+    image_data: Optional[List[str]] = None
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -251,6 +252,10 @@ class Conversation:
         """Append a new message."""
         self.messages.append([role, message])
 
+    def append_image(self, image: str):
+        """Append a new message."""
+        self.image_data.append(image)
+
     def update_last_message(self, message: str):
         """Update the last output.
 
@@ -341,18 +346,31 @@ def generate_chat_conv(
         sep=conv.sep,
         sep2=conv.sep2,
         stop_str=conv.stop_str,
+        image_data=[],
     )
 
     if isinstance(request.messages, str):
         raise ValueError("The messages should be a list of dict.")
     for message in request.messages:
-        msg_role = message["role"]
+        msg_role = message.role
         if msg_role == "system":
-            conv.system_message = message["content"]
+            conv.system_message = message.content
         elif msg_role == "user":
-            conv.append_message(conv.roles[0], message["content"])
+            # Handle the various types of Chat Request content types here.
+            role = conv.roles[0]
+            if isinstance(message.content, str):
+                conv.append_message(conv.roles[0], message.content)
+            else:
+                real_content = ""
+                for content in message.content:
+                    if content.type == "text":
+                        real_content += content.text
+                    elif content.type == "image_url":
+                        real_content += "<image>"
+                        conv.append_image(content.image_url.url)
+                conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
-            conv.append_message(conv.roles[1], message["content"])
+            conv.append_message(conv.roles[1], message.content)
         else:
             raise ValueError(f"Unknown role: {msg_role}")
 

@@ -6,6 +6,7 @@ import sys
 import time
 import traceback
 from io import BytesIO
+from typing import List, Optional
 
 import numpy as np
 import requests
@@ -97,6 +98,47 @@ def alloc_usable_network_port(num, used_list=()):
             if len(port_list) == num:
                 return port_list
     return None
+
+
+def check_port(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("", port))
+            return True
+        except socket.error:
+            return False
+
+
+def handle_port_init(
+    port: Optional[int] = None,
+    additional_ports: Optional[List[int]] = None,
+    tp_size: int = 1,
+):
+    port = 30000 if port is None else port
+    additional_ports = [] if additional_ports is None else additional_ports
+    additional_ports = (
+        [additional_ports] if isinstance(additional_ports, int) else additional_ports
+    )
+    # first check on server port
+    if not check_port(port):
+        new_port = alloc_usable_network_port(1, used_list=[port])[0]
+        print(f"Port {port} is not available, using {new_port} instead.")
+        port = new_port
+
+    # then we check on additional ports
+    additional_unique_ports = set(additional_ports) - {port}
+    # filter out ports that are already in use
+    can_use_ports = [port for port in additional_unique_ports if check_port(port)]
+
+    num_specified_ports = len(can_use_ports)
+    if num_specified_ports < 4 + tp_size:
+        addtional_can_use_ports = alloc_usable_network_port(
+            num=4 + tp_size - num_specified_ports, used_list=can_use_ports + [port]
+        )
+        can_use_ports.extend(addtional_can_use_ports)
+
+    additional_ports = can_use_ports[: 4 + tp_size]
+    return port, additional_ports
 
 
 def get_exception_traceback():
