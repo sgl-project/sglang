@@ -238,10 +238,10 @@ class ModelRpcServer(rpyc.Service):
                 (recv_req.image_hash >> 32) % self.model_config.vocab_size,
                 (recv_req.image_hash >> 64) % self.model_config.vocab_size,
             ]
+            req.image_size = recv_req.image_size
             req.input_ids, req.image_offset = self.model_runner.model.pad_input_ids(
                 req.input_ids, pad_value, req.pixel_values.shape, req.image_size
             )
-            req.image_size = recv_req.image_size
         req.sampling_params = recv_req.sampling_params
         req.return_logprob = recv_req.return_logprob
         req.logprob_start_len = recv_req.logprob_start_len
