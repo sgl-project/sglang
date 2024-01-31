@@ -344,9 +344,13 @@ class ModelRpcServer(rpyc.Service):
             return None
 
         if self.tp_rank == 0:
-            running_req = 0 if self.running_batch is None else len(self.running_batch.reqs)
+            running_req = (
+                0 if self.running_batch is None else len(self.running_batch.reqs)
+            )
             hit_tokens = sum(len(x.prefix_indices) for x in can_run_list)
-            self.tree_cache_metrics["total"] += (hit_tokens + new_batch_input_tokens) / 10**9
+            self.tree_cache_metrics["total"] += (
+                hit_tokens + new_batch_input_tokens
+            ) / 10**9
             self.tree_cache_metrics["hit"] += hit_tokens / 10**9
             tree_cache_hit_rate = (
                 self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
@@ -584,7 +588,7 @@ def start_model_process(port):
         t = ThreadedServer(
             ModelRpcServer(),
             port=port,
-            protocol_config={"allow_pickle": True, "sync_request_timeout": 600},
+            protocol_config={"allow_pickle": True, "sync_request_timeout": 1800},
         )
         t.start()
 
@@ -598,7 +602,7 @@ def start_model_process(port):
             con = rpyc.connect(
                 "localhost",
                 port,
-                config={"allow_pickle": True, "sync_request_timeout": 600},
+                config={"allow_pickle": True, "sync_request_timeout": 1800},
             )
             break
         except ConnectionRefusedError:
