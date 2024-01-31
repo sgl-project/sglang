@@ -1,9 +1,9 @@
-from sglang.srt.constrained.base_cache import Cache
+from sglang.srt.constrained.base_cache import BaseCache
 from sglang.srt.constrained.fsm import RegexFSM
 from sglang.srt.constrained.tokenizer import TransformerTokenizer
 
 
-class FSMCache(Cache):
+class FSMCache(BaseCache):
     def __init__(self, tokenizer_path, tokenizer_args_dict, enable=True):
         super().__init__(enable=enable)
         self.outlines_tokenizer = TransformerTokenizer(

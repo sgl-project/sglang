@@ -3,7 +3,7 @@
 import time
 
 
-class Cache:
+class BaseCache:
     def __init__(self, enable=True):
         self.enable = enable
         self.reset()
