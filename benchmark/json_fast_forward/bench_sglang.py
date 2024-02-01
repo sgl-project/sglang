@@ -9,7 +9,6 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import dump_state_text, read_jsonl
 
-
 # there are some FSM bugs with json regex converted from pydantic model
 # here use a string regex instead
 # regex_string = build_regex_from_object(HarryPoterRole)
@@ -137,6 +136,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str)
     parser.add_argument("--num-jsons", type=int, default=50)
-    parser.add_argument("--mode", type=str, default="character", choices=["character", "city"])
+    parser.add_argument(
+        "--mode", type=str, default="character", choices=["character", "city"]
+    )
     args = add_common_sglang_args_and_parse(parser)
     main(args)
