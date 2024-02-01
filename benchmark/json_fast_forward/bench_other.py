@@ -230,7 +230,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, default="dataset.txt")
+    parser.add_argument("--data-path", type=str)
     parser.add_argument("--num-jsons", type=int, default=50)
     parser.add_argument(
         "--mode", type=str, default="character", choices=["character", "city"]
