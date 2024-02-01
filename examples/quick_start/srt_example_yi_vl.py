@@ -46,12 +46,9 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(model_path="BabyChou/Yi-VL-6B",
-                          tokenizer_path="BabyChou/Yi-VL-6B")
+    runtime = sgl.Runtime(model_path="BabyChou/Yi-VL-6B")
+    # runtime = sgl.Runtime(model_path="BabyChou/Yi-VL-34B")
     sgl.set_default_backend(runtime)
-    # Or you can use API models
-    # sgl.set_default_backend(sgl.OpenAI("gpt-4-vision-preview"))
-    # sgl.set_default_backend(sgl.VertexAI("gemini-pro-vision"))
 
     # Run a single request
     print("\n========== single ==========\n")
