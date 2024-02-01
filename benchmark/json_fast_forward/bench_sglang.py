@@ -115,7 +115,7 @@ def main(args):
     print(f"Latency: {latency:.3f}")
 
     # Write results
-    dump_state_text(f"tmp_output_{args.backend}.txt", states)
+    dump_state_text(f"tmp_output_{args.backend}_{args.mode}.txt", states)
     with open(f"{args.backend}_{args.mode}.json", "w") as fout:
         for state in states:
             fout.write(state["json_output"] + "\n")
