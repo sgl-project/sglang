@@ -233,11 +233,12 @@ def wrap_kernel_launcher(kernel):
 
 def is_multimodal_model(model):
     if isinstance(model, str):
-        return "llava" in model
+        return "llava" or "yi-vl" in model
     from sglang.srt.model_config import ModelConfig
 
     if isinstance(model, ModelConfig):
-        return "llava" in model.path.lower()
+        model_path = model.path.lower()
+        return "llava" in model_path  or "yi-vl" in model_path
     raise Exception("unrecognized type")
 
 
