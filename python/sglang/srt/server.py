@@ -7,7 +7,6 @@ import sys
 import threading
 import time
 from typing import List, Optional, Union
-import logging
 
 # Fix a Python bug
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -53,7 +52,6 @@ from sglang.srt.utils import alloc_usable_network_port, handle_port_init
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-logger = logging.getLogger(__name__)
 
 app = FastAPI()
 tokenizer_manager = None
