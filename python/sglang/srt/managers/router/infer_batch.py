@@ -21,11 +21,14 @@ class FinishReason(Enum):
 
 
 class Req:
-    def __init__(self, rid, input_text, input_ids):
+    def __init__(self, rid, input_text, input_ids, lora_uid=None):
         self.rid = rid
         self.input_text = input_text
         self.input_ids = input_ids
         self.output_ids = []
+
+        # For LoRA
+        self.lora_uid = lora_uid
 
         # For vision input
         self.pixel_values = None

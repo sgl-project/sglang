@@ -1,3 +1,6 @@
+# LoRA layers class inheritance adapted from:
+# https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
+# To be refactored.
 import json
 import os
 import re
@@ -21,44 +24,50 @@ from vllm.model_executor.weight_utils import (
 
 from sglang.srt.managers.router.infer_batch import ForwardMode
 from sglang.srt.managers.router.model_runner import InputMetadata
+from sglang._kernels import dispatch_bgmv
 
 
 class BaseLayerWithLoRA(nn.Module):
-    def create_lora_weights() -> None:
-        """Initializes lora matrices."""
-        ...
+    def __init__(self, base_layer):
+        super().__init__()
+        self.base_layer = base_layer
+        if not hasattr(self, "forward"):
+             self.forward = self.base_layer.forward
 
-    def reset_lora():
-        """Resets the lora weights at index back to 0."""
-        ...
-
-    def set_lora(
-    ):
-        """Overwrites lora tensors at index."""
-        ...
-
-    def set_mapping(
-    ):
-        """Sets the mapping indices."""
+    def set_lora_info(self, *args):
         ...
 
 
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     def __init__(self, base_layer: VocabParallelEmbedding) -> None:
-        super().__init__()
-        self.base_layer = base_layer
-
-    def forward(self):
-        self.base_layer.forward()
+        super().__init__(base_layer)
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(self, base_layer: ColumnParallelLinear) -> None:
-        super().__init__()
-        self.base_layer = base_layer
+        super().__init__(base_layer)
 
-    def forward(self):
-        self.base_layer.forward()
+    def apply_weights(self, x: torch.Tensor,
+                      bias: Optional[torch.Tensor]) -> torch.Tensor:
+        output = self.base_layer.linear_method.apply_weights(
+            self.base_layer.linear_weights, x, bias)
+        return output
+
+    def forward(self, input_):
+        # duplicate the logic in ColumnParallelLinear
+        bias = (self.base_layer.bias
+                if not self.base_layer.skip_bias_add else None)
+
+        # Matrix multiply.
+        output_parallel = self.apply_weights(input_, bias)
+        if self.base_layer.gather_output:
+            # All-gather across the partitions.
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+        output_bias = (self.base_layer.bias
+                       if self.base_layer.skip_bias_add else None)
+        return output, output_bias
 
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
@@ -66,18 +75,123 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         super().__init__(base_layer)
 
 
+def _apply_lora_qkv(
+        x: torch.Tensor,
+        output: torch.Tensor,
+        input_metadata,
+        infer_adapter,
+        lora_uids,
+        max_lora_dim,
+        key_buffer,
+        value_buffer,
+        layer_id,
+    ) -> torch.Tensor:
+    # move the below to lora_manager
+    req_bins = torch.zeros(len(lora_uids), dtype=torch.long, device="cuda")
+    for i, lora_uid in enumerate(lora_uids):
+        # FIX ME @TODO: currently not supporting adapter is None
+        if lora_uid is None: continue
+        idx = infer_adapter.adapter_uids.index(lora_uid)
+        req_bins[i] = idx # TODO single point access!
+    seq_lens = input_metadata.seq_lens
+    assert req_bins.shape[0] == seq_lens.shape[0]
+    batch_req_bins = torch.repeat_interleave(req_bins, seq_lens)
+
+    # do not initiate a delta for each layer
+    delta = []
+    for _ in range(3):
+        delta.append(torch.zeros((len(batch_req_bins), max_lora_dim),
+                                      dtype=torch.float16, device="cuda"))
+    # x: (b, h)
+    # output: (b, 3h)
+    if input_metadata.forward_mode != ForwardMode.DECODE:
+        delta_qA = delta[0]
+        dispatch_bgmv(delta_qA, x, 
+                      key_buffer[layer_id][:, 0],
+                      infer_adapter.a_start, infer_adapter.a_len, 
+                      infer_adapter.a_loc, batch_req_bins, 0, infer_adapter.a_scaling)
+        q_idx = (0, output.shape[1] // 3)
+        dispatch_bgmv(output[:,q_idx[0]:q_idx[1]], delta_qA,
+                      value_buffer[layer_id][:, 1], infer_adapter.a_start, 
+                      infer_adapter.a_len, infer_adapter.a_loc, 
+                      batch_req_bins, 0, infer_adapter.a_scaling)
+    else:
+        # TODO
+        pass
+
+
 class QKVParallelLinearWithLora(ColumnParallelLinearWithLoRA):
     def __init__(self, base_layer: QKVParallelLinear) -> None:
         super().__init__(base_layer)
 
+    def set_lora_info(self, input_metadata, infer_adapter, lora_uids, max_lora_dim, layer_id):
+        self.input_metadata = input_metadata
+        self.infer_adapter = infer_adapter
+        self.lora_uids = lora_uids
+        self.max_lora_dim = max_lora_dim
+        self.layer_id = layer_id
+
+    def apply_weights(self, x: torch.Tensor,
+                      bias: Optional[torch.Tensor]) -> torch.Tensor:
+        output = self.base_layer.linear_method.apply_weights(
+            self.base_layer.linear_weights, x, bias)
+        _apply_lora_qkv(
+            x,
+            output,
+            self.input_metadata,
+            self.infer_adapter,
+            self.lora_uids,
+            self.max_lora_dim,
+            self.infer_adapter.token_to_kv_pool.kv_data,
+            self.infer_adapter.token_to_kv_pool.kv_data,
+            self.layer_id,
+        )
+        return output
+
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(self, base_layer: RowParallelLinear) -> None:
-        super().__init__()
-        self.base_layer = base_layer
+        super().__init__(base_layer)
 
-    def forward(self):
-        self.base_layer.forward()
+    def apply_weights(self, x: torch.Tensor) -> torch.Tensor:
+        output = self.base_layer.linear_method.apply_weights(
+            self.base_layer.linear_weights, x)
+        # TODO change below
+        # _apply_lora(
+        #     x,
+        #     self.lora_a_stacked,
+        #     self.lora_b_stacked,
+        #     self.indices[:self.indices_len[0]],
+        #     output,
+        # )
+        return output
+
+    def forward(self, input_):
+        # duplicate the logic in RowParallelLinear
+        # Set up backprop all-reduce.
+        if self.base_layer.input_is_parallel:
+            input_parallel = input_
+        else:
+            tp_rank = get_tensor_model_parallel_rank()
+            splitted_input = split_tensor_along_last_dim(
+                input_, num_partitions=self.base_layer.tp_size)
+            input_parallel = splitted_input[tp_rank].contiguous()
+
+        # Matrix multiply.
+        output_parallel = self.apply_weights(input_parallel)
+        if self.base_layer.reduce_results and self.base_layer.tp_size > 1:
+            output_ = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output_ = output_parallel
+
+        if not self.base_layer.skip_bias_add:
+            output = (output_ + self.base_layer.bias
+                      if self.base_layer.bias is not None else output_)
+            output_bias = None
+        else:
+            output = output_
+            output_bias = self.base_layer.bias
+        return output, output_bias
 
 
 def get_lora_layer(

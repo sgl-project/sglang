@@ -1,4 +1,11 @@
+import re
+from dataclasses import dataclass
+
+import torch
+
 from sglang.srt.managers.router.infer_adapter import InferAdapter
+from sglang.srt.managers.router.infer_batch import ForwardMode
+from sglang.srt.memory_pool import TokenToKVPool
 from sglang.srt.model_config import LoRAConfig
 from sglang.srt.models.lora import get_lora_layer, params_mapping, LoRAAdapter
 from sglang.srt.utils import replace_submodule
@@ -35,9 +42,9 @@ class LoRAManager:
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(module)
-        # TODO currently doing nothing
-        # replace_submodule(self.base_model, module_name, lora_module)
+        replace_submodule(self.base_model, module_name, lora_module)
         # TODO disable radixattention
+        return lora_module
 
     def init_loras(self):
         # get configs and target modules
@@ -50,8 +57,9 @@ class LoRAManager:
 
         # monkey patch to use Lora version
         modules = self.get_target_modules()
+        self.lora_modules = []
         for module_name, module in modules:
-            self.set_lora_module(module_name, module)
+            self.lora_modules.append((module_name, self.set_lora_module(module_name, module)))
 
         # load all weights to cpu
         self.loras = []
@@ -64,6 +72,9 @@ class LoRAManager:
         # load zero lora for base model only
         self.infer_adapter.add_zero_lora()
 
+        # other helper info
+        self.max_lora_dim = max([x.config["r"] for x in self.configs.values()])
+
     def load_loras_from_path(self, lora_paths):
         loras = [self.loras[self.lora_id[path]] for path in lora_paths]
         # load paged modules
@@ -71,3 +82,11 @@ class LoRAManager:
         # load unpaged modules
         for lora in loras:
             lora.load_to_gpu(mode="no-page")
+
+    def set_lora_input_metadata(self, input_metadata, lora_uids):
+        for module_name, lora_module in self.lora_modules:
+            match = re.search(r"model\.layers\.(\d+)\.*", module_name)
+            layer_id = int(match.group(1)) if match else -1
+            lora_module.set_lora_info(
+                # TODO do not need to use the global max_lora_dim
+                input_metadata, self.infer_adapter, lora_uids, self.max_lora_dim, layer_id)

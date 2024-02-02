@@ -30,7 +30,7 @@ def test_generate_worker(model_path, lora_paths, tp_rank, tp_size):
     # Prefill
     reqs = []
     for i in range(len(prompts)):
-        req = Req(i, None, None)
+        req = Req(i, None, None, lora_uid=lora_paths[0])
         req.input_ids = tokenizer.encode(prompts[i])
         req.sampling_params = sampling_params
         reqs.append(req)
@@ -83,4 +83,5 @@ def test_generate(model_path, lora_paths, tp_size):
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     test_generate("meta-llama/Llama-2-7b-hf",
-                  ["yard1/llama-2-7b-sql-lora-test", "tloen/alpaca-lora-7b"], 1)
+                  # ["yard1/llama-2-7b-sql-lora-test", "tloen/alpaca-lora-7b"], 1)
+                  ["tloen/alpaca-lora-7b"], 1)

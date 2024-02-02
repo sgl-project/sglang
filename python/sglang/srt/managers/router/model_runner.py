@@ -266,9 +266,9 @@ class ModelRunner:
         self.init_memory_pool(total_gpu_memory)
         if self.lora_paths:
             from sglang.srt.managers.router.lora_manager import LoRAManager
-            self.model.lora = LoRAManager(self.model, self.lora_paths,
-		                          base_config=self.model_config.hf_config,
-                                          token_to_kv_pool=self.token_to_kv_pool)
+            self.lora_manager = LoRAManager(self.model, self.lora_paths,
+		                            base_config=self.model_config.hf_config,
+                                            token_to_kv_pool=self.token_to_kv_pool)
             print(f"lora manager ready.")
 
         self.is_multimodal_model = is_multimodal_model(self.model_config)
@@ -306,7 +306,7 @@ class ModelRunner:
         logger.info(f"Rank {self.tp_rank}: load weight end.")
 
     def load_loras_from_path(self, loras: List[str]):
-        self.model.lora.load_loras_from_path(loras)
+        self.lora_manager.load_loras_from_path(loras)
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(
@@ -354,6 +354,7 @@ class ModelRunner:
         position_ids_offsets,
         out_cache_loc,
         return_logprob,
+        lora_uids=None,
     ):
         input_metadata = InputMetadata.create(
             self,
@@ -366,6 +367,8 @@ class ModelRunner:
             out_cache_loc=out_cache_loc,
             return_logprob=return_logprob,
         )
+        if self.lora_paths:
+            self.lora_manager.set_lora_input_metadata(input_metadata, lora_uids)
         return self.model.forward(input_ids, input_metadata.positions, input_metadata)
 
     @torch.inference_mode()
@@ -378,6 +381,7 @@ class ModelRunner:
         position_ids_offsets,
         out_cache_loc,
         return_logprob,
+        lora_uids=None,
     ):
         input_metadata = InputMetadata.create(
             self,
@@ -390,6 +394,8 @@ class ModelRunner:
             out_cache_loc=out_cache_loc,
             return_logprob=return_logprob,
         )
+        if self.lora_paths:
+            self.lora_manager.set_lora_input_metadata(input_metadata, lora_uids)
         return self.model.forward(input_ids, input_metadata.positions, input_metadata)
 
     @torch.inference_mode()
@@ -403,6 +409,7 @@ class ModelRunner:
         out_cache_loc,
         out_cache_cont_start,
         out_cache_cont_end,
+        lora_uids=None,
     ):
         input_metadata = InputMetadata.create(
             self,
@@ -416,6 +423,8 @@ class ModelRunner:
             out_cache_cont_start=out_cache_cont_start,
             out_cache_cont_end=out_cache_cont_end,
         )
+        if self.lora_paths:
+            self.lora_manager.set_lora_input_metadata(input_metadata, lora_uids)
         return self.model.forward(input_ids, input_metadata.positions, input_metadata)[
             0
         ]
@@ -445,6 +454,8 @@ class ModelRunner:
             out_cache_loc=out_cache_loc,
             return_logprob=return_logprob,
         )
+        if self.lora_paths:
+            self.lora_manager.set_lora_input_metadata(input_metadata)
         return self.model.forward(
             input_ids,
             input_metadata.positions,
@@ -469,6 +480,16 @@ class ModelRunner:
             }
             kwargs["return_logprob"] = return_logprob
             return self.forward_extend_multi_modal(**kwargs)
+        elif self.lora_paths:
+            kwargs = {
+                "input_ids": batch.input_ids,
+                "req_pool_indices": batch.req_pool_indices,
+                "seq_lens": batch.seq_lens,
+                "prefix_lens": batch.prefix_lens,
+                "position_ids_offsets": batch.position_ids_offsets,
+                "out_cache_loc": batch.out_cache_loc,
+                "lora_uids": [req.lora_uid for req in batch.reqs],
+            }
         else:
             kwargs = {
                 "input_ids": batch.input_ids,
