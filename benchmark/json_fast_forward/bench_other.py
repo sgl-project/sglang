@@ -223,6 +223,7 @@ def main(args):
             "backend": args.backend,
             "latency": round(latency, 3),
             "num_jsons": args.num_jsons,
+            "mode": args.mode,
             "parallel": args.parallel,
         }
         fout.write(json.dumps(value) + "\n")
