@@ -1,7 +1,10 @@
+import json
 import os
-from typing import Optional, Union
+from typing import ClassVar, List, Optional, Union
 
 import torch
+from huggingface_hub import snapshot_download
+
 from sglang.srt.hf_transformers_utils import get_config, get_context_length
 
 
@@ -27,3 +30,32 @@ class ModelConfig:
         self.hidden_size = self.hf_config.hidden_size
         self.num_hidden_layers = self.hf_config.num_hidden_layers
         self.vocab_size = self.hf_config.vocab_size
+
+
+class LoRAConfig:
+    def __init__(
+        self,
+        path: str,
+    ) -> None:
+        self.path = path
+        self.config = self.get_lora_config()
+        self.target_modules = self.config["target_modules"]
+
+    def get_lora_config(self, dummy=False):
+        if dummy:
+            raise NotImplementedError()
+        else:
+            from sglang.utils import get_lock
+
+            is_local = os.path.isdir(self.path)
+            if not is_local:
+                # Use file lock to prevent multiple processes from
+                # downloading the same model weights at the same time.
+                with get_lock(path=self.path):
+                    weights_dir = snapshot_download(self.path,
+                                                    allow_patterns=["*.bin", "*.json"])
+            else:
+                weights_dir = self.path
+            config_name = "adapter_config.json"
+            with open(os.path.join(weights_dir, config_name), "r") as f:
+                return json.load(f)

@@ -3,7 +3,7 @@ import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -230,6 +230,7 @@ class ModelRunner:
         load_format="auto",
         trust_remote_code=True,
         model_mode: List[str] = (),
+        lora_paths: Optional[List[str]] = None,
     ):
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
@@ -239,6 +240,7 @@ class ModelRunner:
         self.load_format = load_format
         self.trust_remote_code = trust_remote_code
         self.model_mode = model_mode
+        self.lora_paths = lora_paths
 
         global global_model_mode
         global_model_mode = model_mode
@@ -262,11 +264,18 @@ class ModelRunner:
         ) * (1 << 30)
         self.load_model()
         self.init_memory_pool(total_gpu_memory)
+        if self.lora_paths:
+            from sglang.srt.managers.router.lora_manager import LoRAManager
+            self.model.lora = LoRAManager(self.model, self.lora_paths,
+		                          base_config=self.model_config.hf_config,
+                                          token_to_kv_pool=self.token_to_kv_pool)
+            print(f"lora manager ready.")
 
         self.is_multimodal_model = is_multimodal_model(self.model_config)
 
     def load_model(self):
         """See also vllm/model_executor/model_loader.py::get_model"""
+
         # Select model class
         architectures = getattr(self.model_config.hf_config, "architectures", [])
         model_class = get_model_cls_by_arch_name(architectures)
@@ -294,6 +303,10 @@ class ModelRunner:
                 revision=None,
             )
         self.model = model.eval()
+        print(f"model {self.model_config.path} loaded.")
+
+    def load_loras_from_path(self, loras: List[str]):
+        self.model.lora.load_loras_from_path(loras)
 
         logger.info(f"Rank {self.tp_rank}: load weight end.")
 

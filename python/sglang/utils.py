@@ -1,7 +1,9 @@
 """Common utilities."""
 
 import base64
+import filelock
 import json
+import os
 import threading
 import urllib.request
 from io import BytesIO
@@ -26,7 +28,8 @@ def get_available_gpu_memory(gpu_id, distributed=True):
             "which may cause useless memory allocation for torch CUDA context.",
         )
 
-    free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+    total_memory = torch.cuda.get_device_properties(gpu_id).total_memory
+    free_gpu_memory = total_memory - torch.cuda.memory_allocated(gpu_id)
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
@@ -180,3 +183,10 @@ def run_with_timeout(func, args=(), kwargs=None, timeout=None):
         raise RuntimeError()
 
     return ret_value[0]
+
+
+def get_lock(path: str, cache_dir: str = None):
+    lock_dir = cache_dir if cache_dir is not None else "/tmp"
+    lock_file_name = path.replace("/", "-") + ".lock"
+    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name))
+    return lock
