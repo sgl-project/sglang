@@ -393,16 +393,15 @@ class ModelRpcServer(rpyc.Service):
             logits, (logprobs, normalized_logprobs) = self.model_runner.forward(
                 batch, ForwardMode.EXTEND, batch.return_logprob
             )
-            # print("extend logits", logits)
             if logprobs is not None:
                 logprobs = logprobs.cpu().tolist()
                 normalized_logprobs = normalized_logprobs.cpu().tolist()
 
-            next_token_ids, next_token_probs = batch.sample(logits)
+            next_token_ids, _ = batch.sample(logits)
             next_token_ids = next_token_ids.cpu().tolist()
         else:
             next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
-            logprobs = normalized_logprobs = None
+            logits = logprobs = normalized_logprobs = None
 
         # Check finish condition
         reqs = batch.reqs
@@ -414,6 +413,19 @@ class ModelRpcServer(rpyc.Service):
             if logprobs is not None:
                 req.logprob = logprobs[pt : pt + req.extend_input_len - 1]
                 req.normalized_logprob = normalized_logprobs[i]
+
+                # Cannot directly take logprobs[pt + req.extend_input_len - 1]
+                # as it is always the logprob of token 0. This is because at the
+                # time when logprobs is computed, the next token ID is not yet sampled.
+                assert logits is not None
+                token_ids = req.input_ids + [next_token_ids[i]]
+
+                next_token_logprobs = torch.log(torch.softmax(logits[i].float(), dim=-1) + 1e-6)
+                next_token_logprobs = next_token_logprobs.cpu().tolist()
+                token_texts = req.tokenizer.convert_ids_to_tokens(token_ids)
+                token_texts = [t.decode() if isinstance(t, bytes) else t for t in token_texts]
+                token_logprobs = [None] + req.logprob + [next_token_logprobs[next_token_ids[i]]]
+                req.token_logprob = list(zip(token_texts, token_ids, token_logprobs))
                 pt += req.extend_input_len
 
         self.handle_finished_requests(batch)
@@ -463,15 +475,28 @@ class ModelRpcServer(rpyc.Service):
         batch.prepare_for_decode()
 
         # Forward
-        logits = self.model_runner.forward(batch, ForwardMode.DECODE)
-        next_token_ids, next_token_probs = batch.sample(logits)
+        logits, (logprobs, _) = self.model_runner.forward(
+            batch,
+            ForwardMode.DECODE,
+            batch.return_logprob,
+        )
+        next_token_ids, _ = batch.sample(logits)
         next_token_ids = next_token_ids.cpu().tolist()
 
         # Check finish condition
         reqs = batch.reqs
-        for i in range(len(reqs)):
-            reqs[i].output_ids.append(next_token_ids[i])
-            reqs[i].check_finished()
+        for i, (req, next_tok_id) in enumerate(zip(reqs, next_token_ids)):
+            req.output_ids.append(next_tok_id)
+            req.check_finished()
+
+            if logprobs is not None:
+                next_tok_text = req.tokenizer.convert_ids_to_tokens([next_tok_id])[0]
+                next_tok_text = (
+                    next_tok_text.decode() if isinstance(next_tok_text, bytes) else next_tok_text
+                )
+                req.token_logprob.append(
+                    (next_tok_text, next_tok_id, logprobs[i][next_tok_id].tolist())
+                )
 
         self.handle_finished_requests(batch)
 
@@ -513,6 +538,7 @@ class ModelRpcServer(rpyc.Service):
                 }
                 if req.return_logprob:
                     meta_info["prompt_logprob"] = req.logprob
+                    meta_info["token_logprob"] = req.token_logprob
                     meta_info["normalized_prompt_logprob"] = req.normalized_logprob
                 output_meta_info.append(meta_info)
                 output_finished.append(req.finished)

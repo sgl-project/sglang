@@ -392,6 +392,7 @@ class ModelRunner:
         out_cache_loc,
         out_cache_cont_start,
         out_cache_cont_end,
+        return_logprob,
     ):
         input_metadata = InputMetadata.create(
             self,
@@ -404,10 +405,9 @@ class ModelRunner:
             out_cache_loc=out_cache_loc,
             out_cache_cont_start=out_cache_cont_start,
             out_cache_cont_end=out_cache_cont_end,
+            return_logprob=return_logprob,
         )
-        return self.model.forward(input_ids, input_metadata.positions, input_metadata)[
-            0
-        ]
+        return self.model.forward(input_ids, input_metadata.positions, input_metadata)
 
     @torch.inference_mode()
     def forward_extend_multi_modal(
@@ -455,8 +455,8 @@ class ModelRunner:
                 "prefix_lens": batch.prefix_lens,
                 "position_ids_offsets": batch.position_ids_offsets,
                 "out_cache_loc": batch.out_cache_loc,
+                "return_logprob": return_logprob,
             }
-            kwargs["return_logprob"] = return_logprob
             return self.forward_extend_multi_modal(**kwargs)
         else:
             kwargs = {
@@ -466,6 +466,7 @@ class ModelRunner:
                 "prefix_lens": batch.prefix_lens,
                 "position_ids_offsets": batch.position_ids_offsets,
                 "out_cache_loc": batch.out_cache_loc,
+                "return_logprob": return_logprob,
             }
 
         if forward_mode == ForwardMode.DECODE:
@@ -473,10 +474,8 @@ class ModelRunner:
             kwargs["out_cache_cont_end"] = batch.out_cache_cont_end
             return self.forward_decode(**kwargs)
         elif forward_mode == ForwardMode.EXTEND:
-            kwargs["return_logprob"] = return_logprob
             return self.forward_extend(**kwargs)
         elif forward_mode == ForwardMode.PREFILL:
-            kwargs["return_logprob"] = return_logprob
             return self.forward_prefill(**kwargs)
         else:
             raise ValueError(f"Invaid forward mode: {forward_mode}")

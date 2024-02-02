@@ -48,6 +48,7 @@ class Req:
         self.last_node = None
 
         self.logprob = None
+        self.token_logprob = None
         self.normalized_logprob = None
 
         # For constrained decoding
