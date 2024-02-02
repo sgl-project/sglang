@@ -183,11 +183,11 @@ class LoRAAdapter(nn.Module):
             ]
         )
 
-    def load_to_gpu(self):
+    def load_to_gpu(self, mode):
         for name, weight in self.weights.items():
             weight.to("cuda")
         for layer in self.layers:
-            layer.load_to_gpu(mode="no-page")
+            layer.load_to_gpu(mode=mode)
 
     # initialize the LoRA weights to cpu
     def load_weights(

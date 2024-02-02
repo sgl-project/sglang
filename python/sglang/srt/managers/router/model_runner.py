@@ -275,7 +275,6 @@ class ModelRunner:
 
     def load_model(self):
         """See also vllm/model_executor/model_loader.py::get_model"""
-
         # Select model class
         architectures = getattr(self.model_config.hf_config, "architectures", [])
         model_class = get_model_cls_by_arch_name(architectures)
@@ -303,12 +302,11 @@ class ModelRunner:
                 revision=None,
             )
         self.model = model.eval()
-        print(f"model {self.model_config.path} loaded.")
+
+        logger.info(f"Rank {self.tp_rank}: load weight end.")
 
     def load_loras_from_path(self, loras: List[str]):
         self.model.lora.load_loras_from_path(loras)
-
-        logger.info(f"Rank {self.tp_rank}: load weight end.")
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(

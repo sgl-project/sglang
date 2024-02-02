@@ -1,101 +1,64 @@
 import multiprocessing
+import os
 import time
 
 import numpy as np
 import torch
 import torch.distributed as dist
-from sglang.srt.managers.router.infer_batch import ForwardMode
-from sglang.srt.managers.router.model_runner import InputMetadata, ModelRunner
+import transformers
+from sglang.srt.managers.router.infer_batch import Batch, ForwardMode, Req
+from sglang.srt.managers.router.model_runner import ModelRunner
 from sglang.srt.model_config import ModelConfig
+from sglang.srt.sampling_params import SamplingParams
 
 
-def init_batch_data(model, batch_size, input_len):
-    req_pool_indices = model.req_to_token_pool.alloc(batch_size)
-    seq_lens = torch.full((batch_size,), input_len, dtype=torch.int32, device="cuda")
-    prefix_lens = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
-    position_ids_offsets = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
-
-    out_cache_loc = model.token_to_kv_pool.alloc(batch_size * input_len)
-    for i in range(batch_size):
-        model.req_to_token_pool.req_to_token[i, :input_len] = out_cache_loc[
-            i * input_len : (i + 1) * input_len
-        ]
-
-    return (
-        req_pool_indices,
-        seq_lens,
-        prefix_lens,
-        position_ids_offsets,
-        out_cache_loc,
-    )
-
-
-def prefill(model, tp_rank, params, print_logits):
-    logits, _ = model.forward_extend_multi_modal(
-        *params,
-        False,
-    )
-    prob_out = torch.softmax(logits, dim=-1)
-    predict_ids = torch.argmax(prob_out, dim=1, keepdim=True)
-    predict_ids = predict_ids.detach().cpu().numpy()
-
-    if print_logits and tp_rank == 0:
-        print("prefill logits", logits, logits.shape)
-
-    return predict_ids
-
-
-def decode(step, model, tp_rank, batch_size, predict_ids, params, print_logits):
-    (
-        req_pool_indices,
-        seq_lens,
-        prefix_lens,
-        position_ids_offsets,
-        out_cache_loc,
-    ) = params
-
-    (
-        out_cache_loc,
-        out_cache_cont_start,
-        out_cache_cont_end,
-    ) = model.token_to_kv_pool.alloc_contiguous(batch_size)
-    model.req_to_token_pool.req_to_token[req_pool_indices, seq_lens] = out_cache_loc
-    seq_lens.add_(1)
-    logits = model.forward_decode(
-        torch.from_numpy(predict_ids).cuda().reshape(-1),
-        req_pool_indices,
-        seq_lens,
-        None,
-        position_ids_offsets,
-        None,
-        out_cache_cont_start,
-        out_cache_cont_end,
-    )
-    prob_out = torch.softmax(logits, dim=-1)
-    predict_ids = torch.argmax(prob_out, dim=1, keepdim=True)
-    predict_ids = predict_ids.detach().cpu().numpy()
-    if print_logits and tp_rank == 0:
-        print("decode", step, logits)
-    return predict_ids
-
-
-def test_generate_worker(
-    model_path,
-    lora_paths,
-    tp_rank,
-    tp_size,
-):
+@torch.inference_mode()
+def test_generate_worker(model_path, lora_paths, tp_rank, tp_size):
     model_config = ModelConfig(path=model_path)
     model = ModelRunner(model_config, 0.8, tp_rank, tp_size, 28888, lora_paths=lora_paths)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
     model.load_loras_from_path(lora_paths)
-    # print(model.model)
 
-    # Prepare data
-    prompt = ""
+    # Input
+    prompts = [
+        "The capital of France is",
+        "Today is a sunny day and I like",
+    ]
+    sampling_params = SamplingParams(temperature=0)
 
-    # inference
+    output_ids = [[], []]
+    # Prefill
+    reqs = []
+    for i in range(len(prompts)):
+        req = Req(i, None, None)
+        req.input_ids = tokenizer.encode(prompts[i])
+        req.sampling_params = sampling_params
+        reqs.append(req)
 
-    # detokenization
+    batch = Batch.init_new(reqs, model.req_to_token_pool, model.token_to_kv_pool, None)
+    batch.prepare_for_extend(model.model_config.vocab_size, None)
+    logits, _ = model.forward(batch, ForwardMode.EXTEND)
+    next_token_ids, next_token_probs = batch.sample(logits)
+    for k in range(len(output_ids)):
+        output_ids[k].append(next_token_ids[k])
+
+    print("extend logits (first)", logits)
+
+    # Decode
+    for i in range(6):
+        batch.prepare_for_decode(next_token_ids.cpu().numpy())
+        logits = model.forward(batch, ForwardMode.DECODE)
+        next_token_ids, next_token_probs = batch.sample(logits)
+        for k in range(len(output_ids)):
+            output_ids[k].append(next_token_ids[k])
+
+        print(
+            "next_token_ids",
+            next_token_ids,
+            [tokenizer.decode(x) for x in next_token_ids],
+        )
+
+    print([tokenizer.decode(out_ids) for out_ids in output_ids])
 
 
 def test_generate(model_path, lora_paths, tp_size):
@@ -118,6 +81,6 @@ def test_generate(model_path, lora_paths, tp_size):
 
 
 if __name__ == "__main__":
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     test_generate("meta-llama/Llama-2-7b-hf",
                   ["yard1/llama-2-7b-sql-lora-test", "tloen/alpaca-lora-7b"], 1)
-                  # ["tloen/alpaca-lora-7b"], 1)

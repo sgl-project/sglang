@@ -12,6 +12,7 @@ from sglang.srt.model_config import ModelConfig
 from sglang.srt.sampling_params import SamplingParams
 
 
+@torch.inference_mode()
 def test_generate_worker(model_path, tp_rank, tp_size):
     model_config = ModelConfig(path=model_path)
     model = ModelRunner(model_config, 0.8, tp_rank, tp_size, 28888)
@@ -26,6 +27,7 @@ def test_generate_worker(model_path, tp_rank, tp_size):
 
     cut_num = 4
 
+    # Prefill
     reqs = []
     for i in range(len(prompts)):
         req = Req(i, None, None)
@@ -33,7 +35,6 @@ def test_generate_worker(model_path, tp_rank, tp_size):
         req.sampling_params = sampling_params
         reqs.append(req)
 
-    # Prefill
     batch = Batch.init_new(reqs, model.req_to_token_pool, model.token_to_kv_pool, None)
     batch.prepare_for_extend(model.model_config.vocab_size, None)
     logits, _ = model.forward(batch, ForwardMode.EXTEND)
@@ -90,7 +91,7 @@ def test_generate(model_path, tp_size):
 
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    test_generate("TinyLlama/TinyLlama-1.1B-Chat-v0.4", 1)
+    test_generate("meta-llama/Llama-2-7b-hf", 1)
 
     # Reference output for TinyLlama-1.1B-Chat-v0.4
     # extend logits (first) tensor([[-10.0312,  -9.5000,   0.8896,  ...,  -4.9375,  -3.2402,  -3.3633],
