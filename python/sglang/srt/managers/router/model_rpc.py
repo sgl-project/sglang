@@ -83,7 +83,9 @@ class ModelRpcServer(rpyc.Service):
         self.max_num_running_seq = self.max_total_num_token // 2
         self.max_prefill_num_token = max(
             self.model_config.context_len,
-            self.max_total_num_token // 6 if server_args.max_prefill_num_token is None else server_args.max_prefill_num_token,
+            self.max_total_num_token // 6
+            if server_args.max_prefill_num_token is None
+            else server_args.max_prefill_num_token,
         )
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
@@ -233,7 +235,7 @@ class ModelRpcServer(rpyc.Service):
         req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.pixel_values = recv_req.pixel_values
         if req.pixel_values is not None:
-            pad_value = [
+            req.pad_value = [
                 (recv_req.image_hash) % self.model_config.vocab_size,
                 (recv_req.image_hash >> 16) % self.model_config.vocab_size,
                 (recv_req.image_hash >> 32) % self.model_config.vocab_size,
@@ -241,7 +243,7 @@ class ModelRpcServer(rpyc.Service):
             ]
             req.image_size = recv_req.image_size
             req.input_ids, req.image_offset = self.model_runner.model.pad_input_ids(
-                req.input_ids, pad_value, req.pixel_values.shape, req.image_size
+                req.input_ids, req.pad_value, req.pixel_values.shape, req.image_size
             )
         req.sampling_params = recv_req.sampling_params
         req.return_logprob = recv_req.return_logprob
@@ -438,6 +440,20 @@ class ModelRpcServer(rpyc.Service):
         if not self.no_regex_fast_forward:
             # check for fast forward
             fast_forward_reqs = batch.check_for_fast_forward()
+
+            # check for image fast forward
+            for req in fast_forward_reqs:
+                if req.pixel_values is not None:
+                    (
+                        req.input_ids,
+                        req.image_offset,
+                    ) = self.model_runner.model.pad_input_ids(
+                        req.input_ids,
+                        req.pad_value,
+                        req.pixel_values.shape,
+                        req.image_size,
+                    )
+
             self.forward_queue.extend(fast_forward_reqs)
             if batch.is_empty():
                 return

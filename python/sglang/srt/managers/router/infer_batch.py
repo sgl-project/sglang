@@ -31,6 +31,7 @@ class Req:
         self.pixel_values = None
         self.image_size = None
         self.image_offset = 0
+        self.pad_value = None
 
         self.sampling_params = None
         self.return_logprob = False
@@ -58,7 +59,7 @@ class Req:
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
 
-    def tokenize_fast_forward(self, fast_forward_str, next_state):
+    def fast_forward_and_retokenize(self, fast_forward_str, next_state):
         old_output_str = self.tokenizer.decode(self.output_ids)
         # FIXME: This logic does not really solve the problem of determining whether
         # there should be a leading space.
@@ -75,9 +76,14 @@ class Req:
             + fast_forward_str
         )
         new_input_ids = self.tokenizer.encode(new_input_string)
-        fast_forward_tokens_len = (
-            len(new_input_ids) - len(self.input_ids) - len(self.output_ids)
-        )
+        if self.pixel_values is not None:
+            # NOTE: This is a hack because the old input_ids contains the image padding
+            fast_forward_tokens_len = len(self.tokenizer.encode(fast_forward_str))
+        else:
+            fast_forward_tokens_len = (
+                len(new_input_ids) - len(self.input_ids) - len(self.output_ids)
+            )
+
         # print("=" * 100)
         # print(f"Catch fast forward:\n{fast_forward_str}")
         # print(self.tokenizer.convert_ids_to_tokens(self.input_ids))
@@ -351,7 +357,7 @@ class Batch:
                     self.tree_cache.dec_ref_counter(req.last_node)
 
                     # fast forward
-                    req.tokenize_fast_forward(fast_forward_str, next_state)
+                    req.fast_forward_and_retokenize(fast_forward_str, next_state)
 
                     fast_forward_reqs.append(req)
                     filter_indices.remove(i)
