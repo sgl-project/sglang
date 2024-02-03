@@ -15,6 +15,7 @@ class ServerArgs:
     chat_template: Optional[str] = None
     trust_remote_code: bool = True
     mem_fraction_static: Optional[float] = None
+    max_prefill_num_token: Optional[int] = None
     tp_size: int = 1
     model_mode: List[str] = ()
     schedule_heuristic: str = "lpm"
@@ -108,6 +109,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mem_fraction_static,
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+        )
+        parser.add_argument(
+            "--max-prefill-num-token",
+            type=int,
+            default=ServerArgs.max_prefill_num_token,
+            help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length."
         )
         parser.add_argument(
             "--tp-size",
