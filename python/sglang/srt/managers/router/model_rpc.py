@@ -82,7 +82,8 @@ class ModelRpcServer(rpyc.Service):
         self.max_total_num_token = self.model_runner.max_total_num_token
         self.max_num_running_seq = self.max_total_num_token // 2
         self.max_prefill_num_token = max(
-            self.model_config.context_len, self.max_total_num_token // 6
+            self.model_config.context_len,
+            self.max_total_num_token // 6 if server_args.max_prefill_num_token is None else server_args.max_prefill_num_token,
         )
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
