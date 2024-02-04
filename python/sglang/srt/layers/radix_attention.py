@@ -18,15 +18,14 @@ class RadixAttention(nn.Module):
         num_heads,
         head_dim,
         scaling,
-        layer_id,
-        num_kv_heads=None,
+        num_kv_heads,
+        layer_id
     ):
         super().__init__()
         
-        self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.tp_q_head_num = num_heads
-        self.tp_k_head_num = self.num_kv_heads
-        self.tp_v_head_num = self.num_kv_heads
+        self.tp_k_head_num = num_kv_heads
+        self.tp_v_head_num = num_kv_heads
         self.head_dim = head_dim
         self.layer_id = layer_id
 

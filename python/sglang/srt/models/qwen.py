@@ -242,9 +242,6 @@ class QWenLMHeadModel(nn.Module):
             ("gate_up_proj", "w1", 1),
         ]
         params_dict = dict(self.named_parameters())
-        print(params_dict.keys())
-        name_and_weight_iterator = hf_model_weights_iterator(model_name_or_path, cache_dir, load_format, revision)
-        print([name for name, _ in name_and_weight_iterator])
         for name, loaded_weight in hf_model_weights_iterator(
             model_name_or_path, cache_dir, load_format, revision
         ):
