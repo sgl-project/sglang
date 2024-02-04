@@ -106,7 +106,7 @@ class OpenAI(BaseBackend):
                 **kwargs,
             )
         else:
-            raise ValueError(f"Unknown dtype: {dtype}")
+            raise ValueError(f"Unknown dtype: {sampling_params.dtype}")
 
         return comp, {}
 
