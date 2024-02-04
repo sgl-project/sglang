@@ -252,9 +252,8 @@ class StreamExecutor:
         return ret
 
     def fork(self, number: int, position_ids_offset: Optional[List[int]] = None):
-        if number > 1:
-            self.submit(SglCommitLazy())
-            self.sync()
+        self.submit(SglCommitLazy())
+        self.sync()
 
         number = int(number)
 

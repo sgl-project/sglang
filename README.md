@@ -8,6 +8,10 @@ The core features of SGLang include:
 - **A Flexible Front-End Language**: This allows for easy programming of LLM applications with multiple chained generation calls, advanced prompting techniques, control flow, multiple modalities, parallelism, and external interaction.
 - **A High-Performance Runtime with RadixAttention**: This feature significantly accelerates the execution of complex LLM programs by automatic KV cache reuse across multiple calls. It also supports other common techniques like continuous batching and tensor parallelism.
 
+## News
+- [2024/01] 🔥 SGLang powers the serving of the offical LLaVA v1.6 release demo ([blog](https://llava-vl.github.io/blog/2024-01-30-llava-1-6/)).
+- [2024/01] SGLang provides up to 5x faster inference with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
+
 ## Contents
 - [Install](#install)
 - [Quick Start](#quick-start)
@@ -190,6 +194,7 @@ def regular_expression_gen(s):
 ```
 
 ### JSON Decoding
+Use `regex` to specify a JSON schema with a regular expression.
 
 ```python
 character_regex = (
@@ -215,7 +220,7 @@ def character_gen(s, name):
     s += sgl.gen("json_output", max_tokens=256, regex=character_regex)
 ```
 
-See also [json_decode.py](examples/usage/json_decode.py).
+See also [json_decode.py](examples/usage/json_decode.py) for an additional example on specifying formats with Pydantic models.
 
 
 ### Batching
@@ -357,9 +362,11 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 - Llama
 - Mistral
 - Mixtral
+- Qwen / Qwen 2
 - LLaVA
   - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
-- Qwen / Qwen 2
+- Yi-VL
+  - see [srt_example_yi_vl.py](examples/quick_start/srt_example_yi_vl.py).
 - AWQ quantization
 
 ## Benchmark And Performance
