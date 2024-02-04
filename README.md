@@ -194,6 +194,7 @@ def regular_expression_gen(s):
 ```
 
 ### JSON Decoding
+Use `regex` to specify a JSON schema with a regular expression.
 
 ```python
 character_regex = (
@@ -219,7 +220,7 @@ def character_gen(s, name):
     s += sgl.gen("json_output", max_tokens=256, regex=character_regex)
 ```
 
-See also [json_decode.py](examples/usage/json_decode.py).
+See also [json_decode.py](examples/usage/json_decode.py) for an additional example on specifying formats with Pydantic models.
 
 
 ### Batching
