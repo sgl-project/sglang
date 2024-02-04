@@ -17,8 +17,8 @@ from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
 
 import sglang
-QUANTIONCONFIG_MAPPING = {'awq':AWQConfig, 
-                          'gptq':GPTQConfig}
+QUANTIONCONFIG_MAPPING = {'awq': AWQConfig, 
+                          'gptq': GPTQConfig}
 
 logger = logging.getLogger("model_runner")
 
