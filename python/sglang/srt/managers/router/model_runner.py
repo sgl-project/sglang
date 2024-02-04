@@ -7,15 +7,18 @@ from typing import List
 
 import numpy as np
 import torch
+import sglang
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.utils import is_multimodal_model
 from sglang.utils import get_available_gpu_memory
 from vllm.model_executor.layers.quantization.awq import AWQConfig
+from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
 
-import sglang
+QUANTIONCONFIG_MAPPING = {'awq':AWQConfig, 
+                          'gptq':GPTQConfig}
 
 logger = logging.getLogger("model_runner")
 
@@ -280,8 +283,11 @@ class ModelRunner:
                     self.model_config.hf_config, "quantization_config", None
                 )
                 if hf_quant_config is not None:
-                    # TODO: config quantization awq etc
-                    quant_config = AWQConfig.from_config(hf_quant_config)
+                    # TODO: config quantization awq, gptq etc
+                    quant_config_class = QUANTIONCONFIG_MAPPING.get(hf_quant_config['quant_method'])
+                    if quant_config_class is None:
+                        raise ValueError(f"Unsupported quantization method: {hf_quant_config['quant_method']}")
+                    quant_config = quant_config_class.from_config(hf_quant_config)
                     logger.info(f"quant_config: {quant_config}")
                     linear_method = quant_config.get_linear_method()
                 model = model_class(
