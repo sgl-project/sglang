@@ -486,6 +486,3 @@ class ModelRunner:
             return self.forward_prefill(**kwargs)
         else:
             raise ValueError(f"Invaid forward mode: {forward_mode}")
-
-if __name__ == "__main__":
-    import_model_classes()
