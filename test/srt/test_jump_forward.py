@@ -12,7 +12,7 @@ import sglang as sgl
 
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
 
-ip_fast_forward = (
+ip_jump_forward = (
     r"The google's DNS sever address is "
     + IP_REGEX
     + r" and "
@@ -32,11 +32,11 @@ def regex_gen(s):
         "answer",
         max_tokens=128,
         temperature=0,
-        regex=ip_fast_forward,
+        regex=ip_jump_forward,
     )
 # fmt: on
 
-json_fast_forward = (
+json_jump_forward = (
     r"""The information about Hogwarts is in the following JSON format\.\n"""
     + r"""\n\{\n"""
     + r"""  "name": "[\w\d\s]*",\n"""
@@ -54,7 +54,7 @@ def json_gen(s):
         "json",
         max_tokens=128,
         temperature=0,
-        regex=json_fast_forward,
+        regex=json_jump_forward,
     )
 # fmt: on
 

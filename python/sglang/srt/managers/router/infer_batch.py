@@ -53,13 +53,13 @@ class Req:
         # For constrained decoding
         self.regex_fsm = None
         self.regex_fsm_state = 0
-        self.fast_forward_map = None
-        self.output_and_fast_forward_str = ""
+        self.jump_forward_map = None
+        self.output_and_jump_forward_str = ""
 
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
 
-    def fast_forward_and_retokenize(self, fast_forward_str, next_state):
+    def jump_forward_and_retokenize(self, jump_forward_str, next_state):
         old_output_str = self.tokenizer.decode(self.output_ids)
         # FIXME: This logic does not really solve the problem of determining whether
         # there should be a leading space.
@@ -71,35 +71,35 @@ class Req:
             old_output_str = " " + old_output_str
         new_input_string = (
             self.input_text
-            + self.output_and_fast_forward_str
+            + self.output_and_jump_forward_str
             + old_output_str
-            + fast_forward_str
+            + jump_forward_str
         )
         new_input_ids = self.tokenizer.encode(new_input_string)
         if self.pixel_values is not None:
             # NOTE: This is a hack because the old input_ids contains the image padding
-            fast_forward_tokens_len = len(self.tokenizer.encode(fast_forward_str))
+            jump_forward_tokens_len = len(self.tokenizer.encode(jump_forward_str))
         else:
-            fast_forward_tokens_len = (
+            jump_forward_tokens_len = (
                 len(new_input_ids) - len(self.input_ids) - len(self.output_ids)
             )
 
         # print("=" * 100)
-        # print(f"Catch fast forward:\n{fast_forward_str}")
+        # print(f"Catch jump forward:\n{jump_forward_str}")
         # print(self.tokenizer.convert_ids_to_tokens(self.input_ids))
         # print(self.tokenizer.convert_ids_to_tokens(new_input_ids))
 
         self.input_ids = new_input_ids
         self.output_ids = []
         self.sampling_params.max_new_tokens = max(
-            self.sampling_params.max_new_tokens - fast_forward_tokens_len, 0
+            self.sampling_params.max_new_tokens - jump_forward_tokens_len, 0
         )
         self.regex_fsm_state = next_state
-        self.output_and_fast_forward_str = (
-            self.output_and_fast_forward_str + old_output_str + fast_forward_str
+        self.output_and_jump_forward_str = (
+            self.output_and_jump_forward_str + old_output_str + jump_forward_str
         )
 
-        # print(f"Output and fast forward str:\n{self.output_and_fast_forward_str}")
+        # print(f"Output and jump forward str:\n{self.output_and_jump_forward_str}")
         # print("*" * 100)
 
     def check_finished(self):
@@ -327,18 +327,18 @@ class Batch:
 
         return retracted_reqs
 
-    def check_for_fast_forward(self):
-        fast_forward_reqs = []
+    def check_for_jump_forward(self):
+        jump_forward_reqs = []
         filter_indices = [i for i in range(len(self.reqs))]
 
         req_pool_indices_cpu = None
 
         for i, req in enumerate(self.reqs):
-            if req.fast_forward_map is not None:
-                res = req.fast_forward_map.fast_forward(req.regex_fsm_state)
+            if req.jump_forward_map is not None:
+                res = req.jump_forward_map.jump_forward(req.regex_fsm_state)
                 if res is not None:
-                    fast_forward_str, next_state = res
-                    if len(fast_forward_str) <= 1:
+                    jump_forward_str, next_state = res
+                    if len(jump_forward_str) <= 1:
                         continue
 
                     # insert the old request into tree_cache
@@ -356,16 +356,16 @@ class Batch:
                     self.req_to_token_pool.free(req_pool_idx)
                     self.tree_cache.dec_ref_counter(req.last_node)
 
-                    # fast forward
-                    req.fast_forward_and_retokenize(fast_forward_str, next_state)
+                    # jump-forward
+                    req.jump_forward_and_retokenize(jump_forward_str, next_state)
 
-                    fast_forward_reqs.append(req)
+                    jump_forward_reqs.append(req)
                     filter_indices.remove(i)
 
         if len(filter_indices) < len(self.reqs):
             self.filter_batch(filter_indices)
 
-        return fast_forward_reqs
+        return jump_forward_reqs
 
     def prepare_for_decode(self, input_ids=None):
         if input_ids is None:

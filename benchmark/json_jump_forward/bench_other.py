@@ -219,7 +219,7 @@ def main(args):
 
     with open(args.result_file, "a") as fout:
         value = {
-            "task": "json_fast_forward",
+            "task": "json_jump_forward",
             "backend": args.backend,
             "latency": round(latency, 3),
             "num_jsons": args.num_jsons,
