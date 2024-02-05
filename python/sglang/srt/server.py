@@ -389,7 +389,7 @@ def launch_server(server_args, pipe_finish_writer):
 
     assert proc_router.is_alive() and proc_detoken.is_alive()
 
-    def launch_server():
+    def _launch_server():
         # Launch api server
         uvicorn.run(
             app,
@@ -400,26 +400,48 @@ def launch_server(server_args, pipe_finish_writer):
             loop="uvloop",
         )
 
-    t = threading.Thread(target=launch_server)
+    t = threading.Thread(target=_launch_server)
     t.start()
 
-    if pipe_finish_writer:
-        url = server_args.url()
-
-        success = False
-        for i in range(60):
-            time.sleep(1)
-            try:
-                res = requests.get(url + "/get_model_info", timeout=5)
-                success = True
-                break
-            except requests.exceptions.RequestException as e:
-                pass
-
-        if success:
-            pipe_finish_writer.send("init ok")
-        else:
+    url = server_args.url()
+    for _ in range(60):
+        time.sleep(1)
+        try:
+            requests.get(url + "/get_model_info", timeout=5)
+            break
+        except requests.exceptions.RequestException as e:
+            pass
+    else:
+        if pipe_finish_writer is not None:
             pipe_finish_writer.send(str(e))
+        else:
+            print(e, flush=True)
+        return
+
+    # Warmup
+    try:
+        print("Warmup...", flush=True)
+        res = requests.post(
+            url + "/generate",
+            json={
+                "text": "Say this is a warmup request.",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 16,
+                },
+            },
+            timeout=60,
+        )
+        print(f"Warmup done. model response: {res.json()['text']}")
+    except requests.exceptions.RequestException as e:
+        if pipe_finish_writer is not None:
+            pipe_finish_writer.send(str(e))
+        else:
+            print(e, flush=True)
+        return
+
+    if pipe_finish_writer is not None:
+        pipe_finish_writer.send("init ok")
 
 
 class Runtime:
