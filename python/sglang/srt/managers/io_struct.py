@@ -81,7 +81,7 @@ class TokenizedGenerateReqInput:
 class BatchTokenIDOut:
     rids: List[str]
     output_tokens: List[List[int]]
-    output_and_fast_forward_strs: List[str]
+    output_and_jump_forward_strs: List[str]
     hit_stop_str: List[Optional[str]]
     skip_special_tokens: List[bool]
     meta_info: List[Dict]

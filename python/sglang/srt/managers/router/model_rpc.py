@@ -11,7 +11,7 @@ import rpyc
 import torch
 from rpyc.utils.classic import obtain
 from rpyc.utils.server import ThreadedServer
-from sglang.srt.constrained.fast_forward import FastForwardCache
+from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
@@ -49,7 +49,7 @@ class ModelRpcServer(rpyc.Service):
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.schedule_heuristic = server_args.schedule_heuristic
-        self.no_regex_fast_forward = server_args.no_regex_fast_forward
+        self.no_regex_jump_forward = server_args.no_regex_jump_forward
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -127,7 +127,7 @@ class ModelRpcServer(rpyc.Service):
                 "trust_remote_code": server_args.trust_remote_code,
             },
         )
-        self.fast_forward_cache = FastForwardCache()
+        self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
         self.new_token_ratio = min(0.4 * server_args.schedule_conservativeness, 1.0)
@@ -254,8 +254,8 @@ class ModelRpcServer(rpyc.Service):
         # Init regex fsm
         if req.sampling_params.regex is not None:
             req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)
-            if not self.no_regex_fast_forward:
-                req.fast_forward_map = self.fast_forward_cache.query(
+            if not self.no_regex_jump_forward:
+                req.jump_forward_map = self.jump_forward_cache.query(
                     req.sampling_params.regex
                 )
 
@@ -369,8 +369,8 @@ class ModelRpcServer(rpyc.Service):
             logger.debug(
                 f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
                 f"fsm_cache_avg_init_time: {self.regex_fsm_cache.get_avg_init_time():.2f}s. "
-                f"ff_cache_hit_rate: {100.0 * self.fast_forward_cache.get_cache_hit_rate():.2f}%. "
-                f"ff_cache_avg_init_time: {self.fast_forward_cache.get_avg_init_time():.2f}s. "
+                f"ff_cache_hit_rate: {100.0 * self.jump_forward_cache.get_cache_hit_rate():.2f}%. "
+                f"ff_cache_avg_init_time: {self.jump_forward_cache.get_avg_init_time():.2f}s. "
             )
 
         new_batch = Batch.init_new(
@@ -437,12 +437,12 @@ class ModelRpcServer(rpyc.Service):
                 self.min_new_token_ratio,
             )
 
-        if not self.no_regex_fast_forward:
-            # check for fast forward
-            fast_forward_reqs = batch.check_for_fast_forward()
+        if not self.no_regex_jump_forward:
+            # check for jump-forward
+            jump_forward_reqs = batch.check_for_jump_forward()
 
-            # check for image fast forward
-            for req in fast_forward_reqs:
+            # check for image jump-forward
+            for req in jump_forward_reqs:
                 if req.pixel_values is not None:
                     (
                         req.input_ids,
@@ -454,7 +454,7 @@ class ModelRpcServer(rpyc.Service):
                         req.image_size,
                     )
 
-            self.forward_queue.extend(fast_forward_reqs)
+            self.forward_queue.extend(jump_forward_reqs)
             if batch.is_empty():
                 return
 
@@ -478,7 +478,7 @@ class ModelRpcServer(rpyc.Service):
     def handle_finished_requests(self, batch: Batch):
         output_rids = []
         output_tokens = []
-        output_and_fast_forward_strs = []
+        output_and_jump_forward_strs = []
         output_hit_stop_str = []
         output_skip_special_tokens = []
         output_meta_info = []
@@ -502,7 +502,7 @@ class ModelRpcServer(rpyc.Service):
             ):
                 output_rids.append(req.rid)
                 output_tokens.append(req.output_ids)
-                output_and_fast_forward_strs.append(req.output_and_fast_forward_str)
+                output_and_jump_forward_strs.append(req.output_and_jump_forward_str)
                 output_hit_stop_str.append(req.hit_stop_str)
                 output_skip_special_tokens.append(
                     req.sampling_params.skip_special_tokens
@@ -523,7 +523,7 @@ class ModelRpcServer(rpyc.Service):
                 BatchTokenIDOut(
                     output_rids,
                     output_tokens,
-                    output_and_fast_forward_strs,
+                    output_and_jump_forward_strs,
                     output_hit_stop_str,
                     output_skip_special_tokens,
                     output_meta_info,
