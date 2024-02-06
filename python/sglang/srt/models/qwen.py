@@ -34,6 +34,7 @@ class QWenMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str = "silu",
+        linear_method: Optional[LinearMethodBase] = None,
     ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -41,12 +42,14 @@ class QWenMLP(nn.Module):
             2 * [intermediate_size],
             bias=False,
             gather_output=False,
+            linear_method=linear_method
         )
         self.c_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             input_is_parallel=True,
+            linear_method=linear_method
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -71,6 +74,7 @@ class QWenAttention(nn.Module):
         layer_id: int = 0,
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
+        linear_method: Optional[LinearMethodBase] = None
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -82,13 +86,18 @@ class QWenAttention(nn.Module):
 
         # pylint: disable=invalid-name
         self.c_attn = QKVParallelLinear(
-            hidden_size, self.head_dim, self.total_num_heads, bias=True
+            hidden_size, 
+            self.head_dim, 
+            self.total_num_heads, 
+            bias=True, 
+            linear_method=linear_method
         )
         self.c_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             input_is_parallel=True,
+            linear_method=linear_method
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -121,7 +130,7 @@ class QWenAttention(nn.Module):
 
 
 class QWenBlock(nn.Module):
-    def __init__(self, config: QWenConfig, layer_id):
+    def __init__(self, config: QWenConfig, layer_id, linear_method=None):
         super().__init__()
         self.ln_1 = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
@@ -134,11 +143,12 @@ class QWenBlock(nn.Module):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             layer_id=layer_id,
+            linear_method=linear_method
         )
 
         self.ln_2 = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-        self.mlp = QWenMLP(config.hidden_size, config.intermediate_size // 2)
+        self.mlp = QWenMLP(config.hidden_size, config.intermediate_size // 2, linear_method=linear_method)
 
     def forward(
         self,
@@ -165,7 +175,7 @@ class QWenBlock(nn.Module):
 
 
 class QWenModel(nn.Module):
-    def __init__(self, config: QWenConfig):
+    def __init__(self, config: QWenConfig, linear_method=None):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -176,7 +186,7 @@ class QWenModel(nn.Module):
             config.hidden_size,
         )
         self.h = nn.ModuleList(
-            [QWenBlock(config, i) for i in range(config.num_hidden_layers)]
+            [QWenBlock(config, i, linear_method=linear_method) for i in range(config.num_hidden_layers)]
         )
         self.ln_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
@@ -202,7 +212,7 @@ class QWenLMHeadModel(nn.Module):
     def __init__(self, config: QWenConfig, linear_method=None):
         super().__init__()
         self.config = config
-        self.transformer = QWenModel(config)
+        self.transformer = QWenModel(config, linear_method=linear_method)
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         self.lm_head = ParallelLMHead(vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
@@ -218,9 +228,6 @@ class QWenLMHeadModel(nn.Module):
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
         return next_tokens
-
-    _column_parallel_weights = []
-    _row_parallel_weights = ["c_proj.weight"]
 
     def load_weights(
         self,
