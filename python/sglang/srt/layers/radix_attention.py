@@ -22,7 +22,6 @@ class RadixAttention(nn.Module):
         layer_id
     ):
         super().__init__()
-        
         self.tp_q_head_num = num_heads
         self.tp_k_head_num = num_kv_heads
         self.tp_v_head_num = num_kv_heads
