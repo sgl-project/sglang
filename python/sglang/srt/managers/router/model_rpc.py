@@ -402,10 +402,14 @@ class ModelRpcServer(rpyc.Service):
             next_token_ids = next_token_ids.cpu().tolist()
         else:
             next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
-            logits = logprobs = normalized_logprobs = None
+            logits = logprobs = normalized_logprobs = last_logprobs = None
+
+        # Only batch transfer the selected logprobs of the next token to CPU to reduce overhead.
+        reqs = batch.reqs
+        if last_logprobs is not None:
+            last_logprobs = last_logprobs[torch.arange(len(reqs)), next_token_ids].cpu().tolist()
 
         # Check finish condition
-        reqs = batch.reqs
         pt = 0
         for i, req in enumerate(reqs):
             req.output_ids = [next_token_ids[i]]
@@ -416,11 +420,8 @@ class ModelRpcServer(rpyc.Service):
                 req.normalized_logprob = normalized_logprobs[i]
 
                 token_ids = req.input_ids + [next_token_ids[i]]
-                next_token_logprobs = last_logprobs[i].cpu().tolist()
-                token_texts = req.tokenizer.convert_ids_to_tokens(token_ids)
-                token_texts = [t.decode() if isinstance(t, bytes) else t for t in token_texts]
-                token_logprobs = [None] + req.logprob + [next_token_logprobs[next_token_ids[i]]]
-                req.token_logprob = list(zip(token_texts, token_ids, token_logprobs))
+                token_logprobs = [None] + req.logprob + [last_logprobs[i]]
+                req.token_logprob = list(zip(token_ids, token_logprobs))
                 pt += req.extend_input_len
 
         self.handle_finished_requests(batch)
@@ -478,20 +479,18 @@ class ModelRpcServer(rpyc.Service):
         next_token_ids, _ = batch.sample(logits)
         next_token_ids = next_token_ids.cpu().tolist()
 
-        # Check finish condition
+        # Only batch transfer the selected logprobs of the next token to CPU to reduce overhead.
         reqs = batch.reqs
+        if last_logprobs is not None:
+            last_logprobs = last_logprobs[torch.arange(len(reqs)), next_token_ids].tolist()
+
+        # Check finish condition
         for i, (req, next_tok_id) in enumerate(zip(reqs, next_token_ids)):
             req.output_ids.append(next_tok_id)
             req.check_finished()
 
             if last_logprobs is not None:
-                next_tok_text = req.tokenizer.convert_ids_to_tokens([next_tok_id])[0]
-                next_tok_text = (
-                    next_tok_text.decode() if isinstance(next_tok_text, bytes) else next_tok_text
-                )
-                req.token_logprob.append(
-                    (next_tok_text, next_tok_id, last_logprobs[i][next_tok_id].tolist())
-                )
+                req.token_logprob.append((next_tok_id, last_logprobs[i]))
 
         self.handle_finished_requests(batch)
 

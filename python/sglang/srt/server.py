@@ -28,7 +28,7 @@ from sglang.srt.conversation import (
 )
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import DetokenizeReqInput, GenerateReqInput
 from sglang.srt.managers.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -86,6 +86,23 @@ async def stream_generator(obj):
         yield out
 
 
+async def make_openai_style_logprobs(token_logprobs):
+    ret_logprobs = LogProbs()
+
+    # Detokenize
+    token_ids = [tid for tid, _ in token_logprobs]
+    token_texts = await tokenizer_manager.detokenize(DetokenizeReqInput(token_ids))
+
+    for token_text, (_, token_logprob) in zip(token_texts, token_logprobs):
+        ret_logprobs.tokens.append(token_text)
+        ret_logprobs.token_logprobs.append(token_logprob)
+
+        # Not supported yet.
+        ret_logprobs.top_logprobs.append({})
+        ret_logprobs.text_offset.append(-1)
+    return ret_logprobs
+
+
 @app.post("/generate")
 async def generate_request(obj: GenerateReqInput):
     obj.post_init()
@@ -105,17 +122,6 @@ async def generate_request(obj: GenerateReqInput):
 
 @app.post("/v1/completions")
 async def v1_completions(raw_request: Request):
-    def make_openai_style_logprobs(token_logprobs):
-        ret_logprobs = LogProbs()
-        for token_text, _, token_logprob in token_logprobs:
-            ret_logprobs.tokens.append(token_text)
-            ret_logprobs.token_logprobs.append(token_logprob)
-
-            # Not supported yet.
-            ret_logprobs.top_logprobs.append({})
-            ret_logprobs.text_offset.append(-1)
-        return ret_logprobs
-
     request_json = await raw_request.json()
     request = CompletionRequest(**request_json)
 
@@ -156,7 +162,7 @@ async def v1_completions(raw_request: Request):
                         n_prev_token = prompt_tokens
 
                 if request.logprobs is not None:
-                    logprobs = make_openai_style_logprobs(
+                    logprobs = await make_openai_style_logprobs(
                         content["meta_info"]["token_logprob"][n_prev_token:]
                     )
                     n_prev_token = len(content["meta_info"]["token_logprob"])
@@ -201,7 +207,7 @@ async def v1_completions(raw_request: Request):
         token_logprob_pos = prompt_tokens
 
     logprobs = (
-        make_openai_style_logprobs(ret["meta_info"]["token_logprob"][token_logprob_pos:])
+        await make_openai_style_logprobs(ret["meta_info"]["token_logprob"][token_logprob_pos:])
         if request.logprobs is not None
         else None
     )

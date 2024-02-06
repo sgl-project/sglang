@@ -18,6 +18,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.managers.io_struct import (
     BatchStrOut,
+    DetokenizeReqInput,
     FlushCacheReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
@@ -233,6 +234,10 @@ class TokenizerManager:
                 del self.rid_to_state[rid]
 
             yield output_list
+
+    async def detokenize(self, obj: DetokenizeReqInput):
+        token_texts = self.tokenizer.convert_ids_to_tokens(obj.input_ids)
+        return [t.decode() if isinstance(t, bytes) else t for t in token_texts]
 
     async def flush_cache(self):
         flush_cache_req = FlushCacheReq()
