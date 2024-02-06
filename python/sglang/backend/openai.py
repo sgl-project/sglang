@@ -220,8 +220,8 @@ def openai_completion(client, retries=3, is_chat=None, prompt=None, **kwargs):
                     comp = ret.choices[0].text
             break
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError) as e:
-            logger.error(f"OpenAI Error: {e}. Waiting 20 seconds...")
-            time.sleep(20)
+            logger.error(f"OpenAI Error: {e}. Waiting 5 seconds...")
+            time.sleep(5)
             if attempt == retries - 1:
                 raise e
         except Exception as e:
