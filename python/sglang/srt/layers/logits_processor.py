@@ -14,8 +14,10 @@ class LogitsProcessor(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward(self, input_ids, hidden_states, weight, input_metadata):
-        # logits, (prefill_logprobs, normalized_logprobs, last_logprobs)
         last_index = None
+
+        # Compute the last index (the first decode token) of each requeast
+        # if we are in prefill or extend mode.
         if input_metadata.forward_mode != ForwardMode.DECODE:
             last_index = (
                 torch.cumsum(
@@ -27,6 +29,7 @@ class LogitsProcessor(nn.Module):
             )
 
         if not input_metadata.return_logprob:
+            # When logprob is not requested, only compute the last logits.
             if input_metadata.forward_mode == ForwardMode.DECODE:
                 last_hidden = hidden_states
             else:
@@ -39,6 +42,7 @@ class LogitsProcessor(nn.Module):
             last_logits = last_logits[:, : self.config.vocab_size]
             return last_logits, (None, None, None)
         else:
+            # When logprob is requested, compute the logits for all tokens.
             logits = torch.matmul(hidden_states, weight.T)
             if self.tp_size > 1:
                 logits = tensor_model_parallel_all_gather(logits)
@@ -50,8 +54,12 @@ class LogitsProcessor(nn.Module):
                 last_logprobs = all_logprobs
                 prefill_logprobs = normalized_logprobs = None
             else:
+                # Compute the logprobs for the last token of each request.
                 last_logits = logits[last_index]
                 last_logprobs = all_logprobs[last_index]
+
+                # Compute the logprobs and normalized logprobs for the prefill tokens.
+                # Note that we pad a zero at the end of each sequence for easy computation.
                 prefill_logprobs = all_logprobs[
                     torch.arange(all_logprobs.shape[0], device="cuda"),
                     torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
