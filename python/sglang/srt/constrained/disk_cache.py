@@ -9,7 +9,7 @@ import cloudpickle
 from diskcache import Cache
 
 home_dir = os.path.expanduser("~")
-cache_dir = os.environ.get("SGLANG_CACHE_DIR", f"{home_dir}/.cache/sglang")
+cache_dir = os.environ.get("SGLANG_CACHE_DIR", os.path.join(home_dir, ".cache", "sglang", os.getpid()))
 memory = Cache(cache_dir, eviction_policy="none", cull_limit=0)
 _caching_enabled = True
 
