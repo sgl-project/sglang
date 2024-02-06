@@ -283,7 +283,6 @@ class ModelRunner:
                     self.model_config.hf_config, "quantization_config", None
                 )
                 if hf_quant_config is not None:
-                    # TODO: config quantization awq, gptq etc
                     quant_config_class = QUANTIONCONFIG_MAPPING.get(hf_quant_config['quant_method'])
                     if quant_config_class is None:
                         raise ValueError(f"Unsupported quantization method: {hf_quant_config['quant_method']}")
