@@ -100,6 +100,7 @@ class BatchStrOut:
 class FlushCacheReq:
     pass
 
+
 @dataclass
 class DetokenizeReqInput:
     input_ids: List[int]

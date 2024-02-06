@@ -17,8 +17,8 @@ from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
 
 import sglang
-QUANTIONCONFIG_MAPPING = {'awq': AWQConfig, 
-                          'gptq': GPTQConfig}
+
+QUANTIONCONFIG_MAPPING = {"awq": AWQConfig, "gptq": GPTQConfig}
 
 logger = logging.getLogger("model_runner")
 
@@ -283,9 +283,13 @@ class ModelRunner:
                     self.model_config.hf_config, "quantization_config", None
                 )
                 if hf_quant_config is not None:
-                    quant_config_class = QUANTIONCONFIG_MAPPING.get(hf_quant_config['quant_method'])
+                    quant_config_class = QUANTIONCONFIG_MAPPING.get(
+                        hf_quant_config["quant_method"]
+                    )
                     if quant_config_class is None:
-                        raise ValueError(f"Unsupported quantization method: {hf_quant_config['quant_method']}")
+                        raise ValueError(
+                            f"Unsupported quantization method: {hf_quant_config['quant_method']}"
+                        )
                     quant_config = quant_config_class.from_config(hf_quant_config)
                     logger.info(f"quant_config: {quant_config}")
                     linear_method = quant_config.get_linear_method()

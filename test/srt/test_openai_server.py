@@ -64,9 +64,8 @@ def test_completion_stream(args, echo, logprobs):
             first = False
         if logprobs:
             print(
-                f"{r.choices[0].text:12s}\t"
-                f"{r.choices[0].logprobs.token_logprobs}",
-                flush=True
+                f"{r.choices[0].text:12s}\t" f"{r.choices[0].logprobs.token_logprobs}",
+                flush=True,
             )
         else:
             print(r.choices[0].text, end="", flush=True)

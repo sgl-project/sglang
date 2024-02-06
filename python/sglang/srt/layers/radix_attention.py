@@ -13,14 +13,7 @@ from vllm.model_executor.parallel_utils.parallel_state import (
 
 
 class RadixAttention(nn.Module):
-    def __init__(
-        self,
-        num_heads,
-        head_dim,
-        scaling,
-        num_kv_heads,
-        layer_id
-    ):
+    def __init__(self, num_heads, head_dim, scaling, num_kv_heads, layer_id):
         super().__init__()
         self.tp_q_head_num = num_heads
         self.tp_k_head_num = num_kv_heads

@@ -12,6 +12,7 @@ import json
 
 import requests
 
+
 def test_decode_stream(url, return_logprob):
     response = requests.post(
         url + "/generate",
@@ -39,7 +40,7 @@ def test_decode_stream(url, return_logprob):
                 assert data["meta_info"]["prompt_logprob"] is not None
                 assert data["meta_info"]["token_logprob"] is not None
                 assert data["meta_info"]["normalized_prompt_logprob"] is not None
-                if prev == 0: # Skip prompt logprobs
+                if prev == 0:  # Skip prompt logprobs
                     prev = data["meta_info"]["prompt_tokens"]
                 for token_txt, _, logprob in data["meta_info"]["token_logprob"][prev:]:
                     print(f"{token_txt}\t{logprob}", flush=True)
@@ -49,6 +50,7 @@ def test_decode_stream(url, return_logprob):
                 print(output[prev:], end="", flush=True)
                 prev = len(output)
     print("")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

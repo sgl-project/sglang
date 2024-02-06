@@ -12,6 +12,7 @@ import argparse
 
 import requests
 
+
 def test_decode(url, return_logprob):
     response = requests.post(
         url + "/generate",
@@ -26,6 +27,7 @@ def test_decode(url, return_logprob):
         },
     )
     print(response.json())
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
