@@ -13,11 +13,13 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
 import psutil
+import pydantic
 import requests
 import uvicorn
 import uvloop
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.conversation import (
     Conversation,
@@ -58,6 +60,15 @@ tokenizer_manager = None
 chat_template_name = None
 
 
+# FIXME: Remove this once we drop support for pydantic 1.x
+IS_PYDANTIC_1 = int(pydantic.VERSION.split(".")[0]) == 1
+
+def jsonify_pydantic_model(obj: BaseModel):
+    if IS_PYDANTIC_1:
+        return obj.json(ensure_ascii=False)
+    return obj.model_dump_json()
+
+
 @app.get("/health")
 async def health() -> Response:
     """Health check."""
@@ -76,7 +87,8 @@ async def get_model_info():
 async def flush_cache():
     await tokenizer_manager.flush_cache()
     return Response(
-        content="Cache flushed.\nPlease check backend logs for more details. (When there are running or waiting requests, the operation will not be performed.)\n",
+        content="Cache flushed.\nPlease check backend logs for more details. "
+        "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -188,7 +200,7 @@ async def v1_completions(raw_request: Request):
                         total_tokens=prompt_tokens + completion_tokens,
                     ),
                 )
-                yield f"data: {chunk.json(ensure_ascii=False)}\n\n"
+                yield f"data: {jsonify_pydantic_model(chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(gnerate_stream_resp(), media_type="text/event-stream")
@@ -313,7 +325,7 @@ async def v1_chat_completions(raw_request: Request):
                         choices=[choice_data],
                         model=request.model,
                     )
-                    yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
+                    yield f"data: {jsonify_pydantic_model(chunk)}\n\n"
 
                 text = content["text"]
                 delta = text[len(stream_buffer) :]
@@ -326,7 +338,7 @@ async def v1_chat_completions(raw_request: Request):
                     choices=[choice_data],
                     model=request.model,
                 )
-                yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
+                yield f"data: {jsonify_pydantic_model(chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(gnerate_stream_resp(), media_type="text/event-stream")

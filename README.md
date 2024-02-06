@@ -368,7 +368,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
   - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
 - Yi-VL
   - see [srt_example_yi_vl.py](examples/quick_start/srt_example_yi_vl.py).
-- AWQ quantization
+- AWQ/GPTQ quantization
 
 ## Benchmark And Performance
 

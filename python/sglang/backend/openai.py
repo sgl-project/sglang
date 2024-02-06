@@ -1,3 +1,5 @@
+import logging
+import time
 from typing import Callable, List, Optional, Union
 
 import numpy as np
@@ -11,6 +13,9 @@ try:
     import tiktoken
 except ImportError as e:
     openai = tiktoken = e
+
+
+logger = logging.getLogger("openai")
 
 
 def create_logit_bias_int(tokenizer):
@@ -199,42 +204,58 @@ class OpenAI(BaseBackend):
         return decision, scores, scores
 
 
-def openai_completion(client, is_chat=None, prompt=None, **kwargs):
-    try:
-        if is_chat:
-            if kwargs["stop"] is None:
-                kwargs.pop("stop")
-            ret = client.chat.completions.create(messages=prompt, **kwargs)
-            comp = ret.choices[0].message.content
-        else:
-            ret = client.completions.create(prompt=prompt, **kwargs)
-            if isinstance(prompt, (list, tuple)):
-                comp = [c.text for c in ret.choices]
+def openai_completion(client, retries=3, is_chat=None, prompt=None, **kwargs):
+    for attempt in range(retries):
+        try:
+            if is_chat:
+                if "stop" in kwargs and kwargs["stop"] is None:
+                    kwargs.pop("stop")
+                ret = client.chat.completions.create(messages=prompt, **kwargs)
+                comp = ret.choices[0].message.content
             else:
-                comp = ret.choices[0].text
-    except openai.OpenAIError as e:
-        print(f"OpenAI Error: {e}")
-        raise e
+                ret = client.completions.create(prompt=prompt, **kwargs)
+                if isinstance(prompt, (list, tuple)):
+                    comp = [c.text for c in ret.choices]
+                else:
+                    comp = ret.choices[0].text
+            break
+        except (openai.APIError, openai.APIConnectionError, openai.RateLimitError) as e:
+            logger.error(f"OpenAI Error: {e}. Waiting 5 seconds...")
+            time.sleep(5)
+            if attempt == retries - 1:
+                raise e
+        except Exception as e:
+            logger.error(f"RuntimeError {e}.")
+            raise e
 
     return comp
 
 
-def openai_completion_stream(client, is_chat=None, prompt=None, **kwargs):
-    try:
-        if is_chat:
-            if kwargs["stop"] is None:
-                kwargs.pop("stop")
-            generator = client.chat.completions.create(
-                messages=prompt, stream=True, **kwargs
-            )
-            for ret in generator:
-                content = ret.choices[0].delta.content
-                yield content or "", {}
-        else:
-            generator = client.completions.create(prompt=prompt, stream=True, **kwargs)
-            for ret in generator:
-                content = ret.choices[0].text
-                yield content or "", {}
-    except openai.OpenAIError as e:
-        print(f"OpenAI Error: {e}")
-        raise e
+def openai_completion_stream(client, retries=3, is_chat=None, prompt=None, **kwargs):
+    for attempt in range(retries):
+        try:
+            if is_chat:
+                if "stop" in kwargs and kwargs["stop"] is None:
+                    kwargs.pop("stop")
+                generator = client.chat.completions.create(
+                    messages=prompt, stream=True, **kwargs
+                )
+                for ret in generator:
+                    content = ret.choices[0].delta.content
+                    yield content or "", {}
+            else:
+                generator = client.completions.create(
+                    prompt=prompt, stream=True, **kwargs
+                )
+                for ret in generator:
+                    content = ret.choices[0].text
+                    yield content or "", {}
+            break
+        except (openai.APIError, openai.APIConnectionError, openai.RateLimitError) as e:
+            logger.error(f"OpenAI Error: {e}. Waiting 5 seconds...")
+            time.sleep(5)
+            if attempt == retries - 1:
+                raise e
+        except Exception as e:
+            logger.error(f"RuntimeError {e}.")
+            raise e
