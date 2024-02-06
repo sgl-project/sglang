@@ -11,8 +11,8 @@ import rpyc
 import torch
 from rpyc.utils.classic import obtain
 from rpyc.utils.server import ThreadedServer
-from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.constrained.fsm_cache import FSMCache
+from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
@@ -391,8 +391,12 @@ class ModelRpcServer(rpyc.Service):
         logprobs = None
         if batch.extend_num_tokens != 0:
             # Forward
-            logits, (prefill_logprobs, normalized_logprobs, last_logprobs) = (
-                self.model_runner.forward(batch, ForwardMode.EXTEND, batch.return_logprob)
+            logits, (
+                prefill_logprobs,
+                normalized_logprobs,
+                last_logprobs,
+            ) = self.model_runner.forward(
+                batch, ForwardMode.EXTEND, batch.return_logprob
             )
             if prefill_logprobs is not None:
                 logprobs = prefill_logprobs.cpu().tolist()
@@ -407,7 +411,9 @@ class ModelRpcServer(rpyc.Service):
         # Only batch transfer the selected logprobs of the next token to CPU to reduce overhead.
         reqs = batch.reqs
         if last_logprobs is not None:
-            last_logprobs = last_logprobs[torch.arange(len(reqs)), next_token_ids].cpu().tolist()
+            last_logprobs = (
+                last_logprobs[torch.arange(len(reqs)), next_token_ids].cpu().tolist()
+            )
 
         # Check finish condition
         pt = 0
@@ -482,7 +488,9 @@ class ModelRpcServer(rpyc.Service):
         # Only batch transfer the selected logprobs of the next token to CPU to reduce overhead.
         reqs = batch.reqs
         if last_logprobs is not None:
-            last_logprobs = last_logprobs[torch.arange(len(reqs)), next_token_ids].tolist()
+            last_logprobs = last_logprobs[
+                torch.arange(len(reqs)), next_token_ids
+            ].tolist()
 
         # Check finish condition
         for i, (req, next_tok_id) in enumerate(zip(reqs, next_token_ids)):
@@ -620,15 +628,16 @@ class ModelRpcClient:
             self.step = async_wrap("step")
 
 
-def start_model_process(port):
-    def _init_service(port):
-        t = ThreadedServer(
-            ModelRpcServer(),
-            port=port,
-            protocol_config={"allow_pickle": True, "sync_request_timeout": 1800},
-        )
-        t.start()
+def _init_service(port):
+    t = ThreadedServer(
+        ModelRpcServer(),
+        port=port,
+        protocol_config={"allow_pickle": True, "sync_request_timeout": 1800},
+    )
+    t.start()
 
+
+def start_model_process(port):
     proc = multiprocessing.Process(target=_init_service, args=(port,))
     proc.start()
     time.sleep(1)

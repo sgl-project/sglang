@@ -114,7 +114,7 @@ class ServerArgs:
             "--max-prefill-num-token",
             type=int,
             default=ServerArgs.max_prefill_num_token,
-            help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length."
+            help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
         )
         parser.add_argument(
             "--tp-size",

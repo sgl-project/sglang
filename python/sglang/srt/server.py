@@ -63,6 +63,7 @@ chat_template_name = None
 # FIXME: Remove this once we drop support for pydantic 1.x
 IS_PYDANTIC_1 = int(pydantic.VERSION.split(".")[0]) == 1
 
+
 def jsonify_pydantic_model(obj: BaseModel):
     if IS_PYDANTIC_1:
         return obj.json(ensure_ascii=False)
@@ -165,7 +166,7 @@ async def v1_completions(raw_request: Request):
                 prompt_tokens = content["meta_info"]["prompt_tokens"]
                 completion_tokens = content["meta_info"]["completion_tokens"]
 
-                if not stream_buffer: # The first chunk
+                if not stream_buffer:  # The first chunk
                     if request.echo:
                         # Prepend prompt in response text.
                         text = request.prompt + text
@@ -219,7 +220,9 @@ async def v1_completions(raw_request: Request):
         token_logprob_pos = prompt_tokens
 
     logprobs = (
-        await make_openai_style_logprobs(ret["meta_info"]["token_logprob"][token_logprob_pos:])
+        await make_openai_style_logprobs(
+            ret["meta_info"]["token_logprob"][token_logprob_pos:]
+        )
         if request.logprobs is not None
         else None
     )

@@ -4,13 +4,16 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+from sglang.srt.models.llava import (
+    LlavaLlamaForCausalLM,
+    clip_vision_embed_forward,
+    monkey_path_clip_vision_embed_forward,
+)
 from transformers import CLIPVisionModel, LlavaConfig
 from vllm.model_executor.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
-
-from sglang.srt.models.llava import LlavaLlamaForCausalLM, clip_vision_embed_forward, monkey_path_clip_vision_embed_forward
 
 
 class YiVLForCausalLM(LlavaLlamaForCausalLM):
@@ -19,7 +22,9 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
         super().__init__(self.config)
 
         self.multi_modal_projector = YiVLMultiModalProjector(self.config)
-        self.vision_tower_subfolder = self.config.mm_vision_tower.replace("./", "") # Everything after "./"
+        self.vision_tower_subfolder = self.config.mm_vision_tower.replace(
+            "./", ""
+        )  # Everything after "./"
 
     def load_weights(
         self,
@@ -30,7 +35,9 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
     ):
         # We have to use the subfolder of the main model directory (e.g. 01-ai/Yi-VL-6B)
         self.vision_tower = CLIPVisionModel.from_pretrained(
-            model_name_or_path, torch_dtype=torch.float16, subfolder=self.vision_tower_subfolder
+            model_name_or_path,
+            torch_dtype=torch.float16,
+            subfolder=self.vision_tower_subfolder,
         ).cuda()
 
         self.vision_tower.eval()
@@ -80,14 +87,19 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
 
         monkey_path_clip_vision_embed_forward()
 
+
 class YiVLMultiModalProjector(nn.Module):
     def __init__(self, config: LlavaConfig):
         super().__init__()
 
-        self.linear_1 = nn.Linear(config.vision_config.hidden_size, config.text_config.hidden_size)
+        self.linear_1 = nn.Linear(
+            config.vision_config.hidden_size, config.text_config.hidden_size
+        )
         self.ln_1 = nn.LayerNorm(config.text_config.hidden_size)
         self.act = nn.GELU()
-        self.linear_2 = nn.Linear(config.text_config.hidden_size, config.text_config.hidden_size)
+        self.linear_2 = nn.Linear(
+            config.text_config.hidden_size, config.text_config.hidden_size
+        )
         self.ln_2 = nn.LayerNorm(config.text_config.hidden_size)
 
     def forward(self, image_features):
@@ -97,5 +109,6 @@ class YiVLMultiModalProjector(nn.Module):
         hidden_states = self.linear_2(hidden_states)
         hidden_states = self.ln_2(hidden_states)
         return hidden_states
+
 
 EntryClass = YiVLForCausalLM
