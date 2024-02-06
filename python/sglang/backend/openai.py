@@ -1,6 +1,7 @@
-from typing import Callable, List, Optional, Union
 import logging
 import time
+from typing import Callable, List, Optional, Union
+
 import numpy as np
 from sglang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template
@@ -8,13 +9,15 @@ from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
 
 try:
-    import openai
     import tiktoken
+
+    import openai
 except ImportError as e:
     openai = tiktoken = e
 
 
 logger = logging.getLogger("openai")
+
 
 def create_logit_bias_int(tokenizer):
     """Get logit bias for integer numbers."""
@@ -203,7 +206,6 @@ class OpenAI(BaseBackend):
 
 
 def openai_completion(client, retries=3, is_chat=None, prompt=None, **kwargs):
-
     for attempt in range(retries):
         try:
             if is_chat:
@@ -222,16 +224,15 @@ def openai_completion(client, retries=3, is_chat=None, prompt=None, **kwargs):
             logger.error(f"OpenAI Error: {e}. Waiting 20 seconds...")
             time.sleep(20)
             if attempt == retries - 1:
-                raise e    
+                raise e
         except Exception as e:
             logger.error(f"RuntimeError {e}.")
             raise e
 
     return comp
-    
+
 
 def openai_completion_stream(client, retries=3, is_chat=None, prompt=None, **kwargs):
-
     for attempt in range(retries):
         try:
             if is_chat:
@@ -244,7 +245,9 @@ def openai_completion_stream(client, retries=3, is_chat=None, prompt=None, **kwa
                     content = ret.choices[0].delta.content
                     yield content or "", {}
             else:
-                generator = client.completions.create(prompt=prompt, stream=True, **kwargs)
+                generator = client.completions.create(
+                    prompt=prompt, stream=True, **kwargs
+                )
                 for ret in generator:
                     content = ret.choices[0].text
                     yield content or "", {}
@@ -253,7 +256,7 @@ def openai_completion_stream(client, retries=3, is_chat=None, prompt=None, **kwa
             logger.error(f"OpenAI Error: {e}. Waiting 20 seconds...")
             time.sleep(20)
             if attempt == retries - 1:
-                raise e   
+                raise e
         except Exception as e:
             logger.error(f"RuntimeError {e}.")
             raise e
