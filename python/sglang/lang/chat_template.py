@@ -193,6 +193,7 @@ def match_chat_ml(model_path: str):
     if "qwen" in model_path and "chat" in model_path:
         return get_chat_template("chatml")
 
+
 @register_chat_template_matching_function
 def match_chat_yi(model_path: str):
     model_path = model_path.lower()
