@@ -381,8 +381,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 Learn more [here](docs/benchmark_results.md).
 
 ## Roadmap
-- [ ] Function call APIs
-- [ ] S-LoRA (expect by Feb. 15)
+https://github.com/sgl-project/sglang/issues/157
 
 ## Citation And Acknowledgment
 ```
