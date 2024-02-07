@@ -234,7 +234,7 @@ class GPTNeoXForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.gpt_neox(input_ids, positions, input_metadata, skip_embed)
         return self.logits_processor(
-            input_ids, hidden_states, self.embed_out, input_metadata
+            input_ids, hidden_states, self.embed_out.weight, input_metadata
         )
 
     def load_weights(self,
