@@ -90,6 +90,11 @@ class InputMetadata:
     decode_wrapper = None
 
     def init_flashinfer_args(self, tp_size):
+        from flashinfer import (
+            BatchDecodeWithPagedKVCacheWrapper,
+            BatchPrefillWithPagedKVCacheWrapper,
+        )
+
         self.kv_indptr = torch.zeros(
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
         )
@@ -107,11 +112,7 @@ class InputMetadata:
             (self.batch_size,), dtype=torch.int32, device="cuda"
         )
 
-        from flashinfer.ops import (
-            BatchDecodeWithPagedKVCacheWrapper,
-            BatchPrefillWithPagedKVCacheWrapper,
-        )
-
+        workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda")
         if (
             self.forward_mode == ForwardMode.PREFILL
             or self.forward_mode == ForwardMode.EXTEND
@@ -120,19 +121,21 @@ class InputMetadata:
                 (self.batch_size + 1,), dtype=torch.int32, device="cuda"
             )
             self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
-            self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper()
+            self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
             self.prefill_wrapper.begin_forward(
                 self.qo_indptr,
-                self.batch_size,
+                self.kv_indptr,
+                self.kv_indices,
+                self.kv_last_page_len,
                 self.model_runner.model_config.num_attention_heads // tp_size,
                 self.model_runner.model_config.num_key_value_heads // tp_size,
             )
         else:
-            self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper()
+            self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "NHD")
             self.decode_wrapper.begin_forward(
                 self.kv_indptr,
+                self.kv_indices,
                 self.kv_last_page_len,
-                self.batch_size,
                 self.model_runner.model_config.num_attention_heads // tp_size,
                 self.model_runner.model_config.num_key_value_heads // tp_size,
                 self.model_runner.model_config.head_dim,
