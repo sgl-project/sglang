@@ -373,7 +373,7 @@ def launch_server(server_args, pipe_finish_writer):
     global tokenizer_manager
     global chat_template_name
 
-    # Init some global variables according to the server_args
+    # disable disk cache if needed
     if server_args.disable_disk_cache:
         disable_cache()
 
