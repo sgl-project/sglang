@@ -499,6 +499,7 @@ def launch_server(server_args, pipe_finish_writer):
             timeout=60,
         )
         print(f"Warmup done. model response: {res.json()['text']}")
+        print("=" * 20, "Server is ready", "=" * 20, flush=True)
     except requests.exceptions.RequestException as e:
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(str(e))
