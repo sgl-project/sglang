@@ -49,7 +49,7 @@ class ModelRpcServer(rpyc.Service):
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.schedule_heuristic = server_args.schedule_heuristic
-        self.no_regex_jump_forward = server_args.no_regex_jump_forward
+        self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -254,7 +254,7 @@ class ModelRpcServer(rpyc.Service):
         # Init regex fsm
         if req.sampling_params.regex is not None:
             req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)
-            if not self.no_regex_jump_forward:
+            if not self.disable_regex_jump_forward:
                 req.jump_forward_map = self.jump_forward_cache.query(
                     req.sampling_params.regex
                 )
@@ -451,7 +451,7 @@ class ModelRpcServer(rpyc.Service):
                 self.min_new_token_ratio,
             )
 
-        if not self.no_regex_jump_forward:
+        if not self.disable_regex_jump_forward:
             # check for jump-forward
             jump_forward_reqs = batch.check_for_jump_forward()
 
