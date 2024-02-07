@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.srt.constrained.disk_cache import disable_cache
 from sglang.srt.conversation import (
     Conversation,
     SeparatorStyle,
@@ -372,6 +373,10 @@ def launch_server(server_args, pipe_finish_writer):
     global tokenizer_manager
     global chat_template_name
 
+    # disable disk cache if needed
+    if server_args.disable_disk_cache:
+        disable_cache()
+
     # Handle ports
     server_args.port, server_args.additional_ports = handle_port_init(
         server_args.port, server_args.additional_ports, server_args.tp_size
@@ -499,6 +504,7 @@ def launch_server(server_args, pipe_finish_writer):
             timeout=60,
         )
         print(f"Warmup done. model response: {res.json()['text']}")
+        print("=" * 20, "Server is ready", "=" * 20, flush=True)
     except requests.exceptions.RequestException as e:
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(str(e))

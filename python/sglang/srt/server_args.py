@@ -25,7 +25,8 @@ class ServerArgs:
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     log_level: str = "info"
-    no_regex_jump_forward: bool = False
+    disable_regex_jump_forward: bool = False
+    disable_disk_cache: bool = False
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -172,9 +173,14 @@ class ServerArgs:
             help="Log stats interval in second.",
         )
         parser.add_argument(
-            "--no-regex-jump-forward",
+            "--disable-regex-jump-forward",
             action="store_true",
             help="Disable regex jump-forward",
+        )
+        parser.add_argument(
+            "--disable-disk-cache",
+            action="store_true",
+            help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
         )
 
     @classmethod
