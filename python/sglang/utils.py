@@ -91,6 +91,8 @@ class HttpResponse:
 def http_request(url, json=None, stream=False, auth_token=None):
     """A faster version of requests.post with low-level urllib API."""
     if stream:
+        if auth_token is None:
+            return requests.post(url, json=json, stream=True)
         headers = {
             "Content-Type": "application/json",
             "Authentication": f"Bearer {auth_token}"
@@ -99,7 +101,8 @@ def http_request(url, json=None, stream=False, auth_token=None):
     else:
         req = urllib.request.Request(url)
         req.add_header("Content-Type", "application/json; charset=utf-8")
-        req.add_header("Authentication", f"Bearer {auth_token}")
+        if auth_token is not None:
+            req.add_header("Authentication", f"Bearer {auth_token}")
         if json is None:
             data = None
         else:
