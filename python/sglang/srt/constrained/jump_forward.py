@@ -1,7 +1,6 @@
 import interegular
+from sglang.srt.constrained import FSMInfo, disk_cache, make_deterministic_fsm
 from sglang.srt.constrained.base_cache import BaseCache
-from sglang.srt.constrained.disk_cache import disk_cache
-from sglang.srt.constrained.regex import FSMInfo, make_deterministic_fsm
 
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
 

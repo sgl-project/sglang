@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.constrained.disk_cache import disable_cache
+from sglang.srt.constrained import disable_cache
 from sglang.srt.conversation import (
     Conversation,
     SeparatorStyle,
