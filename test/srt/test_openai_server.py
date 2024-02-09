@@ -14,6 +14,7 @@ The capital of Japan is Tokyo
 """
 
 import argparse
+import json
 
 import openai
 
@@ -149,6 +150,29 @@ def test_chat_completion_stream(args):
             continue
         print(data.content, end="", flush=True)
     print()
+
+
+def test_regex(args):
+    client = openai.Client(api_key="EMPTY", base_url=args.base_url)
+
+    regex = (r"""\{\n"""
+        + r"""   "name": "[\w]+",\n"""
+        + r"""   "population": "[\w\d\s]+"\n"""
+        + r"""\}"""
+    )
+
+    response = client.chat.completions.create(
+        model="default",
+        messages=[
+            {"role": "system", "content": "You are a helpful AI assistant"},
+            {"role": "user", "content": "Introduce the capital of France."},
+        ],
+        temperature=0,
+        max_tokens=128,
+        extra_body={"regex": regex},
+    )
+    text = response.choices[0].message.content
+    print(json.loads(text))
 
 
 if __name__ == "__main__":

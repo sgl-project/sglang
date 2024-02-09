@@ -151,6 +151,7 @@ async def v1_completions(raw_request: Request):
             "top_p": request.top_p,
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
+            "regex": request.regex,
         },
         return_logprob=request.logprobs is not None,
         stream=request.stream,
@@ -304,6 +305,7 @@ async def v1_chat_completions(raw_request: Request):
             "top_p": request.top_p,
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
+            "regex": request.regex,
         },
         stream=request.stream,
     )
