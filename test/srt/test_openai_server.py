@@ -193,5 +193,6 @@ if __name__ == "__main__":
     test_completion_stream(args, echo=True, logprobs=True)
     test_chat_completion(args)
     test_chat_completion_stream(args)
+    test_regex(args)
     if args.test_image:
         test_chat_completion_image(args)
