@@ -52,6 +52,7 @@ class Req:
         self.normalized_logprob = None
 
         # For constrained decoding
+        self.orig_prompt_tokens = None
         self.regex_fsm = None
         self.regex_fsm_state = 0
         self.jump_forward_map = None
@@ -341,6 +342,10 @@ class Batch:
                     jump_forward_str, next_state = res
                     if len(jump_forward_str) <= 1:
                         continue
+
+                    # in the first jump forward, record the real prompt token length
+                    if req.orig_prompt_tokens is None:
+                        req.orig_prompt_tokens = len(req.input_ids)
 
                     # insert the old request into tree_cache
                     token_ids_in_memory = tuple(req.input_ids + req.output_ids)[:-1]
