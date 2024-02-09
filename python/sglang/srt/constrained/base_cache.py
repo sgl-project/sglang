@@ -24,7 +24,6 @@ class BaseCache:
             self.metrics["avg_init_time"] = (init_time / new_total) + (
                 curr_total / new_total
             ) * self.metrics["avg_init_time"]
-            self.metrics["total"] += 1
             return val
 
         if key in self.cache:
@@ -35,6 +34,7 @@ class BaseCache:
             val = _init_with_timer(key)
 
         if self.enable:
+            self.metrics["total"] += 1
             self.cache[key] = val
         return val
 
