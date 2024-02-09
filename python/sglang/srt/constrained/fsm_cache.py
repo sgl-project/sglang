@@ -1,6 +1,5 @@
+from sglang.srt.constrained import RegexFSM, TransformerTokenizer
 from sglang.srt.constrained.base_cache import BaseCache
-from sglang.srt.constrained.fsm import RegexFSM
-from sglang.srt.constrained.tokenizer import TransformerTokenizer
 
 
 class FSMCache(BaseCache):
