@@ -27,6 +27,9 @@ class Req:
         self.input_ids = input_ids
         self.output_ids = []
 
+        # for accumulated prompt tokens from jump forward
+        self.orig_prompt_tokens = len(input_ids)
+
         # For vision input
         self.pixel_values = None
         self.image_size = None
