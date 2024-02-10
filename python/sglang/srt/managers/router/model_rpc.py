@@ -534,7 +534,9 @@ class ModelRpcServer(rpyc.Service):
                 output_skip_special_tokens.append(
                     req.sampling_params.skip_special_tokens
                 )
-
+                
+                # For the length of input_ids, which will be accumulated during jump-forward.
+                # Use the original length of input_ids to calculate the token usage info.
                 meta_info = {
                     "prompt_tokens": req.orig_prompt_tokens,
                     "completion_tokens": len(req.input_ids)
