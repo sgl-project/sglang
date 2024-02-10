@@ -535,22 +535,13 @@ class ModelRpcServer(rpyc.Service):
                     req.sampling_params.skip_special_tokens
                 )
 
-                if req.orig_prompt_tokens is not None:
-                    # When orig_prompt_tokens is set, this request was procssed with
-                    # jump forward, which results in accumnulated prompt tokens from
-                    # partial decoding tokens.
-                    prompt_tokens = req.orig_prompt_tokens
-                    completion_tokens = (
-                        len(req.input_ids) - prompt_tokens + len(req.output_ids)
-                    )
-                else:
-                    prompt_tokens = len(req.input_ids)
-                    completion_tokens = len(req.output_ids)
-
                 meta_info = {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
+                    "prompt_tokens": req.orig_prompt_tokens,
+                    "completion_tokens": len(req.input_ids)
+                    + len(req.output_ids)
+                    - req.orig_prompt_tokens,
                 }
+
                 if req.return_logprob:
                     meta_info["prompt_logprob"] = req.logprob
                     meta_info["token_logprob"] = req.token_logprob
