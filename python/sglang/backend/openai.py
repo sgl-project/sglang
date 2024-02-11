@@ -137,7 +137,7 @@ class OpenAI(BaseBackend):
             )
             return generator
         else:
-            raise ValueError(f"Unknown dtype: {dtype}")
+            raise ValueError(f"Unknown dtype: {sampling_params.dtype}")
 
     def select(
         self,
