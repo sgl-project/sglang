@@ -43,9 +43,11 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(model_path="liuhaotian/llava-v1.5-7b",
+    runtime = sgl.Runtime(model_path="liuhaotian/llava-v1.6-vicuna-7b",
                           tokenizer_path="llava-hf/llava-1.5-7b-hf")
     sgl.set_default_backend(runtime)
+    print(f"chat template: {runtime.endpoint.chat_template.name}")
+
     # Or you can use API models
     # sgl.set_default_backend(sgl.OpenAI("gpt-4-vision-preview"))
     # sgl.set_default_backend(sgl.VertexAI("gemini-pro-vision"))
