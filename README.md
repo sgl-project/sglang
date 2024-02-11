@@ -252,7 +252,7 @@ def text_qa(s, question):
     s += "Q: " + question + "\n"
     s += "A:" + sgl.gen("answer", stop="\n")
 
-states = text_qa.run(
+state = text_qa.run(
     question="What is the capital of France?",
     temperature=0.1,
     stream=True
