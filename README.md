@@ -258,7 +258,7 @@ states = text_qa.run(
     stream=True
 )
 
-for out in state.text_iter():
+for out in states.text_iter():
     print(out, end="", flush=True)
 ```
 
