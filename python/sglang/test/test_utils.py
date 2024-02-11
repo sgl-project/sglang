@@ -1,4 +1,5 @@
 """Common utilities for testing and benchmarking"""
+
 import numpy as np
 import requests
 from sglang.backend.openai import OpenAI

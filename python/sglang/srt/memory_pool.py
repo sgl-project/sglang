@@ -1,4 +1,5 @@
 """Memory pool."""
+
 import logging
 
 import torch

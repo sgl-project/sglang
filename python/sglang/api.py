@@ -1,4 +1,5 @@
 """Public API"""
+
 import re
 from typing import Callable, List, Optional, Union
 
