@@ -36,6 +36,9 @@ class CompletionRequest(BaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     user: Optional[str] = None
 
+    # Extra parameters for SRT backend only and will be ignored by OpenAI models.
+    regex: Optional[str] = None
+
 
 class CompletionResponseChoice(BaseModel):
     index: int
@@ -118,6 +121,9 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     user: Optional[str] = None
     best_of: Optional[int] = None
+
+    # Extra parameters for SRT backend only and will be ignored by OpenAI models.
+    regex: Optional[str] = None
 
 
 class ChatMessage(BaseModel):
