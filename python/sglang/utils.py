@@ -22,7 +22,7 @@ def get_available_gpu_memory(gpu_id, distributed=True):
 
     if torch.cuda.current_device() != gpu_id:
         print(
-            f"WARN: current device is not {gpu_id}, but {torch.cuda.current_device()}, ",
+            f"WARNING: current device is not {gpu_id}, but {torch.cuda.current_device()}, ",
             "which may cause useless memory allocation for torch CUDA context.",
         )
 
@@ -95,7 +95,7 @@ def http_request(url, json=None, stream=False, auth_token=None):
             return requests.post(url, json=json, stream=True)
         headers = {
             "Content-Type": "application/json",
-            "Authentication": f"Bearer {auth_token}"
+            "Authentication": f"Bearer {auth_token}",
         }
         return requests.post(url, json=json, stream=True, headers=headers)
     else:

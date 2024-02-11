@@ -97,14 +97,16 @@ class MixtralMoE(nn.Module):
 
         self.experts = nn.ModuleList(
             [
-                MixtralMLP(
-                    self.num_total_experts,
-                    config.hidden_size,
-                    config.intermediate_size,
-                    linear_method=linear_method,
+                (
+                    MixtralMLP(
+                        self.num_total_experts,
+                        config.hidden_size,
+                        config.intermediate_size,
+                        linear_method=linear_method,
+                    )
+                    if idx in self.expert_indicies
+                    else None
                 )
-                if idx in self.expert_indicies
-                else None
                 for idx in range(self.num_total_experts)
             ]
         )

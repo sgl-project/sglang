@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     is_multimodal_model,
     set_random_seed,
 )
+from vllm.logger import _default_handler as vllm_default_handler
 
 logger = logging.getLogger("model_rpc")
 
@@ -50,6 +51,9 @@ class ModelRpcServer(rpyc.Service):
         self.tp_size = server_args.tp_size
         self.schedule_heuristic = server_args.schedule_heuristic
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
+        vllm_default_handler.setLevel(
+            level=getattr(logging, server_args.log_level.upper())
+        )
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -83,9 +87,11 @@ class ModelRpcServer(rpyc.Service):
         self.max_num_running_seq = self.max_total_num_token // 2
         self.max_prefill_num_token = max(
             self.model_config.context_len,
-            self.max_total_num_token // 6
-            if server_args.max_prefill_num_token is None
-            else server_args.max_prefill_num_token,
+            (
+                self.max_total_num_token // 6
+                if server_args.max_prefill_num_token is None
+                else server_args.max_prefill_num_token
+            ),
         )
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
@@ -534,7 +540,7 @@ class ModelRpcServer(rpyc.Service):
                 output_skip_special_tokens.append(
                     req.sampling_params.skip_special_tokens
                 )
-                
+
                 # For the length of input_ids, which will be accumulated during jump-forward.
                 # Use the original length of input_ids to calculate the token usage info.
                 meta_info = {

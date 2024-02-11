@@ -1,4 +1,5 @@
 """SRT: SGLang Runtime"""
+
 import asyncio
 import json
 import multiprocessing as mp
@@ -493,7 +494,7 @@ def launch_server(server_args, pipe_finish_writer):
 
     # Warmup
     try:
-        print("Warmup...", flush=True)
+        # print("Warmup...", flush=True)
         res = requests.post(
             url + "/generate",
             json={
@@ -505,8 +506,8 @@ def launch_server(server_args, pipe_finish_writer):
             },
             timeout=60,
         )
-        print(f"Warmup done. model response: {res.json()['text']}")
-        print("=" * 20, "Server is ready", "=" * 20, flush=True)
+        # print(f"Warmup done. model response: {res.json()['text']}")
+        # print("=" * 20, "Server is ready", "=" * 20, flush=True)
     except requests.exceptions.RequestException as e:
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(str(e))
