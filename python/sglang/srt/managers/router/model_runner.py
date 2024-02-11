@@ -112,7 +112,9 @@ class InputMetadata:
             (self.batch_size,), dtype=torch.int32, device="cuda"
         )
 
-        workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda")
+        workspace_buffer = torch.empty(
+            32 * 1024 * 1024, dtype=torch.int8, device="cuda"
+        )
         if (
             self.forward_mode == ForwardMode.PREFILL
             or self.forward_mode == ForwardMode.EXTEND
@@ -121,7 +123,9 @@ class InputMetadata:
                 (self.batch_size + 1,), dtype=torch.int32, device="cuda"
             )
             self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
-            self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+            self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer, "NHD"
+            )
             self.prefill_wrapper.begin_forward(
                 self.qo_indptr,
                 self.kv_indptr,
@@ -131,7 +135,9 @@ class InputMetadata:
                 self.model_runner.model_config.num_key_value_heads // tp_size,
             )
         else:
-            self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+            self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                workspace_buffer, "NHD"
+            )
             self.decode_wrapper.begin_forward(
                 self.kv_indptr,
                 self.kv_indices,

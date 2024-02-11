@@ -1,4 +1,5 @@
 """Inference-only Yi-VL model."""
+
 import os
 from typing import List, Optional
 

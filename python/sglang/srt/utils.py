@@ -122,7 +122,7 @@ def handle_port_init(
     # first check on server port
     if not check_port(port):
         new_port = alloc_usable_network_port(1, used_list=[port])[0]
-        print(f"Port {port} is not available, using {new_port} instead.")
+        print(f"WARNING: Port {port} is not available. Use {new_port} instead.")
         port = new_port
 
     # then we check on additional ports
@@ -157,8 +157,6 @@ def get_int_token_logit_bias(tokenizer, vocab_size):
         ss = tokenizer.decode([t_id]).strip()
         if not (ss.isdigit() or len(ss) == 0 or t_id == tokenizer.eos_token_id):
             logit_bias[t_id] = -1e5
-        # else:
-        #    print(ss, t_id)
 
     return logit_bias
 

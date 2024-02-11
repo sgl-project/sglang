@@ -1,4 +1,5 @@
 """Sampling parameters for text generation."""
+
 from typing import List, Optional, Union
 
 _SAMPLING_EPS = 1e-6

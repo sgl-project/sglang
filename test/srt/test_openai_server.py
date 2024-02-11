@@ -155,7 +155,8 @@ def test_chat_completion_stream(args):
 def test_regex(args):
     client = openai.Client(api_key="EMPTY", base_url=args.base_url)
 
-    regex = (r"""\{\n"""
+    regex = (
+        r"""\{\n"""
         + r"""   "name": "[\w]+",\n"""
         + r"""   "population": "[\w\d\s]+"\n"""
         + r"""\}"""
