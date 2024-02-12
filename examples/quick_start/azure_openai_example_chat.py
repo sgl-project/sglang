@@ -1,12 +1,15 @@
 """
 Usage:
-python3 srt_example_chat.py
+export AZURE_OPENAI_API_KEY=sk-******
+python3 openai_example_chat.py
 """
 import sglang as sgl
+import os
 
 
 @sgl.function
 def multi_turn_question(s, question_1, question_2):
+    s += sgl.system("You are a helpful assistant.")
     s += sgl.user(question_1)
     s += sgl.assistant(sgl.gen("answer_1", max_tokens=256))
     s += sgl.user(question_2)
@@ -51,8 +54,14 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
-    sgl.set_default_backend(runtime)
+    backend = sgl.OpenAI(
+        model_name="azure-gpt-4",
+        api_version="2023-07-01-preview",
+        azure_endpoint="https://oai-arena-sweden.openai.azure.com/",
+        api_key=os.environ["AZURE_OPENAI_API_KEY"],
+        is_azure=True,
+    )
+    sgl.set_default_backend(backend)
 
     # Run a single request
     print("\n========== single ==========\n")
@@ -65,5 +74,3 @@ if __name__ == "__main__":
     # Run a batch of requests
     print("\n========== batch ==========\n")
     batch()
-
-    runtime.shutdown()
