@@ -23,7 +23,7 @@ def single():
     for m in state.messages():
         print(m["role"], ":", m["content"])
 
-    print("answer_1", state["answer_1"])
+    print("\n-- answer_1 --\n", state["answer_1"])
 
 
 def stream():

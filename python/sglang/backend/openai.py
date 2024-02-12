@@ -4,7 +4,7 @@ from typing import Callable, List, Optional, Union
 
 import numpy as np
 from sglang.backend.base_backend import BaseBackend
-from sglang.lang.chat_template import get_chat_template
+from sglang.lang.chat_template import get_chat_template_by_model_path, ChatTemplate
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
 
@@ -41,7 +41,9 @@ INSTRUCT_MODEL_NAMES = [
 
 
 class OpenAI(BaseBackend):
-    def __init__(self, model_name, *args, **kwargs):
+    def __init__(self, model_name: str, is_chat_model: Optional[bool] = None,
+                 chat_template: Optional[ChatTemplate] = None,
+                 *args, **kwargs):
         super().__init__()
 
         if isinstance(openai, Exception):
@@ -49,15 +51,23 @@ class OpenAI(BaseBackend):
 
         self.client = openai.OpenAI(*args, **kwargs)
         self.model_name = model_name
-        self.tokenizer = tiktoken.encoding_for_model(model_name)
+        try:
+            self.tokenizer = tiktoken.encoding_for_model(model_name)
+        except KeyError:
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
         self.logit_bias_int = create_logit_bias_int(self.tokenizer)
 
-        if model_name in INSTRUCT_MODEL_NAMES:
-            self.is_chat_model = False
-        else:
-            self.is_chat_model = True
+        self.chat_template = chat_template or get_chat_template_by_model_path(model_name)
 
-        self.chat_template = get_chat_template("default")
+        if is_chat_model is not None:
+            self.is_chat_model = is_chat_model
+        else:
+            if model_name in INSTRUCT_MODEL_NAMES:
+                self.is_chat_model = False
+            else:
+                self.is_chat_model = True
+
+        self.chat_begin_str = self.chat_template.role_prefix_and_suffix["assistant"][0]
 
     def get_chat_template(self):
         return self.chat_template
@@ -69,7 +79,7 @@ class OpenAI(BaseBackend):
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
-                if not s.text_.endswith("ASSISTANT:"):
+                if not s.text_.endswith(self.chat_begin_str):
                     raise RuntimeError(
                         "This use case is not supported. "
                         "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
@@ -122,7 +132,11 @@ class OpenAI(BaseBackend):
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
-                assert s.text_.endswith("ASSISTANT:")
+                if not s.text_.endswith(self.chat_begin_str):
+                    raise RuntimeError(
+                        "This use case is not supported. "
+                        "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
+                    )
                 prompt = s.messages_
             else:
                 prompt = s.text_
