@@ -4,7 +4,7 @@ from typing import Callable, List, Optional, Union
 
 import numpy as np
 from sglang.backend.base_backend import BaseBackend
-from sglang.lang.chat_template import get_chat_template_by_model_path, ChatTemplate
+from sglang.lang.chat_template import ChatTemplate, get_chat_template_by_model_path
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
 
@@ -41,11 +41,15 @@ INSTRUCT_MODEL_NAMES = [
 
 
 class OpenAI(BaseBackend):
-    def __init__(self, model_name: str,
-                 is_chat_model: Optional[bool] = None,
-                 chat_template: Optional[ChatTemplate] = None,
-                 is_azure: bool = False,
-                 *args, **kwargs):
+    def __init__(
+        self,
+        model_name: str,
+        is_chat_model: Optional[bool] = None,
+        chat_template: Optional[ChatTemplate] = None,
+        is_azure: bool = False,
+        *args,
+        **kwargs,
+    ):
         super().__init__()
 
         if isinstance(openai, Exception):
@@ -63,7 +67,9 @@ class OpenAI(BaseBackend):
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
         self.logit_bias_int = create_logit_bias_int(self.tokenizer)
 
-        self.chat_template = chat_template or get_chat_template_by_model_path(model_name)
+        self.chat_template = chat_template or get_chat_template_by_model_path(
+            model_name
+        )
 
         if is_chat_model is not None:
             self.is_chat_model = is_chat_model

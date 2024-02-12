@@ -208,6 +208,19 @@ class ModelRpcServer(rpyc.Service):
 
                     if self.out_pyobjs and self.running_batch.reqs[0].stream:
                         break
+
+                    if self.running_batch is not None and self.tp_rank == 0:
+                        if self.decode_forward_ct % 40 == 0:
+                            num_used = self.max_total_num_token - (
+                                self.token_to_kv_pool.available_size()
+                                + self.tree_cache.evictable_size()
+                            )
+                            logger.info(
+                                f"#running-req: {len(self.running_batch.reqs)}, "
+                                f"#token: {num_used}, "
+                                f"token usage: {num_used / self.max_total_num_token:.2f}, "
+                                f"#queue-req: {len(self.forward_queue)}"
+                            )
             else:
                 # check the available size
                 available_size = (
@@ -220,19 +233,6 @@ class ModelRpcServer(rpyc.Service):
                         f"available_size={available_size}, max_total_num_token={self.max_total_num_token}\n"
                         "KV cache pool leak detected!"
                     )
-
-        if self.running_batch is not None and self.tp_rank == 0:
-            if self.decode_forward_ct % 20 == 0:
-                num_used = self.max_total_num_token - (
-                    self.token_to_kv_pool.available_size()
-                    + self.tree_cache.evictable_size()
-                )
-                logger.info(
-                    f"#running-req: {len(self.running_batch.reqs)}, "
-                    f"#token: {num_used}, "
-                    f"token usage: {num_used / self.max_total_num_token:.2f}, "
-                    f"#queue-req: {len(self.forward_queue)}"
-                )
 
     def handle_generate_request(
         self,
