@@ -41,15 +41,21 @@ INSTRUCT_MODEL_NAMES = [
 
 
 class OpenAI(BaseBackend):
-    def __init__(self, model_name: str, is_chat_model: Optional[bool] = None,
+    def __init__(self, model_name: str,
+                 is_chat_model: Optional[bool] = None,
                  chat_template: Optional[ChatTemplate] = None,
+                 is_azure: bool = False,
                  *args, **kwargs):
         super().__init__()
 
         if isinstance(openai, Exception):
             raise openai
 
-        self.client = openai.OpenAI(*args, **kwargs)
+        if is_azure:
+            self.client = openai.AzureOpenAI(*args, **kwargs)
+        else:
+            self.client = openai.OpenAI(*args, **kwargs)
+
         self.model_name = model_name
         try:
             self.tokenizer = tiktoken.encoding_for_model(model_name)
@@ -255,7 +261,10 @@ def openai_completion_stream(client, retries=3, is_chat=None, prompt=None, **kwa
                     messages=prompt, stream=True, **kwargs
                 )
                 for ret in generator:
-                    content = ret.choices[0].delta.content
+                    try:
+                        content = ret.choices[0].delta.content
+                    except IndexError:
+                        content = None
                     yield content or "", {}
             else:
                 generator = client.completions.create(
