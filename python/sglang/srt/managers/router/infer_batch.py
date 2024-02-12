@@ -27,8 +27,12 @@ class Req:
         self.input_ids = input_ids
         self.output_ids = []
 
-        # for accumulated prompt tokens from jump forward
-        self.orig_prompt_tokens = len(input_ids)
+        # Since jump forward may retokenize the prompt with partial outputs,
+        # we maintain the original prompt length to report the correct usage.
+        self.prompt_tokens = len(input_ids)
+        # The number of decoded tokens for token usage report. Note that
+        # this does not include the jump forward tokens.
+        self.completion_tokens_wo_jump_forward = 0
 
         # For vision input
         self.pixel_values = None
