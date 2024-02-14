@@ -211,6 +211,7 @@ async def v1_completions(raw_request: Request):
 
     # Non-streaming response.
     ret = await generate_request(adapted_request)
+    ret = ret[0] if isinstance(ret, list) else ret
 
     prompt_tokens = ret["meta_info"]["prompt_tokens"]
     completion_tokens = ret["meta_info"]["completion_tokens"]
