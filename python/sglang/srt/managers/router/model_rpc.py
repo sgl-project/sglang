@@ -424,6 +424,7 @@ class ModelRpcServer(rpyc.Service):
         # Check finish condition
         pt = 0
         for i, req in enumerate(reqs):
+            req.completion_tokens_wo_jump_forward += 1
             req.output_ids = [next_token_ids[i]]
             req.check_finished()
 
@@ -500,6 +501,7 @@ class ModelRpcServer(rpyc.Service):
 
         # Check finish condition
         for i, (req, next_tok_id) in enumerate(zip(reqs, next_token_ids)):
+            req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_tok_id)
             req.check_finished()
 
@@ -541,15 +543,14 @@ class ModelRpcServer(rpyc.Service):
                     req.sampling_params.skip_special_tokens
                 )
 
-                # For the length of input_ids, which will be accumulated during jump-forward.
-                # Use the original length of input_ids to calculate the token usage info.
                 meta_info = {
-                    "prompt_tokens": req.orig_prompt_tokens,
+                    "prompt_tokens": req.prompt_tokens,
                     "completion_tokens": len(req.input_ids)
                     + len(req.output_ids)
-                    - req.orig_prompt_tokens,
+                    - req.prompt_tokens,
+                    "completion_tokens_wo_jump_forward":
+                    req.completion_tokens_wo_jump_forward
                 }
-
                 if req.return_logprob:
                     meta_info["prompt_logprob"] = req.logprob
                     meta_info["token_logprob"] = req.token_logprob

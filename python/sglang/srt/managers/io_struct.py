@@ -15,10 +15,12 @@ class GenerateReqInput:
     sampling_params: Union[List[Dict], Dict] = None
     # The request id
     rid: Optional[Union[List[str], str]] = None
-    # Whether return logprobs of the prompts
+    # Whether to return logprobs
     return_logprob: Optional[Union[List[bool], bool]] = None
     # The start location of the prompt for return_logprob
     logprob_start_len: Optional[Union[List[int], int]] = None
+    # Whether to detokenize tokens in logprobs
+    return_text_in_logprobs: bool = False
     # Whether to stream output
     stream: bool = False
 
