@@ -52,7 +52,7 @@ from sglang.srt.managers.openai_protocol import (
 from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import alloc_usable_network_port, handle_port_init
+from sglang.srt.utils import handle_port_init
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -96,19 +96,25 @@ async def flush_cache():
     )
 
 
-async def stream_generator(obj):
+async def detokenize_logprob_tokens(token_logprobs):
+    token_ids = [tid for tid, _ in token_logprobs]
+    token_texts = await tokenizer_manager.detokenize(DetokenizeReqInput(token_ids))
+    return [(text, logprob) for text, (_, logprob) in zip(token_texts, token_logprobs)]
+
+
+async def stream_generator(obj: GenerateReqInput):
     async for out in tokenizer_manager.generate_request(obj):
+        if obj.return_logprob and obj.return_text_in_logprobs:
+            out["meta_info"]["token_logprob"] = await detokenize_logprob_tokens(
+                out["meta_info"]["token_logprob"]
+            )
         yield out
 
 
 async def make_openai_style_logprobs(token_logprobs):
     ret_logprobs = LogProbs()
 
-    # Detokenize
-    token_ids = [tid for tid, _ in token_logprobs]
-    token_texts = await tokenizer_manager.detokenize(DetokenizeReqInput(token_ids))
-
-    for token_text, (_, token_logprob) in zip(token_texts, token_logprobs):
+    for token_text, token_logprob in token_logprobs:
         ret_logprobs.tokens.append(token_text)
         ret_logprobs.token_logprobs.append(token_logprob)
 
@@ -132,6 +138,11 @@ async def generate_request(obj: GenerateReqInput):
         return StreamingResponse(stream_results(), media_type="text/event-stream")
 
     ret = await tokenizer_manager.generate_request(obj).__anext__()
+    if obj.return_logprob and obj.return_text_in_logprobs:
+        ret["meta_info"]["token_logprob"] = await detokenize_logprob_tokens(
+            ret["meta_info"]["token_logprob"]
+        )
+
     return ret
 
 
@@ -155,6 +166,7 @@ async def v1_completions(raw_request: Request):
             "regex": request.regex,
         },
         return_logprob=request.logprobs is not None,
+        return_text_in_logprobs=True,
         stream=request.stream,
     )
     adapted_request.post_init()
@@ -211,6 +223,7 @@ async def v1_completions(raw_request: Request):
 
     # Non-streaming response.
     ret = await generate_request(adapted_request)
+    ret = ret[0] if isinstance(ret, list) else ret
 
     prompt_tokens = ret["meta_info"]["prompt_tokens"]
     completion_tokens = ret["meta_info"]["completion_tokens"]
