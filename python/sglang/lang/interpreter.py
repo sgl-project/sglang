@@ -583,6 +583,8 @@ class StreamExecutor:
         if self.chat_template.stop_str:
             if not clone:
                 clone = self.default_sampling_para.clone()
+            if isinstance(clone.stop, str):
+                clone.stop = (clone.stop,)
             clone.stop += self.chat_template.stop_str
 
         return clone or self.default_sampling_para
