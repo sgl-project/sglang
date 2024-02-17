@@ -679,7 +679,7 @@ class ProgramState:
             if var_name is None:
                 yield self.text()
             else:
-                yield self.get_var(name)
+                yield self.get_var(var_name)
 
     async def text_async_iter(
         self, var_name: Optional[str] = None, return_meta_data: bool = False
@@ -717,7 +717,7 @@ class ProgramState:
             if var_name is None:
                 yield self.text()
             else:
-                yield self.get_var(name)
+                yield self.get_var(var_name)
 
     def get_var(self, name):
         return self.stream_executor.get_var(name)
