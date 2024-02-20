@@ -16,6 +16,7 @@ class ServerArgs:
     trust_remote_code: bool = True
     mem_fraction_static: Optional[float] = None
     max_prefill_num_token: Optional[int] = None
+    context_length: Optional[int] = None
     tp_size: int = 1
     model_mode: List[str] = ()
     schedule_heuristic: str = "lpm"
@@ -116,6 +117,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_prefill_num_token,
             help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
+        )
+        parser.add_argument(
+            "--context-length",
+            type=int,
+            default=ServerArgs.context_length,
+            help="The model's maximum context length. Use this to reduce the context length to save memory. Defaults to None (will use the value from the model's config.json instead).",
         )
         parser.add_argument(
             "--tp-size",
