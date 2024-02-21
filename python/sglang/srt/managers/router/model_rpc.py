@@ -57,7 +57,7 @@ class ModelRpcServer(rpyc.Service):
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
-            server_args.model_path, server_args.trust_remote_code
+            server_args.model_path, server_args.trust_remote_code, context_length=server_args.context_length
         )
         self.model_runner = ModelRunner(
             self.model_config,
