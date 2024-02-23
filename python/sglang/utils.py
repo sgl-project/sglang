@@ -99,13 +99,6 @@ def http_request(url, json=None, stream=False, auth_token=None, verify=None):
         }
         return requests.post(url, json=json, stream=True, headers=headers, verify=verify)
     else:
-        # if auth_token is None:
-        #     return requests.post(url, json=json, stream=True, verify=verify)
-        # headers = {
-        #     "Content-Type": "application/json",
-        #     "Authentication": f"Bearer {auth_token}",
-        # }
-        # return requests.post(url, json=json, stream=False, headers=headers, verify=verify)
         req = urllib.request.Request(url)
         req.add_header("Content-Type", "application/json; charset=utf-8")
         if auth_token is not None:
