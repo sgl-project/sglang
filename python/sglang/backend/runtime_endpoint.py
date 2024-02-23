@@ -12,15 +12,16 @@ from sglang.utils import encode_image_base64, find_printable_text, http_request
 
 
 class RuntimeEndpoint(BaseBackend):
-    def __init__(self, base_url, auth_token=None):
+    def __init__(self, base_url, auth_token=None, verify=None):
         super().__init__()
         self.support_concate_and_append = True
 
         self.base_url = base_url
         self.auth_token = auth_token
+        self.verify = verify
 
         res = http_request(
-            self.base_url + "/get_model_info", auth_token=self.auth_token
+            self.base_url + "/get_model_info", auth_token=self.auth_token, verify=self.verify
         )
         assert res.status_code == 200
         self.model_info = res.json()
@@ -40,6 +41,7 @@ class RuntimeEndpoint(BaseBackend):
             self.base_url + "/generate",
             json={"text": prefix_str, "sampling_params": {"max_new_tokens": 0}},
             auth_token=self.auth_token,
+            verify=self.verify
         )
         assert res.status_code == 200
 
@@ -48,6 +50,7 @@ class RuntimeEndpoint(BaseBackend):
             self.base_url + "/generate",
             json={"text": s.text_, "sampling_params": {"max_new_tokens": 0}},
             auth_token=self.auth_token,
+            verify=self.verify
         )
         assert res.status_code == 200
 
@@ -55,7 +58,7 @@ class RuntimeEndpoint(BaseBackend):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
         self._add_images(s, data)
         res = http_request(
-            self.base_url + "/generate", json=data, auth_token=self.auth_token
+            self.base_url + "/generate", json=data, auth_token=self.auth_token, verify=self.verify
         )
         assert res.status_code == 200
 
@@ -87,7 +90,7 @@ class RuntimeEndpoint(BaseBackend):
         self._add_images(s, data)
 
         res = http_request(
-            self.base_url + "/generate", json=data, auth_token=self.auth_token
+            self.base_url + "/generate", json=data, auth_token=self.auth_token, verify=self.verify
         )
         obj = res.json()
         comp = obj["text"]
@@ -126,6 +129,7 @@ class RuntimeEndpoint(BaseBackend):
             json=data,
             stream=True,
             auth_token=self.auth_token,
+            verify=self.verify
         )
         pos = 0
 
@@ -157,7 +161,7 @@ class RuntimeEndpoint(BaseBackend):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
         self._add_images(s, data)
         res = http_request(
-            self.base_url + "/generate", json=data, auth_token=self.auth_token
+            self.base_url + "/generate", json=data, auth_token=self.auth_token, verify=self.verify
         )
         assert res.status_code == 200
         prompt_len = res.json()["meta_info"]["prompt_tokens"]
@@ -171,7 +175,7 @@ class RuntimeEndpoint(BaseBackend):
         }
         self._add_images(s, data)
         res = http_request(
-            self.base_url + "/generate", json=data, auth_token=self.auth_token
+            self.base_url + "/generate", json=data, auth_token=self.auth_token, verify=self.verify
         )
         assert res.status_code == 200
         obj = res.json()
@@ -188,6 +192,7 @@ class RuntimeEndpoint(BaseBackend):
             self.base_url + "/concate_and_append_request",
             json={"src_rids": src_rids, "dst_rid": dst_rid},
             auth_token=self.auth_token,
+            verify=self.verify
         )
         assert res.status_code == 200
 
