@@ -19,6 +19,8 @@ import requests
 import uvicorn
 import uvloop
 from fastapi import FastAPI, HTTPException, Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
@@ -56,6 +58,23 @@ from sglang.srt.utils import handle_port_init
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
+API_KEY_HEADER_NAME = "X-API-Key"
+
+class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, api_key: str):
+        super().__init__(app)
+        self.api_key = api_key
+
+    async def dispatch(self, request: Request, call_next):
+        # extract API key from the request headers
+        api_key_header = request.headers.get(API_KEY_HEADER_NAME)
+        if not api_key_header or api_key_header != self.api_key:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Invalid API Key"},
+            )
+        response = await call_next(request)
+        return response
 
 app = FastAPI()
 tokenizer_manager = None
@@ -476,6 +495,9 @@ def launch_server(server_args, pipe_finish_writer):
 
     assert proc_router.is_alive() and proc_detoken.is_alive()
 
+    if server_args.api_key and server_args.api_key != "":
+        app.add_middleware(APIKeyValidatorMiddleware, api_key=server_args.api_key)
+
     def _launch_server():
         uvicorn.run(
             app,
@@ -487,11 +509,15 @@ def launch_server(server_args, pipe_finish_writer):
         )
 
     def _wait_and_warmup():
+        headers = {}
         url = server_args.url()
-        for _ in range(60):
-            time.sleep(1)
+        if server_args.api_key and server_args.api_key != "":
+            headers[API_KEY_HEADER_NAME] = server_args.api_key
+
+        for _ in range(120):
+            time.sleep(0.5)
             try:
-                requests.get(url + "/get_model_info", timeout=5)
+                requests.get(url + "/get_model_info", timeout=5, headers=headers)
                 break
             except requests.exceptions.RequestException as e:
                 pass
@@ -514,6 +540,7 @@ def launch_server(server_args, pipe_finish_writer):
                         "max_new_tokens": 16,
                     },
                 },
+                headers=headers,
                 timeout=60,
             )
             # print(f"Warmup done. model response: {res.json()['text']}")
@@ -552,6 +579,7 @@ class Runtime:
         schedule_heuristic: str = "lpm",
         random_seed: int = 42,
         log_level: str = "error",
+        api_key: str = "",
         port: Optional[int] = None,
         additional_ports: Optional[Union[List[int], int]] = None,
     ):
@@ -574,6 +602,7 @@ class Runtime:
             schedule_heuristic=schedule_heuristic,
             random_seed=random_seed,
             log_level=log_level,
+            api_key=api_key,
         )
 
         self.url = self.server_args.url()
