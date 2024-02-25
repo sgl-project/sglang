@@ -6,7 +6,6 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
-import numpy as np
 import rpyc
 import torch
 from rpyc.utils.classic import obtain
@@ -25,6 +24,7 @@ from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.managers.router.scheduler import Scheduler
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.speculate.speculate_engine import SpeculateEngine
 from sglang.srt.utils import (
     get_exception_traceback,
     get_int_token_logit_bias,
@@ -57,7 +57,9 @@ class ModelRpcServer(rpyc.Service):
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
-            server_args.model_path, server_args.trust_remote_code, context_length=server_args.context_length
+            server_args.model_path,
+            server_args.trust_remote_code,
+            context_length=server_args.context_length,
         )
         self.model_runner = ModelRunner(
             self.model_config,
@@ -231,7 +233,9 @@ class ModelRpcServer(rpyc.Service):
                     warnings.warn(
                         "Warning: "
                         f"available_size={available_size}, max_total_num_token={self.max_total_num_token}\n"
-                        "KV cache pool leak detected!"
+                        "KV cache pool leak detected!\n"
+                        f"KV pool occupied size: {self.max_total_num_token - self.token_to_kv_pool.available_size()}\n"
+                        f"Evictable size: {self.tree_cache.evictable_size()}"
                     )
 
     def handle_generate_request(
@@ -274,6 +278,11 @@ class ModelRpcServer(rpyc.Service):
         )
         self.forward_queue.append(req)
 
+        # Handle reference speculative decoding
+        req.speculate_engine = SpeculateEngine(tokenizer=self.tokenizer)
+        if req.sampling_params.ref_text is not None:
+            req.speculate_engine.add_entry_text(req.sampling_params.ref_text)
+
     def get_new_fill_batch(self):
         if (
             self.running_batch is not None
@@ -283,6 +292,9 @@ class ModelRpcServer(rpyc.Service):
 
         for req in self.forward_queue:
             prefix_indices, last_node = self.tree_cache.match_prefix(req.input_ids)
+            if req.speculate_tries is not None and not req.speculate_tries.is_empty():
+                max_prefix_len = len(req.input_ids) - len(req.speculate_tries.tree_ids)
+                prefix_indices = prefix_indices[:max_prefix_len]
             if req.return_logprob:
                 prefix_indices = prefix_indices[: req.logprob_start_len]
             req.extend_input_len = len(req.input_ids) - len(prefix_indices)
@@ -398,12 +410,17 @@ class ModelRpcServer(rpyc.Service):
         if batch.extend_num_tokens != 0:
             # Forward
             logits, (
+                all_logits,
                 prefill_logprobs,
                 normalized_logprobs,
                 last_logprobs,
             ) = self.model_runner.forward(
                 batch, ForwardMode.EXTEND, batch.return_logprob
             )
+
+            if batch.tree_mask is not None and len(batch.tree_mask) != 0:
+                batch.speculative_sample(all_logits, logits)
+
             if prefill_logprobs is not None:
                 logprobs = prefill_logprobs.cpu().tolist()
                 normalized_logprobs = normalized_logprobs.cpu().tolist()
@@ -435,7 +452,7 @@ class ModelRpcServer(rpyc.Service):
                 # If logprob_start_len > 0, then first logprob_start_len prompt tokens
                 # will be ignored.
                 prompt_token_len = len(req.logprob)
-                token_ids = req.input_ids[-prompt_token_len :] + [next_token_ids[i]]
+                token_ids = req.input_ids[-prompt_token_len:] + [next_token_ids[i]]
                 token_logprobs = req.logprob + [last_logprobs[i]]
                 req.token_logprob = list(zip(token_ids, token_logprobs))
                 if req.logprob_start_len == 0:
@@ -465,31 +482,23 @@ class ModelRpcServer(rpyc.Service):
 
         if not self.disable_regex_jump_forward:
             # check for jump-forward
-            jump_forward_reqs = batch.check_for_jump_forward()
-
-            # check for image jump-forward
-            for req in jump_forward_reqs:
-                if req.pixel_values is not None:
-                    (
-                        req.input_ids,
-                        req.image_offset,
-                    ) = self.model_runner.model.pad_input_ids(
-                        req.input_ids,
-                        req.pad_value,
-                        req.pixel_values.shape,
-                        req.image_size,
-                    )
-
+            jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
             self.forward_queue.extend(jump_forward_reqs)
             if batch.is_empty():
                 return
+
+        # speculative decoding
+        spec_reqs = batch.check_for_speculative()
+        self.forward_queue.extend(spec_reqs)
+        if batch.is_empty():
+            return
 
         # Update batch tensors
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         batch.prepare_for_decode()
 
         # Forward
-        logits, (_, _, last_logprobs) = self.model_runner.forward(
+        logits, (_, _, _, last_logprobs) = self.model_runner.forward(
             batch,
             ForwardMode.DECODE,
             batch.return_logprob,
@@ -553,8 +562,7 @@ class ModelRpcServer(rpyc.Service):
                     "completion_tokens": len(req.input_ids)
                     + len(req.output_ids)
                     - req.prompt_tokens,
-                    "completion_tokens_wo_jump_forward":
-                    req.completion_tokens_wo_jump_forward
+                    "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
                 }
                 if req.return_logprob:
                     meta_info["prompt_logprob"] = req.logprob

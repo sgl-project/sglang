@@ -573,6 +573,7 @@ class StreamExecutor:
             "ignore_eos",
             "dtype",
             "regex",
+            "ref_text",
         ]:
             value = getattr(sampling_params, item, None)
             if value is not None:

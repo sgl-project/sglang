@@ -28,6 +28,9 @@ class SglSamplingParams:
     dtype: Optional[str] = None
     regex: Optional[str] = None
 
+    # for reference speculative decoding
+    ref_text: Optional[str] = None
+
     def clone(self):
         return SglSamplingParams(
             self.max_new_tokens,
@@ -93,6 +96,7 @@ class SglSamplingParams:
             "presence_penalty": self.presence_penalty,
             "ignore_eos": self.ignore_eos,
             "regex": self.regex,
+            "ref_text": self.ref_text,
         }
 
 
@@ -350,6 +354,7 @@ class SglGen(SglExpr):
         ignore_eos,
         dtype,
         regex,
+        ref_text,
     ):
         super().__init__()
         self.name = name
@@ -364,6 +369,7 @@ class SglGen(SglExpr):
             ignore_eos=ignore_eos,
             dtype=dtype,
             regex=regex,
+            ref_text=ref_text,
         )
 
     def __repr__(self):

@@ -28,7 +28,11 @@ class LogitsProcessor(nn.Module):
                 - 1
             )
 
-        if not input_metadata.return_logprob:
+        return_all_logits = (
+            input_metadata.tree_mask is not None and len(input_metadata.tree_mask) != 0
+        )
+
+        if not input_metadata.return_logprob and not return_all_logits:
             # When logprob is not requested, only compute the last logits.
             if input_metadata.forward_mode == ForwardMode.DECODE:
                 last_hidden = hidden_states
@@ -40,7 +44,7 @@ class LogitsProcessor(nn.Module):
             if self.tp_size > 1:
                 last_logits = tensor_model_parallel_all_gather(last_logits)
             last_logits = last_logits[:, : self.config.vocab_size]
-            return last_logits, (None, None, None)
+            return last_logits, (None, None, None, None)
         else:
             # When logprob is requested, compute the logits for all tokens.
             logits = torch.matmul(hidden_states, weight.T)
@@ -49,39 +53,39 @@ class LogitsProcessor(nn.Module):
             logits = logits[:, : self.config.vocab_size]
             all_logprobs = torch.log(torch.softmax(logits.float(), dim=-1) + 1e-6)
 
+            # decode cases only return logits and last logprobs
             if input_metadata.forward_mode == ForwardMode.DECODE:
-                last_logits = logits
-                last_logprobs = all_logprobs
-                prefill_logprobs = normalized_logprobs = None
-            else:
-                # Compute the logprobs for the last token of each request.
-                last_logits = logits[last_index]
-                last_logprobs = all_logprobs[last_index]
+                return logits, (None, None, None, all_logprobs)
 
-                # Compute the logprobs and normalized logprobs for the prefill tokens.
-                # Note that we pad a zero at the end of each sequence for easy computation.
-                prefill_logprobs = all_logprobs[
-                    torch.arange(all_logprobs.shape[0], device="cuda"),
-                    torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
-                ]
-                logprobs_cumsum = torch.cumsum(
-                    prefill_logprobs, dim=0, dtype=torch.float32
-                )
+            # Compute the logprobs for the last token of each request.
+            last_logits = logits[last_index]
+            last_logprobs = all_logprobs[last_index]
 
-                start = input_metadata.extend_start_loc.clone()
-                end = start + input_metadata.extend_seq_lens - 2
-                start.clamp_(min=0, max=prefill_logprobs.shape[0] - 1)
-                end.clamp_(min=0, max=prefill_logprobs.shape[0] - 1)
-                sum_logp = (
-                    logprobs_cumsum[end]
-                    - logprobs_cumsum[start]
-                    + prefill_logprobs[start]
-                )
-                normalized_logprobs = sum_logp / (
-                    (input_metadata.extend_seq_lens - 1).clamp(min=1)
-                )
+            # Compute the logprobs and normalized logprobs for the prefill tokens.
+            # Note that we pad a zero at the end of each sequence for easy computation.
+            prefill_logprobs = all_logprobs[
+                torch.arange(all_logprobs.shape[0], device="cuda"),
+                torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
+            ]
+            logprobs_cumsum = torch.cumsum(prefill_logprobs, dim=0, dtype=torch.float32)
 
-            return last_logits, (prefill_logprobs, normalized_logprobs, last_logprobs)
+            start = input_metadata.extend_start_loc.clone()
+            end = start + input_metadata.extend_seq_lens - 2
+            start.clamp_(min=0, max=prefill_logprobs.shape[0] - 1)
+            end.clamp_(min=0, max=prefill_logprobs.shape[0] - 1)
+            sum_logp = (
+                logprobs_cumsum[end] - logprobs_cumsum[start] + prefill_logprobs[start]
+            )
+            normalized_logprobs = sum_logp / (
+                (input_metadata.extend_seq_lens - 1).clamp(min=1)
+            )
+
+            return last_logits, (
+                logits.float() if return_all_logits else None,
+                prefill_logprobs,
+                normalized_logprobs,
+                last_logprobs,
+            )
 
 
 if __name__ == "__main__":
