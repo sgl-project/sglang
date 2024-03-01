@@ -41,6 +41,7 @@ def single():
         print(m["role"], ":", m["content"])
 
     print("\n-- answer_1 --\n", state["answer_1"])
+    print("\n-- answer_2 --\n", state["answer_2"])
 
 
 def stream():
@@ -65,10 +66,10 @@ if __name__ == "__main__":
     print("birthday:", state["birthday"])
     print("job:", state["job"])
 
-    # Run a single request
-    print("\n========== single ==========\n")
-    single()
+    # # Run a single request
+    # print("\n========== single ==========\n")
+    # single()
 
-    # Stream output
-    print("\n========== stream ==========\n")
-    stream()
+    # # Stream output
+    # print("\n========== stream ==========\n")
+    # stream()
