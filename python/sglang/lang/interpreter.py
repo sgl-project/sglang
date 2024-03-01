@@ -350,8 +350,6 @@ class StreamExecutor:
         self.is_finished = True
 
     def _execute(self, other):
-        # print("\n=======exe==========")
-        # print("other: ", other)
         if isinstance(other, str):
             other = SglConstantText(other)
 
@@ -394,10 +392,7 @@ class StreamExecutor:
             raise ValueError(f"Unknown type: {type(other)}")
 
     def _execute_fill(self, value: str):
-        # print("=====exefill=======")
         value = str(value)
-        # print(" value: ", value)
-        # print(" self.speculated_text: ", self.speculated_text)
         if self.speculated_text.startswith(value):
             self.speculated_text = self.speculated_text[len(value):]
         else:
@@ -428,7 +423,6 @@ class StreamExecutor:
         #     self.backend.fill_image(self)
 
     def _execute_gen(self, expr: SglGen):
-        # print("=======exe gen=========")
         sampling_params = self._resolve_sampling_params(expr.sampling_params)
         name = expr.name
 
@@ -436,15 +430,9 @@ class StreamExecutor:
             if self.api_num_spec_tokens is not None:
                 stop = sampling_params.stop
                 max_new_tokens = sampling_params.max_new_tokens
-                # print("max_new_tokens: ", max_new_tokens)
-                # print("self.api_num_spec_tokens: ", self.api_num_spec_tokens)
                 meta_info = {}
 
                 def regen():
-                    # print("  ====regen=====")
-                    # i = self.text_.find(self.chat_template.role_prefix_and_suffix["assistant"][0])
-                    # assert i != -1
-                    # self.text_ = self.text_[:i+len(self.chat_template.role_prefix_and_suffix["assistant"][0])]
                     sampling_params.max_new_tokens = max(
                         sampling_params.max_new_tokens, self.api_num_spec_tokens
                     )
@@ -453,12 +441,10 @@ class StreamExecutor:
                         self, sampling_params=sampling_params
                     )
                     pos = self.text_.find(self.chat_template.role_prefix_and_suffix["assistant"][0])
-                    # print("  text: ", self.text_)
                     if pos != -1:
                         extracted_text = self.text_[pos + len(self.chat_template.role_prefix_and_suffix["assistant"][0]):].strip()
                     if self.speculated_text.startswith(extracted_text):
                         self.speculated_text = self.speculated_text[len(extracted_text):]
-                    # print("  speculated_text: ", self.speculated_text)
 
                 def find_stop():
                     if isinstance(stop, str):
@@ -480,12 +466,9 @@ class StreamExecutor:
                     comp = self.speculated_text[:max_new_tokens]
                     self.speculated_text = self.speculated_text[max_new_tokens:]
                 elif isinstance(stop, (str, list, tuple)):
-                    # print("???here: stop: ", stop)
-                    # print("self.speculated_text: ", self.speculated_text)
                     if self.speculated_text == "":
                         regen()
                     stop_pos, stop_len = find_stop()
-                    # print("    stop pos: ", stop_pos, stop_len)
                     if stop_pos == -1:
                         stop_pos, stop_len = (
                             min(
@@ -494,11 +477,8 @@ class StreamExecutor:
                             ),
                             0,
                         )
-                    # print("    speculated_text: ", self.speculated_text)
                     comp = self.speculated_text[:stop_pos]
                     self.speculated_text = self.speculated_text[stop_pos:]
-                    # print("    comp: ", comp)
-                    # print("    speculated_text: ", self.speculated_text)
                 else:
                     raise ValueError("Wrong type of stop in sampling parameters.")
 
