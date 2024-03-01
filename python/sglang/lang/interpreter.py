@@ -350,7 +350,7 @@ class StreamExecutor:
     def _execute_fill(self, value: str):
         value = str(value)
         if self.speculated_text.startswith(value):
-            self.speculated_text = self.speculated_text[len(value) :]
+            self.speculated_text = self.speculated_text[len(value):]
         else:
             self.speculated_text = ""
         self.text_ += value
@@ -400,7 +400,6 @@ class StreamExecutor:
                         return pos, stop_len
                     else:
                         raise Exception("Wrong type of stop in sampling parameters.")
-
                 if stop is None:
                     if len(self.speculated_text) < max_new_tokens:
                         regen()
@@ -488,7 +487,7 @@ class StreamExecutor:
         self.cur_role_begin_pos = len(self.text_)
 
     def _execute_role_end(self, expr: SglRoleEnd):
-        new_text = self.text_[self.cur_role_begin_pos :].lstrip()
+        new_text = self.text_[self.cur_role_begin_pos:].lstrip()
 
         _, suffix = self.chat_template.get_prefix_and_suffix(expr.role, self.messages_)
         self._execute_fill(suffix)
