@@ -46,6 +46,7 @@ class OpenAI(BaseBackend):
         self,
         model_name: str,
         is_chat_model: Optional[bool] = None,
+        is_speculative: Optional[bool] = None,
         chat_template: Optional[ChatTemplate] = None,
         is_azure: bool = False,
         *args,
@@ -81,6 +82,11 @@ class OpenAI(BaseBackend):
                 self.is_chat_model = True
 
         self.chat_begin_str = self.chat_template.role_prefix_and_suffix["assistant"][0]
+        
+        if is_speculative is not None:
+            self.is_speculative = is_speculative
+        else:
+            self.is_speculative = False
 
     def get_chat_template(self):
         return self.chat_template
@@ -93,10 +99,11 @@ class OpenAI(BaseBackend):
         if sampling_params.dtype is None:
             if self.is_chat_model:
                 if not s.text_.endswith(self.chat_begin_str):
-                    raise RuntimeError(
-                        "This use case is not supported. "
-                        "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
-                    )
+                    if not self.is_speculative:
+                            raise RuntimeError(
+                            "This use case is not supported. "
+                            "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
+                        )
                 prompt = s.messages_
             else:
                 prompt = s.text_
@@ -146,10 +153,11 @@ class OpenAI(BaseBackend):
         if sampling_params.dtype is None:
             if self.is_chat_model:
                 if not s.text_.endswith(self.chat_begin_str):
-                    raise RuntimeError(
-                        "This use case is not supported. "
-                        "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
-                    )
+                    if not self.is_speculative:
+                        raise RuntimeError(
+                            "This use case is not supported. "
+                            "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
+                        )
                 prompt = s.messages_
             else:
                 prompt = s.text_

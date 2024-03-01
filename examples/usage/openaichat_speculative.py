@@ -4,14 +4,22 @@ export OPENAI_API_KEY=sk-******
 python3 openai_example_chat.py
 """
 import sglang as sgl
-from sglang import function, gen, set_default_backend, OpenAI
+from sglang import function
+
+@function(api_num_spec_tokens=512)
+def gen_character_spec(s):
+    s += sgl.system("You are a helpful assistant.")
+    s += sgl.user("Construct a character within the following format:")
+    s += sgl.user("\nName: Steve Jobs.\nBirthday: February 24, 1955.\nJob: Apple CEO.\n")
+    s += sgl.user("Please generate new Name, Birthday and Job.\n")
+    s += sgl.assistant("\nName:" + sgl.gen("name", stop="\n") + "\nBirthday:" + sgl.gen("birthday", stop="\n") + "\nJob:" + sgl.gen("job", stop="\n"))
 
 
 @function(api_num_spec_tokens=512)
 def multi_turn_question(s, question_1, question_2):
     s += sgl.system("You are a helpful assistant.")
-    s += sgl.user("Question 1: "+question_1+"\nQuestion 2: "+question_2)
-    s += sgl.assistant("Answer 1: "+sgl.gen("answer_1"+"Answer 2: "+ sgl.gen("answer_2"), max_tokens=512))
+    s += sgl.user(" Question 1: "+question_1+"\nQuestion 2: "+question_2)
+    s += sgl.assistant(" Answer 1: "+sgl.gen("answer_1")+"\nAnswer 2: "+ sgl.gen("answer_2"))
 
 
 def single():
@@ -41,12 +49,17 @@ def stream():
 
 
 if __name__ == "__main__":
-    sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo"))
+    sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo", is_speculative=True))
+    state = gen_character_spec.run()
+
+    print("name:", state["name"])
+    print("birthday:", state["birthday"])
+    print("job:", state["job"])
 
     # Run a single request
     print("\n========== single ==========\n")
     single()
 
-    # # Stream output
-    # print("\n========== stream ==========\n")
-    # stream()
+    # Stream output
+    print("\n========== stream ==========\n")
+    stream()
