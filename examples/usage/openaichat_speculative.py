@@ -1,7 +1,7 @@
 """
 Usage:
 export OPENAI_API_KEY=sk-******
-python3 openai_example_chat.py
+python3 openaichat_example_chat.py
 """
 import sglang as sgl
 from sglang import function
