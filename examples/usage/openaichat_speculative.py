@@ -1,5 +1,14 @@
 """
 Usage:
+***Note: for speculative execution to work, user must put all "gen" in assistant. 
+E.g. 
+correct: 
+    sgl.assistant("\nName:" + sgl.gen("name", stop="\n") + "\nBirthday:" + sgl.gen("birthday", stop="\n") + "\nJob:" + sgl.gen("job", stop="\n"))
+incorrect:     
+    s += sgl.assistant("\nName:" + sgl.gen("name", stop="\n"))
+    s += sgl.assistant("\nBirthday:" + sgl.gen("birthday", stop="\n"))
+    s += sgl.assistant("\nJob:" + sgl.gen("job", stop="\n"))
+
 export OPENAI_API_KEY=sk-******
 python3 openaichat_example_chat.py
 """
