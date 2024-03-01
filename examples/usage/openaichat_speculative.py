@@ -1,6 +1,6 @@
 """
 Usage:
-***Note: for speculative execution to work, user must put all "gen" in assistant. 
+***Note: for speculative execution to work, user must put all "gen" in "assistant". 
 E.g. 
 correct: 
     sgl.assistant("\nName:" + sgl.gen("name", stop="\n") + "\nBirthday:" + sgl.gen("birthday", stop="\n") + "\nJob:" + sgl.gen("job", stop="\n"))
