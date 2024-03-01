@@ -66,10 +66,10 @@ if __name__ == "__main__":
     print("birthday:", state["birthday"])
     print("job:", state["job"])
 
-    # # Run a single request
-    # print("\n========== single ==========\n")
-    # single()
+    # Run a single request
+    print("\n========== single ==========\n")
+    single()
 
-    # # Stream output
-    # print("\n========== stream ==========\n")
-    # stream()
+    # Stream output
+    print("\n========== stream ==========\n")
+    stream()

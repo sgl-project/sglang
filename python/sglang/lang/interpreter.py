@@ -368,6 +368,7 @@ class StreamExecutor:
         #     self.backend.fill_image(self)
 
     def _execute_gen(self, expr: SglGen):
+
         sampling_params = self._resolve_sampling_params(expr.sampling_params)
         name = expr.name
 
@@ -378,6 +379,9 @@ class StreamExecutor:
                 meta_info = {}
 
                 def regen():
+                    i = self.text_.find(self.chat_template.role_prefix_and_suffix["assistant"][0])
+                    assert i != -1
+                    self.text_ = self.text_[:i+len(self.chat_template.role_prefix_and_suffix["assistant"][0])]
                     sampling_params.max_new_tokens = max(
                         sampling_params.max_new_tokens, self.api_num_spec_tokens
                     )
