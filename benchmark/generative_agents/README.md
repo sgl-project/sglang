@@ -1,3 +1,9 @@
+## Download the dataset
+
+```
+wget -O agent_calls.jsonl https://drive.google.com/uc?export=download&id=19qLpD45e9JGTKF2cUjJJegwzSUEZEKht
+```
+
 ## Run benchmark
 
 Ensure that this benchmark is run in a serial manner (using --parallel 1) to preserve any potential dependencies between requests.
