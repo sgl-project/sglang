@@ -17,15 +17,23 @@ class ChatTemplate:
     image_token: str = "<image>"
     style: ChatTemplateStyle = ChatTemplateStyle.PLAIN
 
-    def get_prefix_and_suffix(self, role: str, hist_messages: List[Dict]) -> Tuple[str, str]:
+    def get_prefix_and_suffix(
+        self, role: str, hist_messages: List[Dict]
+    ) -> Tuple[str, str]:
         prefix, suffix = self.role_prefix_and_suffix.get(role, ("", ""))
-        
+
         if self.style == ChatTemplateStyle.LLAMA2:
             if role == "system" and not hist_messages:
                 user_prefix, _ = self.role_prefix_and_suffix.get("user", ("", ""))
-                system_prefix, system_suffix = self.role_prefix_and_suffix.get("system", ("", ""))
+                system_prefix, system_suffix = self.role_prefix_and_suffix.get(
+                    "system", ("", "")
+                )
                 return (user_prefix + system_prefix, system_suffix)
-            elif role == "user" and len(hist_messages) == 1 and hist_messages[0]["content"] is not None:
+            elif (
+                role == "user"
+                and len(hist_messages) == 1
+                and hist_messages[0]["content"] is not None
+            ):
                 return ("", suffix)
 
         return prefix, suffix
