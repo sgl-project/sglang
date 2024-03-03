@@ -1,16 +1,16 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/d65fac2738f0287a41955b45df76a2d5a919bff6/vllm/model_executor/models/gemma.py
 """Inference-only Gemma model compatible with HuggingFace weights."""
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.radix_attention import RadixAttention
 from torch import nn
 from transformers import GemmaConfig
-
 from vllm.config import LoRAConfig
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import GeluAndMul
-from vllm.model_executor.layers.attention import PagedAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
@@ -19,23 +19,17 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
-from vllm.sequence import SamplerOutput
-
-KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
 class GemmaMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -62,13 +56,13 @@ class GemmaMLP(nn.Module):
 
 
 class GemmaAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        layer_id: int = 0,
         max_position_embeddings: int = 8192,
         rope_theta: float = 10000,
         linear_method: Optional[LinearMethodBase] = None,
@@ -117,31 +111,33 @@ class GemmaAttention(nn.Module):
             base=self.rope_theta,
             is_neox_style=True,
         )
-        self.attn = PagedAttention(
-            self.num_heads, self.head_dim, self.scaling, num_kv_heads=self.num_kv_heads
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
         )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        k_cache, v_cache = kv_cache
-        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
+        attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
         return output
 
 
 class GemmaDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: GemmaConfig,
+        layer_id: int = 0,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
@@ -151,6 +147,7 @@ class GemmaDecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
+            layer_id=layer_id,
             max_position_embeddings=config.max_position_embeddings,
             rope_theta=config.rope_theta,
             linear_method=linear_method,
@@ -169,7 +166,6 @@ class GemmaDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
         input_metadata: InputMetadata,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -182,7 +178,6 @@ class GemmaDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            kv_cache=kv_cache,
             input_metadata=input_metadata,
         )
 
@@ -193,7 +188,6 @@ class GemmaDecoderLayer(nn.Module):
 
 
 class GemmaModel(nn.Module):
-
     def __init__(
         self,
         config: GemmaConfig,
@@ -208,8 +202,8 @@ class GemmaModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                GemmaDecoderLayer(config, linear_method)
-                for _ in range(config.num_hidden_layers)
+                GemmaDecoderLayer(config, i, linear_method)
+                for i in range(config.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -218,10 +212,14 @@ class GemmaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[KVCache],
         input_metadata: InputMetadata,
+        skip_embed: bool = False,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if not skip_embed:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_ids
+
         # Normalize the embedding by sqrt(hidden_size)
         hidden_states *= self.config.hidden_size**0.5
 
@@ -231,7 +229,6 @@ class GemmaModel(nn.Module):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                kv_caches[i],
                 input_metadata,
                 residual,
             )
@@ -274,28 +271,20 @@ class GemmaForCausalLM(nn.Module):
         self.config = config
         self.linear_method = linear_method
         self.model = GemmaModel(config, linear_method)
-        self.sampler = Sampler(config.vocab_size)
+        self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[KVCache],
         input_metadata: InputMetadata,
+        skip_embed: bool = False,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, kv_caches, input_metadata)
-        return hidden_states
-
-    def sample(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(
-            self.model.embed_tokens.weight, hidden_states, sampling_metadata
+        hidden_states = self.model(input_ids, positions, input_metadata, skip_embed)
+        return self.logits_processor(
+            input_ids, hidden_states, self.model.embed_tokens.weight, input_metadata
         )
-        return next_tokens
 
     def load_weights(
         self,
@@ -340,3 +329,6 @@ class GemmaForCausalLM(nn.Module):
                 "Some weights are not initialized from checkpoints: "
                 f"{unloaded_params}"
             )
+
+
+EntryClass = GemmaForCausalLM
