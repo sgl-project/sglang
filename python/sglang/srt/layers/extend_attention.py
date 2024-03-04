@@ -193,7 +193,7 @@ def extend_attention_fwd(
         o_extend.shape[-1],
     )
     assert Lq == Lk and Lk == Lv and Lv == Lo
-    assert Lq in {16, 32, 64, 128}
+    assert Lq in {16, 32, 64, 128, 256}
 
     sm_scale = 1.0 / (Lq**0.5)
     batch_size, head_num = b_seq_len.shape[0], q_extend.shape[1]

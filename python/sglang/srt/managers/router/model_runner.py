@@ -319,9 +319,7 @@ class ModelRunner:
         available_gpu_memory = get_available_gpu_memory(
             self.tp_rank, distributed=self.tp_size > 1
         ) * (1 << 30)
-        head_dim = (
-            self.model_config.hidden_size // self.model_config.num_attention_heads
-        )
+        head_dim = self.model_config.head_dim
         head_num = self.model_config.num_key_value_heads // self.tp_size
         cell_size = head_num * head_dim * self.model_config.num_hidden_layers * 2 * 2
         rest_memory = available_gpu_memory - total_gpu_memory * (
@@ -346,8 +344,7 @@ class ModelRunner:
             self.max_total_num_token,
             dtype=torch.float16,
             head_num=self.model_config.num_key_value_heads // self.tp_size,
-            head_dim=self.model_config.hidden_size
-            // self.model_config.num_attention_heads,
+            head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
         )
 

@@ -161,7 +161,7 @@ def _token_att_m_fwd(
     # shape constraints
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
     assert Lq == Lk
-    assert Lk in {16, 32, 64, 128}
+    assert Lk in {16, 32, 64, 128, 256}
     sm_scale = 1.0 / (Lk**0.5)
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
