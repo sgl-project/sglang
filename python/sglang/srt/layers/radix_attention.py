@@ -1,15 +1,10 @@
-from typing import List
-
 import torch
 from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
 from sglang.srt.layers.extend_attention import extend_attention_fwd
 from sglang.srt.layers.token_attention import token_attention_fwd
+from sglang.srt.layers.verify_attention import verify_attention_fwd
 from sglang.srt.managers.router.model_runner import ForwardMode, InputMetadata
 from torch import nn
-from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 
 
 class RadixAttention(nn.Module):
@@ -53,16 +48,26 @@ class RadixAttention(nn.Module):
     def extend_forward_triton(self, q, k, v, input_metadata: InputMetadata):
         o = torch.empty_like(q)
         self.store_kv_cache(k, v, input_metadata)
-        extend_attention_fwd(
+
+        if input_metadata.tree_mask is not None and len(input_metadata.tree_mask) != 0:
+            forward_func = verify_attention_fwd
+            tree_mask_args = (
+                input_metadata.tree_mask,
+                input_metadata.tree_mask_start,
+                input_metadata.tree_mask_idx,
+            )
+        else:
+            forward_func = extend_attention_fwd
+            tree_mask_args = ()
+
+        forward_func(
             q.view(-1, self.tp_q_head_num, self.head_dim),
             k.contiguous(),
             v.contiguous(),
             o.view(-1, self.tp_q_head_num, self.head_dim),
             input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id),
             input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id),
-            input_metadata.tree_mask,
-            input_metadata.tree_mask_start,
-            input_metadata.tree_mask_idx,
+            *tree_mask_args,
             input_metadata.req_to_token_pool.req_to_token,
             input_metadata.req_pool_indices,
             input_metadata.start_loc,

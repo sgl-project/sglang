@@ -1,7 +1,6 @@
 import torch
 import triton
 import triton.language as tl
-from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
 from sglang.srt.utils import wrap_kernel_launcher
 
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
@@ -15,6 +14,9 @@ def _fwd_kernel(
     O_Extend,
     K_Buffer,
     V_Buffer,
+    Tree_Mask,
+    Tree_Mask_Start,
+    Tree_Mask_Idx,
     Req_to_tokens,
     B_req_idx,
     B_Seq_Len,
@@ -35,6 +37,8 @@ def _fwd_kernel(
     stride_buf_vbs,
     stride_buf_vh,
     stride_req_to_tokens_b,
+    stride_tree_mask_b,
+    stride_tree_mask_m,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -108,6 +112,17 @@ def _fwd_kernel(
         e_max = n_e_max
 
     # stage2: compute the trianlge part
+    cur_tree_mask_idx = tl.load(Tree_Mask_Idx + cur_seq)
+    tree_mask_start = (
+        tl.load(Tree_Mask_Start + cur_tree_mask_idx)
+        if cur_tree_mask_idx >= 0
+        else cur_seq_len_extend
+    )
+
+    tree_mask_offs_m = (
+        cur_tree_mask_idx * stride_tree_mask_b
+        + (cur_block_m * BLOCK_M + offs_m[:, None]) * stride_tree_mask_m
+    )
 
     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     for start_n in range(0, cur_block_m_end, BLOCK_N):
@@ -130,6 +145,28 @@ def _fwd_kernel(
         )
         mask_causual &= mask_m[:, None] & mask_n[None, :]
         qk = tl.where(mask_causual, qk, float("-inf"))
+
+        # apply tree mask
+        if tree_mask_start < cur_seq_len_extend:
+            tree_mask_offs = tree_mask_offs_m + start_n + offs_n[None, :]
+            tree_mask_offs -= tree_mask_start * (stride_tree_mask_m + 1)
+
+            tree_mask_offs_mask = tl.where(
+                (offs_m[:, None] >= tree_mask_start - cur_block_m * BLOCK_M)
+                & (offs_m[:, None] < cur_seq_len_extend - cur_block_m * BLOCK_M)
+                & (offs_n[None, :] >= tree_mask_start - start_n)
+                & (offs_n[None, :] < cur_seq_len_extend - start_n),
+                1,
+                0,
+            ).to(tl.int1)
+
+            tree_mask = tl.load(
+                Tree_Mask + tree_mask_offs,
+                mask=tree_mask_offs_mask,
+                other=1,
+            ).to(tl.int1)
+
+            qk = tl.where(tree_mask, qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
@@ -159,13 +196,16 @@ def _fwd_kernel(
 cached_kernel = None
 
 
-def extend_attention_fwd(
+def verify_attention_fwd(
     q_extend,
     k_extend,
     v_extend,
     o_extend,
     k_buffer,
     v_buffer,
+    tree_mask,
+    tree_mask_start,
+    tree_mask_idx,
     req_to_tokens,
     b_req_idx,
     b_start_loc,
@@ -186,6 +226,11 @@ def extend_attention_fwd(
     else:
         BLOCK_M, BLOCK_N = 64, 64
 
+    # NOTE: the verify kernel requires more hardware resources
+    # that's why we split it from extend kernel
+    BLOCK_M //= 2  # assume extend part is smaller
+    # BLOCK_N //= 2
+
     Lq, Lk, Lv, Lo = (
         q_extend.shape[-1],
         k_extend.shape[-1],
@@ -203,6 +248,11 @@ def extend_attention_fwd(
     num_warps = 4 if Lk <= 64 else 8
     num_stages = 1
 
+    assert (
+        tree_mask is not None and len(tree_mask) > 0
+    ), "No tree mask provided, use extend kernel instead"
+    tree_mask = tree_mask.to(torch.int32)  # convert to int32 to avoid triton bug
+
     global cached_kernel
     if cached_kernel:
         cached_kernel(
@@ -214,6 +264,9 @@ def extend_attention_fwd(
             o_extend,
             k_buffer,
             v_buffer,
+            tree_mask,
+            tree_mask_start,
+            tree_mask_idx,
             req_to_tokens,
             b_req_idx,
             b_seq_len,
@@ -234,6 +287,8 @@ def extend_attention_fwd(
             v_buffer.stride(0),
             v_buffer.stride(1),
             req_to_tokens.stride(0),
+            tree_mask.stride(0) if tree_mask.dim() > 1 else 0,
+            tree_mask.stride(1) if tree_mask.dim() > 1 else 0,
         )
         return
 
@@ -244,6 +299,9 @@ def extend_attention_fwd(
         o_extend,
         k_buffer,
         v_buffer,
+        tree_mask,
+        tree_mask_start,
+        tree_mask_idx,
         req_to_tokens,
         b_req_idx,
         b_seq_len,
@@ -264,6 +322,8 @@ def extend_attention_fwd(
         v_buffer.stride(0),
         v_buffer.stride(1),
         req_to_tokens.stride(0),
+        tree_mask.stride(0) if tree_mask.dim() > 1 else 0,
+        tree_mask.stride(1) if tree_mask.dim() > 1 else 0,
         BLOCK_DMODEL=Lq,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
@@ -273,46 +333,67 @@ def extend_attention_fwd(
     cached_kernel = wrap_kernel_launcher(_fwd_kernel)
 
 
-def redundant_attention(
+def redundant_verify(
     q_extend,
     o_extend,
     k_buffer,
     v_buffer,
+    tree_mask,
+    tree_mask_start,
+    tree_mask_idx,
     b_start_loc,
     b_seq_len,
     b_seq_len_prefix,
-    max_len_in_batch,
 ):
-    total_token_num = k_buffer.shape[0]
-    B, H_Q, D = b_start_loc.shape[0], q_extend.shape[-2], q_extend.shape[-1]
-    q_buffer = torch.empty(
-        (total_token_num, H_Q, D), dtype=q_extend.dtype, device=q_extend.device
-    )
+    B, H_Q, H_KV = b_start_loc.shape[0], q_extend.shape[-2], k_buffer.shape[-2]
+    group_num = H_Q // H_KV
+    cur_seq_start_extend = 0
 
-    pt = 0
     for i in range(B):
+        cur_seq_start = b_start_loc[i]
+        cur_seq_end = b_start_loc[i] + b_seq_len[i]
         cur_seq_len_extend = b_seq_len[i] - b_seq_len_prefix[i]
-        pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
-        q_buffer[pl:pr] = q_extend[pt : pt + cur_seq_len_extend]
-        pt += cur_seq_len_extend
+        cur_seq_len_prefix = b_seq_len_prefix[i]
 
-    o_buffer = torch.empty_like(q_buffer)
-    context_attention_fwd(
-        q_buffer, k_buffer, v_buffer, o_buffer, b_start_loc, b_seq_len, max_len_in_batch
-    )
+        q = q_extend[cur_seq_start_extend : cur_seq_start_extend + cur_seq_len_extend]
+        k = k_buffer[cur_seq_start:cur_seq_end]
+        v = v_buffer[cur_seq_start:cur_seq_end]
 
-    pt = 0
-    for i in range(B):
-        cur_seq_len_extend = b_seq_len[i] - b_seq_len_prefix[i]
-        pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
-        o_extend[pt : pt + cur_seq_len_extend] = o_buffer[pl:pr]
-        pt += cur_seq_len_extend
+        mask = torch.tril(
+            torch.ones(
+                (cur_seq_len_extend, cur_seq_len_extend),
+                dtype=torch.bool,
+                device="cuda",
+            ),
+            diagonal=0,
+        )
+
+        cur_tree_mask_idx = tree_mask_idx[i]
+        if cur_tree_mask_idx >= 0:
+            cur_tree_mask_start = tree_mask_start[cur_tree_mask_idx]
+            cur_tree_mask_len = cur_seq_len_extend - cur_tree_mask_start
+            mask[cur_tree_mask_start:, cur_tree_mask_start:] &= tree_mask[
+                cur_tree_mask_idx, :cur_tree_mask_len, :cur_tree_mask_len
+            ]
+
+        for h in range(H_Q):
+            qh = q[:, h]
+            kh = k[:, h // group_num]
+            vh = v[:, h // group_num]
+            qk = torch.matmul(qh, kh.T) / qh.shape[-1] ** 0.5
+            qk[:, cur_seq_len_prefix:].masked_fill_(~mask, float("-inf"))
+            o = torch.matmul(qk.softmax(dim=-1), vh)
+            o_extend[
+                cur_seq_start_extend : cur_seq_start_extend + cur_seq_len_extend, h
+            ] = o
+
+        cur_seq_start_extend += cur_seq_len_extend
 
 
 def test():
     torch.manual_seed(0)
 
-    B, N_CTX, H_Q, H_KV, D = 19, 12331, 12, 4, 128
+    B, N_CTX, H_Q, H_KV, D = 19, 12331, 32, 32, 128
     dtype = torch.float16
 
     b_seq_len_prefix = torch.randint(
@@ -370,15 +451,50 @@ def test():
     b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
     max_len_extend = torch.max(b_seq_len_extend, 0)[0].item()
 
-    ########## TEST EXTEND ATTENTION ##########
+    ########## TEST TREE VERIFICATION ##########
 
-    extend_attention_fwd(
+    tree_mask_idx = torch.empty((B,), dtype=torch.int32, device="cuda").fill_(-1)
+    tree_mask_lens = []
+
+    for i in range(B):
+        if torch.rand(1).item() > 0.2:
+            tree_mask_idx[i] = len(tree_mask_lens)
+            tree_mask_lens.append(
+                torch.randint(1, min(b_seq_len_extend[i].item() + 1, 32), (1,)).item()
+            )
+
+    max_tree_mask_len = max(tree_mask_lens) if tree_mask_lens else 0
+    tree_mask = torch.zeros(
+        (len(tree_mask_lens), max_tree_mask_len, max_tree_mask_len),
+        dtype=torch.bool,
+        device="cuda",
+    )
+    tree_mask_start = torch.zeros(
+        (len(tree_mask_lens),), dtype=torch.int32, device="cuda"
+    )
+
+    for i in range(B):
+        cur_idx = tree_mask_idx[i]
+        if cur_idx >= 0:
+            tree_mask_len = tree_mask_lens[cur_idx]
+            for j in range(tree_mask_len):
+                tree_mask[cur_idx, j, j] = 1
+                if j > 0:
+                    parent = torch.randint(0, j, (1,)).item()
+                    # parent = j - 1
+                    tree_mask[cur_idx, j, :] |= tree_mask[cur_idx, parent, :]
+            tree_mask_start[cur_idx] = b_seq_len_extend[i] - tree_mask_len
+
+    verify_attention_fwd(
         q_extend,
         k_extend,
         v_extend,
         o_extend,
         k_buffer,
         v_buffer,
+        tree_mask,
+        tree_mask_start,
+        tree_mask_idx,
         req_to_tokens,
         b_req_idx,
         b_start_loc,
@@ -390,15 +506,17 @@ def test():
         max_len_extend,
     )
 
-    redundant_attention(
+    redundant_verify(
         q_extend,
         o_redundant,
         k_buffer,
         v_buffer,
+        tree_mask,
+        tree_mask_start,
+        tree_mask_idx,
         b_start_loc,
         b_seq_len,
         b_seq_len_prefix,
-        max_len_in_batch,
     )
 
     print("Mean: ", torch.mean(torch.abs(o_extend - o_redundant)))

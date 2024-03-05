@@ -58,9 +58,6 @@ def test_batch_prefill_with_paged_kv_cache(
         o_triton,
         k_buffer,
         v_buffer,
-        None,
-        None,
-        None,
         req_to_token,
         b_req_idx,
         None,  # b_start_loc = None

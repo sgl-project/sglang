@@ -177,6 +177,3 @@ tmp*.txt
 # Plots
 *.png
 *.pdf
-
-# index file
-*.idx

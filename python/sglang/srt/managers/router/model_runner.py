@@ -195,7 +195,6 @@ class InputMetadata:
             seq_lens_np = seq_lens.cpu().numpy()
             prefix_lens_np = prefix_lens.cpu().numpy()
             position_ids_offsets_np = position_ids_offsets.cpu().numpy()
-            # TODO(lsyin): let tree_mask_idx always not be None and be fixed length to bs
             tree_mask_idx_np = (
                 tree_mask_idx.cpu().numpy()
                 if tree_mask_idx is not None
@@ -214,7 +213,7 @@ class InputMetadata:
                                 seq_lens_np[i] + position_ids_offsets_np[i],
                             )
                             if tree_mask_idx_np[i] < 0
-                            else np.concatenate(
+                            else np.concatenate(  # resolve the positions according nodes' depth
                                 [
                                     np.arange(
                                         prefix_lens_np[i] + position_ids_offsets_np[i],

@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Tuple
 import numpy as np
 
 
@@ -12,6 +12,7 @@ class TrieNode:
         self.children = []
 
         self.spec_prob = 0
+        self.probs_sum = 0
         self.idx = 0
 
     def __lt__(self, other):
@@ -21,9 +22,12 @@ class TrieNode:
         return self.depth == other.depth and abs(self.weight - other.weight) < 1e-6
 
     def sample_children(self, verified_indices: List[int], verified_ids: List[int]):
-        spec_probs = np.array([child.spec_probs for child in self.children])
-        spec_probs = np.append(spec_probs, 1 - np.sum(spec_probs))
-        sample_index = np.random.choice(len(spec_probs), p=spec_probs)
+        spec_probs = np.array([child.spec_prob for child in self.children])
+        spec_probs = spec_probs.astype(np.float64)
+        other_prob = max(0, self.probs_sum - np.sum(spec_probs))
+        spec_probs = np.append(spec_probs, other_prob)
+        spec_probs /= np.sum(spec_probs)
+        sample_index = np.random.multinomial(1, spec_probs).argmax()
 
         if sample_index < len(self.children):
             verified_indices.append(self.children[sample_index].idx)
@@ -48,8 +52,11 @@ class SpeculateTries:
         self.tree_depths = None
         self.tree_mask = None
 
+    def spec_len(self):
+        return len(self.node_list)
+
     def is_empty(self):
-        return len(self.node_list) == 0
+        return self.spec_len() == 0
 
     def insert(self, tree_ids: List[int], weight: float):
         cur_node = self.root
@@ -126,17 +133,20 @@ class SpeculateTries:
         )
         self.tree_ids = [node.token_id for node in self.tree_nodes]
 
-    def fill_probs(self, probs):
-        for i, prob in enumerate(probs):
-            self.tree_nodes[i].spec_probs = prob
+    def fill_probs(self, probs_and_sum: List[Tuple]):
+        for i, (spec_prob, probs_sum) in enumerate(probs_and_sum):
+            self.tree_nodes[i].spec_prob = spec_prob
+            self.tree_nodes[i].probs_sum = probs_sum
             self.tree_nodes[i].idx = i
 
     def sample_tries(self):
         if not self.first_token_fixed:
             raise NotImplementedError("First token not fixed")
 
-        verified_indices, verified_ids = [], []
-        self.root.sample_children(verified_indices, verified_ids)
+        assert len(self.root.children) == 1
+        first_node = self.root.children[0]
+        verified_indices, verified_ids = [first_node.idx], [first_node.token_id]
+        first_node.sample_children(verified_indices, verified_ids)
         return verified_indices, verified_ids
 
 
@@ -154,6 +164,7 @@ class SpeculateEngine:
         self.max_spec_num = max_spec_num
 
         self.entries = []
+        self.prev_ids = []
 
     def add_entry_tokens(self, tokens: List[int]):
         self.entries.append(tokens)
@@ -174,6 +185,9 @@ class SpeculateEngine:
                 return p
         return min(len(x), len(y))
 
+    def set_prev_ids(self, prev_ids: List[int]):
+        self.prev_ids = prev_ids
+
     def search(
         self,
         tokens_to_match: List[int],
@@ -193,7 +207,7 @@ class SpeculateEngine:
         if len(tokens_to_match) < min_match_len:
             return spec_tries
 
-        for entry in self.entries:
+        for entry in self.entries + [self.prev_ids]:
             for i in range(min_match_len, len(entry)):
                 matched_len = self._match(tokens_to_match, entry[:i])
                 if matched_len >= min_match_len:

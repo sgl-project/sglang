@@ -28,6 +28,7 @@ class ServerArgs:
     log_level: str = "info"
     disable_regex_jump_forward: bool = False
     disable_disk_cache: bool = False
+    disable_reference_speculate: bool = False
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -188,6 +189,11 @@ class ServerArgs:
             "--disable-disk-cache",
             action="store_true",
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
+        )
+        parser.add_argument(
+            "--disable-reference-speculate",
+            action="store_true",
+            help="Disable reference speculative decoding",
         )
 
     @classmethod
