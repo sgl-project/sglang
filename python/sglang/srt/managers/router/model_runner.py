@@ -222,7 +222,7 @@ class InputMetadata:
         if forward_mode == ForwardMode.EXTEND:
             ret.init_extend_args()
 
-        if global_server_args_dict["enable_flashinfer"]:
+        if global_server_args_dict.get("enable_flashinfer", False):
             ret.init_flashinfer_args(tp_size)
 
         return ret

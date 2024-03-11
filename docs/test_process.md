@@ -37,6 +37,23 @@ python3 bench_sglang.py --nsub 3
 # Average accuracy: 0.413
 ```
 
+#### GSM-8K
+```
+cd benchmark/gsm8k
+```
+Follow README.md to download the data.
+
+```
+python3 bench_sglang.py --num-q 200
+
+# Expected performance on A10G
+# Latency: 32.103
+# Accuracy: 0.250
+```
+
+#### More
+Please also test `benchmark/hellaswag`, `benchmark/latency_throughput`.
+
 ### More Models
 
 #### LLaVA
@@ -48,6 +65,9 @@ python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenize
 ```
 cd benchmark/llava_bench
 python3 bench_sglang.py
+
+# Expected performance on A10G
+# Latency: 50.031
 ```
 
 ## SGLang Unit Tests
