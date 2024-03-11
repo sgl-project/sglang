@@ -245,6 +245,9 @@ class StreamExecutor:
             self.variable_event[name].wait()
         return self.variables[name]
 
+    def set_var(self, name, value):
+        self.variables[name] = value
+
     def get_meta_info(self, name):
         if name in self.variable_event:
             self.variable_event[name].wait()
@@ -726,6 +729,9 @@ class ProgramState:
     def get_var(self, name):
         return self.stream_executor.get_var(name)
 
+    def set_var(self, name, value):
+        return self.stream_executor.set_var(name, value)
+
     def get_meta_info(self, name):
         return self.stream_executor.get_meta_info(name)
 
@@ -735,6 +741,9 @@ class ProgramState:
 
     def __getitem__(self, name):
         return self.get_var(name)
+
+    def __setitem__(self, name, value):
+        self.set_var(name, value)
 
     def __del__(self):
         self.stream_executor.end()
