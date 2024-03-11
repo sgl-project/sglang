@@ -550,6 +550,7 @@ class Runtime:
         tp_size: int = 1,
         model_mode: List[str] = (),
         schedule_heuristic: str = "lpm",
+        attention_reduce_in_fp32: bool = False,
         random_seed: int = 42,
         log_level: str = "error",
         port: Optional[int] = None,
@@ -572,6 +573,7 @@ class Runtime:
             tp_size=tp_size,
             model_mode=model_mode,
             schedule_heuristic=schedule_heuristic,
+            attention_reduce_in_fp32=attention_reduce_in_fp32,
             random_seed=random_seed,
             log_level=log_level,
         )
