@@ -82,6 +82,8 @@ class TokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        self.server_args = server_args
+
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = context.socket(zmq.PULL)
         self.recv_from_detokenizer.bind(f"tcp://127.0.0.1:{port_args.tokenizer_port}")

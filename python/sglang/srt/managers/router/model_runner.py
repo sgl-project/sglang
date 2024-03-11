@@ -23,7 +23,7 @@ logger = logging.getLogger("model_runner")
 
 
 # for server args in model endpoints
-global_server_args = None
+global_server_args_dict: dict = None
 
 
 @lru_cache()
@@ -222,7 +222,7 @@ class InputMetadata:
         if forward_mode == ForwardMode.EXTEND:
             ret.init_extend_args()
 
-        if "flashinfer" in global_server_args.model_mode:
+        if global_server_args_dict["enable_flashinfer"]:
             ret.init_flashinfer_args(tp_size)
 
         return ret
@@ -236,9 +236,9 @@ class ModelRunner:
         tp_rank,
         tp_size,
         nccl_port,
-        server_args,
         load_format="auto",
         trust_remote_code=True,
+        server_args_dict: dict = {},
     ):
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
@@ -248,8 +248,8 @@ class ModelRunner:
         self.load_format = load_format
         self.trust_remote_code = trust_remote_code
 
-        global global_server_args
-        global_server_args = server_args
+        global global_server_args_dict
+        global_server_args_dict = server_args_dict
 
         # Init torch distributed
         torch.cuda.set_device(self.tp_rank)
