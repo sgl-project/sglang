@@ -1,6 +1,7 @@
 """SRT: SGLang Runtime"""
 
 import asyncio
+import dataclasses
 import json
 import multiprocessing as mp
 import os
@@ -84,6 +85,11 @@ async def get_model_info():
         "model_path": tokenizer_manager.model_path,
     }
     return result
+
+
+@app.get("/get_server_args")
+async def get_server_args():
+    return dataclasses.asdict(tokenizer_manager.server_args)
 
 
 @app.get("/flush_cache")

@@ -35,6 +35,22 @@ class RuntimeEndpoint(BaseBackend):
     def get_model_name(self):
         return self.model_info["model_path"]
 
+    def flush_cache(self):
+        res = http_request(
+            self.base_url + "/flush_cache",
+            auth_token=self.auth_token,
+            verify=self.verify,
+        )
+        return res.status_code == 200
+
+    def get_server_args(self):
+        res = http_request(
+            self.base_url + "/get_server_args",
+            auth_token=self.auth_token,
+            verify=self.verify,
+        )
+        return res.json()
+
     def get_chat_template(self):
         return self.chat_template
 
