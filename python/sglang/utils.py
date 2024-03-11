@@ -88,7 +88,9 @@ class HttpResponse:
         return self.resp.status
 
 
-def http_request(url, json=None, stream=False, auth_token=None, api_key=None, verify=None):
+def http_request(
+    url, json=None, stream=False, auth_token=None, api_key=None, verify=None
+):
     """A faster version of requests.post with low-level urllib API."""
     headers = {"Content-Type": "application/json; charset=utf-8"}
 
