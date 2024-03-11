@@ -63,7 +63,7 @@ def decode(step, model, tp_rank, batch_size, predict_ids, params, print_logits):
     ) = model.token_to_kv_pool.alloc_contiguous(batch_size)
     model.req_to_token_pool.req_to_token[req_pool_indices, seq_lens] = out_cache_loc
     seq_lens.add_(1)
-    logits = model.forward_decode(
+    logits, _ = model.forward_decode(
         torch.from_numpy(predict_ids).cuda().reshape(-1),
         req_pool_indices,
         seq_lens,
@@ -72,6 +72,7 @@ def decode(step, model, tp_rank, batch_size, predict_ids, params, print_logits):
         None,
         out_cache_cont_start,
         out_cache_cont_end,
+        False,
     )
     prob_out = torch.softmax(logits, dim=-1)
     predict_ids = torch.argmax(prob_out, dim=1, keepdim=True)
@@ -92,7 +93,7 @@ def test_generate_worker(
 
     # Prepare data
     prompt = "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER: <image>\nDescribe this picture ASSISTANT:"
-    image_path = "/home/ubuntu/sglang/test/lang/image.png"
+    image_path = "/home/ubuntu/sglang/test/lang/test_image.png"
     image = load_image(image_path)
 
     processor = get_processor("llava-hf/llava-1.5-7b-hf")

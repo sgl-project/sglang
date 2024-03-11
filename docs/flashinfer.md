@@ -5,14 +5,7 @@ It can be used in SGLang runtime to accelerate attention computation.
 
 ### Install flashinfer
 
-You can install flashinfer via pip as follows for CUDA 12.1.
-
-```bash
-pip install flashinfer -i https://flashinfer.ai/whl/cu121/
-```
-
-You can look for other CUDA versions in https://github.com/flashinfer-ai/flashinfer?tab=readme-ov-file#installation. If there is no desire version for your environment,
-please build it from source (the compilation takes a long time).
+See https://docs.flashinfer.ai/installation.html.
 
 ### Run a Server With Flashinfer Mode
 
