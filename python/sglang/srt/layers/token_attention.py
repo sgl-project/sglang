@@ -4,8 +4,8 @@
 import torch
 import triton
 import triton.language as tl
-from sglang.srt.utils import wrap_kernel_launcher
 from sglang.srt.managers.router.model_runner import global_server_args
+from sglang.srt.utils import wrap_kernel_launcher
 
 if global_server_args.attention_reduce_in_fp32:
     REDUCE_TRITON_TYPE = tl.float32
