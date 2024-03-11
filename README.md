@@ -1,4 +1,9 @@
-# SGLang
+<div align="center">
+<img src="assets/logo.png" alt="logo" width="400"></img>
+</div>
+
+--------------------------------------------------------------------------------
+
 | [**Blog**](https://lmsys.org/blog/2024-01-17-sglang/) | [**Paper**](https://arxiv.org/abs/2312.07104) |
 
 SGLang is a structured generation language designed for large language models (LLMs).
