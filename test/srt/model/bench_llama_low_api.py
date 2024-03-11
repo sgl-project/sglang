@@ -151,7 +151,7 @@ def bench_generate_worker(
     shared_len,
     unique_len,
     decode_len,
-    model_mode,
+    server_args_dict,
 ):
     assert unique_num % shared_num == 0
 
@@ -162,7 +162,7 @@ def bench_generate_worker(
         tp_rank=tp_rank,
         tp_size=tp_size,
         nccl_port=28888,
-        model_mode=model_mode,
+        server_args_dict=server_args_dict,
     )
 
     batch = BenchBatch(model_runner)
@@ -227,7 +227,7 @@ def bench_generate(
     shared_len,
     unique_len,
     decode_len,
-    model_mode,
+    server_args_dict,
 ):
     print(
         f"tp_size: {tp_size}, "
@@ -236,7 +236,7 @@ def bench_generate(
         f"shared_len: {shared_len}, "
         f"unique_len: {unique_len}, "
         f"decode_len: {decode_len}, "
-        f"model_mode: {model_mode}"
+        f"server_args: {server_args_dict}"
     )
     workers = []
     for tp_rank in range(tp_size):
@@ -251,7 +251,7 @@ def bench_generate(
                 shared_len,
                 unique_len,
                 decode_len,
-                model_mode,
+                server_args_dict,
             ),
         )
         proc.start()
@@ -270,5 +270,5 @@ if __name__ == "__main__":
         shared_len=256,
         unique_len=256,
         decode_len=8,
-        model_mode=[],
+        server_args_dict={},
     )
