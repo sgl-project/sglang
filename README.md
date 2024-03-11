@@ -3,6 +3,8 @@
 <br></br>
 </div>
 
+--------------------------------------------------------------------------------
+
 | [**Blog**](https://lmsys.org/blog/2024-01-17-sglang/) | [**Paper**](https://arxiv.org/abs/2312.07104) |
 
 SGLang is a <ins>s</ins>tructured <ins>g</ins>eneration <ins>lang</ins>uage designed for large language models (LLMs).
