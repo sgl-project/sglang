@@ -88,7 +88,7 @@ class HttpResponse:
         return self.resp.status
 
 
-def http_request(url, json=None, stream=False, auth_token=None, api_key=None):
+def http_request(url, json=None, stream=False, auth_token=None, api_key=None, verify=None):
     """A faster version of requests.post with low-level urllib API."""
     headers = {"Content-Type": "application/json; charset=utf-8"}
 
@@ -99,7 +99,7 @@ def http_request(url, json=None, stream=False, auth_token=None, api_key=None):
     # add the API Key header if an API key is provided
     if api_key is not None:
         headers["X-API-Key"] = api_key
-    
+
     if stream:
         return requests.post(url, json=json, stream=True, headers=headers)
     else:
@@ -108,7 +108,7 @@ def http_request(url, json=None, stream=False, auth_token=None, api_key=None):
             data = None
         else:
             data = bytes(dumps(json), encoding="utf-8")
-        resp = urllib.request.urlopen(req, data=data)
+        resp = urllib.request.urlopen(req, data=data, cafile=verify)
         return HttpResponse(resp)
 
 

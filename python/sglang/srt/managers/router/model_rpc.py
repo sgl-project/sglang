@@ -46,7 +46,6 @@ class ModelRpcServer(rpyc.Service):
         server_args, port_args = [obtain(x) for x in [server_args, port_args]]
 
         # Copy arguments
-        self.model_mode = server_args.model_mode
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.schedule_heuristic = server_args.schedule_heuristic
@@ -57,17 +56,26 @@ class ModelRpcServer(rpyc.Service):
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
-            server_args.model_path, server_args.trust_remote_code, context_length=server_args.context_length
-        )
-        self.model_runner = ModelRunner(
-            self.model_config,
-            server_args.mem_fraction_static,
-            tp_rank,
-            server_args.tp_size,
-            port_args.nccl_port,
-            server_args.load_format,
+            server_args.model_path,
             server_args.trust_remote_code,
-            server_args.model_mode,
+            context_length=server_args.context_length,
+        )
+
+        # for model end global settings
+        server_args_dict = {
+            "enable_flashinfer": server_args.enable_flashinfer,
+            "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
+        }
+
+        self.model_runner = ModelRunner(
+            model_config=self.model_config,
+            mem_fraction_static=server_args.mem_fraction_static,
+            tp_rank=tp_rank,
+            tp_size=server_args.tp_size,
+            nccl_port=port_args.nccl_port,
+            load_format=server_args.load_format,
+            trust_remote_code=server_args.trust_remote_code,
+            server_args_dict=server_args_dict,
         )
         if is_multimodal_model(server_args.model_path):
             self.processor = get_processor(
@@ -102,11 +110,11 @@ class ModelRpcServer(rpyc.Service):
             f"max_total_num_token={self.max_total_num_token}, "
             f"max_prefill_num_token={self.max_prefill_num_token}, "
             f"context_len={self.model_config.context_len}, "
-            f"model_mode={self.model_mode}"
         )
+        logger.info(server_args.get_optional_modes_logging())
 
         # Init cache
-        self.tree_cache = RadixCache(disable="no-cache" in self.model_mode)
+        self.tree_cache = RadixCache(server_args.disable_radix_cache)
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.scheduler = Scheduler(
             self.schedule_heuristic,
@@ -435,7 +443,7 @@ class ModelRpcServer(rpyc.Service):
                 # If logprob_start_len > 0, then first logprob_start_len prompt tokens
                 # will be ignored.
                 prompt_token_len = len(req.logprob)
-                token_ids = req.input_ids[-prompt_token_len :] + [next_token_ids[i]]
+                token_ids = req.input_ids[-prompt_token_len:] + [next_token_ids[i]]
                 token_logprobs = req.logprob + [last_logprobs[i]]
                 req.token_logprob = list(zip(token_ids, token_logprobs))
                 if req.logprob_start_len == 0:
@@ -553,8 +561,7 @@ class ModelRpcServer(rpyc.Service):
                     "completion_tokens": len(req.input_ids)
                     + len(req.output_ids)
                     - req.prompt_tokens,
-                    "completion_tokens_wo_jump_forward":
-                    req.completion_tokens_wo_jump_forward
+                    "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
                 }
                 if req.return_logprob:
                     meta_info["prompt_logprob"] = req.logprob
