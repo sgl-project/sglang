@@ -21,6 +21,7 @@ class ServerArgs:
     model_mode: List[str] = ()
     schedule_heuristic: str = "lpm"
     schedule_conservativeness: float = 1.0
+    attention_reduce_in_fp32: bool = False
     random_seed: int = 42
     stream_interval: int = 8
     disable_log_stats: bool = False
@@ -28,7 +29,6 @@ class ServerArgs:
     log_level: str = "info"
     disable_regex_jump_forward: bool = False
     disable_disk_cache: bool = False
-    attention_reduce_in_fp32: bool = False
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -158,6 +158,11 @@ class ServerArgs:
             help="Random seed.",
         )
         parser.add_argument(
+            "--attention-reduce-in-fp32",
+            action="store_true",
+            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16.",
+        )
+        parser.add_argument(
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
@@ -189,11 +194,6 @@ class ServerArgs:
             "--disable-disk-cache",
             action="store_true",
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
-        )
-        parser.add_argument(
-            "--attention-reduce-in-fp32",
-            action="store_true",
-            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16.",
         )
 
     @classmethod

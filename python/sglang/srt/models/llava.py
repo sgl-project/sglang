@@ -233,9 +233,7 @@ class LlavaLlamaForCausalLM(nn.Module):
                 input_ids, positions, input_metadata, input_embeds=input_embeds
             )
         elif input_metadata.forward_mode == ForwardMode.DECODE:
-            return self.language_model(
-                input_ids, positions, input_metadata
-            )
+            return self.language_model(input_ids, positions, input_metadata)
 
     def load_weights(
         self,
