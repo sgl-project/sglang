@@ -57,17 +57,19 @@ class ModelRpcServer(rpyc.Service):
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
-            server_args.model_path, server_args.trust_remote_code, context_length=server_args.context_length
+            server_args.model_path,
+            server_args.trust_remote_code,
+            context_length=server_args.context_length,
         )
         self.model_runner = ModelRunner(
-            self.model_config,
-            server_args.mem_fraction_static,
-            tp_rank,
-            server_args.tp_size,
-            port_args.nccl_port,
-            server_args.load_format,
-            server_args.trust_remote_code,
-            server_args.model_mode,
+            model_config=self.model_config,
+            mem_fraction_static=server_args.mem_fraction_static,
+            tp_rank=tp_rank,
+            tp_size=server_args.tp_size,
+            nccl_port=port_args.nccl_port,
+            server_args=server_args,
+            load_format=server_args.load_format,
+            trust_remote_code=server_args.trust_remote_code,
         )
         if is_multimodal_model(server_args.model_path):
             self.processor = get_processor(
@@ -435,7 +437,7 @@ class ModelRpcServer(rpyc.Service):
                 # If logprob_start_len > 0, then first logprob_start_len prompt tokens
                 # will be ignored.
                 prompt_token_len = len(req.logprob)
-                token_ids = req.input_ids[-prompt_token_len :] + [next_token_ids[i]]
+                token_ids = req.input_ids[-prompt_token_len:] + [next_token_ids[i]]
                 token_logprobs = req.logprob + [last_logprobs[i]]
                 req.token_logprob = list(zip(token_ids, token_logprobs))
                 if req.logprob_start_len == 0:
@@ -553,8 +555,7 @@ class ModelRpcServer(rpyc.Service):
                     "completion_tokens": len(req.input_ids)
                     + len(req.output_ids)
                     - req.prompt_tokens,
-                    "completion_tokens_wo_jump_forward":
-                    req.completion_tokens_wo_jump_forward
+                    "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
                 }
                 if req.return_logprob:
                     meta_info["prompt_logprob"] = req.logprob
