@@ -12,10 +12,13 @@ from sglang.utils import encode_image_base64, find_printable_text, http_request
 
 
 class RuntimeEndpoint(BaseBackend):
-    def __init__(self, base_url: str,
-                 auth_token: Optional[str] = None,
-                 api_key: Optional[str] = None,
-                 verify: Optional[str] = None):
+    def __init__(
+        self,
+        base_url: str,
+        auth_token: Optional[str] = None,
+        api_key: Optional[str] = None,
+        verify: Optional[str] = None,
+    ):
         super().__init__()
         self.support_concate_and_append = True
 
