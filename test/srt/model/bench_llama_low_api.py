@@ -66,9 +66,9 @@ class BenchBatch:
             p_idx = prefix_req_idx[i // fork_num].item()
             n_idx = self.req_pool_indices[i].item()
             req_to_token[n_idx, :prefix_len] = req_to_token[p_idx, :prefix_len]
-            req_to_token[n_idx, prefix_len : prefix_len + extend_len] = (
-                self.out_cache_loc[i * extend_len : (i + 1) * extend_len]
-            )
+            req_to_token[
+                n_idx, prefix_len : prefix_len + extend_len
+            ] = self.out_cache_loc[i * extend_len : (i + 1) * extend_len]
 
     def update_decode(self, predict_ids, batch_size):
         assert predict_ids.shape[0] == batch_size
@@ -81,9 +81,9 @@ class BenchBatch:
             self.out_cache_cont_start,
             self.out_cache_cont_end,
         ) = self.token_to_kv_pool.alloc_contiguous(batch_size)
-        self.req_to_token_pool.req_to_token[self.req_pool_indices, self.seq_lens] = (
-            self.out_cache_loc
-        )
+        self.req_to_token_pool.req_to_token[
+            self.req_pool_indices, self.seq_lens
+        ] = self.out_cache_loc
         self.seq_lens.add_(1)
 
 
@@ -151,7 +151,7 @@ def bench_generate_worker(
     shared_len,
     unique_len,
     decode_len,
-    model_mode,
+    server_args_dict,
 ):
     assert unique_num % shared_num == 0
 
@@ -162,7 +162,7 @@ def bench_generate_worker(
         tp_rank=tp_rank,
         tp_size=tp_size,
         nccl_port=28888,
-        model_mode=model_mode,
+        server_args_dict=server_args_dict,
     )
 
     batch = BenchBatch(model_runner)
@@ -227,7 +227,7 @@ def bench_generate(
     shared_len,
     unique_len,
     decode_len,
-    model_mode,
+    server_args_dict,
 ):
     print(
         f"tp_size: {tp_size}, "
@@ -236,7 +236,7 @@ def bench_generate(
         f"shared_len: {shared_len}, "
         f"unique_len: {unique_len}, "
         f"decode_len: {decode_len}, "
-        f"model_mode: {model_mode}"
+        f"server_args: {server_args_dict}"
     )
     workers = []
     for tp_rank in range(tp_size):
@@ -251,7 +251,7 @@ def bench_generate(
                 shared_len,
                 unique_len,
                 decode_len,
-                model_mode,
+                server_args_dict,
             ),
         )
         proc.start()
@@ -270,5 +270,5 @@ if __name__ == "__main__":
         shared_len=256,
         unique_len=256,
         decode_len=8,
-        model_mode=[],
+        server_args_dict={},
     )

@@ -181,19 +181,20 @@ def extend_attention_fwd(
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
-    if CUDA_CAPABILITY[0] >= 8:
-        BLOCK_M, BLOCK_N = 128, 128
-    else:
-        BLOCK_M, BLOCK_N = 64, 64
-
     Lq, Lk, Lv, Lo = (
         q_extend.shape[-1],
         k_extend.shape[-1],
         v_extend.shape[-1],
         o_extend.shape[-1],
     )
+
     assert Lq == Lk and Lk == Lv and Lv == Lo
-    assert Lq in {16, 32, 64, 128}
+    assert Lq in {16, 32, 64, 128, 256}
+
+    if CUDA_CAPABILITY[0] >= 8:
+        BLOCK_M, BLOCK_N = (128, 128) if Lq <= 128 else (64, 64)
+    else:
+        BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
     sm_scale = 1.0 / (Lq**0.5)
     batch_size, head_num = b_seq_len.shape[0], q_extend.shape[1]

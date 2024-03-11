@@ -1,6 +1,7 @@
 """SRT: SGLang Runtime"""
 
 import asyncio
+import dataclasses
 import json
 import multiprocessing as mp
 import os
@@ -84,6 +85,11 @@ async def get_model_info():
         "model_path": tokenizer_manager.model_path,
     }
     return result
+
+
+@app.get("/get_server_args")
+async def get_server_args():
+    return dataclasses.asdict(tokenizer_manager.server_args)
 
 
 @app.get("/flush_cache")
@@ -548,8 +554,8 @@ class Runtime:
         max_prefill_num_token: int = ServerArgs.max_prefill_num_token,
         context_length: int = ServerArgs.context_length,
         tp_size: int = 1,
-        model_mode: List[str] = (),
         schedule_heuristic: str = "lpm",
+        attention_reduce_in_fp32: bool = False,
         random_seed: int = 42,
         log_level: str = "error",
         port: Optional[int] = None,
@@ -570,8 +576,8 @@ class Runtime:
             max_prefill_num_token=max_prefill_num_token,
             context_length=context_length,
             tp_size=tp_size,
-            model_mode=model_mode,
             schedule_heuristic=schedule_heuristic,
+            attention_reduce_in_fp32=attention_reduce_in_fp32,
             random_seed=random_seed,
             log_level=log_level,
         )

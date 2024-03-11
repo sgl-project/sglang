@@ -16,10 +16,10 @@ please build it from source (the compilation takes a long time).
 
 ### Run a Server With Flashinfer Mode
 
-Add `--model-mode flashinfer` argument to enable flashinfer when launching a server.
+Add `--enable-flashinfer` argument to enable flashinfer when launching a server.
 
 Example:
 
 ```bash
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --model-mode flashinfer
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --enable-flashinfer
 ```

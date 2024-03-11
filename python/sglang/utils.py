@@ -97,7 +97,9 @@ def http_request(url, json=None, stream=False, auth_token=None, verify=None):
             "Content-Type": "application/json",
             "Authentication": f"Bearer {auth_token}",
         }
-        return requests.post(url, json=json, stream=True, headers=headers, verify=verify)
+        return requests.post(
+            url, json=json, stream=True, headers=headers, verify=verify
+        )
     else:
         req = urllib.request.Request(url)
         req.add_header("Content-Type", "application/json; charset=utf-8")

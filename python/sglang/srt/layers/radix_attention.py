@@ -16,11 +16,9 @@ class RadixAttention(nn.Module):
         self.head_dim = head_dim
         self.layer_id = layer_id
 
-        from sglang.srt.managers.router.model_runner import global_model_mode
+        from sglang.srt.managers.router.model_runner import global_server_args_dict
 
-        self.use_flashinfer = "flashinfer" in global_model_mode
-
-        if self.use_flashinfer:
+        if global_server_args_dict["enable_flashinfer"]:
             self.prefill_forward = self.prefill_forward_flashinfer
             self.extend_forward = self.prefill_forward_flashinfer
             self.decode_forward = self.decode_forward_flashinfer
