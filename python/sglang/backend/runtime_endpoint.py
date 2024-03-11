@@ -12,7 +12,13 @@ from sglang.utils import encode_image_base64, find_printable_text, http_request
 
 
 class RuntimeEndpoint(BaseBackend):
-    def __init__(self, base_url, auth_token=None, api_key=None, verify=None):
+    def __init__(
+        self,
+        base_url: str,
+        auth_token: Optional[str] = None,
+        api_key: Optional[str] = None,
+        verify: Optional[str] = None,
+    ):
         super().__init__()
         self.support_concate_and_append = True
 
@@ -61,7 +67,7 @@ class RuntimeEndpoint(BaseBackend):
             self.base_url + "/generate",
             json={"text": prefix_str, "sampling_params": {"max_new_tokens": 0}},
             auth_token=self.auth_token,
-            api_key=self.api_key
+            api_key=self.api_key,
             verify=self.verify,
         )
         assert res.status_code == 200
@@ -71,7 +77,7 @@ class RuntimeEndpoint(BaseBackend):
             self.base_url + "/generate",
             json={"text": s.text_, "sampling_params": {"max_new_tokens": 0}},
             auth_token=self.auth_token,
-            api_key=self.api_key
+            api_key=self.api_key,
             verify=self.verify,
         )
         assert res.status_code == 200
@@ -159,7 +165,7 @@ class RuntimeEndpoint(BaseBackend):
             json=data,
             stream=True,
             auth_token=self.auth_token,
-            api_key=self.api_key
+            api_key=self.api_key,
             verify=self.verify,
         )
         pos = 0

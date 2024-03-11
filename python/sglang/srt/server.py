@@ -20,8 +20,6 @@ import requests
 import uvicorn
 import uvloop
 from fastapi import FastAPI, HTTPException, Request
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
@@ -56,10 +54,13 @@ from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import handle_port_init
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 API_KEY_HEADER_NAME = "X-API-Key"
+
 
 class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, api_key: str):
@@ -76,6 +77,7 @@ class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
             )
         response = await call_next(request)
         return response
+
 
 app = FastAPI()
 tokenizer_manager = None
