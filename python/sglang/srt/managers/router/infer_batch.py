@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.speculate.speculate_engine import SpeculateEngine, SpeculateTries
 
 
 class ForwardMode(Enum):
@@ -30,9 +31,12 @@ class Req:
         # Since jump forward may retokenize the prompt with partial outputs,
         # we maintain the original prompt length to report the correct usage.
         self.prompt_tokens = len(input_ids)
-        # The number of decoded tokens for token usage report. Note that
-        # this does not include the jump forward tokens.
-        self.completion_tokens_wo_jump_forward = 0
+        # The number of decoded tokens for token usage report.
+        # Note that this does not include any forward tokens.
+        self.decode_tokens = 0
+        # include fast-forward part (jump-forward, speculate)
+        # and the non-empty output_ids when doing fast-forward
+        self.gap_str = ""
 
         # For vision input
         self.pixel_values = None
@@ -62,7 +66,16 @@ class Req:
         self.regex_fsm = None
         self.regex_fsm_state = 0
         self.jump_forward_map = None
-        self.output_and_jump_forward_str = ""
+
+        # For speculative decoding
+        # TODO(lsyin): global SpeculateEngine to share ref materials
+        self.speculate_engine: SpeculateEngine = None
+        self.speculate_tries: SpeculateTries = None
+
+    def spec_len(self):
+        return (
+            self.speculate_tries.spec_len() if self.speculate_tries is not None else 0
+        )
 
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
@@ -78,10 +91,7 @@ class Req:
         if first_token.startswith("▁"):
             old_output_str = " " + old_output_str
         new_input_string = (
-            self.input_text
-            + self.output_and_jump_forward_str
-            + old_output_str
-            + jump_forward_str
+            self.input_text + self.gap_str + old_output_str + jump_forward_str
         )
         new_input_ids = self.tokenizer.encode(new_input_string)
         if self.pixel_values is not None:
@@ -103,11 +113,9 @@ class Req:
             self.sampling_params.max_new_tokens - jump_forward_tokens_len, 0
         )
         self.regex_fsm_state = next_state
-        self.output_and_jump_forward_str = (
-            self.output_and_jump_forward_str + old_output_str + jump_forward_str
-        )
+        self.gap_str = self.gap_str + old_output_str + jump_forward_str
 
-        # print(f"Output and jump forward str:\n{self.output_and_jump_forward_str}")
+        # print(f"Gap Str:\n{self.gap_str}")
         # print("*" * 100)
 
     def check_finished(self):
@@ -119,6 +127,7 @@ class Req:
             self.finish_reason = FinishReason.LENGTH
             return
 
+        # gap_str will never include <eos>
         if (
             self.output_ids[-1] == self.tokenizer.eos_token_id
             and self.sampling_params.ignore_eos == False
@@ -131,6 +140,12 @@ class Req:
             tail_str = self.tokenizer.decode(
                 self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
             )
+            # When len(self.output_ids) == 1, the gap_str is just refreshed
+            if len(self.output_ids) == 1:
+                tail_str = self.gap_str + tail_str
+            else:
+                max_stop_str_len = max(len(s) for s in self.sampling_params.stop_strs)
+                tail_str = self.gap_str[-max_stop_str_len + 1 :] + tail_str
 
             for stop_str in self.sampling_params.stop_strs:
                 if stop_str in tail_str:
@@ -151,7 +166,7 @@ class Batch:
     tree_cache: RadixCache
 
     # batched arguments to model runner
-    input_ids: torch.Tensor = None
+    input_ids: torch.Tensor = None  # flatten input_ids for extend/decode part
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
     prefix_lens: torch.Tensor = None
@@ -178,6 +193,12 @@ class Batch:
     presence_penalties: torch.Tensor = None
     logit_bias: torch.Tensor = None
 
+    # batched tree mask
+    tree_mask: torch.Tensor = None
+    tree_mask_start: torch.Tensor = None
+    tree_mask_idx: torch.Tensor = None
+    tree_depths: List[List[int]] = None
+
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -194,35 +215,54 @@ class Batch:
         return len(self.reqs) == 0
 
     def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+        # Set some alias
         device = "cuda"
         bs = len(self.reqs)
-        reqs = self.reqs
-        input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
-        prefix_indices = [r.prefix_indices for r in reqs]
 
-        # Handle prefix
-        flatten_input_ids = []
+        # Batched arguments
+        flatten_input_ids = []  # flatten all extend input ids
         extend_lens = []
         prefix_lens = []
         seq_lens = []
-
         req_pool_indices = self.req_to_token_pool.alloc(bs)
         req_pool_indices_cpu = req_pool_indices.cpu().numpy()
-        for i in range(bs):
-            flatten_input_ids.extend(input_ids[i])
-            extend_lens.append(len(input_ids[i]))
 
-            if len(prefix_indices[i]) == 0:
-                prefix_lens.append(0)
-            else:
-                prefix_lens.append(len(prefix_indices[i]))
+        # init tree mask args
+        max_spec_tokens_len = max(r.spec_len() for r in self.reqs)
+        num_spec_reqs = sum(r.spec_len() > 0 for r in self.reqs)
+        tree_mask = np.zeros(
+            (num_spec_reqs, max_spec_tokens_len, max_spec_tokens_len),
+            dtype=np.int32,
+        )
+        tree_mask_start, tree_mask_idx, tree_depths = [], [], []
+        tree_mask_ct = 0
+
+        # Handle prefix indices && flatten input ids
+        for i, r in enumerate(self.reqs):
+            prefix_len, seq_len = len(r.prefix_indices), len(r.input_ids)
+            flatten_input_ids.extend(r.input_ids[prefix_len:])
+            extend_lens.append(seq_len - prefix_len)
+            prefix_lens.append(prefix_len)
+            seq_lens.append(seq_len)
+
+            # avoid GPU overhead
+            if prefix_len != 0:
                 self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
-                    : len(prefix_indices[i])
-                ] = prefix_indices[i]
+                    :prefix_len
+                ] = r.prefix_indices
 
-            seq_lens.append(prefix_lens[-1] + extend_lens[-1])
-
-        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
+            # handle tree mask
+            if r.spec_len() > 0:
+                tree_ids_len = r.spec_len()
+                tree_mask[tree_mask_ct, :tree_ids_len, :tree_ids_len] = (
+                    r.speculate_tries.tree_mask
+                )
+                tree_mask_start.append(seq_len - prefix_len - tree_ids_len)
+                tree_mask_idx.append(tree_mask_ct)
+                tree_depths.append(r.speculate_tries.tree_depths)
+                tree_mask_ct += 1
+            else:
+                tree_mask_idx.append(-1)
 
         # Alloc mem
         seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
@@ -238,6 +278,7 @@ class Batch:
                 self.tree_cache.pretty_print()
                 exit()
 
+        # Map out_cache_loc to memory pool
         pt = 0
         for i in range(bs):
             self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
@@ -248,47 +289,63 @@ class Batch:
         # Handle logit bias
         logit_bias = torch.zeros((bs, vocab_size), dtype=torch.float32, device=device)
         for i in range(bs):
-            if reqs[i].sampling_params.dtype == "int":
+            if self.reqs[i].sampling_params.dtype == "int":
                 logit_bias[i] = int_token_logit_bias
 
         # Set fields
         self.input_ids = torch.tensor(
             flatten_input_ids, dtype=torch.int32, device=device
         )
-        self.pixel_values = [r.pixel_values for r in reqs]
-        self.image_sizes = [r.image_size for r in reqs]
+        self.pixel_values = [r.pixel_values for r in self.reqs]
+        self.image_sizes = [r.image_size for r in self.reqs]
         self.image_offsets = [
-            r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
+            r.image_offset - p_len for r, p_len in zip(self.reqs, prefix_lens)
         ]
         self.req_pool_indices = req_pool_indices
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
-        self.position_ids_offsets = position_ids_offsets
+        self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
 
         self.temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
+            [r.sampling_params.temperature for r in self.reqs],
             dtype=torch.float,
             device=device,
         ).view(-1, 1)
         self.top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
+            [r.sampling_params.top_p for r in self.reqs],
+            dtype=torch.float,
+            device=device,
         ).view(-1, 1)
         self.top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
+            [r.sampling_params.top_k for r in self.reqs], dtype=torch.int, device=device
         ).view(-1, 1)
         self.frequency_penalties = torch.tensor(
-            [r.sampling_params.frequency_penalty for r in reqs],
+            [r.sampling_params.frequency_penalty for r in self.reqs],
             dtype=torch.float,
             device=device,
         )
         self.presence_penalties = torch.tensor(
-            [r.sampling_params.presence_penalty for r in reqs],
+            [r.sampling_params.presence_penalty for r in self.reqs],
             dtype=torch.float,
             device=device,
         )
         self.logit_bias = logit_bias
+
+        if len(tree_mask) != 0:
+            self.tree_mask = torch.tensor(tree_mask, dtype=torch.int32, device=device)
+            self.tree_mask_start = torch.tensor(
+                tree_mask_start, dtype=torch.int32, device=device
+            )
+            self.tree_mask_idx = torch.tensor(
+                tree_mask_idx, dtype=torch.int32, device=device
+            )
+            self.tree_depths = tree_depths
+        else:
+            self.tree_mask = self.tree_mask_start = self.tree_mask_idx = (
+                self.tree_depths
+            ) = None
 
     def check_decode_mem(self):
         bs = len(self.reqs)
@@ -335,45 +392,206 @@ class Batch:
 
         return retracted_reqs
 
-    def check_for_jump_forward(self):
-        jump_forward_reqs = []
-        filter_indices = [i for i in range(len(self.reqs))]
-
-        req_pool_indices_cpu = None
+    def check_for_jump_forward(self, model_runner):
+        jump_forward_indices = []
+        jump_forward_res = []
+        filter_indices = []
 
         for i, req in enumerate(self.reqs):
-            if req.jump_forward_map is not None:
-                res = req.jump_forward_map.jump_forward(req.regex_fsm_state)
-                if res is not None:
-                    jump_forward_str, next_state = res
-                    if len(jump_forward_str) <= 1:
-                        continue
+            res = (
+                req.jump_forward_map.jump_forward(req.regex_fsm_state)
+                if req.jump_forward_map is not None
+                else None
+            )
+            if res is not None and len(res[0]) > 1:
+                jump_forward_indices.append(i)
+                jump_forward_res.append(res)
+            else:
+                filter_indices.append(i)
 
-                    # insert the old request into tree_cache
-                    token_ids_in_memory = tuple(req.input_ids + req.output_ids)[:-1]
-                    if req_pool_indices_cpu is None:
-                        req_pool_indices_cpu = self.req_pool_indices.cpu().tolist()
-                    req_pool_idx = req_pool_indices_cpu[i]
-                    indices = self.req_to_token_pool.req_to_token[
-                        req_pool_idx, : len(token_ids_in_memory)
-                    ]
-                    prefix_len = self.tree_cache.insert(
-                        token_ids_in_memory, indices.clone()
-                    )
-                    self.token_to_kv_pool.free(indices[:prefix_len])
-                    self.req_to_token_pool.free(req_pool_idx)
-                    self.tree_cache.dec_ref_counter(req.last_node)
+        # insert requests into tree_cache
+        self.cache_batch(jump_forward_indices)
 
-                    # jump-forward
-                    req.jump_forward_and_retokenize(jump_forward_str, next_state)
+        for idx, res in zip(jump_forward_indices, jump_forward_res):
+            req = self.reqs[idx]
+            req.jump_forward_and_retokenize(*res)
 
-                    jump_forward_reqs.append(req)
-                    filter_indices.remove(i)
+            # re-applying image padding
+            if req.pixel_values is not None:
+                (
+                    req.input_ids,
+                    req.image_offset,
+                ) = model_runner.model.pad_input_ids(
+                    req.input_ids,
+                    req.pad_value,
+                    req.pixel_values.shape,
+                    req.image_size,
+                )
 
+        jump_forward_reqs = [self.reqs[i] for i in jump_forward_indices]
         if len(filter_indices) < len(self.reqs):
             self.filter_batch(filter_indices)
 
         return jump_forward_reqs
+
+    def check_for_speculative(self):
+        spec_indices = []
+        filter_indices = []
+
+        for i, req in enumerate(self.reqs):
+            if req.speculate_engine is not None:
+                prev_ids = req.input_ids + req.output_ids
+                req.speculate_engine.set_prev_ids(prev_ids)
+                req.speculate_tries = req.speculate_engine.search(prev_ids)
+
+                if not req.speculate_tries.is_empty():
+                    spec_indices.append(i)
+                    continue
+
+            filter_indices.append(i)
+
+        # insert requests into tree_cache
+        self.cache_batch(spec_indices)
+
+        for idx in spec_indices:
+            req = self.reqs[idx]
+            # append old output str to the gap_str
+            old_output_ids = req.output_ids[:-1]
+            if len(old_output_ids) > 0:
+                old_output_str = req.tokenizer.decode(old_output_ids)
+                if req.tokenizer.convert_ids_to_tokens(old_output_ids[0]).startswith(
+                    "▁"
+                ):
+                    old_output_str = " " + old_output_str
+                req.gap_str = req.gap_str + old_output_str
+
+            # debug print
+            # print("=" * 20, "Check For Speculative", "=" * 20)
+            # print(
+            #     f"Prev Tokens: {req.tokenizer.convert_ids_to_tokens(req.input_ids[-10:] + req.output_ids)}"
+            # )
+            # print(
+            #     f"Tree Tokens: #{len(req.speculate_tries.tree_ids)} {req.tokenizer.convert_ids_to_tokens(req.speculate_tries.tree_ids)}"
+            # )
+            # print("=" * 75)
+
+            # NOTE: spec tokens include the last output_ids by default
+            prev_new_tokens = len(req.output_ids) - 1
+            req.input_ids = (
+                req.input_ids + req.output_ids[:-1] + req.speculate_tries.tree_ids
+            )
+            req.output_ids = []
+            req.sampling_params.max_new_tokens = max(
+                req.sampling_params.max_new_tokens - prev_new_tokens, 0
+            )
+
+        spec_reqs = [self.reqs[i] for i in spec_indices]
+        if len(filter_indices) < len(self.reqs):
+            self.filter_batch(filter_indices)
+
+        return spec_reqs
+
+    def speculative_sample(self, all_logits, last_logits):
+        extend_starts = np.array([0] + [req.extend_input_len for req in self.reqs])
+        extend_starts = np.cumsum(extend_starts)
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
+        for i, req in enumerate(self.reqs):
+            if req.spec_len() > 0:
+                assert len(req.output_ids) == 0, "Ouput ids should be empty"
+                cur_extend_start = extend_starts[i]
+                cur_extend_len = req.extend_input_len
+                cur_spec_len = req.spec_len()
+                cur_spec_start_in_extend = cur_extend_len - cur_spec_len
+                cur_spec_start_in_seq = len(req.input_ids) - cur_spec_len
+
+                # apply sampling params
+                logits = all_logits[
+                    cur_extend_start
+                    + cur_spec_start_in_extend : cur_extend_start
+                    + cur_extend_len
+                ].clone()
+                logits.div_(req.sampling_params.temperature)
+                logits.add_(self.logit_bias[i])
+                probs = torch.softmax(logits, dim=-1)
+                top_ps = torch.full(
+                    (probs.shape[0], 1),
+                    req.sampling_params.top_p,
+                    dtype=torch.float,
+                    device="cuda",
+                )
+                top_ks = torch.full(
+                    (probs.shape[0], 1),
+                    req.sampling_params.top_k,
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                probs_sort, probs_idx = _top_p_top_k(probs, top_ps, top_ks)
+                probs = probs_sort.gather(1, probs_idx.argsort(1))
+
+                # speculative sample in tries
+                # NOTE: first id is always verified (last turn output)
+                parent_indices = np.array(req.speculate_tries.parent_indices[1:])
+                ids_indices = req.input_ids[-cur_spec_len + 1 :]
+                probs_sums = probs.sum(dim=-1).cpu().tolist()
+                spec_probs = [probs_sums[0]] + probs[
+                    parent_indices, ids_indices
+                ].cpu().tolist()
+                req.speculate_tries.fill_probs(zip(spec_probs, probs_sums))
+                verified_indices, verified_ids = req.speculate_tries.sample_tries()
+
+                # update the kv cache
+                req_pool_idx = req_pool_indices_cpu[i]
+                cur_req_to_token = self.req_to_token_pool.req_to_token[req_pool_idx]
+                all_spec_kv_indices = cur_req_to_token[
+                    cur_spec_start_in_seq : cur_spec_start_in_seq + cur_spec_len
+                ]
+                verified_kv_indices = cur_req_to_token[
+                    cur_spec_start_in_seq + np.array(verified_indices)
+                ]
+                self.token_to_kv_pool.add_refs(verified_kv_indices)
+                self.token_to_kv_pool.decrease_refs(all_spec_kv_indices)
+                cur_req_to_token[
+                    cur_spec_start_in_seq : cur_spec_start_in_seq
+                    + len(verified_kv_indices)
+                ] = verified_kv_indices
+
+                # debug print
+                # prefix_len = len(req.prefix_indices)
+                # extend_len = len(req.input_ids) - prefix_len
+                # spec_len = len(req.speculate_tries.tree_ids)
+                # print("*" * 20, "Speculative Sample", "*" * 20)
+                # print(
+                #     f"prefix tokens: #{prefix_len} {req.tokenizer.convert_ids_to_tokens((req.input_ids)[max(0, prefix_len - 10) : prefix_len])}"
+                # )
+                # print(
+                #     f"extend tokens: #{extend_len} {req.tokenizer.convert_ids_to_tokens((req.input_ids)[prefix_len:])}"
+                # )
+                # print(
+                #     f"spec tokens: #{spec_len} {req.tokenizer.convert_ids_to_tokens(req.speculate_tries.tree_ids)}"
+                # )
+                # print(
+                #     f"verified tokens: #{len(verified_ids)} {req.tokenizer.convert_ids_to_tokens(verified_ids)}"
+                # )
+                # for token, probs in zip(
+                #     req.tokenizer.convert_ids_to_tokens(verified_ids), spec_probs
+                # ):
+                #     print(f"{token}: {probs:.4f}")
+                # print("*" * 75)
+
+                # update other meta data
+                req.input_ids[-cur_spec_len:] = verified_ids
+                spec_forward_str = req.tokenizer.decode(verified_ids)
+                if req.tokenizer.convert_ids_to_tokens(verified_ids[0]).startswith("▁"):
+                    spec_forward_str = " " + spec_forward_str
+                req.gap_str = req.gap_str + spec_forward_str
+                last_logits[i] = all_logits[
+                    cur_extend_start + cur_spec_start_in_extend + verified_indices[-1]
+                ]
+                self.seq_lens[i] -= len(all_spec_kv_indices) - len(verified_kv_indices)
+                req.sampling_params.max_new_tokens = max(
+                    req.sampling_params.max_new_tokens - len(verified_ids), 0
+                )
+                # print(f"Speculative Sample: \x1b[31m{spec_forward_str}\x1b[0m")
 
     def prepare_for_decode(self, input_ids=None):
         if input_ids is None:
@@ -405,6 +623,24 @@ class Batch:
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
+
+    def cache_batch(self, cache_indices: List[int]):
+        if cache_indices is None or len(cache_indices) == 0:
+            return
+
+        # insert requests into tree_cache
+        req_pool_indices_cpu = self.req_pool_indices.cpu().tolist()
+        for idx in cache_indices:
+            req = self.reqs[idx]
+            token_ids_in_memory = tuple(req.input_ids + req.output_ids)[:-1]
+            req_pool_idx = req_pool_indices_cpu[idx]
+            indices = self.req_to_token_pool.req_to_token[
+                req_pool_idx, : len(token_ids_in_memory)
+            ]
+            prefix_len = self.tree_cache.insert(token_ids_in_memory, indices.clone())
+            self.token_to_kv_pool.free(indices[:prefix_len])
+            self.req_to_token_pool.free(req_pool_idx)
+            self.tree_cache.dec_ref_counter(req.last_node)
 
     def filter_batch(self, unfinished_indices: List[int]):
         self.reqs = [self.reqs[i] for i in unfinished_indices]

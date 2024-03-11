@@ -46,11 +46,6 @@ class DetokenizerManager:
                 # Trim stop str
                 # TODO(lmzheng): handle the case where multiple stop strs are hit
                 for i in range(len(output_strs)):
-                    if recv_obj.hit_stop_str[i] is not None:
-                        pos = output_strs[i].find(recv_obj.hit_stop_str[i])
-                        if pos != -1:
-                            output_strs[i] = output_strs[i][:pos]
-
                     if len(output_tokens[i]) > 0:
                         first_token = self.tokenizer.convert_ids_to_tokens(
                             int(output_tokens[i][0])
@@ -60,9 +55,12 @@ class DetokenizerManager:
                         if first_token.startswith("▁"):
                             output_strs[i] = " " + output_strs[i]
 
-                    output_strs[i] = (
-                        recv_obj.output_and_jump_forward_strs[i] + output_strs[i]
-                    )
+                    output_strs[i] = recv_obj.gap_strs[i] + output_strs[i]
+
+                    if recv_obj.hit_stop_str[i] is not None:
+                        pos = output_strs[i].find(recv_obj.hit_stop_str[i])
+                        if pos != -1:
+                            output_strs[i] = output_strs[i][:pos]
 
                 self.send_to_tokenizer.send_pyobj(
                     BatchStrOut(
