@@ -32,6 +32,7 @@ class ServerArgs:
     enable_flashinfer: bool = False
     disable_regex_jump_forward: bool = False
     disable_disk_cache: bool = False
+    api_key: str = ""
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -200,6 +201,12 @@ class ServerArgs:
             "--disable-disk-cache",
             action="store_true",
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
+        )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default=ServerArgs.api_key,
+            help="Set API Key",
         )
 
     @classmethod
