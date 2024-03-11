@@ -3,7 +3,6 @@ import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import List
 
 import numpy as np
 import torch
@@ -23,8 +22,8 @@ QUANTIONCONFIG_MAPPING = {"awq": AWQConfig, "gptq": GPTQConfig}
 logger = logging.getLogger("model_runner")
 
 
-# for model_mode
-global_model_mode: List[str] = []
+# for server args in model endpoints
+global_server_args = None
 
 
 @lru_cache()
@@ -81,7 +80,6 @@ class InputMetadata:
     return_logprob: bool = False
 
     # for flashinfer
-    use_flashinfer: bool = False
     qo_indptr: torch.Tensor = None
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
@@ -224,8 +222,7 @@ class InputMetadata:
         if forward_mode == ForwardMode.EXTEND:
             ret.init_extend_args()
 
-        ret.use_flashinfer = "flashinfer" in model_runner.model_mode
-        if ret.use_flashinfer:
+        if "flashinfer" in global_server_args.model_mode:
             ret.init_flashinfer_args(tp_size)
 
         return ret
@@ -239,9 +236,9 @@ class ModelRunner:
         tp_rank,
         tp_size,
         nccl_port,
+        server_args,
         load_format="auto",
         trust_remote_code=True,
-        model_mode: List[str] = (),
     ):
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
@@ -250,10 +247,9 @@ class ModelRunner:
         self.nccl_port = nccl_port
         self.load_format = load_format
         self.trust_remote_code = trust_remote_code
-        self.model_mode = model_mode
 
-        global global_model_mode
-        global_model_mode = model_mode
+        global global_server_args
+        global_server_args = server_args
 
         # Init torch distributed
         torch.cuda.set_device(self.tp_rank)
