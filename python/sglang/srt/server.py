@@ -587,6 +587,10 @@ class Runtime:
         attention_reduce_in_fp32: bool = False,
         random_seed: int = 42,
         log_level: str = "error",
+        disable_radix_cache: bool = False,
+        enable_flashinfer: bool = False,
+        disable_regex_jump_forward: bool = False,
+        disable_disk_cache: bool = False,
         api_key: str = "",
         port: Optional[int] = None,
         additional_ports: Optional[Union[List[int], int]] = None,
@@ -610,6 +614,10 @@ class Runtime:
             attention_reduce_in_fp32=attention_reduce_in_fp32,
             random_seed=random_seed,
             log_level=log_level,
+            disable_radix_cache=disable_radix_cache,
+            enable_flashinfer=enable_flashinfer,
+            disable_regex_jump_forward=disable_regex_jump_forward,
+            disable_disk_cache=disable_disk_cache,
             api_key=api_key,
         )
 
