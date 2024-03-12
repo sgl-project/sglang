@@ -135,6 +135,7 @@ class InputMetadata:
             ]
 
             # flashinfer >= 0.0.3
+            # FIXME: Drop this when flashinfer updates to 0.0.4
             if len(inspect.signature(self.prefill_wrapper.begin_forward).parameters) == 7:
                 args.append(self.model_runner.model_config.head_dim)
             
