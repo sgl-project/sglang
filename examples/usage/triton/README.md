@@ -26,7 +26,7 @@ tritonserver --model-repository=/mnt/models
 
 Send request to the server:
 ```
-curl -X POST http://localhost:8000/v2/models/character_generation/infer \
+curl -X POST http://localhost:8000/v2/models/character_generation/generate \
      -H "Content-Type: application/json" \
      -d '{
            "inputs": [
