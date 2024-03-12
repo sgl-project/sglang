@@ -18,16 +18,21 @@ class ServerArgs:
     max_prefill_num_token: Optional[int] = None
     context_length: Optional[int] = None
     tp_size: int = 1
-    model_mode: List[str] = ()
     schedule_heuristic: str = "lpm"
     schedule_conservativeness: float = 1.0
+    attention_reduce_in_fp32: bool = False
     random_seed: int = 42
     stream_interval: int = 8
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     log_level: str = "info"
+
+    # optional modes
+    disable_radix_cache: bool = False
+    enable_flashinfer: bool = False
     disable_regex_jump_forward: bool = False
     disable_disk_cache: bool = False
+    api_key: str = ""
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -131,14 +136,6 @@ class ServerArgs:
             help="Tensor parallelism degree.",
         )
         parser.add_argument(
-            "--model-mode",
-            type=str,
-            default=[],
-            nargs="+",
-            choices=["flashinfer", "no-cache"],
-            help="Model mode: [flashinfer, no-cache]",
-        )
-        parser.add_argument(
             "--schedule-heuristic",
             type=str,
             default=ServerArgs.schedule_heuristic,
@@ -155,6 +152,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.random_seed,
             help="Random seed.",
+        )
+        parser.add_argument(
+            "--attention-reduce-in-fp32",
+            action="store_true",
+            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16.",
         )
         parser.add_argument(
             "--stream-interval",
@@ -179,6 +181,17 @@ class ServerArgs:
             default=ServerArgs.log_stats_interval,
             help="Log stats interval in second.",
         )
+        # optional modes
+        parser.add_argument(
+            "--disable-radix-cache",
+            action="store_true",
+            help="Disable RadixAttention",
+        )
+        parser.add_argument(
+            "--enable-flashinfer",
+            action="store_true",
+            help="Enable flashinfer inference kernels",
+        )
         parser.add_argument(
             "--disable-regex-jump-forward",
             action="store_true",
@@ -189,6 +202,12 @@ class ServerArgs:
             action="store_true",
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
         )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default=ServerArgs.api_key,
+            help="Set API Key",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -197,6 +216,15 @@ class ServerArgs:
 
     def url(self):
         return f"http://{self.host}:{self.port}"
+
+    def get_optional_modes_logging(self):
+        return (
+            f"disable_radix_cache={self.disable_radix_cache}, "
+            f"enable_flashinfer={self.enable_flashinfer}, "
+            f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
+            f"disable_disk_cache={self.disable_disk_cache}, "
+            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}"
+        )
 
 
 @dataclasses.dataclass

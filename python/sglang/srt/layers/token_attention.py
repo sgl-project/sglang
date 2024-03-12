@@ -4,7 +4,15 @@
 import torch
 import triton
 import triton.language as tl
+from sglang.srt.managers.router.model_runner import global_server_args_dict
 from sglang.srt.utils import wrap_kernel_launcher
+
+if global_server_args_dict.get("attention_reduce_in_fp32", False):
+    REDUCE_TRITON_TYPE = tl.float32
+    REDUCE_TORCH_TYPE = torch.float32
+else:
+    REDUCE_TRITON_TYPE = tl.float16
+    REDUCE_TORCH_TYPE = torch.float16
 
 
 @triton.jit
@@ -49,7 +57,7 @@ def _fwd_kernel_stage1(
     block_mask = tl.where(block_stard_index < cur_batch_seq_len, 1, 0)
 
     for start_mark in range(0, block_mask, 1):
-        q = tl.load(Q + off_q + start_mark)
+        q = tl.load(Q + off_q + start_mark).to(REDUCE_TRITON_TYPE)
         offs_n_new = cur_batch_start_index + offs_n
         k_loc = tl.load(
             Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + offs_n_new,
@@ -65,7 +73,7 @@ def _fwd_kernel_stage1(
             K_Buffer + offs_buf_k,
             mask=offs_n_new[:, None] < cur_batch_end_index,
             other=0.0,
-        )
+        ).to(REDUCE_TRITON_TYPE)
         att_value = tl.sum(q[None, :] * k, 1)
         att_value *= sm_scale
         off_o = cur_head * att_stride_h + (cur_batch_in_all_start_index + offs_n)
@@ -161,7 +169,7 @@ def _token_att_m_fwd(
     # shape constraints
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
     assert Lq == Lk
-    assert Lk in {16, 32, 64, 128}
+    assert Lk in {16, 32, 64, 128, 256}
     sm_scale = 1.0 / (Lk**0.5)
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
@@ -299,7 +307,7 @@ def token_attention_fwd(
 ):
     if att_m is None:
         att_m = torch.empty(
-            (q.shape[-2], total_num_tokens), dtype=q.dtype, device="cuda"
+            (q.shape[-2], total_num_tokens), dtype=REDUCE_TORCH_TYPE, device="cuda"
         )
 
     _token_att_m_fwd(

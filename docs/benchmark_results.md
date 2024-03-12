@@ -11,8 +11,7 @@ We tested our system on the following common LLM workloads and reported the achi
 - **[DSPy RAG](https://github.com/stanfordnlp/dspy)**: A retrieval-augmented generation pipeline in the DSPy tutorial.
 - **[LLaVA Bench](https://github.com/haotian-liu/LLaVA)**: Running LLaVA v1.5, a vision language model on the LLaVA-in-the-wild benchmark.
 
-We tested both Llama-7B on one NVIDIA A10G GPU (24GB) and Mixtral-8x7B on 8 NVIDIA A10G GPUs with tensor parallelism, using FP16 precision. We used vllm v0.2.5, guidance v0.1.8, and Hugging Face TGI v1.3.0 as baseline systems.
-
+We tested both Llama-7B on one NVIDIA A10G GPU (24GB) and Mixtral-8x7B on 8 NVIDIA A10G GPUs with tensor parallelism, using FP16 precision. We used vllm v0.2.5, guidance v0.1.8, Hugging Face TGI v1.3.0, and SGLang v0.1.5.
 
 - Llama-7B on NVIDIA A10G, FP16, Tensor Parallelism=1
 ![llama_7b](../assets/llama_7b.jpg)

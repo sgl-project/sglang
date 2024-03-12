@@ -3,7 +3,6 @@ import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import List
 
 import numpy as np
 import torch
@@ -23,8 +22,8 @@ QUANTIONCONFIG_MAPPING = {"awq": AWQConfig, "gptq": GPTQConfig}
 logger = logging.getLogger("model_runner")
 
 
-# for model_mode
-global_model_mode: List[str] = []
+# for server args in model endpoints
+global_server_args_dict: dict = None
 
 
 @lru_cache()
@@ -81,7 +80,6 @@ class InputMetadata:
     return_logprob: bool = False
 
     # for flashinfer
-    use_flashinfer: bool = False
     qo_indptr: torch.Tensor = None
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
@@ -224,8 +222,7 @@ class InputMetadata:
         if forward_mode == ForwardMode.EXTEND:
             ret.init_extend_args()
 
-        ret.use_flashinfer = "flashinfer" in model_runner.model_mode
-        if ret.use_flashinfer:
+        if global_server_args_dict.get("enable_flashinfer", False):
             ret.init_flashinfer_args(tp_size)
 
         return ret
@@ -241,7 +238,7 @@ class ModelRunner:
         nccl_port,
         load_format="auto",
         trust_remote_code=True,
-        model_mode: List[str] = (),
+        server_args_dict: dict = {},
     ):
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
@@ -250,10 +247,9 @@ class ModelRunner:
         self.nccl_port = nccl_port
         self.load_format = load_format
         self.trust_remote_code = trust_remote_code
-        self.model_mode = model_mode
 
-        global global_model_mode
-        global_model_mode = model_mode
+        global global_server_args_dict
+        global_server_args_dict = server_args_dict
 
         # Init torch distributed
         torch.cuda.set_device(self.tp_rank)
@@ -319,9 +315,7 @@ class ModelRunner:
         available_gpu_memory = get_available_gpu_memory(
             self.tp_rank, distributed=self.tp_size > 1
         ) * (1 << 30)
-        head_dim = (
-            self.model_config.hidden_size // self.model_config.num_attention_heads
-        )
+        head_dim = self.model_config.head_dim
         head_num = self.model_config.num_key_value_heads // self.tp_size
         cell_size = head_num * head_dim * self.model_config.num_hidden_layers * 2 * 2
         rest_memory = available_gpu_memory - total_gpu_memory * (
@@ -346,8 +340,7 @@ class ModelRunner:
             self.max_total_num_token,
             dtype=torch.float16,
             head_num=self.model_config.num_key_value_heads // self.tp_size,
-            head_dim=self.model_config.hidden_size
-            // self.model_config.num_attention_heads,
+            head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
         )
 

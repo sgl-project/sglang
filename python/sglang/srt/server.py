@@ -1,6 +1,7 @@
 """SRT: SGLang Runtime"""
 
 import asyncio
+import dataclasses
 import json
 import multiprocessing as mp
 import os
@@ -53,8 +54,29 @@ from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import handle_port_init
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+API_KEY_HEADER_NAME = "X-API-Key"
+
+
+class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, api_key: str):
+        super().__init__(app)
+        self.api_key = api_key
+
+    async def dispatch(self, request: Request, call_next):
+        # extract API key from the request headers
+        api_key_header = request.headers.get(API_KEY_HEADER_NAME)
+        if not api_key_header or api_key_header != self.api_key:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Invalid API Key"},
+            )
+        response = await call_next(request)
+        return response
 
 
 app = FastAPI()
@@ -84,6 +106,11 @@ async def get_model_info():
         "model_path": tokenizer_manager.model_path,
     }
     return result
+
+
+@app.get("/get_server_args")
+async def get_server_args():
+    return dataclasses.asdict(tokenizer_manager.server_args)
 
 
 @app.get("/flush_cache")
@@ -476,6 +503,9 @@ def launch_server(server_args, pipe_finish_writer):
 
     assert proc_router.is_alive() and proc_detoken.is_alive()
 
+    if server_args.api_key and server_args.api_key != "":
+        app.add_middleware(APIKeyValidatorMiddleware, api_key=server_args.api_key)
+
     def _launch_server():
         uvicorn.run(
             app,
@@ -487,11 +517,15 @@ def launch_server(server_args, pipe_finish_writer):
         )
 
     def _wait_and_warmup():
+        headers = {}
         url = server_args.url()
-        for _ in range(60):
-            time.sleep(1)
+        if server_args.api_key and server_args.api_key != "":
+            headers[API_KEY_HEADER_NAME] = server_args.api_key
+
+        for _ in range(120):
+            time.sleep(0.5)
             try:
-                requests.get(url + "/get_model_info", timeout=5)
+                requests.get(url + "/get_model_info", timeout=5, headers=headers)
                 break
             except requests.exceptions.RequestException as e:
                 pass
@@ -514,6 +548,7 @@ def launch_server(server_args, pipe_finish_writer):
                         "max_new_tokens": 16,
                     },
                 },
+                headers=headers,
                 timeout=60,
             )
             # print(f"Warmup done. model response: {res.json()['text']}")
@@ -548,10 +583,15 @@ class Runtime:
         max_prefill_num_token: int = ServerArgs.max_prefill_num_token,
         context_length: int = ServerArgs.context_length,
         tp_size: int = 1,
-        model_mode: List[str] = (),
         schedule_heuristic: str = "lpm",
+        attention_reduce_in_fp32: bool = False,
         random_seed: int = 42,
         log_level: str = "error",
+        disable_radix_cache: bool = False,
+        enable_flashinfer: bool = False,
+        disable_regex_jump_forward: bool = False,
+        disable_disk_cache: bool = False,
+        api_key: str = "",
         port: Optional[int] = None,
         additional_ports: Optional[Union[List[int], int]] = None,
     ):
@@ -570,10 +610,15 @@ class Runtime:
             max_prefill_num_token=max_prefill_num_token,
             context_length=context_length,
             tp_size=tp_size,
-            model_mode=model_mode,
             schedule_heuristic=schedule_heuristic,
+            attention_reduce_in_fp32=attention_reduce_in_fp32,
             random_seed=random_seed,
             log_level=log_level,
+            disable_radix_cache=disable_radix_cache,
+            enable_flashinfer=enable_flashinfer,
+            disable_regex_jump_forward=disable_regex_jump_forward,
+            disable_disk_cache=disable_disk_cache,
+            api_key=api_key,
         )
 
         self.url = self.server_args.url()

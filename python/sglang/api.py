@@ -44,6 +44,20 @@ def set_default_backend(backend: BaseBackend):
     global_config.default_backend = backend
 
 
+def flush_cache(backend: BaseBackend = None):
+    backend = backend or global_config.default_backend
+    if backend is None:
+        return False
+    return backend.flush_cache()
+
+
+def get_server_args(backend: BaseBackend = None):
+    backend = backend or global_config.default_backend
+    if backend is None:
+        return None
+    return backend.get_server_args()
+
+
 def gen(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
