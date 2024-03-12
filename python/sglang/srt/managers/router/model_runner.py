@@ -12,12 +12,13 @@ from sglang.srt.utils import is_multimodal_model
 from sglang.utils import get_available_gpu_memory
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
+from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
 
 import sglang
 
-QUANTIONCONFIG_MAPPING = {"awq": AWQConfig, "gptq": GPTQConfig}
+QUANTIONCONFIG_MAPPING = {"awq": AWQConfig, "gptq": GPTQConfig, "marlin": MarlinConfig}
 
 logger = logging.getLogger("model_runner")
 
