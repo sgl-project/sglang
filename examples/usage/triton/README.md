@@ -22,3 +22,20 @@ docker exec -ti sglang-triton /bin/bash
 cd /mnt
 tritonserver --model-repository=/mnt/models
 ```
+
+
+Send request to the server:
+```
+curl -X POST http://localhost:8000/v2/models/character_generation/infer \
+     -H "Content-Type: application/json" \
+     -d '{
+           "inputs": [
+               {
+                   "name": "INPUT_TEXT",
+                   "datatype": "STRING",
+                   "shape": [1],
+                   "data": ["Name1"]
+               }
+           ]
+         }'
+```
