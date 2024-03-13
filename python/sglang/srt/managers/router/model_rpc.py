@@ -6,7 +6,6 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
-import numpy as np
 import rpyc
 import torch
 from rpyc.utils.classic import obtain

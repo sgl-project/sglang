@@ -1,10 +1,10 @@
 import importlib
-import logging
+import importlib.resources
 import inspect
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-import importlib.resources
 
 import numpy as np
 import torch
@@ -17,8 +17,6 @@ from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
-
-import sglang
 
 QUANTIONCONFIG_MAPPING = {"awq": AWQConfig, "gptq": GPTQConfig, "marlin": MarlinConfig}
 
@@ -34,7 +32,7 @@ def import_model_classes():
     model_arch_name_to_cls = {}
     for f in importlib.resources.files("sglang.srt.models").iterdir():
         if f.name.endswith(".py"):
-            module_name = Path(f.name).with_suffix('')
+            module_name = Path(f.name).with_suffix("")
             module = importlib.import_module(f"sglang.srt.models.{module_name}")
             if hasattr(module, "EntryClass"):
                 model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
@@ -140,9 +138,12 @@ class InputMetadata:
 
             # flashinfer >= 0.0.3
             # FIXME: Drop this when flashinfer updates to 0.0.4
-            if len(inspect.signature(self.prefill_wrapper.begin_forward).parameters) == 7:
+            if (
+                len(inspect.signature(self.prefill_wrapper.begin_forward).parameters)
+                == 7
+            ):
                 args.append(self.model_runner.model_config.head_dim)
-            
+
             self.prefill_wrapper.begin_forward(*args)
         else:
             self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
@@ -303,9 +304,11 @@ class ModelRunner:
                     hf_quant_method = hf_quant_config["quant_method"]
 
                     # compat: autogptq uses is_marlin_format within quant config
-                    if (hf_quant_method == "gptq"
-                            and "is_marlin_format" in hf_quant_config
-                            and hf_quant_config["is_marlin_format"]):
+                    if (
+                        hf_quant_method == "gptq"
+                        and "is_marlin_format" in hf_quant_config
+                        and hf_quant_config["is_marlin_format"]
+                    ):
                         hf_quant_method = "marlin"
                     quant_config_class = QUANTIONCONFIG_MAPPING.get(hf_quant_method)
 
