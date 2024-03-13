@@ -3,6 +3,7 @@ import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import importlib.resources
 
 import numpy as np
 import torch
@@ -29,10 +30,12 @@ global_server_args_dict: dict = None
 @lru_cache()
 def import_model_classes():
     model_arch_name_to_cls = {}
-    for module_path in (Path(sglang.__file__).parent / "srt" / "models").glob("*.py"):
-        module = importlib.import_module(f"sglang.srt.models.{module_path.stem}")
-        if hasattr(module, "EntryClass"):
-            model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
+    for f in importlib.resources.files("sglang.srt.models").iterdir():
+        if f.name.endswith(".py"):
+            module_name = Path(f.name).with_suffix('')
+            module = importlib.import_module(f"sglang.srt.models.{module_name}")
+            if hasattr(module, "EntryClass"):
+                model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
     return model_arch_name_to_cls
 
 
