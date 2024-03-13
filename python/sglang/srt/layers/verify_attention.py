@@ -221,6 +221,10 @@ def verify_attention_fwd(
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
+
+    if triton.__version__ <= "2.1.0":
+        raise RuntimeError("Require triton 2.2.0 or later")
+
     if CUDA_CAPABILITY[0] >= 8:
         BLOCK_M, BLOCK_N = 128, 128
     else:
@@ -345,8 +349,6 @@ def redundant_verify(
     b_seq_len,
     b_seq_len_prefix,
 ):
-    if triton.__version__ <= "2.1.0":
-        raise RuntimeError("Require triton 2.2.0 or later")
 
     B, H_Q, H_KV = b_start_loc.shape[0], q_extend.shape[-2], k_buffer.shape[-2]
     group_num = H_Q // H_KV
