@@ -1,3 +1,7 @@
+"""
+Mixed Attention Kernel: Extend + Verify, using FlashAttention tiling strategy.
+"""
+
 import torch
 import triton
 import triton.language as tl
@@ -196,7 +200,7 @@ def _fwd_kernel(
 cached_kernel = None
 
 
-def verify_attention_fwd(
+def verify_with_extend_attention_fwd(
     q_extend,
     k_extend,
     v_extend,
@@ -490,7 +494,7 @@ def test():
                     tree_mask[cur_idx, j, :] |= tree_mask[cur_idx, parent, :]
             tree_mask_start[cur_idx] = b_seq_len_extend[i] - tree_mask_len
 
-    verify_attention_fwd(
+    verify_with_extend_attention_fwd(
         q_extend,
         k_extend,
         v_extend,

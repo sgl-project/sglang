@@ -2,7 +2,7 @@ import torch
 from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
 from sglang.srt.layers.extend_attention import extend_attention_fwd
 from sglang.srt.layers.token_attention import token_attention_fwd
-from sglang.srt.layers.verify_attention import verify_attention_fwd
+from sglang.srt.layers.verify_extend_attention import verify_with_extend_attention_fwd
 from sglang.srt.managers.router.model_runner import ForwardMode, InputMetadata
 from torch import nn
 
@@ -48,7 +48,7 @@ class RadixAttention(nn.Module):
         self.store_kv_cache(k, v, input_metadata)
 
         if input_metadata.tree_mask is not None and len(input_metadata.tree_mask) != 0:
-            forward_func = verify_attention_fwd
+            forward_func = verify_with_extend_attention_fwd
             tree_mask_args = (
                 input_metadata.tree_mask,
                 input_metadata.tree_mask_start,
