@@ -25,6 +25,9 @@ def _fwd_kernel_stage1(
     Q_Flatten,
     Att_M,
     K_Buffer,
+    Tree_Mask_Flatten,
+    Tree_Mask_Start_Loc,
+    Tree_Mask_Lens,
     Req_To_Tokens,
     B_Req_Indices,
     B_Seq_Lens,
@@ -81,6 +84,10 @@ def _fwd_kernel_stage1(
             tl.store(Att_M + offs_att_m, att_value, mask=mask_n)
         return
 
+    cur_tree_mask_start = tl.load(Tree_Mask_Start_Loc + cur_seq)
+    cur_tree_mask_len = tl.load(Tree_Mask_Lens + cur_seq)
+    cur_un_tree_mask_len = cur_qo_len - cur_tree_mask_len
+
     for start_m in range(0, cur_qo_len, BLOCK_M):
         start_m = tl.multiple_of(start_m, BLOCK_M)
         offs_m = start_m + tl.arange(0, BLOCK_M)
@@ -109,9 +116,28 @@ def _fwd_kernel_stage1(
         mask = offs_m[:, None] >= (offs_n[None, :] - cur_pre_len)  # causal mask
         mask &= mask_m[:, None] & mask_n[None, :]
 
+        # tree mask
+        tree_mask_offs = (
+            cur_tree_mask_start
+            + (offs_m[:, None] - cur_un_tree_mask_len) * cur_tree_mask_len
+            + offs_n[None, :]
+            - (cur_seq_len - cur_tree_mask_len)
+        )
+        tree_mask_offs_mask = tl.where(
+            (offs_m[:, None] >= cur_un_tree_mask_len)
+            & (offs_m[:, None] < cur_qo_len)
+            & (offs_n[None, :] >= cur_seq_len - cur_tree_mask_len)
+            & (offs_n[None, :] < cur_seq_len),
+            1,
+            0,
+        ).to(tl.int1)
+        tree_mask = tl.load(
+            Tree_Mask_Flatten + tree_mask_offs, mask=tree_mask_offs_mask, other=1
+        ).to(tl.int1)
+
         qk = tl.dot(q, k)
         qk *= sm_scale
-        qk = tl.where(mask, qk, float("-inf"))
+        qk = tl.where(mask & tree_mask, qk, float("-inf"))
 
         offs_att_m = (
             cur_head * stride_att_m_h
@@ -213,6 +239,9 @@ def _fused_att_m_fwd(
     q_flatten,
     att_m,
     k_buffer,
+    tree_mask_flatten,
+    tree_mask_start_loc,
+    tree_mask_lens,
     req_to_tokens,
     b_req_indices,
     b_seq_lens,
@@ -238,6 +267,9 @@ def _fused_att_m_fwd(
         q_flatten,
         att_m,
         k_buffer,
+        tree_mask_flatten,
+        tree_mask_start_loc,
+        tree_mask_lens,
         req_to_tokens,
         b_req_indices,
         b_seq_lens,
@@ -309,6 +341,9 @@ def verify_with_token_attention_fwd(
     o_flatten,
     k_buffer,
     v_buffer,
+    tree_mask_flatten,
+    tree_mask_start_loc,
+    tree_mask_lens,
     req_to_tokens,
     b_req_indices,
     b_seq_lens,
@@ -338,6 +373,9 @@ def verify_with_token_attention_fwd(
         q_flatten,
         att_m,
         k_buffer,
+        tree_mask_flatten,
+        tree_mask_start_loc,
+        tree_mask_lens,
         req_to_tokens,
         b_req_indices,
         b_seq_lens,
@@ -366,7 +404,6 @@ def test():
     dtype, device = torch.float16, "cuda"
 
     b_seq_lens = torch.randint(1, N_CTX, (B,), dtype=torch.int32, device=device)
-    b_qo_lens = torch.full_like(b_seq_lens, 1)
     total_num_tokens = b_seq_lens.sum().item()
     max_len_in_batch = b_seq_lens.max().item()
     k_buffer = torch.normal(
@@ -377,10 +414,13 @@ def test():
     )
     b_req_indices = torch.arange(0, B, dtype=torch.int32, device=device)
     req_to_tokens = torch.empty((B, max_len_in_batch), dtype=torch.int32, device=device)
+    b_start_loc = torch.zeros_like(b_seq_lens)
+    b_start_loc[1:] = torch.cumsum(b_seq_lens, dim=0)[:-1]
 
-    q = torch.normal(0.1, 0.2, (B, H_Q, D), dtype=dtype, device=device)
-    o_0 = torch.empty_like(q)
-    o_1 = torch.empty_like(q)
+    tree_mask_flatten = torch.empty((0,), dtype=torch.int32, device=device)
+    tree_mask_start_loc = torch.zeros_like(b_seq_lens)
+    tree_mask_lens = torch.zeros_like(b_seq_lens)
+    b_qo_lens = torch.zeros_like(b_seq_lens)
 
     pt = 0
     for i in range(B):
@@ -389,27 +429,84 @@ def test():
             pt, pt + cur_seq_len, device=device
         )
         pt += cur_seq_len
-    b_start_loc = torch.zeros_like(b_seq_lens)
-    b_start_loc[1:] = torch.cumsum(b_seq_lens, dim=0)[:-1]
+
+        if torch.rand(1).item() < 0.01:
+            b_qo_lens[i] = 1
+            tree_mask_start_loc[i] = tree_mask_flatten.shape[0]
+            tree_mask_lens[i] = 0
+        else:
+            b_qo_len = torch.randint(1, min(cur_seq_len, 32), (1,)).item()
+            tree_mask_len = torch.randint(1, b_qo_len + 1, (1,)).item()
+
+            b_qo_lens[i] = b_qo_len
+            tree_mask_start_loc[i] = tree_mask_flatten.shape[0]
+            tree_mask_lens[i] = tree_mask_len
+
+            tree_mask = torch.zeros(
+                (tree_mask_len, tree_mask_len), dtype=torch.bool, device=device
+            )
+
+            for j in range(tree_mask_len):
+                tree_mask[j, j] = 1
+                if j > 0:
+                    parent = torch.randint(0, j, (1,)).item()
+                    # parent = j - 1
+                    tree_mask[j, :] |= tree_mask[parent, :]
+
+            tree_mask_flatten = torch.cat([tree_mask_flatten, tree_mask.flatten()])
+
+    q_flatten = torch.empty(
+        (b_qo_lens.sum().item(), H_Q, D), dtype=dtype, device=device
+    ).normal_(0.1, 0.2)
+    o_0 = torch.empty_like(q_flatten)
+    o_1 = torch.empty_like(q_flatten)
+
+    # Another style parameters
+    max_tree_mask_len = tree_mask_lens.max().item()
+    tree_mask_ct = (tree_mask_lens != 0).sum().item()
+    tree_mask = torch.zeros(
+        (tree_mask_ct, max_tree_mask_len, max_tree_mask_len),
+        dtype=torch.bool,
+        device=device,
+    )
+    tree_mask_start = torch.zeros(tree_mask_ct, dtype=torch.int32, device=device)
+    tree_mask_idx = torch.zeros(B, dtype=torch.int32, device=device)
+
+    ct, start = 0, 0
+    for i in range(B):
+        if tree_mask_lens[i] != 0:
+            tree_mask_len = tree_mask_lens[i].item()
+            tree_mask_start[ct] = b_qo_lens[i].item() - tree_mask_len
+            tree_mask_idx[i] = ct
+            tree_mask[ct, :tree_mask_len, :tree_mask_len] = tree_mask_flatten[
+                start : start + tree_mask_len * tree_mask_len
+            ].view(tree_mask_len, tree_mask_len)
+            start += tree_mask_len * tree_mask_len
+            ct += 1
+        else:
+            tree_mask_idx[i] = -1
 
     redundant_verify(
-        q,
+        q_flatten,
         o_0,
         k_buffer,
         v_buffer,
-        None,
-        None,
-        torch.full_like(b_seq_lens, -1),
+        tree_mask,
+        tree_mask_start,
+        tree_mask_idx,
         b_start_loc,
         b_seq_lens,
-        b_seq_lens - 1,
+        b_seq_lens - b_qo_lens,
     )
 
     verify_with_token_attention_fwd(
-        q,
+        q_flatten,
         o_1,
         k_buffer,
         v_buffer,
+        tree_mask_flatten,
+        tree_mask_start_loc,
+        tree_mask_lens,
         req_to_tokens,
         b_req_indices,
         b_seq_lens,
