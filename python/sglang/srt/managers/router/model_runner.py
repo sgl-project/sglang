@@ -88,9 +88,9 @@ class InputMetadata:
     decode_wrapper = None
 
     # for speculative decoding
-    tree_mask: torch.Tensor = None
-    tree_mask_start: torch.Tensor = None
-    tree_mask_idx: torch.Tensor = None
+    tree_mask_flatten: torch.Tensor = None
+    tree_mask_start_loc: torch.Tensor = None
+    tree_mask_lens: torch.Tensor = None
 
     def init_flashinfer_args(self, tp_size):
         from flashinfer import (
@@ -173,9 +173,9 @@ class InputMetadata:
         out_cache_cont_start=None,
         out_cache_cont_end=None,
         return_logprob=False,
-        tree_mask=None,
-        tree_mask_start=None,
-        tree_mask_idx=None,
+        tree_mask_flatten=None,
+        tree_mask_start_loc=None,
+        tree_mask_lens=None,
         tree_depths=None,
     ):
         batch_size = len(req_pool_indices)
@@ -193,39 +193,30 @@ class InputMetadata:
             seq_lens_np = seq_lens.cpu().numpy()
             prefix_lens_np = prefix_lens.cpu().numpy()
             position_ids_offsets_np = position_ids_offsets.cpu().numpy()
-            tree_mask_idx_np = (
-                tree_mask_idx.cpu().numpy()
-                if tree_mask_idx is not None
-                else np.full((batch_size,), -1)
+            tree_mask_lens_np = (
+                tree_mask_lens.cpu().numpy()
+                if tree_mask_lens is not None
+                else np.zeros(batch_size)
             )
-            tree_mask_start_np = (
-                tree_mask_start.cpu().numpy() if tree_mask_start is not None else None
-            )
+            un_mask_lens_np = seq_lens_np - prefix_lens_np - tree_mask_lens_np
 
             positions = torch.tensor(
                 np.concatenate(
                     [
-                        (
-                            np.arange(
-                                prefix_lens_np[i] + position_ids_offsets_np[i],
-                                seq_lens_np[i] + position_ids_offsets_np[i],
-                            )
-                            if tree_mask_idx_np[i] < 0
-                            else np.concatenate(  # resolve the positions according nodes' depth
-                                [
-                                    np.arange(
-                                        prefix_lens_np[i] + position_ids_offsets_np[i],
-                                        prefix_lens_np[i]
-                                        + tree_mask_start_np[tree_mask_idx_np[i]]
-                                        + position_ids_offsets_np[i],
-                                    ),
+                        np.concatenate(  # resolve the positions according nodes' depth
+                            [
+                                np.arange(
+                                    prefix_lens_np[i] + position_ids_offsets_np[i],
                                     prefix_lens_np[i]
-                                    + tree_mask_start_np[tree_mask_idx_np[i]]
-                                    + position_ids_offsets_np[i]
-                                    + np.array(tree_depths[tree_mask_idx_np[i]])
-                                    - 1,
-                                ]
-                            )
+                                    + un_mask_lens_np[i]
+                                    + position_ids_offsets_np[i],
+                                ),
+                                prefix_lens_np[i]
+                                + un_mask_lens_np[i]
+                                + position_ids_offsets_np[i]
+                                + np.array(tree_depths[i], dtype=np.int32)
+                                - 1,
+                            ]
                         )
                         for i in range(batch_size)
                     ],
@@ -253,9 +244,9 @@ class InputMetadata:
             out_cache_cont_end=out_cache_cont_end,
             return_logprob=return_logprob,
             other_kv_index=other_kv_index,
-            tree_mask=tree_mask,
-            tree_mask_start=tree_mask_start,
-            tree_mask_idx=tree_mask_idx,
+            tree_mask_flatten=tree_mask_flatten,
+            tree_mask_start_loc=tree_mask_start_loc,
+            tree_mask_lens=tree_mask_lens,
         )
 
         if forward_mode == ForwardMode.EXTEND:
@@ -417,9 +408,9 @@ class ModelRunner:
         position_ids_offsets,
         out_cache_loc,
         return_logprob,
-        tree_mask,
-        tree_mask_start,
-        tree_mask_idx,
+        tree_mask_flatten,
+        tree_mask_start_loc,
+        tree_mask_lens,
         tree_depths,
     ):
         input_metadata = InputMetadata.create(
@@ -432,9 +423,9 @@ class ModelRunner:
             position_ids_offsets=position_ids_offsets,
             out_cache_loc=out_cache_loc,
             return_logprob=return_logprob,
-            tree_mask=tree_mask,
-            tree_mask_start=tree_mask_start,
-            tree_mask_idx=tree_mask_idx,
+            tree_mask_flatten=tree_mask_flatten,
+            tree_mask_start_loc=tree_mask_start_loc,
+            tree_mask_lens=tree_mask_lens,
             tree_depths=tree_depths,
         )
         return self.model.forward(input_ids, input_metadata.positions, input_metadata)
@@ -532,9 +523,9 @@ class ModelRunner:
             kwargs["out_cache_cont_end"] = batch.out_cache_cont_end
             return self.forward_decode(**kwargs)
         elif forward_mode == ForwardMode.EXTEND:
-            kwargs["tree_mask"] = batch.tree_mask
-            kwargs["tree_mask_start"] = batch.tree_mask_start
-            kwargs["tree_mask_idx"] = batch.tree_mask_idx
+            kwargs["tree_mask_flatten"] = batch.tree_mask_flatten
+            kwargs["tree_mask_start_loc"] = batch.tree_mask_start_loc
+            kwargs["tree_mask_lens"] = batch.tree_mask_lens
             kwargs["tree_depths"] = batch.tree_depths
             return self.forward_extend(**kwargs)
         elif forward_mode == ForwardMode.PREFILL:

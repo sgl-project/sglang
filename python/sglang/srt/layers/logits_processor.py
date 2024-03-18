@@ -29,7 +29,8 @@ class LogitsProcessor(nn.Module):
             )
 
         return_all_logits = (
-            input_metadata.tree_mask is not None and len(input_metadata.tree_mask) != 0
+            input_metadata.tree_mask_flatten is not None
+            and len(input_metadata.tree_mask_flatten) != 0
         )
 
         if not input_metadata.return_logprob and not return_all_logits:

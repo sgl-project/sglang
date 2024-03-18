@@ -47,12 +47,15 @@ class RadixAttention(nn.Module):
         o = torch.empty_like(q)
         self.store_kv_cache(k, v, input_metadata)
 
-        if input_metadata.tree_mask is not None and len(input_metadata.tree_mask) != 0:
+        if (
+            input_metadata.tree_mask_flatten is not None
+            and len(input_metadata.tree_mask_flatten) != 0
+        ):
             forward_func = verify_with_extend_attention_fwd
             tree_mask_args = (
-                input_metadata.tree_mask,
-                input_metadata.tree_mask_start,
-                input_metadata.tree_mask_idx,
+                input_metadata.tree_mask_flatten,
+                input_metadata.tree_mask_start_loc,
+                input_metadata.tree_mask_lens,
             )
         else:
             forward_func = extend_attention_fwd

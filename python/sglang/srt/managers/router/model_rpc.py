@@ -429,7 +429,10 @@ class ModelRpcServer(rpyc.Service):
                 batch, ForwardMode.EXTEND, batch.return_logprob
             )
 
-            if batch.tree_mask is not None and len(batch.tree_mask) != 0:
+            if (
+                batch.tree_mask_flatten is not None
+                and len(batch.tree_mask_flatten) != 0
+            ):
                 batch.speculative_sample(all_logits, logits)
 
             if prefill_logprobs is not None:

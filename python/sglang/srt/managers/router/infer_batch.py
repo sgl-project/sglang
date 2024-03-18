@@ -194,9 +194,9 @@ class Batch:
     logit_bias: torch.Tensor = None
 
     # batched tree mask
-    tree_mask: torch.Tensor = None
-    tree_mask_start: torch.Tensor = None
-    tree_mask_idx: torch.Tensor = None
+    tree_mask_flatten: torch.Tensor = None
+    tree_mask_start_loc: torch.Tensor = None
+    tree_mask_lens: torch.Tensor = None
     tree_depths: List[List[int]] = None
 
     @classmethod
@@ -228,14 +228,8 @@ class Batch:
         req_pool_indices_cpu = req_pool_indices.cpu().numpy()
 
         # init tree mask args
-        max_spec_tokens_len = max(r.spec_len() for r in self.reqs)
-        num_spec_reqs = sum(r.spec_len() > 0 for r in self.reqs)
-        tree_mask = np.zeros(
-            (num_spec_reqs, max_spec_tokens_len, max_spec_tokens_len),
-            dtype=np.int32,
-        )
-        tree_mask_start, tree_mask_idx, tree_depths = [], [], []
-        tree_mask_ct = 0
+        tree_mask_flatten = np.zeros((0,), dtype=np.int32)
+        tree_mask_start_loc, tree_mask_lens, tree_depths = [], [], []
 
         # Handle prefix indices && flatten input ids
         for i, r in enumerate(self.reqs):
@@ -252,17 +246,17 @@ class Batch:
                 ] = r.prefix_indices
 
             # handle tree mask
-            if r.spec_len() > 0:
-                tree_ids_len = r.spec_len()
-                tree_mask[tree_mask_ct, :tree_ids_len, :tree_ids_len] = (
-                    r.speculate_tries.tree_mask
-                )
-                tree_mask_start.append(seq_len - prefix_len - tree_ids_len)
-                tree_mask_idx.append(tree_mask_ct)
-                tree_depths.append(r.speculate_tries.tree_depths)
-                tree_mask_ct += 1
+            if r.spec_len() == 0:
+                tree_mask_start_loc.append(tree_mask_flatten.shape[0])
+                tree_mask_lens.append(0)
+                tree_depths.append([])
             else:
-                tree_mask_idx.append(-1)
+                tree_mask_start_loc.append(tree_mask_flatten.shape[0])
+                tree_mask_lens.append(r.spec_len())
+                tree_mask_flatten = np.concatenate(
+                    (tree_mask_flatten, r.speculate_tries.tree_mask.flatten())
+                )
+                tree_depths.append(r.speculate_tries.tree_depths)
 
         # Alloc mem
         seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
@@ -333,19 +327,17 @@ class Batch:
         )
         self.logit_bias = logit_bias
 
-        if len(tree_mask) != 0:
-            self.tree_mask = torch.tensor(tree_mask, dtype=torch.int32, device=device)
-            self.tree_mask_start = torch.tensor(
-                tree_mask_start, dtype=torch.int32, device=device
-            )
-            self.tree_mask_idx = torch.tensor(
-                tree_mask_idx, dtype=torch.int32, device=device
-            )
-            self.tree_depths = tree_depths
-        else:
-            self.tree_mask = self.tree_mask_start = self.tree_mask_idx = (
-                self.tree_depths
-            ) = None
+        # assign tree mask fields
+        self.tree_mask_flatten = torch.tensor(
+            tree_mask_flatten, dtype=torch.int32, device=device
+        )
+        self.tree_mask_start_loc = torch.tensor(
+            tree_mask_start_loc, dtype=torch.int32, device=device
+        )
+        self.tree_mask_lens = torch.tensor(
+            tree_mask_lens, dtype=torch.int32, device=device
+        )
+        self.tree_depths = tree_depths
 
     def check_decode_mem(self):
         bs = len(self.reqs)

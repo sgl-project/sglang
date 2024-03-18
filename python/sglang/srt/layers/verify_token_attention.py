@@ -86,7 +86,7 @@ def _fwd_kernel_stage1(
 
     cur_tree_mask_start = tl.load(Tree_Mask_Start_Loc + cur_seq)
     cur_tree_mask_len = tl.load(Tree_Mask_Lens + cur_seq)
-    cur_un_tree_mask_len = cur_qo_len - cur_tree_mask_len
+    cur_un_mask_len = cur_qo_len - cur_tree_mask_len
 
     for start_m in range(0, cur_qo_len, BLOCK_M):
         start_m = tl.multiple_of(start_m, BLOCK_M)
@@ -119,12 +119,12 @@ def _fwd_kernel_stage1(
         # tree mask
         tree_mask_offs = (
             cur_tree_mask_start
-            + (offs_m[:, None] - cur_un_tree_mask_len) * cur_tree_mask_len
+            + (offs_m[:, None] - cur_un_mask_len) * cur_tree_mask_len
             + offs_n[None, :]
             - (cur_seq_len - cur_tree_mask_len)
         )
         tree_mask_offs_mask = tl.where(
-            (offs_m[:, None] >= cur_un_tree_mask_len)
+            (offs_m[:, None] >= cur_un_mask_len)
             & (offs_m[:, None] < cur_qo_len)
             & (offs_n[None, :] >= cur_seq_len - cur_tree_mask_len)
             & (offs_n[None, :] < cur_seq_len),
@@ -430,7 +430,7 @@ def test():
         )
         pt += cur_seq_len
 
-        if torch.rand(1).item() < 0.01:
+        if torch.rand(1).item() < 0.2:
             b_qo_lens[i] = 1
             tree_mask_start_loc[i] = tree_mask_flatten.shape[0]
             tree_mask_lens[i] = 0
@@ -461,39 +461,14 @@ def test():
     o_0 = torch.empty_like(q_flatten)
     o_1 = torch.empty_like(q_flatten)
 
-    # Another style parameters
-    max_tree_mask_len = tree_mask_lens.max().item()
-    tree_mask_ct = (tree_mask_lens != 0).sum().item()
-    tree_mask = torch.zeros(
-        (tree_mask_ct, max_tree_mask_len, max_tree_mask_len),
-        dtype=torch.bool,
-        device=device,
-    )
-    tree_mask_start = torch.zeros(tree_mask_ct, dtype=torch.int32, device=device)
-    tree_mask_idx = torch.zeros(B, dtype=torch.int32, device=device)
-
-    ct, start = 0, 0
-    for i in range(B):
-        if tree_mask_lens[i] != 0:
-            tree_mask_len = tree_mask_lens[i].item()
-            tree_mask_start[ct] = b_qo_lens[i].item() - tree_mask_len
-            tree_mask_idx[i] = ct
-            tree_mask[ct, :tree_mask_len, :tree_mask_len] = tree_mask_flatten[
-                start : start + tree_mask_len * tree_mask_len
-            ].view(tree_mask_len, tree_mask_len)
-            start += tree_mask_len * tree_mask_len
-            ct += 1
-        else:
-            tree_mask_idx[i] = -1
-
     redundant_verify(
         q_flatten,
         o_0,
         k_buffer,
         v_buffer,
-        tree_mask,
-        tree_mask_start,
-        tree_mask_idx,
+        tree_mask_flatten,
+        tree_mask_start_loc,
+        tree_mask_lens,
         b_start_loc,
         b_seq_lens,
         b_seq_lens - b_qo_lens,
