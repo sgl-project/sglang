@@ -17,7 +17,7 @@ python3 bench_sglang.py --nsub 10
 
 ```
 # OpenAI models
-python3 bench_sglang.py --backend gpt-3.5-turbo
+python3 bench_sglang.py --backend gpt-3.5-turbo --parallel 8
 ```
 
 ### Benchmark vllm
