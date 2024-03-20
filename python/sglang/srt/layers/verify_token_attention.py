@@ -349,6 +349,8 @@ def verify_with_token_attention_fwd(
     b_seq_lens,
     b_qo_lens,
 ):
+    tree_mask_flatten = tree_mask_flatten.to(torch.bool)
+
     Lq, Lo, Lk, Lv = (
         q_flatten.shape[-1],
         o_flatten.shape[-1],
@@ -417,7 +419,7 @@ def test():
     b_start_loc = torch.zeros_like(b_seq_lens)
     b_start_loc[1:] = torch.cumsum(b_seq_lens, dim=0)[:-1]
 
-    tree_mask_flatten = torch.empty((0,), dtype=torch.int32, device=device)
+    tree_mask_flatten = torch.empty((0,), dtype=torch.bool, device=device)
     tree_mask_start_loc = torch.zeros_like(b_seq_lens)
     tree_mask_lens = torch.zeros_like(b_seq_lens)
     b_qo_lens = torch.zeros_like(b_seq_lens)

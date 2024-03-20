@@ -246,7 +246,7 @@ def verify_with_extend_attention_fwd(
     assert (
         tree_mask is not None and len(tree_mask) > 0
     ), "No tree mask provided, use extend kernel instead"
-    tree_mask = tree_mask.to(torch.int32)  # convert to int32 to avoid triton bug
+    tree_mask = tree_mask.to(torch.bool)
 
     global cached_kernel
     if cached_kernel:
@@ -449,7 +449,7 @@ def test():
 
     ########## TEST TREE VERIFICATION ##########
 
-    tree_mask_flatten = torch.empty((0,), dtype=torch.int32, device="cuda")
+    tree_mask_flatten = torch.empty((0,), dtype=torch.bool, device="cuda")
     tree_mask_start_loc = torch.zeros_like(b_seq_len)
     tree_mask_lens = torch.zeros_like(b_seq_len)
 
@@ -463,7 +463,7 @@ def test():
             tree_mask_start_loc[i] = tree_mask_flatten.shape[0]
             tree_mask_lens[i] = tree_mask_len
             tree_mask = torch.zeros(
-                (tree_mask_len, tree_mask_len), dtype=torch.int32, device="cuda"
+                (tree_mask_len, tree_mask_len), dtype=torch.bool, device="cuda"
             )
 
             for j in range(tree_mask_len):
