@@ -88,6 +88,7 @@ class InputMetadata:
     decode_wrapper = None
 
     # for speculative decoding
+    b_qo_lens: torch.Tensor = None
     tree_mask_flatten: torch.Tensor = None
     tree_mask_start_loc: torch.Tensor = None
     tree_mask_lens: torch.Tensor = None
@@ -173,6 +174,7 @@ class InputMetadata:
         out_cache_cont_start=None,
         out_cache_cont_end=None,
         return_logprob=False,
+        b_qo_lens=None,
         tree_mask_flatten=None,
         tree_mask_start_loc=None,
         tree_mask_lens=None,
@@ -188,6 +190,41 @@ class InputMetadata:
             positions = ((seq_lens - 1) + position_ids_offsets).to(torch.int64)
             other_kv_index = model_runner.req_to_token_pool.req_to_token[
                 req_pool_indices[0], seq_lens[0] - 1
+            ].item()
+        elif forward_mode == ForwardMode.VERIFY_WITH_DECODE:
+            seq_lens_np = seq_lens.cpu().numpy()
+            b_qo_lens_cpu = b_qo_lens.cpu().numpy()
+            tree_mask_lens_np = tree_mask_lens.cpu().numpy()
+            position_ids_offsets_np = position_ids_offsets.cpu().numpy()
+
+            positions = torch.tensor(
+                np.concatenate(
+                    [
+                        np.concatenate(  # resolve the positions according nodes' depth
+                            [
+                                np.arange(
+                                    seq_lens_np[i]
+                                    - b_qo_lens_cpu[i]
+                                    + position_ids_offsets_np[i],
+                                    seq_lens_np[i]
+                                    - tree_mask_lens_np[i]
+                                    + position_ids_offsets_np[i],
+                                ),
+                                seq_lens_np[i]
+                                - tree_mask_lens_np[i]
+                                + position_ids_offsets_np[i]
+                                + np.array(tree_depths[i], dtype=np.int32)
+                                - 1,
+                            ]
+                        )
+                        for i in range(batch_size)
+                    ],
+                    axis=0,
+                ),
+                device="cuda",
+            )
+            other_kv_index = model_runner.req_to_token_pool.req_to_token[
+                req_pool_indices[0], seq_lens_np[0] - 1
             ].item()
         else:
             seq_lens_np = seq_lens.cpu().numpy()
@@ -244,6 +281,7 @@ class InputMetadata:
             out_cache_cont_end=out_cache_cont_end,
             return_logprob=return_logprob,
             other_kv_index=other_kv_index,
+            b_qo_lens=b_qo_lens,
             tree_mask_flatten=tree_mask_flatten,
             tree_mask_start_loc=tree_mask_start_loc,
             tree_mask_lens=tree_mask_lens,
@@ -459,6 +497,40 @@ class ModelRunner:
         return self.model.forward(input_ids, input_metadata.positions, input_metadata)
 
     @torch.inference_mode()
+    def forward_verify_with_decode(
+        self,
+        input_ids,
+        req_pool_indices,
+        seq_lens,
+        prefix_lens,
+        position_ids_offsets,
+        out_cache_loc,
+        return_logprob,
+        b_qo_lens,
+        tree_mask_flatten,
+        tree_mask_start_loc,
+        tree_mask_lens,
+        tree_depths,
+    ):
+        input_metadata = InputMetadata.create(
+            self,
+            forward_mode=ForwardMode.VERIFY_WITH_DECODE,
+            tp_size=self.tp_size,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            position_ids_offsets=position_ids_offsets,
+            out_cache_loc=out_cache_loc,
+            return_logprob=return_logprob,
+            b_qo_lens=b_qo_lens,
+            tree_mask_flatten=tree_mask_flatten,
+            tree_mask_start_loc=tree_mask_start_loc,
+            tree_mask_lens=tree_mask_lens,
+            tree_depths=tree_depths,
+        )
+        return self.model.forward(input_ids, input_metadata.positions, input_metadata)
+
+    @torch.inference_mode()
     def forward_extend_multi_modal(
         self,
         input_ids,
@@ -522,6 +594,13 @@ class ModelRunner:
             kwargs["out_cache_cont_start"] = batch.out_cache_cont_start
             kwargs["out_cache_cont_end"] = batch.out_cache_cont_end
             return self.forward_decode(**kwargs)
+        elif forward_mode == ForwardMode.VERIFY_WITH_DECODE:
+            kwargs["b_qo_lens"] = batch.b_qo_lens
+            kwargs["tree_mask_flatten"] = batch.tree_mask_flatten
+            kwargs["tree_mask_start_loc"] = batch.tree_mask_start_loc
+            kwargs["tree_mask_lens"] = batch.tree_mask_lens
+            kwargs["tree_depths"] = batch.tree_depths
+            return self.forward_verify_with_decode(**kwargs)
         elif forward_mode == ForwardMode.EXTEND:
             kwargs["tree_mask_flatten"] = batch.tree_mask_flatten
             kwargs["tree_mask_start_loc"] = batch.tree_mask_start_loc

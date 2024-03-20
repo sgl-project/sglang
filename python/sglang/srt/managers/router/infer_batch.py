@@ -13,6 +13,8 @@ class ForwardMode(Enum):
     PREFILL = auto()
     EXTEND = auto()
     DECODE = auto()
+    VERIFY_WITH_DECODE = auto()
+    VERIFY_WITH_EXTEND = auto()
 
 
 class FinishReason(Enum):
@@ -37,6 +39,8 @@ class Req:
         # include fast-forward part (jump-forward, speculate)
         # and the non-empty output_ids when doing fast-forward
         self.gap_str = ""
+        # For checking the stop str
+        self.last_turn_decode_tokens = 0
 
         # For vision input
         self.pixel_values = None
@@ -137,9 +141,14 @@ class Req:
             return
 
         if len(self.sampling_params.stop_strs) > 0:
-            tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
+            max_possible_len = (
+                self.last_turn_decode_tokens + self.sampling_params.stop_str_max_len + 1
             )
+            tail_ids = self.output_ids[-max_possible_len:]
+            tail_str = self.tokenizer.decode(tail_ids)
+            if self.tokenizer.convert_ids_to_tokens(tail_ids[0]).startswith("▁"):
+                tail_str = " " + tail_str
+
             # When len(self.output_ids) == 1, the gap_str is just refreshed
             if len(self.output_ids) == 1:
                 tail_str = self.gap_str + tail_str
@@ -194,6 +203,7 @@ class Batch:
     logit_bias: torch.Tensor = None
 
     # batched tree mask
+    b_qo_lens: torch.Tensor = None
     tree_mask_flatten: torch.Tensor = None
     tree_mask_start_loc: torch.Tensor = None
     tree_mask_lens: torch.Tensor = None
@@ -426,7 +436,7 @@ class Batch:
 
         return jump_forward_reqs
 
-    def check_for_speculative(self):
+    def check_for_speculative(self, filter_out: bool = False):
         spec_indices = []
         filter_indices = []
 
@@ -441,6 +451,9 @@ class Batch:
                     continue
 
             filter_indices.append(i)
+
+        if not filter_out:
+            return []
 
         # insert requests into tree_cache
         self.cache_batch(spec_indices)
@@ -483,7 +496,7 @@ class Batch:
 
         return spec_reqs
 
-    def speculative_sample(self, all_logits, last_logits):
+    def speculative_sample_extend(self, all_logits, last_logits):
         extend_starts = np.array([0] + [req.extend_input_len for req in self.reqs])
         extend_starts = np.cumsum(extend_starts)
         req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
@@ -584,6 +597,157 @@ class Batch:
                     req.sampling_params.max_new_tokens - len(verified_ids), 0
                 )
                 # print(f"Speculative Sample: \x1b[31m{spec_forward_str}\x1b[0m")
+
+    def speculative_sample_decode(self, all_logits, last_logits):
+        qo_lens_cpu = self.b_qo_lens.cpu().numpy()
+        qo_lens_start_cpu = np.cumsum(np.concatenate(([0], qo_lens_cpu[:-1])))
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
+
+        for i, req in enumerate(self.reqs):
+            if req.spec_len() > 0:
+                cur_qo_start = qo_lens_start_cpu[i]
+                cur_qo_len = qo_lens_cpu[i]
+                cur_spec_len = req.spec_len()
+                cur_seq_len = len(req.input_ids) + len(req.output_ids)
+                assert cur_spec_len == cur_qo_len
+
+                logits = all_logits[cur_qo_start : cur_qo_start + cur_qo_len].clone()
+                logits.div_(req.sampling_params.temperature)
+                logits.add_(self.logit_bias[i])
+                probs = torch.softmax(logits, dim=-1)
+                top_ps = torch.full(
+                    (probs.shape[0], 1),
+                    req.sampling_params.top_p,
+                    dtype=torch.float,
+                    device="cuda",
+                )
+                top_ks = torch.full(
+                    (probs.shape[0], 1),
+                    req.sampling_params.top_k,
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                probs_sort, probs_idx = _top_p_top_k(probs, top_ps, top_ks)
+                probs = probs_sort.gather(1, probs_idx.argsort(1))
+
+                # speculative sample in tries
+                # NOTE: first id is always verified (last turn output)
+                parent_indices = np.array(req.speculate_tries.parent_indices[1:])
+                ids_indices = req.speculate_tries.tree_ids[1:]
+                probs_sums = probs.sum(dim=-1).cpu().tolist()
+                spec_probs = [probs_sums[0]] + probs[
+                    parent_indices, ids_indices
+                ].cpu().tolist()
+                req.speculate_tries.fill_probs(zip(spec_probs, probs_sums))
+                verified_indices, verified_ids = req.speculate_tries.sample_tries()
+
+                # debug print
+                # all_ids = req.input_ids + req.output_ids
+                # prev_ids = all_ids[:-cur_spec_len]
+                # print("*" * 20, "Speculative Sample", "*" * 20)
+                # print(
+                #     f"previous tokens: {req.tokenizer.convert_ids_to_tokens(prev_ids[-10:])}"
+                # )
+                # print(
+                #     f"spec tokens: {req.tokenizer.convert_ids_to_tokens(req.speculate_tries.tree_ids)}"
+                # )
+                # print(
+                #     f"verified tokens: {req.tokenizer.convert_ids_to_tokens(verified_ids)}"
+                # )
+                # for token, probs in zip(
+                #     req.tokenizer.convert_ids_to_tokens(req.speculate_tries.tree_ids),
+                #     spec_probs,
+                # ):
+                #     print(f"{token}: {probs:.4f}")
+                # print("*" * 75)
+
+                # update the kv cache
+                req_pool_idx = req_pool_indices_cpu[i]
+                cur_req_to_token = self.req_to_token_pool.req_to_token[req_pool_idx]
+                cur_spec_start_in_seq = cur_seq_len - cur_spec_len
+                all_spec_kv_indices = cur_req_to_token[
+                    cur_spec_start_in_seq:cur_seq_len
+                ]
+                verified_kv_indice = cur_req_to_token[
+                    cur_spec_start_in_seq + np.array(verified_indices)
+                ]
+                self.token_to_kv_pool.add_refs(verified_kv_indice)
+                self.token_to_kv_pool.decrease_refs(all_spec_kv_indices)
+                cur_req_to_token[
+                    cur_spec_start_in_seq : cur_spec_start_in_seq
+                    + len(verified_kv_indice)
+                ] = verified_kv_indice
+
+                # update other meta data
+                req.output_ids[-cur_spec_len:] = verified_ids
+                last_logits[i] = all_logits[cur_qo_start + verified_indices[-1]]
+                self.seq_lens[i] -= len(all_spec_kv_indices) - len(verified_kv_indice)
+                req.last_turn_decode_tokens = len(verified_ids) - 1
+                # print(
+                #     f"Speculative Sample: \x1b[31m{req.tokenizer.decode(verified_ids)}\x1b[0m"
+                # )
+
+    def prepare_for_verify_with_decode(self):
+        tree_mask_flatten = np.zeros((0,), dtype=np.int32)
+        tree_mask_start_loc, tree_mask_lens, tree_mask_depths = [], [], []
+        input_ids, b_qo_lens = [], []
+
+        for r in self.reqs:
+            if r.spec_len() > 0:
+                tree_mask_start_loc.append(tree_mask_flatten.shape[0])
+                tree_mask_lens.append(r.spec_len())
+                tree_mask_depths.append(r.speculate_tries.tree_depths)
+                tree_mask_flatten = np.concatenate(
+                    (tree_mask_flatten, r.speculate_tries.tree_mask.flatten())
+                )
+
+                input_ids.extend(r.speculate_tries.tree_ids)
+                b_qo_lens.append(r.spec_len())
+                r.output_ids.extend(r.speculate_tries.tree_ids[1:])
+            else:
+                tree_mask_start_loc.append(tree_mask_flatten.shape[0])
+                tree_mask_lens.append(0)
+                tree_mask_depths.append([])
+                input_ids.append(r.output_ids[-1])
+                b_qo_lens.append(1)
+
+        qo_num_tokens = sum(b_qo_lens)
+        self.out_cache_loc = self.token_to_kv_pool.alloc(qo_num_tokens)
+        self.out_cache_cont_start = None
+        self.out_cache_cont_end = None
+
+        if self.out_cache_loc is None:
+            if not self.tree_cache.disable:
+                self.tree_cache.evict(qo_num_tokens, self.token_to_kv_pool.free)
+                self.out_cache_loc = self.token_to_kv_pool.alloc(qo_num_tokens)
+
+            if self.out_cache_loc is None:
+                print("Decode verification out of memory. This should nerver happen.")
+                self.tree_cache.pretty_print()
+                exit()
+
+        pt = 0
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
+        for i in range(len(self.reqs)):
+            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
+                seq_lens_cpu[i] : seq_lens_cpu[i] + b_qo_lens[i]
+            ] = self.out_cache_loc[pt : pt + b_qo_lens[i]]
+            pt += b_qo_lens[i]
+
+        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
+        self.b_qo_lens = torch.tensor(b_qo_lens, dtype=torch.int32, device="cuda")
+        self.seq_lens = self.seq_lens + self.b_qo_lens
+        self.tree_mask_flatten = torch.tensor(
+            tree_mask_flatten, dtype=torch.int32, device="cuda"
+        )
+        self.tree_mask_start_loc = torch.tensor(
+            tree_mask_start_loc, dtype=torch.int32, device="cuda"
+        )
+        self.tree_mask_lens = torch.tensor(
+            tree_mask_lens, dtype=torch.int32, device="cuda"
+        )
+        self.tree_depths = tree_mask_depths
 
     def prepare_for_decode(self, input_ids=None):
         if input_ids is None:

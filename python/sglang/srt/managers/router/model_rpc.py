@@ -433,7 +433,7 @@ class ModelRpcServer(rpyc.Service):
                 batch.tree_mask_flatten is not None
                 and len(batch.tree_mask_flatten) != 0
             ):
-                batch.speculative_sample(all_logits, logits)
+                batch.speculative_sample_extend(all_logits, logits)
 
             if prefill_logprobs is not None:
                 logprobs = prefill_logprobs.cpu().tolist()
@@ -496,14 +496,30 @@ class ModelRpcServer(rpyc.Service):
 
         # Update batch tensors
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
-        batch.prepare_for_decode()
+        if self.disable_reference_speculate:
+            batch.prepare_for_decode()
+        else:
+            batch.prepare_for_verify_with_decode()
 
         # Forward
-        logits, (_, _, _, last_logprobs) = self.model_runner.forward(
+        forward_mode = (
+            ForwardMode.VERIFY_WITH_DECODE
+            if batch.tree_mask_flatten is not None
+            and batch.tree_mask_flatten.shape[0] > 0
+            else ForwardMode.DECODE
+        )
+        logits, (all_logits, _, _, last_logprobs) = self.model_runner.forward(
             batch,
-            ForwardMode.DECODE,
+            forward_mode,
             batch.return_logprob,
         )
+
+        # reset last_turn_decode_tokens
+        for r in batch.reqs:
+            r.last_turn_decode_tokens = 0
+        if forward_mode == ForwardMode.VERIFY_WITH_DECODE:
+            batch.speculative_sample_decode(all_logits, logits)
+
         next_token_ids, _ = batch.sample(logits)
         next_token_ids = next_token_ids.cpu().tolist()
 
@@ -518,6 +534,7 @@ class ModelRpcServer(rpyc.Service):
         for i, (req, next_tok_id) in enumerate(zip(reqs, next_token_ids)):
             req.decode_tokens += 1
             req.output_ids.append(next_tok_id)
+            req.last_turn_decode_tokens += 1
             req.check_finished()
 
             if last_logprobs is not None:

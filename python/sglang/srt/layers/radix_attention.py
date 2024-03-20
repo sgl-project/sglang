@@ -3,6 +3,7 @@ from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
 from sglang.srt.layers.extend_attention import extend_attention_fwd
 from sglang.srt.layers.token_attention import token_attention_fwd
 from sglang.srt.layers.verify_extend_attention import verify_with_extend_attention_fwd
+from sglang.srt.layers.verify_token_attention import verify_with_token_attention_fwd
 from sglang.srt.managers.router.model_runner import ForwardMode, InputMetadata
 from torch import nn
 
@@ -26,6 +27,8 @@ class RadixAttention(nn.Module):
             self.prefill_forward = self.prefill_forward_triton
             self.extend_forward = self.extend_forward_triton
             self.decode_forward = self.decode_forward_triton
+
+        self.verify_with_decode_forward = self.verify_with_decode_forward_triton
 
     def prefill_forward_triton(self, q, k, v, input_metadata: InputMetadata):
         o = torch.empty_like(q)
@@ -102,6 +105,26 @@ class RadixAttention(nn.Module):
 
         return o
 
+    def verify_with_decode_forward_triton(self, q, k, v, input_metadata: InputMetadata):
+        o = torch.empty_like(q)
+        self.store_kv_cache(k, v, input_metadata)
+
+        verify_with_token_attention_fwd(
+            q.view(-1, self.tp_q_head_num, self.head_dim),
+            o.view(-1, self.tp_q_head_num, self.head_dim),
+            input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id),
+            input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id),
+            input_metadata.tree_mask_flatten,
+            input_metadata.tree_mask_start_loc,
+            input_metadata.tree_mask_lens,
+            input_metadata.req_to_token_pool.req_to_token,
+            input_metadata.req_pool_indices,
+            input_metadata.seq_lens,
+            input_metadata.b_qo_lens,
+        )
+
+        return o
+
     def prefill_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         self.store_kv_cache(k, v, input_metadata)
 
@@ -132,6 +155,10 @@ class RadixAttention(nn.Module):
             return self.extend_forward(q, k, v, input_metadata)
         elif input_metadata.forward_mode == ForwardMode.DECODE:
             return self.decode_forward(q, k, v, input_metadata)
+        elif input_metadata.forward_mode == ForwardMode.VERIFY_WITH_DECODE:
+            return self.verify_with_decode_forward(q, k, v, input_metadata)
+        else:
+            raise ValueError(f"Unsupported forward mode: {input_metadata.forward_mode}")
 
     def store_kv_cache(self, cache_k, cache_v, input_metadata: InputMetadata):
         key_buffer = input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id)
