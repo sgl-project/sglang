@@ -52,7 +52,7 @@ def batch():
 
 
 if __name__ == "__main__":
-    sgl.set_default_backend(sgl.Anthropic("claude-2"))
+    sgl.set_default_backend(sgl.Anthropic("claude-3-haiku-20240307"))
 
     # Run a single request
     print("\n========== single ==========\n")

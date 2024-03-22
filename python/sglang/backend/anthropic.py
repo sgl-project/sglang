@@ -30,13 +30,17 @@ class Anthropic(BaseBackend):
         s: StreamExecutor,
         sampling_params: SglSamplingParams,
     ):
-        prompt = s.text_
-        ret = anthropic.Anthropic().completions.create(
+        if s.messages_:
+            messages = s.messages_
+        else:
+            messages = [{"role": "user", "content": s.text_}]
+
+        ret = anthropic.Anthropic().messages.create(
             model=self.model_name,
-            prompt=prompt,
+            messages=messages,
             **sampling_params.to_anthropic_kwargs(),
         )
-        comp = ret.completion
+        comp = ret.content[0].text
 
         return comp, {}
 
@@ -45,13 +49,15 @@ class Anthropic(BaseBackend):
         s: StreamExecutor,
         sampling_params: SglSamplingParams,
     ):
-        prompt = s.text_
-        generator = anthropic.Anthropic().completions.create(
-            model=self.model_name,
-            prompt=prompt,
-            stream=True,
-            **sampling_params.to_anthropic_kwargs(),
-        )
+        if s.messages_:
+            messages = s.messages_
+        else:
+            messages = [{"role": "user", "content": s.text_}]
 
-        for ret in generator:
-            yield ret.completion, {}
+        with anthropic.Anthropic().messages.stream(
+            model=self.model_name,
+            messages=messages,
+            **sampling_params.to_anthropic_kwargs(),
+        ) as stream:
+            for text in stream.text_stream:
+                yield text, {}
