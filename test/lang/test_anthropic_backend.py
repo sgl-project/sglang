@@ -14,7 +14,7 @@ class TestAnthropicBackend(unittest.TestCase):
         cls = type(self)
 
         if cls.backend is None:
-            cls.backend = Anthropic("claude-2")
+            cls.backend = Anthropic("claude-3-haiku-20240307")
             set_default_backend(cls.backend)
 
     def test_mt_bench(self):
