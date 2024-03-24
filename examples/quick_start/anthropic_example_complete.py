@@ -19,7 +19,7 @@ def few_shot_qa(s, question):
 \n\nAssistant: Rome
 """)
     s += "\n\nHuman: " + question + "\n"
-    s += "\n\nAssistant:" + sgl.gen("answer", stop="\n", temperature=0)
+    s += "\n\nAssistant:" + sgl.gen("answer", temperature=0)
 
 
 def single():
@@ -52,7 +52,7 @@ def batch():
 
 
 if __name__ == "__main__":
-    sgl.set_default_backend(sgl.Anthropic("claude-2"))
+    sgl.set_default_backend(sgl.Anthropic("claude-3-haiku-20240307"))
 
     # Run a single request
     print("\n========== single ==========\n")

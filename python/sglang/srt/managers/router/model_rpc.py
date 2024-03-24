@@ -89,7 +89,6 @@ class ModelRpcServer:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
             )
-        self.eos_token_id = self.tokenizer.eos_token_id
         self.max_total_num_token = self.model_runner.max_total_num_token
         self.max_num_running_seq = self.max_total_num_token // 2
         self.max_prefill_num_token = max(

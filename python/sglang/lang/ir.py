@@ -73,7 +73,7 @@ class SglSamplingParams:
                 "Regular expression is not supported in the Anthropic backend."
             )
         return {
-            "max_tokens_to_sample": self.max_new_tokens,
+            "max_tokens": self.max_new_tokens,
             "stop_sequences": (
                 self.stop if isinstance(self.stop, (list, tuple)) else [self.stop]
             ),

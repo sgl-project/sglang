@@ -64,10 +64,16 @@ def evaluate(args, subject, dev_df, test_df):
     #####################################
 
     import sglang as sgl
-    
-    @sgl.function
-    def few_shot_mmlu(s, examples, question):
-        s += examples + question + sgl.gen("answer")
+
+    if args.backend.startswith("gpt-"):
+        @sgl.function
+        def few_shot_mmlu(s, examples, question):
+            s += sgl.user(examples + question)
+            s += sgl.assistant(sgl.gen("answer"))
+    else:
+        @sgl.function
+        def few_shot_mmlu(s, examples, question):
+            s += examples + question + sgl.gen("answer")
 
     #####################################
     ########## SGL Program End ##########

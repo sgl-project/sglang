@@ -155,7 +155,7 @@ def select_sglang_backend(args):
             global_config.enable_parallel_decoding = False
             global_config.enable_parallel_encoding = False
         backend = RuntimeEndpoint(f"{args.host}:{args.port}")
-    elif args.backend.startswith("gpt"):
+    elif args.backend.startswith("gpt-"):
         backend = OpenAI(args.backend)
     else:
         raise ValueError(f"Invalid backend: {args.backend}")

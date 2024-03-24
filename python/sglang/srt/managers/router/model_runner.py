@@ -2,9 +2,9 @@ import importlib
 import importlib.resources
 import inspect
 import logging
+import pkgutil
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -30,10 +30,11 @@ global_server_args_dict: dict = None
 @lru_cache()
 def import_model_classes():
     model_arch_name_to_cls = {}
-    for f in importlib.resources.files("sglang.srt.models").iterdir():
-        if f.name.endswith(".py"):
-            module_name = Path(f.name).with_suffix("")
-            module = importlib.import_module(f"sglang.srt.models.{module_name}")
+    package_name = "sglang.srt.models"
+    package = importlib.import_module(package_name)
+    for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
+        if not ispkg:
+            module = importlib.import_module(name)
             if hasattr(module, "EntryClass"):
                 model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
     return model_arch_name_to_cls

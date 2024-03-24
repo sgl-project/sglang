@@ -36,7 +36,6 @@ class ReqState:
     out_list: List
     finished: bool
     event: asyncio.Event
-    lock: asyncio.Lock
 
 
 global global_processor
@@ -178,9 +177,8 @@ class TokenizerManager:
             )
             self.send_to_router.send_pyobj(tokenized_obj)
 
-            lock = asyncio.Lock()
             event = asyncio.Event()
-            state = ReqState([], False, event, lock)
+            state = ReqState([], False, event)
             self.rid_to_state[rid] = state
 
             while True:
@@ -221,9 +219,8 @@ class TokenizerManager:
                 )
                 self.send_to_router.send_pyobj(tokenized_obj)
 
-                lock = asyncio.Lock()
                 event = asyncio.Event()
-                state = ReqState([], False, event, lock)
+                state = ReqState([], False, event)
                 self.rid_to_state[rid] = state
 
             output_list = []
