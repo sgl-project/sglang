@@ -9,8 +9,9 @@ from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
 
 try:
-    import openai
     import tiktoken
+
+    import openai
 except ImportError as e:
     openai = tiktoken = e
 
