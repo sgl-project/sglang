@@ -6,7 +6,6 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
-import numpy as np
 import rpyc
 import torch
 from rpyc.utils.classic import obtain
@@ -36,8 +35,8 @@ from vllm.logger import _default_handler as vllm_default_handler
 logger = logging.getLogger("model_rpc")
 
 
-class ModelRpcServer(rpyc.Service):
-    def exposed_init_model(
+class ModelRpcServer:
+    def __init__(
         self,
         tp_rank: int,
         server_args: ServerArgs,
@@ -608,14 +607,19 @@ class ModelRpcServer(rpyc.Service):
                 batch.reqs = []
 
 
+class ModelRpcService(rpyc.Service):
+    exposed_ModelRpcServer = ModelRpcServer
+
+
 class ModelRpcClient:
     def __init__(self, server_args: ServerArgs, port_args: PortArgs):
         tp_size = server_args.tp_size
 
         if tp_size == 1:
             # Init model
-            self.model_server = ModelRpcServer()
-            self.model_server.exposed_init_model(0, server_args, port_args)
+            self.model_server = ModelRpcService().exposed_ModelRpcServer(
+                0, server_args, port_args
+            )
 
             # Wrap functions
             def async_wrap(f):
@@ -629,14 +633,16 @@ class ModelRpcClient:
             with ThreadPoolExecutor(tp_size) as executor:
                 # Launch model processes
                 rets = executor.map(start_model_process, port_args.model_rpc_ports)
-                self.model_servers = [x[0] for x in rets]
+                self.remote_services = [x[0] for x in rets]
                 self.procs = [x[1] for x in rets]
 
                 # Init model
                 def init_model(i):
-                    return self.model_servers[i].init_model(i, server_args, port_args)
+                    return self.remote_services[i].ModelRpcServer(
+                        i, server_args, port_args
+                    )
 
-                rets = [obtain(x) for x in executor.map(init_model, range(tp_size))]
+                self.model_servers = executor.map(init_model, range(tp_size))
 
             # Wrap functions
             def async_wrap(func_name):
@@ -654,7 +660,7 @@ class ModelRpcClient:
 
 def _init_service(port):
     t = ThreadedServer(
-        ModelRpcServer(),
+        ModelRpcService(),
         port=port,
         protocol_config={"allow_pickle": True, "sync_request_timeout": 1800},
     )
