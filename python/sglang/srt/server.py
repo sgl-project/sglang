@@ -47,7 +47,7 @@ from sglang.srt.managers.openai_protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     DeltaMessage,
-    TokenLogProb,
+    LogProbs,
     UsageInfo,
 )
 from sglang.srt.managers.router.manager import start_router_process
@@ -177,13 +177,15 @@ async def stream_generator(obj: GenerateReqInput):
 
 
 async def make_openai_style_logprobs(token_logprobs):
-    ret_logprobs = []
+    ret_logprobs = LogProbs()
 
-    for logprob, token_id, token_text in token_logprobs:
-        token_logprob = TokenLogProb(
-            logprob=logprob, token_id=token_id, token_text=token_text
-        )
-        ret_logprobs.append(token_logprob)
+    for logprob, _, token_text in token_logprobs:
+        ret_logprobs.tokens.append(token_text)
+        ret_logprobs.token_logprobs.append(logprob)
+
+        # Not supported yet.
+        ret_logprobs.top_logprobs.append({})
+        ret_logprobs.text_offset.append(-1)
     return ret_logprobs
 
 
@@ -247,7 +249,7 @@ async def v1_completions(raw_request: Request):
                         text = request.prompt + text
 
                 if request.logprobs:
-                    logprobs = []
+                    logprobs = LogProbs()
                     # The first chunk and echo is enabled.
                     if not stream_buffer and request.echo:
                         prefill_token_logprobs = await make_openai_style_logprobs(
@@ -298,7 +300,7 @@ async def v1_completions(raw_request: Request):
         text = request.prompt + text
 
     if request.logprobs:
-        logprobs = []
+        logprobs = LogProbs()
         if request.echo:
             prefill_token_logprobs = await make_openai_style_logprobs(
                 ret["meta_info"]["prefill_token_logprobs"]

@@ -5,16 +5,17 @@ from pydantic import BaseModel, Field
 from typing_extensions import Literal
 
 
-class TopLogProbs(BaseModel):
-    # TODO: not supported yet
-    pass
+class LogProbs(BaseModel):
+    text_offset: List[int] = Field(default_factory=list)
+    token_logprobs: List[Optional[float]] = Field(default_factory=list)
+    tokens: List[str] = Field(default_factory=list)
+    top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
-
-class TokenLogProb(BaseModel):
-    logprob: Optional[float] = None
-    token_id: int
-    token_text: Optional[str] = None
-    top_logprobs: Optional[TopLogProbs] = None
+    def extend(self, other: "LogProbs"):
+        self.text_offset.extend(other.text_offset)
+        self.token_logprobs.extend(other.token_logprobs)
+        self.tokens.extend(other.tokens)
+        self.top_logprobs.extend(other.top_logprobs)
 
 
 class UsageInfo(BaseModel):
@@ -48,7 +49,7 @@ class CompletionRequest(BaseModel):
 class CompletionResponseChoice(BaseModel):
     index: int
     text: str
-    logprobs: Optional[List[TokenLogProb]] = None
+    logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
 
 
@@ -64,7 +65,7 @@ class CompletionResponse(BaseModel):
 class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
-    logprobs: Optional[List[TokenLogProb]] = None
+    logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
 
 
