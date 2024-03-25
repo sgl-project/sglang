@@ -464,7 +464,7 @@ class StreamExecutor:
             name = expr.name
             self.variables[name] = decision
             self.meta_info[name] = {
-                "normalized_prompt_logprob": normalized_prompt_logprobs,
+                "normalized_prompt_logprobs": normalized_prompt_logprobs,
                 "prefill_token_logprobs": prefill_token_logprobs,
                 "decode_token_logprobs": decode_token_logprobs,
             }
