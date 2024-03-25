@@ -13,29 +13,27 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
 
-    def _get_normalized_logprobs(
-        self, all_logprobs, input_ids, input_metadata: InputMetadata
+    def _get_normalized_prompt_logprobs(
+        self, prefill_token_logprobs, input_metadata: InputMetadata
     ):
-        # Compute the logprobs and normalized logprobs for the prefill tokens.
-        # Note that we pad a zero at the end of each sequence for easy computation.
-        prefill_logprobs = all_logprobs[
-            torch.arange(all_logprobs.shape[0], device="cuda"),
-            torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
-        ]
-        logprobs_cumsum = torch.cumsum(prefill_logprobs, dim=0, dtype=torch.float32)
+        logprobs_cumsum = torch.cumsum(
+            prefill_token_logprobs, dim=0, dtype=torch.float32
+        )
 
         start = input_metadata.extend_start_loc.clone()
         end = start + input_metadata.extend_seq_lens - 2
-        start.clamp_(min=0, max=prefill_logprobs.shape[0] - 1)
-        end.clamp_(min=0, max=prefill_logprobs.shape[0] - 1)
+        start.clamp_(min=0, max=prefill_token_logprobs.shape[0] - 1)
+        end.clamp_(min=0, max=prefill_token_logprobs.shape[0] - 1)
         sum_logp = (
-            logprobs_cumsum[end] - logprobs_cumsum[start] + prefill_logprobs[start]
+            logprobs_cumsum[end]
+            - logprobs_cumsum[start]
+            + prefill_token_logprobs[start]
         )
-        normalized_logprobs = sum_logp / (
+        normalized_prompt_logprobs = sum_logp / (
             (input_metadata.extend_seq_lens - 1).clamp(min=1)
         )
 
-        return prefill_logprobs, normalized_logprobs
+        return normalized_prompt_logprobs
 
     def forward(self, input_ids, hidden_states, weight, input_metadata: InputMetadata):
         # Get last index for next token prediction, except for DECODE mode.
@@ -74,16 +72,25 @@ class LogitsProcessor(nn.Module):
             all_logprobs = torch.log(torch.softmax(all_logits.float(), dim=-1) + 1e-6)
 
             if input_metadata.forward_mode == ForwardMode.DECODE:
-                return last_logits, (None, None, all_logprobs)
+                last_logprobs = all_logprobs
+                return last_logits, (None, None, last_logprobs)
             else:
                 # Compute the logprobs for the last token of each request.
                 last_logprobs = all_logprobs[last_index]
-                prefill_logprobs, normalized_logprobs = self._get_normalized_logprobs(
-                    all_logprobs, input_ids, input_metadata
+
+                # Compute the logprobs and normalized logprobs for the prefill tokens.
+                # Note that we pad a zero at the end of each sequence for easy computation.
+                prefill_token_logprobs = all_logprobs[
+                    torch.arange(all_logprobs.shape[0], device="cuda"),
+                    torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
+                ]
+
+                normalized_prompt_logprobs = self._get_normalized_prompt_logprobs(
+                    prefill_token_logprobs, input_metadata
                 )
                 return last_logits, (
-                    prefill_logprobs,
-                    normalized_logprobs,
+                    prefill_token_logprobs,
+                    normalized_prompt_logprobs,
                     last_logprobs,
                 )
 
@@ -97,23 +104,22 @@ if __name__ == "__main__":
     )
     seq_lens = torch.tensor([2, 0, 3, 0], dtype=torch.int32, device="cuda")
     input_ids = torch.tensor([1, 2, 3, 0, 1], dtype=torch.int32, device="cuda")
-    logprobs = torch.zeros(5, dtype=torch.float32, device="cuda")
 
-    logprobs = all_logprobs[
+    token_logprobs = all_logprobs[
         torch.arange(all_logprobs.shape[0], device="cuda"),
         torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
     ]
-    logprobs_cumsum = torch.cumsum(logprobs, dim=0, dtype=torch.float32)
+    logprobs_cumsum = torch.cumsum(token_logprobs, dim=0, dtype=torch.float32)
 
     len_cumsum = torch.cumsum(seq_lens, dim=0)
     start = torch.cat((torch.tensor([0], device="cuda"), len_cumsum[:-1]), 0)
     end = start + seq_lens - 2
-    start.clamp_(min=0, max=logprobs.shape[0] - 1)
-    end.clamp_(min=0, max=logprobs.shape[0] - 1)
-    sum_logp = logprobs_cumsum[end] - logprobs_cumsum[start] + logprobs[start]
+    start.clamp_(min=0, max=token_logprobs.shape[0] - 1)
+    end.clamp_(min=0, max=token_logprobs.shape[0] - 1)
+    sum_logp = logprobs_cumsum[end] - logprobs_cumsum[start] + token_logprobs[start]
 
     # assert logprobs == [2, _, 2, 4, _]
-    print("logprobs", logprobs)
+    print("token logprobs", token_logprobs)
     print("start", start)
     print("end", end)
     print("sum_logp", sum_logp)
