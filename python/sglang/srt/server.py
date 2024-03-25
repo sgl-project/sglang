@@ -136,18 +136,21 @@ async def detokenize_logprob_tokens(token_logprobs, decode_to_text):
 
 
 async def handle_token_logprobs_results(obj: GenerateReqInput, ret):
+    """
+    Convert the style `(logprobs, token_id)` into `(logprobs, token_id, token_text)`
+    """
     # NOTE: This is because the multiple requests in one http request.
 
     if isinstance(obj.text, str):
         if obj.return_logprob:
             ret["meta_info"]["prefill_token_logprobs"] = (
                 await detokenize_logprob_tokens(
-                    ret["meta_info"]["prefill_token_logprobs_with_ids"],
+                    ret["meta_info"]["prefill_token_logprobs"],
                     obj.return_text_in_logprobs,
                 )
             )
             ret["meta_info"]["decode_token_logprobs"] = await detokenize_logprob_tokens(
-                ret["meta_info"]["decode_token_logprobs_with_ids"],
+                ret["meta_info"]["decode_token_logprobs"],
                 obj.return_text_in_logprobs,
             )
     else:
@@ -155,13 +158,13 @@ async def handle_token_logprobs_results(obj: GenerateReqInput, ret):
             if obj.return_logprob[i]:
                 r["meta_info"]["prefill_token_logprobs"] = (
                     await detokenize_logprob_tokens(
-                        r["meta_info"]["prefill_token_logprobs_with_ids"],
+                        r["meta_info"]["prefill_token_logprobs"],
                         obj.return_text_in_logprobs,
                     )
                 )
                 r["meta_info"]["decode_token_logprobs"] = (
                     await detokenize_logprob_tokens(
-                        r["meta_info"]["decode_token_logprobs_with_ids"],
+                        r["meta_info"]["decode_token_logprobs"],
                         obj.return_text_in_logprobs,
                     )
                 )

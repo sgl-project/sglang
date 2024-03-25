@@ -54,8 +54,8 @@ class Req:
         self.prefix_indices = []
         self.last_node = None
 
-        self.prefill_token_logprobs_with_ids = None
-        self.decode_token_logprobs_with_ids = None
+        self.prefill_token_logprobs = None
+        self.decode_token_logprobs = None
         self.normalized_prompt_logprob = None
 
         # For constrained decoding

@@ -437,17 +437,17 @@ class ModelRpcServer:
 
             if prefill_token_logprobs is not None:
                 # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
-                req.prefill_token_logprobs_with_ids = list(
+                req.prefill_token_logprobs = list(
                     zip(
                         prefill_token_logprobs[pt : pt + req.extend_input_len - 1],
                         req.input_ids[-req.extend_input_len + 1 :],
                     )
                 )
                 if req.logprob_start_len == 0:
-                    req.prefill_token_logprobs_with_ids = [
+                    req.prefill_token_logprobs = [
                         (None, req.input_ids[0])
-                    ] + req.prefill_token_logprobs_with_ids
-                req.decode_token_logprobs_with_ids = [
+                    ] + req.prefill_token_logprobs
+                req.decode_token_logprobs = [
                     (last_token_logprobs[i], next_token_ids[i])
                 ]
                 req.normalized_prompt_logprob = normalized_prompt_logprobs[i]
@@ -521,9 +521,7 @@ class ModelRpcServer:
             req.check_finished()
 
             if new_token_logprobs is not None:
-                req.decode_token_logprobs_with_ids.append(
-                    (new_token_logprobs[i], next_token_id)
-                )
+                req.decode_token_logprobs.append((new_token_logprobs[i], next_token_id))
 
         self.handle_finished_requests(batch)
 
@@ -569,12 +567,12 @@ class ModelRpcServer:
                 }
                 if req.return_logprob:
                     (
-                        meta_info["prefill_token_logprobs_with_ids"],
-                        meta_info["decode_token_logprobs_with_ids"],
+                        meta_info["prefill_token_logprobs"],
+                        meta_info["decode_token_logprobs"],
                         meta_info["normalized_prompt_logprob"],
                     ) = (
-                        req.prefill_token_logprobs_with_ids,
-                        req.decode_token_logprobs_with_ids,
+                        req.prefill_token_logprobs,
+                        req.decode_token_logprobs,
                         req.normalized_prompt_logprob,
                     )
                 output_meta_info.append(meta_info)
