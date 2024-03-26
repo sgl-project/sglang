@@ -27,8 +27,7 @@ class CompletionRequest(BaseModel):
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
     stream: Optional[bool] = False
-    logprobs: Optional[bool] = None
-    top_logprobs: Optional[int] = None
+    logprobs: Optional[int] = None
     echo: Optional[bool] = False
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     presence_penalty: Optional[float] = 0.0

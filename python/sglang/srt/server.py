@@ -249,8 +249,8 @@ async def v1_completions(raw_request: Request):
             "frequency_penalty": request.frequency_penalty,
             "regex": request.regex,
         },
-        return_logprob=request.logprobs is not None and request.logprobs,
-        top_logprobs_num=request.top_logprobs,
+        return_logprob=request.logprobs is not None and request.logprobs > 0,
+        top_logprobs_num=request.logprobs if request.logprobs is not None else 0,
         return_text_in_logprobs=True,
         stream=request.stream,
     )
