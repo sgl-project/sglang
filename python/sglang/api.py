@@ -15,6 +15,7 @@ from sglang.lang.ir import (
     SglFunction,
     SglGen,
     SglImage,
+    SglVideo,
     SglRoleBegin,
     SglRoleEnd,
     SglSelect,
@@ -151,6 +152,9 @@ def gen_string(
 
 def image(expr: SglExpr):
     return SglImage(expr)
+
+def video(expr: SglExpr):
+    return SglVideo(expr)
 
 
 def select(

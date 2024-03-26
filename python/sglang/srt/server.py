@@ -522,19 +522,22 @@ def launch_server(server_args, pipe_finish_writer):
         if server_args.api_key and server_args.api_key != "":
             headers[API_KEY_HEADER_NAME] = server_args.api_key
 
+        success = False  # Flag to indicate if the request was successful
         for _ in range(120):
             time.sleep(0.5)
             try:
                 requests.get(url + "/get_model_info", timeout=5, headers=headers)
+                success = True  # Set flag to True if request succeeds
                 break
             except requests.exceptions.RequestException as e:
-                pass
-        else:
+                last_exception = e  # Store the last exception
+
+        if not success:  # Check if the request never succeeded
+            error_message = str(last_exception) if 'last_exception' in locals() else "Failed to connect to the server."
             if pipe_finish_writer is not None:
-                pipe_finish_writer.send(str(e))
+                pipe_finish_writer.send(error_message)
             else:
-                print(e, flush=True)
-            return
+                print(error_message, flush=True)
 
         # Warmup
         try:
@@ -549,7 +552,7 @@ def launch_server(server_args, pipe_finish_writer):
                     },
                 },
                 headers=headers,
-                timeout=60,
+                timeout=600,
             )
             # print(f"Warmup done. model response: {res.json()['text']}")
             # print("=" * 20, "Server is ready", "=" * 20, flush=True)
@@ -597,6 +600,7 @@ class Runtime:
     ):
         host = "127.0.0.1"
         port, additional_ports = handle_port_init(port, additional_ports, tp_size)
+        print(port, additional_ports)
         self.server_args = ServerArgs(
             model_path=model_path,
             tokenizer_path=tokenizer_path,
