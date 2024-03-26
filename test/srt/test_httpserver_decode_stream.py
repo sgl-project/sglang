@@ -13,7 +13,7 @@ import json
 import requests
 
 
-def test_decode_stream(url, return_logprob):
+def test_decode_stream(url, return_logprob, top_logprobs_num):
     response = requests.post(
         url + "/generate",
         json={
@@ -24,6 +24,7 @@ def test_decode_stream(url, return_logprob):
             },
             "stream": True,
             "return_logprob": return_logprob,
+            "top_logprobs_num": top_logprobs_num,
             "return_text_in_logprobs": True,
         },
         stream=True,
@@ -50,7 +51,8 @@ def test_decode_stream(url, return_logprob):
                 output = data["text"].strip()
                 print(output[prev:], end="", flush=True)
                 prev = len(output)
-    print("")
+
+    print("=" * 100)
 
 
 if __name__ == "__main__":
@@ -61,5 +63,6 @@ if __name__ == "__main__":
 
     url = f"{args.host}:{args.port}"
 
-    test_decode_stream(url, False)
-    test_decode_stream(url, True)
+    test_decode_stream(url, False, 0)
+    test_decode_stream(url, True, 0)
+    test_decode_stream(url, True, 3)
