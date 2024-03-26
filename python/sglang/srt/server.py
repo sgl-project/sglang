@@ -135,39 +135,40 @@ async def detokenize_logprob_tokens(token_logprobs, decode_to_text):
     ]
 
 
+async def detokenize_top_logprobs_tokens(top_logprobs, decode_to_text):
+    for i, t in enumerate(top_logprobs):
+        if top_logprobs[i] is not None:
+            top_logprobs[i] = await detokenize_logprob_tokens(t, decode_to_text)
+    return top_logprobs
+
+
 async def handle_token_logprobs_results(obj: GenerateReqInput, ret):
     """
     Convert the style `(logprobs, token_id)` into `(logprobs, token_id, token_text)`
     """
     # NOTE: This is because the multiple requests in one http request.
 
+    async def convert_style(r, return_text):
+        r["meta_info"]["prefill_token_logprobs"] = await detokenize_logprob_tokens(
+            r["meta_info"]["prefill_token_logprobs"], return_text
+        )
+        r["meta_info"]["decode_token_logprobs"] = await detokenize_logprob_tokens(
+            r["meta_info"]["decode_token_logprobs"], return_text
+        )
+        r["meta_info"]["prefill_top_logprobs"] = await detokenize_top_logprobs_tokens(
+            r["meta_info"]["prefill_top_logprobs"], return_text
+        )
+        r["meta_info"]["decode_top_logprobs"] = await detokenize_top_logprobs_tokens(
+            r["meta_info"]["decode_top_logprobs"], return_text
+        )
+
     if isinstance(obj.text, str):
         if obj.return_logprob:
-            ret["meta_info"]["prefill_token_logprobs"] = (
-                await detokenize_logprob_tokens(
-                    ret["meta_info"]["prefill_token_logprobs"],
-                    obj.return_text_in_logprobs,
-                )
-            )
-            ret["meta_info"]["decode_token_logprobs"] = await detokenize_logprob_tokens(
-                ret["meta_info"]["decode_token_logprobs"],
-                obj.return_text_in_logprobs,
-            )
+            await convert_style(ret, obj.return_text_in_logprobs)
     else:
-        for i, r in enumerate(ret):
+        for i, r in enumerate(r):
             if obj.return_logprob[i]:
-                r["meta_info"]["prefill_token_logprobs"] = (
-                    await detokenize_logprob_tokens(
-                        r["meta_info"]["prefill_token_logprobs"],
-                        obj.return_text_in_logprobs,
-                    )
-                )
-                r["meta_info"]["decode_token_logprobs"] = (
-                    await detokenize_logprob_tokens(
-                        r["meta_info"]["decode_token_logprobs"],
-                        obj.return_text_in_logprobs,
-                    )
-                )
+                await convert_style(r, obj.return_text_in_logprobs[i])
 
 
 async def stream_generator(obj: GenerateReqInput):
@@ -176,16 +177,37 @@ async def stream_generator(obj: GenerateReqInput):
         yield out
 
 
-async def make_openai_style_logprobs(token_logprobs):
+async def make_openai_style_logprobs(
+    prefill_token_logprobs=None,
+    decode_token_logprobs=None,
+    prefill_top_logprobs=None,
+    decode_top_logprobs=None,
+):
     ret_logprobs = LogProbs()
 
-    for logprob, _, token_text in token_logprobs:
-        ret_logprobs.tokens.append(token_text)
-        ret_logprobs.token_logprobs.append(logprob)
+    def append_token_logprobs(token_logprobs):
+        for logprob, _, token_text in token_logprobs:
+            ret_logprobs.tokens.append(token_text)
+            ret_logprobs.token_logprobs.append(logprob)
 
-        # Not supported yet.
-        ret_logprobs.top_logprobs.append({})
-        ret_logprobs.text_offset.append(-1)
+    def append_top_logprobs(top_logprobs):
+        for tokens in top_logprobs:
+            if tokens is not None:
+                ret_logprobs.top_logprobs.append(
+                    {token[2]: token[0] for token in tokens}
+                )
+            else:
+                ret_logprobs.top_logprobs.append(None)
+
+    if prefill_token_logprobs is not None:
+        append_token_logprobs(prefill_token_logprobs)
+    if decode_token_logprobs is not None:
+        append_token_logprobs(decode_token_logprobs)
+    if prefill_top_logprobs is not None:
+        append_top_logprobs(prefill_top_logprobs)
+    if decode_top_logprobs is not None:
+        append_top_logprobs(decode_top_logprobs)
+
     return ret_logprobs
 
 
@@ -228,6 +250,7 @@ async def v1_completions(raw_request: Request):
             "regex": request.regex,
         },
         return_logprob=request.logprobs is not None and request.logprobs,
+        top_logprobs_num=request.top_logprobs,
         return_text_in_logprobs=True,
         stream=request.stream,
     )
@@ -249,18 +272,29 @@ async def v1_completions(raw_request: Request):
                         text = request.prompt + text
 
                 if request.logprobs:
-                    logprobs = LogProbs()
                     # The first chunk and echo is enabled.
                     if not stream_buffer and request.echo:
-                        prefill_token_logprobs = await make_openai_style_logprobs(
-                            content["meta_info"]["prefill_token_logprobs"]
-                        )
-                        logprobs.extend(prefill_token_logprobs)
+                        prefill_token_logprobs = content["meta_info"][
+                            "prefill_token_logprobs"
+                        ]
+                        prefill_top_logprobs = content["meta_info"][
+                            "prefill_top_logprobs"
+                        ]
+                    else:
+                        prefill_token_logprobs = None
+                        prefill_top_logprobs = None
 
-                    decode_token_logprobs = await make_openai_style_logprobs(
-                        content["meta_info"]["decode_token_logprobs"][n_prev_token:]
+                    logprobs = await make_openai_style_logprobs(
+                        prefill_token_logprobs=prefill_token_logprobs,
+                        prefill_top_logprobs=prefill_top_logprobs,
+                        decode_token_logprobs=content["meta_info"][
+                            "decode_token_logprobs"
+                        ][n_prev_token:],
+                        decode_top_logprobs=content["meta_info"]["decode_top_logprobs"][
+                            n_prev_token:
+                        ],
                     )
-                    logprobs.extend(decode_token_logprobs)
+
                     n_prev_token = len(content["meta_info"]["decode_token_logprobs"])
                 else:
                     logprobs = None
@@ -300,16 +334,19 @@ async def v1_completions(raw_request: Request):
         text = request.prompt + text
 
     if request.logprobs:
-        logprobs = LogProbs()
         if request.echo:
-            prefill_token_logprobs = await make_openai_style_logprobs(
-                ret["meta_info"]["prefill_token_logprobs"]
-            )
-            logprobs.extend(prefill_token_logprobs)
-        decode_token_logprob_pos = await make_openai_style_logprobs(
-            ret["meta_info"]["decode_token_logprobs"]
+            prefill_token_logprobs = ret["meta_info"]["prefill_token_logprobs"]
+            prefill_top_logprobs = ret["meta_info"]["prefill_top_logprobs"]
+        else:
+            prefill_token_logprobs = None
+            prefill_top_logprobs = None
+
+        logprobs = await make_openai_style_logprobs(
+            prefill_token_logprobs=prefill_token_logprobs,
+            prefill_top_logprobs=prefill_top_logprobs,
+            decode_token_logprobs=ret["meta_info"]["decode_token_logprobs"],
+            decode_top_logprobs=ret["meta_info"]["decode_top_logprobs"],
         )
-        logprobs.extend(decode_token_logprob_pos)
     else:
         logprobs = None
 

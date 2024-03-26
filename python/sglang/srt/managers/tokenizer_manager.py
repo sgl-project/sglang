@@ -173,6 +173,7 @@ class TokenizerManager:
                 sampling_params=sampling_params,
                 return_logprob=obj.return_logprob,
                 logprob_start_len=obj.logprob_start_len,
+                top_logprobs_num=obj.top_logprobs_num,
                 stream=obj.stream,
             )
             self.send_to_router.send_pyobj(tokenized_obj)
@@ -215,6 +216,7 @@ class TokenizerManager:
                     sampling_params=sampling_params,
                     return_logprob=obj.return_logprob[i],
                     logprob_start_len=obj.logprob_start_len[i],
+                    top_logprobs_num=obj.top_logprobs_num[i],
                     stream=obj.stream,
                 )
                 self.send_to_router.send_pyobj(tokenized_obj)

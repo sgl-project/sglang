@@ -11,12 +11,6 @@ class LogProbs(BaseModel):
     tokens: List[str] = Field(default_factory=list)
     top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
-    def extend(self, other: "LogProbs"):
-        self.text_offset.extend(other.text_offset)
-        self.token_logprobs.extend(other.token_logprobs)
-        self.tokens.extend(other.tokens)
-        self.top_logprobs.extend(other.top_logprobs)
-
 
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
@@ -34,6 +28,7 @@ class CompletionRequest(BaseModel):
     n: Optional[int] = 1
     stream: Optional[bool] = False
     logprobs: Optional[bool] = None
+    top_logprobs: Optional[int] = None
     echo: Optional[bool] = False
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     presence_penalty: Optional[float] = 0.0

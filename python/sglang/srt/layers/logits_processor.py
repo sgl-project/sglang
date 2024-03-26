@@ -35,6 +35,34 @@ class LogitsProcessor(nn.Module):
 
         return normalized_prompt_logprobs
 
+    def _get_top_logprobs(self, all_logprobs, input_metadata: InputMetadata):
+        if input_metadata.forward_mode == ForwardMode.DECODE:
+            decode_top_logprobs = []
+            for i in range(all_logprobs.shape[0]):
+                k = input_metadata.top_logprobs_nums[i]
+                t = all_logprobs[i].topk(k)
+                v_cpu = t.values.cpu().tolist()
+                p_cpu = t.indices.cpu().tolist()
+                decode_top_logprobs.append(list(zip(v_cpu, p_cpu)))
+            return None, decode_top_logprobs
+        else:
+            prefill_top_logprobs, decode_top_logprobs = [], []
+            pt = 0
+            # NOTE: the GPU-CPU overhead can be reduced
+            extend_seq_lens_cpu = input_metadata.extend_seq_lens
+            for i in range(len(input_metadata.extend_seq_lens)):
+                if extend_seq_lens_cpu[i] == 0:
+                    continue
+                k = input_metadata.top_logprobs_nums[i]
+                t = all_logprobs[pt : pt + extend_seq_lens_cpu[i]].topk(k)
+                vs_cpu = t.values.cpu().tolist()
+                ps_cpu = t.indices.cpu().tolist()
+                prefill_top_logprobs.append(
+                    [list(zip(vs_cpu[j], ps_cpu[j])) for j in range(len(vs_cpu) - 1)]
+                )
+                decode_top_logprobs.append(list(zip(vs_cpu[-1], ps_cpu[-1])))
+            return prefill_top_logprobs, decode_top_logprobs
+
     def forward(self, input_ids, hidden_states, weight, input_metadata: InputMetadata):
         # Get last index for next token prediction, except for DECODE mode.
         last_index = None
@@ -58,7 +86,7 @@ class LogitsProcessor(nn.Module):
         # Return only last_logits if logprob is not requested
         if not input_metadata.return_logprob:
             hidden_states = None
-            return last_logits, (None, None, None)
+            return last_logits, (None, None, None, None, None)
         else:
             # When logprob is requested, compute the logits for all tokens.
             if input_metadata.forward_mode == ForwardMode.DECODE:
@@ -71,9 +99,19 @@ class LogitsProcessor(nn.Module):
 
             all_logprobs = torch.log(torch.softmax(all_logits.float(), dim=-1) + 1e-6)
 
+            prefill_top_logprobs, decode_top_logprobs = self._get_top_logprobs(
+                all_logprobs, input_metadata
+            )
+
             if input_metadata.forward_mode == ForwardMode.DECODE:
                 last_logprobs = all_logprobs
-                return last_logits, (None, None, last_logprobs)
+                return last_logits, (
+                    None,
+                    None,
+                    decode_top_logprobs,
+                    None,
+                    last_logprobs,
+                )
             else:
                 # Compute the logprobs for the last token of each request.
                 last_logprobs = all_logprobs[last_index]
@@ -90,6 +128,8 @@ class LogitsProcessor(nn.Module):
                 )
                 return last_logits, (
                     prefill_token_logprobs,
+                    prefill_top_logprobs,
+                    decode_top_logprobs,
                     normalized_prompt_logprobs,
                     last_logprobs,
                 )

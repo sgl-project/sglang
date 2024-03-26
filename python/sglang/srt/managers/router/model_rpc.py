@@ -260,6 +260,7 @@ class ModelRpcServer:
         req.sampling_params = recv_req.sampling_params
         req.return_logprob = recv_req.return_logprob
         req.logprob_start_len = recv_req.logprob_start_len
+        req.top_logprobs_num = recv_req.top_logprobs_num
         req.stream = recv_req.stream
         req.tokenizer = self.tokenizer
 
@@ -405,6 +406,8 @@ class ModelRpcServer:
             # Forward
             logits, (
                 prefill_token_logprobs,
+                prefill_top_logprobs,
+                decode_top_logprobs,
                 normalized_prompt_logprobs,
                 last_logprobs,
             ) = self.model_runner.forward(batch, ForwardMode.EXTEND)
@@ -450,6 +453,10 @@ class ModelRpcServer:
                 req.decode_token_logprobs = [
                     (last_token_logprobs[i], next_token_ids[i])
                 ]
+                req.prefill_top_logprobs = prefill_top_logprobs[i]
+                if req.logprob_start_len == 0:
+                    req.prefill_top_logprobs = [None] + req.prefill_top_logprobs
+                req.decode_top_logprobs = [decode_top_logprobs[i]]
                 req.normalized_prompt_logprob = normalized_prompt_logprobs[i]
                 pt += req.extend_input_len
 
@@ -500,8 +507,8 @@ class ModelRpcServer:
         batch.prepare_for_decode()
 
         # Forward
-        logits, (_, _, last_logprobs) = self.model_runner.forward(
-            batch, ForwardMode.DECODE
+        logits, (_, _, decode_top_logprobs, _, last_logprobs) = (
+            self.model_runner.forward(batch, ForwardMode.DECODE)
         )
         next_token_ids, _ = batch.sample(logits)
         next_token_ids = next_token_ids.cpu().tolist()
@@ -522,6 +529,7 @@ class ModelRpcServer:
 
             if new_token_logprobs is not None:
                 req.decode_token_logprobs.append((new_token_logprobs[i], next_token_id))
+                req.decode_top_logprobs.append(decode_top_logprobs[i])
 
         self.handle_finished_requests(batch)
 
@@ -569,10 +577,14 @@ class ModelRpcServer:
                     (
                         meta_info["prefill_token_logprobs"],
                         meta_info["decode_token_logprobs"],
+                        meta_info["prefill_top_logprobs"],
+                        meta_info["decode_top_logprobs"],
                         meta_info["normalized_prompt_logprob"],
                     ) = (
                         req.prefill_token_logprobs,
                         req.decode_token_logprobs,
+                        req.prefill_top_logprobs,
+                        req.decode_top_logprobs,
                         req.normalized_prompt_logprob,
                     )
                 output_meta_info.append(meta_info)
