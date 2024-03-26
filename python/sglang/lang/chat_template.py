@@ -288,14 +288,14 @@ def match_chat_ml(model_path: str):
         return get_chat_template("chatml")
     if "qwen" in model_path and "chat" in model_path:
         return get_chat_template("chatml")
-    if "llava-v1.6-34b" in model_path:
+    if "llava-v1.6-34b" in model_path or "llava-v1.6-yi-34b" in model_path:
         return get_chat_template("chatml-llava")
 
 
 @register_chat_template_matching_function
 def match_chat_yi(model_path: str):
     model_path = model_path.lower()
-    if "yi" in model_path:
+    if "yi" in model_path and "llava" not in model_path:
         return get_chat_template("yi")
 
 

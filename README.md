@@ -1,236 +1,85 @@
+To refine and clean up the README you've provided for the SGLang project, I'll focus on improving clarity, organization, and conciseness. This includes providing clear installation instructions, simplifying steps where possible, and ensuring the document is easy to navigate. Here's a revised version:
+
+---
+
 <div align="center">
-<img src="assets/logo.png" alt="logo" width="400"></img>
+    <img src="assets/logo.png" alt="SGLang Logo" width="400">
 </div>
 
 --------------------------------------------------------------------------------
 
 | [**Blog**](https://lmsys.org/blog/2024-01-17-sglang/) | [**Paper**](https://arxiv.org/abs/2312.07104) |
 
-SGLang is a structured generation language designed for large language models (LLMs).
-It makes your interaction with LLMs faster and more controllable by co-designing the frontend language and the runtime system.
+**SGLang** is a structured generation language tailored for large language models (LLMs), enhancing interaction speed and control by integrating an adaptable frontend language with a high-performance runtime system.
 
-The core features of SGLang include:
-- **A Flexible Front-End Language**: This allows for easy programming of LLM applications with multiple chained generation calls, advanced prompting techniques, control flow, multiple modalities, parallelism, and external interaction.
-- **A High-Performance Runtime with RadixAttention**: This feature significantly accelerates the execution of complex LLM programs by automatic KV cache reuse across multiple calls. It also supports other common techniques like continuous batching and tensor parallelism.
+### Key Features
+- **Flexible Front-End Language**: Facilitates programming of LLM applications, supporting chained generations, advanced prompts, control flows, multi-modalities, parallelism, and external interactions.
+- **High-Performance Runtime with RadixAttention**: Boosts complex LLM program execution through KV cache reuse, continuous batching, and tensor parallelism.
 
-## News
-- [2024/02] 🔥 SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] 🔥 SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
+## Getting Started
 
-## Contents
-- [Install](#install)
-- [Quick Start](#quick-start)
-- [Frontend: Structured Generation Language (SGLang)](#frontend-structured-generation-language-sglang)
-- [Backend: SGLang Runtime (SRT)](#backend-sglang-runtime-srt)
-- [Benchmark And Performance](#benchmark-and-performance)
-- [Roadmap](#roadmap)
-- [Citation And Acknowledgment](#citation-and-acknowledgment)
+### Installation
 
-## Install
-
-### Method 1: With pip
-```
-pip install "sglang[all]"
-```
-
-### Method 2: From source
-```
-git clone git@github.com:sgl-project/sglang.git
-cd sglang
-
+#### SGLang Setup
+```sh
+cd PATH_TO/sglang_video
 pip install --upgrade pip
 pip install -e "python[all]"
 ```
 
-### Notes
-- If you are using older GPUs (NVIDIA V100, T4), please pick the correct triton compiler version to avoid some known bugs.
-  - For NVIDIA T4, please use `pip install "triton>=2.2.0"`.
-  - For NVIDIA V100, please install the [nightly](https://triton-lang.org/main/getting-started/installation.html) version.
-- If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`
 
+#### Dependency Installation
 
-## Quick Start
-The example below shows how to use sglang to answer a mulit-turn question.
+Install the necessary Python packages:
 
-### Using Local Models
-First, launch a server with
-```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+```sh
+pip3 install huggingface_hub hf_transfer outlines==0.0.34 opencv-python-headless
+pip3 install git+https://github.com/huggingface/transformers.git@56b64bf1a51e29046bb3f8ca15839ff4d6a92c74
 ```
 
-Then, connect to the server and answer a multi-turn question.
+#### Downloading Models
 
-```python
-from sglang import function, system, user, assistant, gen, set_default_backend, RuntimeEndpoint
+Before proceeding, ensure you're in the project's model directory:
 
-@function
-def multi_turn_question(s, question_1, question_2):
-    s += system("You are a helpful assistant.")
-    s += user(question_1)
-    s += assistant(gen("answer_1", max_tokens=256))
-    s += user(question_2)
-    s += assistant(gen("answer_2", max_tokens=256))
-
-set_default_backend(RuntimeEndpoint("http://localhost:30000"))
-
-state = multi_turn_question.run(
-    question_1="What is the capital of the United States?",
-    question_2="List two local attractions.",
-)
-
-for m in state.messages():
-    print(m["role"], ":", m["content"])
-
-print(state["answer_1"])
+```sh
+cd PATH_TO/sglang_video/work_dirs/llava_next_video_model
 ```
 
-### Using OpenAI Models
-Set the OpenAI API Key
-```
-export OPENAI_API_KEY=sk-******
-```
+Choose the set of instructions based on the number of frames you plan to use for inference:
 
-Then, answer a multi-turn question.
-```python
-from sglang import function, system, user, assistant, gen, set_default_backend, OpenAI
+- **For 32 Frames Inference:**
 
-@function
-def multi_turn_question(s, question_1, question_2):
-    s += system("You are a helpful assistant.")
-    s += user(question_1)
-    s += assistant(gen("answer_1", max_tokens=256))
-    s += user(question_2)
-    s += assistant(gen("answer_2", max_tokens=256))
+  Download and set up the models:
 
-set_default_backend(OpenAI("gpt-3.5-turbo"))
+  ```sh
+  python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='liuhaotian/llava-v1.6-34b', local_dir='./llava-v1.6-Yi-34b-8k')"
+  cp llava-v1.6-Yi-34b-8k_config.json llava-v1.6-Yi-34b-8k/config.json 
+  cp llava-v1.6-Yi-34b-8k_generation_config.json llava-v1.6-Yi-34b-8k/generation_config.json
+  ```
 
-state = multi_turn_question.run(
-    question_1="What is the capital of the United States?",
-    question_2="List two local attractions.",
-)
+  Repeat the download and setup process for other models as necessary, adjusting the `repo_id` and `local_dir` accordingly.
 
-for m in state.messages():
-    print(m["role"], ":", m["content"])
+- **For Inference with Less Than 32 Frames:**
 
-print(state["answer_1"])
-```
+  You only need to download the models without additional setup steps:
 
-### More Examples
+  ```sh
+  python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='liuhaotian/llava-v1.6-34b', local_dir='./llava-v1.6-Yi-34b')"
+  ```
 
-Anthropic and VertexAI (Gemini) models are also supported.
-You can find more examples at [examples/quick_start](examples/quick_start).
+  Repeat the download process for other models as necessary, adjusting the `repo_id` and `local_dir` accordingly.
 
-## Frontend: Structured Generation Language (SGLang)
+#### Additional Notes
 
-To begin with, import sglang.
-```python
-import sglang as sgl
-```
-
-`sglang` provides some simple primitives such as `gen`, `select`, `fork`, `image`.
-You can implement your prompt flow in a function decorated by `sgl.function`.
-You can then invoke the function with `run` or `run_batch`.
-The system will manage the state, chat template, parallelism and batching for you.
-
-The complete code for the examples below can be found at [readme_examples.py](examples/usage/readme_examples.py)
-
-### Control Flow
-You can use any Python code within the function body, including control flow, nested function calls, and external libraries.
-
-```python
-@sgl.function
-def tool_use(s, question):
-    s += "To answer this question: " + question + ". "
-    s += "I need to use a " + sgl.gen("tool", choices=["calculator", "search engine"]) + ". "
-
-    if s["tool"] == "calculator":
-        s += "The math expression is" + sgl.gen("expression")
-    elif s["tool"] == "search engine":
-        s += "The key word to search is" + sgl.gen("word")
-```
-
-### Parallelism
-Use `fork` to launch parallel prompts.
-Because `sgl.gen` is non-blocking, the for loop below issues two generation calls in parallel.
-
-```python
-@sgl.function
-def tip_suggestion(s):
-    s += (
-        "Here are two tips for staying healthy: "
-        "1. Balanced Diet. 2. Regular Exercise.\n\n"
-    )
-
-    forks = s.fork(2)
-    for i, f in enumerate(forks):
-        f += f"Now, expand tip {i+1} into a paragraph:\n"
-        f += sgl.gen(f"detailed_tip", max_tokens=256, stop="\n\n")
-
-    s += "Tip 1:" + forks[0]["detailed_tip"] + "\n"
-    s += "Tip 2:" + forks[1]["detailed_tip"] + "\n"
-    s += "In summary" + sgl.gen("summary")
-```
-
-### Multi Modality
-Use `sgl.image` to pass an image as input.
-
-```python
-@sgl.function
-def image_qa(s, image_file, question):
-    s += sgl.user(sgl.image(image_file) + question)
-    s += sgl.assistant(sgl.gen("answer", max_tokens=256)
-```
-
-See also [srt_example_llava.py](examples/quick_start/srt_example_llava.py).
-
-### Constrained Decoding
-Use `regex` to specify a regular expression as a decoding constraint.
-This is only supported for local models.
-
-```python
-@sgl.function
-def regular_expression_gen(s):
-    s += "Q: What is the IP address of the Google DNS servers?\n"
-    s += "A: " + sgl.gen(
-        "answer",
-        temperature=0,
-        regex=r"((25[0-5]|2[0-4]\d|[01]?\d\d?).){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)",
-    )
-```
-
-### JSON Decoding
-Use `regex` to specify a JSON schema with a regular expression.
-
-```python
-character_regex = (
-    r"""\{\n"""
-    + r"""    "name": "[\w\d\s]{1,16}",\n"""
-    + r"""    "house": "(Gryffindor|Slytherin|Ravenclaw|Hufflepuff)",\n"""
-    + r"""    "blood status": "(Pure-blood|Half-blood|Muggle-born)",\n"""
-    + r"""    "occupation": "(student|teacher|auror|ministry of magic|death eater|order of the phoenix)",\n"""
-    + r"""    "wand": \{\n"""
-    + r"""        "wood": "[\w\d\s]{1,16}",\n"""
-    + r"""        "core": "[\w\d\s]{1,16}",\n"""
-    + r"""        "length": [0-9]{1,2}\.[0-9]{0,2}\n"""
-    + r"""    \},\n"""
-    + r"""    "alive": "(Alive|Deceased)",\n"""
-    + r"""    "patronus": "[\w\d\s]{1,16}",\n"""
-    + r"""    "bogart": "[\w\d\s]{1,16}"\n"""
-    + r"""\}"""
-)
-
-@sgl.function
-def character_gen(s, name):
-    s += name + " is a character in Harry Potter. Please fill in the following information about this character.\n"
-    s += sgl.gen("json_output", max_tokens=256, regex=character_regex)
-```
-
-See also [json_decode.py](examples/usage/json_decode.py) for an additional example on specifying formats with Pydantic models.
+- Make sure to replace `PATH_TO` with the actual path to your `sglang_video` directory.
+- Adjust the `repo_id` and `local_dir` as needed based on the specific models you intend to use.
 
 
-### Batching
-Use `run_batch` to run a batch of requests with continuous batching.
+### System Requirements
+- CUDA >= 12.1. Specific GPU models may require different versions of the Triton compiler:
+  - NVIDIA T4: `pip install "triton>=2.2.0"`
+  - NVIDIA V100: Install the [nightly version of Triton](https://triton-lang.org/main/getting-started/installation.html).
+- For OpenAI backend usage only: `pip install "sglang[openai]"`
 
 ```python
 @sgl.function
@@ -410,7 +259,23 @@ https://github.com/sgl-project/sglang/issues/157
 }
 ```
 
-[![Paper page](https://huggingface.co/datasets/huggingface/badges/resolve/main/paper-page-md.svg)](https://huggingface.co/papers/2312.07104)
+1. **Prepare Environment**:
+   ```sh
+   cd PATH_TO/sglang_video
+   ```
 
+2. **Launch and Run on (K) Nodes**:
+   - First node:
+     ```sh
+     bash examples/quick_start/srt_example_llava_v.sh K 0 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO JPEG
+     ```
+   - Second node:
+     ```sh
+     bash examples/quick_start/srt_example_llava_v.sh K 1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO JPEG
+     ```
+   - The K node:
+     ```sh
+     bash examples/quick_start/srt_example_llava_v.sh K K-1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO JPEG
+     ```
 
-We learned from the design and reused some code of the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), [LMQL](https://github.com/eth-sri/lmql).
+Replace `K`, `YOUR_VIDEO_PATH`, `YOUR_MODEL_PATH`, and `FRAMES_PER_VIDEO` with your specific details. Frames are encoded in the either PNG or JPEG format.

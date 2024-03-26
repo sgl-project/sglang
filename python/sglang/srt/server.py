@@ -587,6 +587,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer):
             time.sleep(0.5)
             try:
                 requests.get(url + "/get_model_info", timeout=5, headers=headers)
+                success = True  # Set flag to True if request succeeds
                 break
             except requests.exceptions.RequestException as e:
                 pass
@@ -603,7 +604,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer):
                     },
                 },
                 headers=headers,
-                timeout=60,
+                timeout=600,
             )
             assert res.status_code == 200
         except Exception as e:

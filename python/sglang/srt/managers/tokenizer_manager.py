@@ -57,21 +57,31 @@ def get_pixel_values(
 ):
     try:
         processor = processor or global_processor
-        image = load_image(image_data)
-        image_hash = hash(image_data)
-        if image_aspect_ratio == "pad":
-            image = expand2square(
-                image, tuple(int(x * 255) for x in processor.image_processor.image_mean)
-            )
-            pixel_values = processor.image_processor(image)["pixel_values"][0]
-        elif image_aspect_ratio == "anyres":
-            pixel_values = process_anyres_image(
-                image, processor.image_processor, image_grid_pinpoints
-            )
+        image, image_size  = load_image(image_data)
+        if image_size != None:
+            image_hash = hash(image_data)
+            pixel_values = processor.image_processor(image)["pixel_values"]
+            for _ in range(len(pixel_values)):
+                pixel_values[_] = pixel_values[_].astype(np.float16)
+            pixel_values = np.stack(pixel_values, axis=0)
+            return pixel_values, image_hash, image_size
         else:
-            pixel_values = processor.image_processor(image)["pixel_values"][0]
-        pixel_values = pixel_values.astype(np.float16)
-        return pixel_values, image_hash, image.size
+            image_hash = hash(image_data)
+            if image_aspect_ratio == "pad":
+                image = expand2square(
+                    image, tuple(int(x * 255) for x in processor.image_processor.image_mean)
+                )
+                pixel_values = processor.image_processor(image)["pixel_values"][0]
+            elif image_aspect_ratio == "anyres":
+                pixel_values = process_anyres_image(
+                    image, processor.image_processor, image_grid_pinpoints
+                )
+            else:
+                pixel_values = processor.image_processor(image)["pixel_values"][0]
+            
+            pixel_values = pixel_values.astype(np.float16)
+            return pixel_values, image_hash, image.size
+
     except Exception:
         print("Exception in TokenizerManager:\n" + get_exception_traceback())
 
@@ -148,7 +158,7 @@ class TokenizerManager:
 
         if is_single:
             rid = obj.rid
-            input_ids = self.tokenizer.encode(obj.text)
+            input_ids = self.tokenizer.encode(obj.text) 
             sampling_params = SamplingParams(**obj.sampling_params)
             if sampling_params.max_new_tokens != 0:
                 sampling_params.normalize(self.tokenizer)
