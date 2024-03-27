@@ -166,9 +166,9 @@ async def handle_token_logprobs_results(obj: GenerateReqInput, ret):
         if obj.return_logprob:
             await convert_style(ret, obj.return_text_in_logprobs)
     else:
-        for i, r in enumerate(r):
+        for i, r in enumerate(ret):
             if obj.return_logprob[i]:
-                await convert_style(r, obj.return_text_in_logprobs[i])
+                await convert_style(r, obj.return_text_in_logprobs)
 
 
 async def stream_generator(obj: GenerateReqInput):
