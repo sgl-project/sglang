@@ -353,9 +353,10 @@ class StreamExecutor:
     def _execute_fill(self, value: str):
         value = str(value)
         if self.speculated_text.startswith(value):
-            self.speculated_text = self.speculated_text[len(value) :]
+            self.speculated_text = self.speculated_text[len(value):]
         else:
             self.speculated_text = ""
+
         self.text_ += value
 
     def _execute_image(self, expr: SglImage):
@@ -388,6 +389,11 @@ class StreamExecutor:
                     self.speculated_text, meta_info = self.backend.generate(
                         self, sampling_params=sampling_params
                     )
+                    pos = self.text_.find(self.chat_template.role_prefix_and_suffix["assistant"][0])
+                    if pos != -1:
+                        extracted_text = self.text_[pos + len(self.chat_template.role_prefix_and_suffix["assistant"][0]):].strip()
+                    if self.speculated_text.startswith(extracted_text):
+                        self.speculated_text = self.speculated_text[len(extracted_text):]
 
                 def find_stop():
                     if isinstance(stop, str):
@@ -403,7 +409,6 @@ class StreamExecutor:
                         return pos, stop_len
                     else:
                         raise Exception("Wrong type of stop in sampling parameters.")
-
                 if stop is None:
                     if len(self.speculated_text) < max_new_tokens:
                         regen()
@@ -425,6 +430,7 @@ class StreamExecutor:
                     self.speculated_text = self.speculated_text[stop_pos:]
                 else:
                     raise ValueError("Wrong type of stop in sampling parameters.")
+
             else:
                 comp, meta_info = self.backend.generate(
                     self, sampling_params=sampling_params
@@ -491,7 +497,7 @@ class StreamExecutor:
         self.cur_role_begin_pos = len(self.text_)
 
     def _execute_role_end(self, expr: SglRoleEnd):
-        new_text = self.text_[self.cur_role_begin_pos :].lstrip()
+        new_text = self.text_[self.cur_role_begin_pos:].lstrip()
 
         _, suffix = self.chat_template.get_prefix_and_suffix(expr.role, self.messages_)
         self._execute_fill(suffix)
