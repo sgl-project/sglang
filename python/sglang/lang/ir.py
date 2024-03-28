@@ -472,4 +472,4 @@ class SglCommitLazy(SglExpr):
         super().__init__()
 
     def __repr__(self):
-        return f"CommitLazy()"
+        return "CommitLazy()"

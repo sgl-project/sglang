@@ -1,19 +1,11 @@
 import unittest
 
-from sglang.test.test_programs import (
-    test_decode_int,
-    test_decode_json,
-    test_expert_answer,
-    test_few_shot_qa,
-    test_image_qa,
-    test_mt_bench,
-    test_parallel_decoding,
-    test_parallel_encoding,
-    test_react,
-    test_select,
-    test_stream,
-    test_tool_use,
-)
+from sglang.test.test_programs import (test_decode_int, test_decode_json,
+                                       test_expert_answer, test_few_shot_qa,
+                                       test_image_qa, test_mt_bench,
+                                       test_parallel_decoding,
+                                       test_parallel_encoding, test_react,
+                                       test_select, test_stream, test_tool_use)
 
 from sglang import OpenAI, set_default_backend
 

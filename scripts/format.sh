@@ -1,5 +1,5 @@
 isort python
-black python
+ruff python
 
 isort test
-black test
+ruff test

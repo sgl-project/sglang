@@ -1,7 +1,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/d0215a58e78572d91dadafe9d832a2db89b09a13/vllm/model_executor/models/mixtral.py#L1
 """Inference-only Mixtral model."""
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import torch
@@ -12,28 +12,19 @@ from sglang.srt.managers.router.model_runner import InputMetadata
 from torch import nn
 from transformers import MixtralConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    LinearMethodBase,
-    QKVParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import (LinearMethodBase,
+                                               QKVParallelLinear,
+                                               ReplicatedLinear,
+                                               RowParallelLinear)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
-from vllm.model_executor.parallel_utils.communication_op import (
-    tensor_model_parallel_all_reduce,
-)
+    ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.parallel_utils.communication_op import \
+    tensor_model_parallel_all_reduce
 from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from vllm.model_executor.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
+from vllm.model_executor.weight_utils import (default_weight_loader,
+                                              hf_model_weights_iterator)
 
 
 class MixtralMLP(nn.Module):

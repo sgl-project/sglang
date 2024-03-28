@@ -6,7 +6,6 @@ The capital of France is Paris.\nThe capital of the United States is Washington,
 """
 
 import argparse
-import time
 
 import requests
 

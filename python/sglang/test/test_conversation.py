@@ -1,12 +1,9 @@
 from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.managers.openai_protocol import (
     ChatCompletionMessageContentImagePart,
-    ChatCompletionMessageContentImageURL,
-    ChatCompletionMessageContentTextPart,
-    ChatCompletionMessageGenericParam,
-    ChatCompletionMessageUserParam,
-    ChatCompletionRequest,
-)
+    ChatCompletionMessageContentImageURL, ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam,
+    ChatCompletionRequest)
 
 
 def test_chat_completion_to_conv_image():

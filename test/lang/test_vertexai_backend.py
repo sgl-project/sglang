@@ -1,14 +1,9 @@
 import unittest
 
-from sglang.test.test_programs import (
-    test_expert_answer,
-    test_few_shot_qa,
-    test_image_qa,
-    test_mt_bench,
-    test_parallel_decoding,
-    test_parallel_encoding,
-    test_stream,
-)
+from sglang.test.test_programs import (test_expert_answer, test_few_shot_qa,
+                                       test_image_qa, test_mt_bench,
+                                       test_parallel_decoding,
+                                       test_parallel_encoding, test_stream)
 
 from sglang import VertexAI, set_default_backend
 

@@ -7,26 +7,14 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 import tqdm
 from sglang.global_config import global_config
-from sglang.lang.ir import (
-    SglCommitLazy,
-    SglConcateAndAppend,
-    SglConstantText,
-    SglExpr,
-    SglExprList,
-    SglFunction,
-    SglGen,
-    SglImage,
-    SglRoleBegin,
-    SglRoleEnd,
-    SglSelect,
-    SglVariable,
-    SglVarScopeBegin,
-    SglVarScopeEnd,
-)
+from sglang.lang.ir import (SglCommitLazy, SglConcateAndAppend,
+                            SglConstantText, SglExpr, SglExprList, SglGen,
+                            SglImage, SglRoleBegin, SglRoleEnd, SglSelect,
+                            SglVariable, SglVarScopeBegin, SglVarScopeEnd)
 from sglang.utils import encode_image_base64
 
 

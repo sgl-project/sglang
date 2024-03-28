@@ -3,10 +3,8 @@ from enum import Enum
 
 from pydantic import BaseModel, constr
 from sglang.srt.constrained import build_regex_from_object
-from sglang.test.test_utils import (
-    add_common_sglang_args_and_parse,
-    select_sglang_backend,
-)
+from sglang.test.test_utils import (add_common_sglang_args_and_parse,
+                                    select_sglang_backend)
 
 import sglang as sgl
 

@@ -3,22 +3,10 @@
 import re
 from typing import Callable, List, Optional, Union
 
-from sglang.backend.anthropic import Anthropic
 from sglang.backend.base_backend import BaseBackend
-from sglang.backend.openai import OpenAI
-from sglang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.backend.vertexai import VertexAI
 from sglang.global_config import global_config
-from sglang.lang.ir import (
-    SglExpr,
-    SglExprList,
-    SglFunction,
-    SglGen,
-    SglImage,
-    SglRoleBegin,
-    SglRoleEnd,
-    SglSelect,
-)
+from sglang.lang.ir import (SglExpr, SglExprList, SglFunction, SglGen,
+                            SglImage, SglRoleBegin, SglRoleEnd, SglSelect)
 
 
 def function(

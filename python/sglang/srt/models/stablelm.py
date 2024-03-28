@@ -5,31 +5,23 @@ model compatible with HuggingFace weights."""
 from typing import Optional, Tuple
 
 import torch
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.router.model_runner import InputMetadata
+from torch import nn
+from transformers import PretrainedConfig
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.linear import (
-    LinearMethodBase,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import (LinearMethodBase,
+                                               MergedColumnParallelLinear,
+                                               QKVParallelLinear,
+                                               RowParallelLinear)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-    ParallelLMHead,
-)
-from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_world_size,
-)
-from vllm.model_executor.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
+    ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.parallel_utils.parallel_state import \
+    get_tensor_model_parallel_world_size
+from vllm.model_executor.weight_utils import (default_weight_loader,
+                                              hf_model_weights_iterator)
 
 
 class StablelmMLP(nn.Module):

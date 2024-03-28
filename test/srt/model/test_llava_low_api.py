@@ -1,12 +1,9 @@
 import multiprocessing
-import time
 
 import numpy as np
 import torch
-import torch.distributed as dist
 from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.managers.router.infer_batch import ForwardMode
-from sglang.srt.managers.router.model_runner import InputMetadata, ModelRunner
+from sglang.srt.managers.router.model_runner import ModelRunner
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.utils import load_image
 

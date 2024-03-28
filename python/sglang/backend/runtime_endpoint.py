@@ -1,14 +1,13 @@
 import json
-from typing import Callable, List, Optional, Union
+from typing import List, Optional
 
 import numpy as np
-import requests
 from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.lang.interpreter import StreamExecutor
-from sglang.lang.ir import SglArgument, SglSamplingParams
-from sglang.utils import encode_image_base64, find_printable_text, http_request
+from sglang.lang.ir import SglSamplingParams
+from sglang.utils import find_printable_text, http_request
 
 
 class RuntimeEndpoint(BaseBackend):

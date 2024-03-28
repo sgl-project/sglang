@@ -1,4 +1,3 @@
-import json
 import unittest
 
 from sglang.test.test_programs import test_mt_bench, test_stream
