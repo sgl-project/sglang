@@ -177,3 +177,7 @@ tmp*.txt
 # Plots
 *.png
 *.pdf
+
+# personnal
+work_dirs/
+*.csv

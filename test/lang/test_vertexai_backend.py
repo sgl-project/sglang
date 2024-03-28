@@ -1,5 +1,6 @@
 import unittest
 
+from sglang import VertexAI, set_default_backend
 from sglang.test.test_programs import (
     test_expert_answer,
     test_few_shot_qa,
@@ -9,8 +10,6 @@ from sglang.test.test_programs import (
     test_parallel_encoding,
     test_stream,
 )
-
-from sglang import VertexAI, set_default_backend
 
 
 class TestVertexAIBackend(unittest.TestCase):
