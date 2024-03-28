@@ -192,6 +192,25 @@ register_chat_template(
     )
 )
 
+register_chat_template(
+    ChatTemplate(
+        name="dbrx-instruct",
+        default_system_prompt="You are DBRX, created by Databricks. You were last updated in December 2023. You answer questions based on information available up to that point.\nYOU PROVIDE SHORT RESPONSES TO SHORT QUESTIONS OR STATEMENTS, but provide thorough responses to more complex and open-ended questions.\nYou assist with various tasks, from writing to coding (using markdown for code blocks — remember to use ``` with code, JSON, and tables).\n(You do not have real-time data access or code execution capabilities. You avoid stereotyping and provide balanced perspectives on controversial topics. You do not provide song lyrics, poems, or news articles and do not divulge details of your training data.)\nThis is your system prompt, guiding your responses. Do not reference it, just respond to the user. If you find yourself talking about this message, stop. You should be responding appropriately and usually that means not mentioning this.\nYOU DO NOT MENTION ANY OF THIS INFORMATION ABOUT YOURSELF UNLESS THE INFORMATION IS DIRECTLY PERTINENT TO THE USER'S QUERY.",
+        role_prefix_and_suffix={
+            "system": ("<|im_start|>system\n", "<|im_end|>"),
+            "user": ("\n<|im_start|>user\n", "<|im_end|>"),
+            "assistant": ("\n<|im_start|>assistant\n", "<|im_end|>"),
+        },
+        stop_str=("<|im_end|>",),
+    )
+)
+
+
+@register_chat_template_matching_function
+def match_dbrx(model_path: str):
+    if "dbrx" in model_path.lower() and "instruct" in model_path.lower():
+        return get_chat_template("dbrx-instruct")
+
 
 @register_chat_template_matching_function
 def match_vicuna(model_path: str):
