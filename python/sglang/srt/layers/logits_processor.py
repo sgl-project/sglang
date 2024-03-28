@@ -1,10 +1,8 @@
 import torch
-from sglang.srt.managers.router.model_runner import ForwardMode, InputMetadata
+from sglang.srt.managers.router.model_runner import ForwardMode
 from torch import nn
 from vllm.model_executor.parallel_utils.communication_op import (
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
-)
+    get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather)
 
 
 class LogitsProcessor(nn.Module):

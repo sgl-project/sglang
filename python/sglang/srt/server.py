@@ -24,32 +24,19 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.constrained import disable_cache
-from sglang.srt.conversation import (
-    Conversation,
-    SeparatorStyle,
-    chat_template_exists,
-    generate_chat_conv,
-    register_conv_template,
-)
+from sglang.srt.conversation import (Conversation, SeparatorStyle,
+                                     chat_template_exists, generate_chat_conv,
+                                     register_conv_template)
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import DetokenizeReqInput, GenerateReqInput
 from sglang.srt.managers.openai_protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ChatCompletionResponseChoice,
-    ChatCompletionResponseStreamChoice,
-    ChatCompletionStreamResponse,
-    ChatMessage,
-    CompletionRequest,
-    CompletionResponse,
-    CompletionResponseChoice,
-    CompletionResponseStreamChoice,
-    CompletionStreamResponse,
-    DeltaMessage,
-    LogProbs,
-    UsageInfo,
-)
+    ChatCompletionRequest, ChatCompletionResponse,
+    ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
+    ChatCompletionStreamResponse, ChatMessage, CompletionRequest,
+    CompletionResponse, CompletionResponseChoice,
+    CompletionResponseStreamChoice, CompletionStreamResponse, DeltaMessage,
+    LogProbs, UsageInfo)
 from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -527,7 +514,7 @@ def launch_server(server_args, pipe_finish_writer):
             try:
                 requests.get(url + "/get_model_info", timeout=5, headers=headers)
                 break
-            except requests.exceptions.RequestException as e:
+            except requests.exceptions.RequestException:
                 pass
         else:
             if pipe_finish_writer is not None:

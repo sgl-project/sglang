@@ -1,11 +1,8 @@
 from sglang.srt.managers.openai_protocol import (
     ChatCompletionMessageContentImagePart,
-    ChatCompletionMessageContentImageURL,
-    ChatCompletionMessageContentTextPart,
-    ChatCompletionMessageGenericParam,
-    ChatCompletionMessageUserParam,
-    ChatCompletionRequest,
-)
+    ChatCompletionMessageContentImageURL, ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam,
+    ChatCompletionRequest)
 
 
 def test_chat_completion_request_image():

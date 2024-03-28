@@ -16,7 +16,8 @@ from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.model_loader import _set_default_torch_dtype
-from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
+from vllm.model_executor.parallel_utils.parallel_state import \
+    initialize_model_parallel
 
 QUANTIONCONFIG_MAPPING = {"awq": AWQConfig, "gptq": GPTQConfig, "marlin": MarlinConfig}
 
@@ -92,10 +93,8 @@ class InputMetadata:
     decode_wrapper = None
 
     def init_flashinfer_args(self, tp_size):
-        from flashinfer import (
-            BatchDecodeWithPagedKVCacheWrapper,
-            BatchPrefillWithPagedKVCacheWrapper,
-        )
+        from flashinfer import (BatchDecodeWithPagedKVCacheWrapper,
+                                BatchPrefillWithPagedKVCacheWrapper)
 
         self.kv_indptr = torch.zeros(
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"

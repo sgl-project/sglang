@@ -3,17 +3,12 @@
 import json
 import os
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
 from huggingface_hub import snapshot_download
 from sglang.srt.utils import is_multimodal_model
-from transformers import (
-    AutoConfig,
-    AutoProcessor,
-    AutoTokenizer,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerFast,
-)
+from transformers import (AutoConfig, AutoProcessor, AutoTokenizer,
+                          PreTrainedTokenizer, PreTrainedTokenizerFast)
 
 
 def download_from_hf(model_path: str):

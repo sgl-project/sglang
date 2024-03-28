@@ -1,5 +1,6 @@
 import torch
-from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
+from sglang.srt.layers.context_flashattention_nopad import \
+    context_attention_fwd
 from sglang.srt.layers.extend_attention import extend_attention_fwd
 from sglang.srt.layers.token_attention import token_attention_fwd
 from sglang.srt.managers.router.model_runner import ForwardMode, InputMetadata
@@ -15,7 +16,8 @@ class RadixAttention(nn.Module):
         self.head_dim = head_dim
         self.layer_id = layer_id
 
-        from sglang.srt.managers.router.model_runner import global_server_args_dict
+        from sglang.srt.managers.router.model_runner import \
+            global_server_args_dict
 
         if global_server_args_dict.get("enable_flashinfer", False):
             self.prefill_forward = self.prefill_forward_flashinfer

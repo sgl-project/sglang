@@ -13,23 +13,17 @@ from rpyc.utils.server import ThreadedServer
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.io_struct import (
-    BatchTokenIDOut,
-    FlushCacheReq,
-    TokenizedGenerateReqInput,
-)
+from sglang.srt.managers.io_struct import (BatchTokenIDOut, FlushCacheReq,
+                                           TokenizedGenerateReqInput)
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode, Req
 from sglang.srt.managers.router.model_runner import ModelRunner
 from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.managers.router.scheduler import Scheduler
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import (
-    get_exception_traceback,
-    get_int_token_logit_bias,
-    is_multimodal_model,
-    set_random_seed,
-)
+from sglang.srt.utils import (get_exception_traceback,
+                              get_int_token_logit_bias, is_multimodal_model,
+                              set_random_seed)
 from vllm.logger import _default_handler as vllm_default_handler
 
 logger = logging.getLogger("model_rpc")
