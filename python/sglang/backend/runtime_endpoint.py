@@ -73,9 +73,11 @@ class RuntimeEndpoint(BaseBackend):
         assert res.status_code == 200
 
     def commit_lazy_operations(self, s: StreamExecutor):
+        data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
+        self._add_images(s, data)
         res = http_request(
             self.base_url + "/generate",
-            json={"text": s.text_, "sampling_params": {"max_new_tokens": 0}},
+            json=data,
             auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,

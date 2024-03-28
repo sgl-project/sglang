@@ -276,6 +276,7 @@ class StreamExecutor:
             exes[i].messages_ = list(self.messages_)
             exes[i].cur_role = self.cur_role
             exes[i].fork_start_text_pos = len(self.text_)
+            exes[i].images_ = list(self.images_)
 
         return exes
 
