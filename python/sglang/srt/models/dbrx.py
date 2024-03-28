@@ -1,11 +1,14 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/14ccd94c89d0ffd9da283545d93ab1dfea5da340/vllm/model_executor/models/dbrx.py
 # coding=utf-8
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
-
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.router.model_runner import InputMetadata
+from sglang.srt.models.dbrx_config import DbrxConfig
 from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
@@ -14,7 +17,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -27,14 +29,11 @@ from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
-from vllm.sequence import SamplerOutput
-from sglang.srt.models.dbrx_config import DbrxConfig
 
 
 class DbrxRouter(nn.Module):
@@ -176,6 +175,7 @@ class DbrxAttention(nn.Module):
     def __init__(
         self,
         config: DbrxConfig,
+        layer_id: int = 0,
         linear_method: Optional[LinearMethodBase] = None,
     ):
         super().__init__()
@@ -226,26 +226,26 @@ class DbrxAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.attn = Attention(
+        self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
         )
 
     def forward(
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        input_metadata: InputMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.Wqkv(hidden_states)
         if self.clip_qkv is not None:
             qkv.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(position_ids, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        attn_output = self.attn(q, k, v, input_metadata)
         hidden_states, _ = self.out_proj(attn_output)
         return hidden_states
 
@@ -255,11 +255,12 @@ class DbrxFusedNormAttention(nn.Module):
     def __init__(
         self,
         config: DbrxConfig,
+        layer_id: int = 0,
         linear_method: Optional[LinearMethodBase] = None,
     ):
         super().__init__()
         self.d_model = config.d_model
-        self.attn = DbrxAttention(config, linear_method)
+        self.attn = DbrxAttention(config, layer_id, linear_method)
         self.norm_1 = nn.LayerNorm(self.d_model)
         self.norm_2 = nn.LayerNorm(self.d_model)
 
@@ -267,16 +268,14 @@ class DbrxFusedNormAttention(nn.Module):
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        input_metadata: InputMetadata,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.norm_1(hidden_states)
         x = self.attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
+            input_metadata=input_metadata,
         )
         hidden_states = residual + x
         residual = hidden_states
@@ -289,24 +288,23 @@ class DbrxBlock(nn.Module):
     def __init__(
         self,
         config: DbrxConfig,
+        layer_id: int = 0,
         linear_method: Optional[LinearMethodBase] = None,
     ):
         super().__init__()
-        self.norm_attn_norm = DbrxFusedNormAttention(config, linear_method)
+        self.norm_attn_norm = DbrxFusedNormAttention(config, layer_id, linear_method)
         self.ffn = DbrxExperts(config, linear_method)
 
     def forward(
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        input_metadata: InputMetadata,
     ) -> torch.Tensor:
         hidden_states, residual = self.norm_attn_norm(
             position_ids=position_ids,
             hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
+            input_metadata=input_metadata,
         )
         hidden_states = self.ffn(hidden_states)
         hidden_states = hidden_states + residual
@@ -326,7 +324,7 @@ class DbrxModel(nn.Module):
             config.d_model,
         )
         self.blocks = nn.ModuleList(
-            [DbrxBlock(config, linear_method) for _ in range(config.n_layers)]
+            [DbrxBlock(config, i, linear_method) for i in range(config.n_layers)]
         )
         self.norm_f = nn.LayerNorm(config.d_model, eps=1e-5)
         for module in self.modules():
@@ -338,18 +336,16 @@ class DbrxModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        input_metadata: InputMetadata,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.wte(input_ids)
+        if input_embeds is None:
+            hidden_states = self.wte(input_ids)
+        else:
+            hidden_states = input_embeds
         for i in range(len(self.blocks)):
             block = self.blocks[i]
-            hidden_states = block(
-                position_ids,
-                hidden_states,
-                kv_caches[i],
-                attn_metadata,
-            )
+            hidden_states = block(position_ids, hidden_states, input_metadata)
         hidden_states = self.norm_f(hidden_states)
         return hidden_states
 
@@ -372,36 +368,18 @@ class DbrxForCausalLM(nn.Module):
             org_num_embeddings=config.vocab_size,
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
         )
-        self.logits_processor = LogitsProcessor(
-            self.unpadded_vocab_size, config.vocab_size
-        )
-        self.sampler = Sampler()
+        self.logits_processor = LogitsProcessor(config)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, kv_caches, attn_metadata)
-        return hidden_states
-
-    def compute_logits(
-        self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata
-    ) -> torch.Tensor:
-        logits = self.logits_processor(
-            self.lm_head.weight, hidden_states, sampling_metadata
+        hidden_states = self.transformer(input_ids, positions, input_metadata)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
-        return logits
-
-    def sample(
-        self,
-        logits: Optional[torch.Tensor],
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
 
     def load_weights(
         self,
@@ -433,3 +411,6 @@ class DbrxForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+
+EntryClass = DbrxForCausalLM
