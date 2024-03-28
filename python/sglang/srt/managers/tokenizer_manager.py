@@ -57,7 +57,7 @@ def get_pixel_values(
 ):
     try:
         processor = processor or global_processor
-        image, image_size  = load_image(image_data)
+        image, image_size = load_image(image_data)
         if image_size != None:
             image_hash = hash(image_data)
             pixel_values = processor.image_processor(image)["pixel_values"]
@@ -69,7 +69,8 @@ def get_pixel_values(
             image_hash = hash(image_data)
             if image_aspect_ratio == "pad":
                 image = expand2square(
-                    image, tuple(int(x * 255) for x in processor.image_processor.image_mean)
+                    image,
+                    tuple(int(x * 255) for x in processor.image_processor.image_mean),
                 )
                 pixel_values = processor.image_processor(image)["pixel_values"][0]
             elif image_aspect_ratio == "anyres":
@@ -78,7 +79,7 @@ def get_pixel_values(
                 )
             else:
                 pixel_values = processor.image_processor(image)["pixel_values"][0]
-            
+
             pixel_values = pixel_values.astype(np.float16)
             return pixel_values, image_hash, image.size
 
@@ -91,6 +92,7 @@ class TokenizerManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        model_overide_args: dict = None,
     ):
         self.server_args = server_args
 
@@ -103,7 +105,9 @@ class TokenizerManager:
 
         self.model_path = server_args.model_path
         self.hf_config = get_config(
-            self.model_path, trust_remote_code=server_args.trust_remote_code
+            self.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            model_overide_args=model_overide_args,
         )
 
         self.context_len = get_context_length(self.hf_config)
@@ -158,7 +162,7 @@ class TokenizerManager:
 
         if is_single:
             rid = obj.rid
-            input_ids = self.tokenizer.encode(obj.text) 
+            input_ids = self.tokenizer.encode(obj.text)
             sampling_params = SamplingParams(**obj.sampling_params)
             if sampling_params.max_new_tokens != 0:
                 sampling_params.normalize(self.tokenizer)
