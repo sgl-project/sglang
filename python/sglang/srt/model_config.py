@@ -29,6 +29,13 @@ class ModelConfig:
         )
         self.num_attention_heads = self.hf_config.num_attention_heads
         self.num_key_value_heads = getattr(self.hf_config, "num_key_value_heads", None)
+
+        # for Dbrx and MPT models
+        if self.hf_config.model_type in ["dbrx", "mpt"]:
+            self.num_key_value_heads = getattr(
+                self.hf_config.attn_config, "kv_n_heads", None
+            )
+
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_config.hidden_size
