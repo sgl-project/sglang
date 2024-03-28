@@ -13,25 +13,26 @@ VIDEO_DIR=$3
 
 MODEL_PATH=$4   
 
-TARGET_FRAMES=$5
+NUM_FRAMES=$5
 
-FRAME_FORMAT=$6
 
-FRAME_FORMAT=$(echo $FRAME_FORMAT | tr '[:lower:]' '[:upper:]')
+# FRAME_FORMAT=$6
 
-# Check if FRAME_FORMAT is either JPEG or PNG
-if [[ "$FRAME_FORMAT" != "JPEG" && "$FRAME_FORMAT" != "PNG" ]]; then
-    echo "Error: FRAME_FORMAT must be either JPEG or PNG."
-    exit 1
-fi
+# FRAME_FORMAT=$(echo $FRAME_FORMAT | tr '[:lower:]' '[:upper:]')
 
-export TARGET_FRAMES=$TARGET_FRAMES
+# # Check if FRAME_FORMAT is either JPEG or PNG
+# if [[ "$FRAME_FORMAT" != "JPEG" && "$FRAME_FORMAT" != "PNG" ]]; then
+#     echo "Error: FRAME_FORMAT must be either JPEG or PNG."
+#     exit 1
+# fi
 
-echo "Each video you will sample $TARGET_FRAMES frames"
+# export TARGET_FRAMES=$TARGET_FRAMES
 
-export FRAME_FORMAT=$FRAME_FORMAT
+echo "Each video you will sample $NUM_FRAMES frames"
 
-echo "The frame format is $FRAME_FORMAT"
+# export FRAME_FORMAT=$FRAME_FORMAT
+
+# echo "The frame format is $FRAME_FORMAT"
 
 # Assuming GPULIST is a bash array containing your GPUs
 GPULIST=(0) # 1 2 3 4 5 6 7)
@@ -76,7 +77,8 @@ for IDX in $(seq 1 $LOCAL_CHUNKS); do
             --chunk-idx $(($LOCAL_IDX - 1)) \
             --save-dir work_dirs/llava_next_video_inference_results \
             --video-dir $VIDEO_DIR \
-            --model-path $MODEL_PATH &
+            --model-path $MODEL_PATH \
+            --num-frames $NUM_FRAMES &
             
             wait $!  # Wait for the process to finish and capture its exit status
             COMMAND_STATUS=$?

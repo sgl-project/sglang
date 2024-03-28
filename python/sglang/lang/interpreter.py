@@ -20,13 +20,13 @@ from sglang.lang.ir import (
     SglFunction,
     SglGen,
     SglImage,
-    SglVideo,
     SglRoleBegin,
     SglRoleEnd,
     SglSelect,
     SglVariable,
     SglVarScopeBegin,
     SglVarScopeEnd,
+    SglVideo,
 )
 from sglang.utils import encode_image_base64, encode_video_base64
 
@@ -370,12 +370,11 @@ class StreamExecutor:
         self.cur_images.append((path, base64_data))
         self.text_ += self.chat_template.image_token
 
-
     def _execute_video(self, expr: SglVideo):
         path = expr.path
+        num_frames = expr.num_frames
 
-        base64_data = encode_video_base64(path)
-        # print(f"Encoded video {path} to base64...")
+        base64_data = encode_video_base64(path, num_frames)
 
         self.images_.append((path, base64_data))
         self.cur_images.append((path, base64_data))

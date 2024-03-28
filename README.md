@@ -45,29 +45,14 @@ Before proceeding, ensure you're in the project's model directory:
 cd PATH_TO/sglang_video/work_dirs/llava_next_video_model
 ```
 
-Choose the set of instructions based on the number of frames you plan to use for inference:
+Download and set up the models:
 
-- **For 32 Frames Inference:**
+```sh
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='liuhaotian/llava-v1.6-34b', local_dir='./llava-v1.6-Yi-34b-8k')"
+```
 
-  Download and set up the models:
+Repeat the download and setup process for other models as necessary, adjusting the `repo_id` and `local_dir` accordingly.
 
-  ```sh
-  python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='liuhaotian/llava-v1.6-34b', local_dir='./llava-v1.6-Yi-34b-8k')"
-  cp llava-v1.6-Yi-34b-8k_config.json llava-v1.6-Yi-34b-8k/config.json 
-  cp llava-v1.6-Yi-34b-8k_generation_config.json llava-v1.6-Yi-34b-8k/generation_config.json
-  ```
-
-  Repeat the download and setup process for other models as necessary, adjusting the `repo_id` and `local_dir` accordingly.
-
-- **For Inference with Less Than 32 Frames:**
-
-  You only need to download the models without additional setup steps:
-
-  ```sh
-  python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='liuhaotian/llava-v1.6-34b', local_dir='./llava-v1.6-Yi-34b')"
-  ```
-
-  Repeat the download process for other models as necessary, adjusting the `repo_id` and `local_dir` accordingly.
 
 #### Additional Notes
 
@@ -92,15 +77,15 @@ Configure your environment and run examples using the following steps, adjusting
 2. **Launch and Run on (K) Nodes**:
    - First node:
      ```sh
-     bash examples/quick_start/srt_example_llava_v.sh K 0 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO JPEG
+     bash examples/quick_start/srt_example_llava_v.sh K 0 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
      ```
    - Second node:
      ```sh
-     bash examples/quick_start/srt_example_llava_v.sh K 1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO JPEG
+     bash examples/quick_start/srt_example_llava_v.sh K 1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
      ```
    - The K node:
      ```sh
-     bash examples/quick_start/srt_example_llava_v.sh K K-1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO JPEG
+     bash examples/quick_start/srt_example_llava_v.sh K K-1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
      ```
 
-Replace `K`, `YOUR_VIDEO_PATH`, `YOUR_MODEL_PATH`, and `FRAMES_PER_VIDEO` with your specific details. Frames are encoded in the either PNG or JPEG format.
+Replace `K`, `YOUR_VIDEO_PATH`, `YOUR_MODEL_PATH`, and `FRAMES_PER_VIDEO` with your specific details.

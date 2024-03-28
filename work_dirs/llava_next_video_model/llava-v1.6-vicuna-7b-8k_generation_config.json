@@ -1,8 +1,0 @@
-{
-  "attn_implementation": "flash_attention_2",
-  "bos_token_id": 1,
-  "eos_token_id": 2,
-  "max_length": 8192,
-  "pad_token_id": 0,
-  "transformers_version": "4.36.2"
-}

@@ -41,6 +41,7 @@ class ModelRpcServer:
         tp_rank: int,
         server_args: ServerArgs,
         port_args: PortArgs,
+        model_overide_args,
     ):
         server_args, port_args = [obtain(x) for x in [server_args, port_args]]
 
@@ -58,6 +59,7 @@ class ModelRpcServer:
             server_args.model_path,
             server_args.trust_remote_code,
             context_length=server_args.context_length,
+            model_overide_args=model_overide_args,
         )
 
         # for model end global settings
@@ -608,13 +610,15 @@ class ModelRpcService(rpyc.Service):
 
 
 class ModelRpcClient:
-    def __init__(self, server_args: ServerArgs, port_args: PortArgs):
+    def __init__(
+        self, server_args: ServerArgs, port_args: PortArgs, model_overide_args
+    ):
         tp_size = server_args.tp_size
 
         if tp_size == 1:
             # Init model
             self.model_server = ModelRpcService().exposed_ModelRpcServer(
-                0, server_args, port_args
+                0, server_args, port_args, model_overide_args
             )
 
             # Wrap functions

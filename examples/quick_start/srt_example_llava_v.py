@@ -3,44 +3,26 @@ Usage: python3 srt_example_llava.py
 """
 
 import sglang as sgl
-
 import os
-
 import csv
-
 import time
-
 import argparse
 
-
-
 @sgl.function
-def video_qa(s, video_path, question):
-    s += sgl.user(sgl.video(video_path) + question)
+def video_qa(s, num_frames, video_path, question):
+    s += sgl.user(sgl.video(video_path,num_frames) + question)
     s += sgl.assistant(sgl.gen("answer"))
 
 
-# def image_qa(s, image_path, question):
-#     s += sgl.user(sgl.image(image_path) + question)
-#     s += sgl.assistant(sgl.gen("answer"))
-
-
-# def single():
-#     state = image_qa.run(
-#         image_path="/mnt/bn/vl-research/workspace/yhzhang/sglang_video/examples/quick_start/images/cat.jpeg",
-#         question="What is this?",
-#         max_new_tokens=64)
-#     print(state["answer"], "\n")
-
-
-def single(path):
+def single(path, num_frames=16):
     state = video_qa.run(
+        num_frames=num_frames,
         video_path=path,
         question="Please provide a detailed description of the video, focusing on the main subjects, their actions, the background scenes, and the temporal transitions.",
         temperature=0.0,
         max_new_tokens=1024,
     )
-    print(state["answer"][:2], "\n")
+    print(state["answer"], "\n")
 
 
 # def stream():
@@ -107,7 +89,7 @@ def find_video_files(video_dir):
                 video_files.append(os.path.join(root, file))
     return video_files
 
-def batch(video_dir, save_dir, cur_chunk, num_chunks, batch_size=64):
+def batch(video_dir, save_dir, cur_chunk, num_chunks, num_frames=32, batch_size=64):
     video_files = find_video_files(video_dir)
     chunked_video_files = split_into_chunks(video_files, num_chunks)[cur_chunk]
     num_batches = 0
@@ -119,9 +101,10 @@ def batch(video_dir, save_dir, cur_chunk, num_chunks, batch_size=64):
         if not batch_video_files:
             print("No video files found in the specified directory.")
             return
-
+        
         batch_input = [
-            {
+            {   
+                "num_frames": num_frames,
                 "video_path": video_path,
                 "question": "Please provide a detailed description of the video, focusing on the main subjects, their actions, the background scenes.",
             } for video_path in batch_video_files
@@ -146,12 +129,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run video processing with specified port.')
 
     # Add an argument for the port
-    parser.add_argument('--port', type=int, default=30000, help='The master port for distributed training.')
+    parser.add_argument('--port', type=int, default=30000, help='The master port for distributed serving.')
     parser.add_argument('--chunk-idx', type=int, default=0, help='The index of the chunk to process.')
     parser.add_argument('--num-chunks', type=int, default=8, help='The number of chunks to process.')
     parser.add_argument('--save-dir', type=str, default="./work_dirs/llava_video", help='The directory to save the processed video files.')
     parser.add_argument('--video-dir', type=str, default="/mnt/bn/vl-research/workspace/yhzhang/data/sora/", help='The directory to save the processed video files.')
     parser.add_argument('--model-path', type=str, default="/mnt/bn/vl-research/checkpoints/llava-1.6-vicuna-7b-8k", help='The model path for the video processing.')
+    parser.add_argument('--num-frames', type=int, default=32, help='The number of frames to process in each video.' )
+    parser.add_argument("--mm_spatial_pool_stride", type=int, default=2)
 
     # Parse the arguments
     args = parser.parse_args()
@@ -162,6 +147,8 @@ if __name__ == "__main__":
 
     num_chunks = args.num_chunks
 
+    num_frames = args.num_frames
+
     if "34b" in args.model_path:
         tokenizer_path = "liuhaotian/llava-v1.6-34b-tokenizer"
     elif "7b" in args.model_path:
@@ -170,45 +157,57 @@ if __name__ == "__main__":
         print("Invalid model path. Please specify a valid model path.")
         exit()
 
+    model_overide_args = {}
+
+    model_overide_args["mm_spatial_pool_stride"] = args.mm_spatial_pool_stride
+    model_overide_args["architectures"] = ["LlavaVidForCausalLM"]
+    model_overide_args["num_frames"] = args.num_frames
+    model_overide_args["model_type"] = "llava"
+
+    if args.num_frames == 32:
+        model_overide_args["rope_scaling"] = {"factor": 2.0, "type": "linear"}
+        model_overide_args["max_sequence_length"] = 4096 * 2
+        model_overide_args["tokenizer_model_max_length"] = 4096 * 2
+    elif args.num_frames < 32:
+        pass
+    else:
+        print("The maximum number of frames to process is 32. Please specify a valid number of frames.")
+        exit()
+
 
     runtime = sgl.Runtime(
         model_path=args.model_path, #"liuhaotian/llava-v1.6-vicuna-7b",
         tokenizer_path=tokenizer_path,
         port=cur_port,
-        additional_ports=[cur_port+1,cur_port+2,cur_port+3,cur_port+4]
+        additional_ports=[cur_port+1,cur_port+2,cur_port+3,cur_port+4],
+        model_overide_args=model_overide_args,
     )
     sgl.set_default_backend(runtime)
     print(f"chat template: {runtime.endpoint.chat_template.name}")
 
-    # Or you can use API models
-    # sgl.set_default_backend(sgl.OpenAI("gpt-4-vision-preview"))
-    # sgl.set_default_backend(sgl.VertexAI("gemini-pro-vision"))
 
     # # Run a single request
-    # try:
-    #     print("\n========== single ==========\n")
-    #     root = "/mnt/bn/vl-research/workspace/yhzhang/data/sora/"
-    #     video_files = [os.path.join(root, f) for f in os.listdir(root) if f.endswith(('.mp4', '.avi', '.mov'))]  # Add more extensions if needed
-    #     start_time = time.time()  # Start time for processing a single video
-    #     for cur_video in video_files[:]:
-    #         print(cur_video)
-    #         single(cur_video)
-    #     end_time = time.time()  # End time for processing a single video
-    #     total_time = end_time - start_time
-    #     average_time = total_time / len(video_files)  # Calculate the average processing time
-    #     print(f"Average processing time per video: {average_time:.2f} seconds")
-    #     runtime.shutdown()
-    # except Exception as e:
-    #     print(e)
-    #     runtime.shutdown()
+    # # try:
+    # print("\n========== single ==========\n")
+    # root = "/mnt/bn/vl-research/workspace/yhzhang/data/sora/"
+    # video_files = [os.path.join(root, f) for f in os.listdir(root) if f.endswith(('.mp4', '.avi', '.mov'))]  # Add more extensions if needed
+    # start_time = time.time()  # Start time for processing a single video
+    # for cur_video in video_files[:]:
+    #     print(cur_video)
+    #     single(cur_video, num_frames)
+    # end_time = time.time()  # End time for processing a single video
+    # total_time = end_time - start_time
+    # average_time = total_time / len(video_files)  # Calculate the average processing time
+    # print(f"Average processing time per video: {average_time:.2f} seconds")
+    # runtime.shutdown()
+    # # except Exception as e:
+    # #     print(e)
+    # runtime.shutdown()
 
-    # # Stream output
-    # print("\n========== stream ==========\n")
-    # stream()
 
     # # Run a batch of requests
     print("\n========== batch ==========\n")
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
-    batch(args.video_dir,args.save_dir,cur_chunk,num_chunks)
+    batch(args.video_dir,args.save_dir,cur_chunk, num_chunks, num_frames, num_chunks)
     runtime.shutdown()
