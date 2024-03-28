@@ -34,6 +34,7 @@ def test_completion(args, echo, logprobs):
     if echo:
         assert text.startswith("The capital of France is")
     if logprobs:
+        print(response.choices[0].logprobs.top_logprobs)
         assert response.choices[0].logprobs
         if echo:
             assert response.choices[0].logprobs.token_logprobs[0] == None
@@ -44,6 +45,7 @@ def test_completion(args, echo, logprobs):
     assert response.usage.prompt_tokens > 0
     assert response.usage.completion_tokens > 0
     assert response.usage.total_tokens > 0
+    print("=" * 100)
 
 
 def test_completion_stream(args, echo, logprobs):
@@ -68,13 +70,14 @@ def test_completion_stream(args, echo, logprobs):
                 f"{r.choices[0].text:12s}\t" f"{r.choices[0].logprobs.token_logprobs}",
                 flush=True,
             )
+            print(r.choices[0].logprobs.top_logprobs)
         else:
             print(r.choices[0].text, end="", flush=True)
         assert r.id
         assert r.usage.prompt_tokens > 0
         assert r.usage.completion_tokens > 0
         assert r.usage.total_tokens > 0
-    print()
+    print("=" * 100)
 
 
 def test_chat_completion(args):
@@ -94,6 +97,7 @@ def test_chat_completion(args):
     assert response.usage.prompt_tokens > 0
     assert response.usage.completion_tokens > 0
     assert response.usage.total_tokens > 0
+    print("=" * 100)
 
 
 def test_chat_completion_image(args):
@@ -124,6 +128,7 @@ def test_chat_completion_image(args):
     assert response.usage.prompt_tokens > 0
     assert response.usage.completion_tokens > 0
     assert response.usage.total_tokens > 0
+    print("=" * 100)
 
 
 def test_chat_completion_stream(args):
@@ -149,7 +154,7 @@ def test_chat_completion_stream(args):
         if not data.content:
             continue
         print(data.content, end="", flush=True)
-    print()
+    print("=" * 100)
 
 
 def test_regex(args):
@@ -174,6 +179,7 @@ def test_regex(args):
     )
     text = response.choices[0].message.content
     print(json.loads(text))
+    print("=" * 100)
 
 
 if __name__ == "__main__":
@@ -188,10 +194,14 @@ if __name__ == "__main__":
     test_completion(args, echo=True, logprobs=False)
     test_completion(args, echo=False, logprobs=True)
     test_completion(args, echo=True, logprobs=True)
+    test_completion(args, echo=False, logprobs=3)
+    test_completion(args, echo=True, logprobs=3)
     test_completion_stream(args, echo=False, logprobs=False)
     test_completion_stream(args, echo=True, logprobs=False)
     test_completion_stream(args, echo=False, logprobs=True)
     test_completion_stream(args, echo=True, logprobs=True)
+    test_completion_stream(args, echo=False, logprobs=3)
+    test_completion_stream(args, echo=True, logprobs=3)
     test_chat_completion(args)
     test_chat_completion_stream(args)
     test_regex(args)

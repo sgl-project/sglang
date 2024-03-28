@@ -213,6 +213,7 @@ class RuntimeEndpoint(BaseBackend):
             "sampling_params": {"max_new_tokens": 0},
             "return_logprob": True,
             "logprob_start_len": max(prompt_len - 2, 0),
+            "return_text_in_logprobs": True,
         }
         self._add_images(s, data)
         res = http_request(
@@ -224,13 +225,19 @@ class RuntimeEndpoint(BaseBackend):
         )
         assert res.status_code == 200
         obj = res.json()
-        normalized_prompt_logprob = [
+        normalized_prompt_logprobs = [
             r["meta_info"]["normalized_prompt_logprob"] for r in obj
         ]
-        prompt_logprob = [r["meta_info"]["prompt_logprob"] for r in obj]
+        decision = choices[np.argmax(normalized_prompt_logprobs)]
+        prefill_token_logprobs = [r["meta_info"]["prefill_token_logprobs"] for r in obj]
+        decode_token_logprobs = [r["meta_info"]["decode_token_logprobs"] for r in obj]
 
-        decision = choices[np.argmax(normalized_prompt_logprob)]
-        return decision, normalized_prompt_logprob, prompt_logprob
+        return (
+            decision,
+            normalized_prompt_logprobs,
+            prefill_token_logprobs,
+            decode_token_logprobs,
+        )
 
     def concatenate_and_append(self, src_rids: List[str], dst_rid: str):
         res = http_request(
