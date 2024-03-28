@@ -419,9 +419,12 @@ class ModelRpcServer:
             next_token_ids = next_token_ids.cpu().tolist()
         else:
             next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
-            logits = prefill_token_logprobs = normalized_prompt_logprobs = (
-                last_logprobs
-            ) = None
+            (
+                logits,
+                prefill_token_logprobs,
+                normalized_prompt_logprobs,
+                last_logprobs,
+            ) = (None,) * 4
 
         # Only batch transfer the selected logprobs of the next token to CPU to reduce overhead.
         reqs = batch.reqs

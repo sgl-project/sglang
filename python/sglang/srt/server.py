@@ -143,8 +143,11 @@ async def detokenize_top_logprobs_tokens(top_logprobs, decode_to_text):
 
 
 async def handle_token_logprobs_results(obj: GenerateReqInput, ret):
-    """
-    Convert the style `(logprobs, token_id)` into `(logprobs, token_id, token_text)`
+    """Handle the token logprobs results, convert token ids to text if needed.
+
+    Args:
+        obj (GenerateReqInput): The request object.
+        ret (Union[Dict, List[Dict]]): The response object.
     """
     # NOTE: This is because the multiple requests in one http request.
 
