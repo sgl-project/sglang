@@ -193,6 +193,9 @@ async def make_openai_style_logprobs(
             ret_logprobs.tokens.append(token_text)
             ret_logprobs.token_logprobs.append(logprob)
 
+            # Not Supported yet
+            ret_logprobs.text_offset.append(-1)
+
     def append_top_logprobs(top_logprobs):
         for tokens in top_logprobs:
             if tokens is not None:
