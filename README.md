@@ -48,7 +48,7 @@ cd PATH_TO/sglang_video/work_dirs/llava_next_video_model
 Download and set up the models:
 
 ```sh
-python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='liuhaotian/llava-v1.6-34b', local_dir='./llava-v1.6-Yi-34b-8k')"
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='liuhaotian/llava-v1.6-34b', local_dir='./llava-v1.6-34b')"
 ```
 
 Repeat the download and setup process for other models as necessary, adjusting the `repo_id` and `local_dir` accordingly.
