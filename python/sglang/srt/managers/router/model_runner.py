@@ -18,7 +18,11 @@ from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
 
-QUANTIZATION_CONFIG_MAPPING = {"awq": AWQConfig, "gptq": GPTQConfig, "marlin": MarlinConfig}
+QUANTIZATION_CONFIG_MAPPING = {
+    "awq": AWQConfig,
+    "gptq": GPTQConfig,
+    "marlin": MarlinConfig,
+}
 
 logger = logging.getLogger("model_runner")
 
@@ -302,8 +306,9 @@ class ModelRunner:
             quant_method = quant_cfg.get("quant_method", "").lower()
             # compat: autogptq >=0.8.0 use checkpoint_format: str
             # compat: autogptq <=0.7.1 is_marlin_format: bool
-            is_format_marlin = (quant_cfg.get("checkpoint_format") == "marlin"
-                                or quant_cfg.get("is_marlin_format", False))
+            is_format_marlin = quant_cfg.get(
+                "checkpoint_format"
+            ) == "marlin" or quant_cfg.get("is_marlin_format", False)
 
             # Use marlin if the GPTQ model is serialized in marlin format.
             if quant_method == "gptq" and is_format_marlin:
