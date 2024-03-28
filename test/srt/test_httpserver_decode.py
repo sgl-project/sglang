@@ -9,11 +9,12 @@ The capital of France is Paris.\nThe capital of the United States is Washington,
 """
 
 import argparse
+import json
 
 import requests
 
 
-def test_decode(url, return_logprob):
+def test_decode(url, return_logprob, top_logprobs_num, return_text):
     response = requests.post(
         url + "/generate",
         json={
@@ -23,10 +24,13 @@ def test_decode(url, return_logprob):
                 "max_new_tokens": 32,
             },
             "return_logprob": return_logprob,
+            "top_logprobs_num": top_logprobs_num,
+            "return_text_in_logprobs": return_text,
             "logprob_start_len": 0,
         },
     )
-    print(response.json())
+    print(json.dumps(response.json()))
+    print("=" * 100)
 
 
 if __name__ == "__main__":
@@ -37,5 +41,8 @@ if __name__ == "__main__":
 
     url = f"{args.host}:{args.port}"
 
-    test_decode(url, False)
-    test_decode(url, True)
+    test_decode(url, False, 0, False)
+    test_decode(url, True, 0, False)
+    test_decode(url, True, 0, True)
+    test_decode(url, True, 3, False)
+    test_decode(url, True, 3, True)
