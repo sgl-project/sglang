@@ -470,6 +470,10 @@ class Batch:
                 setattr(
                     self, item, torch.concat([self_val, other_val])
                 )
+            elif self_val is not None or other_val is not None:
+                setattr(
+                    self, item, self_val if self_val else other_val
+                )
 
     def sample(self, logits: torch.Tensor):
         # Post process logits
