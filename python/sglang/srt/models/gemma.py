@@ -6,10 +6,10 @@ from typing import Optional, Tuple
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.router.model_runner import InputMetadata
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import LoRAConfig
-from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import GeluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
