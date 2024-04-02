@@ -3,6 +3,7 @@ import importlib.resources
 import inspect
 import logging
 import pkgutil
+import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import List
@@ -15,15 +16,22 @@ from sglang.srt.utils import is_multimodal_model
 from sglang.utils import get_available_gpu_memory
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
-from vllm.model_executor.layers.quantization.marlin import MarlinConfig
+try:
+    from vllm.model_executor.layers.quantization.marlin import MarlinConfig
+except ModuleNotFoundError:
+    pass
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
+
 
 QUANTIZATION_CONFIG_MAPPING = {
     "awq": AWQConfig,
     "gptq": GPTQConfig,
-    "marlin": MarlinConfig,
 }
+try:
+    QUANTIZATION_CONFIG_MAPPING["marlin"] = MarlinConfig
+except NameError:
+    warnings.warn("MerlinConfig missing, please install vllm main if you want to use it.")
 
 logger = logging.getLogger("model_runner")
 

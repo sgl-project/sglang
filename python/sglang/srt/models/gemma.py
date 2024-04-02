@@ -10,7 +10,10 @@ from sglang.srt.managers.router.model_runner import InputMetadata
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import LoRAConfig
-from vllm.model_executor.layers.activation import GeluAndMul
+try:
+    from vllm.model_executor.layers.activation import GeluAndMul
+except ImportError:
+    pass
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
@@ -46,7 +49,11 @@ class GemmaMLP(nn.Module):
         self.down_proj = RowParallelLinear(
             intermediate_size, hidden_size, bias=False, linear_method=linear_method
         )
-        self.act_fn = GeluAndMul()
+        try:
+            self.act_fn = GeluAndMul()
+        except:
+            raise Exception("GeluAndMul not imported. Try install vllm main.")
+
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
