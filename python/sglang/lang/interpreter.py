@@ -248,9 +248,11 @@ class StreamExecutor:
     def set_var(self, name, value):
         self.variables[name] = value
 
-    def get_meta_info(self, name):
+    def get_meta_info(self, name, timeout=None):
         if name in self.variable_event:
-            self.variable_event[name].wait()
+            got = self.variable_event[name].wait(timeout)
+            if not got:
+                raise TimeoutError(f"Timeout while waiting for event '{name}'")
         ret = self.meta_info.get(name, None)
         return ret
 
