@@ -18,8 +18,8 @@ from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 try:
     from vllm.model_executor.layers.quantization.marlin import MarlinConfig
-except ModuleNotFoundError:
-    pass
+except ModuleNotFoundError as e:
+    MarlinConfig = e
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
 
@@ -28,10 +28,11 @@ QUANTIZATION_CONFIG_MAPPING = {
     "awq": AWQConfig,
     "gptq": GPTQConfig,
 }
-try:
+
+if isinstance(MarlinConfig, ModuleNotFoundError):
+    warnings.warn("MerlinConfig is not found. Please install the main branch of vLLM if you want to use it. {MarlinConfig}")
+else:
     QUANTIZATION_CONFIG_MAPPING["marlin"] = MarlinConfig
-except NameError:
-    warnings.warn("MerlinConfig missing, please install vllm main if you want to use it.")
 
 logger = logging.getLogger("model_runner")
 
