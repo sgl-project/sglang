@@ -327,7 +327,7 @@ class ModelRunner:
 
             if quant_config_class is None:
                 raise ValueError(f"Unsupported quantization method: {quant_method}")
-            elif isinstance(MarlinConfig, ModuleNotFoundError):
+            elif isinstance(MarlinConfig, Exception):
                 raise e
 
             quant_config = quant_config_class.from_config(quant_cfg)
