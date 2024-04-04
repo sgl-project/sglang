@@ -12,8 +12,8 @@ from transformers import PretrainedConfig
 from vllm.config import LoRAConfig
 try:
     from vllm.model_executor.layers.activation import GeluAndMul
-except ImportError:
-    pass
+except ImportError as e:
+    GeluAndMul = e
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
@@ -49,11 +49,10 @@ class GemmaMLP(nn.Module):
         self.down_proj = RowParallelLinear(
             intermediate_size, hidden_size, bias=False, linear_method=linear_method
         )
-        try:
+        if isinstance(GeluAndMul, Exception):
+            raise e
+        else:
             self.act_fn = GeluAndMul()
-        except:
-            raise Exception("GeluAndMul not imported. Try install vllm main.")
-
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
