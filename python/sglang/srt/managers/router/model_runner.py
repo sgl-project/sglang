@@ -27,12 +27,8 @@ from vllm.model_executor.parallel_utils.parallel_state import initialize_model_p
 QUANTIZATION_CONFIG_MAPPING = {
     "awq": AWQConfig,
     "gptq": GPTQConfig,
+    "marlin": MarlinConfig,
 }
-
-if isinstance(MarlinConfig, ModuleNotFoundError):
-    warnings.warn("MerlinConfig is not found. Please install the main branch of vLLM if you want to use it. {MarlinConfig}")
-else:
-    QUANTIZATION_CONFIG_MAPPING["marlin"] = MarlinConfig
 
 logger = logging.getLogger("model_runner")
 
@@ -331,6 +327,8 @@ class ModelRunner:
 
             if quant_config_class is None:
                 raise ValueError(f"Unsupported quantization method: {quant_method}")
+            elif isinstance(MarlinConfig, ModuleNotFoundError):
+                raise e
 
             quant_config = quant_config_class.from_config(quant_cfg)
             logger.info(f"quant_config: {quant_config}")
