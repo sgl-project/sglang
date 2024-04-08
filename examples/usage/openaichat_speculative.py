@@ -15,6 +15,7 @@ python3 openaichat_speculative.py
 import sglang as sgl
 from sglang import function, gen, set_default_backend, OpenAI
 
+
 @function(api_num_spec_tokens=512)
 def gen_character_spec(s):
     s += sgl.system("You are a helpful assistant.")
@@ -33,17 +34,15 @@ def multi_turn_question(s, question_1, question_2):
     s += sgl.user("Question 1: "+question_1+"\nQuestion 2: "+question_2)
     s += sgl.assistant("Answer 1: "+sgl.gen("answer_1", stop="\n") + "\nAnswer 2: "+ sgl.gen("answer_2", stop="\n"))
 
-def single1():
 
+def single1():
     state = gen_character_spec.run(max_new_tokens=64)
     for m in state.messages():
         print(m["role"], ":", m["content"])
 
-
     print("\n-- name:", state["name"])
     print("\n-- birthday:", state["birthday"])
     print("\n-- job:", state["job"])
-
 
 
 def single2():
@@ -68,9 +67,6 @@ def stream():
 
     for out in state.text_iter():
         print(out, end="", flush=True)
-    print()
-
-
 
 
 if __name__ == "__main__":
