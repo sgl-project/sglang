@@ -66,9 +66,9 @@ class BenchBatch:
             p_idx = prefix_req_idx[i // fork_num].item()
             n_idx = self.req_pool_indices[i].item()
             req_to_token[n_idx, :prefix_len] = req_to_token[p_idx, :prefix_len]
-            req_to_token[
-                n_idx, prefix_len : prefix_len + extend_len
-            ] = self.out_cache_loc[i * extend_len : (i + 1) * extend_len]
+            req_to_token[n_idx, prefix_len : prefix_len + extend_len] = (
+                self.out_cache_loc[i * extend_len : (i + 1) * extend_len]
+            )
 
     def update_decode(self, predict_ids, batch_size):
         assert predict_ids.shape[0] == batch_size
@@ -81,9 +81,9 @@ class BenchBatch:
             self.out_cache_cont_start,
             self.out_cache_cont_end,
         ) = self.token_to_kv_pool.alloc_contiguous(batch_size)
-        self.req_to_token_pool.req_to_token[
-            self.req_pool_indices, self.seq_lens
-        ] = self.out_cache_loc
+        self.req_to_token_pool.req_to_token[self.req_pool_indices, self.seq_lens] = (
+            self.out_cache_loc
+        )
         self.seq_lens.add_(1)
 
 
