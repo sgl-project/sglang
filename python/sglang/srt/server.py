@@ -24,6 +24,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.constrained import disable_cache
+from sglang.srt.utils import enable_show_time_cost
 from sglang.srt.conversation import (
     Conversation,
     SeparatorStyle,
@@ -502,6 +503,10 @@ async def v1_chat_completions(raw_request: Request):
 def launch_server(server_args, pipe_finish_writer):
     global tokenizer_manager
     global chat_template_name
+
+    # start show time thread
+    if server_args.show_time_cost:
+        enable_show_time_cost()
 
     # disable disk cache if needed
     if server_args.disable_disk_cache:

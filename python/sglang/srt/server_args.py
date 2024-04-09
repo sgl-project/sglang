@@ -26,13 +26,14 @@ class ServerArgs:
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     log_level: str = "info"
+    api_key: str = ""
+    show_time_cost: bool = False
 
     # optional modes
     disable_radix_cache: bool = False
     enable_flashinfer: bool = False
     disable_regex_jump_forward: bool = False
     disable_disk_cache: bool = False
-    api_key: str = ""
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -181,6 +182,18 @@ class ServerArgs:
             default=ServerArgs.log_stats_interval,
             help="Log stats interval in second.",
         )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default=ServerArgs.api_key,
+            help="Set API Key",
+        )
+        parser.add_argument(
+            "--show-time-cost",
+            action="store_true",
+            help="Show time cost of custom marks",
+        )
+
         # optional modes
         parser.add_argument(
             "--disable-radix-cache",
@@ -201,12 +214,6 @@ class ServerArgs:
             "--disable-disk-cache",
             action="store_true",
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
-        )
-        parser.add_argument(
-            "--api-key",
-            type=str,
-            default=ServerArgs.api_key,
-            help="Set API Key",
         )
 
     @classmethod
