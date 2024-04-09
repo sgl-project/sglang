@@ -240,7 +240,7 @@ class Batch:
                 out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
 
             if out_cache_loc is None:
-                print("Prefill out of memory. This should nerver happen.")
+                print("Prefill out of memory. This should never happen.")
                 self.tree_cache.pretty_print()
                 exit()
 
@@ -402,7 +402,7 @@ class Batch:
             self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
             if self.out_cache_loc is None:
-                print("Decode out of memory. This should nerver happen.")
+                print("Decode out of memory. This should never happen.")
                 self.tree_cache.pretty_print()
                 exit()
 
