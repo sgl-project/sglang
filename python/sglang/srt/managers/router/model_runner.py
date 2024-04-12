@@ -17,7 +17,7 @@ from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.model_loader import _set_default_torch_dtype
-from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
+from vllm.distributed import initialize_model_parallel
 
 QUANTIZATION_CONFIG_MAPPING = {
     "awq": AWQConfig,
