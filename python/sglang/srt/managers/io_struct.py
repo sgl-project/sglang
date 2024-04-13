@@ -8,7 +8,9 @@ from sglang.srt.sampling_params import SamplingParams
 @dataclass
 class GenerateReqInput:
     # The input prompt
-    text: Union[List[str], str]
+    text: Optional[Union[List[str], str]] = None
+    # The tokens for text; one can either specify text or input_ids
+    input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The image input
     image_data: Optional[Union[List[str], str]] = None
     # The sampling_params
@@ -28,7 +30,18 @@ class GenerateReqInput:
     # TODO: make all parameters a Union[List[T], T] to allow for batched requests
 
     def post_init(self):
-        is_single = isinstance(self.text, str)
+
+        if self.text is None:
+            assert self.input_ids is not None, "Either text or input_ids should be provided"
+        else:
+            assert self.input_ids is None, "Either text or input_ids should be provided"
+        
+        if self.text is not None:
+            is_single = isinstance(self.text, str)
+        else:
+            is_single = isinstance(self.input_ids[0], int)
+        
+        self._is_single = is_single
 
         if is_single:
             if self.sampling_params is None:
@@ -42,7 +55,7 @@ class GenerateReqInput:
             if self.top_logprobs_num is None:
                 self.top_logprobs_num = 0
         else:
-            num = len(self.text)
+            num = len(self.text) if self.text is not None else len(self.input_ids)
 
             if self.image_data is None:
                 self.image_data = [None] * num
@@ -74,6 +87,8 @@ class GenerateReqInput:
             elif not isinstance(self.top_logprobs_num, list):
                 self.top_logprobs_num = [self.top_logprobs_num] * num
 
+    def is_single(self):
+        return self._is_single
 
 @dataclass
 class TokenizedGenerateReqInput:
