@@ -378,7 +378,13 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
   - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.6-34b --tokenizer-path liuhaotian/llava-v1.6-34b-tokenizer --port 3000`
 - Yi-VL
   - see [srt_example_yi_vl.py](examples/quick_start/srt_example_yi_vl.py).
+- StableLM
+- Command-R
+- DBRX
 - AWQ/GPTQ quantization
+- Marlin INT4
+
+Model support can be added [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models).
 
 ## Benchmark And Performance
 
