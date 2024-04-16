@@ -171,7 +171,6 @@ class DbrxExperts(nn.Module):
 
 
 class DbrxAttention(nn.Module):
-
     def __init__(
         self,
         config: DbrxConfig,
@@ -251,7 +250,6 @@ class DbrxAttention(nn.Module):
 
 
 class DbrxFusedNormAttention(nn.Module):
-
     def __init__(
         self,
         config: DbrxConfig,
@@ -284,7 +282,6 @@ class DbrxFusedNormAttention(nn.Module):
 
 
 class DbrxBlock(nn.Module):
-
     def __init__(
         self,
         config: DbrxConfig,
@@ -312,7 +309,6 @@ class DbrxBlock(nn.Module):
 
 
 class DbrxModel(nn.Module):
-
     def __init__(
         self,
         config: DbrxConfig,
@@ -351,7 +347,6 @@ class DbrxModel(nn.Module):
 
 
 class DbrxForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: DbrxConfig,
