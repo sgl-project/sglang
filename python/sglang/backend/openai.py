@@ -83,10 +83,7 @@ class OpenAI(BaseBackend):
 
         self.chat_begin_str = self.chat_template.role_prefix_and_suffix["assistant"][0]
         
-        if is_speculative is not None:
-            self.is_speculative = is_speculative
-        else:
-            self.is_speculative = False
+        self.is_speculative = is_speculative if is_speculative else False
 
     def get_chat_template(self):
         return self.chat_template
