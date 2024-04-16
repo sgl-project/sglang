@@ -60,8 +60,14 @@ class Anthropic(BaseBackend):
         else:
             messages = [{"role": "user", "content": s.text_}]
 
+        if messages and messages[0]["role"] == "system":
+            system = messages.pop(0)["content"]
+        else:
+            system = ""
+
         with anthropic.Anthropic().messages.stream(
             model=self.model_name,
+            system=system,
             messages=messages,
             **sampling_params.to_anthropic_kwargs(),
         ) as stream:
