@@ -384,7 +384,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 - AWQ/GPTQ quantization
 - Marlin INT4
 
-Model support can be added [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models).
+Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/model_support.md).
 
 ## Benchmark And Performance
 
