@@ -26,6 +26,19 @@ def gen_character_spec(s):
 
 
 @function(api_num_spec_tokens=512)
+def gen_character_spec_no_few_shot(s):
+    s += sgl.user("Construct a character. For each field stop with a newline\n")
+    s += sgl.assistant("Name:" + sgl.gen("name", stop="\n") + "\nAge:" + sgl.gen("age", stop="\n") + "\nJob:" + sgl.gen("job", stop="\n"))
+
+
+@function
+def gen_character_normal(s):
+    s += sgl.system("You are a helpful assistant.")
+    s += sgl.user("What's the answer of 23 + 8?")
+    s += sgl.assistant(sgl.gen("answer", max_tokens=64))
+
+
+@function(api_num_spec_tokens=1024)
 def multi_turn_question(s, question_1, question_2):
     s += sgl.system("You are a helpful assistant.")
     s += sgl.user("Answer questions in the following format:")
@@ -35,7 +48,7 @@ def multi_turn_question(s, question_1, question_2):
     s += sgl.assistant("Answer 1: "+sgl.gen("answer_1", stop="\n") + "\nAnswer 2: "+ sgl.gen("answer_2", stop="\n"))
 
 
-def single1():
+def test_spec_single_turn():
     state = gen_character_spec.run(max_new_tokens=64)
     for m in state.messages():
         print(m["role"], ":", m["content"])
@@ -45,10 +58,26 @@ def single1():
     print("\n-- job:", state["job"])
 
 
-def single2():
+def test_inaccurate_spec_single_turn():
+    state = gen_character_spec_no_few_shot.run(max_new_tokens=64)
+    for m in state.messages():
+        print(m["role"], ":", m["content"])
+
+    print("\n-- name:", state["name"])
+    print("\n-- age:", state["age"])
+    print("\n-- job:", state["job"])
+
+
+def test_normal_single_turn():
+    state = gen_character_normal.run()
+    for m in state.messages():
+        print(m["role"], ":", m["content"])
+
+
+def test_spec_multi_turn():
     state = multi_turn_question.run(
         question_1="What is the capital of the United States?",
-        question_2="List two local attractions in the capital of the United States.", max_new_tokens=128
+        question_2="List two local attractions in the capital of the United States.",
     )
 
     for m in state.messages():
@@ -58,7 +87,7 @@ def single2():
     print("\n-- answer_2 --\n", state["answer_2"])
 
 
-def stream():
+def test_spec_stream():
     state = multi_turn_question.run(
         question_1="What is the capital of the United States?",
         question_2="List two local attractions.",
@@ -70,15 +99,22 @@ def stream():
 
 
 if __name__ == "__main__":
-    set_default_backend(OpenAI("gpt-3.5-turbo-instruct"))
+    # set_default_backend(OpenAI("gpt-3.5-turbo-instruct"))
+    set_default_backend(OpenAI("gpt-4-turbo"))
 
-    # Run a single request
-    print("\n========== single 1 ==========\n")
-    single1()
+    # TODO add assert
 
-    print("\n========== single 2 ==========\n")
-    single2()
+    print("\n========== test spec single turn ==========\n")
+    test_spec_single_turn()
 
-    # Stream output
-    print("\n========== stream ==========\n")
-    stream()
+    print("\n========== test inaccurate spec single turn ==========\n")
+    test_inaccurate_spec_single_turn()
+
+    print("\n========== test normal single turn ==========\n")
+    test_normal_single_turn()
+
+    print("\n========== test spec multi turn ==========\n")
+    test_spec_multi_turn()
+
+    print("\n========== test spec stream ==========\n")
+    test_spec_stream()
