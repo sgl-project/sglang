@@ -3,6 +3,7 @@ from typing import Callable, List, Optional, Union
 
 import numpy as np
 import requests
+
 from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config
 from sglang.lang.chat_template import get_chat_template_by_model_path

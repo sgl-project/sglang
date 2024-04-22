@@ -22,6 +22,9 @@ import uvloop
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.constrained import disable_cache
 from sglang.srt.conversation import (
@@ -54,8 +57,6 @@ from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import enable_show_time_cost, handle_port_init
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 

@@ -1,8 +1,7 @@
 import unittest
 
-from sglang.backend.runtime_endpoint import RuntimeEndpoint
-
 import sglang as sgl
+from sglang.backend.runtime_endpoint import RuntimeEndpoint
 
 
 class TestBind(unittest.TestCase):

@@ -4,9 +4,6 @@
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.router.model_runner import InputMetadata
 from torch import nn
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -28,6 +25,10 @@ from vllm.model_executor.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
+
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.router.model_runner import InputMetadata
 
 Qwen2Config = None
 
