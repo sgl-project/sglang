@@ -1,10 +1,6 @@
 import multiprocessing
 import os
-import time
 
-import numpy as np
-import torch
-import torch.distributed as dist
 import transformers
 
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode, Req
