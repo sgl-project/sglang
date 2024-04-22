@@ -1,7 +1,6 @@
 """Inference-only Yi-VL model."""
 
-import os
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -13,7 +12,6 @@ from vllm.model_executor.weight_utils import (
 
 from sglang.srt.models.llava import (
     LlavaLlamaForCausalLM,
-    clip_vision_embed_forward,
     monkey_path_clip_vision_embed_forward,
 )
 

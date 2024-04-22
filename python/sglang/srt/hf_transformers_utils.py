@@ -3,7 +3,7 @@
 import json
 import os
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
 from huggingface_hub import snapshot_download
 from transformers import (

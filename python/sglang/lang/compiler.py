@@ -7,7 +7,6 @@ from sglang.global_config import global_config
 from sglang.lang.interpreter import ProgramState, StreamExecutor, pin_program
 from sglang.lang.ir import (
     SglArgument,
-    SglConstantText,
     SglExpr,
     SglSamplingParams,
     SglVariable,

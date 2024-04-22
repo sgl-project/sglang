@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Callable, List, Optional, Union
+from typing import List, Optional
 
 import numpy as np
 
