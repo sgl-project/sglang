@@ -10,9 +10,6 @@ import threading
 import time
 from typing import List, Optional, Union
 
-# Fix a Python bug
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
-
 import aiohttp
 import psutil
 import pydantic
@@ -22,6 +19,9 @@ import uvloop
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.constrained import disable_cache
 from sglang.srt.conversation import (
@@ -54,8 +54,9 @@ from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import enable_show_time_cost, handle_port_init
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+
+# Fix a Python bug
+setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -618,7 +619,7 @@ def launch_server(server_args, pipe_finish_writer):
             try:
                 requests.get(url + "/get_model_info", timeout=5, headers=headers)
                 break
-            except requests.exceptions.RequestException as e:
+            except requests.exceptions.RequestException:
                 pass
         else:
             if pipe_finish_writer is not None:

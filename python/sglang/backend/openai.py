@@ -1,8 +1,9 @@
 import logging
 import time
-from typing import Callable, List, Optional, Union
+from typing import List, Optional
 
 import numpy as np
+
 from sglang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import ChatTemplate, get_chat_template_by_model_path
 from sglang.lang.interpreter import StreamExecutor
