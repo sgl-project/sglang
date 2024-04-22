@@ -1,5 +1,6 @@
 import unittest
 
+from sglang import OpenAI, set_default_backend
 from sglang.test.test_programs import (
     test_decode_int,
     test_decode_json,
@@ -14,8 +15,6 @@ from sglang.test.test_programs import (
     test_stream,
     test_tool_use,
 )
-
-from sglang import OpenAI, set_default_backend
 
 
 class TestOpenAIBackend(unittest.TestCase):

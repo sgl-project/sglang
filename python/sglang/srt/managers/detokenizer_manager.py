@@ -3,6 +3,7 @@ import asyncio
 import uvloop
 import zmq
 import zmq.asyncio
+
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import BatchStrOut, BatchTokenIDOut
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -83,7 +84,7 @@ def start_detokenizer_process(
 ):
     try:
         manager = DetokenizerManager(server_args, port_args)
-    except Exception as e:
+    except Exception:
         pipe_writer.send(get_exception_traceback())
         raise
     pipe_writer.send("init ok")
