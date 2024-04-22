@@ -1,9 +1,8 @@
 import json
 import unittest
 
-from sglang.test.test_programs import test_mt_bench, test_stream
-
 from sglang import Anthropic, set_default_backend
+from sglang.test.test_programs import test_mt_bench, test_stream
 
 
 class TestAnthropicBackend(unittest.TestCase):
