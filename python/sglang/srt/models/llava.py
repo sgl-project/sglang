@@ -16,7 +16,7 @@ from torch import nn
 from transformers import CLIPVisionModel, LlamaConfig, LlavaConfig
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 from vllm.model_executor.layers.linear import LinearMethodBase
-from vllm.model_executor.weight_utils import (
+from sglang.srt.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
