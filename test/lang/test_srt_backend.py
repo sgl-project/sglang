@@ -2,9 +2,9 @@
 python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 """
 
-import json
 import unittest
 
+import sglang as sgl
 from sglang.test.test_programs import (
     test_decode_int,
     test_decode_json_regex,
@@ -12,15 +12,11 @@ from sglang.test.test_programs import (
     test_few_shot_qa,
     test_mt_bench,
     test_parallel_decoding,
-    test_parallel_encoding,
-    test_react,
     test_regex,
     test_select,
     test_stream,
     test_tool_use,
 )
-
-import sglang as sgl
 
 
 class TestSRTBackend(unittest.TestCase):

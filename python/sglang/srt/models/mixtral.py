@@ -1,14 +1,11 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/d0215a58e78572d91dadafe9d832a2db89b09a13/vllm/model_executor/models/mixtral.py#L1
 """Inference-only Mixtral model."""
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.router.model_runner import InputMetadata
 from torch import nn
 from transformers import MixtralConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -34,6 +31,10 @@ from vllm.model_executor.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
+
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.router.model_runner import InputMetadata
 
 
 class MixtralMLP(nn.Module):
