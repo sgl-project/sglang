@@ -10,6 +10,8 @@ import rpyc
 import torch
 from rpyc.utils.classic import obtain
 from rpyc.utils.server import ThreadedServer
+from vllm.logger import _default_handler as vllm_default_handler
+
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -30,7 +32,6 @@ from sglang.srt.utils import (
     is_multimodal_model,
     set_random_seed,
 )
-from vllm.logger import _default_handler as vllm_default_handler
 
 logger = logging.getLogger("model_rpc")
 

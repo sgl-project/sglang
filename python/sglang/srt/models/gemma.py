@@ -4,9 +4,6 @@
 from typing import Optional, Tuple
 
 import torch
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.router.model_runner import InputMetadata
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import LoRAConfig
@@ -27,6 +24,10 @@ from sglang.srt.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
+
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.router.model_runner import InputMetadata
 
 
 class GemmaMLP(nn.Module):
