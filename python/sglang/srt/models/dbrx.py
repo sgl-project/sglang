@@ -5,6 +5,10 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.router.model_runner import InputMetadata
+from sglang.srt.models.dbrx_config import DbrxConfig
 from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
@@ -30,11 +34,6 @@ from vllm.model_executor.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
-
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.router.model_runner import InputMetadata
-from sglang.srt.models.dbrx_config import DbrxConfig
 
 
 class DbrxRouter(nn.Module):

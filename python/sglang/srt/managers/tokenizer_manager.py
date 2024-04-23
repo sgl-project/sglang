@@ -10,7 +10,6 @@ import transformers
 import uvloop
 import zmq
 import zmq.asyncio
-
 from sglang.srt.hf_transformers_utils import (
     get_config,
     get_context_length,

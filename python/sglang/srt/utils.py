@@ -157,6 +157,7 @@ def get_exception_traceback():
 
 
 def get_int_token_logit_bias(tokenizer, vocab_size):
+    from transformers import LlamaTokenizer, LlamaTokenizerFast
 
     # a bug when model's vocab size > tokenizer.vocab_size
     vocab_size = tokenizer.vocab_size
