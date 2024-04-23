@@ -12,8 +12,8 @@ import torch
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
-from vllm.model_executor.model_loader import _set_default_torch_dtype
-from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
+from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+from vllm.distributed import initialize_model_parallel
 
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
@@ -40,6 +40,10 @@ def import_model_classes():
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
+            # gemma references InputMetadata that does not exist, skip it for now.
+            # TODO Wait for sglang/main to fix it.
+            if name in ["sglang.srt.models.gemma"]:
+                continue
             module = importlib.import_module(name)
             if hasattr(module, "EntryClass"):
                 model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
@@ -328,7 +332,7 @@ class ModelRunner:
             logger.info(f"quant_config: {quant_config}")
             linear_method = quant_config.get_linear_method()
 
-        with _set_default_torch_dtype(torch.float16):
+        with set_default_torch_dtype(torch.float16):
             with torch.device("cuda"):
                 model = model_class(
                     config=self.model_config.hf_config, linear_method=linear_method

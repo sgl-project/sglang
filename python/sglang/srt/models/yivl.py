@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from transformers import CLIPVisionModel, LlavaConfig
-from vllm.model_executor.weight_utils import (
+from sglang.srt.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
