@@ -20,7 +20,7 @@
 
 # This file is based on the LLama model definition file in transformers
 """PyTorch Cohere model."""
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.utils.checkpoint

@@ -7,7 +7,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import tqdm
 
@@ -18,6 +18,7 @@ from sglang.lang.ir import (
     SglConstantText,
     SglExpr,
     SglExprList,
+    SglFunction,
     SglGen,
     SglImage,
     SglRoleBegin,

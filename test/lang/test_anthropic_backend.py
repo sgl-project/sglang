@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from sglang import Anthropic, set_default_backend

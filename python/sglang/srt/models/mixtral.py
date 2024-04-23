@@ -1,7 +1,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/d0215a58e78572d91dadafe9d832a2db89b09a13/vllm/model_executor/models/mixtral.py#L1
 """Inference-only Mixtral model."""
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
