@@ -29,7 +29,7 @@ def main(args):
 
     tic = time.time()
     states = multi_turns.run_batch(
-        multi_qas, temperature=0, backend=backend, num_threads=args.parallel
+        multi_qas, temperature=0, backend=backend, num_threads=args.parallel, progress_bar=True
     )
     latency = time.time() - tic
 

@@ -73,7 +73,7 @@ def main(args):
     # Run requests
     tic = time.time()
     states = few_shot_gsm8k.run_batch(
-        arguments, temperature=0, backend=backend, num_threads=args.parallel)
+        arguments, temperature=0, backend=backend, num_threads=args.parallel, progress_bar=True)
     latency = time.time() - tic
 
     preds = []
