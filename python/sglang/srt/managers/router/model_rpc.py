@@ -113,7 +113,7 @@ class ModelRpcServer:
         logger.info(server_args.get_optional_modes_logging())
 
         # Init cache
-        self.tree_cache = RadixCache(server_args.disable_radix_cache)
+        self.tree_cache = RadixCache(disable=server_args.disable_radix_cache)
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.scheduler = Scheduler(
             self.schedule_heuristic,
@@ -626,7 +626,7 @@ class ModelRpcServer:
                     token_ids[:seq_len], indices.clone()
                 )
 
-                self.token_to_kv_pool.free(indices[:prefix_len])
+                self.token_to_kv_pool.dec_refs(indices[:prefix_len])
                 self.req_to_token_pool.free(req_pool_idx)
                 self.tree_cache.dec_ref_counter(req.last_node)
 
