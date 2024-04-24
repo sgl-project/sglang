@@ -313,6 +313,7 @@ def test_image_qa():
 def test_stream():
     @sgl.function
     def qa(s, question):
+        s += sgl.system("You are a helpful assistant.")
         s += sgl.user(question)
         s += sgl.assistant(sgl.gen("answer"))
 

@@ -4,6 +4,7 @@ from typing import List
 
 import numpy as np
 import torch
+
 from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
@@ -240,7 +241,7 @@ class Batch:
                 out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
 
             if out_cache_loc is None:
-                print("Prefill out of memory. This should nerver happen.")
+                print("Prefill out of memory. This should never happen.")
                 self.tree_cache.pretty_print()
                 exit()
 
@@ -251,10 +252,14 @@ class Batch:
             ] = out_cache_loc[pt : pt + extend_lens[i]]
             pt += extend_lens[i]
 
-        # Handle logit bias
-        logit_bias = torch.zeros((bs, vocab_size), dtype=torch.float32, device=device)
+        # Handle logit bias but only allocate when needed
+        logit_bias = None
         for i in range(bs):
             if reqs[i].sampling_params.dtype == "int":
+                if logit_bias is None:
+                    logit_bias = torch.zeros(
+                        (bs, vocab_size), dtype=torch.float32, device=device
+                    )
                 logit_bias[i] = int_token_logit_bias
 
         # Set fields
@@ -398,7 +403,7 @@ class Batch:
             self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
             if self.out_cache_loc is None:
-                print("Decode out of memory. This should nerver happen.")
+                print("Decode out of memory. This should never happen.")
                 self.tree_cache.pretty_print()
                 exit()
 
@@ -433,9 +438,12 @@ class Batch:
             "presence_penalties",
             "logit_bias",
         ]:
-            setattr(self, item, getattr(self, item)[new_indices])
+            self_val = getattr(self, item, None)
+            # logit_bias can be None
+            if self_val is not None:
+                setattr(self, item, self_val[new_indices])
 
-    def merge(self, other):
+    def merge(self, other: "Batch"):
         self.reqs.extend(other.reqs)
 
         self.req_pool_indices = torch.concat(
@@ -456,17 +464,34 @@ class Batch:
             "top_ks",
             "frequency_penalties",
             "presence_penalties",
-            "logit_bias",
         ]:
-            setattr(
-                self, item, torch.concat([getattr(self, item), getattr(other, item)])
+            self_val = getattr(self, item, None)
+            other_val = getattr(other, item, None)
+            setattr(self, item, torch.concat([self_val, other_val]))
+
+        # logit_bias can be None
+        if self.logit_bias is not None or other.logit_bias is not None:
+            vocab_size = (
+                self.logit_bias.shape[1]
+                if self.logit_bias is not None
+                else other.logit_bias.shape[1]
             )
+            if self.logit_bias is None:
+                self.logit_bias = torch.zeros(
+                    (len(self.reqs), vocab_size), dtype=torch.float32, device="cuda"
+                )
+            if other.logit_bias is None:
+                other.logit_bias = torch.zeros(
+                    (len(other.reqs), vocab_size), dtype=torch.float32, device="cuda"
+                )
+            self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
 
     def sample(self, logits: torch.Tensor):
         # Post process logits
         logits = logits.contiguous()
         logits.div_(self.temperatures)
-        logits.add_(self.logit_bias)
+        if self.logit_bias is not None:
+            logits.add_(self.logit_bias)
 
         has_regex = any(req.regex_fsm is not None for req in self.reqs)
         if has_regex:

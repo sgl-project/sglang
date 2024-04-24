@@ -54,7 +54,7 @@ def main(args):
     # Run requests
     tic = time.time()
     states = multi_dimension_judge.run_batch(
-        arguments, temperature=0, backend=backend, num_threads=args.parallel)
+        arguments, temperature=0, backend=backend, num_threads=args.parallel, progress_bar=True)
     latency = time.time() - tic
 
     print(f"Latency: {latency:.3f}")

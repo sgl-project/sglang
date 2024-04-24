@@ -162,6 +162,28 @@ register_chat_template(
     )
 )
 
+register_chat_template(
+    ChatTemplate(
+        name="llama-3-instruct",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "<|start_header_id|>system<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
+            "user": (
+                "<|start_header_id|>user<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
+            "assistant": (
+                "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
+        },
+        stop_str=("<|eot_id|>",),
+    )
+)
+
 # Reference: https://github.com/01-ai/Yi/tree/main/VL#major-difference-with-llava
 register_chat_template(
     ChatTemplate(
@@ -231,6 +253,13 @@ def match_llama2_chat(model_path: str):
         return get_chat_template("llama-2-chat")
     if "codellama" in model_path and "instruct" in model_path:
         return get_chat_template("llama-2-chat")
+
+
+@register_chat_template_matching_function
+def match_llama3_instruct(model_path: str):
+    model_path = model_path.lower()
+    if "llama-3" in model_path and "instruct" in model_path:
+        return get_chat_template("llama-3-instruct")
 
 
 @register_chat_template_matching_function

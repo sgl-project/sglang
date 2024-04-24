@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import contextvars
 import tqdm
+
 from sglang.global_config import global_config
 from sglang.lang.ir import (
     SglCommitLazy,
@@ -252,15 +253,23 @@ class StreamExecutor:
     def set_var(self, name, value):
         self.variables[name] = value
 
-    def get_meta_info(self, name):
+    def get_meta_info(self, name, timeout=None):
         if name in self.variable_event:
-            self.variable_event[name].wait()
+            got = self.variable_event[name].wait(timeout)
+            if not got:
+                raise TimeoutError(f"Timeout while waiting for event '{name}'")
         ret = self.meta_info.get(name, None)
         return ret
 
-    def fork(self, number: int, position_ids_offset: Optional[List[int]] = None):
-        self.submit(SglCommitLazy())
-        self.sync()
+    def fork(
+        self,
+        number: int,
+        position_ids_offset: Optional[List[int]] = None,
+        copy: bool = False,
+    ):
+        if number > 1 or copy:
+            self.submit(SglCommitLazy())
+            self.sync()
 
         number = int(number)
 
@@ -280,6 +289,7 @@ class StreamExecutor:
             exes[i].messages_ = list(self.messages_)
             exes[i].cur_role = self.cur_role
             exes[i].fork_start_text_pos = len(self.text_)
+            exes[i].images_ = list(self.images_)
 
         return exes
 
@@ -642,15 +652,20 @@ class ProgramState:
         yield
         self.stream_executor.submit(SglVarScopeEnd(name))
 
-    def fork(self, number: int = 1, position_ids_offset: Optional[List[int]] = None):
-        stream_executors = self.stream_executor.fork(number, position_ids_offset)
+    def fork(
+        self,
+        number: int = 1,
+        position_ids_offset: Optional[List[int]] = None,
+        copy: bool = False,
+    ):
+        stream_executors = self.stream_executor.fork(number, position_ids_offset, copy)
         states = [ProgramState(x) for x in stream_executors]
         state_group = ProgramStateGroup(states, self)
         return state_group
 
     @contextmanager
     def copy(self, position_ids_offset: Optional[List[int]] = None):
-        state_group = self.fork(1, position_ids_offset)
+        state_group = self.fork(1, position_ids_offset, True)
         try:
             yield state_group[0]
         finally:

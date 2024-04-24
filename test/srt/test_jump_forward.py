@@ -2,13 +2,13 @@ import argparse
 from enum import Enum
 
 from pydantic import BaseModel, constr
+
+import sglang as sgl
 from sglang.srt.constrained import build_regex_from_object
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
-
-import sglang as sgl
 
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
 

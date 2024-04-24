@@ -3,6 +3,7 @@ from typing import Callable, List, Optional, Union
 
 import numpy as np
 import requests
+
 from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config
 from sglang.lang.chat_template import get_chat_template_by_model_path
@@ -73,9 +74,11 @@ class RuntimeEndpoint(BaseBackend):
         assert res.status_code == 200
 
     def commit_lazy_operations(self, s: StreamExecutor):
+        data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
+        self._add_images(s, data)
         res = http_request(
             self.base_url + "/generate",
-            json={"text": s.text_, "sampling_params": {"max_new_tokens": 0}},
+            json=data,
             auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,

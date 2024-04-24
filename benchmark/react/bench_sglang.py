@@ -110,7 +110,9 @@ def main(args):
     tic = time.time()
     states = webthink.run_batch(arguments,
                                 temperature=0,
-                                num_threads=args.parallel)
+                                num_threads=args.parallel,
+                                progress_bar=True,
+                                )
     latency = time.time() - tic
 
     # Compute accuracy
