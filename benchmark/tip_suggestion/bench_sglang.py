@@ -59,7 +59,7 @@ def main(args):
     # Run requests
     tic = time.time()
     states = suggest_tips.run_batch(
-        arguments, temperature=0, num_threads=args.parallel)
+        arguments, temperature=0, num_threads=args.parallel, progress_bar=True)
     latency = time.time() - tic
 
     # Compute accuracy

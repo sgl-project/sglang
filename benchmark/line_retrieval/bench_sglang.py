@@ -61,7 +61,7 @@ def eval_model(args, line_obj, num_hoops, src_indices, dst_percents):
 
     tic = time.time()
     states = line_retrieval.run_batch(
-        arguments, temperature=0, backend=backend, num_threads=args.parallel)
+        arguments, temperature=0, backend=backend, num_threads=args.parallel, progress_bar=True)
     latency = time.time() - tic
 
     corrects = []

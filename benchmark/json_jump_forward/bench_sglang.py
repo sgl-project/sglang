@@ -72,7 +72,7 @@ def bench_city_doc(args):
         arguments,
         temperature=0,
         num_threads=args.parallel,
-        progress_bar=(args.parallel == 1),
+        progress_bar=True,
     )
     latency = time.time() - tic
 
@@ -96,7 +96,7 @@ def bench_character(args):
         arguments,
         temperature=0,
         num_threads=args.parallel,
-        progress_bar=(args.parallel == 1),
+        progress_bar=True,
     )
     latency = time.time() - tic
 

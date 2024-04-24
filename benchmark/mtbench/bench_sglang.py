@@ -60,7 +60,9 @@ def main(args):
         arguments,
         temperature=0,
         max_new_tokens=256,
-        num_threads=args.parallel)
+        num_threads=args.parallel,
+        progress_bar=True,
+    )
     answers = [[s["answer_1"], s["answer_2"]] for s in rets]
     latency = time.time() - tic
 
