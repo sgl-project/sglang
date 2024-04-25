@@ -46,8 +46,11 @@ def single_image(path, prompt, num_frames=16):
 # app = Flask(__name__)
 
 # Ensure model is in evaluation mode
-prompt_txt_path = "/mnt/bn/vl-research/workspace/yhzhang/llava-next-video-demo/user_logs/prompts.txt"
-multimodal_folder_path = "/mnt/bn/vl-research/workspace/yhzhang/llava-next-video-demo/user_logs"
+prompt_txt_path = "./user_logs/prompts.txt"
+multimodal_folder_path = "./user_logs"
+
+if not os.path.exists(multimodal_folder_path):
+    os.makedirs(multimodal_folder_path)
 
 cur_port = 30000
 
@@ -170,7 +173,7 @@ def process_image_and_prompt():
     # # Decode the video
     # video_data = query_content["video"]
     # video = cv2.VideoCapture(BytesIO(base64.b64decode(video_data)))
-    video = cv2.VideoCapture("/mnt/bn/vl-research/workspace/yhzhang/data/twitter/Q98Z4OTh8RwmDonc.mp4")
+    video = cv2.VideoCapture("./Q98Z4OTh8RwmDonc.mp4")
     path = save_video_unique(video)
     video.release()
 
