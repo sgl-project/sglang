@@ -33,25 +33,8 @@ pip install -e "python[all]"
 Install the necessary Python packages:
 
 ```sh
-pip3 install huggingface_hub hf_transfer outlines==0.0.34 opencv-python-headless
-pip3 install git+https://github.com/huggingface/transformers.git@56b64bf1a51e29046bb3f8ca15839ff4d6a92c74
+pip3 install huggingface_hub hf_transfer outlines==0.0.34 opencv-python-headless transformers==4.39.2
 ```
-
-#### Downloading Models
-
-Before proceeding, ensure you're in the project's model directory:
-
-```sh
-cd PATH_TO/sglang_video/work_dirs/llava_next_video_model
-```
-
-Download and set up the models:
-
-```sh
-python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='liuhaotian/llava-v1.6-34b', local_dir='./llava-v1.6-34b')"
-```
-
-Repeat the download and setup process for other models as necessary, adjusting the `repo_id` and `local_dir` accordingly.
 
 
 #### Additional Notes
