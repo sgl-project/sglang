@@ -547,6 +547,7 @@ class ModelRpcServer:
         output_and_jump_forward_strs = []
         output_hit_stop_str = []
         output_skip_special_tokens = []
+        output_spaces_between_special_tokens = []
         output_meta_info = []
         output_finished = []
         finished_indices = []
@@ -572,6 +573,9 @@ class ModelRpcServer:
                 output_hit_stop_str.append(req.hit_stop_str)
                 output_skip_special_tokens.append(
                     req.sampling_params.skip_special_tokens
+                )
+                output_spaces_between_special_tokens.append(
+                    req.sampling_params.spaces_between_special_tokens
                 )
 
                 meta_info = {
@@ -607,6 +611,7 @@ class ModelRpcServer:
                     output_and_jump_forward_strs,
                     output_hit_stop_str,
                     output_skip_special_tokens,
+                    output_spaces_between_special_tokens,
                     output_meta_info,
                     output_finished,
                 )
