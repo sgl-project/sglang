@@ -60,11 +60,11 @@ model_overide_args["mm_spatial_pool_stride"] = 2
 model_overide_args["architectures"] = ["LlavaVidForCausalLM"]
 model_overide_args["num_frames"] = 16
 model_overide_args["model_type"] = "llavavid"
-model_overide_args["image_token_index"] = 64002
+# model_overide_args["image_token_index"] = 64002
 
 runtime = sgl.Runtime(
-    model_path="lmms-lab/LLaVA-NeXT-Video-34B",
-    tokenizer_path= "liuhaotian/llava-v1.6-34b-tokenizer",
+    model_path="liuhaotian/llava-v1.6-vicuna-7b", #"lmms-lab/LLaVA-NeXT-Video-34B",
+    tokenizer_path= "llava-hf/llava-1.5-7b-hf", #"liuhaotian/llava-v1.6-34b-tokenizer",
     port=cur_port,
     additional_ports=[cur_port+1,cur_port+2,cur_port+3,cur_port+4],
     tp_size=4,
