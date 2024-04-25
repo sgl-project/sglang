@@ -31,9 +31,6 @@ class ReqToTokenPool:
             self.can_use_mem_size += free_index.shape[0]
         self.mem_state[free_index] = 1
 
-        # if self.can_use_mem_size == len(self.mem_state):
-        #     print(f"ReqToTokenPool: freed all. size = {self.can_use_mem_size}.")
-
     def clear(self):
         self.mem_state.fill_(1)
         self.can_use_mem_size = len(self.mem_state)
@@ -42,7 +39,7 @@ class ReqToTokenPool:
 class TokenToKVPool:
     def __init__(self, size, dtype, head_num, head_dim, layer_num):
         self.mem_state = torch.zeros((size,), dtype=torch.int16, device="cuda")
-        self.alloc_ct = 0
+        self.total_ref_ct = 0
 
         # [size, key/value, head_num, head_dim] for each layer
         self.kv_data = [
@@ -83,9 +80,6 @@ class TokenToKVPool:
         self.add_refs(select_index)
         return select_index.to(torch.int32), start_loc, start_loc + need_size
 
-    def free(self, free_index):
-        return self.decrease_refs(free_index)
-
     def used_size(self):
         return len(torch.nonzero(self.mem_state).squeeze(1))
 
@@ -93,20 +87,17 @@ class TokenToKVPool:
         return torch.sum(self.mem_state == 0).item()
 
     def add_refs(self, token_index: torch.Tensor):
-        self.alloc_ct += len(token_index)
+        self.total_ref_ct += len(token_index)
         self.mem_state[token_index] += 1
 
-    def decrease_refs(self, token_index: torch.Tensor):
-        self.alloc_ct -= len(token_index)
+    def dec_refs(self, token_index: torch.Tensor):
+        self.total_ref_ct -= len(token_index)
         self.mem_state[token_index] -= 1
 
         num_freed = torch.sum(self.mem_state[token_index] == 0)
-
-        # if self.alloc_ct == 0:
-        #     print(f"TokenToKVPool: freed all. size = {len(self.mem_state)}.")
 
         return num_freed
 
     def clear(self):
         self.mem_state.fill_(0)
-        self.alloc_ct = 0
+        self.total_ref_ct = 0

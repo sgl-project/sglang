@@ -1,8 +1,6 @@
 import heapq
 import time
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Tuple
 
 import torch
 
@@ -16,23 +14,23 @@ class TreeNode:
         self.ref_counter = 0
         self.last_access_time = time.time()
 
-    def __lt__(self, other):
+    def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
 
 
-def match(key, seq):
+def _key_match(key0, key1):
     i = 0
-    for k, w in zip(key, seq):
-        if k != w:
+    for k0, k1 in zip(key0, key1):
+        if k0 != k1:
             break
         i += 1
     return i
 
 
 class RadixCache:
-    def __init__(self, disable=False):
-        self.reset()
+    def __init__(self, disable: bool = False):
         self.disable = disable
+        self.reset()
 
     ##### Public API #####
 
@@ -71,7 +69,7 @@ class RadixCache:
 
     def evict(self, num_tokens, evict_callback):
         if self.disable:
-            raise RuntimeError()
+            return
 
         leaves = self._collect_leaves()
         heapq.heapify(leaves)
@@ -115,6 +113,7 @@ class RadixCache:
         return self.evictable_size_
 
     ##### Internal Helper Functions #####
+
     def _match_prefix_helper(self, node, key, value, last_node):
         node.last_access_time = time.time()
         if len(key) == 0:
@@ -122,7 +121,7 @@ class RadixCache:
 
         if key[0] in node.children.keys():
             child = node.children[key[0]]
-            prefix_len = match(child.key, key)
+            prefix_len = _key_match(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -153,7 +152,7 @@ class RadixCache:
 
         if key[0] in node.children.keys():
             child = node.children[key[0]]
-            prefix_len = match(child.key, key)
+            prefix_len = _key_match(child.key, key)
 
             if prefix_len == len(child.key):
                 if prefix_len == len(key):
@@ -212,7 +211,7 @@ class RadixCache:
 
 
 if __name__ == "__main__":
-    tree = RadixCache(disable=False)
+    tree = RadixCache()
 
     tree.insert("Hello")
     tree.insert("Hello")
