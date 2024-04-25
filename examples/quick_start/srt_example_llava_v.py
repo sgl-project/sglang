@@ -89,7 +89,7 @@ def find_video_files(video_dir):
                 video_files.append(os.path.join(root, file))
     return video_files
 
-def batch(video_dir, save_dir, cur_chunk, num_chunks, num_frames=32, batch_size=64):
+def batch(video_dir, save_dir, cur_chunk, num_chunks, num_frames=16, batch_size=64):
     video_files = find_video_files(video_dir)
     chunked_video_files = split_into_chunks(video_files, num_chunks)[cur_chunk]
     num_batches = 0
@@ -134,8 +134,8 @@ if __name__ == "__main__":
     parser.add_argument('--num-chunks', type=int, default=8, help='The number of chunks to process.')
     parser.add_argument('--save-dir', type=str, default="./work_dirs/llava_video", help='The directory to save the processed video files.')
     parser.add_argument('--video-dir', type=str, default="/mnt/bn/vl-research/workspace/yhzhang/data/sora/", help='The directory to save the processed video files.')
-    parser.add_argument('--model-path', type=str, default="/mnt/bn/vl-research/checkpoints/llava-1.6-vicuna-7b-8k", help='The model path for the video processing.')
-    parser.add_argument('--num-frames', type=int, default=32, help='The number of frames to process in each video.' )
+    parser.add_argument('--model-path', type=str, default="lmms-lab/LLaVA-NeXT-Video-34B", help='The model path for the video processing.')
+    parser.add_argument('--num-frames', type=int, default=16, help='The number of frames to process in each video.' )
     parser.add_argument("--mm_spatial_pool_stride", type=int, default=2)
 
     # Parse the arguments
@@ -149,9 +149,9 @@ if __name__ == "__main__":
 
     num_frames = args.num_frames
 
-    if "34b" in args.model_path:
+    if "34b" in args.model_path.lower():
         tokenizer_path = "liuhaotian/llava-v1.6-34b-tokenizer"
-    elif "7b" in args.model_path:
+    elif "7b" in args.model_path.lower():
         tokenizer_path = "llava-hf/llava-1.5-7b-hf"
     else:
         print("Invalid model path. Please specify a valid model path.")
@@ -163,6 +163,10 @@ if __name__ == "__main__":
     model_overide_args["architectures"] = ["LlavaVidForCausalLM"]
     model_overide_args["num_frames"] = args.num_frames
     model_overide_args["model_type"] = "llava"
+
+    if "34b" in args.model_path.lower():
+        model_overide_args["image_token_index"] = 64002
+
 
     if args.num_frames == 32:
         model_overide_args["rope_scaling"] = {"factor": 2.0, "type": "linear"}
@@ -181,33 +185,34 @@ if __name__ == "__main__":
         port=cur_port,
         additional_ports=[cur_port+1,cur_port+2,cur_port+3,cur_port+4],
         model_overide_args=model_overide_args,
+        tp_size=1
     )
     sgl.set_default_backend(runtime)
     print(f"chat template: {runtime.endpoint.chat_template.name}")
 
 
-    # # Run a single request
-    # # try:
-    # print("\n========== single ==========\n")
-    # root = "/mnt/bn/vl-research/workspace/yhzhang/data/sora/"
-    # video_files = [os.path.join(root, f) for f in os.listdir(root) if f.endswith(('.mp4', '.avi', '.mov'))]  # Add more extensions if needed
-    # start_time = time.time()  # Start time for processing a single video
-    # for cur_video in video_files[:]:
-    #     print(cur_video)
-    #     single(cur_video, num_frames)
-    # end_time = time.time()  # End time for processing a single video
-    # total_time = end_time - start_time
-    # average_time = total_time / len(video_files)  # Calculate the average processing time
-    # print(f"Average processing time per video: {average_time:.2f} seconds")
-    # runtime.shutdown()
-    # # except Exception as e:
-    # #     print(e)
-    # runtime.shutdown()
-
-
-    # # Run a batch of requests
-    print("\n========== batch ==========\n")
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
-    batch(args.video_dir,args.save_dir,cur_chunk, num_chunks, num_frames, num_chunks)
+    # Run a single request
+    # try:
+    print("\n========== single ==========\n")
+    root = "/mnt/bn/vl-research/workspace/yhzhang/data/sora/"
+    video_files = [os.path.join(root, f) for f in os.listdir(root) if f.endswith(('.mp4', '.avi', '.mov'))]  # Add more extensions if needed
+    start_time = time.time()  # Start time for processing a single video
+    for cur_video in video_files[:1]:
+        print(cur_video)
+        single(cur_video, num_frames)
+    end_time = time.time()  # End time for processing a single video
+    total_time = end_time - start_time
+    average_time = total_time / len(video_files)  # Calculate the average processing time
+    print(f"Average processing time per video: {average_time:.2f} seconds")
     runtime.shutdown()
+    # except Exception as e:
+    #     print(e)
+    runtime.shutdown()
+
+
+    # # # Run a batch of requests
+    # print("\n========== batch ==========\n")
+    # if not os.path.exists(args.save_dir):
+    #     os.makedirs(args.save_dir)
+    # batch(args.video_dir,args.save_dir,cur_chunk, num_chunks, num_frames, num_chunks)
+    # runtime.shutdown()

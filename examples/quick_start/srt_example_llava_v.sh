@@ -35,7 +35,7 @@ echo "Each video you will sample $NUM_FRAMES frames"
 # echo "The frame format is $FRAME_FORMAT"
 
 # Assuming GPULIST is a bash array containing your GPUs
-GPULIST=(0) # 1 2 3 4 5 6 7)
+GPULIST=(0 1 2 3 4 5 6 7)
 LOCAL_CHUNKS=${#GPULIST[@]}
 
 echo "Number of GPUs in GPULIST: $LOCAL_CHUNKS"
@@ -43,7 +43,7 @@ echo "Number of GPUs in GPULIST: $LOCAL_CHUNKS"
 ALL_CHUNKS=$((NUM_NODES * LOCAL_CHUNKS))
 
 # Calculate GPUs per chunk
-GPUS_PER_CHUNK=1
+GPUS_PER_CHUNK=8
 
 echo $GPUS_PER_CHUNK
 
@@ -78,7 +78,7 @@ for IDX in $(seq 1 $LOCAL_CHUNKS); do
             --save-dir work_dirs/llava_next_video_inference_results \
             --video-dir $VIDEO_DIR \
             --model-path $MODEL_PATH \
-            --num-frames $NUM_FRAMES &
+            --num-frames $NUM_FRAMES #&
             
             wait $!  # Wait for the process to finish and capture its exit status
             COMMAND_STATUS=$?

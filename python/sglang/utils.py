@@ -158,7 +158,7 @@ def encode_frame(frame):
     return frame_bytes
 
 
-def encode_video_base64(video_path, num_frames=32):
+def encode_video_base64(video_path, num_frames=16):
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():

@@ -36,6 +36,9 @@ from sglang.srt.utils import (
     set_random_seed,
 )
 
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+
 logger = logging.getLogger("model_rpc")
 logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
@@ -46,7 +49,7 @@ class ModelRpcServer:
         tp_rank: int,
         server_args: ServerArgs,
         port_args: PortArgs,
-        model_overide_args,
+        model_overide_args: Optional[dict] = None,
     ):
         server_args, port_args = [obtain(x) for x in [server_args, port_args]]
 
@@ -686,7 +689,7 @@ class ModelRpcClient:
                 # Init model
                 def init_model(i):
                     return self.remote_services[i].ModelRpcServer(
-                        i, server_args, port_args
+                        i, server_args, port_args, model_overide_args
                     )
 
                 self.model_servers = executor.map(init_model, range(tp_size))
@@ -709,7 +712,7 @@ def _init_service(port):
     t = ThreadedServer(
         ModelRpcService(),
         port=port,
-        protocol_config={"allow_pickle": True, "sync_request_timeout": 1800},
+        protocol_config={'allow_public_attrs': True, "allow_pickle": True, "sync_request_timeout": 1800},
     )
     t.start()
 
@@ -725,7 +728,7 @@ def start_model_process(port):
             con = rpyc.connect(
                 "localhost",
                 port,
-                config={"allow_pickle": True, "sync_request_timeout": 1800},
+                config={'allow_public_attrs': True, "allow_pickle": True, "sync_request_timeout": 1800},
             )
             break
         except ConnectionRefusedError:

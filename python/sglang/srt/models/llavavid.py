@@ -40,7 +40,7 @@ class LlavaVidForCausalLM(nn.Module):
             kernel_size=self.mm_spatial_pool_stride, stride=self.mm_spatial_pool_stride
         )
         self.language_model = LlamaForCausalLM(config, linear_method)
-        self.num_frames = getattr(self.config, "num_frames", 8)
+        self.num_frames = getattr(self.config, "num_frames", 16)
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
@@ -67,6 +67,7 @@ class LlavaVidForCausalLM(nn.Module):
         pad_ids = pad_value * (
             (new_image_feature_len + len(pad_value)) // len(pad_value)
         )
+        print(input_ids)
         offset = input_ids.index(self.config.image_token_index)
         # old_len + pad_len - 1, because we need to remove image_token_id
         new_input_ids = (
