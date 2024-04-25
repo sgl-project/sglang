@@ -105,7 +105,7 @@ def test_generate_worker(
 
     for i in range(batch_size):
         req_idx = req_pool_indices[i].item()
-        model.token_to_kv_pool.free(
+        model.token_to_kv_pool.dec_refs(
             model.req_to_token_pool.req_to_token[req_idx, : seq_lens[i]]
         )
     model.req_to_token_pool.free(req_pool_indices)

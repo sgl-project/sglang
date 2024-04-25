@@ -500,7 +500,7 @@ async def v1_chat_completions(raw_request: Request):
     return response
 
 
-def launch_server(server_args, pipe_finish_writer):
+def launch_server(server_args: ServerArgs, pipe_finish_writer):
     global tokenizer_manager
     global chat_template_name
 
