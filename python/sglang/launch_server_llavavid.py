@@ -17,10 +17,14 @@ if __name__ == "__main__":
     model_overide_args["architectures"] = ["LlavaVidForCausalLM"]
     model_overide_args["num_frames"] = 16
     model_overide_args["model_type"] = "llavavid"
-
+    
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     args = parser.parse_args()
+    
+    if "34b" in args.model_path.lower():
+        model_overide_args["image_token_index"] = 64002
+        
     server_args = ServerArgs.from_cli_args(args)
 
     pipe_reader, pipe_writer = mp.Pipe(duplex=False)
