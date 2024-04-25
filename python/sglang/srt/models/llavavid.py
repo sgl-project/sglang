@@ -252,7 +252,11 @@ class LlavaVidForCausalLM(nn.Module):
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                if name in params_dict:
+                    param = params_dict[name] 
+                else:
+                    print(f"Warning: {name} not found in the model")
+                    continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
