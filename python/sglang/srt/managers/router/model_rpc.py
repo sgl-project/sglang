@@ -348,6 +348,7 @@ class ModelRpcServer:
                     # Undo the insertion
                     delta = self.tree_cache.dec_ref_counter(req.last_node)
                     available_size += delta
+                    break
                 else:
                     # Add this request to the running batch
                     self.token_to_kv_pool.add_refs(req.prefix_indices)
@@ -356,7 +357,8 @@ class ModelRpcServer:
                         req.extend_input_len + req.max_new_tokens()
                     )
                     new_batch_input_tokens += req.extend_input_len
-
+            else:
+                break
         if len(can_run_list) == 0:
             return None
 
