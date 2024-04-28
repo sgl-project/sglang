@@ -1,18 +1,19 @@
 import argparse
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 from tqdm import tqdm
+
 from sglang.test.test_utils import (
     add_common_other_args_and_parse,
     call_generate_lightllm,
-    call_generate_vllm,
     call_generate_srt_raw,
+    call_generate_vllm,
 )
-from sglang.utils import read_jsonl, dump_state_text
+from sglang.utils import dump_state_text, read_jsonl
 
 
 def get_prompt(question):
@@ -83,16 +84,15 @@ Action 2: Search[Leonid Levin]
 Observation 2: Leonid Anatolievich Levin is a Soviet-American mathematician and computer scientist. 
 Thought 3: Leonid Levin is a mathematician and computer scientist. So Pavel Urysohn and Leonid Levin have the same type of work. 
 Action 3: Finish[yes]
-""" + question)
+"""
+        + question
+    )
     return prompt
 
 
 def main(args):
-    lines = read_jsonl(args.data_path)[:args.num_questions]
-    arguments = [{
-        "question": k,
-        "triplets": v
-    } for l in lines for k, v in l.items()]
+    lines = read_jsonl(args.data_path)[: args.num_questions]
+    arguments = [{"question": k, "triplets": v} for l in lines for k, v in l.items()]
 
     states = []
 
@@ -107,7 +107,7 @@ def main(args):
         url = f"{args.host}:{args.port}/generate"
         call_generate = partial(call_generate_srt_raw, url=url)
     elif args.backend == "guidance":
-        from guidance import models, gen
+        from guidance import gen, models
 
         model = models.LlamaCpp(
             str(Path.home()) + "/model_weights/Llama-2-7b-chat.gguf",
@@ -116,12 +116,16 @@ def main(args):
         )
 
         def call_generate(prompt, temperature, max_tokens, stop):
-            out = (model + prompt + gen(
-                name="result",
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stop=stop,
-            ))
+            out = (
+                model
+                + prompt
+                + gen(
+                    name="result",
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stop=stop,
+                )
+            )
             return out["result"]
 
         # warmup
@@ -137,15 +141,23 @@ def main(args):
         for i in range(1, len(triplets) + 2):
             prompt += "Thought " + str(i) + ":"
             states.append(prompt)
-            answer = call_generate(prompt,
-                                   max_tokens=200,
-                                   temperature=0,
-                                   stop="Observation")
+            answer = call_generate(
+                prompt, max_tokens=200, temperature=0, stop="Observation"
+            )
             if i > len(triplets):
                 break
-            prompt += (triplets[i - 1]["thought"] + "\nAction " + str(i) +
-                       ":" + triplets[i - 1]["action"] + "\nObservation " +
-                       str(i) + ":" + triplets[i - 1]["observation"] + "\n")
+            prompt += (
+                triplets[i - 1]["thought"]
+                + "\nAction "
+                + str(i)
+                + ":"
+                + triplets[i - 1]["action"]
+                + "\nObservation "
+                + str(i)
+                + ":"
+                + triplets[i - 1]["observation"]
+                + "\n"
+            )
 
             states.append(answer)
 

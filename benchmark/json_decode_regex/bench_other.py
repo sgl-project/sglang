@@ -4,13 +4,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
+from tqdm import tqdm
+
+from sglang.lang.ir import REGEX_FLOAT, REGEX_INT, REGEX_STRING
 from sglang.test.test_utils import (
     add_common_other_args_and_parse,
     call_generate_outlines,
 )
 from sglang.utils import dump_state_text, read_jsonl
-from sglang.lang.ir import REGEX_INT, REGEX_STRING, REGEX_FLOAT
-from tqdm import tqdm
 
 REGEX_LIST = r"\[(" + REGEX_STRING + ", )*" + REGEX_STRING + r"\]"
 
