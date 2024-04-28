@@ -1,8 +1,8 @@
 import os
 
 # Create the 'images' directory if it doesn't exist
-if not os.path.exists('images'):
-    os.makedirs('images')
+if not os.path.exists("images"):
+    os.makedirs("images")
 
 # Base URL
 base_url = "https://huggingface.co/datasets/liuhaotian/llava-bench-in-the-wild/resolve/main/images/"

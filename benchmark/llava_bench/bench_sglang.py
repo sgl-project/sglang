@@ -1,13 +1,16 @@
 import argparse
 import json
-import time
 import os
+import time
+
+import tqdm
 
 import sglang as sgl
-import tqdm
-from sglang.test.test_utils import add_common_sglang_args_and_parse, select_sglang_backend
-from sglang.utils import read_jsonl, dump_state_text
-from PIL import Image
+from sglang.test.test_utils import (
+    add_common_sglang_args_and_parse,
+    select_sglang_backend,
+)
+from sglang.utils import dump_state_text, read_jsonl
 
 
 @sgl.function
@@ -17,17 +20,19 @@ def image_qa(s, image_file, question):
 
 
 def main(args):
-    lines = read_jsonl(args.question_file)[:args.num_questions]
+    lines = read_jsonl(args.question_file)[: args.num_questions]
     arguments = [
-        {"image_file":
-            os.path.abspath(args.image_folder + "/" + l["image"]),
-          "question": l["text"]} for l in lines
+        {
+            "image_file": os.path.abspath(args.image_folder + "/" + l["image"]),
+            "question": l["text"],
+        }
+        for l in lines
     ]
-    #arguments = [
+    # arguments = [
     #    {"image_file":
     #        Image.open(os.path.abspath(args.image_folder + "/" + l["image"])),
     #      "question": l["text"]} for l in lines
-    #]
+    # ]
 
     states = [None] * len(lines)
 
@@ -41,17 +46,12 @@ def main(args):
         for i in tqdm.tqdm(range(len(lines))):
             image_file = arguments[i]["image_file"]
             question = arguments[i]["question"]
-            ret = image_qa.run(
-                image_file=image_file,
-                question=question,
-                temperature=0)
+            ret = image_qa.run(image_file=image_file, question=question, temperature=0)
             states[i] = ret
     else:
         states = image_qa.run_batch(
-            arguments,
-            temperature=0,
-            num_threads=args.parallel,
-            progress_bar=True)
+            arguments, temperature=0, num_threads=args.parallel, progress_bar=True
+        )
     latency = time.time() - tic
 
     print(f"Latency: {latency:.3f}")

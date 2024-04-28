@@ -4,12 +4,12 @@ from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
-from sglang.test.test_utils import add_common_other_args_and_parse
-from sglang.utils import dump_state_text
+from data_gen import gen_arguments
 from tqdm import tqdm
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
-from data_gen import gen_arguments
+from sglang.test.test_utils import add_common_other_args_and_parse
+from sglang.utils import dump_state_text
 
 
 def get_generate(args):
@@ -61,7 +61,7 @@ def multi_turns(generate, qas):
     s = ""
     for qa in qas:
         s += qa["prompt"]
-        s += generate(s, max_tokens=qa["new_tokens"]) 
+        s += generate(s, max_tokens=qa["new_tokens"])
 
     return s
 

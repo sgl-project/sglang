@@ -4,12 +4,13 @@ Generate line data for line retrieval task.
 Usage:
 python3 gen_data.py --number 1000
 """
-import argparse
-from collections import defaultdict
-import json
 
-from tqdm import tqdm
+import argparse
+import json
+from collections import defaultdict
+
 import numpy as np
+from tqdm import tqdm
 
 
 def generate_lines(random_words, num_lines, redirect_ratio):
@@ -42,11 +43,14 @@ def generate_lines(random_words, num_lines, redirect_ratio):
     # Add redirect
     if redirect_ratio > 0:
         num_redirect_lines = int(len(lines) * redirect_ratio)
-        redirect_indices = np.random.choice(np.arange(len(lines)),
-            size=(num_redirect_lines,), replace=False)
+        redirect_indices = np.random.choice(
+            np.arange(len(lines)), size=(num_redirect_lines,), replace=False
+        )
         for i in redirect_indices:
             target_idx = np.random.choice(min(i * 2 + 100, num_lines))
-            lines[i] = f"Line {indices[i]}: The REGISTER_CONTENT is the same as Line {indices[target_idx]}."
+            lines[i] = (
+                f"Line {indices[i]}: The REGISTER_CONTENT is the same as Line {indices[target_idx]}."
+            )
             redirects[i] = target_idx
 
     # Build links and find sources

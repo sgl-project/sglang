@@ -3,7 +3,8 @@ import json
 import transformers
 
 content = "\n".join(
-    open("llama2.txt", 'r', encoding='utf-8', errors='ignore').readlines())
+    open("llama2.txt", "r", encoding="utf-8", errors="ignore").readlines()
+)
 content = content.replace("\n\n", "\n")
 
 # Count token
@@ -35,30 +36,35 @@ for i, s in enumerate(segments):
 
 # Dump
 with open("questions.jsonl", "w") as fout:
-    fout.write(json.dumps({
-        "documents": segments[:30],
-        "questions": [
-            "What is the name of the fine-tuned LLMs?",
-            "Which figure shows the helpfulness human evaluation results for Llama 2-Chat?",
-            "What is the number of parameters in the largest Llama 2 model?",
-            "What is the batch size of fine-tuning?",
-            "Where can we find the details of potential data contamination?",
-            "What is the full name of MPT?",
-            "What is the power consumption of RSC in Watt?",
-            "How many tokens of data do they train on?",
-            "Which model's release is delayed due to a lack of time to sufficiently red team?",
-            "Which activation function is used in Llama?"
-        ],
-        "answers": [
-            "Llama 2 Chat",
-            "1",
-            "70 B",
-            "64",
-            "A 6",
-            "MosaicML",
-            "400",
-            "2 trillion",
-            "34 B",
-            "SwiGLU",
-        ],
-    }) + "\n")
+    fout.write(
+        json.dumps(
+            {
+                "documents": segments[:30],
+                "questions": [
+                    "What is the name of the fine-tuned LLMs?",
+                    "Which figure shows the helpfulness human evaluation results for Llama 2-Chat?",
+                    "What is the number of parameters in the largest Llama 2 model?",
+                    "What is the batch size of fine-tuning?",
+                    "Where can we find the details of potential data contamination?",
+                    "What is the full name of MPT?",
+                    "What is the power consumption of RSC in Watt?",
+                    "How many tokens of data do they train on?",
+                    "Which model's release is delayed due to a lack of time to sufficiently red team?",
+                    "Which activation function is used in Llama?",
+                ],
+                "answers": [
+                    "Llama 2 Chat",
+                    "1",
+                    "70 B",
+                    "64",
+                    "A 6",
+                    "MosaicML",
+                    "400",
+                    "2 trillion",
+                    "34 B",
+                    "SwiGLU",
+                ],
+            }
+        )
+        + "\n"
+    )
