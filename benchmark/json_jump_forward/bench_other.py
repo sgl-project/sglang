@@ -5,12 +5,13 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import guidance
+from tqdm import tqdm
+
 from sglang.test.test_utils import (
     add_common_other_args_and_parse,
     call_generate_outlines,
 )
 from sglang.utils import dump_state_text, read_jsonl
-from tqdm import tqdm
 
 # there are some FSM bugs with json regex converted from pydantic model
 # here use a string regex instead

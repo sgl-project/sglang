@@ -1,14 +1,19 @@
 import argparse
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 import json
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 from fastchat.model import get_conversation_template
-import requests
-from sglang.test.test_utils import add_common_other_args_and_parse, call_generate_lightllm, call_generate_vllm, call_generate_srt
+
+from sglang.test.test_utils import (
+    add_common_other_args_and_parse,
+    call_generate_lightllm,
+    call_generate_srt,
+    call_generate_vllm,
+)
 
 
 def load_questions(filename):
@@ -38,7 +43,7 @@ def write_answers(filename, model_id, questions, answers):
 
 def main(args):
     questions = load_questions(args.question_file)
-    questions = (questions * 10)[:args.num_questions]
+    questions = (questions * 10)[: args.num_questions]
     max_tokens = 256
     model_id = "llama-2-chat"
 
@@ -67,9 +72,8 @@ def main(args):
             conv.append_message(conv.roles[0], q)
             conv.append_message(conv.roles[1], None)
 
-            prompt = conv.get_prompt() 
-            output = call_generate(prompt,
-                temperature=0, max_tokens=max_tokens).strip()
+            prompt = conv.get_prompt()
+            output = call_generate(prompt, temperature=0, max_tokens=max_tokens).strip()
 
             cur_answers.append(output)
             conv.update_last_message(output)
@@ -102,7 +106,7 @@ def main(args):
             "other": {
                 "num_questions": args.num_questions,
                 "parallel": args.parallel,
-            }
+            },
         }
         fout.write(json.dumps(value) + "\n")
 

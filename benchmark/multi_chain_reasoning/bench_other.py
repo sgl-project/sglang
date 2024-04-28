@@ -1,23 +1,28 @@
 import argparse
 import ast
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 import numpy as np
-from sglang.test.test_utils import add_common_other_args_and_parse, call_generate_lightllm, call_generate_vllm, call_generate_srt_raw
-from sglang.utils import read_jsonl, dump_state_text
 
+from sglang.test.test_utils import (
+    add_common_other_args_and_parse,
+    call_generate_lightllm,
+    call_generate_srt_raw,
+    call_generate_vllm,
+)
+from sglang.utils import dump_state_text, read_jsonl
 
 INVALID = -9999999
 
 
 def get_answer_value(answer_str):
     answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r'\d+', answer_str)
+    numbers = re.findall(r"\d+", answer_str)
     if len(numbers) < 1:
         return INVALID
     try:
@@ -44,14 +49,20 @@ def multi_chain_gsm8k(question, num_chains, call_generate):
 
     comps = []
     for i in range(num_chains):
-        comps.append(call_generate(s + "Answer: " + prompt_lib[i % num_chains],
-                     max_tokens=256, temperature=0.3, stop="Question"))
+        comps.append(
+            call_generate(
+                s + "Answer: " + prompt_lib[i % num_chains],
+                max_tokens=256,
+                temperature=0.3,
+                stop="Question",
+            )
+        )
 
     s += "Answer: To answer this question, here are some possible solutions. "
     s += "After considering all of them, I will do a majority vote.\n\n"
     for i in range(num_chains):
         s += f"Solution {i+1}: " + comps[i].strip() + "\n\n"
-    s += f"\nBy considering the above solutions and doing a majority vote, I think the final answer (a single integer number) is "
+    s += "\nBy considering the above solutions and doing a majority vote, I think the final answer (a single integer number) is "
     s += call_generate(s, max_tokens=16, temperature=0, stop=None)
     return s
 
@@ -64,7 +75,7 @@ def main(args):
 
     questions = []
     labels = []
-    for i in range(len(lines[:args.num_questions])):
+    for i in range(len(lines[: args.num_questions])):
         questions.append(lines[i]["question"])
         labels.append(get_answer_value(lines[i]["answer"]))
     assert all(l != INVALID for l in labels)
@@ -82,16 +93,28 @@ def main(args):
         url = f"{args.host}:{args.port}/generate"
         call_generate = partial(call_generate_srt_raw, url=url)
     elif args.backend == "guidance":
-        from guidance import models, gen
+        from guidance import gen, models
 
-        model = models.LlamaCpp("/home/ubuntu/model_weights/Llama-2-7b-chat.gguf", n_gpu_layers=-1, n_ctx=4096)
+        model = models.LlamaCpp(
+            "/home/ubuntu/model_weights/Llama-2-7b-chat.gguf",
+            n_gpu_layers=-1,
+            n_ctx=4096,
+        )
 
         def call_generate(prompt, temperature, max_tokens, stop):
-            out = model + prompt + gen(name="answer",
-                max_tokens=max_tokens, temperature=temperature, stop=stop)
+            out = (
+                model
+                + prompt
+                + gen(
+                    name="answer",
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stop=stop,
+                )
+            )
             return out["answer"]
 
-        #def multi_chain_gsm8k(question, num_chains, call_generate):
+        # def multi_chain_gsm8k(question, num_chains, call_generate):
         #    s = model + "Question: " + question + "\n"
 
         #    comps = []
@@ -108,8 +131,10 @@ def main(args):
 
     elif args.backend == "lmql":
         import lmql
-        model = lmql.model("meta-llama/Llama-2-7b-chat-hf",
-           endpoint=f"{args.host}:{args.port}")
+
+        model = lmql.model(
+            "meta-llama/Llama-2-7b-chat-hf", endpoint=f"{args.host}:{args.port}"
+        )
 
         @lmql.query(model=model)
         async def program(question):
@@ -128,8 +153,7 @@ def main(args):
     if args.backend != "lmql":
         # Use thread pool
         def get_one_answer(i):
-            answer = multi_chain_gsm8k(questions[i], args.num_chains,
-                call_generate)
+            answer = multi_chain_gsm8k(questions[i], args.num_chains, call_generate)
             states[i] = answer
 
         tic = time.time()
@@ -144,12 +168,18 @@ def main(args):
         async def batched_call(batch_size):
             for i in range(0, len(questions), batch_size):
                 tasks = []
-                for q in questions[i:i+batch_size]:
-                    tasks.append(call_generate(few_shot_examples + q,
-                        temperature=0, max_tokens=256, stop="Question"))
+                for q in questions[i : i + batch_size]:
+                    tasks.append(
+                        call_generate(
+                            few_shot_examples + q,
+                            temperature=0,
+                            max_tokens=256,
+                            stop="Question",
+                        )
+                    )
                 rets = await asyncio.gather(*tasks)
                 for j in range(len(rets)):
-                    states[i+j] = get_answer_value(rets[j])
+                    states[i + j] = get_answer_value(rets[j])
 
         tic = time.time()
         asyncio.run(batched_call(batch_size=args.parallel))
@@ -180,7 +210,7 @@ def main(args):
             "other": {
                 "num_questions": args.num_questions,
                 "parallel": args.parallel,
-            }
+            },
         }
         fout.write(json.dumps(value) + "\n")
 
