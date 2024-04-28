@@ -2,7 +2,6 @@ import argparse
 import json
 import time
 
-import numpy as np
 
 import sglang as sgl
 from sglang.test.test_utils import (

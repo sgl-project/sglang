@@ -4,7 +4,6 @@ import os
 import time
 
 import tqdm
-from PIL import Image
 
 import sglang as sgl
 from sglang.test.test_utils import (

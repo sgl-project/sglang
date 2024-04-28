@@ -1,6 +1,5 @@
 import argparse
 import ast
-import asyncio
 import json
 import re
 import time

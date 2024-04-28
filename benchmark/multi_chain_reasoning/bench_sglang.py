@@ -71,7 +71,7 @@ def main(args):
             forks[i] += (
                 "Answer: "
                 + prompt_lib[i % num_chains]
-                + sgl.gen(f"chain", max_tokens=256, temperature=0.3, stop="Question")
+                + sgl.gen("chain", max_tokens=256, temperature=0.3, stop="Question")
             )
         forks.join()
 
@@ -79,7 +79,7 @@ def main(args):
         s += "After considering all of them, I will do a majority vote.\n\n"
         for i in range(num_chains):
             s += f"Solution {i+1}: " + forks[i]["chain"].strip() + "\n\n"
-        s += f"\nBy considering the above solutions and doing a majority vote, I think the final answer (a single integer number) is "
+        s += "\nBy considering the above solutions and doing a majority vote, I think the final answer (a single integer number) is "
         s += sgl.gen("answer", max_tokens=16)
 
     #####################################

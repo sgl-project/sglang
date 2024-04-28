@@ -1,11 +1,9 @@
 import argparse
-import asyncio
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-import numpy as np
 from tqdm import tqdm
 
 from sglang.test.test_utils import (

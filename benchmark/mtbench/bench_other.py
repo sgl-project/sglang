@@ -6,7 +6,6 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-import requests
 from fastchat.model import get_conversation_template
 
 from sglang.test.test_utils import (

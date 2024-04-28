@@ -62,7 +62,7 @@ def multi_chain_gsm8k(question, num_chains, call_generate):
     s += "After considering all of them, I will do a majority vote.\n\n"
     for i in range(num_chains):
         s += f"Solution {i+1}: " + comps[i].strip() + "\n\n"
-    s += f"\nBy considering the above solutions and doing a majority vote, I think the final answer (a single integer number) is "
+    s += "\nBy considering the above solutions and doing a majority vote, I think the final answer (a single integer number) is "
     s += call_generate(s, max_tokens=16, temperature=0, stop=None)
     return s
 
