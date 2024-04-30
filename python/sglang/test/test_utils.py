@@ -8,6 +8,7 @@ import requests
 from sglang.backend.openai import OpenAI
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.global_config import global_config
+from sglang.srt.utils import get_exception_traceback
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -249,7 +250,7 @@ def select_sglang_backend(args):
     return backend
 
 
-def get_call_generate(args):
+def _get_call_generate(args):
     if args.backend == "lightllm":
         return partial(call_generate_lightllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "vllm":
@@ -274,7 +275,7 @@ def get_call_generate(args):
         raise ValueError(f"Invalid backend: {args.backend}")
 
 
-def get_call_select(args):
+def _get_call_select(args):
     if args.backend == "lightllm":
         return partial(call_select_lightllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "vllm":
@@ -295,3 +296,29 @@ def get_call_select(args):
         return partial(call_select_lmql, model=model)
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
+
+
+def get_call_generate(args):
+    call_generate = _get_call_generate(args)
+
+    def func(*args, **kwargs):
+        try:
+            return call_generate(*args, **kwargs)
+        except Exception:
+            print("Exception in call_generate:\n" + get_exception_traceback())
+            raise
+
+    return func
+
+
+def get_call_select(args):
+    call_select = _get_call_select(args)
+
+    def func(*args, **kwargs):
+        try:
+            return call_select(*args, **kwargs)
+        except Exception:
+            print("Exception in call_select:\n" + get_exception_traceback())
+            raise
+
+    return func
