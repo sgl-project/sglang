@@ -39,5 +39,5 @@ python3 bench_other.py --num-questions 64 --backend lightllm
 
 ### Benchmark guidance
 ```
-python3 bench_other.py --num-questions 8 --backend guidance --parallel 1
+python3 bench_other.py --num-questions 8 --backend guidance --parallel 1 --n-ctx 4096 --model-path path/to/gguf
 ```

@@ -6,12 +6,7 @@ from functools import partial
 
 from tqdm import tqdm
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_lightllm,
-    call_generate_srt_raw,
-    call_generate_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
 
 system_prompt = "Please serve as an impartial judge and rigorously evaluate the quality of the following article. Apply the most stringent standards possible, showing no leniency."
@@ -59,40 +54,11 @@ def main(args):
     states = [None] * len(lines)
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_lightllm, url=url, temperature=0)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_vllm, url=url, temperature=0)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_srt_raw, url=url, temperature=0)
-    elif args.backend == "guidance":
-        from guidance import gen, models
-
-        model = models.LlamaCpp(
-            "/home/ubuntu/model_weights/Llama-2-7b-chat.gguf",
-            n_gpu_layers=-1,
-            n_ctx=4096,
-        )
-
-        def generate(prompt, max_tokens, stop):
-            out = (
-                model
-                + prompt
-                + gen(name="answer", max_tokens=max_tokens, temperature=0, stop=stop)
-            )
-            return out["answer"]
-
-        # warmup
-        generate("Hello!", max_tokens=8, stop=None)
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    call_generate = partial(get_call_generate(args), temperature=0)
 
     # Run requests
     def get_one_answer(i):
-        states[i] = multi_dimension_judge(lines[i], generate)
+        states[i] = multi_dimension_judge(lines[i], call_generate)
 
     tic = time.time()
     if args.parallel == 1:

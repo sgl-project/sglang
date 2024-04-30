@@ -39,7 +39,7 @@ python3 bench_sglang.py --mode city
 ```
 
 
-### Benchmark vllm
+### Benchmark Outlines + vLLM
 
 Run Llama-7B
 
@@ -50,13 +50,13 @@ python3 -m outlines.serve.serve --tokenizer-mode auto --model meta-llama/Llama-2
 Benchmark Character Generation
 
 ```bash
-python3 bench_other.py --mode character --backend vllm
+python3 bench_other.py --mode character --backend outlines
 ```
 
 Benchmark City Information Retrieval
 
 ```bash
-python3 bench_other.py --mode city --backend vllm
+python3 bench_other.py --mode city --backend outlines
 ```
 
 ### Benchmark guidance
@@ -64,11 +64,11 @@ python3 bench_other.py --mode city --backend vllm
 Run Llama-7B and benchmark character generation
 
 ```bash
-python3 bench_other.py --mode character --backend guidance --parallel 1
+python3 bench_other.py --mode character --backend guidance --parallel 1 --n-ctx 4096 --model-path path/to/gguf
 ```
 
 Run Llama-7B and benchmark city information retrieval
 
 ```bash
-python3 bench_other.py --mode city --backend guidance --parallel 1
+python3 bench_other.py --mode city --backend guidance --parallel 1 --n-ctx 4096 --model-path path/to/gguf
 ```

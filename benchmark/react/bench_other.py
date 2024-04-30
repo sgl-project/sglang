@@ -2,17 +2,10 @@ import argparse
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-from pathlib import Path
 
 from tqdm import tqdm
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_lightllm,
-    call_generate_srt_raw,
-    call_generate_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
 
 
@@ -97,42 +90,7 @@ def main(args):
     states = []
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_lightllm, url=url)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_vllm, url=url)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_srt_raw, url=url)
-    elif args.backend == "guidance":
-        from guidance import gen, models
-
-        model = models.LlamaCpp(
-            str(Path.home()) + "/model_weights/Llama-2-7b-chat.gguf",
-            n_gpu_layers=-1,
-            n_ctx=4096,
-        )
-
-        def call_generate(prompt, temperature, max_tokens, stop):
-            out = (
-                model
-                + prompt
-                + gen(
-                    name="result",
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stop=stop,
-                )
-            )
-            return out["result"]
-
-        # warmup
-        call_generate("Hello,", 1.0, 8, ".")
-
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    call_generate = get_call_generate(args)
 
     def run_single_agent(argument):
         question = argument["question"]

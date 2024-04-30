@@ -5,16 +5,10 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 
 import numpy as np
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_lightllm,
-    call_generate_srt_raw,
-    call_generate_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
 
 INVALID = -9999999
@@ -83,71 +77,7 @@ def main(args):
     states = [None] * len(labels)
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_lightllm, url=url)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_vllm, url=url)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_srt_raw, url=url)
-    elif args.backend == "guidance":
-        from guidance import gen, models
-
-        model = models.LlamaCpp(
-            "/home/ubuntu/model_weights/Llama-2-7b-chat.gguf",
-            n_gpu_layers=-1,
-            n_ctx=4096,
-        )
-
-        def call_generate(prompt, temperature, max_tokens, stop):
-            out = (
-                model
-                + prompt
-                + gen(
-                    name="answer",
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stop=stop,
-                )
-            )
-            return out["answer"]
-
-        # def multi_chain_gsm8k(question, num_chains, call_generate):
-        #    s = model + "Question: " + question + "\n"
-
-        #    comps = []
-        #    for i in range(num_chains):
-        #        comps.append(call_generate(s + "Answer: " + prompt_lib[i % num_chains],
-        #                     max_tokens=256, temperature=0.3, stop="Question"))
-
-        #    s += "Answer: To answer this question, here are some possible solutions. "
-        #    s += "After considering all of them, I will do a majority vote.\n\n"
-        #    for i in range(num_chains):
-        #        s += f"Solution {i+1}: " + comps[i].strip() + "\n\n"
-        #    s += f"\nBy considering the above solutions and doing a majority vote, I think the final answer (a single integer number) is "
-        #    return call_generate(s, max_tokens=16, temperature=0, stop=None)
-
-    elif args.backend == "lmql":
-        import lmql
-
-        model = lmql.model(
-            "meta-llama/Llama-2-7b-chat-hf", endpoint=f"{args.host}:{args.port}"
-        )
-
-        @lmql.query(model=model)
-        async def program(question):
-            '''lmql
-            """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < 257 and STOPS_AT(ANSWER, "Question")
-            return ANSWER
-            '''
-
-        async def call_generate(prompt, temperature, max_tokens, stop):
-            return await program(question=prompt, temperature=0)
-
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    call_generate = get_call_generate(args)
 
     # Run requests
     if args.backend != "lmql":

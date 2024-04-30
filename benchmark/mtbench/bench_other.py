@@ -4,16 +4,10 @@ import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 
 from fastchat.model import get_conversation_template
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_lightllm,
-    call_generate_srt,
-    call_generate_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 
 
 def load_questions(filename):
@@ -50,17 +44,7 @@ def main(args):
     conv_main = get_conversation_template(model_id)
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_lightllm, url=url, stop=None)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_vllm, url=url, stop=None)
-    elif args.backend == "srt":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_srt, url=url, stop=None)
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    call_generate = get_call_generate(args)
 
     answers = [None] * len(questions)
 

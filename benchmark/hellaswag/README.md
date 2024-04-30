@@ -38,7 +38,7 @@ python3 bench_other.py --num-questions 200 --backend lightllm
 
 ### Benchmark guidance
 ```
-CUDA_VISIBLE_DEVICES=0,1 python3 bench_other.py --num-questions 200 --backend guidance --parallel 1
+CUDA_VISIBLE_DEVICES=0,1 python3 bench_other.py --num-questions 200 --backend guidance --parallel 1 --n-ctx 4096 --model-path path/to/gguf
 ```
 
 

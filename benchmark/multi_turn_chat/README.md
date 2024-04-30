@@ -56,11 +56,11 @@ python3 bench_other.py --tokenizer meta-llama/Llama-2-7b-chat-hf --backend vllm 
 Benchmark Llama-7B (short output)
 
 ```
-python3 bench_other.py --tokenizer meta-llama/Llama-2-7b-chat-hf --backend guidance --parallel 1
+python3 bench_other.py --tokenizer meta-llama/Llama-2-7b-chat-hf --backend guidance --parallel 1 --n-ctx 4096 --model-path path/to/gguf
 ```
 
 Benchmark Llama-7B (long output)
 
 ```
-python3 bench_other.py --tokenizer meta-llama/Llama-2-7b-chat-hf --backend guidance --parallel 1 --long
+python3 bench_other.py --tokenizer meta-llama/Llama-2-7b-chat-hf --backend guidance --parallel 1 --n-ctx 4096 --model-path path/to/gguf --long
 ```

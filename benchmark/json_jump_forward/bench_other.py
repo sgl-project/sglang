@@ -7,10 +7,7 @@ from functools import partial
 import guidance
 from tqdm import tqdm
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_outlines,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
 
 # there are some FSM bugs with json regex converted from pydantic model
@@ -119,26 +116,23 @@ def bench_character(args):
     states = [None] * len(arguments)
 
     # Select backend
-    if args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_outlines, url=url, temperature=0)
+    if args.backend == "outlines":
+        call_generate = partial(get_call_generate(args), temperature=0)
 
-        def func(i):
-            states[i] = character_gen(**arguments[i], generate=generate)
+        def get_one_answer(i):
+            states[i] = character_gen(**arguments[i], generate=call_generate)
 
-        get_one_answer = func
     elif args.backend == "guidance":
         model = guidance.models.LlamaCpp(
-            args.llama_cpp_model_path,
+            args.model_path,
             n_gpu_layers=-1,
-            n_ctx=4096,
+            n_ctx=args.n_ctx,
         )
 
-        def func(i):
+        def get_one_answer(i):
             lm = model + character_maker(**arguments[i])
             states[i] = lm
 
-        get_one_answer = func
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
@@ -166,26 +160,23 @@ def bench_city_doc(args):
     states = [None] * len(arguments)
 
     # Select backend
-    if args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_outlines, url=url, temperature=0)
+    if args.backend == "outlines":
+        call_generate = partial(get_call_generate(args), temperature=0)
 
-        def func(i):
-            states[i] = city_gen(**arguments[i], generate=generate)
+        def get_one_answer(i):
+            states[i] = city_gen(**arguments[i], generate=call_generate)
 
-        get_one_answer = func
     elif args.backend == "guidance":
         model = guidance.models.LlamaCpp(
-            args.llama_cpp_model_path,
+            args.model_path,
             n_gpu_layers=-1,
-            n_ctx=4096,
+            n_ctx=args.n_ctx,
         )
 
-        def func(i):
+        def get_one_answer(i):
             lm = model + city_maker(**arguments[i])
             states[i] = lm
 
-        get_one_answer = func
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
@@ -236,11 +227,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-jsons", type=int, default=50)
     parser.add_argument(
         "--mode", type=str, default="character", choices=["character", "city"]
-    )
-    parser.add_argument(
-        "--llama-cpp-model-path",
-        type=str,
-        default="/home/ubuntu/model_weights/Llama-2-7b-chat-hf/ggml-model-f16.gguf",
     )
     args = add_common_other_args_and_parse(parser)
     main(args)
