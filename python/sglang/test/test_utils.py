@@ -1,5 +1,6 @@
 """Common utilities for testing and benchmarking"""
 
+import asyncio
 from functools import partial
 
 import numpy as np
@@ -110,20 +111,32 @@ def call_generate_guidance(
     return rets if n > 1 else rets[0]
 
 
-async def call_generate_lmql(prompt, temperature, max_tokens, model=None):
+async def call_generate_lmql(
+    prompt, temperature, max_tokens, stop=None, n=1, max_len=4096, model=None, **kwargs
+):
     assert model is not None
     import lmql
 
     @lmql.query(model=model)
-    async def program(question):
+    async def program(question, max_tokens, stop):
         '''lmql
-        """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < 2
+        """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < max_tokens and STOPS_AT(ANSWER, stop)
         return ANSWER
         '''
 
-    return await program(
-        question=prompt, temperature=temperature, max_tokens=max_tokens
-    )
+    tasks = [
+        program(
+            question=prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stop=stop,
+            max_len=max_len,
+            **kwargs,
+        )
+        for _ in range(n)
+    ]
+    rets = await asyncio.gather(*tasks)
+    return rets if n > 1 else rets[0]
 
 
 def call_select_lightllm(context, choices, url=None):
@@ -175,7 +188,7 @@ def call_select_guidance(context, choices, model=None):
     return choices.index(out["answer"])
 
 
-async def call_select_lmql(context, choices, model=None):
+async def call_select_lmql(context, choices, temperature=0, max_len=4096, model=None):
     assert model is not None
     import lmql
 
@@ -186,7 +199,9 @@ async def call_select_lmql(context, choices, model=None):
         return ANSWER
         '''
 
-    answer = await program(ctx=context, choices=choices, temperature=0)
+    answer = await program(
+        ctx=context, choices=choices, temperature=temperature, max_len=max_len
+    )
     return choices.index(answer)
 
 
