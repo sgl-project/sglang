@@ -117,12 +117,23 @@ async def call_generate_lmql(
     assert model is not None
     import lmql
 
-    @lmql.query(model=model)
-    async def program(question, max_tokens, stop):
-        '''lmql
-        """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < max_tokens and STOPS_AT(ANSWER, stop)
-        return ANSWER
-        '''
+    if stop != None:
+
+        @lmql.query(model=model)
+        async def program(question, max_tokens, stop):
+            '''lmql
+            """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < max_tokens and STOPS_AT(ANSWER, stop)
+            return ANSWER
+            '''
+
+    else:
+
+        @lmql.query(model=model)
+        async def program(question, max_tokens):
+            '''lmql
+            """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < max_tokens
+            return ANSWER
+            '''
 
     tasks = [
         program(
