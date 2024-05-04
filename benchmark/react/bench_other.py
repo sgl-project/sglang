@@ -119,13 +119,55 @@ def main(args):
 
             states.append(answer)
 
+    async def run_single_agent_async(argument):
+        question = argument["question"]
+        triplets = argument["triplets"]
+        prompt = get_prompt(question)
+        for i in range(1, len(triplets) + 2):
+            prompt += "Thought " + str(i) + ":"
+            states.append(prompt)
+            answer = await call_generate(
+                prompt, max_tokens=200, temperature=0, stop="Observation", max_len=4096
+            )
+            if i > len(triplets):
+                break
+            prompt += (
+                triplets[i - 1]["thought"]
+                + "\nAction "
+                + str(i)
+                + ":"
+                + triplets[i - 1]["action"]
+                + "\nObservation "
+                + str(i)
+                + ":"
+                + triplets[i - 1]["observation"]
+                + "\n"
+            )
+
+            states.append(answer)
+
     tic = time.time()
-    if args.parallel == 1:
-        for arg in tqdm(arguments):
-            run_single_agent(arg)
+
+    if args.backend != "lmql":
+        if args.parallel == 1:
+            for arg in tqdm(arguments):
+                run_single_agent(arg)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                executor.map(run_single_agent, arguments)
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(run_single_agent, arguments)
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        batches = [
+            [] for _ in range((len(arguments) + args.parallel - 1) // args.parallel)
+        ]
+        for i, arg in enumerate(arguments):
+            batches[i // args.parallel].append(arg)
+        for bt in tqdm(batches):
+            tasks = [run_single_agent_async(arg) for arg in bt]
+            loop.run_until_complete(asyncio.gather(*tasks))
+
     latency = time.time() - tic
 
     print(f"Latency: {latency:.3f}")

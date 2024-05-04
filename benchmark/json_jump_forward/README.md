@@ -72,3 +72,17 @@ Run Llama-7B and benchmark city information retrieval
 ```bash
 python3 bench_other.py --mode city --backend guidance --parallel 1 --n-ctx 4096 --model-path path/to/gguf
 ```
+
+### Benchmark lmql
+
+Run Llama-7B and benchmark character generation
+
+```
+python3 bench_other.py --mode character --backend lmql --parallel 1
+```
+
+Run Llama-7B and benchmark city information retrieval
+
+```
+python3 bench_other.py --mode city --backend lmql --parallel 1
+```

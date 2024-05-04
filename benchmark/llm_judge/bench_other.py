@@ -49,6 +49,34 @@ def multi_dimension_judge(article, generate):
     return s
 
 
+async def multi_dimension_judge_async(article, generate):
+    s = system_prompt
+    s += "\n```\n" + article + "\n```\n\n"
+
+    judges = []
+    for i in range(len(dimension_prompts)):
+        comp = await generate(
+            s
+            + "USER: Please judge the quality based on the following metric. "
+            + dimension_prompts[i]
+            + " Please provide a single-paragraph judgement. "
+            + "Focus on the provided metric and do not say other things. "
+            'End your judgement paragraph with the word "END"\nJUDGE:',
+            max_tokens=256,
+            stop="END",
+        )
+        judges.append(comp)
+
+    s += "I will judge the quality based on the following metrics.\n"
+    for i in range(len(dimension_prompts)):
+        s += dimension_prompts[i].split(":")[0] + ": " + judges[i].strip() + "\n"
+
+    s += "In summary, on a scale of 1 to 10, I would give the article a score of"
+    s += await generate(s, max_tokens=2, stop=None)
+
+    return s
+
+
 def main(args):
     lines = read_jsonl(args.data_path)[: args.num_questions]
     states = [None] * len(lines)
@@ -57,16 +85,35 @@ def main(args):
     call_generate = partial(get_call_generate(args), temperature=0)
 
     # Run requests
-    def get_one_answer(i):
-        states[i] = multi_dimension_judge(lines[i], call_generate)
-
     tic = time.time()
-    if args.parallel == 1:
-        for i in tqdm(range(len(lines))):
-            get_one_answer(i)
+
+    if args.backend != "lmql":
+
+        def get_one_answer(i):
+            states[i] = multi_dimension_judge(lines[i], call_generate)
+
+        if args.parallel == 1:
+            for i in tqdm(range(len(lines))):
+                get_one_answer(i)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                executor.map(get_one_answer, list(range(len(lines))))
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(lines))))
+        import asyncio
+
+        async def get_one_answer_async(i):
+            states[i] = await multi_dimension_judge_async(lines[i], call_generate)
+
+        batches = []
+        for i in range(0, len(lines), args.parallel):
+            batches.append(list(range(i, min(i + args.parallel, len(lines)))))
+
+        loop = asyncio.get_event_loop()
+        for bt in tqdm(batches):
+            loop.run_until_complete(
+                asyncio.gather(*[get_one_answer_async(i) for i in bt])
+            )
+
     latency = time.time() - tic
 
     # Compute accuracy

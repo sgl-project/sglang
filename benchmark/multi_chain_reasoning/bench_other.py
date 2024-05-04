@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+from tqdm import tqdm
 
 from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
@@ -61,6 +62,32 @@ def multi_chain_gsm8k(question, num_chains, call_generate):
     return s
 
 
+async def multi_chain_gsm8k_async(question, num_chains, call_generate):
+    s = "Question: " + question + "\n"
+    # s += call_generate(s + "Answer: " + prompt_lib[0], max_tokens=256,
+    #     stop="Question", temperature=0)
+    # return s
+
+    comps = []
+    for i in range(num_chains):
+        comps.append(
+            await call_generate(
+                s + "Answer: " + prompt_lib[i % num_chains],
+                max_tokens=256,
+                temperature=0.3,
+                stop="Question",
+            )
+        )
+
+    s += "Answer: To answer this question, here are some possible solutions. "
+    s += "After considering all of them, I will do a majority vote.\n\n"
+    for i in range(num_chains):
+        s += f"Solution {i+1}: " + comps[i].strip() + "\n\n"
+    s += "\nBy considering the above solutions and doing a majority vote, I think the final answer (a single integer number) is "
+    s += await call_generate(s, max_tokens=16, temperature=0, stop=None)
+    return s
+
+
 def main(args):
     lines = read_jsonl(args.data_path)
 
@@ -95,24 +122,23 @@ def main(args):
                 executor.map(get_one_answer, list(range(len(questions))))
     else:
         # Use asyncio
-        async def batched_call(batch_size):
-            for i in range(0, len(questions), batch_size):
-                tasks = []
-                for q in questions[i : i + batch_size]:
-                    tasks.append(
-                        call_generate(
-                            few_shot_examples + q,
-                            temperature=0,
-                            max_tokens=256,
-                            stop="Question",
-                        )
-                    )
-                rets = await asyncio.gather(*tasks)
-                for j in range(len(rets)):
-                    states[i + j] = get_answer_value(rets[j])
+        async def get_one_answer_asyncio(i):
+            answer = await multi_chain_gsm8k_async(
+                questions[i], args.num_chains, call_generate
+            )
+            states[i] = answer
 
         tic = time.time()
-        asyncio.run(batched_call(batch_size=args.parallel))
+        loop = asyncio.get_event_loop()
+        batches = [
+            [] for _ in range((len(questions) + args.parallel - 1) // args.parallel)
+        ]
+        for i in range(len(questions)):
+            batches[i // args.parallel].append(i)
+        for bt in tqdm(batches):
+            tasks = [get_one_answer_asyncio(k) for k in bt]
+            loop.run_until_complete(asyncio.gather(*tasks))
+
     latency = time.time() - tic
 
     preds = []

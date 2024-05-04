@@ -82,6 +82,29 @@ def character_maker(lm, name):
     return lm
 
 
+async def call_generate_lmql(
+    prompt, temperature, max_tokens, regex, max_len=4096, model=None, **kwargs
+):
+    assert model is not None
+    import lmql
+
+    @lmql.query(model=model)
+    async def program(question, max_tokens, regex):
+        '''lmql
+        """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < max_tokens and REGEX(ANSWER, regex)
+        return ANSWER
+        '''
+
+    return await program(
+        question=prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        max_len=max_len,
+        regex=regex,
+        **kwargs,
+    )
+
+
 @guidance
 def city_maker(lm, document):
     regex_str_no_quote = r"[\w\d\s]+"
@@ -133,18 +156,46 @@ def bench_character(args):
             lm = model + character_maker(**arguments[i])
             states[i] = lm
 
+    elif args.backend == "lmql":
+        import asyncio
+
+        import lmql
+
+        model = lmql.model(args.model_path, endpoint=f"{args.host}:{args.port}")
+        call_generate = partial(
+            call_generate_lmql,
+            model=model,
+            max_tokens=256,
+            regex=character_regex,
+        )
+
+        async def get_one_answer_async(i):
+            states[i] = await call_generate(prompt=arguments[i]["name"], temperature=0)
+
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
     tic = time.time()
-    if args.parallel == 1:
-        for i in tqdm(range(len(arguments))):
-            get_one_answer(i)
+
+    if args.backend != "lmql":
+        if args.parallel == 1:
+            for i in tqdm(range(len(arguments))):
+                get_one_answer(i)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                rets = executor.map(get_one_answer, list(range(len(arguments))))
+                for _ in rets:
+                    pass
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            rets = executor.map(get_one_answer, list(range(len(arguments))))
-            for _ in rets:
-                pass
+        batches = []
+        for i in range(0, len(arguments), args.parallel):
+            batches.append(list(range(i, min(i + args.parallel, len(arguments)))))
+        loop = asyncio.get_event_loop()
+
+        for bt in tqdm(batches):
+            loop.run_until_complete(
+                asyncio.gather(*[get_one_answer_async(i) for i in bt])
+            )
 
     latency = time.time() - tic
 

@@ -138,16 +138,39 @@ def main(args):
     # Run requests
     states = [None] * len(questions)
 
-    def get_one_answer(i):
-        states[i] = tree_search(**arguments[i], call_generate=call_generate)
-
     tic = time.time()
-    if args.parallel == 1:
-        for i in tqdm(range(len(questions))):
-            get_one_answer(i)
+    if args.backend != "lmql":
+
+        def get_one_answer(i):
+            states[i] = tree_search(**arguments[i], call_generate=call_generate)
+
+        if args.parallel == 1:
+            for i in tqdm(range(len(questions))):
+                get_one_answer(i)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                executor.map(get_one_answer, list(range(len(questions))))
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(questions))))
+        import asyncio
+
+        from lmql_funcs import tree_search_async
+
+        async def get_one_answer_async(i):
+            states[i] = await tree_search_async(
+                **arguments[i], call_generate=call_generate
+            )
+
+        batches = [
+            [] for _ in range((len(questions) + args.parallel - 1) // args.parallel)
+        ]
+        for i in range(len(questions)):
+            batches[i // args.parallel].append(i)
+
+        loop = asyncio.get_event_loop()
+        for bt in tqdm(batches):
+            tasks = [get_one_answer_async(k) for k in bt]
+            loop.run_until_complete(asyncio.gather(*tasks))
+
     latency = time.time() - tic
 
     answers_text = []

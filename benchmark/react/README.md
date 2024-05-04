@@ -26,3 +26,9 @@ python3 bench_other.py --num-questions 100 --backend vllm
 ```
 python3 bench_other.py --num-questions 100 --backend guidance --parallel 1 --n-ctx 4096 --model-path path/to/gguf
 ```
+
+### Benchmark lmql
+
+```
+python3 bench_other.py --num-questions 100 --backend lmql --parallel 1
+```

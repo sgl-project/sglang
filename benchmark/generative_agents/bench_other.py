@@ -35,10 +35,21 @@ def main(args):
         answer = call_generate(**arg, temperature=0)
         states.append(answer)
 
+    async def get_one_answer_async(arg):
+        answer = await call_generate(**arg, temperature=0)
+        states.append(answer)
+
     tic = time.time()
     # we always sequentially execute agent calls to maintain its dependency
-    for arg in tqdm(arguments):
-        get_one_answer(arg)
+    if args.backend != "lmql":
+        for arg in tqdm(arguments):
+            get_one_answer(arg)
+    else:
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        for arg in tqdm(arguments):
+            loop.run_until_complete(get_one_answer_async(arg))
     latency = time.time() - tic
 
     print(f"Latency: {latency:.3f}")

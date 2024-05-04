@@ -68,16 +68,34 @@ def main(args):
     call_generate = partial(get_call_generate(args), temperature=0)
 
     # Run requests
-    def get_one_answer(i):
-        states[i] = suggest_tips(lines[i]["topic"], call_generate)
-
     tic = time.time()
-    if args.parallel == 1:
-        for i in tqdm(range(len(lines))):
-            get_one_answer(i)
+    if args.backend != "lmql":
+
+        def get_one_answer(i):
+            states[i] = suggest_tips(lines[i]["topic"], call_generate)
+
+        if args.parallel == 1:
+            for i in tqdm(range(len(lines))):
+                get_one_answer(i)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                executor.map(get_one_answer, list(range(len(lines))))
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(lines))))
+        import asyncio
+
+        from lmql_funcs import suggest_tips_async
+
+        async def get_one_answer_async(i):
+            states[i] = await suggest_tips_async(lines[i]["topic"], call_generate)
+
+        batches = []
+        for i in range(0, len(lines), args.parallel):
+            batches.append(list(range(i, min(i + args.parallel, len(lines)))))
+        loop = asyncio.get_event_loop()
+        for batch in tqdm(batches):
+            loop.run_until_complete(
+                asyncio.gather(*[get_one_answer_async(i) for i in batch])
+            )
     latency = time.time() - tic
 
     # Compute accuracy
