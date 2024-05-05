@@ -6,12 +6,7 @@ from functools import partial
 
 from tqdm import tqdm
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_lightllm,
-    call_generate_srt_raw,
-    call_generate_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
 
 number = 5
@@ -70,48 +65,43 @@ def main(args):
     states = [None] * len(lines)
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_lightllm, url=url, temperature=0)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_vllm, url=url, temperature=0)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_srt_raw, url=url, temperature=0)
-    elif args.backend == "guidance":
-        from guidance import gen, models
-
-        model = models.LlamaCpp(
-            "/home/ubuntu/model_weights/Llama-2-7b-chat.gguf",
-            n_gpu_layers=-1,
-            n_ctx=4096,
-        )
-
-        def generate(prompt, max_tokens, stop):
-            out = (
-                model
-                + prompt
-                + gen(name="answer", max_tokens=max_tokens, temperature=0, stop=stop)
-            )
-            return out["answer"]
-
-        # warmup
-        generate("Hello!", max_tokens=8, stop=None)
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    call_generate = partial(get_call_generate(args), temperature=0)
 
     # Run requests
-    def get_one_answer(i):
-        states[i] = suggest_tips(lines[i]["topic"], generate)
-
     tic = time.time()
-    if args.parallel == 1:
-        for i in tqdm(range(len(lines))):
-            get_one_answer(i)
+    if args.backend != "lmql":
+
+        def get_one_answer(i):
+            states[i] = suggest_tips(lines[i]["topic"], call_generate)
+
+        if args.parallel == 1:
+            for i in tqdm(range(len(lines))):
+                get_one_answer(i)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                list(
+                    tqdm(
+                        executor.map(get_one_answer, list(range(len(lines)))),
+                        total=len(lines),
+                    )
+                )
+
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(lines))))
+        import asyncio
+
+        from lmql_funcs import suggest_tips_async
+
+        async def get_one_answer_async(i):
+            states[i] = await suggest_tips_async(lines[i]["topic"], call_generate)
+
+        batches = []
+        for i in range(0, len(lines), args.parallel):
+            batches.append(list(range(i, min(i + args.parallel, len(lines)))))
+        loop = asyncio.get_event_loop()
+        for batch in tqdm(batches):
+            loop.run_until_complete(
+                asyncio.gather(*[get_one_answer_async(i) for i in batch])
+            )
     latency = time.time() - tic
 
     # Compute accuracy

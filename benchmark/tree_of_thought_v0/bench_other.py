@@ -5,17 +5,11 @@ import re
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 
 import numpy as np
 from tqdm import tqdm
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_lightllm,
-    call_generate_srt_raw,
-    call_generate_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
 
 INVALID = -9999999
@@ -119,52 +113,7 @@ def main(args):
     arguments = [{"question": q, "num_branches": num_branches} for q in questions]
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_lightllm, url=url)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_vllm, url=url)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_srt_raw, url=url)
-    elif args.backend == "guidance":
-        from guidance import gen, models
-
-        model = models.LlamaCpp(
-            "/home/ubuntu/model_weights/Llama-2-7b-chat.gguf",
-            n_gpu_layers=-1,
-            n_ctx=4096,
-        )
-
-        def call_generate(prompt, temperature, max_tokens, stop, n):
-            if n == 1:
-                out = (
-                    model
-                    + prompt
-                    + gen(
-                        name="answer",
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        stop=stop,
-                    )
-                )
-                return out["answer"]
-            else:
-                rets = []
-                for i in range(n):
-                    out = (
-                        model
-                        + prompt
-                        + gen(
-                            name="answer",
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                            stop=stop,
-                        )
-                    )
-                    rets.append(out["answer"])
-                return rets
+    call_generate = get_call_generate(args)
 
     # Run requests
     states = [None] * len(questions)
@@ -178,7 +127,13 @@ def main(args):
             get_one_answer(i)
     else:
         with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(questions))))
+            list(
+                tqdm(
+                    executor.map(get_one_answer, list(range(len(questions)))),
+                    total=len(questions),
+                )
+            )
+
     latency = time.time() - tic
 
     answers_text = []

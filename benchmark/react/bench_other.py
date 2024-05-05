@@ -2,17 +2,10 @@ import argparse
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-from pathlib import Path
 
 from tqdm import tqdm
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_lightllm,
-    call_generate_srt_raw,
-    call_generate_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
 
 
@@ -97,42 +90,7 @@ def main(args):
     states = []
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_lightllm, url=url)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_vllm, url=url)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_srt_raw, url=url)
-    elif args.backend == "guidance":
-        from guidance import gen, models
-
-        model = models.LlamaCpp(
-            str(Path.home()) + "/model_weights/Llama-2-7b-chat.gguf",
-            n_gpu_layers=-1,
-            n_ctx=4096,
-        )
-
-        def call_generate(prompt, temperature, max_tokens, stop):
-            out = (
-                model
-                + prompt
-                + gen(
-                    name="result",
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stop=stop,
-                )
-            )
-            return out["result"]
-
-        # warmup
-        call_generate("Hello,", 1.0, 8, ".")
-
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    call_generate = get_call_generate(args)
 
     def run_single_agent(argument):
         question = argument["question"]
@@ -161,13 +119,60 @@ def main(args):
 
             states.append(answer)
 
+    async def run_single_agent_async(argument):
+        question = argument["question"]
+        triplets = argument["triplets"]
+        prompt = get_prompt(question)
+        for i in range(1, len(triplets) + 2):
+            prompt += "Thought " + str(i) + ":"
+            states.append(prompt)
+            answer = await call_generate(
+                prompt, max_tokens=200, temperature=0, stop="Observation", max_len=4096
+            )
+            if i > len(triplets):
+                break
+            prompt += (
+                triplets[i - 1]["thought"]
+                + "\nAction "
+                + str(i)
+                + ":"
+                + triplets[i - 1]["action"]
+                + "\nObservation "
+                + str(i)
+                + ":"
+                + triplets[i - 1]["observation"]
+                + "\n"
+            )
+
+            states.append(answer)
+
     tic = time.time()
-    if args.parallel == 1:
-        for arg in tqdm(arguments):
-            run_single_agent(arg)
+
+    if args.backend != "lmql":
+        if args.parallel == 1:
+            for arg in tqdm(arguments):
+                run_single_agent(arg)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                list(
+                    tqdm(
+                        executor.map(run_single_agent, arguments), total=len(arguments)
+                    )
+                )
+
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(run_single_agent, arguments)
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        batches = [
+            [] for _ in range((len(arguments) + args.parallel - 1) // args.parallel)
+        ]
+        for i, arg in enumerate(arguments):
+            batches[i // args.parallel].append(arg)
+        for bt in tqdm(batches):
+            tasks = [run_single_agent_async(arg) for arg in bt]
+            loop.run_until_complete(asyncio.gather(*tasks))
+
     latency = time.time() - tic
 
     print(f"Latency: {latency:.3f}")

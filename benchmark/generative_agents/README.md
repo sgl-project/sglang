@@ -28,5 +28,11 @@ python3 bench_other.py --num-events 1000 --backend vllm --parallel 1
 
 ### Benchmark guidance
 ```
-python3 bench_other.py --num-events 1000 --backend guidance --parallel 1
+python3 bench_other.py --num-events 1000 --backend guidance --parallel 1 --n-ctx 4096 --model-path path/to/gguf
+```
+
+### Benchmark lmql
+
+```
+python3 bench_other.py --num-events 1000 --backend lmql --parallel 1
 ```

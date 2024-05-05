@@ -6,12 +6,7 @@ from functools import partial
 
 from tqdm import tqdm
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_lightllm,
-    call_generate_srt_raw,
-    call_generate_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
 
 system_prompt = "Please serve as an impartial judge and rigorously evaluate the quality of the following article. Apply the most stringent standards possible, showing no leniency."
@@ -54,53 +49,77 @@ def multi_dimension_judge(article, generate):
     return s
 
 
+async def multi_dimension_judge_async(article, generate):
+    s = system_prompt
+    s += "\n```\n" + article + "\n```\n\n"
+
+    judges = []
+    for i in range(len(dimension_prompts)):
+        comp = await generate(
+            s
+            + "USER: Please judge the quality based on the following metric. "
+            + dimension_prompts[i]
+            + " Please provide a single-paragraph judgement. "
+            + "Focus on the provided metric and do not say other things. "
+            'End your judgement paragraph with the word "END"\nJUDGE:',
+            max_tokens=256,
+            stop="END",
+        )
+        judges.append(comp)
+
+    s += "I will judge the quality based on the following metrics.\n"
+    for i in range(len(dimension_prompts)):
+        s += dimension_prompts[i].split(":")[0] + ": " + judges[i].strip() + "\n"
+
+    s += "In summary, on a scale of 1 to 10, I would give the article a score of"
+    s += await generate(s, max_tokens=2, stop=None)
+
+    return s
+
+
 def main(args):
     lines = read_jsonl(args.data_path)[: args.num_questions]
     states = [None] * len(lines)
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_lightllm, url=url, temperature=0)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_vllm, url=url, temperature=0)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_srt_raw, url=url, temperature=0)
-    elif args.backend == "guidance":
-        from guidance import gen, models
-
-        model = models.LlamaCpp(
-            "/home/ubuntu/model_weights/Llama-2-7b-chat.gguf",
-            n_gpu_layers=-1,
-            n_ctx=4096,
-        )
-
-        def generate(prompt, max_tokens, stop):
-            out = (
-                model
-                + prompt
-                + gen(name="answer", max_tokens=max_tokens, temperature=0, stop=stop)
-            )
-            return out["answer"]
-
-        # warmup
-        generate("Hello!", max_tokens=8, stop=None)
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    call_generate = partial(get_call_generate(args), temperature=0)
 
     # Run requests
-    def get_one_answer(i):
-        states[i] = multi_dimension_judge(lines[i], generate)
-
     tic = time.time()
-    if args.parallel == 1:
-        for i in tqdm(range(len(lines))):
-            get_one_answer(i)
+
+    if args.backend != "lmql":
+
+        def get_one_answer(i):
+            states[i] = multi_dimension_judge(lines[i], call_generate)
+
+        if args.parallel == 1:
+            for i in tqdm(range(len(lines))):
+                get_one_answer(i)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                list(
+                    tqdm(
+                        executor.map(get_one_answer, list(range(len(lines)))),
+                        total=len(lines),
+                    )
+                )
+
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(lines))))
+        import asyncio
+
+        async def get_one_answer_async(i):
+            states[i] = await multi_dimension_judge_async(lines[i], call_generate)
+
+        batches = []
+        for i in range(0, len(lines), args.parallel):
+            batches.append(list(range(i, min(i + args.parallel, len(lines)))))
+
+        loop = asyncio.get_event_loop()
+        for bt in tqdm(batches):
+            loop.run_until_complete(
+                asyncio.gather(*[get_one_answer_async(i) for i in bt])
+            )
+
     latency = time.time() - tic
 
     # Compute accuracy

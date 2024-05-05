@@ -4,19 +4,13 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 
 import numpy as np
 import pandas as pd
 import tiktoken
 from tqdm import tqdm
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_lightllm,
-    call_generate_srt_raw,
-    call_generate_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 
 choices = ["A", "B", "C", "D"]
 
@@ -53,10 +47,7 @@ def gen_prompt(train_df, subject, k=-1):
     return prompt
 
 
-model_initialized = None
-
-
-def evaluate(args, subject, dev_df, test_df):
+def evaluate(args, subject, dev_df, test_df, call_generate):
     prompts = []
     labels = []
 
@@ -77,62 +68,6 @@ def evaluate(args, subject, dev_df, test_df):
 
     preds = [None] * len(prompts)
     max_tokens = 1
-
-    # Select backend
-    global model_initialized
-
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_lightllm, url=url, stop=None)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_vllm, url=url, stop=None)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_srt_raw, url=url, stop=None)
-    elif args.backend == "guidance":
-        from guidance import gen, models
-
-        if model_initialized is None:
-            model = models.LlamaCpp(
-                "/home/ubuntu/model_weights/Llama-2-7b-chat.gguf",
-                n_gpu_layers=-1,
-                n_ctx=4096,
-            )
-            model_initialized = model
-        else:
-            model = model_initialized
-
-        def call_generate(prompt, temperature, max_tokens):
-            out = (
-                model
-                + prompt
-                + gen(name="answer", max_tokens=max_tokens, temperature=0)
-            )
-            return out["answer"]
-
-        # warmup
-        call_generate("Hello,", temperature=1.0, max_tokens=8)
-
-    elif args.backend == "lmql":
-        import lmql
-
-        model = lmql.model(
-            "meta-llama/Llama-2-7b-chat-hf", endpoint=f"{args.host}:{args.port}"
-        )
-
-        @lmql.query(model=model)
-        async def program(question):
-            '''lmql
-            """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < 2
-            return ANSWER
-            '''
-
-        async def call_generate(prompt, temperature, max_tokens):
-            return await program(question=prompt, temperature=temperature)
-
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
 
     # Run requests
     if args.backend != "lmql":
@@ -190,6 +125,9 @@ def main(args):
     all_latencies = []
     num_requests = 0
 
+    # Select backend
+    call_generate = get_call_generate(args)
+
     for subject in tqdm(subjects[: args.nsub]):
         dev_df = pd.read_csv(
             os.path.join(args.data_dir, "dev", subject + "_dev.csv"), header=None
@@ -198,7 +136,7 @@ def main(args):
             os.path.join(args.data_dir, "test", subject + "_test.csv"), header=None
         )
 
-        cors, acc, latency = evaluate(args, subject, dev_df, test_df)
+        cors, acc, latency = evaluate(args, subject, dev_df, test_df, call_generate)
         all_cors.append(cors)
         all_latencies.append(latency)
         num_requests += len(test_df)

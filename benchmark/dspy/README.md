@@ -9,6 +9,12 @@ Turn off cache at https://github.com/stanfordnlp/dspy/blob/34d8420383ec752037aa2
 cache_turn_on = False
 ```
 
+or set the environment variable
+
+```
+export DSP_CACHEBOOL=false
+```
+
 ## Benchmark SGLang
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
