@@ -3,6 +3,7 @@ import asyncio
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 
 import numpy as np
 
@@ -54,11 +55,17 @@ def main(args):
 
         tic = time.time()
         if args.parallel == 1:
-            for i in range(len(questions)):
+            for i in tqdm(range(len(questions))):
                 get_one_answer(i)
         else:
             with ThreadPoolExecutor(args.parallel) as executor:
-                executor.map(get_one_answer, list(range(len(questions))))
+                list(
+                    tqdm(
+                        executor.map(get_one_answer, list(range(len(questions)))),
+                        total=len(questions),
+                    )
+                )
+
     else:
         # Use asyncio
         async def batched_call(batch_size):

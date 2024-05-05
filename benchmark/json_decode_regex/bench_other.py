@@ -59,7 +59,12 @@ def main(args):
             get_one_answer(i)
     else:
         with ThreadPoolExecutor(args.parallel) as executor:
-            rets = executor.map(get_one_answer, list(range(len(arguments))))
+            rets = list(
+                tqdm(
+                    executor.map(get_one_answer, list(range(len(arguments)))),
+                    total=len(arguments),
+                )
+            )
             for _ in rets:
                 pass
 

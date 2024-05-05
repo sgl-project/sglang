@@ -115,11 +115,17 @@ def main(args):
 
         tic = time.time()
         if args.parallel == 1:
-            for i in range(len(questions)):
+            for i in tqdm(range(len(questions))):
                 get_one_answer(i)
         else:
             with ThreadPoolExecutor(args.parallel) as executor:
-                executor.map(get_one_answer, list(range(len(questions))))
+                list(
+                    tqdm(
+                        executor.map(get_one_answer, list(range(len(questions)))),
+                        total=len(questions),
+                    )
+                )
+
     else:
         # Use asyncio
         async def get_one_answer_asyncio(i):
@@ -131,10 +137,9 @@ def main(args):
         tic = time.time()
         loop = asyncio.get_event_loop()
         batches = [
-            [] for _ in range((len(questions) + args.parallel - 1) // args.parallel)
+            list(range(i, min(i + args.parallel, len(questions))))
+            for i in range(0, len(questions), args.parallel)
         ]
-        for i in range(len(questions)):
-            batches[i // args.parallel].append(i)
         for bt in tqdm(batches):
             tasks = [get_one_answer_asyncio(k) for k in bt]
             loop.run_until_complete(asyncio.gather(*tasks))

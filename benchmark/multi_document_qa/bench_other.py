@@ -67,7 +67,13 @@ def main(args):
             get_one_answer(i)
     else:
         with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(labels))))
+            list(
+                tqdm(
+                    executor.map(get_one_answer, list(range(len(labels)))),
+                    total=len(labels),
+                )
+            )
+
     latency = time.time() - tic
 
     # Compute accuracy

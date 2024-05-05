@@ -79,7 +79,13 @@ def main(args):
                 get_one_answer(i)
         else:
             with ThreadPoolExecutor(args.parallel) as executor:
-                executor.map(get_one_answer, list(range(len(lines))))
+                list(
+                    tqdm(
+                        executor.map(get_one_answer, list(range(len(lines)))),
+                        total=len(lines),
+                    )
+                )
+
     else:
         import asyncio
 

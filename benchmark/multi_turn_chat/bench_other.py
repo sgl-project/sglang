@@ -41,7 +41,12 @@ def main(args):
             get_one_answer(i)
     else:
         with ThreadPoolExecutor(args.parallel) as executor:
-            rets = executor.map(get_one_answer, list(range(len(multi_qas))))
+            rets = list(
+                tqdm(
+                    executor.map(get_one_answer, list(range(len(multi_qas)))),
+                    total=len(multi_qas),
+                )
+            )
             for _ in rets:
                 pass
 

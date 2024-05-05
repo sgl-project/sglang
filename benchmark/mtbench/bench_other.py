@@ -5,6 +5,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+from tqdm import tqdm
 from fastchat.model import get_conversation_template
 
 from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
@@ -67,11 +68,17 @@ def main(args):
     # Run requests
     tic = time.time()
     if args.parallel == 1:
-        for i in range(len(questions)):
+        for i in tqdm(range(len(questions))):
             get_answer(i)
     else:
         with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_answer, list(range(len(questions))))
+            list(
+                tqdm(
+                    executor.map(get_answer, list(range(len(questions)))),
+                    total=len(questions),
+                )
+            )
+
     latency = time.time() - tic
 
     print(f"#questions: {len(questions)}, Latency: {latency:.2f}")

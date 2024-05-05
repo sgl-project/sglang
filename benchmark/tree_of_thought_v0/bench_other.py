@@ -127,7 +127,13 @@ def main(args):
             get_one_answer(i)
     else:
         with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(questions))))
+            list(
+                tqdm(
+                    executor.map(get_one_answer, list(range(len(questions)))),
+                    total=len(questions),
+                )
+            )
+
     latency = time.time() - tic
 
     answers_text = []

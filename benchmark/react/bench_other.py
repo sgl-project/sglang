@@ -154,7 +154,12 @@ def main(args):
                 run_single_agent(arg)
         else:
             with ThreadPoolExecutor(args.parallel) as executor:
-                executor.map(run_single_agent, arguments)
+                list(
+                    tqdm(
+                        executor.map(run_single_agent, arguments), total=len(arguments)
+                    )
+                )
+
     else:
         import asyncio
 
