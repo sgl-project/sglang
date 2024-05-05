@@ -5,17 +5,11 @@ import re
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 
 import numpy as np
 from tqdm import tqdm
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_lightllm,
-    call_generate_srt_raw,
-    call_generate_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
 
 INVALID = -9999999
@@ -139,69 +133,50 @@ def main(args):
     arguments = [{"question": q, "num_branches": num_branches} for q in questions]
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_lightllm, url=url)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_vllm, url=url)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_srt_raw, url=url)
-    elif args.backend == "guidance":
-        from guidance import gen, models
-
-        model = models.LlamaCpp(
-            "/home/ubuntu/model_weights/Llama-2-7b-chat.gguf",
-            n_gpu_layers=-1,
-            n_ctx=4096,
-        )
-
-        def call_generate(prompt, temperature, max_tokens, stop, n):
-            if n == 1:
-                out = (
-                    model
-                    + prompt
-                    + gen(
-                        name="answer",
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        stop=stop,
-                    )
-                )
-                return out["answer"]
-            else:
-                rets = []
-                for i in range(n):
-                    out = (
-                        model
-                        + prompt
-                        + gen(
-                            name="answer",
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                            stop=stop,
-                        )
-                    )
-                    rets.append(out["answer"])
-                return rets
-
-        # warmup
-        call_generate("Hello,", 1.0, 8, ".", 1)
+    call_generate = get_call_generate(args)
 
     # Run requests
     states = [None] * len(questions)
 
-    def get_one_answer(i):
-        states[i] = tree_search(**arguments[i], call_generate=call_generate)
-
     tic = time.time()
-    if args.parallel == 1:
-        for i in tqdm(range(len(questions))):
-            get_one_answer(i)
+    if args.backend != "lmql":
+
+        def get_one_answer(i):
+            states[i] = tree_search(**arguments[i], call_generate=call_generate)
+
+        if args.parallel == 1:
+            for i in tqdm(range(len(questions))):
+                get_one_answer(i)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                list(
+                    tqdm(
+                        executor.map(get_one_answer, list(range(len(questions)))),
+                        total=len(questions),
+                    )
+                )
+
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(questions))))
+        import asyncio
+
+        from lmql_funcs import tree_search_async
+
+        async def get_one_answer_async(i):
+            states[i] = await tree_search_async(
+                **arguments[i], call_generate=call_generate
+            )
+
+        batches = [
+            [] for _ in range((len(questions) + args.parallel - 1) // args.parallel)
+        ]
+        for i in range(len(questions)):
+            batches[i // args.parallel].append(i)
+
+        loop = asyncio.get_event_loop()
+        for bt in tqdm(batches):
+            tasks = [get_one_answer_async(k) for k in bt]
+            loop.run_until_complete(asyncio.gather(*tasks))
+
     latency = time.time() - tic
 
     answers_text = []

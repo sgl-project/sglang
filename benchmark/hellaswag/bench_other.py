@@ -3,15 +3,11 @@ import asyncio
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 
 import numpy as np
+from tqdm import tqdm
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_select_lightllm,
-    call_select_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_select
 from sglang.utils import read_jsonl
 
 
@@ -47,47 +43,7 @@ def main(args):
     preds = [None] * len(labels)
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_select = partial(call_select_lightllm, url=url)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_select = partial(call_select_vllm, url=url)
-    elif args.backend == "guidance":
-        from guidance import models, select
-
-        model = models.LlamaCpp(
-            "/home/ubuntu/model_weights/Llama-2-7b-chat.gguf",
-            n_gpu_layers=-1,
-            n_ctx=4096,
-        )
-
-        def call_select(context, choices):
-            out = model + context + select(choices, name="answer")
-            return choices.index(out["answer"])
-
-        call_select("Hello,", ["world", "earth"])
-
-    elif args.backend == "lmql":
-        import lmql
-
-        model = lmql.model(
-            "meta-llama/Llama-2-7b-chat-hf", endpoint=f"{args.host}:{args.port}"
-        )
-
-        @lmql.query(model=model)
-        async def program(ctx, choices):
-            '''lmql
-            """{ctx}[ANSWER]""" where ANSWER in set(choices)
-            return ANSWER
-            '''
-
-        async def call_select(context, choices):
-            answer = await program(ctx=context, choices=choices, temperature=0)
-            return choices.index(answer)
-
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    call_select = get_call_select(args)
 
     # Run requests
     if args.backend != "lmql":
@@ -99,11 +55,17 @@ def main(args):
 
         tic = time.time()
         if args.parallel == 1:
-            for i in range(len(questions)):
+            for i in tqdm(range(len(questions))):
                 get_one_answer(i)
         else:
             with ThreadPoolExecutor(args.parallel) as executor:
-                executor.map(get_one_answer, list(range(len(questions))))
+                list(
+                    tqdm(
+                        executor.map(get_one_answer, list(range(len(questions)))),
+                        total=len(questions),
+                    )
+                )
+
     else:
         # Use asyncio
         async def batched_call(batch_size):

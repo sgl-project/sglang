@@ -1,8 +1,6 @@
 import argparse
 import json
 import time
-from functools import partial
-from pathlib import Path
 
 from agent_functions import (
     action_location_object_prompt,
@@ -13,12 +11,7 @@ from agent_functions import (
 )
 from tqdm import tqdm
 
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_lightllm,
-    call_generate_srt_raw,
-    call_generate_vllm,
-)
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
 
 
@@ -36,48 +29,27 @@ def main(args):
     states = []
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_lightllm, url=url)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_vllm, url=url)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_srt_raw, url=url)
-    elif args.backend == "guidance":
-        from guidance import gen, models
-
-        model = models.LlamaCpp(
-            str(Path.home()) + "/model_weights/Llama-2-7b-chat.gguf",
-            n_gpu_layers=-1,
-            n_ctx=4096,
-        )
-
-        def call_generate(prompt, temperature, max_tokens, stop):
-            out = (
-                model
-                + prompt
-                + gen(
-                    name="result",
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stop=stop,
-                )
-            )
-            return out["result"]
-
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    call_generate = get_call_generate(args)
 
     def get_one_answer(arg):
         answer = call_generate(**arg, temperature=0)
         states.append(answer)
 
+    async def get_one_answer_async(arg):
+        answer = await call_generate(**arg, temperature=0)
+        states.append(answer)
+
     tic = time.time()
     # we always sequentially execute agent calls to maintain its dependency
-    for arg in tqdm(arguments):
-        get_one_answer(arg)
+    if args.backend != "lmql":
+        for arg in tqdm(arguments):
+            get_one_answer(arg)
+    else:
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        for arg in tqdm(arguments):
+            loop.run_until_complete(get_one_answer_async(arg))
     latency = time.time() - tic
 
     print(f"Latency: {latency:.3f}")
