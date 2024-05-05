@@ -159,7 +159,7 @@ def process_image_and_prompt():
     # # Decode the video
     # video_data = query_content["video"]
     # video = cv2.VideoCapture(BytesIO(base64.b64decode(video_data)))
-    video = cv2.VideoCapture("./Q98Z4OTh8RwmDonc.mp4")
+    video = cv2.VideoCapture("/mnt/bn/vl-research/workspace/yhzhang/data/twitter/Q98Z4OTh8RwmDonc.mp4")
     path = save_video_unique(video)
     video.release()
 
