@@ -18,7 +18,7 @@ def single(path, num_frames=16):
     state = video_qa.run(
         num_frames=num_frames,
         video_path=path,
-        question="Please provide a detailed description of the video, focusing on the main subjects, their actions, the background scenes, and the temporal transitions.",
+        question="Please provide a detailed description of the video, focusing on the main subjects, their actions, the background scenes",
         temperature=0.0,
         max_new_tokens=1024,
     )
