@@ -3,9 +3,9 @@ import asyncio
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm
 
 import numpy as np
+from tqdm import tqdm
 
 from sglang.test.test_utils import add_common_other_args_and_parse, get_call_select
 from sglang.utils import read_jsonl
