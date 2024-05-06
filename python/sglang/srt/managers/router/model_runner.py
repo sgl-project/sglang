@@ -40,10 +40,6 @@ def import_model_classes():
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
-            # gemma references InputMetadata that does not exist, skip it for now.
-            # TODO Wait for sglang/main to fix it.
-            if name in ["sglang.srt.models.gemma"]:
-                continue
             module = importlib.import_module(name)
             if hasattr(module, "EntryClass"):
                 model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
