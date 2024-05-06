@@ -308,7 +308,7 @@ class ModelRunner:
         logger.info(f"Rank {self.tp_rank}: load weight begin.")
 
         # Load weights
-        linear_method = None
+        quant_config = None
 
         quant_cfg = getattr(self.model_config.hf_config, "quantization_config", None)
         if quant_cfg is not None:
@@ -330,12 +330,11 @@ class ModelRunner:
 
             quant_config = quant_config_class.from_config(quant_cfg)
             logger.info(f"quant_config: {quant_config}")
-            linear_method = quant_config.get_linear_method()
 
         with set_default_torch_dtype(torch.float16):
             with torch.device("cuda"):
                 model = model_class(
-                    config=self.model_config.hf_config, linear_method=linear_method
+                    config=self.model_config.hf_config, quant_config=quant_config
                 )
             model.load_weights(
                 self.model_config.path,
