@@ -504,6 +504,10 @@ def launch_server(server_args, pipe_finish_writer):
     global tokenizer_manager
     global chat_template_name
 
+    if server_args.enable_flashinfer:
+        from sglang.srt.utils import assert_pkg_version
+        assert_pkg_version("flashinfer", "0.0.4")
+
     # start show time thread
     if server_args.show_time_cost:
         enable_show_time_cost()
@@ -712,10 +716,6 @@ class Runtime:
             disable_disk_cache=disable_disk_cache,
             api_key=api_key,
         )
-
-        if enable_flashinfer:
-            from sglang.srt.utils import assert_pkg_version
-            assert_pkg_version("flashinfer", "0.0.4")
 
         self.url = self.server_args.url()
         self.generate_url = (
