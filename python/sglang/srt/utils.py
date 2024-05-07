@@ -280,4 +280,4 @@ def assert_pkg_version(pkg: str, min_version: str):
                 f"is less than the minimum required version {min_version}"
             )
     except PackageNotFoundError:
-        raise f"{pkg} is not installed"
+        raise f"{pkg} with minimum required version {min_version} is not installed"
