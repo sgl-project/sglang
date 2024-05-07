@@ -20,6 +20,8 @@ from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.utils import is_multimodal_model
 from sglang.utils import get_available_gpu_memory
 
+from python.sglang.srt.utils import assert_pkg_version
+
 QUANTIZATION_CONFIG_MAPPING = {
     "awq": AWQConfig,
     "gptq": GPTQConfig,
@@ -99,6 +101,8 @@ class InputMetadata:
     decode_wrapper = None
 
     def init_flashinfer_args(self, tp_size):
+        assert_pkg_version("flashinfer", "0.0.4")
+
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
             BatchPrefillWithPagedKVCacheWrapper,
@@ -142,15 +146,8 @@ class InputMetadata:
                 self.kv_last_page_len,
                 self.model_runner.model_config.num_attention_heads // tp_size,
                 self.model_runner.model_config.num_key_value_heads // tp_size,
+                self.model_runner.model_config.head_dim
             ]
-
-            # flashinfer >= 0.0.3
-            # FIXME: Drop this when flashinfer updates to 0.0.4
-            if (
-                len(inspect.signature(self.prefill_wrapper.begin_forward).parameters)
-                == 7
-            ):
-                args.append(self.model_runner.model_config.head_dim)
 
             self.prefill_wrapper.begin_forward(*args)
         else:

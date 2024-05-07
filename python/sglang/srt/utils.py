@@ -5,12 +5,14 @@ import socket
 import sys
 import time
 import traceback
+from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
 from typing import List, Optional
 
 import numpy as np
 import requests
 import torch
+from packaging import version as pkg_version
 
 show_time_cost = False
 time_infos = {}
@@ -267,3 +269,15 @@ def load_image(image_file):
         image = Image.open(BytesIO(base64.b64decode(image_file)))
 
     return image
+
+
+def assert_pkg_version(pkg: str, min_version: str):
+    try:
+        installed_version = version(pkg)
+        if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
+            raise (
+                f"{pkg} is installed with version {installed_version} which "
+                f"is less than the minimum required version {min_version}"
+            )
+    except PackageNotFoundError:
+        raise f"{pkg} is not installed"
