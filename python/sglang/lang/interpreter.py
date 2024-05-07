@@ -1,6 +1,7 @@
 """The interpreter that executes SGL programs"""
 
 import asyncio
+import contextvars
 import multiprocessing
 import queue
 import threading
@@ -9,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Union
 
-import contextvars
 import tqdm
 
 from sglang.global_config import global_config
