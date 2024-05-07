@@ -6,11 +6,12 @@ from transformers import PretrainedConfig
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    LinearMethodBase,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -35,7 +36,7 @@ class QWenMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str = "silu",
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -43,14 +44,14 @@ class QWenMLP(nn.Module):
             2 * [intermediate_size],
             bias=False,
             gather_output=False,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.c_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             input_is_parallel=True,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -75,7 +76,7 @@ class QWenAttention(nn.Module):
         layer_id: int = 0,
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -91,14 +92,14 @@ class QWenAttention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             bias=True,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.c_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             input_is_parallel=True,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -131,7 +132,7 @@ class QWenAttention(nn.Module):
 
 
 class QWenBlock(nn.Module):
-    def __init__(self, config: PretrainedConfig, layer_id, linear_method=None):
+    def __init__(self, config: PretrainedConfig, layer_id, quant_config: Optional[QuantizationConfig] = None,):
         super().__init__()
         self.ln_1 = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
@@ -144,7 +145,7 @@ class QWenBlock(nn.Module):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             layer_id=layer_id,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
 
         self.ln_2 = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -152,7 +153,7 @@ class QWenBlock(nn.Module):
         self.mlp = QWenMLP(
             config.hidden_size,
             config.intermediate_size // 2,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -180,7 +181,7 @@ class QWenBlock(nn.Module):
 
 
 class QWenModel(nn.Module):
-    def __init__(self, config: PretrainedConfig, linear_method=None):
+    def __init__(self, config: PretrainedConfig, quant_config: Optional[QuantizationConfig] = None,):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -192,7 +193,7 @@ class QWenModel(nn.Module):
         )
         self.h = nn.ModuleList(
             [
-                QWenBlock(config, i, linear_method=linear_method)
+                QWenBlock(config, i, quant_config=quant_config)
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -217,10 +218,10 @@ class QWenModel(nn.Module):
 
 
 class QWenLMHeadModel(nn.Module):
-    def __init__(self, config: PretrainedConfig, linear_method=None):
+    def __init__(self, config: PretrainedConfig, quant_config: Optional[QuantizationConfig] = None,):
         super().__init__()
         self.config = config
-        self.transformer = QWenModel(config, linear_method=linear_method)
+        self.transformer = QWenModel(config, quant_config=quant_config)
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         self.lm_head = ParallelLMHead(vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)

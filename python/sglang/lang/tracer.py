@@ -1,16 +1,20 @@
 """Tracing a program."""
 
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from sglang.backend.base_backend import BaseBackend
+from sglang.global_config import global_config
 from sglang.lang.interpreter import ProgramState, ProgramStateGroup
 from sglang.lang.ir import (
     SglArgument,
+    SglCommitLazy,
+    SglConcateAndAppend,
     SglConstantText,
     SglExpr,
     SglExprList,
     SglFork,
+    SglFunction,
     SglGen,
     SglGetForkItem,
     SglRoleBegin,

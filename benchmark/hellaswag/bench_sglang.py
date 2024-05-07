@@ -61,7 +61,7 @@ def main(args):
     # Run requests
     tic = time.time()
     rets = few_shot_hellaswag.run_batch(
-        arguments, temperature=0, backend=backend, num_threads=args.parallel)
+        arguments, temperature=0, backend=backend, num_threads=args.parallel, progress_bar=True)
     preds = [choices[i].index(rets[i]["answer"]) for i in range(len(rets))]
     latency = time.time() - tic
 

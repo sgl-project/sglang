@@ -1,3 +1,8 @@
+# The PR(https://github.com/vllm-project/vllm/pull/4097) of vllm borken the sglang code.
+# In order to adapt to the latest code without modifying too much code,
+# copied the previous vllm/model_executor/weight_utils.py
+# Copied in https://github.com/vllm-project/vllm/blob/05434764cd99990035779cf9a4ed86623b528825/vllm/model_executor/weight_utils.py
+
 """Utilities for downloading and initializing model weights."""
 import fnmatch
 import glob
