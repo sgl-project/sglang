@@ -222,7 +222,10 @@ class StreamExecutor:
 
             def _run_worker_in_context():
                 self._thread_worker_func()
-            self.worker = threading.Thread(target=contextvars.copy_context().run, args=(_run_worker_in_context, ))
+
+            self.worker = threading.Thread(
+                target=contextvars.copy_context().run, args=(_run_worker_in_context,)
+            )
             self.worker.start()
 
         # For streaming
@@ -265,9 +268,10 @@ class StreamExecutor:
         self,
         number: int,
         position_ids_offset: Optional[List[int]] = None,
-        copy: bool = False,
     ):
-        if number > 1 or copy:
+        self.sync()
+
+        if number > 1:
             self.submit(SglCommitLazy())
             self.sync()
 
@@ -656,16 +660,15 @@ class ProgramState:
         self,
         number: int = 1,
         position_ids_offset: Optional[List[int]] = None,
-        copy: bool = False,
     ):
-        stream_executors = self.stream_executor.fork(number, position_ids_offset, copy)
+        stream_executors = self.stream_executor.fork(number, position_ids_offset)
         states = [ProgramState(x) for x in stream_executors]
         state_group = ProgramStateGroup(states, self)
         return state_group
 
     @contextmanager
     def copy(self, position_ids_offset: Optional[List[int]] = None):
-        state_group = self.fork(1, position_ids_offset, True)
+        state_group = self.fork(1, position_ids_offset)
         try:
             yield state_group[0]
         finally:
