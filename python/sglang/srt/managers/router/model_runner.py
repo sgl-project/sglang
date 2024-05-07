@@ -20,8 +20,6 @@ from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.utils import is_multimodal_model
 from sglang.utils import get_available_gpu_memory
 
-from python.sglang.srt.utils import assert_pkg_version
-
 QUANTIZATION_CONFIG_MAPPING = {
     "awq": AWQConfig,
     "gptq": GPTQConfig,
@@ -101,8 +99,6 @@ class InputMetadata:
     decode_wrapper = None
 
     def init_flashinfer_args(self, tp_size):
-        assert_pkg_version("flashinfer", "0.0.4")
-
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
             BatchPrefillWithPagedKVCacheWrapper,

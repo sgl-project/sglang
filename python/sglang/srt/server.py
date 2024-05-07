@@ -713,6 +713,10 @@ class Runtime:
             api_key=api_key,
         )
 
+        if enable_flashinfer:
+            from sglang.srt.utils import assert_pkg_version
+            assert_pkg_version("flashinfer", "0.0.4")
+
         self.url = self.server_args.url()
         self.generate_url = (
             f"http://{self.server_args.host}:{self.server_args.port}/generate"
