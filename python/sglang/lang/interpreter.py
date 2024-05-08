@@ -269,12 +269,10 @@ class StreamExecutor:
         number: int,
         position_ids_offset: Optional[List[int]] = None,
     ):
-        self.sync()
-
         if number > 1:
             self.submit(SglCommitLazy())
-            self.sync()
 
+        self.sync()
         number = int(number)
 
         exes = [
