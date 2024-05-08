@@ -42,7 +42,9 @@ class DetokenizerManager:
                 output_strs = self.tokenizer.batch_decode(
                     output_tokens,
                     skip_special_tokens=recv_obj.skip_special_tokens[0],
-                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
+                        0
+                    ],
                 )
 
                 # Trim stop str
