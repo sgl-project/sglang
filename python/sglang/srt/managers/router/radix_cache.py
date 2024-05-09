@@ -11,7 +11,7 @@ class TreeNode:
         self.parent = None
         self.key = None
         self.value = None
-        self.ref_counter = 0
+        self.lock_ref = 0
         self.last_access_time = time.time()
 
     def __lt__(self, other: "TreeNode"):
@@ -38,7 +38,7 @@ class RadixCache:
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
-        self.root_node.ref_counter = 1
+        self.root_node.lock_ref = 1
         self.evictable_size_ = 0
 
     def match_prefix(self, key):
@@ -80,7 +80,7 @@ class RadixCache:
 
             if x == self.root_node:
                 break
-            if x.ref_counter > 0:
+            if x.lock_ref > 0:
                 continue
 
             num_evicted += evict_callback(x.value)
@@ -89,23 +89,23 @@ class RadixCache:
             if len(x.parent.children) == 0:
                 heapq.heappush(leaves, x.parent)
 
-    def inc_ref_counter(self, node):
+    def inc_lock_ref(self, node: TreeNode):
         delta = 0
         while node != self.root_node:
-            if node.ref_counter == 0:
+            if node.lock_ref == 0:
                 self.evictable_size_ -= len(node.value)
                 delta -= len(node.value)
-            node.ref_counter += 1
+            node.lock_ref += 1
             node = node.parent
         return delta
 
-    def dec_ref_counter(self, node):
+    def dec_lock_ref(self, node: TreeNode):
         delta = 0
         while node != self.root_node:
-            if node.ref_counter == 1:
+            if node.lock_ref == 1:
                 self.evictable_size_ += len(node.value)
                 delta += len(node.value)
-            node.ref_counter -= 1
+            node.lock_ref -= 1
             node = node.parent
         return delta
 
@@ -131,12 +131,12 @@ class RadixCache:
                 last_node[0] = child
                 self._match_prefix_helper(child, key[prefix_len:], value, last_node)
 
-    def _split_node(self, key, child, split_len):
+    def _split_node(self, key, child: TreeNode, split_len):
         # new_node -> child
         new_node = TreeNode()
         new_node.children = {key[split_len:][0]: child}
         new_node.parent = child.parent
-        new_node.ref_counter = child.ref_counter
+        new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
         child.parent = new_node
@@ -176,11 +176,9 @@ class RadixCache:
             self.evictable_size_ += len(value)
         return 0
 
-    def _print_helper(self, node, indent):
+    def _print_helper(self, node: TreeNode, indent):
         for _, child in node.children.items():
-            print(
-                " " * indent, len(child.key), child.key[:10], f"r={child.ref_counter}"
-            )
+            print(" " * indent, len(child.key), child.key[:10], f"r={child.lock_ref}")
             self._print_helper(child, indent=indent + 2)
 
     def _delete_leaf(self, node):

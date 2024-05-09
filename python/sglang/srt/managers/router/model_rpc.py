@@ -338,15 +338,15 @@ class ModelRpcServer:
                 and req.extend_input_len + new_batch_input_tokens
                 < self.max_prefill_num_token
             ):
-                delta = self.tree_cache.inc_ref_counter(req.last_node)
+                delta = self.tree_cache.inc_lock_ref(req.last_node)
                 available_size += delta
 
                 if not (
                     req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
                     < available_size
                 ):
-                    # Undo the insertion
-                    delta = self.tree_cache.dec_ref_counter(req.last_node)
+                    # Undo locking
+                    delta = self.tree_cache.dec_lock_ref(req.last_node)
                     available_size += delta
                     break
                 else:
@@ -637,7 +637,7 @@ class ModelRpcServer:
 
                 self.token_to_kv_pool.dec_refs(indices[:prefix_len])
                 self.req_to_token_pool.free(req_pool_idx)
-                self.tree_cache.dec_ref_counter(req.last_node)
+                self.tree_cache.dec_lock_ref(req.last_node)
 
             # Update batch tensors
             if unfinished_indices:

@@ -328,7 +328,7 @@ class Batch:
             req = self.reqs[idx]
             retracted_reqs.append(req)
 
-            self.tree_cache.dec_ref_counter(req.last_node)
+            self.tree_cache.dec_lock_ref(req.last_node)
             req.prefix_indices = None
             req.last_node = None
             req.extend_input_len = 0
@@ -373,7 +373,7 @@ class Batch:
                     )
                     self.token_to_kv_pool.dec_refs(indices[:prefix_len])
                     self.req_to_token_pool.free(req_pool_idx)
-                    self.tree_cache.dec_ref_counter(req.last_node)
+                    self.tree_cache.dec_lock_ref(req.last_node)
 
                     # jump-forward
                     req.jump_forward_and_retokenize(jump_forward_str, next_state)
