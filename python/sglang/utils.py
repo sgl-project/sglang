@@ -6,9 +6,10 @@ import threading
 import urllib.request
 from io import BytesIO
 from json import dumps
-
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if
+import socket
 import requests
-
+from urllib.parse import urlparse
 
 def get_available_gpu_memory(gpu_id, distributed=True):
     """
@@ -88,6 +89,34 @@ class HttpResponse:
         return self.resp.status
 
 
+def _is_port_open(host, port, timeout=5):
+    """ Check if a port at a given address is open. """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    result = sock.connect_ex((host, port))
+    sock.close()
+    return result == 0
+
+def _should_retry(retry_state):
+    url = retry_state.args[0]  # Assumes the first argument to the function is the URL
+    exception = retry_state.outcome.exception()
+    try:
+        parsed_url = urlparse(url)
+        host = parsed_url.hostname
+        port = parsed_url.port
+        is_server_online = _is_port_open(host, port)
+    except:
+        is_server_online = False
+
+    if isinstance(exception, ConnectionResetError) and is_server_online(url):
+        return True
+    return False
+
+@retry(
+    stop=stop_after_attempt(999999999),
+    wait=wait_fixed(1),
+    retry=retry_if(_should_retry)
+)
 def http_request(
     url, json=None, stream=False, auth_token=None, api_key=None, verify=None
 ):
