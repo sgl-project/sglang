@@ -360,19 +360,17 @@ class Batch:
                     if len(jump_forward_str) <= 1:
                         continue
 
-                    # insert the old request into tree_cache
-                    token_ids_in_memory = tuple(req.input_ids + req.output_ids)[:-1]
                     if req_pool_indices_cpu is None:
                         req_pool_indices_cpu = self.req_pool_indices.cpu().tolist()
-                    req_pool_idx = req_pool_indices_cpu[i]
-                    indices = self.req_to_token_pool.req_to_token[
-                        req_pool_idx, : len(token_ids_in_memory)
-                    ]
-                    prefix_len = self.tree_cache.insert(
-                        token_ids_in_memory, indices.clone()
+
+                    # insert the old request into tree_cache
+                    self.tree_cache.cache_req(
+                        token_ids=tuple(req.input_ids + req.output_ids)[:-1],
+                        last_uncached_pos=len(req.prefix_indices),
+                        req_pool_idx=req_pool_indices_cpu[i],
                     )
-                    self.token_to_kv_pool.dec_refs(indices[:prefix_len])
-                    self.req_to_token_pool.free(req_pool_idx)
+
+                    # unlock the last node
                     self.tree_cache.dec_lock_ref(req.last_node)
 
                     # jump-forward

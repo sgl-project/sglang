@@ -28,7 +28,9 @@ def _key_match(key0, key1):
 
 
 class RadixCache:
-    def __init__(self, disable: bool = False):
+    def __init__(self, req_to_token_pool, token_to_kv_pool, disable: bool = False):
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool = token_to_kv_pool
         self.disable = disable
         self.reset()
 
@@ -59,6 +61,18 @@ class RadixCache:
         if value is None:
             value = [x for x in key]
         return self._insert_helper(self.root_node, key, value)
+
+    def cache_req(
+        self, token_ids, last_uncached_pos, req_pool_idx, del_in_memory_pool=True
+    ):
+        # Insert the request into radix cache
+        indices = self.req_to_token_pool.req_to_token[req_pool_idx, : len(token_ids)]
+        new_prefix_len = self.insert(token_ids, indices.clone())
+
+        if del_in_memory_pool:
+            # Radix Cache takes one ref in memory pool
+            self.req_to_token_pool.free(req_pool_idx)
+            self.token_to_kv_pool.dec_refs(indices[last_uncached_pos:new_prefix_len])
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
@@ -209,7 +223,7 @@ class RadixCache:
 
 
 if __name__ == "__main__":
-    tree = RadixCache()
+    tree = RadixCache(None, None, False)
 
     tree.insert("Hello")
     tree.insert("Hello")

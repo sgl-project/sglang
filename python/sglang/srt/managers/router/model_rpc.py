@@ -113,7 +113,11 @@ class ModelRpcServer:
         logger.info(server_args.get_optional_modes_logging())
 
         # Init cache
-        self.tree_cache = RadixCache(disable=server_args.disable_radix_cache)
+        self.tree_cache = RadixCache(
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            disable=server_args.disable_radix_cache,
+        )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.scheduler = Scheduler(
             self.schedule_heuristic,
@@ -351,7 +355,6 @@ class ModelRpcServer:
                     break
                 else:
                     # Add this request to the running batch
-                    self.token_to_kv_pool.add_refs(req.prefix_indices)
                     can_run_list.append(req)
                     new_batch_total_tokens += (
                         req.extend_input_len + req.max_new_tokens()
@@ -627,16 +630,12 @@ class ModelRpcServer:
             req_pool_indices_cpu = batch.req_pool_indices.cpu().tolist()
             for i in finished_indices:
                 req = batch.reqs[i]
-                req_pool_idx = req_pool_indices_cpu[i]
-                token_ids = tuple(req.input_ids + req.output_ids)
-                seq_len = len(token_ids) - 1
-                indices = self.req_to_token_pool.req_to_token[req_pool_idx, :seq_len]
-                prefix_len = self.tree_cache.insert(
-                    token_ids[:seq_len], indices.clone()
+                self.tree_cache.cache_req(
+                    token_ids=tuple(req.input_ids + req.output_ids)[:-1],
+                    last_uncached_pos=len(req.prefix_indices),
+                    req_pool_idx=req_pool_indices_cpu[i],
                 )
 
-                self.token_to_kv_pool.dec_refs(indices[:prefix_len])
-                self.req_to_token_pool.free(req_pool_idx)
                 self.tree_cache.dec_lock_ref(req.last_node)
 
             # Update batch tensors
