@@ -115,7 +115,7 @@ def _should_retry(retry_state):
 @retry(
     stop=stop_after_attempt(999999999),
     wait=wait_fixed(1),
-    retry=retry_if(_should_retry)
+    retry=_should_retry
 )
 def http_request(
     url, json=None, stream=False, auth_token=None, api_key=None, verify=None
