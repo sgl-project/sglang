@@ -17,6 +17,11 @@ if __name__ == "__main__":
     model_overide_args["architectures"] = ["LlavaVidForCausalLM"]
     model_overide_args["num_frames"] = 16
     model_overide_args["model_type"] = "llavavid"
+    if model_overide_args["num_frames"] == 32:
+        model_overide_args["rope_scaling"] = {"factor": 2.0, "type": "linear"}
+        model_overide_args["max_sequence_length"] = 4096 * 2
+        model_overide_args["tokenizer_model_max_length"] = 4096 * 2
+        model_overide_args["model_max_length"] = 4096 * 2
     
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
