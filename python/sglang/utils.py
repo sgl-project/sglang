@@ -109,6 +109,7 @@ def _should_retry(retry_state):
         is_server_online = False
 
     if isinstance(exception, ConnectionResetError) and is_server_online(url):
+        print("ConnectionResetError: Retrying...")
         return True
     return False
 
