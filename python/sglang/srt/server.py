@@ -412,7 +412,7 @@ async def v1_chat_completions(raw_request: Request):
     return response
 
 
-def launch_server(server_args, pipe_finish_writer):
+def launch_server(server_args, pipe_finish_writer, model_overide_args=None):
     global tokenizer_manager
     global chat_template_name
 
@@ -467,17 +467,13 @@ def launch_server(server_args, pipe_finish_writer):
             chat_template_name = server_args.chat_template
 
     # Launch processes
-    tokenizer_manager = TokenizerManager(server_args, port_args)
+    tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
     pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
     proc_router = mp.Process(
         target=start_router_process,
-        args=(
-            server_args,
-            port_args,
-            pipe_router_writer,
-        ),
+        args=(server_args, port_args, pipe_router_writer, model_overide_args),
     )
     proc_router.start()
     proc_detoken = mp.Process(
@@ -522,19 +518,26 @@ def launch_server(server_args, pipe_finish_writer):
         if server_args.api_key and server_args.api_key != "":
             headers[API_KEY_HEADER_NAME] = server_args.api_key
 
+        success = False  # Flag to indicate if the request was successful
         for _ in range(120):
             time.sleep(0.5)
             try:
                 requests.get(url + "/get_model_info", timeout=5, headers=headers)
+                success = True  # Set flag to True if request succeeds
                 break
             except requests.exceptions.RequestException as e:
-                pass
-        else:
+                last_exception = e  # Store the last exception
+
+        if not success:  # Check if the request never succeeded
+            error_message = (
+                str(last_exception)
+                if "last_exception" in locals()
+                else "Failed to connect to the server."
+            )
             if pipe_finish_writer is not None:
-                pipe_finish_writer.send(str(e))
+                pipe_finish_writer.send(error_message)
             else:
-                print(e, flush=True)
-            return
+                print(error_message, flush=True)
 
         # Warmup
         try:
@@ -549,7 +552,7 @@ def launch_server(server_args, pipe_finish_writer):
                     },
                 },
                 headers=headers,
-                timeout=60,
+                timeout=600,
             )
             # print(f"Warmup done. model response: {res.json()['text']}")
             # print("=" * 20, "Server is ready", "=" * 20, flush=True)
@@ -594,6 +597,7 @@ class Runtime:
         api_key: str = "",
         port: Optional[int] = None,
         additional_ports: Optional[Union[List[int], int]] = None,
+        model_overide_args: Optional[dict] = None,
     ):
         host = "127.0.0.1"
         port, additional_ports = handle_port_init(port, additional_ports, tp_size)
@@ -628,7 +632,10 @@ class Runtime:
 
         self.pid = None
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
-        proc = mp.Process(target=launch_server, args=(self.server_args, pipe_writer))
+        proc = mp.Process(
+            target=launch_server,
+            args=(self.server_args, pipe_writer, model_overide_args),
+        )
         proc.start()
         pipe_writer.close()
         self.pid = proc.pid
