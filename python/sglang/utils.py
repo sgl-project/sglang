@@ -6,7 +6,7 @@ import threading
 import urllib.request
 from io import BytesIO
 from json import dumps
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if
+from tenacity import retry, stop_after_attempt, wait_fixed
 import socket
 import requests
 from urllib.parse import urlparse
