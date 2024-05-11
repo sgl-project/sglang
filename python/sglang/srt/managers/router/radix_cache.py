@@ -52,6 +52,8 @@ class RadixCache:
         self._match_prefix_helper(self.root_node, key, value, last_node)
         if value:
             value = torch.concat(value)
+        else:
+            value = torch.tensor([], dtype=torch.int64)
         return value, last_node[0]
 
     def insert(self, key, value=None):
@@ -63,16 +65,32 @@ class RadixCache:
         return self._insert_helper(self.root_node, key, value)
 
     def cache_req(
-        self, token_ids, last_uncached_pos, req_pool_idx, del_in_memory_pool=True
+        self,
+        token_ids,
+        last_uncached_pos,
+        req_pool_idx,
+        finished=True,
+        old_last_node=None,
     ):
         # Insert the request into radix cache
         indices = self.req_to_token_pool.req_to_token[req_pool_idx, : len(token_ids)]
         new_prefix_len = self.insert(token_ids, indices.clone())
 
-        if del_in_memory_pool:
-            # Radix Cache takes one ref in memory pool
+        # Radix Cache takes one ref in memory pool
+        self.token_to_kv_pool.dec_refs(indices[last_uncached_pos:new_prefix_len])
+
+        if finished:
             self.req_to_token_pool.free(req_pool_idx)
-            self.token_to_kv_pool.dec_refs(indices[last_uncached_pos:new_prefix_len])
+        else:
+            cached_indices, new_last_node = self.match_prefix(token_ids)
+            assert len(cached_indices) == len(token_ids)
+
+            self.req_to_token_pool.req_to_token[
+                req_pool_idx, last_uncached_pos : len(cached_indices)
+            ] = cached_indices[last_uncached_pos:]
+            self.dec_lock_ref(old_last_node)
+            self.inc_lock_ref(new_last_node)
+            return cached_indices, new_last_node
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)

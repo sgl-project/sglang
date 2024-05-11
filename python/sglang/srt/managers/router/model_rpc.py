@@ -201,6 +201,8 @@ class ModelRpcServer:
             # Run new fill batch
             self.forward_fill_batch(new_batch)
 
+            self.cache_filled_batch(new_batch)
+
             if not new_batch.is_empty():
                 if self.running_batch is None:
                     self.running_batch = new_batch
@@ -470,6 +472,18 @@ class ModelRpcServer:
                 pt += req.extend_input_len
 
         self.handle_finished_requests(batch)
+
+    def cache_filled_batch(self, batch: Batch):
+        req_pool_indices_cpu = batch.req_pool_indices.cpu().tolist()
+        for i, req in enumerate(batch.reqs):
+            new_prefix_indices, new_last_node = self.tree_cache.cache_req(
+                token_ids=tuple(req.input_ids + req.output_ids)[:-1],
+                last_uncached_pos=len(req.prefix_indices),
+                req_pool_idx=req_pool_indices_cpu[i],
+                finished=False,
+                old_last_node=req.last_node,
+            )
+            req.prefix_indices, req.last_node = new_prefix_indices, new_last_node
 
     def forward_decode_batch(self, batch: Batch):
         # check if decode out of memory
