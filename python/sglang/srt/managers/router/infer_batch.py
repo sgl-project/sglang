@@ -328,19 +328,19 @@ class Batch:
             req = self.reqs[idx]
             retracted_reqs.append(req)
 
+            # TODO: apply more fine-grained retraction
+            last_uncached_pos = len(req.prefix_indices)
+            token_indices = self.req_to_token_pool.req_to_token[
+                req_pool_indices_np[idx]
+            ][last_uncached_pos : seq_lens_np[idx]]
+            self.token_to_kv_pool.dec_refs(token_indices)
+
             self.tree_cache.dec_lock_ref(req.last_node)
             req.prefix_indices = None
             req.last_node = None
             req.extend_input_len = 0
             req.output_ids = []
             req.regex_fsm_state = 0
-
-            # TODO: apply more fine-grained retraction
-
-            token_indices = self.req_to_token_pool.req_to_token[
-                req_pool_indices_np[idx]
-            ][: seq_lens_np[idx]]
-            self.token_to_kv_pool.dec_refs(token_indices)
 
         self.filter_batch(sorted_indices)
 
