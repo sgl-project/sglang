@@ -10,7 +10,10 @@ import rpyc
 import torch
 from rpyc.utils.classic import obtain
 from rpyc.utils.server import ThreadedServer
-from vllm.logger import _default_handler as vllm_default_handler
+try:
+    from vllm.logger import _default_handler as vllm_default_logger
+except ImportError:
+    from vllm.logger import logger as vllm_default_logger
 
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
@@ -50,7 +53,7 @@ class ModelRpcServer:
         self.tp_size = server_args.tp_size
         self.schedule_heuristic = server_args.schedule_heuristic
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
-        vllm_default_handler.setLevel(
+        vllm_default_logger.setLevel(
             level=getattr(logging, server_args.log_level.upper())
         )
 

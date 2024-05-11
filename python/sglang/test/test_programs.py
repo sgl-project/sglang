@@ -226,7 +226,7 @@ Action 3: Finish [United States].\n
 
 def test_parallel_decoding():
     max_tokens = 64
-    number = 5
+    fork_size = 5
 
     @sgl.function
     def parallel_decoding(s, topic):
@@ -234,17 +234,17 @@ def test_parallel_decoding():
         s += "USER: Give some tips for " + topic + ".\n"
         s += (
             "ASSISTANT: Okay. Here are "
-            + str(number)
+            + str(fork_size)
             + " concise tips, each under 8 words:\n"
         )
 
         # Generate skeleton
-        for i in range(1, 1 + number):
+        for i in range(1, 1 + fork_size):
             s += f"{i}." + sgl.gen(max_tokens=16, stop=[".", "\n"]) + ".\n"
 
         # Generate detailed tips
-        forks = s.fork(number)
-        for i in range(number):
+        forks = s.fork(fork_size)
+        for i in range(fork_size):
             forks[
                 i
             ] += f"Now, I expand tip {i+1} into a detailed paragraph:\nTip {i+1}:"
@@ -253,7 +253,7 @@ def test_parallel_decoding():
 
         # Concatenate tips and summarize
         s += "Here are these tips with detailed explanation:\n"
-        for i in range(number):
+        for i in range(fork_size):
             s += f"Tip {i+1}:" + forks[i]["detailed_tip"] + "\n"
 
         s += "\nIn summary," + sgl.gen("summary", max_tokens=512)
