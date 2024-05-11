@@ -1,15 +1,13 @@
 import argparse
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 from tqdm import tqdm
-import numpy as np
-from sglang.test.test_utils import add_common_other_args_and_parse, call_generate_lightllm, call_generate_vllm, call_generate_srt_raw
-from sglang.utils import read_jsonl, dump_state_text
 
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
+from sglang.utils import dump_state_text, read_jsonl
 
 USER_PREFIX = "[INST] "
 USER_SUFFIX = " [/INST]"
@@ -25,7 +23,11 @@ def multi_document_qa(docs, question, generate):
     s += "".join(docs)
 
     s += "\nDocuments end."
-    s += ("\n\nBased on the above documents, please answer this question:\n" + question + "\nAnswer in three words or fewer.")
+    s += (
+        "\n\nBased on the above documents, please answer this question:\n"
+        + question
+        + "\nAnswer in three words or fewer."
+    )
     s += USER_SUFFIX
     s += ASSISTANT_PREFIX
     answer = generate(s, max_tokens=16, stop=None)
@@ -42,42 +44,22 @@ def main(args):
     if args.backend == "guidance":
         num_docs = 7  # due to OOM
 
-    for i in range(len(l["questions"][:args.num_questions])):
-        arguments.append({
-            "docs": l["documents"][:num_docs],
-            "question": l["questions"][i],
-        })
+    for i in range(len(l["questions"][: args.num_questions])):
+        arguments.append(
+            {
+                "docs": l["documents"][:num_docs],
+                "question": l["questions"][i],
+            }
+        )
         labels.append(l["answers"][i])
     states = [None] * len(arguments)
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_lightllm, url=url, temperature=0)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_vllm, url=url, temperature=0)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_srt_raw, url=url, temperature=0)
-    elif args.backend == "guidance":
-        from guidance import models, gen
-
-        model = models.LlamaCpp("/home/ubuntu/model_weights/CodeLlama-7b-instruct-hf.gguf", n_gpu_layers=-1, n_ctx=11000)
-
-        def generate(prompt, max_tokens, stop):
-            out = model + prompt + gen(name="answer",
-                max_tokens=max_tokens, temperature=0, stop=stop)
-            return out["answer"]
-
-        # warmup
-        generate("Hello!", max_tokens=8, stop=None)
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    call_generate = partial(get_call_generate(args), temperature=0)
 
     # Run requests
     def get_one_answer(i):
-        states[i] = multi_document_qa(generate=generate, **arguments[i])
+        states[i] = multi_document_qa(generate=call_generate, **arguments[i])
 
     tic = time.time()
     if args.parallel == 1:
@@ -85,7 +67,13 @@ def main(args):
             get_one_answer(i)
     else:
         with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(labels))))
+            list(
+                tqdm(
+                    executor.map(get_one_answer, list(range(len(labels)))),
+                    total=len(labels),
+                )
+            )
+
     latency = time.time() - tic
 
     # Compute accuracy
@@ -113,7 +101,7 @@ def main(args):
             "other": {
                 "num_questions": args.num_questions,
                 "parallel": args.parallel,
-            }
+            },
         }
         fout.write(json.dumps(value) + "\n")
 

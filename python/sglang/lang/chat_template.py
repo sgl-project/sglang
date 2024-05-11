@@ -227,6 +227,25 @@ register_chat_template(
     )
 )
 
+register_chat_template(
+    ChatTemplate(
+        name="c4ai-command-r",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>",
+                "<|END_OF_TURN_TOKEN|>",
+            ),
+            "user": ("<|START_OF_TURN_TOKEN|><|USER_TOKEN|>", "<|END_OF_TURN_TOKEN|>"),
+            "assistant": (
+                "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",
+                "<|END_OF_TURN_TOKEN|>",
+            ),
+        },
+        style=ChatTemplateStyle.PLAIN,
+    )
+)
+
 
 @register_chat_template_matching_function
 def match_dbrx(model_path: str):
@@ -285,6 +304,13 @@ def match_gemma_it(model_path: str):
     model_path = model_path.lower()
     if "gemma" in model_path and "it" in model_path:
         return get_chat_template("gemma-it")
+
+
+@register_chat_template_matching_function
+def match_c4ai_command_r(model_path: str):
+    model_path = model_path.lower()
+    if "c4ai-command-r" in model_path:
+        return get_chat_template("c4ai-command-r")
 
 
 if __name__ == "__main__":

@@ -1,25 +1,23 @@
 import argparse
 import ast
-import asyncio
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 import json
 import re
 import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from tqdm import tqdm
-from sglang.test.test_utils import add_common_other_args_and_parse, call_generate_lightllm, call_generate_vllm, call_generate_srt_raw
-from sglang.utils import read_jsonl, dump_state_text
 
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
+from sglang.utils import dump_state_text, read_jsonl
 
 INVALID = -9999999
 
 
 def get_answer_value(answer_str):
     answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r'\d+', answer_str)
+    numbers = re.findall(r"\d+", answer_str)
     if len(numbers) < 1:
         return INVALID
     try:
@@ -47,35 +45,56 @@ temp = 0.001
 
 
 def propose_plan(s, question, num_branches, call_generate):
-    s += (USER_PREFIX +
-"""Please generate a high-level plan for solving the following question. As the first step, just say what method and idea you will use to solve the question. You can reorganize the information in the question. Do not do the actual calculation. Keep your response concise and within 80 words. Question: """ + question + USER_SUFFIX)
+    s += (
+        USER_PREFIX
+        + """Please generate a high-level plan for solving the following question. As the first step, just say what method and idea you will use to solve the question. You can reorganize the information in the question. Do not do the actual calculation. Keep your response concise and within 80 words. Question: """
+        + question
+        + USER_SUFFIX
+    )
 
     s += ASSISTANT_PREFIX
-    comps = call_generate(s, max_tokens=256, temperature=temp, stop=None, n=num_branches)
+    comps = call_generate(
+        s, max_tokens=256, temperature=temp, stop=None, n=num_branches
+    )
     return [s + comp + ASSISTANT_SUFFIX for comp in comps]
 
 
 def execute_plan(s, num_branches, call_generate):
-    s += (USER_PREFIX +
-"""The plan looks good! Now, use real numbers and do the calculation. Please solve the question step-by-step according to the high-level plan. Give me the final answer. Make your response short.""" + USER_SUFFIX)
+    s += (
+        USER_PREFIX
+        + """The plan looks good! Now, use real numbers and do the calculation. Please solve the question step-by-step according to the high-level plan. Give me the final answer. Make your response short."""
+        + USER_SUFFIX
+    )
     s += ASSISTANT_PREFIX
-    comps = call_generate(s, max_tokens=256, temperature=temp, stop=None, n=num_branches)
+    comps = call_generate(
+        s, max_tokens=256, temperature=temp, stop=None, n=num_branches
+    )
     return [s + comp + ASSISTANT_SUFFIX for comp in comps]
 
 
 def reflect_solution(s, num_branches, call_generate):
-    s += (USER_PREFIX +
-"""Okay. Now, evaluate your own solution and give it a score on a scale of 1 to 5. Please do rigorous check of the correctness.""" + USER_SUFFIX)
+    s += (
+        USER_PREFIX
+        + """Okay. Now, evaluate your own solution and give it a score on a scale of 1 to 5. Please do rigorous check of the correctness."""
+        + USER_SUFFIX
+    )
     s += ASSISTANT_PREFIX
-    comps = call_generate(s, max_tokens=256, temperature=temp, stop=None, n=num_branches)
+    comps = call_generate(
+        s, max_tokens=256, temperature=temp, stop=None, n=num_branches
+    )
     return [s + comp + ASSISTANT_SUFFIX for comp in comps]
 
 
 def get_final_answer(s, num_branches, call_generate):
-    s += (USER_PREFIX +
-"""Based on your reflection, do you change your mind? Now, give me the final answer after careful consideration.""" + USER_SUFFIX)
+    s += (
+        USER_PREFIX
+        + """Based on your reflection, do you change your mind? Now, give me the final answer after careful consideration."""
+        + USER_SUFFIX
+    )
     s += ASSISTANT_PREFIX
-    comps = call_generate(s, max_tokens=256, temperature=temp, stop=None, n=num_branches)
+    comps = call_generate(
+        s, max_tokens=256, temperature=temp, stop=None, n=num_branches
+    )
     return [s + comp + ASSISTANT_SUFFIX for comp in comps]
 
 
@@ -107,55 +126,57 @@ def main(args):
     num_branches = 2
     questions = []
     labels = []
-    for i in range(len(lines[:args.num_questions])):
+    for i in range(len(lines[: args.num_questions])):
         questions.append(lines[i]["question"])
         labels.append(get_answer_value(lines[i]["answer"]))
     assert all(l != INVALID for l in labels)
     arguments = [{"question": q, "num_branches": num_branches} for q in questions]
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_lightllm, url=url)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_vllm, url=url)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_srt_raw, url=url)
-    elif args.backend == "guidance":
-        from guidance import models, gen
-
-        model = models.LlamaCpp("/home/ubuntu/model_weights/Llama-2-7b-chat.gguf", n_gpu_layers=-1, n_ctx=4096)
-
-        def call_generate(prompt, temperature, max_tokens, stop, n):
-            if n == 1:
-                out = model + prompt + gen(name="answer",
-                    max_tokens=max_tokens, temperature=temperature, stop=stop)
-                return out["answer"]
-            else:
-                rets = []
-                for i in range(n):
-                    out = model + prompt + gen(name="answer",
-                        max_tokens=max_tokens, temperature=temperature, stop=stop)
-                    rets.append(out["answer"])
-                return rets
-
-        # warmup
-        call_generate("Hello,", 1.0, 8, ".", 1)
+    call_generate = get_call_generate(args)
 
     # Run requests
     states = [None] * len(questions)
-    def get_one_answer(i):
-        states[i] = tree_search(**arguments[i], call_generate=call_generate)
 
     tic = time.time()
-    if args.parallel == 1:
-        for i in tqdm(range(len(questions))):
-            get_one_answer(i)
+    if args.backend != "lmql":
+
+        def get_one_answer(i):
+            states[i] = tree_search(**arguments[i], call_generate=call_generate)
+
+        if args.parallel == 1:
+            for i in tqdm(range(len(questions))):
+                get_one_answer(i)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                list(
+                    tqdm(
+                        executor.map(get_one_answer, list(range(len(questions)))),
+                        total=len(questions),
+                    )
+                )
+
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(questions))))
+        import asyncio
+
+        from lmql_funcs import tree_search_async
+
+        async def get_one_answer_async(i):
+            states[i] = await tree_search_async(
+                **arguments[i], call_generate=call_generate
+            )
+
+        batches = [
+            [] for _ in range((len(questions) + args.parallel - 1) // args.parallel)
+        ]
+        for i in range(len(questions)):
+            batches[i // args.parallel].append(i)
+
+        loop = asyncio.get_event_loop()
+        for bt in tqdm(batches):
+            tasks = [get_one_answer_async(k) for k in bt]
+            loop.run_until_complete(asyncio.gather(*tasks))
+
     latency = time.time() - tic
 
     answers_text = []
@@ -188,7 +209,7 @@ def main(args):
             "other": {
                 "num_questions": args.num_questions,
                 "parallel": args.parallel,
-            }
+            },
         }
         fout.write(json.dumps(value) + "\n")
 

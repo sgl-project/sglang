@@ -122,16 +122,36 @@ Area options: {Oak Hill College Student Dormatory, The Rose and Crown Pub, Hobbs
 * Must be one of the "Area options," verbatim.
 For eating dinner, Jane Anderson should go to the following area: {Hobbs Cafe}
 ---"""
-    s += (persona_name + " lives in " + living_sector + " that has " +
-          living_sector_areas + ".\n")
-    s += (persona_name + " is currently in " + current_sector + " that has " +
-          current_sector_areas + ".\n")
+    s += (
+        persona_name
+        + " lives in "
+        + living_sector
+        + " that has "
+        + living_sector_areas
+        + ".\n"
+    )
+    s += (
+        persona_name
+        + " is currently in "
+        + current_sector
+        + " that has "
+        + current_sector_areas
+        + ".\n"
+    )
     s += daily_plan + ".\n"
     s += "Area options: " + sector_options + ".\n"
     s += """* Stay in the current area if the activity can be done there. Only go out if the activity needs to take place in another place.
 * Must be one of the "Area options," verbatim.\n"""
-    s += (persona_name + " is " + current_action + ". For " + next_action +
-          ", " + persona_name + " should go to the following area: {")
+    s += (
+        persona_name
+        + " is "
+        + current_action
+        + ". For "
+        + next_action
+        + ", "
+        + persona_name
+        + " should go to the following area: {"
+    )
     s += sgl.gen(name="Location", max_tokens=10, stop="}")
 
 
@@ -162,22 +182,43 @@ Area options: {Oak Hill College Student Dormatory, The Rose and Crown Pub, Hobbs
 * Must be one of the "Area options," verbatim.
 For eating dinner, Jane Anderson should go to the following area: {Hobbs Cafe}
 ---"""
-    s += (persona_name + " lives in " + living_sector + " that has " +
-          living_sector_areas + ".\n")
-    s += (persona_name + " is currently in " + current_sector + " that has " +
-          current_sector_areas + ".\n")
+    s += (
+        persona_name
+        + " lives in "
+        + living_sector
+        + " that has "
+        + living_sector_areas
+        + ".\n"
+    )
+    s += (
+        persona_name
+        + " is currently in "
+        + current_sector
+        + " that has "
+        + current_sector_areas
+        + ".\n"
+    )
     s += daily_plan + ".\n"
     s += "Area options: " + sector_options + ".\n"
     s += """* Stay in the current area if the activity can be done there. Only go out if the activity needs to take place in another place.
 * Must be one of the "Area options," verbatim.\n"""
-    s += (persona_name + " is " + current_action + ". For " + next_action +
-          ", " + persona_name + " should go to the following area: {")
+    s += (
+        persona_name
+        + " is "
+        + current_action
+        + ". For "
+        + next_action
+        + ", "
+        + persona_name
+        + " should go to the following area: {"
+    )
     return {"prompt": s, "max_tokens": 10, "stop": "}"}
 
 
 @sgl.function
-def action_location_object(s, persona_name, target_sector, target_sector_areas,
-                           current_action, next_action):
+def action_location_object(
+    s, persona_name, target_sector, target_sector_areas, current_action, next_action
+):
     s += """
 Jane Anderson is in kitchen in Jane Anderson's house.
 Jane Anderson is going to Jane Anderson's house that has the following areas: {kitchen,  bedroom, bathroom}
@@ -191,20 +232,34 @@ Stay in the current area if the activity can be done there. Never go into other 
 For getting coffee, Tom Watson should go to the following area in Hobbs Cafe:
 Answer: {cafe}
 ---"""
-    s += (persona_name + " is going to " + target_sector +
-          " that has the following areas: {" + target_sector_areas + "}\n")
+    s += (
+        persona_name
+        + " is going to "
+        + target_sector
+        + " that has the following areas: {"
+        + target_sector_areas
+        + "}\n"
+    )
     s += """* Stay in the current area if the activity can be done there. 
 * NEVER go into other people's rooms unless necessary."""
-    s += (persona_name + " is " + current_action + ". For " + next_action +
-          ", " + persona_name + "should go to the following area in " +
-          target_sector)
+    s += (
+        persona_name
+        + " is "
+        + current_action
+        + ". For "
+        + next_action
+        + ", "
+        + persona_name
+        + "should go to the following area in "
+        + target_sector
+    )
     s += " (MUST pick one of {" + target_sector_areas + "}):\n"
     s += "Answer: {" + sgl.gen(name="Area", max_tokens=5, stop="}")
 
 
-def action_location_object_prompt(persona_name, target_sector,
-                                  target_sector_areas, current_action,
-                                  next_action):
+def action_location_object_prompt(
+    persona_name, target_sector, target_sector_areas, current_action, next_action
+):
     s = ""
     s += """
 Jane Anderson is in kitchen in Jane Anderson's house.
@@ -219,13 +274,27 @@ Stay in the current area if the activity can be done there. Never go into other 
 For getting coffee, Tom Watson should go to the following area in Hobbs Cafe:
 Answer: {cafe}
 ---"""
-    s += (persona_name + " is going to " + target_sector +
-          " that has the following areas: {" + target_sector_areas + "}\n")
+    s += (
+        persona_name
+        + " is going to "
+        + target_sector
+        + " that has the following areas: {"
+        + target_sector_areas
+        + "}\n"
+    )
     s += """* Stay in the current area if the activity can be done there. 
 * NEVER go into other people's rooms unless necessary."""
-    s += (persona_name + " is " + current_action + ". For " + next_action +
-          ", " + persona_name + "should go to the following area in " +
-          target_sector)
+    s += (
+        persona_name
+        + " is "
+        + current_action
+        + ". For "
+        + next_action
+        + ", "
+        + persona_name
+        + "should go to the following area in "
+        + target_sector
+    )
     s += " (MUST pick one of {" + target_sector_areas + "}):\n"
     s += "Answer: {"
     return {"prompt": s, "max_tokens": 5, "stop": "}"}

@@ -1,3 +1,9 @@
+## Download Dataset
+
+```sh
+wget -O question.jsonl https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl
+```
+
 ## Run benchmark
 
 ### Benchmark sglang

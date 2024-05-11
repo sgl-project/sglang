@@ -36,7 +36,7 @@ python3 bench_sglang.py --num-questions 10
 ```
 
 
-### Benchmark vllm
+### Benchmark Outlines + vLLM
 
 Run Llama-7B
 
@@ -47,7 +47,7 @@ python3 -m outlines.serve.serve --tokenizer-mode auto --model meta-llama/Llama-2
 Benchmark
 
 ```
-python3 bench_other.py --backend vllm --num-questions 10
+python3 bench_other.py --backend outlines --num-questions 10
 ```
 
 
@@ -56,5 +56,5 @@ python3 bench_other.py --backend vllm --num-questions 10
 Run Llama-7B and benchmark
 
 ```
-python3 bench_other.py --backend guidance --num-questions 10 --parallel 1
+python3 bench_other.py --backend guidance --num-questions 10 --parallel 1 --n-ctx 4096 --model-path path/to/gguf
 ```
