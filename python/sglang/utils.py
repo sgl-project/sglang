@@ -90,7 +90,7 @@ class HttpResponse:
     def status_code(self):
         return self.resp.status
 
-@cached(ttl = 5) # cache result so to not ddos the server
+@cached(ttl = 5)
 def _is_port_open(host, port, timeout=5):
     """ Check if a port at a given address is open. """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
