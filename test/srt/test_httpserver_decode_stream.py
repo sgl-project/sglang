@@ -26,6 +26,7 @@ def test_decode_stream(url, return_logprob, top_logprobs_num):
             "return_logprob": return_logprob,
             "top_logprobs_num": top_logprobs_num,
             "return_text_in_logprobs": True,
+            "logprob_start_len": 0,
         },
         stream=True,
     )

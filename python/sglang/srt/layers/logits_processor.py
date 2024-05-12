@@ -42,15 +42,15 @@ class LogitsProcessor(nn.Module):
             for i in range(all_logprobs.shape[0]):
                 k = input_metadata.top_logprobs_nums[i]
                 t = all_logprobs[i].topk(k)
-                v_cpu = t.values.cpu().tolist()
-                p_cpu = t.indices.cpu().tolist()
+                v_cpu = t.values.tolist()
+                p_cpu = t.indices.tolist()
                 decode_top_logprobs.append(list(zip(v_cpu, p_cpu)))
             return None, decode_top_logprobs
         else:
             prefill_top_logprobs, decode_top_logprobs = [], []
             pt = 0
             # NOTE: the GPU-CPU overhead can be reduced
-            extend_seq_lens_cpu = input_metadata.extend_seq_lens.cpu().tolist()
+            extend_seq_lens_cpu = input_metadata.extend_seq_lens.cpu().numpy()
             for i in range(len(extend_seq_lens_cpu)):
                 if extend_seq_lens_cpu[i] == 0:
                     prefill_top_logprobs.append([])
@@ -58,8 +58,8 @@ class LogitsProcessor(nn.Module):
                     continue
                 k = input_metadata.top_logprobs_nums[i]
                 t = all_logprobs[pt : pt + extend_seq_lens_cpu[i]].topk(k)
-                vs_cpu = t.values.cpu().tolist()
-                ps_cpu = t.indices.cpu().tolist()
+                vs_cpu = t.values.tolist()
+                ps_cpu = t.indices.tolist()
                 prefill_top_logprobs.append(
                     [list(zip(vs_cpu[j], ps_cpu[j])) for j in range(len(vs_cpu) - 1)]
                 )

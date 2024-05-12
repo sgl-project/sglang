@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import IntEnum, auto
 from typing import List
 
 import numpy as np
@@ -9,15 +9,15 @@ from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
 
-class ForwardMode(Enum):
+class ForwardMode(IntEnum):
     PREFILL = auto()
     EXTEND = auto()
     DECODE = auto()
 
 
-class FinishReason(Enum):
-    LENGTH = auto()
+class FinishReason(IntEnum):
     EOS_TOKEN = auto()
+    LENGTH = auto()
     STOP_STR = auto()
 
 
@@ -325,8 +325,8 @@ class Batch:
         )
 
         retracted_reqs = []
-        seq_lens_np = self.seq_lens.cpu().numpy()
-        req_pool_indices_np = self.req_pool_indices.cpu().numpy()
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
         while self.token_to_kv_pool.available_size() < len(self.reqs):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
@@ -342,8 +342,8 @@ class Batch:
             # TODO: apply more fine-grained retraction
 
             token_indices = self.req_to_token_pool.req_to_token[
-                req_pool_indices_np[idx]
-            ][: seq_lens_np[idx]]
+                req_pool_indices_cpu[idx]
+            ][: seq_lens_cpu[idx]]
             self.token_to_kv_pool.dec_refs(token_indices)
 
         self.filter_batch(sorted_indices)
@@ -367,7 +367,7 @@ class Batch:
                     # insert the old request into tree_cache
                     token_ids_in_memory = tuple(req.input_ids + req.output_ids)[:-1]
                     if req_pool_indices_cpu is None:
-                        req_pool_indices_cpu = self.req_pool_indices.cpu().tolist()
+                        req_pool_indices_cpu = self.req_pool_indices.tolist()
                     req_pool_idx = req_pool_indices_cpu[i]
                     indices = self.req_to_token_pool.req_to_token[
                         req_pool_idx, : len(token_ids_in_memory)

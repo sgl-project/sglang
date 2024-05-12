@@ -29,7 +29,7 @@ QUANTIZATION_CONFIG_MAPPING = {
 logger = logging.getLogger("model_runner")
 
 # for server args in model endpoints
-global_server_args_dict: dict = None
+global_server_args_dict = {}
 
 
 @lru_cache()
@@ -110,8 +110,8 @@ class InputMetadata:
         self.kv_last_page_len = torch.ones(
             (self.batch_size,), dtype=torch.int32, device="cuda"
         )
-        req_pool_indices_cpu = self.req_pool_indices[i].cpu().tolist()
-        seq_lens_cpu = self.seq_lens[i].cpu().tolist()
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
         self.kv_indices = torch.cat(
             [
                 self.req_to_token_pool.req_to_token[
@@ -197,15 +197,15 @@ class InputMetadata:
                 req_pool_indices[0], seq_lens[0] - 1
             ].item()
         else:
-            seq_lens_np = seq_lens.cpu().numpy()
-            prefix_lens_np = prefix_lens.cpu().numpy()
-            position_ids_offsets_np = position_ids_offsets.cpu().numpy()
+            seq_lens_cpu = seq_lens.cpu().numpy()
+            prefix_lens_cpu = prefix_lens.cpu().numpy()
+            position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
             positions = torch.tensor(
                 np.concatenate(
                     [
                         np.arange(
-                            prefix_lens_np[i] + position_ids_offsets_np[i],
-                            seq_lens_np[i] + position_ids_offsets_np[i],
+                            prefix_lens_cpu[i] + position_ids_offsets_cpu[i],
+                            seq_lens_cpu[i] + position_ids_offsets_cpu[i],
                         )
                         for i in range(batch_size)
                     ],
