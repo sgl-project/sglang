@@ -121,7 +121,6 @@ def _should_retry(retry_state: RetryCallState):
     return False
 
 @retry(
-    stop=stop_after_attempt(999999999),
     wait=wait_fixed(1),
     retry=_should_retry
 )
