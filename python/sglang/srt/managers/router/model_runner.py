@@ -12,8 +12,8 @@ import torch
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
-from vllm.model_executor.model_loader import _set_default_torch_dtype
-from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
+from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+from vllm.distributed import initialize_model_parallel
 
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
@@ -28,9 +28,8 @@ QUANTIZATION_CONFIG_MAPPING = {
 
 logger = logging.getLogger("model_runner")
 
-
 # for server args in model endpoints
-global_server_args_dict: dict = None
+global_server_args_dict = {}
 
 
 @lru_cache()
@@ -87,8 +86,8 @@ class InputMetadata:
     out_cache_cont_end: torch.Tensor = None
 
     other_kv_index: torch.Tensor = None
-    top_logprobs_nums: List[int] = None
     return_logprob: bool = False
+    top_logprobs_nums: List[int] = None
 
     # for flashinfer
     qo_indptr: torch.Tensor = None
@@ -108,18 +107,20 @@ class InputMetadata:
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
         )
         self.kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+        self.kv_last_page_len = torch.ones(
+            (self.batch_size,), dtype=torch.int32, device="cuda"
+        )
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
         self.kv_indices = torch.cat(
             [
                 self.req_to_token_pool.req_to_token[
-                    self.req_pool_indices[i].item(), : self.seq_lens[i].item()
+                    req_pool_indices_cpu[i]: seq_lens_cpu[i]
                 ]
                 for i in range(self.batch_size)
             ],
             dim=0,
         ).contiguous()
-        self.kv_last_page_len = torch.ones(
-            (self.batch_size,), dtype=torch.int32, device="cuda"
-        )
 
         workspace_buffer = torch.empty(
             32 * 1024 * 1024, dtype=torch.int8, device="cuda"
@@ -142,15 +143,8 @@ class InputMetadata:
                 self.kv_last_page_len,
                 self.model_runner.model_config.num_attention_heads // tp_size,
                 self.model_runner.model_config.num_key_value_heads // tp_size,
+                self.model_runner.model_config.head_dim
             ]
-
-            # flashinfer >= 0.0.3
-            # FIXME: Drop this when flashinfer updates to 0.0.4
-            if (
-                len(inspect.signature(self.prefill_wrapper.begin_forward).parameters)
-                == 7
-            ):
-                args.append(self.model_runner.model_config.head_dim)
 
             self.prefill_wrapper.begin_forward(*args)
         else:
@@ -203,15 +197,15 @@ class InputMetadata:
                 req_pool_indices[0], seq_lens[0] - 1
             ].item()
         else:
-            seq_lens_np = seq_lens.cpu().numpy()
-            prefix_lens_np = prefix_lens.cpu().numpy()
-            position_ids_offsets_np = position_ids_offsets.cpu().numpy()
+            seq_lens_cpu = seq_lens.cpu().numpy()
+            prefix_lens_cpu = prefix_lens.cpu().numpy()
+            position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
             positions = torch.tensor(
                 np.concatenate(
                     [
                         np.arange(
-                            prefix_lens_np[i] + position_ids_offsets_np[i],
-                            seq_lens_np[i] + position_ids_offsets_np[i],
+                            prefix_lens_cpu[i] + position_ids_offsets_cpu[i],
+                            seq_lens_cpu[i] + position_ids_offsets_cpu[i],
                         )
                         for i in range(batch_size)
                     ],
@@ -237,9 +231,9 @@ class InputMetadata:
             out_cache_loc=out_cache_loc,
             out_cache_cont_start=out_cache_cont_start,
             out_cache_cont_end=out_cache_cont_end,
-            top_logprobs_nums=top_logprobs_nums,
-            return_logprob=return_logprob,
             other_kv_index=other_kv_index,
+            return_logprob=return_logprob,
+            top_logprobs_nums=top_logprobs_nums,
         )
 
         if forward_mode == ForwardMode.EXTEND:
@@ -283,9 +277,6 @@ class ModelRunner:
             init_method=f"tcp://127.0.0.1:{self.nccl_port}",
         )
 
-        # A small all_reduce for warmup.
-        if self.tp_size > 1:
-            torch.distributed.all_reduce(torch.zeros(1).cuda())
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
 
         total_gpu_memory = get_available_gpu_memory(
@@ -304,7 +295,7 @@ class ModelRunner:
         logger.info(f"Rank {self.tp_rank}: load weight begin.")
 
         # Load weights
-        linear_method = None
+        quant_config = None
 
         quant_cfg = getattr(self.model_config.hf_config, "quantization_config", None)
         if quant_cfg is not None:
@@ -326,12 +317,11 @@ class ModelRunner:
 
             quant_config = quant_config_class.from_config(quant_cfg)
             logger.info(f"quant_config: {quant_config}")
-            linear_method = quant_config.get_linear_method()
 
-        with _set_default_torch_dtype(torch.float16):
+        with set_default_torch_dtype(torch.float16):
             with torch.device("cuda"):
                 model = model_class(
-                    config=self.model_config.hf_config, linear_method=linear_method
+                    config=self.model_config.hf_config, quant_config=quant_config
                 )
             model.load_weights(
                 self.model_config.path,
