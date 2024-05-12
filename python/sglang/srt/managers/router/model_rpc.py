@@ -113,7 +113,8 @@ class ModelRpcServer:
             f"max_prefill_num_token={self.max_prefill_num_token}, "
             f"context_len={self.model_config.context_len}, "
         )
-        logger.info(f"server_args: {server_args.print_mode_args()}")
+        if self.tp_rank == 0:
+            logger.info(f"server_args: {server_args.print_mode_args()}")
 
         # Init cache
         self.tree_cache = RadixCache(disable=server_args.disable_radix_cache)
