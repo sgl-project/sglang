@@ -28,7 +28,6 @@ QUANTIZATION_CONFIG_MAPPING = {
 
 logger = logging.getLogger("model_runner")
 
-
 # for server args in model endpoints
 global_server_args_dict: dict = None
 
@@ -276,9 +275,6 @@ class ModelRunner:
             init_method=f"tcp://127.0.0.1:{self.nccl_port}",
         )
 
-        # A small all_reduce for warmup.
-        if self.tp_size > 1:
-            torch.distributed.all_reduce(torch.zeros(1).cuda())
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
 
         total_gpu_memory = get_available_gpu_memory(
