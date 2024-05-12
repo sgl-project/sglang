@@ -426,7 +426,9 @@ class ModelRpcServer:
             # Only transfer the selected logprobs of the next token to CPU to reduce overhead.
             if last_logprobs is not None:
                 last_token_logprobs = (
-                    last_logprobs[torch.arange(len(batch.reqs)), next_token_ids].tolist()
+                    last_logprobs[
+                        torch.arange(len(batch.reqs), device=next_token_ids.device),
+                        next_token_ids].tolist()
                 )
 
             next_token_ids = next_token_ids.tolist()

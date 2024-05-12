@@ -178,7 +178,7 @@ def test_regex(args):
         extra_body={"regex": regex},
     )
     text = response.choices[0].message.content
-    print(json.loads(text))
+    print(test)
     print("=" * 100)
 
 

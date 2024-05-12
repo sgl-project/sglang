@@ -81,3 +81,9 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 cd test/lang
 python3 run_all.py
 ```
+
+## OpenAI API server
+```
+cd test/srt
+python test_openai_server.py
+```
