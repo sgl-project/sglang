@@ -4,7 +4,7 @@ import dataclasses
 from enum import IntEnum, auto
 from typing import Dict, List, Optional, Tuple, Union
 
-from sglang.srt.managers.openai_protocol import ChatCompletionRequest
+from sglang.srt.openai_protocol import ChatCompletionRequest
 
 
 class SeparatorStyle(IntEnum):
