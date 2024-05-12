@@ -10,7 +10,10 @@ import rpyc
 import torch
 from rpyc.utils.classic import obtain
 from rpyc.utils.server import ThreadedServer
-from vllm.logger import _default_handler as vllm_default_handler
+try:
+    from vllm.logger import _default_handler as vllm_default_logger
+except ImportError:
+    from vllm.logger import logger as vllm_default_logger
 
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
@@ -34,6 +37,7 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger("model_rpc")
+logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
 
 class ModelRpcServer:
@@ -50,7 +54,7 @@ class ModelRpcServer:
         self.tp_size = server_args.tp_size
         self.schedule_heuristic = server_args.schedule_heuristic
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
-        vllm_default_handler.setLevel(
+        vllm_default_logger.setLevel(
             level=getattr(logging, server_args.log_level.upper())
         )
 
@@ -110,7 +114,7 @@ class ModelRpcServer:
             f"max_prefill_num_token={self.max_prefill_num_token}, "
             f"context_len={self.model_config.context_len}, "
         )
-        logger.info(server_args.get_optional_modes_logging())
+        logger.info(f"server_args: {server_args.print_mode_args()}")
 
         # Init cache
         self.tree_cache = RadixCache(disable=server_args.disable_radix_cache)
@@ -586,7 +590,7 @@ class ModelRpcServer:
                     + len(req.output_ids)
                     - req.prompt_tokens,
                     "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
-                    "finish_reason": req.finish_reason,
+                    "finish_reason": str(req.finish_reason),
                     "hit_stop_str": req.hit_stop_str,
                 }
                 if req.return_logprob:

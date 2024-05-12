@@ -12,8 +12,8 @@ import torch
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
-from vllm.model_executor.model_loader import _set_default_torch_dtype
-from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
+from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+from vllm.distributed import initialize_model_parallel
 
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
@@ -27,7 +27,6 @@ QUANTIZATION_CONFIG_MAPPING = {
 }
 
 logger = logging.getLogger("model_runner")
-
 
 # for server args in model endpoints
 global_server_args_dict: dict = None
@@ -142,15 +141,8 @@ class InputMetadata:
                 self.kv_last_page_len,
                 self.model_runner.model_config.num_attention_heads // tp_size,
                 self.model_runner.model_config.num_key_value_heads // tp_size,
+                self.model_runner.model_config.head_dim
             ]
-
-            # flashinfer >= 0.0.3
-            # FIXME: Drop this when flashinfer updates to 0.0.4
-            if (
-                len(inspect.signature(self.prefill_wrapper.begin_forward).parameters)
-                == 7
-            ):
-                args.append(self.model_runner.model_config.head_dim)
 
             self.prefill_wrapper.begin_forward(*args)
         else:
@@ -283,9 +275,6 @@ class ModelRunner:
             init_method=f"tcp://127.0.0.1:{self.nccl_port}",
         )
 
-        # A small all_reduce for warmup.
-        if self.tp_size > 1:
-            torch.distributed.all_reduce(torch.zeros(1).cuda())
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
 
         total_gpu_memory = get_available_gpu_memory(
@@ -304,7 +293,7 @@ class ModelRunner:
         logger.info(f"Rank {self.tp_rank}: load weight begin.")
 
         # Load weights
-        linear_method = None
+        quant_config = None
 
         quant_cfg = getattr(self.model_config.hf_config, "quantization_config", None)
         if quant_cfg is not None:
@@ -326,12 +315,11 @@ class ModelRunner:
 
             quant_config = quant_config_class.from_config(quant_cfg)
             logger.info(f"quant_config: {quant_config}")
-            linear_method = quant_config.get_linear_method()
 
-        with _set_default_torch_dtype(torch.float16):
+        with set_default_torch_dtype(torch.float16):
             with torch.device("cuda"):
                 model = model_class(
-                    config=self.model_config.hf_config, linear_method=linear_method
+                    config=self.model_config.hf_config, quant_config=quant_config
                 )
             model.load_weights(
                 self.model_config.path,
