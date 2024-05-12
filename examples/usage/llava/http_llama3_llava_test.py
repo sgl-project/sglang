@@ -6,10 +6,10 @@ Usage:
 # Endpoint Service CLI: 
 # python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --tokenizer-path lmms-lab/llama3-llava-next-8b-tokenizer --port=30000 --host="127.0.0.1" --tp-size=4
 
-python3 test_httpserver_llava_llama3.py
+python3 http_llama3_llava_test.py
 
 Output:
-"Stylish Feline: A Cat's Chic Adventure in a Pink Hoodie and Sunglasses"
+"Friends posing for a fun photo with a life-sized teddy bear, creating a playful and memorable moment."
 """
 
 import argparse

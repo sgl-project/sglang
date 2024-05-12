@@ -4,12 +4,12 @@ Usage:
 # Installing latest sglang.
 
 # Endpoint Service CLI: 
-# python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --tokenizer-path lmms-lab/llama3-llava-next-8b-tokenizer --port=30000 --host="127.0.0.1" --tp-size=4
+# python -m sglang.launch_server --model-path lmms-lab/llava-next-72b --tokenizer-path lmms-lab/llavanext-qwen-tokenizer --port=30000 --host="127.0.0.1" --tp-size=4
 
-python3 test_httpserver_llava_llama3.py
+python3 http_qwen_llava_test.py
 
 Output:
-"Stylish Feline: A Cat's Chic Adventure in a Pink Hoodie and Sunglasses"
+"Two children pose with a large teddy bear, one holding a smaller stuffed bear, in a room with an American flag and potted plants."
 """
 
 import argparse
@@ -59,7 +59,7 @@ async def test_concurrent(args):
                         "top_p": 1.0,
                         "presence_penalty": 2,
                         "frequency_penalty": 2,
-                        "stop": "<|eot_id|>",
+                        "stop": "<|im_end|>",
                     },
                 },
             )
@@ -84,7 +84,7 @@ def test_streaming(args):
             "top_p": 1.0,
             "presence_penalty": 2,
             "frequency_penalty": 2,
-            "stop": "<|eot_id|>",
+            "stop": "<|im_end|>",
         },
         "image_data": "https://farm4.staticflickr.com/3175/2653711032_804ff86d81_z.jpg",
         "stream": True,
