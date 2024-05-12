@@ -30,7 +30,7 @@ if __name__ == "__main__":
         response = requests.post(
             url + "/generate",
             json={
-                "text": f"{a}, ",
+                "input_ids": [[1,2,3], [1,2,3]],
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,
