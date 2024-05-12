@@ -1,5 +1,6 @@
 """Some Public API Definitions"""
 
+import os
 import re
 from typing import Callable, List, Optional, Union
 
@@ -31,6 +32,7 @@ def function(
 
 def Runtime(*args, **kwargs):
     # Avoid importing unnecessary dependency
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     from sglang.srt.server import Runtime
 
     return Runtime(*args, **kwargs)
