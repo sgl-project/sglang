@@ -1,6 +1,7 @@
 from typing import List, Optional, Union
 
 import numpy as np
+
 from sglang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template
 from sglang.lang.interpreter import StreamExecutor
@@ -35,8 +36,14 @@ class Anthropic(BaseBackend):
         else:
             messages = [{"role": "user", "content": s.text_}]
 
+        if messages and messages[0]["role"] == "system":
+            system = messages.pop(0)["content"]
+        else:
+            system = ""
+
         ret = anthropic.Anthropic().messages.create(
             model=self.model_name,
+            system=system,
             messages=messages,
             **sampling_params.to_anthropic_kwargs(),
         )
@@ -54,8 +61,14 @@ class Anthropic(BaseBackend):
         else:
             messages = [{"role": "user", "content": s.text_}]
 
+        if messages and messages[0]["role"] == "system":
+            system = messages.pop(0)["content"]
+        else:
+            system = ""
+
         with anthropic.Anthropic().messages.stream(
             model=self.model_name,
+            system=system,
             messages=messages,
             **sampling_params.to_anthropic_kwargs(),
         ) as stream:

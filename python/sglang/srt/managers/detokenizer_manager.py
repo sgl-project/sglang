@@ -3,6 +3,7 @@ import asyncio
 import uvloop
 import zmq
 import zmq.asyncio
+
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import BatchStrOut, BatchTokenIDOut
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -37,10 +38,13 @@ class DetokenizerManager:
             if isinstance(recv_obj, BatchTokenIDOut):
                 output_tokens = recv_obj.output_tokens
 
-                # TODO(lmzheng): handle skip_special_tokens per request
+                # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
                 output_strs = self.tokenizer.batch_decode(
                     output_tokens,
                     skip_special_tokens=recv_obj.skip_special_tokens[0],
+                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
+                        0
+                    ],
                 )
 
                 # Trim stop str

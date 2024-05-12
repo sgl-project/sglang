@@ -1,6 +1,7 @@
 """The interpreter that executes SGL programs"""
 
 import asyncio
+import contextvars
 import multiprocessing
 import queue
 import threading
@@ -10,6 +11,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import tqdm
+
 from sglang.global_config import global_config
 from sglang.lang.ir import (
     SglCommitLazy,
@@ -217,7 +219,13 @@ class StreamExecutor:
         self.use_thread = use_thread
         if self.use_thread:
             self.queue = queue.Queue()
-            self.worker = threading.Thread(target=self._thread_worker_func)
+
+            def _run_worker_in_context():
+                self._thread_worker_func()
+
+            self.worker = threading.Thread(
+                target=contextvars.copy_context().run, args=(_run_worker_in_context,)
+            )
             self.worker.start()
 
         # For streaming
@@ -248,17 +256,24 @@ class StreamExecutor:
     def set_var(self, name, value):
         self.variables[name] = value
 
-    def get_meta_info(self, name):
+    def get_meta_info(self, name, timeout=None):
         if name in self.variable_event:
-            self.variable_event[name].wait()
+            got = self.variable_event[name].wait(timeout)
+            if not got:
+                raise TimeoutError(f"Timeout while waiting for event '{name}'")
         ret = self.meta_info.get(name, None)
         return ret
 
-    def fork(self, number: int, position_ids_offset: Optional[List[int]] = None):
-        self.submit(SglCommitLazy())
-        self.sync()
+    def fork(
+        self,
+        size: int = 1,
+        position_ids_offset: Optional[List[int]] = None,
+    ):
+        if size > 1:
+            self.submit(SglCommitLazy())
 
-        number = int(number)
+        self.sync()
+        size = int(size)
 
         exes = [
             StreamExecutor(
@@ -268,14 +283,15 @@ class StreamExecutor:
                 self.chat_template,
                 self.stream,
             )
-            for _ in range(number)
+            for _ in range(size)
         ]
-        for i in range(number):
+        for i in range(size):
             exes[i].variables = dict(self.variables)
             exes[i].text_ = str(self.text_)
             exes[i].messages_ = list(self.messages_)
             exes[i].cur_role = self.cur_role
             exes[i].fork_start_text_pos = len(self.text_)
+            exes[i].images_ = list(self.images_)
 
         return exes
 
@@ -454,15 +470,19 @@ class StreamExecutor:
             self.stream_var_event[name].set()
 
     def _execute_select(self, expr: SglSelect):
-        decision, normalized_prompt_logprob, prompt_logprob = self.backend.select(
-            self, expr.choices, expr.temperature
-        )
+        (
+            decision,
+            normalized_prompt_logprobs,
+            prefill_token_logprobs,
+            decode_token_logprobs,
+        ) = self.backend.select(self, expr.choices, expr.temperature)
         if expr.name is not None:
             name = expr.name
             self.variables[name] = decision
             self.meta_info[name] = {
-                "normalized_prompt_logprob": normalized_prompt_logprob,
-                "prompt_logprob": prompt_logprob,
+                "normalized_prompt_logprobs": normalized_prompt_logprobs,
+                "prefill_token_logprobs": prefill_token_logprobs,
+                "decode_token_logprobs": decode_token_logprobs,
             }
             self.variable_event[name].set()
         self.text_ += decision
@@ -634,8 +654,12 @@ class ProgramState:
         yield
         self.stream_executor.submit(SglVarScopeEnd(name))
 
-    def fork(self, number: int = 1, position_ids_offset: Optional[List[int]] = None):
-        stream_executors = self.stream_executor.fork(number, position_ids_offset)
+    def fork(
+        self,
+        size: int = 1,
+        position_ids_offset: Optional[List[int]] = None,
+    ):
+        stream_executors = self.stream_executor.fork(size, position_ids_offset)
         states = [ProgramState(x) for x in stream_executors]
         state_group = ProgramStateGroup(states, self)
         return state_group

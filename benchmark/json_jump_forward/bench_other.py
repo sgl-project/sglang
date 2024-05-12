@@ -5,12 +5,10 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import guidance
-from sglang.test.test_utils import (
-    add_common_other_args_and_parse,
-    call_generate_outlines,
-)
-from sglang.utils import dump_state_text, read_jsonl
 from tqdm import tqdm
+
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
+from sglang.utils import dump_state_text, read_jsonl
 
 # there are some FSM bugs with json regex converted from pydantic model
 # here use a string regex instead
@@ -84,6 +82,29 @@ def character_maker(lm, name):
     return lm
 
 
+async def call_generate_lmql(
+    prompt, temperature, max_tokens, regex, max_len=4096, model=None, **kwargs
+):
+    assert model is not None
+    import lmql
+
+    @lmql.query(model=model)
+    async def program(question, max_tokens, regex):
+        '''lmql
+        """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < max_tokens and REGEX(ANSWER, regex)
+        return ANSWER
+        '''
+
+    return await program(
+        question=prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        max_len=max_len,
+        regex=regex,
+        **kwargs,
+    )
+
+
 @guidance
 def city_maker(lm, document):
     regex_str_no_quote = r"[\w\d\s]+"
@@ -118,38 +139,68 @@ def bench_character(args):
     states = [None] * len(arguments)
 
     # Select backend
-    if args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_outlines, url=url, temperature=0)
+    if args.backend == "outlines":
+        call_generate = partial(get_call_generate(args), temperature=0)
 
-        def func(i):
-            states[i] = character_gen(**arguments[i], generate=generate)
+        def get_one_answer(i):
+            states[i] = character_gen(**arguments[i], generate=call_generate)
 
-        get_one_answer = func
     elif args.backend == "guidance":
         model = guidance.models.LlamaCpp(
-            args.llama_cpp_model_path,
+            args.model_path,
             n_gpu_layers=-1,
-            n_ctx=4096,
+            n_ctx=args.n_ctx,
         )
 
-        def func(i):
+        def get_one_answer(i):
             lm = model + character_maker(**arguments[i])
             states[i] = lm
 
-        get_one_answer = func
+    elif args.backend == "lmql":
+        import asyncio
+
+        import lmql
+
+        model = lmql.model(args.model_path, endpoint=f"{args.host}:{args.port}")
+        call_generate = partial(
+            call_generate_lmql,
+            model=model,
+            max_tokens=256,
+            regex=character_regex,
+        )
+
+        async def get_one_answer_async(i):
+            states[i] = await call_generate(prompt=arguments[i]["name"], temperature=0)
+
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
     tic = time.time()
-    if args.parallel == 1:
-        for i in tqdm(range(len(arguments))):
-            get_one_answer(i)
+
+    if args.backend != "lmql":
+        if args.parallel == 1:
+            for i in tqdm(range(len(arguments))):
+                get_one_answer(i)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                rets = list(
+                    tqdm(
+                        executor.map(get_one_answer, list(range(len(arguments)))),
+                        total=len(arguments),
+                    )
+                )
+                for _ in rets:
+                    pass
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            rets = executor.map(get_one_answer, list(range(len(arguments))))
-            for _ in rets:
-                pass
+        batches = []
+        for i in range(0, len(arguments), args.parallel):
+            batches.append(list(range(i, min(i + args.parallel, len(arguments)))))
+        loop = asyncio.get_event_loop()
+
+        for bt in tqdm(batches):
+            loop.run_until_complete(
+                asyncio.gather(*[get_one_answer_async(i) for i in bt])
+            )
 
     latency = time.time() - tic
 
@@ -165,26 +216,23 @@ def bench_city_doc(args):
     states = [None] * len(arguments)
 
     # Select backend
-    if args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_outlines, url=url, temperature=0)
+    if args.backend == "outlines":
+        call_generate = partial(get_call_generate(args), temperature=0)
 
-        def func(i):
-            states[i] = city_gen(**arguments[i], generate=generate)
+        def get_one_answer(i):
+            states[i] = city_gen(**arguments[i], generate=call_generate)
 
-        get_one_answer = func
     elif args.backend == "guidance":
         model = guidance.models.LlamaCpp(
-            args.llama_cpp_model_path,
+            args.model_path,
             n_gpu_layers=-1,
-            n_ctx=4096,
+            n_ctx=args.n_ctx,
         )
 
-        def func(i):
+        def get_one_answer(i):
             lm = model + city_maker(**arguments[i])
             states[i] = lm
 
-        get_one_answer = func
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
@@ -235,11 +283,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-jsons", type=int, default=50)
     parser.add_argument(
         "--mode", type=str, default="character", choices=["character", "city"]
-    )
-    parser.add_argument(
-        "--llama-cpp-model-path",
-        type=str,
-        default="/home/ubuntu/model_weights/Llama-2-7b-chat-hf/ggml-model-f16.gguf",
     )
     args = add_common_other_args_and_parse(parser)
     main(args)

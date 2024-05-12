@@ -1,17 +1,16 @@
 import argparse
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import json
-from functools import partial
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
 import tiktoken
 from tqdm import tqdm
-from sglang.test.test_utils import add_common_other_args_and_parse, call_generate_lightllm, call_generate_vllm, call_generate_srt_raw
 
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 
 choices = ["A", "B", "C", "D"]
 
@@ -25,18 +24,22 @@ def format_subject(subject):
         s += " " + entry
     return s
 
+
 def format_example(df, idx, include_answer=True):
     prompt = df.iloc[idx, 0]
     k = df.shape[1] - 2
     for j in range(k):
-        prompt += "\n{}. {}".format(choices[j], df.iloc[idx, j+1])
+        prompt += "\n{}. {}".format(choices[j], df.iloc[idx, j + 1])
     prompt += "\nAnswer:"
     if include_answer:
         prompt += " {}\n\n".format(df.iloc[idx, k + 1])
     return prompt
 
+
 def gen_prompt(train_df, subject, k=-1):
-    prompt = "The following are multiple choice questions (with answers) about{}.\n\n".format(format_subject(subject))
+    prompt = "The following are multiple choice questions (with answers) about{}.\n\n".format(
+        format_subject(subject)
+    )
     if k == -1:
         k = train_df.shape[0]
     for i in range(k):
@@ -44,10 +47,7 @@ def gen_prompt(train_df, subject, k=-1):
     return prompt
 
 
-model_initialized = None
-
-
-def evaluate(args, subject, dev_df, test_df):
+def evaluate(args, subject, dev_df, test_df, call_generate):
     prompts = []
     labels = []
 
@@ -63,64 +63,17 @@ def evaluate(args, subject, dev_df, test_df):
         prompt = train_prompt + prompt_end
         prompts.append(prompt)
 
-        label = test_df.iloc[i, test_df.shape[1]-1]
+        label = test_df.iloc[i, test_df.shape[1] - 1]
         labels.append(label)
 
     preds = [None] * len(prompts)
     max_tokens = 1
 
-    # Select backend
-    global model_initialized
-
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_lightllm, url=url, stop=None)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_vllm, url=url, stop=None)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        call_generate = partial(call_generate_srt_raw, url=url, stop=None)
-    elif args.backend == "guidance":
-        from guidance import models, gen
-
-        if model_initialized is None:
-            model = models.LlamaCpp("/home/ubuntu/model_weights/Llama-2-7b-chat.gguf", n_gpu_layers=-1, n_ctx=4096)
-            model_initialized = model
-        else:
-            model = model_initialized
-
-        def call_generate(prompt, temperature, max_tokens):
-            out = model + prompt + gen(name="answer",
-                max_tokens=max_tokens, temperature=0)
-            return out["answer"]
-
-        # warmup
-        call_generate("Hello,", temperature=1.0, max_tokens=8)
-
-    elif args.backend == "lmql":
-        import lmql
-        model = lmql.model("meta-llama/Llama-2-7b-chat-hf",
-           endpoint=f"{args.host}:{args.port}")
-
-        @lmql.query(model=model)
-        async def program(question):
-            '''lmql
-            """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < 2
-            return ANSWER
-            '''
-
-        async def call_generate(prompt, temperature, max_tokens):
-            return await program(question=prompt, temperature=temperature)
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
-
     # Run requests
     if args.backend != "lmql":
         # Use thread pool
         def get_one_answer(i):
-            pred = call_generate(prompts[i], temperature=0,
-                                 max_tokens=max_tokens)
+            pred = call_generate(prompts[i], temperature=0, max_tokens=max_tokens)
             preds[i] = pred.strip()[0]
 
         tic = time.time()
@@ -135,12 +88,11 @@ def evaluate(args, subject, dev_df, test_df):
         async def batched_call(batch_size):
             for i in range(0, len(prompts), batch_size):
                 tasks = []
-                for p in prompts[i:i+batch_size]:
-                    tasks.append(call_generate(p,
-                        temperature=0, max_tokens=max_tokens))
+                for p in prompts[i : i + batch_size]:
+                    tasks.append(call_generate(p, temperature=0, max_tokens=max_tokens))
                 rets = await asyncio.gather(*tasks)
                 for j in range(len(rets)):
-                    preds[i+j] = rets[j].strip()[0]
+                    preds[i + j] = rets[j].strip()[0]
 
         tic = time.time()
         asyncio.run(batched_call(batch_size=args.parallel))
@@ -151,24 +103,40 @@ def evaluate(args, subject, dev_df, test_df):
     acc = np.mean(cors)
     cors = np.array(cors)
 
-    print("Average accuracy {:.3f}, latency {:.2f}, #q: {} - {}".format(
-        acc, latency, len(prompts), subject))
+    print(
+        "Average accuracy {:.3f}, latency {:.2f}, #q: {} - {}".format(
+            acc, latency, len(prompts), subject
+        )
+    )
 
     return cors, acc, latency
 
 
 def main(args):
-    subjects = sorted([f.split("_test.csv")[0] for f in os.listdir(os.path.join(args.data_dir, "test")) if "_test.csv" in f])
+    subjects = sorted(
+        [
+            f.split("_test.csv")[0]
+            for f in os.listdir(os.path.join(args.data_dir, "test"))
+            if "_test.csv" in f
+        ]
+    )
 
     all_cors = []
     all_latencies = []
     num_requests = 0
 
-    for subject in tqdm(subjects[:args.nsub]):
-        dev_df = pd.read_csv(os.path.join(args.data_dir, "dev", subject + "_dev.csv"), header=None)[:args.ntrain]
-        test_df = pd.read_csv(os.path.join(args.data_dir, "test", subject + "_test.csv"), header=None)
+    # Select backend
+    call_generate = get_call_generate(args)
 
-        cors, acc, latency = evaluate(args, subject, dev_df, test_df)
+    for subject in tqdm(subjects[: args.nsub]):
+        dev_df = pd.read_csv(
+            os.path.join(args.data_dir, "dev", subject + "_dev.csv"), header=None
+        )[: args.ntrain]
+        test_df = pd.read_csv(
+            os.path.join(args.data_dir, "test", subject + "_test.csv"), header=None
+        )
+
+        cors, acc, latency = evaluate(args, subject, dev_df, test_df, call_generate)
         all_cors.append(cors)
         all_latencies.append(latency)
         num_requests += len(test_df)
@@ -191,7 +159,7 @@ def main(args):
             "other": {
                 "nsub": args.nsub,
                 "parallel": args.parallel,
-            }
+            },
         }
         fout.write(json.dumps(value) + "\n")
 

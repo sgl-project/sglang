@@ -5,15 +5,18 @@ import re
 import time
 
 import numpy as np
-from sglang.test.test_utils import add_common_sglang_args_and_parse, select_sglang_backend
-from sglang.utils import read_jsonl, dump_state_text
 
+from sglang.test.test_utils import (
+    add_common_sglang_args_and_parse,
+    select_sglang_backend,
+)
+from sglang.utils import dump_state_text, read_jsonl
 
 INVALID = -9999999
 
 
 def get_one_example(lines, i, include_answer):
-    ret = "Question: " + lines[i]["question"] + "\nAnswer:" 
+    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
     if include_answer:
         ret += " " + lines[i]["answer"]
     return ret
@@ -28,7 +31,7 @@ def get_few_shot_examples(lines, k):
 
 def get_answer_value(answer_str):
     answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r'\d+', answer_str)
+    numbers = re.findall(r"\d+", answer_str)
     if len(numbers) < 1:
         return INVALID
     try:
@@ -46,7 +49,7 @@ def main(args):
 
     questions = []
     labels = []
-    for i in range(len(lines[:args.num_questions])):
+    for i in range(len(lines[: args.num_questions])):
         questions.append(get_one_example(lines, i, False))
         labels.append(get_answer_value(lines[i]["answer"]))
     assert all(l != INVALID for l in labels)
@@ -73,7 +76,12 @@ def main(args):
     # Run requests
     tic = time.time()
     states = few_shot_gsm8k.run_batch(
-        arguments, temperature=0, backend=backend, num_threads=args.parallel)
+        arguments,
+        temperature=0,
+        backend=backend,
+        num_threads=args.parallel,
+        progress_bar=True,
+    )
     latency = time.time() - tic
 
     preds = []
@@ -101,7 +109,7 @@ def main(args):
             "other": {
                 "num_questions": args.num_questions,
                 "parallel": args.parallel,
-            }
+            },
         }
         fout.write(json.dumps(value) + "\n")
 

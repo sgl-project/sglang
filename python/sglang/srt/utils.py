@@ -5,54 +5,67 @@ import socket
 import sys
 import time
 import traceback
+from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
 from typing import List, Optional
 
 import numpy as np
+import pydantic
 import requests
 import torch
-import torch.distributed as dist
+from packaging import version as pkg_version
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
-is_show_cost_time = False
-
-
-def mark_cost_time(func_name):
-    def inner_func(func):
-        def time_func(*args, **kwargs):
-            if dist.get_rank() in [0, 1] and is_show_cost_time:
-                torch.cuda.synchronize()
-                start_time = time.time()
-                ans = func(*args, **kwargs)
-                torch.cuda.synchronize()
-                print(func_name, "cost time:", (time.time() - start_time) * 1000)
-                return ans
-            else:
-                torch.cuda.synchronize()
-                ans = func(*args, **kwargs)
-                torch.cuda.synchronize()
-                return ans
-
-        return time_func
-
-    return inner_func
+show_time_cost = False
+time_infos = {}
 
 
-time_mark = {}
+def enable_show_time_cost():
+    global show_time_cost
+    show_time_cost = True
 
 
-def mark_start(key):
+class TimeInfo:
+    def __init__(self, name, interval=0.1, color=0, indent=0):
+        self.name = name
+        self.interval = interval
+        self.color = color
+        self.indent = indent
+
+        self.acc_time = 0
+        self.last_acc_time = 0
+
+    def check(self):
+        if self.acc_time - self.last_acc_time > self.interval:
+            self.last_acc_time = self.acc_time
+            return True
+        return False
+
+    def pretty_print(self):
+        print(f"\x1b[{self.color}m", end="")
+        print("-" * self.indent * 2, end="")
+        print(f"{self.name}: {self.acc_time:.3f}s\x1b[0m")
+
+
+def mark_start(name, interval=0.1, color=0, indent=0):
+    global time_infos, show_time_cost
+    if not show_time_cost:
+        return
     torch.cuda.synchronize()
-    global time_mark
-    time_mark[key] = time.time()
-    return
+    if time_infos.get(name, None) is None:
+        time_infos[name] = TimeInfo(name, interval, color, indent)
+    time_infos[name].acc_time -= time.time()
 
 
-def mark_end(key, print_min_cost=0.0):
+def mark_end(name):
+    global time_infos, show_time_cost
+    if not show_time_cost:
+        return
     torch.cuda.synchronize()
-    global time_mark
-    cost_time = (time.time() - time_mark[key]) * 1000
-    if cost_time > print_min_cost:
-        print(f"cost {key}:", cost_time)
+    time_infos[name].acc_time += time.time()
+    if time_infos[name].check():
+        time_infos[name].pretty_print()
 
 
 def calculate_time(show=False, min_cost_ms=0.0):
@@ -110,7 +123,7 @@ def check_port(port):
             return False
 
 
-def handle_port_init(
+def allocate_init_ports(
     port: Optional[int] = None,
     additional_ports: Optional[List[int]] = None,
     tp_size: int = 1,
@@ -149,8 +162,6 @@ def get_exception_traceback():
 
 
 def get_int_token_logit_bias(tokenizer, vocab_size):
-    from transformers import LlamaTokenizer, LlamaTokenizerFast
-
     # a bug when model's vocab size > tokenizer.vocab_size
     vocab_size = tokenizer.vocab_size
     logit_bias = np.zeros(vocab_size, dtype=np.float32)
@@ -259,3 +270,44 @@ def load_image(image_file):
         image = Image.open(BytesIO(base64.b64decode(image_file)))
 
     return image
+
+
+def assert_pkg_version(pkg: str, min_version: str):
+    try:
+        installed_version = version(pkg)
+        if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
+            raise Exception(
+                f"{pkg} is installed with version {installed_version} which "
+                f"is less than the minimum required version {min_version}"
+            )
+    except PackageNotFoundError:
+        raise Exception(f"{pkg} with minimum required version {min_version} is not installed")
+
+
+API_KEY_HEADER_NAME = "X-API-Key"
+
+
+class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, api_key: str):
+        super().__init__(app)
+        self.api_key = api_key
+
+    async def dispatch(self, request, call_next):
+        # extract API key from the request headers
+        api_key_header = request.headers.get(API_KEY_HEADER_NAME)
+        if not api_key_header or api_key_header != self.api_key:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Invalid API Key"},
+            )
+        response = await call_next(request)
+        return response
+
+# FIXME: Remove this once we drop support for pydantic 1.x
+IS_PYDANTIC_1 = int(pydantic.VERSION.split(".")[0]) == 1
+
+
+def jsonify_pydantic_model(obj: BaseModel):
+    if IS_PYDANTIC_1:
+        return obj.json(ensure_ascii=False)
+    return obj.model_dump_json()

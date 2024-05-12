@@ -6,7 +6,6 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 from huggingface_hub import snapshot_download
-from sglang.srt.utils import is_multimodal_model
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -14,6 +13,8 @@ from transformers import (
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
+
+from sglang.srt.utils import is_multimodal_model
 
 
 def download_from_hf(model_path: str):

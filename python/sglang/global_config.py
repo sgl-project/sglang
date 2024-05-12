@@ -12,6 +12,7 @@ class GlobalConfig:
 
         # Output configs
         self.skip_special_tokens_in_output = True
+        self.spaces_between_special_tokens_in_out = True
 
         # Optimization configs
         self.eager_fill_image = False

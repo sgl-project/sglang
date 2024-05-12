@@ -1,22 +1,20 @@
 import argparse
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 from tqdm import tqdm
-import numpy as np
-from sglang.test.test_utils import add_common_other_args_and_parse, call_generate_lightllm, call_generate_vllm, call_generate_srt_raw
-from sglang.utils import read_jsonl, dump_state_text
 
+from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
+from sglang.utils import dump_state_text, read_jsonl
 
 number = 5
 
 
 def expand_tip(topic, tip, generate):
     s = (
-"""Please expand a tip for a topic into a detailed paragraph.
+        """Please expand a tip for a topic into a detailed paragraph.
 
 Topic: staying healthy
 Tip: Regular Exercise
@@ -30,14 +28,23 @@ Topic: writing a blog post
 Tip: structure your content effectively
 Paragraph: A well-structured post is easier to read and more enjoyable. Start with an engaging introduction that hooks the reader and clearly states the purpose of your post. Use headings and subheadings to break up the text and guide readers through your content. Bullet points and numbered lists can make information more digestible. Ensure each paragraph flows logically into the next, and conclude with a summary or call-to-action that encourages reader engagement.
 
-Topic: """ + topic + "\nTip: " + tip + "\nParagraph:")
+Topic: """
+        + topic
+        + "\nTip: "
+        + tip
+        + "\nParagraph:"
+    )
     return generate(s, max_tokens=128, stop=["\n\n"])
 
 
 def suggest_tips(topic, generate):
     s = "Please act as a helpful assistant. Your job is to provide users with useful tips on a specific topic.\n"
     s += "USER: Give some tips for " + topic + ".\n"
-    s += ("ASSISTANT: Okay. Here are " + str(number) + " concise tips, each under 8 words:\n")
+    s += (
+        "ASSISTANT: Okay. Here are "
+        + str(number)
+        + " concise tips, each under 8 words:\n"
+    )
 
     tips = []
     for i in range(1, 1 + number):
@@ -49,50 +56,52 @@ def suggest_tips(topic, generate):
     paragraphs = [expand_tip(topic, tip, generate=generate) for tip in tips]
 
     for i in range(1, 1 + number):
-        s += f"Tip {i}:" + paragraphs[i-1] + "\n"
+        s += f"Tip {i}:" + paragraphs[i - 1] + "\n"
     return s
 
 
 def main(args):
-    lines = read_jsonl(args.data_path)[:args.num_questions]
+    lines = read_jsonl(args.data_path)[: args.num_questions]
     states = [None] * len(lines)
 
     # Select backend
-    if args.backend == "lightllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_lightllm, url=url, temperature=0)
-    elif args.backend == "vllm":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_vllm, url=url, temperature=0)
-    elif args.backend == "srt-raw":
-        url = f"{args.host}:{args.port}/generate"
-        generate = partial(call_generate_srt_raw, url=url, temperature=0)
-    elif args.backend == "guidance":
-        from guidance import models, gen
-
-        model = models.LlamaCpp("/home/ubuntu/model_weights/Llama-2-7b-chat.gguf", n_gpu_layers=-1, n_ctx=4096)
-
-        def generate(prompt, max_tokens, stop):
-            out = model + prompt + gen(name="answer",
-                max_tokens=max_tokens, temperature=0, stop=stop)
-            return out["answer"]
-
-        # warmup
-        generate("Hello!", max_tokens=8, stop=None)
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    call_generate = partial(get_call_generate(args), temperature=0)
 
     # Run requests
-    def get_one_answer(i):
-        states[i] = suggest_tips(lines[i]["topic"], generate)
-
     tic = time.time()
-    if args.parallel == 1:
-        for i in tqdm(range(len(lines))):
-            get_one_answer(i)
+    if args.backend != "lmql":
+
+        def get_one_answer(i):
+            states[i] = suggest_tips(lines[i]["topic"], call_generate)
+
+        if args.parallel == 1:
+            for i in tqdm(range(len(lines))):
+                get_one_answer(i)
+        else:
+            with ThreadPoolExecutor(args.parallel) as executor:
+                list(
+                    tqdm(
+                        executor.map(get_one_answer, list(range(len(lines)))),
+                        total=len(lines),
+                    )
+                )
+
     else:
-        with ThreadPoolExecutor(args.parallel) as executor:
-            executor.map(get_one_answer, list(range(len(lines))))
+        import asyncio
+
+        from lmql_funcs import suggest_tips_async
+
+        async def get_one_answer_async(i):
+            states[i] = await suggest_tips_async(lines[i]["topic"], call_generate)
+
+        batches = []
+        for i in range(0, len(lines), args.parallel):
+            batches.append(list(range(i, min(i + args.parallel, len(lines)))))
+        loop = asyncio.get_event_loop()
+        for batch in tqdm(batches):
+            loop.run_until_complete(
+                asyncio.gather(*[get_one_answer_async(i) for i in batch])
+            )
     latency = time.time() - tic
 
     # Compute accuracy
@@ -111,7 +120,7 @@ def main(args):
             "other": {
                 "num_questions": args.num_questions,
                 "parallel": args.parallel,
-            }
+            },
         }
         fout.write(json.dumps(value) + "\n")
 

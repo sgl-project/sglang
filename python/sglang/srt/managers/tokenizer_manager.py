@@ -10,6 +10,7 @@ import transformers
 import uvloop
 import zmq
 import zmq.asyncio
+
 from sglang.srt.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -36,7 +37,6 @@ class ReqState:
     out_list: List
     finished: bool
     event: asyncio.Event
-    lock: asyncio.Lock
 
 
 global global_processor
@@ -174,13 +174,13 @@ class TokenizerManager:
                 sampling_params=sampling_params,
                 return_logprob=obj.return_logprob,
                 logprob_start_len=obj.logprob_start_len,
+                top_logprobs_num=obj.top_logprobs_num,
                 stream=obj.stream,
             )
             self.send_to_router.send_pyobj(tokenized_obj)
 
-            lock = asyncio.Lock()
             event = asyncio.Event()
-            state = ReqState([], False, event, lock)
+            state = ReqState([], False, event)
             self.rid_to_state[rid] = state
 
             while True:
@@ -217,13 +217,13 @@ class TokenizerManager:
                     sampling_params=sampling_params,
                     return_logprob=obj.return_logprob[i],
                     logprob_start_len=obj.logprob_start_len[i],
+                    top_logprobs_num=obj.top_logprobs_num[i],
                     stream=obj.stream,
                 )
                 self.send_to_router.send_pyobj(tokenized_obj)
 
-                lock = asyncio.Lock()
                 event = asyncio.Event()
-                state = ReqState([], False, event, lock)
+                state = ReqState([], False, event)
                 self.rid_to_state[rid] = state
 
             output_list = []

@@ -22,7 +22,7 @@ python3 bench_other.py --backend vllm --num-questions 64
 
 ### Benchmark guidance
 ```
-python3 bench_other.py --backend guidance --num-questions 32 --parallel 1
+python3 bench_other.py --backend guidance --num-questions 32 --parallel 1 --n-ctx 11000 --model-path path/to/code-llama/gguf
 ```
 
 
