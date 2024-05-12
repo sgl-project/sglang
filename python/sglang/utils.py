@@ -6,10 +6,11 @@ import threading
 import urllib.request
 from io import BytesIO
 from json import dumps
-from tenacity import RetryCallState, retry, stop_after_attempt, wait_fixed, retry_if_result
+from tenacity import RetryCallState, retry, wait_fixed
 import requests
 import socket
 from urllib.parse import urlparse, error
+from urllib import error
 from memoization import cached
 
 
