@@ -16,19 +16,19 @@ from sglang.srt.models.llama2 import LlamaForCausalLM
 from torch import nn
 from transformers import CLIPVisionModel, LlamaConfig, LlavaConfig
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
-from vllm.model_executor.layers.linear import LinearMethodBase
-from vllm.model_executor.weight_utils import (
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig)
+from sglang.srt.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
-
 
 
 class LlavaVidForCausalLM(nn.Module):
     def __init__(
         self,
         config: LlavaConfig,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -40,7 +40,7 @@ class LlavaVidForCausalLM(nn.Module):
         self.resampler = nn.AvgPool2d(
             kernel_size=self.mm_spatial_pool_stride, stride=self.mm_spatial_pool_stride
         )
-        self.language_model = LlamaForCausalLM(config, linear_method)
+        self.language_model = LlamaForCausalLM(config, quant_config=quant_config)
         self.num_frames = getattr(self.config, "num_frames", 16)
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(

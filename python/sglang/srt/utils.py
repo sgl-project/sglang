@@ -13,16 +13,13 @@ import numpy as np
 import pydantic
 import requests
 import torch
-<<<<<<< HEAD
 from packaging import version as pkg_version
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 show_time_cost = False
 time_infos = {}
-=======
 import torch.distributed as dist
->>>>>>> ebd7603 (Fix import order and remove unused code)
 from PIL import Image
 
 

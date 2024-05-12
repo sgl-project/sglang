@@ -510,7 +510,7 @@ def load_chat_template_for_openai_api(chat_template_arg):
         chat_template_name = chat_template_arg
 
 
-def launch_server(server_args: ServerArgs, pipe_finish_writer):
+def launch_server(server_args: ServerArgs, pipe_finish_writer,model_overide_args=None):
     global tokenizer_manager
 
     # Set global environments
@@ -631,6 +631,7 @@ class Runtime:
     def __init__(
         self,
         log_evel="error",
+        model_overide_args: Optional[dict] = None,
         *args,
         **kwargs,
     ):

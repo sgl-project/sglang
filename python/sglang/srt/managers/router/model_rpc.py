@@ -36,8 +36,6 @@ from sglang.srt.utils import (
     set_random_seed,
 )
 
-from typing import 
-
 
 logger = logging.getLogger("model_rpc")
 logging.getLogger("vllm.utils").setLevel(logging.WARN)

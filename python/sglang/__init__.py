@@ -13,6 +13,7 @@ from sglang.api import (
     gen_string,
     get_server_args,
     image,
+    video,
     select,
     set_default_backend,
     system,
@@ -46,6 +47,7 @@ __all__ = [
     "gen_int",
     "gen_string",
     "image",
+    "video"
     "select",
     "system",
     "user",

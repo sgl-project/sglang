@@ -22,14 +22,6 @@ from sglang.srt.mm_utils import (
     unpad_image_shape,
 )
 from sglang.srt.models.llama2 import LlamaForCausalLM
-from torch import nn
-from transformers import CLIPVisionModel, LlamaConfig, LlavaConfig
-from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
-from vllm.model_executor.layers.linear import LinearMethodBase
-from vllm.model_executor.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
 
 
 class LlavaLlamaForCausalLM(nn.Module):
@@ -44,7 +36,7 @@ class LlavaLlamaForCausalLM(nn.Module):
         self.config.vision_config.hidden_size = config.mm_hidden_size
         self.config.text_config.hidden_size = config.hidden_size
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = LlamaForCausalLM(config, linear_method)
+        self.language_model = LlamaForCausalLM(config, quant_config=quant_config)
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
