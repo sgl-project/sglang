@@ -147,15 +147,14 @@ class TokenizerManager:
         if self.to_create_loop:
             await self.create_handle_loop()
 
-        is_single = obj.is_single()
+        is_single = obj.is_single
         if is_single:
             rid = obj.rid
-            
+
             if obj.input_ids is None:
-                input_ids = obj.input_ids = self.tokenizer.encode(obj.text)
+                input_ids = self.tokenizer.encode(obj.text)
             else:
                 input_ids = obj.input_ids
-                obj.text = self.tokenizer.decode(input_ids, skip_special_tokens=True)
 
             sampling_params = SamplingParams(**obj.sampling_params)
             if sampling_params.max_new_tokens != 0:
@@ -209,22 +208,22 @@ class TokenizerManager:
                 event.clear()
         else:
             assert obj.stream is False
-            
+
             if obj.text is not None:
                 bs = len(obj.text)
-                _input_ids = []
             else:
                 bs = len(obj.input_ids)
-                _text = []
 
             for i in range(bs):
                 rid = obj.rid[i]
+
                 if obj.input_ids is None:
+                    input_text = obj.text[i]
                     input_ids = self.tokenizer.encode(obj.text[i])
-                    _input_ids.append(input_ids)
                 else:
+                    input_text = None
                     input_ids = obj.input_ids[i]
-                    _text.append(self.tokenizer.decode(input_ids, skip_special_tokens=True))
+
                 sampling_params = SamplingParams(**obj.sampling_params[i])
                 if sampling_params.max_new_tokens != 0:
                     sampling_params.normalize(self.tokenizer)
@@ -237,7 +236,7 @@ class TokenizerManager:
                     )
                 tokenized_obj = TokenizedGenerateReqInput(
                     rid=rid,
-                    input_text=obj.text[i],
+                    input_text=input_text,
                     input_ids=input_ids,
                     pixel_values=pixel_values,
                     image_hash=image_hash,
@@ -253,13 +252,6 @@ class TokenizerManager:
                 event = asyncio.Event()
                 state = ReqState([], False, event)
                 self.rid_to_state[rid] = state
-
-            if obj.input_ids is None:
-                obj.input_ids = _input_ids
-            elif obj.text is None:
-                obj.text = _text
-            else:
-                raise ValueError("Either text or input_ids should be None, not both; possibly a corrupted object.")
 
             output_list = []
             for i in range(bs):

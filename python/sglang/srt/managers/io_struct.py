@@ -9,7 +9,7 @@ from sglang.srt.sampling_params import SamplingParams
 class GenerateReqInput:
     # The input prompt
     text: Optional[Union[List[str], str]] = None
-    # The tokens for text; one can either specify text or input_ids
+    # The token ids for text; one can either specify text or input_ids
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The image input
     image_data: Optional[Union[List[str], str]] = None
@@ -35,13 +35,12 @@ class GenerateReqInput:
             assert self.input_ids is not None, "Either text or input_ids should be provided"
         else:
             assert self.input_ids is None, "Either text or input_ids should be provided"
-        
+
         if self.text is not None:
             is_single = isinstance(self.text, str)
         else:
             is_single = isinstance(self.input_ids[0], int)
-        
-        self._is_single = is_single
+        self.is_single = is_single
 
         if is_single:
             if self.sampling_params is None:
@@ -87,8 +86,6 @@ class GenerateReqInput:
             elif not isinstance(self.top_logprobs_num, list):
                 self.top_logprobs_num = [self.top_logprobs_num] * num
 
-    def is_single(self):
-        return self._is_single
 
 @dataclass
 class TokenizedGenerateReqInput:
