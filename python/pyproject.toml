@@ -20,7 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 srt = ["aiohttp", "fastapi", "psutil", "rpyc", "torch", "uvloop", "uvicorn",
-       "zmq", "vllm>=0.4.2", "interegular", "pydantic", "pillow", "outlines>=0.0.27", "flashinfer>=0.0.4", "packaging"]
+       "zmq", "vllm>=0.4.2", "interegular", "pydantic", "pillow", "outlines>=0.0.27", "packaging"]
 openai = ["openai>=1.0", "numpy", "tiktoken"]
 anthropic = ["anthropic>=0.20.0", "numpy"]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]"]

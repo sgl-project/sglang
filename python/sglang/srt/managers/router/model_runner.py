@@ -110,12 +110,12 @@ class InputMetadata:
         self.kv_last_page_len = torch.ones(
             (self.batch_size,), dtype=torch.int32, device="cuda"
         )
-        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
-        seq_lens_cpu = self.seq_lens.cpu().numpy()
+        req_pool_indices_cpu = self.req_pool_indices.cpu().tolist()
+        seq_lens_cpu = self.seq_lens.tolist()
         self.kv_indices = torch.cat(
             [
                 self.req_to_token_pool.req_to_token[
-                    req_pool_indices_cpu[i]: seq_lens_cpu[i]
+                    req_pool_indices_cpu[i], : seq_lens_cpu[i]
                 ]
                 for i in range(self.batch_size)
             ],
