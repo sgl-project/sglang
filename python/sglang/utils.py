@@ -118,7 +118,7 @@ def _should_retry(retry_state: RetryCallState):
 
         is_timeout = (isinstance(exception, requests.exceptions.Timeout) or
                       isinstance(exception, ConnectionResetError) or
-                      (isinstance(exception, error.URLEerror) and
+                      (isinstance(exception, error.URLError) and
                        isinstance(exception.reason, TimeoutError))
                       )
         if is_timeout and is_server_online:
