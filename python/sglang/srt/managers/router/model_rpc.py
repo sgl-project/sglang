@@ -4,7 +4,7 @@ import multiprocessing
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from typing import List, Any, Dict, Optional, Tuple, Union
 
 import rpyc
 import torch
@@ -36,7 +36,7 @@ from sglang.srt.utils import (
     set_random_seed,
 )
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import 
 
 
 logger = logging.getLogger("model_rpc")

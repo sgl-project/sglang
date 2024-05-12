@@ -122,7 +122,6 @@ def batch(video_dir, save_dir, cur_chunk, num_chunks, num_frames=16, batch_size=
     compile_and_cleanup_final_results(cur_chunk, num_batches, save_dir)
 
 
-import argparse
 if __name__ == "__main__":
 
     # Create the parser
@@ -133,7 +132,7 @@ if __name__ == "__main__":
     parser.add_argument('--chunk-idx', type=int, default=0, help='The index of the chunk to process.')
     parser.add_argument('--num-chunks', type=int, default=8, help='The number of chunks to process.')
     parser.add_argument('--save-dir', type=str, default="./work_dirs/llava_video", help='The directory to save the processed video files.')
-    parser.add_argument('--video-dir', type=str, default="/mnt/bn/vl-research/workspace/yhzhang/data/sora/", help='The directory to save the processed video files.')
+    parser.add_argument('--video-dir', type=str, help='The directory to save the processed video files.')
     parser.add_argument('--model-path', type=str, default="lmms-lab/LLaVA-NeXT-Video-34B", help='The model path for the video processing.')
     parser.add_argument('--num-frames', type=int, default=16, help='The number of frames to process in each video.' )
     parser.add_argument("--mm_spatial_pool_stride", type=int, default=2)

@@ -7,7 +7,6 @@ class FSMCache(BaseCache):
         super().__init__(enable=enable)
 
         from importlib.metadata import version
-
         if version("outlines") >= "0.0.35":
             from transformers import AutoTokenizer
 

@@ -203,41 +203,6 @@ def encode_video_base64(video_path, num_frames=16):
     return video_base64
 
 
-# def encode_video_base64(video_path):
-#     # Use decord's VideoReader for efficient frame access
-#     vr = VideoReader(video_path, ctx=cpu(0))
-#     total_frames = len(vr)
-
-#     frames = []
-#     if total_frames >= 32:
-#         # Sample 32 frames evenly across the video
-#         frame_indices = np.linspace(0, total_frames - 1, 32, dtype=int)
-#         frames = vr.get_batch(frame_indices).asnumpy()
-#     else:
-#         # If less than 32 frames, read all and repeat frames
-#         frames = vr[:]
-#         while len(frames) < 32:
-#             frames = np.append(frames, frames[:32 - len(frames)], axis=0)
-
-#     # Process and encode each frame
-#     encoded_frames = []
-#     for frame in frames:
-#         # Convert frame to PIL Image (decord returns frames in RGB format)
-#         im_pil = Image.fromarray(frame)
-
-#         # Convert to bytes and encode
-#         buffered = BytesIO()
-#         im_pil.save(buffered, format="PNG")
-#         frame_bytes = buffered.getvalue()
-#         encoded_frames.append(frame_bytes)
-
-#     # Concatenate and encode to base64
-#     video_bytes = b''.join(encoded_frames)
-#     video_base64 = "video:"+base64.b64encode(video_bytes).decode("utf-8")
-
-#     return video_base64
-
-
 def _is_chinese_char(cp):
     """Checks whether CP is the codepoint of a CJK character."""
     # This defines a "chinese character" as anything in the CJK Unicode block:
