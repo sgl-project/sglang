@@ -4,7 +4,7 @@ import multiprocessing
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from typing import List, Any, Dict, Optional, Tuple, Union
 
 import rpyc
 import torch
@@ -36,6 +36,9 @@ from sglang.srt.utils import (
     set_random_seed,
 )
 
+from typing import 
+
+
 logger = logging.getLogger("model_rpc")
 logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
@@ -46,6 +49,7 @@ class ModelRpcServer:
         tp_rank: int,
         server_args: ServerArgs,
         port_args: PortArgs,
+        model_overide_args: Optional[dict] = None,
     ):
         server_args, port_args = [obtain(x) for x in [server_args, port_args]]
 
@@ -63,6 +67,7 @@ class ModelRpcServer:
             server_args.model_path,
             server_args.trust_remote_code,
             context_length=server_args.context_length,
+            model_overide_args=model_overide_args,
         )
 
         # for model end global settings
@@ -655,13 +660,15 @@ class ModelRpcService(rpyc.Service):
 
 
 class ModelRpcClient:
-    def __init__(self, server_args: ServerArgs, port_args: PortArgs):
+    def __init__(
+        self, server_args: ServerArgs, port_args: PortArgs, model_overide_args
+    ):
         tp_size = server_args.tp_size
 
         if tp_size == 1:
             # Init model
             self.model_server = ModelRpcService().exposed_ModelRpcServer(
-                0, server_args, port_args
+                0, server_args, port_args, model_overide_args
             )
 
             # Wrap functions
@@ -682,7 +689,7 @@ class ModelRpcClient:
                 # Init model
                 def init_model(i):
                     return self.remote_services[i].ModelRpcServer(
-                        i, server_args, port_args
+                        i, server_args, port_args, model_overide_args
                     )
 
                 self.model_servers = executor.map(init_model, range(tp_size))
@@ -705,7 +712,7 @@ def _init_service(port):
     t = ThreadedServer(
         ModelRpcService(),
         port=port,
-        protocol_config={"allow_pickle": True, "sync_request_timeout": 1800},
+        protocol_config={'allow_public_attrs': True, "allow_pickle": True, "sync_request_timeout": 1800},
     )
     t.start()
 
@@ -721,7 +728,7 @@ def start_model_process(port):
             con = rpyc.connect(
                 "localhost",
                 port,
-                config={"allow_pickle": True, "sync_request_timeout": 1800},
+                config={'allow_public_attrs': True, "allow_pickle": True, "sync_request_timeout": 1800},
             )
             break
         except ConnectionRefusedError:

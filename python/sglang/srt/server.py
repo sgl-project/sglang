@@ -538,17 +538,13 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer):
     )
 
     # Launch processes
-    tokenizer_manager = TokenizerManager(server_args, port_args)
+    tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
     pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
     proc_router = mp.Process(
         target=start_router_process,
-        args=(
-            server_args,
-            port_args,
-            pipe_router_writer,
-        ),
+        args=(server_args, port_args, pipe_router_writer, model_overide_args),
     )
     proc_router.start()
     proc_detoken = mp.Process(
@@ -587,6 +583,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer):
             time.sleep(0.5)
             try:
                 requests.get(url + "/get_model_info", timeout=5, headers=headers)
+                success = True  # Set flag to True if request succeeds
                 break
             except requests.exceptions.RequestException as e:
                 pass
@@ -603,7 +600,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer):
                     },
                 },
                 headers=headers,
-                timeout=60,
+                timeout=600,
             )
             assert res.status_code == 200
         except Exception as e:
@@ -651,7 +648,10 @@ class Runtime:
 
         self.pid = None
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
-        proc = mp.Process(target=launch_server, args=(self.server_args, pipe_writer))
+        proc = mp.Process(
+            target=launch_server,
+            args=(self.server_args, pipe_writer, model_overide_args),
+        )
         proc.start()
         pipe_writer.close()
         self.pid = proc.pid

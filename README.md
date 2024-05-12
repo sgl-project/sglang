@@ -327,6 +327,101 @@ response = client.chat.completions.create(
 print(response)
 ```
 
+```python
+@sgl.function
+def text_qa(s, question):
+    s += "Q: " + question + "\n"
+    s += "A:" + sgl.gen("answer", stop="\n")
+
+states = text_qa.run_batch(
+    [
+        {"question": "What is the capital of the United Kingdom?"},
+        {"question": "What is the capital of France?"},
+        {"question": "What is the capital of Japan?"},
+    ],
+    progress_bar=True
+)
+```
+
+### Streaming
+Add `stream=True` to enable streaming.
+
+```python
+@sgl.function
+def text_qa(s, question):
+    s += "Q: " + question + "\n"
+    s += "A:" + sgl.gen("answer", stop="\n")
+
+state = text_qa.run(
+    question="What is the capital of France?",
+    temperature=0.1,
+    stream=True
+)
+
+for out in state.text_iter():
+    print(out, end="", flush=True)
+```
+
+### Tips and Implementation Details
+- The `choices` argument in `sgl.gen` is implemented by computing the normalized log probabilities of all choices and selecting the one with the highest probability.
+- The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex.
+
+## Backend: SGLang Runtime (SRT)
+The SGLang Runtime (SRT) is designed to work best with the SGLang frontend.
+However, it can also be used as a standalone API server.
+In this case, the [RadixAttention](https://arxiv.org/abs/2312.07104) can still greatly accelerate many use cases with automatic KV cache reuse.
+
+### Usage
+Launch a server
+```
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+```
+
+Send a request
+```
+curl http://localhost:30000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Once upon a time,",
+    "sampling_params": {
+      "max_new_tokens": 16,
+      "temperature": 0
+    }
+  }'
+```
+Learn more about the argument format [here](docs/sampling_params.md).
+
+### OpenAI Compatible API
+
+In addition, the server supports an experimental OpenAI-compatible API.
+
+```python
+import openai
+client = openai.Client(
+    base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+# Text completion
+response = client.completions.create(
+	model="default",
+	prompt="The capital of France is",
+	temperature=0,
+	max_tokens=32,
+)
+print(response)
+
+# Chat completion
+response = client.chat.completions.create(
+    model="default",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "List 3 countries and their capitals."},
+    ],
+    temperature=0,
+    max_tokens=64,
+)
+print(response)
+```
+
 In above example, the server uses the chat template specified in the model tokenizer.
 You can override the chat template if needed when launching the server:
 

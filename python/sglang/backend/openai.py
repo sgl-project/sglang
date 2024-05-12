@@ -11,7 +11,6 @@ from sglang.lang.ir import SglSamplingParams
 
 try:
     import openai
-    import tiktoken
 except ImportError as e:
     openai = tiktoken = e
 
