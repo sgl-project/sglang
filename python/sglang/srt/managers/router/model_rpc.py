@@ -4,7 +4,7 @@ import multiprocessing
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from typing import List, Any, Dict, Optional, Tuple, Union
 
 import rpyc
 import torch
@@ -32,7 +32,7 @@ from sglang.srt.utils import (
 )
 from vllm.logger import _default_handler as vllm_default_handler
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import 
 
 
 logger = logging.getLogger("model_rpc")

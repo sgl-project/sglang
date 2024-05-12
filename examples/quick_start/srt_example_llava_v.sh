@@ -1,4 +1,22 @@
 #!/bin/bash
+
+##### USAGE #####
+#    - First node:
+#      ```sh
+#      bash examples/quick_start/srt_example_llava_v.sh K 0 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
+#      ```
+#    - Second node:
+#      ```sh
+#      bash examples/quick_start/srt_example_llava_v.sh K 1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
+#      ```
+#    - The K node:
+#      ```sh
+#      bash examples/quick_start/srt_example_llava_v.sh K K-1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
+#      ```
+
+
+# Replace `K`, `YOUR_VIDEO_PATH`, `YOUR_MODEL_PATH`, and `FRAMES_PER_VIDEO` with your specific details.
+
 cd /mnt/bn/vl-research/workspace/yhzhang/sglang_video
 
 export PYTHONWARNINGS=ignore
