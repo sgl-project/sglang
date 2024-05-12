@@ -163,7 +163,7 @@ def test_regex(args):
     regex = (
         r"""\{\n"""
         + r"""   "name": "[\w]+",\n"""
-        + r"""   "population": [\w\d\s]+\n"""
+        + r"""   "population": [\d]+\n"""
         + r"""\}"""
     )
 
@@ -178,7 +178,7 @@ def test_regex(args):
         extra_body={"regex": regex},
     )
     text = response.choices[0].message.content
-    print(text)
+    print(json.loads(text))
     print("=" * 100)
 
 
