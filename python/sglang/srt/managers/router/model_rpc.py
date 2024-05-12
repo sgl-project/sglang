@@ -36,7 +36,9 @@ from sglang.srt.utils import (
     set_random_seed,
 )
 
+
 logger = logging.getLogger("model_rpc")
+vllm_default_logger.setLevel(logging.WARN)
 logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
 
@@ -54,9 +56,6 @@ class ModelRpcServer:
         self.tp_size = server_args.tp_size
         self.schedule_heuristic = server_args.schedule_heuristic
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
-        vllm_default_logger.setLevel(
-            level=getattr(logging, server_args.log_level.upper())
-        )
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -65,7 +64,7 @@ class ModelRpcServer:
             context_length=server_args.context_length,
         )
 
-        # for model end global settings
+        # For model end global settings
         server_args_dict = {
             "enable_flashinfer": server_args.enable_flashinfer,
             "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
@@ -164,7 +163,7 @@ class ModelRpcServer:
             logger.info("Cache flushed successfully!")
         else:
             warnings.warn(
-                "Cache not flushed because there are pending requests. "
+                f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.forward_queue)}, "
                 f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
             )
@@ -386,12 +385,12 @@ class ModelRpcServer:
                 f"#running_req: {running_req}. "
                 f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%."
             )
-            logger.debug(
-                f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
-                f"fsm_cache_avg_init_time: {self.regex_fsm_cache.get_avg_init_time():.2f}s. "
-                f"ff_cache_hit_rate: {100.0 * self.jump_forward_cache.get_cache_hit_rate():.2f}%. "
-                f"ff_cache_avg_init_time: {self.jump_forward_cache.get_avg_init_time():.2f}s. "
-            )
+            #logger.debug(
+            #    f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
+            #    f"fsm_cache_avg_init_time: {self.regex_fsm_cache.get_avg_init_time():.2f}s. "
+            #    f"ff_cache_hit_rate: {100.0 * self.jump_forward_cache.get_cache_hit_rate():.2f}%. "
+            #    f"ff_cache_avg_init_time: {self.jump_forward_cache.get_avg_init_time():.2f}s. "
+            #)
 
         new_batch = Batch.init_new(
             can_run_list,
@@ -408,14 +407,13 @@ class ModelRpcServer:
             self.model_config.vocab_size, self.int_token_logit_bias
         )
 
-        prefill_token_logprobs = None
         if batch.extend_num_tokens != 0:
             # Forward
             logits, (
                 prefill_token_logprobs,
+                normalized_prompt_logprobs,
                 prefill_top_logprobs,
                 decode_top_logprobs,
-                normalized_prompt_logprobs,
                 last_logprobs,
             ) = self.model_runner.forward(batch, ForwardMode.EXTEND)
             if prefill_token_logprobs is not None:
@@ -424,31 +422,25 @@ class ModelRpcServer:
 
             next_token_ids, _ = batch.sample(logits)
             next_token_ids = next_token_ids.cpu().tolist()
+
+            # Only transfer the selected logprobs of the next token to CPU to reduce overhead.
+            if last_logprobs is not None:
+                last_token_logprobs = (
+                    last_logprobs[torch.arange(len(batch.reqs)), next_token_ids].cpu().tolist()
+                )
         else:
             next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
-            (
-                logits,
-                prefill_token_logprobs,
-                normalized_prompt_logprobs,
-                last_logprobs,
-            ) = (None,) * 4
-
-        # Only batch transfer the selected logprobs of the next token to CPU to reduce overhead.
-        reqs = batch.reqs
-        last_token_logprobs = None
-        if last_logprobs is not None:
-            last_token_logprobs = (
-                last_logprobs[torch.arange(len(reqs)), next_token_ids].cpu().tolist()
-            )
 
         # Check finish condition
         pt = 0
-        for i, req in enumerate(reqs):
+        for i, req in enumerate(batch.reqs):
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids = [next_token_ids[i]]
             req.check_finished()
 
-            if prefill_token_logprobs is not None:
+            if req.return_logprob:
+                req.normalized_prompt_logprob = normalized_prompt_logprobs[i]
+
                 # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
                 req.prefill_token_logprobs = list(
                     zip(
@@ -463,12 +455,14 @@ class ModelRpcServer:
                 req.decode_token_logprobs = [
                     (last_token_logprobs[i], next_token_ids[i])
                 ]
+
+            if req.top_logprobs_num > 0:
                 req.prefill_top_logprobs = prefill_top_logprobs[i]
                 if req.logprob_start_len == 0:
                     req.prefill_top_logprobs = [None] + req.prefill_top_logprobs
                 req.decode_top_logprobs = [decode_top_logprobs[i]]
-                req.normalized_prompt_logprob = normalized_prompt_logprobs[i]
-                pt += req.extend_input_len
+
+            pt += req.extend_input_len
 
         self.handle_finished_requests(batch)
 

@@ -86,8 +86,8 @@ class InputMetadata:
     out_cache_cont_end: torch.Tensor = None
 
     other_kv_index: torch.Tensor = None
-    top_logprobs_nums: List[int] = None
     return_logprob: bool = False
+    top_logprobs_nums: List[int] = None
 
     # for flashinfer
     qo_indptr: torch.Tensor = None
@@ -107,18 +107,20 @@ class InputMetadata:
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
         )
         self.kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+        self.kv_last_page_len = torch.ones(
+            (self.batch_size,), dtype=torch.int32, device="cuda"
+        )
+        req_pool_indices_cpu = self.req_pool_indices[i].cpu().tolist()
+        seq_lens_cpu = self.seq_lens[i].cpu().tolist()
         self.kv_indices = torch.cat(
             [
                 self.req_to_token_pool.req_to_token[
-                    self.req_pool_indices[i].item(), : self.seq_lens[i].item()
+                    req_pool_indices_cpu[i]: seq_lens_cpu[i]
                 ]
                 for i in range(self.batch_size)
             ],
             dim=0,
         ).contiguous()
-        self.kv_last_page_len = torch.ones(
-            (self.batch_size,), dtype=torch.int32, device="cuda"
-        )
 
         workspace_buffer = torch.empty(
             32 * 1024 * 1024, dtype=torch.int8, device="cuda"
@@ -229,9 +231,9 @@ class InputMetadata:
             out_cache_loc=out_cache_loc,
             out_cache_cont_start=out_cache_cont_start,
             out_cache_cont_end=out_cache_cont_end,
-            top_logprobs_nums=top_logprobs_nums,
-            return_logprob=return_logprob,
             other_kv_index=other_kv_index,
+            return_logprob=return_logprob,
+            top_logprobs_nums=top_logprobs_nums,
         )
 
         if forward_mode == ForwardMode.EXTEND:
