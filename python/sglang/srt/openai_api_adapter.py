@@ -179,7 +179,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
             prefill_token_logprobs = None
             prefill_top_logprobs = None
 
-        logprobs = await to_openai_style_logprobs(
+        logprobs = to_openai_style_logprobs(
             prefill_token_logprobs=prefill_token_logprobs,
             prefill_top_logprobs=prefill_top_logprobs,
             decode_token_logprobs=ret["meta_info"]["decode_token_logprobs"],
