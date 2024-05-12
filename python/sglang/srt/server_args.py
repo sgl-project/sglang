@@ -34,6 +34,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
+    log_requests: bool = False
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     show_time_cost: bool = False
@@ -183,6 +184,11 @@ class ServerArgs:
             help="Logging level",
         )
         parser.add_argument(
+            "--log-requests",
+            action="store_true",
+            help="Log all requests",
+        )
+        parser.add_argument(
             "--disable-log-stats",
             action="store_true",
             help="Disable logging throughput stats.",
@@ -243,7 +249,7 @@ class ServerArgs:
     def print_mode_args(self):
         return (
             f"enable_flashinfer={self.enable_flashinfer}, "
-            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}"
+            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}, "
             f"disable_radix_cache={self.disable_radix_cache}, "
             f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
             f"disable_disk_cache={self.disable_disk_cache}, "

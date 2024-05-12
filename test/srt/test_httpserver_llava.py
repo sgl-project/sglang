@@ -34,7 +34,7 @@ async def test_concurrent(args):
                 url + "/generate",
                 {
                     "text": "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER: <image>\nDescribe this picture ASSISTANT:",
-                    "image_data": "test_image.png",
+                    "image_data": "example_image.png",
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": 16,
@@ -55,7 +55,7 @@ def test_streaming(args):
         url + "/generate",
         json={
             "text": "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER: <image>\nDescribe this picture ASSISTANT:",
-            "image_data": "test_image.png",
+            "image_data": "example_image.png",
             "sampling_params": {
                 "temperature": 0,
                 "max_new_tokens": 128,
