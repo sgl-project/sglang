@@ -34,6 +34,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
+    log_requests: bool = False
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     show_time_cost: bool = False
@@ -179,6 +180,11 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level,
             help="Logging level",
+        )
+        parser.add_argument(
+            "--log-requests",
+            action="store_true",
+            help="Log all requests",
         )
         parser.add_argument(
             "--disable-log-stats",

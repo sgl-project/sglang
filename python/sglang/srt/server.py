@@ -3,6 +3,7 @@
 import asyncio
 import dataclasses
 import json
+import logging
 import multiprocessing as mp
 import os
 import sys
@@ -94,17 +95,22 @@ async def generate_request(obj: GenerateReqInput):
 
 
 @app.post("/v1/completions")
-async def v1_completions(raw_request: Request):
-    return v1_completions(tokenizer_manager, raw_request)
+async def openai_v1_completions(raw_request: Request):
+    return await v1_completions(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/chat/completions")
-async def v1_chat_completions(raw_request: Request):
-    return v1_chat_completions(tokenizer_manager, raw_request)
+async def openai_v1_chat_completions(raw_request: Request):
+    return await v1_chat_completions(tokenizer_manager, raw_request)
 
 
 def launch_server(server_args: ServerArgs, pipe_finish_writer):
     global tokenizer_manager
+
+    logging.basicConfig(
+        level=getattr(logging, server_args.log_level.upper()),
+        format="%(message)s",
+    )
 
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"

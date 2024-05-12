@@ -32,6 +32,8 @@ from sglang.srt.openai_protocol import (
 from sglang.srt.utils import jsonify_pydantic_model
 
 
+chat_template_name = None
+
 def load_chat_template_for_openai_api(chat_template_arg):
     global chat_template_name
 
@@ -220,16 +222,6 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     if not isinstance(request.messages, str):
         # Apply chat template and its stop strings.
         if chat_template_name is None:
-            # This flow doesn't support the full OpenAI spec.  Verify messages
-            # has the right type before proceeding:
-            for m in request.messages:
-                if not isinstance(m.content, str):
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Structured content requests not supported with "
-                        "HuggingFace Chat Templates. "
-                        "Make sure the server specifies a sglang chat template.",
-                    )
             prompt = tokenizer_manager.tokenizer.apply_chat_template(
                 request.messages, tokenize=False, add_generation_prompt=True
             )
