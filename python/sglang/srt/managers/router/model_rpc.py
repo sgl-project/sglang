@@ -37,6 +37,7 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger("model_rpc")
+logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
 
 class ModelRpcServer:

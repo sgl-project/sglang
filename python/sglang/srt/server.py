@@ -633,11 +633,12 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer):
 class Runtime:
     def __init__(
         self,
+        log_evel="error",
         *args,
         **kwargs,
     ):
         """See the arguments in server_args.py::ServerArgs"""
-        self.server_args = ServerArgs(*args, **kwargs)
+        self.server_args = ServerArgs(*args, log_level=log_evel, **kwargs)
 
         # Pre-allocate ports
         self.server_args.port, self.server_args.additional_ports = allocate_init_ports(
