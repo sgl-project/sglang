@@ -241,7 +241,7 @@ class ServerArgs:
     def print_mode_args(self):
         return (
             f"enable_flashinfer={self.enable_flashinfer}, "
-            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}"
+            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}, "
             f"disable_radix_cache={self.disable_radix_cache}, "
             f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
             f"disable_disk_cache={self.disable_disk_cache}, "

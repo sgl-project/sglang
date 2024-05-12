@@ -10,7 +10,7 @@ import threading
 import time
 from typing import List, Optional, Union
 
-# Fix a Python bug
+# Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
@@ -53,10 +53,10 @@ from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    enable_show_time_cost,
     allocate_init_ports,
-    jsonify_pydantic_model,
     assert_pkg_version,
+    enable_show_time_cost,
+    jsonify_pydantic_model,
     get_exception_traceback,
     API_KEY_HEADER_NAME,
     APIKeyValidatorMiddleware
@@ -99,12 +99,6 @@ async def flush_cache():
     )
 
 
-async def stream_generator(obj: GenerateReqInput):
-    async for out in tokenizer_manager.generate_request(obj):
-        await handle_token_logprobs_results(obj, out)
-        yield out
-
-
 @app.post("/generate")
 async def generate_request(obj: GenerateReqInput):
     obj.post_init()
@@ -112,67 +106,14 @@ async def generate_request(obj: GenerateReqInput):
     if obj.stream:
 
         async def stream_results():
-            async for out in stream_generator(obj):
+            async for out in tokenizer_manager.generate_request(obj):
                 yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_results(), media_type="text/event-stream")
 
     ret = await tokenizer_manager.generate_request(obj).__anext__()
-    await handle_token_logprobs_results(obj, ret)
-
     return ret
-
-
-async def detokenize_logprob_tokens(token_logprobs, decode_to_text):
-    if not decode_to_text:
-        return [(logprob, token_id, None) for logprob, token_id in token_logprobs]
-
-    token_ids = [tid for _, tid in token_logprobs]
-    token_texts = await tokenizer_manager.detokenize(DetokenizeReqInput(token_ids))
-    return [
-        (logprob, token_id, token_text)
-        for (logprob, token_id), token_text, in zip(token_logprobs, token_texts)
-    ]
-
-
-async def detokenize_top_logprobs_tokens(top_logprobs, decode_to_text):
-    for i, t in enumerate(top_logprobs):
-        if top_logprobs[i] is not None:
-            top_logprobs[i] = await detokenize_logprob_tokens(t, decode_to_text)
-    return top_logprobs
-
-
-async def handle_token_logprobs_results(obj: GenerateReqInput, ret):
-    """Handle the token logprobs results, convert token ids to text if needed.
-
-    Args:
-        obj (GenerateReqInput): The request object.
-        ret (Union[Dict, List[Dict]]): The response object.
-    """
-    # NOTE: This is because the multiple requests in one http request.
-
-    async def convert_style(r, return_text):
-        r["meta_info"]["prefill_token_logprobs"] = await detokenize_logprob_tokens(
-            r["meta_info"]["prefill_token_logprobs"], return_text
-        )
-        r["meta_info"]["decode_token_logprobs"] = await detokenize_logprob_tokens(
-            r["meta_info"]["decode_token_logprobs"], return_text
-        )
-        r["meta_info"]["prefill_top_logprobs"] = await detokenize_top_logprobs_tokens(
-            r["meta_info"]["prefill_top_logprobs"], return_text
-        )
-        r["meta_info"]["decode_top_logprobs"] = await detokenize_top_logprobs_tokens(
-            r["meta_info"]["decode_top_logprobs"], return_text
-        )
-
-    if isinstance(obj.text, str):
-        if obj.return_logprob:
-            await convert_style(ret, obj.return_text_in_logprobs)
-    else:
-        for i, r in enumerate(ret):
-            if obj.return_logprob[i]:
-                await convert_style(r, obj.return_text_in_logprobs)
 
 
 @app.post("/v1/completions")
@@ -203,10 +144,10 @@ async def v1_completions(raw_request: Request):
 
     if adapted_request.stream:
 
-        async def gnerate_stream_resp():
+        async def generate_stream_resp():
             stream_buffer = ""
             n_prev_token = 0
-            async for content in stream_generator(adapted_request):
+            async for content in tokenizer_manager.generate_request(adapted_request):
                 text = content["text"]
                 prompt_tokens = content["meta_info"]["prompt_tokens"]
                 completion_tokens = content["meta_info"]["completion_tokens"]
@@ -266,7 +207,7 @@ async def v1_completions(raw_request: Request):
                 yield f"data: {jsonify_pydantic_model(chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(gnerate_stream_resp(), media_type="text/event-stream")
+        return StreamingResponse(generate_stream_resp(), media_type="text/event-stream")
 
     # Non-streaming response.
     ret = await generate_request(adapted_request)
@@ -384,7 +325,7 @@ async def v1_chat_completions(raw_request: Request):
             is_first = True
 
             stream_buffer = ""
-            async for content in stream_generator(adapted_request):
+            async for content in tokenizer_manager.generate_request(adapted_request):
                 if is_first:
                     # First chunk with role
                     is_first = False

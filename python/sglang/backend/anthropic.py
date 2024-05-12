@@ -14,7 +14,7 @@ except ImportError as e:
 
 
 class Anthropic(BaseBackend):
-    def __init__(self, model_name):
+    def __init__(self, model_name, *args, **kwargs):
         super().__init__()
 
         if isinstance(anthropic, Exception):
@@ -22,6 +22,7 @@ class Anthropic(BaseBackend):
 
         self.model_name = model_name
         self.chat_template = get_chat_template("claude")
+        self.client = anthropic.Anthropic(*args, **kwargs)
 
     def get_chat_template(self):
         return self.chat_template
@@ -41,7 +42,7 @@ class Anthropic(BaseBackend):
         else:
             system = ""
 
-        ret = anthropic.Anthropic().messages.create(
+        ret = self.client.messages.create(
             model=self.model_name,
             system=system,
             messages=messages,
@@ -66,7 +67,7 @@ class Anthropic(BaseBackend):
         else:
             system = ""
 
-        with anthropic.Anthropic().messages.stream(
+        with self.client.messages.stream(
             model=self.model_name,
             system=system,
             messages=messages,
