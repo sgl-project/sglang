@@ -417,16 +417,16 @@ class ModelRpcServer:
                 last_logprobs,
             ) = self.model_runner.forward(batch, ForwardMode.EXTEND)
             if prefill_token_logprobs is not None:
-                prefill_token_logprobs = prefill_token_logprobs.cpu().tolist()
-                normalized_prompt_logprobs = normalized_prompt_logprobs.cpu().tolist()
+                prefill_token_logprobs = prefill_token_logprobs.tolist()
+                normalized_prompt_logprobs = normalized_prompt_logprobs.tolist()
 
             next_token_ids, _ = batch.sample(logits)
-            next_token_ids = next_token_ids.cpu().tolist()
+            next_token_ids = next_token_ids.tolist()
 
             # Only transfer the selected logprobs of the next token to CPU to reduce overhead.
             if last_logprobs is not None:
                 last_token_logprobs = (
-                    last_logprobs[torch.arange(len(batch.reqs)), next_token_ids].cpu().tolist()
+                    last_logprobs[torch.arange(len(batch.reqs)), next_token_ids].tolist()
                 )
         else:
             next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
@@ -514,29 +514,29 @@ class ModelRpcServer:
         logits, (
             _,
             _,
-            decode_top_logprobs,
             _,
+            decode_top_logprobs,
             last_logprobs,
         ) = self.model_runner.forward(batch, ForwardMode.DECODE)
         next_token_ids, _ = batch.sample(logits)
-        next_token_ids = next_token_ids.cpu().tolist()
+        next_token_ids = next_token_ids.tolist()
 
         # Only batch transfer the selected logprobs of the next token to CPU to reduce overhead.
-        reqs = batch.reqs
-        new_token_logprobs = None
         if last_logprobs is not None:
             new_token_logprobs = last_logprobs[
-                torch.arange(len(reqs)), next_token_ids
+                torch.arange(len(batch.reqs)), next_token_ids
             ].tolist()
 
         # Check finish condition
-        for i, (req, next_token_id) in enumerate(zip(reqs, next_token_ids)):
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
             req.check_finished()
 
-            if new_token_logprobs is not None:
+            if req.return_logprob:
                 req.decode_token_logprobs.append((new_token_logprobs[i], next_token_id))
+
+            if req.top_logprobs_num > 0:
                 req.decode_top_logprobs.append(decode_top_logprobs[i])
 
         self.handle_finished_requests(batch)
@@ -584,8 +584,7 @@ class ModelRpcServer:
                     + len(req.output_ids)
                     - req.prompt_tokens,
                     "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
-                    "finish_reason": str(req.finish_reason),
-                    "hit_stop_str": req.hit_stop_str,
+                    "finish_reason": str(req.finish_reason),  # FIXME: convert to the correct string
                 }
                 if req.return_logprob:
                     (
@@ -622,10 +621,10 @@ class ModelRpcServer:
         # Remove finished reqs
         if finished_indices:
             # Update radix cache
-            req_pool_indices_cpu = batch.req_pool_indices.cpu().tolist()
+            req_pool_indices_np = batch.req_pool_indices.cpu().numpy()
             for i in finished_indices:
                 req = batch.reqs[i]
-                req_pool_idx = req_pool_indices_cpu[i]
+                req_pool_idx = req_pool_indices_np[i]
                 token_ids = tuple(req.input_ids + req.output_ids)
                 seq_len = len(token_ids) - 1
                 indices = self.req_to_token_pool.req_to_token[req_pool_idx, :seq_len]

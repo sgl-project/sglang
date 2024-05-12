@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import IntEnum, auto
 from typing import List
 
 import numpy as np
@@ -9,15 +9,15 @@ from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
 
-class ForwardMode(Enum):
+class ForwardMode(IntEnum):
     PREFILL = auto()
     EXTEND = auto()
     DECODE = auto()
 
 
-class FinishReason(Enum):
-    LENGTH = auto()
+class FinishReason(IntEnum):
     EOS_TOKEN = auto()
+    LENGTH = auto()
     STOP_STR = auto()
 
 
@@ -218,7 +218,7 @@ class Batch:
         seq_lens = []
 
         req_pool_indices = self.req_to_token_pool.alloc(bs)
-        req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+        req_pool_indices_np = req_pool_indices.cpu().numpy()
         for i in range(bs):
             flatten_input_ids.extend(input_ids[i])
             extend_lens.append(len(input_ids[i]))
@@ -227,7 +227,7 @@ class Batch:
                 prefix_lens.append(0)
             else:
                 prefix_lens.append(len(prefix_indices[i]))
-                self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
+                self.req_to_token_pool.req_to_token[req_pool_indices_np[i]][
                     : len(prefix_indices[i])
                 ] = prefix_indices[i]
 
@@ -354,7 +354,7 @@ class Batch:
         jump_forward_reqs = []
         filter_indices = [i for i in range(len(self.reqs))]
 
-        req_pool_indices_cpu = None
+        req_pool_indices_np = None
 
         for i, req in enumerate(self.reqs):
             if req.jump_forward_map is not None:
@@ -366,9 +366,9 @@ class Batch:
 
                     # insert the old request into tree_cache
                     token_ids_in_memory = tuple(req.input_ids + req.output_ids)[:-1]
-                    if req_pool_indices_cpu is None:
-                        req_pool_indices_cpu = self.req_pool_indices.cpu().tolist()
-                    req_pool_idx = req_pool_indices_cpu[i]
+                    if req_pool_indices_np is None:
+                        req_pool_indices_np = self.req_pool_indices.cpu().numpy()
+                    req_pool_idx = req_pool_indices_np[i]
                     indices = self.req_to_token_pool.req_to_token[
                         req_pool_idx, : len(token_ids_in_memory)
                     ]
@@ -519,11 +519,11 @@ class Batch:
         ).view(-1)
 
         if has_regex:
-            batch_next_token_ids_cpu = batch_next_token_ids.cpu().numpy()
+            batch_next_token_ids_np = batch_next_token_ids.cpu().numpy()
             for i, req in enumerate(self.reqs):
                 if req.regex_fsm is not None:
                     req.regex_fsm_state = req.regex_fsm.next_state(
-                        req.regex_fsm_state, batch_next_token_ids_cpu[i]
+                        req.regex_fsm_state, batch_next_token_ids_np[i]
                     )
 
         return batch_next_token_ids, batch_next_token_probs
