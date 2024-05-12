@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import dataclasses
+import logging
 import multiprocessing as mp
 import os
 from typing import List
@@ -30,6 +31,8 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_exception_traceback, is_multimodal_model, load_image
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -185,10 +188,15 @@ class TokenizerManager:
 
             while True:
                 await event.wait()
-                yield self.convert_logprob_style(state.out_list[-1],
+                out = self.convert_logprob_style(state.out_list[-1],
                                                  obj.return_logprob,
                                                  obj.top_logprobs_num,
                                                  obj.return_text_in_logprobs)
+
+                if self.server_args.log_requests and state.finished:
+                    logger.info(f"in={obj.text}, out={out}")
+
+                yield out
                 state.out_list = []
                 if state.finished:
                     del self.rid_to_state[rid]
