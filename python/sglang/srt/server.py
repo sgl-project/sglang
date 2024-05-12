@@ -53,13 +53,13 @@ from sglang.srt.openai_protocol import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    API_KEY_HEADER_NAME,
-    APIKeyValidatorMiddleware,
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
-    get_exception_traceback,
     jsonify_pydantic_model,
+    get_exception_traceback,
+    API_KEY_HEADER_NAME,
+    APIKeyValidatorMiddleware
 )
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
