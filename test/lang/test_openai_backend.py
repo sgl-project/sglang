@@ -28,7 +28,7 @@ class TestOpenAIBackend(unittest.TestCase):
         if cls.backend is None:
             cls.backend = OpenAI("gpt-3.5-turbo-instruct")
             cls.chat_backend = OpenAI("gpt-3.5-turbo")
-            cls.chat_vision_backend = OpenAI("gpt-4-vision-preview")
+            cls.chat_vision_backend = OpenAI("gpt-4-turbo")
 
     def test_few_shot_qa(self):
         set_default_backend(self.backend)
@@ -88,14 +88,3 @@ if __name__ == "__main__":
     # t = TestOpenAIBackend()
     # t.setUp()
     # t.test_few_shot_qa()
-    # t.test_mt_bench()
-    # t.test_select()
-    # t.test_decode_int()
-    # t.test_decode_json()
-    # t.test_expert_answer()
-    # t.test_tool_use()
-    # t.test_react()
-    # t.test_parallel_decoding()
-    # t.test_parallel_encoding()
-    # t.test_image_qa()
-    # t.test_stream()
