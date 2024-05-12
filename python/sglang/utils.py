@@ -9,7 +9,7 @@ from json import dumps
 from tenacity import RetryCallState, retry, stop_after_attempt, wait_fixed, retry_if_result
 import requests
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urlparse, error
 from memoization import cached
 
 
@@ -115,8 +115,13 @@ def _should_retry(retry_state: RetryCallState):
         except:
             is_server_online = False
 
-        if (isinstance(exception, ConnectionResetError)) and is_server_online:
-            print("ConnectionResetError: Retrying...")
+        is_timeout = (isinstance(exception, requests.exceptions.Timeout) or
+                      isinstance(exception, ConnectionResetError) or
+                      (isinstance(exception, error.URLEerror) and
+                       isinstance(exception.reason, TimeoutError))
+                      )
+        if is_timeout and is_server_online:
+            print("SGLang http request connection timed out. Retrying...")
             return True
     return False
 
@@ -125,7 +130,7 @@ def _should_retry(retry_state: RetryCallState):
     retry=_should_retry
 )
 def http_request(
-    url, json=None, stream=False, auth_token=None, api_key=None, verify=None
+    url, json=None, stream=False, auth_token=None, api_key=None, verify=None, timeout=60
 ):
     """A faster version of requests.post with low-level urllib API."""
     headers = {"Content-Type": "application/json; charset=utf-8"}
@@ -139,14 +144,14 @@ def http_request(
         headers["X-API-Key"] = api_key
 
     if stream:
-        return requests.post(url, json=json, stream=True, headers=headers)
+        return requests.post(url, json=json, stream=True, headers=headers, timeout=timeout)
     else:
         req = urllib.request.Request(url, headers=headers)
         if json is None:
             data = None
         else:
             data = bytes(dumps(json), encoding="utf-8")
-        resp = urllib.request.urlopen(req, data=data, cafile=verify)
+        resp = urllib.request.urlopen(req, data=data, cafile=verify, timeout=timeout)
         return HttpResponse(resp)
 
 
