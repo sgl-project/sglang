@@ -118,9 +118,8 @@ def _should_retry(retry_state: RetryCallState):
 
         is_timeout = (isinstance(exception, requests.exceptions.Timeout) or
                       isinstance(exception, ConnectionResetError) or
-                      (isinstance(exception, error.URLError) and
-                       isinstance(exception.reason, TimeoutError))
-                      )
+                      isinstance(exception, TimeoutError)
+                     )
         if is_timeout and is_server_online:
             print("SGLang http request connection timed out. Retrying...")
             return True
@@ -131,7 +130,7 @@ def _should_retry(retry_state: RetryCallState):
     retry=_should_retry
 )
 def http_request(
-    url, json=None, stream=False, auth_token=None, api_key=None, verify=None, timeout=60
+    url, json=None, stream=False, auth_token=None, api_key=None, verify=None, timeout=60*5
 ):
     """A faster version of requests.post with low-level urllib API."""
     headers = {"Content-Type": "application/json; charset=utf-8"}
