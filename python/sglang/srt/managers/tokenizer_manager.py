@@ -209,7 +209,7 @@ class TokenizerManager:
         else:
             assert obj.stream is False
 
-            if obj.text is not None:
+            if obj.input_ids is None:
                 bs = len(obj.text)
             else:
                 bs = len(obj.input_ids)
