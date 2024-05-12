@@ -7,8 +7,8 @@ import torch
 from torch import nn
 from transformers import CLIPVisionModel, LlavaConfig, CLIPVisionConfig, MistralConfig
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
-from vllm.model_executor.layers.linear import LinearMethodBase
-from vllm.model_executor.weight_utils import (
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.weight_utils import (
     default_weight_loader,
     hf_model_weights_iterator,
 )
@@ -37,7 +37,7 @@ class LlavaMistralForCausalLM(nn.Module):
 
         if getattr(self.config, "text_config", None) is None:
             self.config.text_config = MistralConfig(self.config._name_or_path)
-            
+
         self.config.vision_config.hidden_size = config.mm_hidden_size
         self.config.text_config.hidden_size = config.hidden_size
 
@@ -46,7 +46,7 @@ class LlavaMistralForCausalLM(nn.Module):
 
         if getattr(self.config, "image_token_index", None) is None:
             self.config.image_token_index = 32000
-            
+
         self.multi_modal_projector = LlavaMultiModalProjector(config)
         self.language_model = MistralForCausalLM(config, linear_method)
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
