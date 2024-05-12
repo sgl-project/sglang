@@ -27,7 +27,7 @@ class LlavaMistralForCausalLM(nn.Module):
     def __init__(
         self,
         config: LlavaConfig,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -48,7 +48,7 @@ class LlavaMistralForCausalLM(nn.Module):
             self.config.image_token_index = 32000
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = MistralForCausalLM(config, linear_method)
+        self.language_model = MistralForCausalLM(config, quant_config=quant_config)
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
