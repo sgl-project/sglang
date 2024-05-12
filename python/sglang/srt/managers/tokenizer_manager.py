@@ -193,7 +193,7 @@ class TokenizerManager:
                                                  obj.top_logprobs_num,
                                                  obj.return_text_in_logprobs)
 
-                if state.finished:
+                if self.server_args.log_requests and state.finished:
                     logger.info(f"in={obj.text}, out={out}")
 
                 yield out
