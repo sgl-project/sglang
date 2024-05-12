@@ -6,10 +6,11 @@ import threading
 import urllib.request
 from io import BytesIO
 from json import dumps
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import RetryCallState, retry, stop_after_attempt, wait_fixed, retry_if_result
 import requests
 import socket
 from urllib.parse import urlparse
+from memoization import cached
 
 
 def get_available_gpu_memory(gpu_id, distributed=True):
@@ -89,6 +90,7 @@ class HttpResponse:
     def status_code(self):
         return self.resp.status
 
+@cached(ttl = 5) # cache result so to not ddos the server
 def _is_port_open(host, port, timeout=5):
     """ Check if a port at a given address is open. """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -97,20 +99,25 @@ def _is_port_open(host, port, timeout=5):
     sock.close()
     return result == 0
 
-def _should_retry(retry_state):
-    url = retry_state.args[0]  # Assumes the first argument to the function is the URL
-    exception = retry_state.outcome.exception()
-    try:
-        parsed_url = urlparse(url)
-        host = parsed_url.hostname
-        port = parsed_url.port
-        is_server_online = _is_port_open(host, port)
-    except:
-        is_server_online = False
+def _should_retry(retry_state: RetryCallState):
+    if retry_state.outcome is None:
+        raise RuntimeError("_should_retry called before outcome was set")
+    if retry_state.outcome.failed:
+        url = retry_state.args[0]  # Assumes the first argument to the function is the URL
+        exception = retry_state.outcome.exception()
+        if exception is None:
+            raise RuntimeError("_should_retry outcome failed but the exception is None")
+        try:
+            parsed_url = urlparse(url)
+            host = parsed_url.hostname
+            port = parsed_url.port
+            is_server_online = _is_port_open(host, port)
+        except:
+            is_server_online = False
 
-    if isinstance(exception, ConnectionResetError) and is_server_online(url):
-        print("ConnectionResetError: Retrying...")
-        return True
+        if (isinstance(exception, ConnectionResetError)) and is_server_online:
+            print("ConnectionResetError: Retrying...")
+            return True
     return False
 
 @retry(

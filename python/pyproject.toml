@@ -15,7 +15,8 @@ classifiers = [
 ]
 dependencies = [
     "requests",
-    "tenacity"
+    "tenacity",
+    "memoization"
 ]
 
 [project.optional-dependencies]
