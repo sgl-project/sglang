@@ -426,7 +426,9 @@ class ModelRpcServer:
             # Only transfer the selected logprobs of the next token to CPU to reduce overhead.
             if last_logprobs is not None:
                 last_token_logprobs = (
-                    last_logprobs[torch.arange(len(batch.reqs)), next_token_ids].tolist()
+                    last_logprobs[
+                        torch.arange(len(batch.reqs), device=next_token_ids.device),
+                        next_token_ids].tolist()
                 )
 
             next_token_ids = next_token_ids.tolist()
@@ -587,6 +589,7 @@ class ModelRpcServer:
                     - req.prompt_tokens,
                     "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
                     "finish_reason": str(req.finish_reason),  # FIXME: convert to the correct string
+                    "hit_stop_str": req.hit_stop_str,
                 }
                 if req.return_logprob:
                     (
