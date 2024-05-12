@@ -9,7 +9,7 @@ from json import dumps
 from tenacity import RetryCallState, retry, wait_fixed
 import requests
 import socket
-from urllib.parse import urlparse, error
+from urllib.parse import urlparse
 from urllib import error
 from memoization import cached
 
