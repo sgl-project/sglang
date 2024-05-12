@@ -13,13 +13,13 @@ from sglang.api import (
     gen_string,
     get_server_args,
     image,
-    video,
     select,
     set_default_backend,
     system,
     user,
     user_begin,
     user_end,
+    video,
 )
 
 # SGL Backends
@@ -47,8 +47,7 @@ __all__ = [
     "gen_int",
     "gen_string",
     "image",
-    "video"
-    "select",
+    "video" "select",
     "system",
     "user",
     "assistant",

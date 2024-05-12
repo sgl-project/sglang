@@ -291,7 +291,11 @@ def match_chat_ml(model_path: str):
         return get_chat_template("chatml")
     if "qwen" in model_path and "chat" in model_path:
         return get_chat_template("chatml")
-    if "llava-v1.6-34b" in model_path or "llava-v1.6-yi-34b" in model_path or "llava-next-video-34b" in model_path:
+    if (
+        "llava-v1.6-34b" in model_path
+        or "llava-v1.6-yi-34b" in model_path
+        or "llava-next-video-34b" in model_path
+    ):
         return get_chat_template("chatml-llava")
 
 

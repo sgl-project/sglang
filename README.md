@@ -297,102 +297,6 @@ curl http://localhost:30000/generate \
 Learn more about the argument format [here](docs/sampling_params.md).
 
 ### OpenAI Compatible API
-
-In addition, the server supports an experimental OpenAI-compatible API.
-
-```python
-import openai
-client = openai.Client(
-    base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
-
-# Text completion
-response = client.completions.create(
-	model="default",
-	prompt="The capital of France is",
-	temperature=0,
-	max_tokens=32,
-)
-print(response)
-
-# Chat completion
-response = client.chat.completions.create(
-    model="default",
-    messages=[
-        {"role": "system", "content": "You are a helpful AI assistant"},
-        {"role": "user", "content": "List 3 countries and their capitals."},
-    ],
-    temperature=0,
-    max_tokens=64,
-)
-print(response)
-```
-
-```python
-@sgl.function
-def text_qa(s, question):
-    s += "Q: " + question + "\n"
-    s += "A:" + sgl.gen("answer", stop="\n")
-
-states = text_qa.run_batch(
-    [
-        {"question": "What is the capital of the United Kingdom?"},
-        {"question": "What is the capital of France?"},
-        {"question": "What is the capital of Japan?"},
-    ],
-    progress_bar=True
-)
-```
-
-### Streaming
-Add `stream=True` to enable streaming.
-
-```python
-@sgl.function
-def text_qa(s, question):
-    s += "Q: " + question + "\n"
-    s += "A:" + sgl.gen("answer", stop="\n")
-
-state = text_qa.run(
-    question="What is the capital of France?",
-    temperature=0.1,
-    stream=True
-)
-
-for out in state.text_iter():
-    print(out, end="", flush=True)
-```
-
-### Tips and Implementation Details
-- The `choices` argument in `sgl.gen` is implemented by computing the normalized log probabilities of all choices and selecting the one with the highest probability.
-- The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex.
-
-## Backend: SGLang Runtime (SRT)
-The SGLang Runtime (SRT) is designed to work best with the SGLang frontend.
-However, it can also be used as a standalone API server.
-In this case, the [RadixAttention](https://arxiv.org/abs/2312.07104) can still greatly accelerate many use cases with automatic KV cache reuse.
-
-### Usage
-Launch a server
-```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
-```
-
-Send a request
-```
-curl http://localhost:30000/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Once upon a time,",
-    "sampling_params": {
-      "max_new_tokens": 16,
-      "temperature": 0
-    }
-  }'
-```
-Learn more about the argument format [here](docs/sampling_params.md).
-
-### OpenAI Compatible API
-
 In addition, the server supports an experimental OpenAI-compatible API.
 
 ```python
@@ -481,7 +385,6 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/model_support.md).
 
 ## Benchmark And Performance
-
 - Llama-7B on NVIDIA A10G, FP16, Tensor Parallelism=1
 ![llama_7b](assets/llama_7b.jpg)
 
@@ -504,8 +407,5 @@ https://github.com/sgl-project/sglang/issues/157
       primaryClass={cs.AI}
 }
 ```
-
-[![Paper page](https://huggingface.co/datasets/huggingface/badges/resolve/main/paper-page-md.svg)](https://huggingface.co/papers/2312.07104)
-
 
 We learned from the design and reused some code of the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), [LMQL](https://github.com/eth-sri/lmql).

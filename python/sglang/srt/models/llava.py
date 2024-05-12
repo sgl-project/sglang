@@ -7,12 +7,7 @@ import torch
 from torch import nn
 from transformers import CLIPVisionModel, LlavaConfig
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
-from sglang.srt.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from sglang.srt.managers.router.infer_batch import ForwardMode
 from sglang.srt.managers.router.model_runner import InputMetadata
@@ -22,6 +17,7 @@ from sglang.srt.mm_utils import (
     unpad_image_shape,
 )
 from sglang.srt.models.llama2 import LlamaForCausalLM
+from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
 
 
 class LlavaLlamaForCausalLM(nn.Module):

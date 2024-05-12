@@ -5,6 +5,11 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+from torch import nn
+from transformers import CLIPVisionModel, LlamaConfig, LlavaConfig
+from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
 from sglang.srt.managers.router.infer_batch import ForwardMode
 from sglang.srt.managers.router.model_runner import InputMetadata
 from sglang.srt.mm_utils import (
@@ -13,15 +18,7 @@ from sglang.srt.mm_utils import (
     unpad_image_shape,
 )
 from sglang.srt.models.llama2 import LlamaForCausalLM
-from torch import nn
-from transformers import CLIPVisionModel, LlamaConfig, LlavaConfig
-from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
-from sglang.srt.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
+from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
 
 
 class LlavaVidForCausalLM(nn.Module):
@@ -256,7 +253,7 @@ class LlavaVidForCausalLM(nn.Module):
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
                 if name in params_dict:
-                    param = params_dict[name] 
+                    param = params_dict[name]
                 else:
                     print(f"Warning: {name} not found in the model")
                     continue

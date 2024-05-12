@@ -110,7 +110,7 @@ class TracerProgramState(ProgramState):
     ##################################
 
     def fork(self, size: int = 1, position_ids_offset: Optional[List[int]] = None):
-        assert (size >= 1)
+        assert size >= 1
 
         if self.only_trace_prefix:
             raise StopTracing()

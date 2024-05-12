@@ -4,12 +4,13 @@ import multiprocessing
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import rpyc
 import torch
 from rpyc.utils.classic import obtain
 from rpyc.utils.server import ThreadedServer
+
 try:
     from vllm.logger import _default_handler as vllm_default_logger
 except ImportError:
@@ -35,7 +36,6 @@ from sglang.srt.utils import (
     is_multimodal_model,
     set_random_seed,
 )
-
 
 logger = logging.getLogger("model_rpc")
 logging.getLogger("vllm.utils").setLevel(logging.WARN)
@@ -710,7 +710,11 @@ def _init_service(port):
     t = ThreadedServer(
         ModelRpcService(),
         port=port,
-        protocol_config={'allow_public_attrs': True, "allow_pickle": True, "sync_request_timeout": 1800},
+        protocol_config={
+            "allow_public_attrs": True,
+            "allow_pickle": True,
+            "sync_request_timeout": 1800,
+        },
     )
     t.start()
 
@@ -726,7 +730,11 @@ def start_model_process(port):
             con = rpyc.connect(
                 "localhost",
                 port,
-                config={'allow_public_attrs': True, "allow_pickle": True, "sync_request_timeout": 1800},
+                config={
+                    "allow_public_attrs": True,
+                    "allow_pickle": True,
+                    "sync_request_timeout": 1800,
+                },
             )
             break
         except ConnectionRefusedError:

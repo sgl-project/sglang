@@ -19,8 +19,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 show_time_cost = False
 time_infos = {}
-import torch.distributed as dist
-from PIL import Image
 
 
 def enable_show_time_cost():
@@ -258,6 +256,9 @@ def is_multimodal_model(model):
 
 
 def decode_video_base64(video_base64):
+    import torch.distributed as dist
+    from PIL import Image
+
     # Decode the base64 string
     video_bytes = base64.b64decode(video_base64)
 
@@ -367,7 +368,9 @@ def assert_pkg_version(pkg: str, min_version: str):
                 f"is less than the minimum required version {min_version}"
             )
     except PackageNotFoundError:
-        raise Exception(f"{pkg} with minimum required version {min_version} is not installed")
+        raise Exception(
+            f"{pkg} with minimum required version {min_version} is not installed"
+        )
 
 
 API_KEY_HEADER_NAME = "X-API-Key"
@@ -388,6 +391,7 @@ class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
             )
         response = await call_next(request)
         return response
+
 
 # FIXME: Remove this once we drop support for pydantic 1.x
 IS_PYDANTIC_1 = int(pydantic.VERSION.split(".")[0]) == 1

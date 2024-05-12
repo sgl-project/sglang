@@ -9,10 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
 
-import cv2
 import numpy as np
 import requests
-from PIL import Image
 
 # from decord import VideoReader, cpu
 
@@ -138,6 +136,8 @@ def encode_image_base64(image_path):
 
 
 def encode_frame(frame):
+    import cv2
+    from PIL import Image
 
     # Convert the frame to RGB (OpenCV uses BGR by default)
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

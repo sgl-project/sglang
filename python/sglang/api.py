@@ -150,7 +150,7 @@ def image(expr: SglExpr):
     return SglImage(expr)
 
 
-def video(expr_1: SglExpr, expr_2: SglExpr):
+def video(path: str, num_frames: int):
     return SglVideo(expr_1, expr_2)
 
 

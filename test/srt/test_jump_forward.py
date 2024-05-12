@@ -1,7 +1,6 @@
 import argparse
 from enum import Enum
 
-import sglang as sgl
 from pydantic import BaseModel, constr
 
 import sglang as sgl

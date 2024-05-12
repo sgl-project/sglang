@@ -79,10 +79,12 @@ class ServerArgs:
             default=ServerArgs.tokenizer_path,
             help="The path of the tokenizer.",
         )
-        parser.add_argument("--host", type=str, default=ServerArgs.host,
-                            help="The host of the server.")
-        parser.add_argument("--port", type=int, default=ServerArgs.port,
-                            help="The port of the server.")
+        parser.add_argument(
+            "--host", type=str, default=ServerArgs.host, help="The host of the server."
+        )
+        parser.add_argument(
+            "--port", type=int, default=ServerArgs.port, help="The port of the server."
+        )
         parser.add_argument(
             "--additional-ports",
             type=int,

@@ -17,7 +17,7 @@
 
 # Replace `K`, `YOUR_VIDEO_PATH`, `YOUR_MODEL_PATH`, and `FRAMES_PER_VIDEO` with your specific details.
 
-cd /mnt/bn/vl-research/workspace/yhzhang/sglang_video
+cd sglang_video
 
 export PYTHONWARNINGS=ignore
 

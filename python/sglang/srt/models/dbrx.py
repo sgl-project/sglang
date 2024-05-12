@@ -5,37 +5,31 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.distributed import (
-    tensor_model_parallel_all_reduce,
-)
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from vllm.model_executor.utils import set_weight_attrs
-from sglang.srt.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.router.model_runner import InputMetadata
 from sglang.srt.models.dbrx_config import DbrxConfig
+from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
 
 
 class DbrxRouter(nn.Module):
@@ -291,7 +285,9 @@ class DbrxBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.norm_attn_norm = DbrxFusedNormAttention(config, layer_id, quant_config=quant_config)
+        self.norm_attn_norm = DbrxFusedNormAttention(
+            config, layer_id, quant_config=quant_config
+        )
         self.ffn = DbrxExperts(config, quant_config=quant_config)
 
     def forward(
@@ -322,7 +318,10 @@ class DbrxModel(nn.Module):
             config.d_model,
         )
         self.blocks = nn.ModuleList(
-            [DbrxBlock(config, i, quant_config=quant_config) for i in range(config.n_layers)]
+            [
+                DbrxBlock(config, i, quant_config=quant_config)
+                for i in range(config.n_layers)
+            ]
         )
         self.norm_f = nn.LayerNorm(config.d_model, eps=1e-5)
         for module in self.modules():

@@ -33,6 +33,8 @@ from sglang.srt.conversation import (
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import DetokenizeReqInput, GenerateReqInput
+from sglang.srt.managers.router.manager import start_router_process
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -49,17 +51,15 @@ from sglang.srt.openai_protocol import (
     LogProbs,
     UsageInfo,
 )
-from sglang.srt.managers.router.manager import start_router_process
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    enable_show_time_cost,
-    allocate_init_ports,
-    jsonify_pydantic_model,
-    assert_pkg_version,
-    get_exception_traceback,
     API_KEY_HEADER_NAME,
-    APIKeyValidatorMiddleware
+    APIKeyValidatorMiddleware,
+    allocate_init_ports,
+    assert_pkg_version,
+    enable_show_time_cost,
+    get_exception_traceback,
+    jsonify_pydantic_model,
 )
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -510,7 +510,7 @@ def load_chat_template_for_openai_api(chat_template_arg):
         chat_template_name = chat_template_arg
 
 
-def launch_server(server_args: ServerArgs, pipe_finish_writer,model_overide_args=None):
+def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_args=None):
     global tokenizer_manager
 
     # Set global environments
@@ -564,8 +564,13 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer,model_overide_args
     if router_init_state != "init ok" or detoken_init_state != "init ok":
         proc_router.kill()
         proc_detoken.kill()
-        print(f"Initialization failed. router_init_state: {router_init_state}", flush=True)
-        print(f"Initialization failed. detoken_init_state: {detoken_init_state}", flush=True)
+        print(
+            f"Initialization failed. router_init_state: {router_init_state}", flush=True
+        )
+        print(
+            f"Initialization failed. detoken_init_state: {detoken_init_state}",
+            flush=True,
+        )
         sys.exit(1)
     assert proc_router.is_alive() and proc_detoken.is_alive()
 
@@ -640,7 +645,10 @@ class Runtime:
 
         # Pre-allocate ports
         self.server_args.port, self.server_args.additional_ports = allocate_init_ports(
-            self.server_args.port, self.server_args.additional_ports, self.server_args.tp_size)
+            self.server_args.port,
+            self.server_args.additional_ports,
+            self.server_args.tp_size,
+        )
 
         self.url = self.server_args.url()
         self.generate_url = (
@@ -664,7 +672,9 @@ class Runtime:
 
         if init_state != "init ok":
             self.shutdown()
-            raise RuntimeError("Initialization failed. Please see the error messages above.")
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
 
         self.endpoint = RuntimeEndpoint(self.url)
 
