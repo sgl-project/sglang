@@ -237,10 +237,6 @@ class TokenizerManager:
 
             yield output_list
 
-    async def detokenize(self, obj: DetokenizeReqInput):
-        token_texts = self.tokenizer.convert_ids_to_tokens(obj.input_ids)
-        return [t.decode() if isinstance(t, bytes) else t for t in token_texts]
-
     async def flush_cache(self):
         flush_cache_req = FlushCacheReq()
         self.send_to_router.send_pyobj(flush_cache_req)
@@ -267,3 +263,7 @@ class TokenizerManager:
                     state.event.set()
             else:
                 raise ValueError(f"Invalid object: {recv_obj}")
+
+    async def detokenize(self, obj: DetokenizeReqInput):
+        token_texts = self.tokenizer.convert_ids_to_tokens(obj.input_ids)
+        return [t.decode() if isinstance(t, bytes) else t for t in token_texts]

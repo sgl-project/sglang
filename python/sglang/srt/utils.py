@@ -1,3 +1,5 @@
+"""Common utilities."""
+
 import base64
 import os
 import random
@@ -13,6 +15,7 @@ import numpy as np
 import pydantic
 import requests
 import torch
+from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -302,6 +305,7 @@ class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
             )
         response = await call_next(request)
         return response
+
 
 # FIXME: Remove this once we drop support for pydantic 1.x
 IS_PYDANTIC_1 = int(pydantic.VERSION.split(".")[0]) == 1
