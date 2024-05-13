@@ -5,7 +5,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 
-from sglang import global_config
+from sglang.global_config import global_config
 from sglang.srt.managers.router.model_rpc import ModelRpcClient
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_exception_traceback
