@@ -313,7 +313,7 @@ class StreamExecutor:
             try:
                 self._execute(expr)
             except Exception as e:
-                print(f"Error in stream_executor: {get_exception_traceback()}")
+                # print(f"Error in stream_executor: {get_exception_traceback()}")
                 error = e
                 break
             self.queue.task_done()
@@ -693,9 +693,10 @@ class ProgramState:
         return self.stream_executor.messages()
 
     def sync(self):
-        ret = self.stream_executor.sync()
-        self.error = self.stream_executor.error
-        return ret
+        return self.stream_executor.sync()
+
+    def error(self):
+        return self.stream_executor.error
 
     def text_iter(self, var_name: Optional[str] = None):
         if self.stream_executor.stream:
