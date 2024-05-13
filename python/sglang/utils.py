@@ -8,8 +8,11 @@ import traceback
 import urllib.request
 from io import BytesIO
 from json import dumps
-
+from tenacity import RetryCallState, retry, stop_after_attempt, wait_fixed, retry_if_result
 import requests
+import socket
+from urllib.parse import urlparse
+from memoization import cached
 
 
 def get_exception_traceback():
@@ -67,7 +70,40 @@ class HttpResponse:
     def status_code(self):
         return self.resp.status
 
+@cached(ttl = 5)
+def _is_port_open(host, port, timeout=5):
+    """ Check if a port at a given address is open. """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    result = sock.connect_ex((host, port))
+    sock.close()
+    return result == 0
 
+def _should_retry(retry_state: RetryCallState):
+    if retry_state.outcome is None:
+        raise RuntimeError("_should_retry called before outcome was set")
+    if retry_state.outcome.failed:
+        url = retry_state.args[0]  # Assumes the first argument to the function is the URL
+        exception = retry_state.outcome.exception()
+        if exception is None:
+            raise RuntimeError("_should_retry outcome failed but the exception is None")
+        try:
+            parsed_url = urlparse(url)
+            host = parsed_url.hostname
+            port = parsed_url.port
+            is_server_online = _is_port_open(host, port)
+        except:
+            is_server_online = False
+
+        if (isinstance(exception, ConnectionResetError)) and is_server_online:
+            print("ConnectionResetError: Retrying...")
+            return True
+    return False
+
+@retry(
+    wait=wait_fixed(1),
+    retry=_should_retry
+)
 def http_request(
     url, json=None, stream=False, auth_token=None, api_key=None, verify=None
 ):
