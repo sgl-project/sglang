@@ -86,9 +86,9 @@ def run_program_batch(
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
 
-    # Extract prefix by tracing and cache it
-    if len(batch_arguments) > 1:
-        pin_program(program, backend)
+    # Pre-cache the common prefix for a batch. The prefix is extracted by tracing the program.
+    if global_config.enable_precache_with_tracing and len(batch_arguments) > 1:
+        cache_program(program, backend)
 
     # Run all programs
     if num_threads == "auto":
@@ -154,21 +154,12 @@ def run_program_batch(
     return rets
 
 
-def pin_program(program, backend):
-    if global_config.enable_prefix_sharing and program.pin_prefix_rid is None:
-        # TODO: handle multiple backends
-        from sglang.lang.tracer import extract_prefix_by_tracing
+def cache_program(program, backend):
+    from sglang.lang.tracer import extract_prefix_by_tracing
 
-        prefix = extract_prefix_by_tracing(program, backend)
-        if prefix and len(prefix) > 64:
-            prefix_rid = backend.cache_prefix(prefix)
-            program.pin_prefix_rid = prefix_rid
-            return prefix_rid
-    return None
-
-
-def unpin_program(program, backend):
-    pass
+    prefix = extract_prefix_by_tracing(program, backend)
+    if prefix and len(prefix) > 64:
+        backend.cache_prefix(prefix)
 
 
 class StreamExecutor:

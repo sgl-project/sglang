@@ -16,7 +16,7 @@ class GlobalConfig:
 
         # Optimization configs
         self.eager_fill_image = False
-        self.enable_prefix_sharing = True
+        self.enable_precache_with_tracing = True
         self.enable_parallel_encoding = True
         self.enable_parallel_decoding = True
 
