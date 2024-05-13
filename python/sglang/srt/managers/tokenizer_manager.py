@@ -98,7 +98,6 @@ class TokenizerManager:
         self.hf_config = get_config(
             self.model_path, trust_remote_code=server_args.trust_remote_code
         )
-
         self.context_len = get_context_length(self.hf_config)
 
         if is_multimodal_model(self.model_path):
@@ -155,6 +154,12 @@ class TokenizerManager:
                 input_ids = self.tokenizer.encode(obj.text)
             else:
                 input_ids = obj.input_ids
+
+            if len(input_ids) >= self.context_len:
+                raise ValueError(
+                    f"The input ({len(input_ids)} tokens) is longer than the "
+                    f"model's context length ({self.context_len} tokens)"
+                )
 
             sampling_params = SamplingParams(**obj.sampling_params)
             if sampling_params.max_new_tokens != 0:

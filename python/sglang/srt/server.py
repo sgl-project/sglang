@@ -20,7 +20,7 @@ import requests
 import uvicorn
 import uvloop
 from fastapi import FastAPI, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.constrained import disable_cache
@@ -90,8 +90,11 @@ async def generate_request(obj: GenerateReqInput):
 
         return StreamingResponse(stream_results(), media_type="text/event-stream")
 
-    ret = await tokenizer_manager.generate_request(obj).__anext__()
-    return ret
+    try:
+        ret = await tokenizer_manager.generate_request(obj).__anext__()
+        return ret
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
 @app.post("/v1/completions")
