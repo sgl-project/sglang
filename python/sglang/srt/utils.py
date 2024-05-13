@@ -4,9 +4,7 @@ import base64
 import os
 import random
 import socket
-import sys
 import time
-import traceback
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
 from typing import List, Optional
@@ -19,6 +17,8 @@ from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
+
+from sglang.utils import get_exception_traceback
 
 show_time_cost = False
 time_infos = {}
@@ -90,6 +90,32 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
+def get_available_gpu_memory(gpu_id, distributed=True):
+    """
+    Get available memory for cuda:gpu_id device.
+    When distributed is True, the available memory is the minimum available memory of all GPUs.
+    """
+    num_gpus = torch.cuda.device_count()
+    assert gpu_id < num_gpus
+
+    if torch.cuda.current_device() != gpu_id:
+        print(
+            f"WARNING: current device is not {gpu_id}, but {torch.cuda.current_device()}, ",
+            "which may cause useless memory allocation for torch CUDA context.",
+        )
+
+    free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+
+    if distributed:
+        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
+            torch.device("cuda", gpu_id)
+        )
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
+        free_gpu_memory = tensor.item()
+
+    return free_gpu_memory / (1 << 30)
+
+
 def set_random_seed(seed: int) -> None:
     random.seed(seed)
 
@@ -158,12 +184,6 @@ def allocate_init_ports(
 
     additional_ports = can_use_ports[: 4 + tp_size]
     return port, additional_ports
-
-
-def get_exception_traceback():
-    etype, value, tb = sys.exc_info()
-    err_str = "".join(traceback.format_exception(etype, value, tb))
-    return err_str
 
 
 def get_int_token_logit_bias(tokenizer, vocab_size):

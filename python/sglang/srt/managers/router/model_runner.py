@@ -17,8 +17,8 @@ from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
-from sglang.srt.utils import is_multimodal_model
-from sglang.utils import get_available_gpu_memory
+from sglang.srt.utils import is_multimodal_model, get_available_gpu_memory
+
 
 QUANTIZATION_CONFIG_MAPPING = {
     "awq": AWQConfig,
@@ -110,8 +110,8 @@ class InputMetadata:
         self.kv_last_page_len = torch.ones(
             (self.batch_size,), dtype=torch.int32, device="cuda"
         )
-        req_pool_indices_cpu = self.req_pool_indices.cpu().tolist()
-        seq_lens_cpu = self.seq_lens.tolist()
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
         self.kv_indices = torch.cat(
             [
                 self.req_to_token_pool.req_to_token[

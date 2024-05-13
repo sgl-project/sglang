@@ -138,6 +138,8 @@ class ModelRpcServer:
         self.out_pyobjs = []
         self.decode_forward_ct = 0
         self.stream_interval = server_args.stream_interval
+        self.num_generated_tokens = 0
+        self.last_stats_tic = time.time()
 
         # Init the FSM cache for constrained generation
         self.regex_fsm_cache = FSMCache(
@@ -214,6 +216,7 @@ class ModelRpcServer:
             if self.running_batch is not None:
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(10):
+                    self.num_generated_tokens += len(self.running_batch.reqs)
                     self.forward_decode_batch(self.running_batch)
 
                     if self.running_batch.is_empty():
@@ -229,10 +232,14 @@ class ModelRpcServer:
                                 self.token_to_kv_pool.available_size()
                                 + self.tree_cache.evictable_size()
                             )
+                            throuhgput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
+                            self.num_generated_tokens = 0
+                            self.last_stats_tic = time.time()
                             logger.info(
                                 f"#running-req: {len(self.running_batch.reqs)}, "
                                 f"#token: {num_used}, "
                                 f"token usage: {num_used / self.max_total_num_token:.2f}, "
+                                f"gen throughput (token/s): {throuhgput:.2f}, "
                                 f"#queue-req: {len(self.forward_queue)}"
                             )
             else:
@@ -429,7 +436,9 @@ class ModelRpcServer:
             # Only transfer the selected logprobs of the next token to CPU to reduce overhead.
             if last_logprobs is not None:
                 last_token_logprobs = (
-                    last_logprobs[torch.arange(len(batch.reqs)), next_token_ids].tolist()
+                    last_logprobs[
+                        torch.arange(len(batch.reqs), device=next_token_ids.device),
+                        next_token_ids].tolist()
                 )
 
             next_token_ids = next_token_ids.tolist()
@@ -590,6 +599,7 @@ class ModelRpcServer:
                     - req.prompt_tokens,
                     "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
                     "finish_reason": str(req.finish_reason),  # FIXME: convert to the correct string
+                    "hit_stop_str": req.hit_stop_str,
                 }
                 if req.return_logprob:
                     (
