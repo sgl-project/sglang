@@ -17,8 +17,8 @@ from vllm.distributed import initialize_model_parallel
 
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
-from sglang.srt.utils import is_multimodal_model
-from sglang.utils import get_available_gpu_memory
+from sglang.srt.utils import is_multimodal_model, get_available_gpu_memory
+
 
 QUANTIZATION_CONFIG_MAPPING = {
     "awq": AWQConfig,
