@@ -335,19 +335,19 @@ class Batch:
             req = self.reqs[idx]
             retracted_reqs.append(req)
 
-            self.tree_cache.dec_ref_counter(req.last_node)
+            # TODO: apply more fine-grained retraction
+            last_uncached_pos = len(req.prefix_indices)
+            token_indices = self.req_to_token_pool.req_to_token[
+                req_pool_indices_cpu[idx]
+            ][last_uncached_pos : seq_lens_cpu[idx]]
+            self.token_to_kv_pool.dec_refs(token_indices)
+
+            self.tree_cache.dec_lock_ref(req.last_node)
             req.prefix_indices = None
             req.last_node = None
             req.extend_input_len = 0
             req.output_ids = []
             req.regex_fsm_state = 0
-
-            # TODO: apply more fine-grained retraction
-
-            token_indices = self.req_to_token_pool.req_to_token[
-                req_pool_indices_cpu[idx]
-            ][: seq_lens_cpu[idx]]
-            self.token_to_kv_pool.dec_refs(token_indices)
 
         self.filter_batch(sorted_indices)
 
@@ -367,20 +367,18 @@ class Batch:
                     if len(jump_forward_str) <= 1:
                         continue
 
-                    # insert the old request into tree_cache
-                    token_ids_in_memory = tuple(req.input_ids + req.output_ids)[:-1]
                     if req_pool_indices_cpu is None:
                         req_pool_indices_cpu = self.req_pool_indices.tolist()
-                    req_pool_idx = req_pool_indices_cpu[i]
-                    indices = self.req_to_token_pool.req_to_token[
-                        req_pool_idx, : len(token_ids_in_memory)
-                    ]
-                    prefix_len = self.tree_cache.insert(
-                        token_ids_in_memory, indices.clone()
+
+                    # insert the old request into tree_cache
+                    self.tree_cache.cache_req(
+                        token_ids=tuple(req.input_ids + req.output_ids)[:-1],
+                        last_uncached_pos=len(req.prefix_indices),
+                        req_pool_idx=req_pool_indices_cpu[i],
                     )
-                    self.token_to_kv_pool.dec_refs(indices[:prefix_len])
-                    self.req_to_token_pool.free(req_pool_idx)
-                    self.tree_cache.dec_ref_counter(req.last_node)
+
+                    # unlock the last node
+                    self.tree_cache.dec_lock_ref(req.last_node)
 
                     # jump-forward
                     req.jump_forward_and_retokenize(jump_forward_str, next_state)

@@ -117,7 +117,11 @@ class ModelRpcServer:
             logger.info(f"server_args: {server_args.print_mode_args()}")
 
         # Init cache
-        self.tree_cache = RadixCache(disable=server_args.disable_radix_cache)
+        self.tree_cache = RadixCache(
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            disable=server_args.disable_radix_cache,
+        )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.scheduler = Scheduler(
             self.schedule_heuristic,
@@ -202,6 +206,8 @@ class ModelRpcServer:
         if new_batch is not None:
             # Run new fill batch
             self.forward_fill_batch(new_batch)
+
+            self.cache_filled_batch(new_batch)
 
             if not new_batch.is_empty():
                 if self.running_batch is None:
@@ -349,20 +355,19 @@ class ModelRpcServer:
                 and req.extend_input_len + new_batch_input_tokens
                 < self.max_prefill_num_token
             ):
-                delta = self.tree_cache.inc_ref_counter(req.last_node)
+                delta = self.tree_cache.inc_lock_ref(req.last_node)
                 available_size += delta
 
                 if not (
                     req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
                     < available_size
                 ):
-                    # Undo the insertion
-                    delta = self.tree_cache.dec_ref_counter(req.last_node)
+                    # Undo locking
+                    delta = self.tree_cache.dec_lock_ref(req.last_node)
                     available_size += delta
                     break
                 else:
                     # Add this request to the running batch
-                    self.token_to_kv_pool.add_refs(req.prefix_indices)
                     can_run_list.append(req)
                     new_batch_total_tokens += (
                         req.extend_input_len + req.max_new_tokens()
@@ -476,6 +481,18 @@ class ModelRpcServer:
             pt += req.extend_input_len
 
         self.handle_finished_requests(batch)
+
+    def cache_filled_batch(self, batch: Batch):
+        req_pool_indices_cpu = batch.req_pool_indices.cpu().tolist()
+        for i, req in enumerate(batch.reqs):
+            new_prefix_indices, new_last_node = self.tree_cache.cache_req(
+                token_ids=tuple(req.input_ids + req.output_ids)[:-1],
+                last_uncached_pos=len(req.prefix_indices),
+                req_pool_idx=req_pool_indices_cpu[i],
+                del_in_memory_pool=False,
+                old_last_node=req.last_node,
+            )
+            req.prefix_indices, req.last_node = new_prefix_indices, new_last_node
 
     def forward_decode_batch(self, batch: Batch):
         # check if decode out of memory
@@ -636,17 +653,13 @@ class ModelRpcServer:
             req_pool_indices_cpu = batch.req_pool_indices.tolist()
             for i in finished_indices:
                 req = batch.reqs[i]
-                req_pool_idx = req_pool_indices_cpu[i]
-                token_ids = tuple(req.input_ids + req.output_ids)
-                seq_len = len(token_ids) - 1
-                indices = self.req_to_token_pool.req_to_token[req_pool_idx, :seq_len]
-                prefix_len = self.tree_cache.insert(
-                    token_ids[:seq_len], indices.clone()
+                self.tree_cache.cache_req(
+                    token_ids=tuple(req.input_ids + req.output_ids)[:-1],
+                    last_uncached_pos=len(req.prefix_indices),
+                    req_pool_idx=req_pool_indices_cpu[i],
                 )
 
-                self.token_to_kv_pool.dec_refs(indices[:prefix_len])
-                self.req_to_token_pool.free(req_pool_idx)
-                self.tree_cache.dec_ref_counter(req.last_node)
+                self.tree_cache.dec_lock_ref(req.last_node)
 
             # Update batch tensors
             if unfinished_indices:

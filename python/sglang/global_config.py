@@ -25,5 +25,8 @@ class GlobalConfig:
         # adjust_cache: Adjust the position embedding of KV cache.
         self.concate_and_append_mode = "no_adjust"
 
+        # Request dependency time due to network delay
+        self.request_dependency_time = 0.03
+
 
 global_config = GlobalConfig()
