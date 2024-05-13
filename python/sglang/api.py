@@ -153,7 +153,7 @@ def image(expr: SglExpr):
 
 
 def video(path: str, num_frames: int):
-    return SglVideo(str, num_frames)
+    return SglVideo(path, num_frames)
 
 
 def select(

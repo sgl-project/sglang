@@ -16,8 +16,11 @@
 
 
 # Replace `K`, `YOUR_VIDEO_PATH`, `YOUR_MODEL_PATH`, and `FRAMES_PER_VIDEO` with your specific details.
+CURRENT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-cd sglang_video
+echo ${CURRENT_ROOT}
+
+cd ${CURRENT_ROOT}
 
 export PYTHONWARNINGS=ignore
 
@@ -89,7 +92,8 @@ for IDX in $(seq 1 $LOCAL_CHUNKS); do
         while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ $COMMAND_STATUS -ne 0 ]; do
             echo "Running chunk $(($LOCAL_IDX - 1)) on GPUs $CHUNK_GPUS_STR with port $PORT. Attempt $(($RETRY_COUNT + 1))"
             
-            CUDA_VISIBLE_DEVICES=$CHUNK_GPUS_STR python3 examples/quick_start/srt_example_llava_v.py \
+#!/bin/bash
+            CUDA_VISIBLE_DEVICES=$CHUNK_GPUS_STR python3 examples/usage/llava_video/srt_example_llava_v.py \
             --port $PORT \
             --num-chunks $ALL_CHUNKS \
             --chunk-idx $(($LOCAL_IDX - 1)) \
