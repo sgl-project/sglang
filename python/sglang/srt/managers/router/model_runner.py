@@ -115,7 +115,7 @@ class InputMetadata:
         self.kv_indices = torch.cat(
             [
                 self.req_to_token_pool.req_to_token[
-                    req_pool_indices_cpu[i]: seq_lens_cpu[i]
+                    req_pool_indices_cpu[i], : seq_lens_cpu[i]
                 ]
                 for i in range(self.batch_size)
             ],

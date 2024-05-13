@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import dataclasses
+import logging
 import multiprocessing as mp
 import os
 from typing import List
@@ -30,6 +31,8 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_exception_traceback, is_multimodal_model, load_image
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -144,11 +147,15 @@ class TokenizerManager:
         if self.to_create_loop:
             await self.create_handle_loop()
 
-        is_single = isinstance(obj.text, str)
-
+        is_single = obj.is_single
         if is_single:
             rid = obj.rid
-            input_ids = self.tokenizer.encode(obj.text)
+
+            if obj.input_ids is None:
+                input_ids = self.tokenizer.encode(obj.text)
+            else:
+                input_ids = obj.input_ids
+
             sampling_params = SamplingParams(**obj.sampling_params)
             if sampling_params.max_new_tokens != 0:
                 sampling_params.normalize(self.tokenizer)
@@ -185,10 +192,15 @@ class TokenizerManager:
 
             while True:
                 await event.wait()
-                yield self.convert_logprob_style(state.out_list[-1],
+                out = self.convert_logprob_style(state.out_list[-1],
                                                  obj.return_logprob,
                                                  obj.top_logprobs_num,
                                                  obj.return_text_in_logprobs)
+
+                if self.server_args.log_requests and state.finished:
+                    logger.info(f"in={obj.text}, out={out}")
+
+                yield out
                 state.out_list = []
                 if state.finished:
                     del self.rid_to_state[rid]
@@ -196,10 +208,22 @@ class TokenizerManager:
                 event.clear()
         else:
             assert obj.stream is False
-            bs = len(obj.text)
+
+            if obj.input_ids is None:
+                bs = len(obj.text)
+            else:
+                bs = len(obj.input_ids)
+
             for i in range(bs):
                 rid = obj.rid[i]
-                input_ids = self.tokenizer.encode(obj.text[i])
+
+                if obj.input_ids is None:
+                    input_text = obj.text[i]
+                    input_ids = self.tokenizer.encode(obj.text[i])
+                else:
+                    input_text = None
+                    input_ids = obj.input_ids[i]
+
                 sampling_params = SamplingParams(**obj.sampling_params[i])
                 if sampling_params.max_new_tokens != 0:
                     sampling_params.normalize(self.tokenizer)
@@ -212,7 +236,7 @@ class TokenizerManager:
                     )
                 tokenized_obj = TokenizedGenerateReqInput(
                     rid=rid,
-                    input_text=obj.text[i],
+                    input_text=input_text,
                     input_ids=input_ids,
                     pixel_values=pixel_values,
                     image_hash=image_hash,

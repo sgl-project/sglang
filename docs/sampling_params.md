@@ -8,6 +8,8 @@ The `/generate` endpoint accepts the following arguments in the JSON format.
 class GenerateReqInput:
     # The input prompt
     text: Union[List[str], str]
+    # The token ids for text; one can either specify text or input_ids
+    input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The image input
     image_data: Optional[Union[List[str], str]] = None
     # The sampling_params

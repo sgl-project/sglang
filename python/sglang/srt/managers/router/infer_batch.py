@@ -85,6 +85,9 @@ class Req:
         )
         if first_token.startswith("▁"):
             old_output_str = " " + old_output_str
+        if self.input_text is None:
+            # TODO(lmzheng): This can be wrong. Check with Liangsheng.
+            self.input_text = self.tokenizer.decode(self.input_ids)
         new_input_string = (
             self.input_text
             + self.output_and_jump_forward_str
