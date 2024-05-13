@@ -12,7 +12,6 @@ from json import dumps
 import numpy as np
 import requests
 
-# from decord import VideoReader, cpu
 
 
 def get_available_gpu_memory(gpu_id, distributed=True):
