@@ -72,8 +72,7 @@ def get_pixel_values(
             image_hash = hash(image_data)
             if image_aspect_ratio == "pad":
                 image = expand2square(
-                    image,
-                    tuple(int(x * 255) for x in processor.image_processor.image_mean),
+                    image, tuple(int(x * 255) for x in processor.image_processor.image_mean)
                 )
                 pixel_values = processor.image_processor(image)["pixel_values"][0]
             elif image_aspect_ratio == "anyres":
@@ -82,10 +81,8 @@ def get_pixel_values(
                 )
             else:
                 pixel_values = processor.image_processor(image)["pixel_values"][0]
-
             pixel_values = pixel_values.astype(np.float16)
             return pixel_values, image_hash, image.size
-
     except Exception:
         print("Exception in TokenizerManager:\n" + get_exception_traceback())
 

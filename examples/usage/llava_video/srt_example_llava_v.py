@@ -25,18 +25,6 @@ def single(path, num_frames=16):
     print(state["answer"], "\n")
 
 
-# def stream():
-#     state = image_qa.run(
-#         image_path="/mnt/bn/vl-research/workspace/yhzhang/sglang_video/examples/quick_start/images/cat.jpeg",
-#         question="What is this?",
-#         max_new_tokens=64,
-#         stream=True,
-#     )
-
-#     for out in state.text_iter("answer"):
-#         print(out, end="", flush=True)
-#     print()
-
 
 def split_into_chunks(lst, num_chunks):
     """Split a list into a specified number of chunks."""
@@ -132,8 +120,8 @@ if __name__ == "__main__":
     parser.add_argument('--chunk-idx', type=int, default=0, help='The index of the chunk to process.')
     parser.add_argument('--num-chunks', type=int, default=8, help='The number of chunks to process.')
     parser.add_argument('--save-dir', type=str, default="./work_dirs/llava_video", help='The directory to save the processed video files.')
-    parser.add_argument('--video-dir', type=str, help='The directory to save the processed video files.')
-    parser.add_argument('--model-path', type=str, default="lmms-lab/LLaVA-NeXT-Video-34B", help='The model path for the video processing.')
+    parser.add_argument('--video-dir', type=str, default="./videos/Q98Z4OTh8RwmDonc.mp4", help='The directory or path for the processed video files.')
+    parser.add_argument('--model-path', type=str, default="lmms-lab/LLaVA-NeXT-Video-7B", help='The model path for the video processing.')
     parser.add_argument('--num-frames', type=int, default=16, help='The number of frames to process in each video.' )
     parser.add_argument("--mm_spatial_pool_stride", type=int, default=2)
 
@@ -193,8 +181,11 @@ if __name__ == "__main__":
     # Run a single request
     # try:
     print("\n========== single ==========\n")
-    root = "/mnt/bn/vl-research/workspace/yhzhang/data/sora/"
-    video_files = [os.path.join(root, f) for f in os.listdir(root) if f.endswith(('.mp4', '.avi', '.mov'))]  # Add more extensions if needed
+    root = args.video_dir
+    if os.path.isfile(root):
+        video_files = [root]
+    else:
+        video_files = [os.path.join(root, f) for f in os.listdir(root) if f.endswith(('.mp4', '.avi', '.mov'))]  # Add more extensions if needed
     start_time = time.time()  # Start time for processing a single video
     for cur_video in video_files[:1]:
         print(cur_video)

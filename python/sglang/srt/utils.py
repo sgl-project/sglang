@@ -381,7 +381,7 @@ def load_image(image_file):
     else:
         image = Image.open(BytesIO(base64.b64decode(image_file)))
 
-    return image
+    return image, None
 
 
 def assert_pkg_version(pkg: str, min_version: str):
