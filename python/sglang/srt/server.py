@@ -234,7 +234,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 class Runtime:
     def __init__(
         self,
-        log_evel="error",
+        log_evel: str = "error",
         model_overide_args: Optional[dict] = None,
         *args,
         **kwargs,

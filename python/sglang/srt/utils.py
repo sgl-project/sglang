@@ -281,7 +281,6 @@ def is_multimodal_model(model):
 
 
 def decode_video_base64(video_base64):
-    import torch.distributed as dist
     from PIL import Image
 
     # Decode the base64 string
@@ -363,7 +362,7 @@ def decode_video_base64(video_base64):
 def load_image(image_file):
     from PIL import Image
 
-    image = None
+    image = image_size = None
 
     if image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
@@ -377,11 +376,10 @@ def load_image(image_file):
     elif image_file.startswith("video:"):
         image_file = image_file.replace("video:", "")
         image, image_size = decode_video_base64(image_file)
-        return image, image_size
     else:
         image = Image.open(BytesIO(base64.b64decode(image_file)))
 
-    return image, None
+    return image, image_size
 
 
 def assert_pkg_version(pkg: str, min_version: str):

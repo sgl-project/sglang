@@ -56,12 +56,12 @@ if __name__ == "__main__":
     print("\n========== single ==========\n")
     single()
 
-    # # Stream output
-    # print("\n========== stream ==========\n")
-    # stream()
+    # Stream output
+    print("\n========== stream ==========\n")
+    stream()
 
-    # # Run a batch of requests
-    # print("\n========== batch ==========\n")
-    # batch()
+    # Run a batch of requests
+    print("\n========== batch ==========\n")
+    batch()
 
     runtime.shutdown()
