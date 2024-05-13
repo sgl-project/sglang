@@ -326,8 +326,10 @@ response = client.chat.completions.create(
 print(response)
 ```
 
-In above example, the server uses the chat template specified in the model tokenizer.
-You can override the chat template if needed when launching the server:
+By default, the server uses the chat template specified in the model tokenizer from Hugging Face.
+It should just work for most official models such as llama-2 and llama-3.
+
+If needed, you can also override the chat template when launching the server:
 
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --chat-template llama-2
