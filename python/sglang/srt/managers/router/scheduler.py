@@ -31,8 +31,6 @@ class Scheduler:
             last_node_to_reqs = defaultdict(list)
             for req in forward_queue:
                 last_node_to_reqs[req.last_node].append(req)
-            for node in last_node_to_reqs:
-                last_node_to_reqs[node].sort(key=lambda x: -len(x.prefix_indices))
 
             node_to_weight = defaultdict(int)
             for node in last_node_to_reqs:

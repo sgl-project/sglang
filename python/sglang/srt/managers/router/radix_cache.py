@@ -69,7 +69,7 @@ class RadixCache:
         token_ids,
         last_uncached_pos,
         req_pool_idx,
-        finished=True,
+        del_in_memory_pool=True,
         old_last_node=None,
     ):
         # Insert the request into radix cache
@@ -79,7 +79,7 @@ class RadixCache:
         # Radix Cache takes one ref in memory pool
         self.token_to_kv_pool.dec_refs(indices[last_uncached_pos:new_prefix_len])
 
-        if finished:
+        if del_in_memory_pool:
             self.req_to_token_pool.free(req_pool_idx)
         else:
             cached_indices, new_last_node = self.match_prefix(token_ids)

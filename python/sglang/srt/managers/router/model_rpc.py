@@ -482,7 +482,7 @@ class ModelRpcServer:
                 token_ids=tuple(req.input_ids + req.output_ids)[:-1],
                 last_uncached_pos=len(req.prefix_indices),
                 req_pool_idx=req_pool_indices_cpu[i],
-                finished=False,
+                del_in_memory_pool=False,
                 old_last_node=req.last_node,
             )
             req.prefix_indices, req.last_node = new_prefix_indices, new_last_node
