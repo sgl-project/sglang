@@ -30,10 +30,17 @@ def get_config_json(model_path: str):
     return config
 
 
-def get_config(model: str, trust_remote_code: bool, revision: Optional[str] = None):
+def get_config(
+    model: str,
+    trust_remote_code: bool,
+    revision: Optional[str] = None,
+    model_overide_args: Optional[dict] = None,
+):
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision
     )
+    if model_overide_args:
+        config.update(model_overide_args)
     return config
 
 

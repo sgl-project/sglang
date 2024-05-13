@@ -60,9 +60,7 @@ class RouterManager:
 
 
 def start_router_process(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-    pipe_writer,
+    server_args: ServerArgs, port_args: PortArgs, pipe_writer, model_overide_args
 ):
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
@@ -70,7 +68,7 @@ def start_router_process(
     )
 
     try:
-        model_client = ModelRpcClient(server_args, port_args)
+        model_client = ModelRpcClient(server_args, port_args, model_overide_args)
         router = RouterManager(model_client, port_args)
     except Exception:
         pipe_writer.send(get_exception_traceback())
