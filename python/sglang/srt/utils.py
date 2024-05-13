@@ -247,15 +247,17 @@ def wrap_kernel_launcher(kernel):
 
 
 def is_multimodal_model(model):
+    from sglang.srt.model_config import ModelConfig
+
     if isinstance(model, str):
         model = model.lower()
         return "llava" in model or "yi-vl" in model or "llava-next" in model
-    from sglang.srt.model_config import ModelConfig
 
     if isinstance(model, ModelConfig):
         model_path = model.path.lower()
-        return "llava" in model_path or "yi-vl" in model_path or "llava-next" in model
-    raise Exception("unrecognized type")
+        return "llava" in model_path or "yi-vl" in model_path or "llava-next" in model_path
+
+    raise ValueError("unrecognized type")
 
 
 def decode_video_base64(video_base64):
