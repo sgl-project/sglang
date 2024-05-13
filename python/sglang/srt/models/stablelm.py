@@ -7,35 +7,31 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.router.model_runner import InputMetadata
+from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
 
 
 class StablelmMLP(nn.Module):
     def __init__(
-        self, config: PretrainedConfig, quant_config: Optional[QuantizationConfig] = None,
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -48,7 +44,10 @@ class StablelmMLP(nn.Module):
             quant_config=quant_config,
         )
         self.down_proj = RowParallelLinear(
-            config.intermediate_size, config.hidden_size, bias=False, quant_config=quant_config,
+            config.intermediate_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
         )
         self.act_fn = SiluAndMul()
 
@@ -181,7 +180,9 @@ class StablelmDecoderLayer(nn.Module):
 
 class StableLMEpochModel(nn.Module):
     def __init__(
-        self, config: PretrainedConfig, quant_config: Optional[QuantizationConfig] = None,
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(

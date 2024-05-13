@@ -3,6 +3,7 @@ from typing import Any, Dict, Optional
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -10,24 +11,17 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.router.model_runner import InputMetadata
+from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
 
 
 class QWenMLP(nn.Module):
@@ -132,7 +126,12 @@ class QWenAttention(nn.Module):
 
 
 class QWenBlock(nn.Module):
-    def __init__(self, config: PretrainedConfig, layer_id, quant_config: Optional[QuantizationConfig] = None,):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
         super().__init__()
         self.ln_1 = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
@@ -181,7 +180,11 @@ class QWenBlock(nn.Module):
 
 
 class QWenModel(nn.Module):
-    def __init__(self, config: PretrainedConfig, quant_config: Optional[QuantizationConfig] = None,):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -218,7 +221,11 @@ class QWenModel(nn.Module):
 
 
 class QWenLMHeadModel(nn.Module):
-    def __init__(self, config: PretrainedConfig, quant_config: Optional[QuantizationConfig] = None,):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
         super().__init__()
         self.config = config
         self.transformer = QWenModel(config, quant_config=quant_config)
