@@ -114,7 +114,7 @@ def encode_image_base64(image_path):
 
 
 def encode_frame(frame):
-    import cv2
+    import cv2  # pip install opencv-python-headless
     from PIL import Image
 
     # Convert the frame to RGB (OpenCV uses BGR by default)
