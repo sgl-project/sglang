@@ -138,6 +138,7 @@ def encode_frame(frame):
 
 def encode_video_base64(video_path, num_frames=16):
     import cv2
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Could not open video file:{video_path}")
