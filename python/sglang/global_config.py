@@ -16,7 +16,7 @@ class GlobalConfig:
 
         # Optimization configs
         self.eager_fill_image = False
-        self.enable_prefix_sharing = True
+        self.enable_precache_with_tracing = True
         self.enable_parallel_encoding = True
         self.enable_parallel_decoding = True
 
@@ -24,6 +24,9 @@ class GlobalConfig:
         # no_adjust: Do not adjust the position embedding of KV cache.
         # adjust_cache: Adjust the position embedding of KV cache.
         self.concate_and_append_mode = "no_adjust"
+
+        # Request dependency time due to network delay
+        self.request_dependency_time = 0.03
 
 
 global_config = GlobalConfig()

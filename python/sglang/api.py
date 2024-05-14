@@ -1,5 +1,6 @@
 """Some Public API Definitions"""
 
+import os
 import re
 from typing import Callable, List, Optional, Union
 
@@ -14,6 +15,7 @@ from sglang.lang.ir import (
     SglRoleBegin,
     SglRoleEnd,
     SglSelect,
+    SglVideo,
 )
 
 
@@ -31,6 +33,7 @@ def function(
 
 def Runtime(*args, **kwargs):
     # Avoid importing unnecessary dependency
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     from sglang.srt.server import Runtime
 
     return Runtime(*args, **kwargs)
@@ -147,6 +150,10 @@ def gen_string(
 
 def image(expr: SglExpr):
     return SglImage(expr)
+
+
+def video(path: str, num_frames: int):
+    return SglVideo(path, num_frames)
 
 
 def select(

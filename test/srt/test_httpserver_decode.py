@@ -3,7 +3,6 @@ Usage:
 python3 -m sglang.launch_server --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --port 30000
 python3 test_httpserver_decode.py
 
-
 Output:
 The capital of France is Paris.\nThe capital of the United States is Washington, D.C.\nThe capital of Canada is Ottawa.\nThe capital of Japan is Tokyo
 """
@@ -23,6 +22,7 @@ def test_decode(url, return_logprob, top_logprobs_num, return_text):
                 "temperature": 0,
                 "max_new_tokens": 32,
             },
+            "stream": False,
             "return_logprob": return_logprob,
             "top_logprobs_num": top_logprobs_num,
             "return_text_in_logprobs": return_text,

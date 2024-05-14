@@ -28,8 +28,9 @@ from sglang.lang.ir import (
     SglVariable,
     SglVarScopeBegin,
     SglVarScopeEnd,
+    SglVideo,
 )
-from sglang.utils import encode_image_base64
+from sglang.utils import encode_image_base64, encode_video_base64, get_exception_traceback
 
 
 def run_internal(state, program, func_args, func_kwargs, sync):
@@ -86,9 +87,9 @@ def run_program_batch(
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
 
-    # Extract prefix by tracing and cache it
-    if len(batch_arguments) > 1:
-        pin_program(program, backend)
+    # Pre-cache the common prefix for a batch. The prefix is extracted by tracing the program.
+    if global_config.enable_precache_with_tracing and len(batch_arguments) > 1:
+        cache_program(program, backend)
 
     # Run all programs
     if num_threads == "auto":
@@ -154,21 +155,12 @@ def run_program_batch(
     return rets
 
 
-def pin_program(program, backend):
-    if global_config.enable_prefix_sharing and program.pin_prefix_rid is None:
-        # TODO: handle multiple backends
-        from sglang.lang.tracer import extract_prefix_by_tracing
+def cache_program(program, backend):
+    from sglang.lang.tracer import extract_prefix_by_tracing
 
-        prefix = extract_prefix_by_tracing(program, backend)
-        if prefix and len(prefix) > 64:
-            prefix_rid = backend.cache_prefix(prefix)
-            program.pin_prefix_rid = prefix_rid
-            return prefix_rid
-    return None
-
-
-def unpin_program(program, backend):
-    pass
+    prefix = extract_prefix_by_tracing(program, backend)
+    if prefix and len(prefix) > 64:
+        backend.cache_prefix(prefix)
 
 
 class StreamExecutor:
@@ -195,6 +187,7 @@ class StreamExecutor:
         self.variable_event = {}  # Dict[name: str -> event: threading.Event]
         self.meta_info = {}  # Dict[name: str -> info: str]
         self.is_finished = False
+        self.error = None
 
         # For completion
         self.text_ = ""  # The full text
@@ -310,16 +303,38 @@ class StreamExecutor:
         self.backend.end_program(self)
 
     def _thread_worker_func(self):
+        error = None
+
         while True:
             expr = self.queue.get()
             if expr is None:
                 self.queue.task_done()
                 break
 
-            self._execute(expr)
+            try:
+                self._execute(expr)
+            except Exception as e:
+                # print(f"Error in stream_executor: {get_exception_traceback()}")
+                error = e
+                break
             self.queue.task_done()
             if self.stream_text_event:
                 self.stream_text_event.set()
+
+        # Clean the queue and events
+        if error is not None:
+            try:
+                while True:
+                    self.queue.task_done()
+                    self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            for name in self.variable_event:
+                self.variable_event[name].set()
+            if self.stream_var_event:
+                for name in self.stream_var_event:
+                    self.stream_var_event[name].set()
+            self.error = error
 
         if self.stream_text_event:
             self.stream_text_event.set()
@@ -347,6 +362,8 @@ class StreamExecutor:
             self._execute_role_end(other)
         elif isinstance(other, SglImage):
             self._execute_image(other)
+        elif isinstance(other, SglVideo):
+            self._execute_video(other)
         elif isinstance(other, SglVariable):
             self._execute_variable(other)
         elif isinstance(other, SglVarScopeBegin):
@@ -378,6 +395,16 @@ class StreamExecutor:
         path = expr.path
 
         base64_data = encode_image_base64(path)
+
+        self.images_.append((path, base64_data))
+        self.cur_images.append((path, base64_data))
+        self.text_ += self.chat_template.image_token
+
+    def _execute_video(self, expr: SglVideo):
+        path = expr.path
+        num_frames = expr.num_frames
+
+        base64_data = encode_video_base64(path, num_frames)
 
         self.images_.append((path, base64_data))
         self.cur_images.append((path, base64_data))
@@ -681,6 +708,9 @@ class ProgramState:
     def sync(self):
         return self.stream_executor.sync()
 
+    def error(self):
+        return self.stream_executor.error
+
     def text_iter(self, var_name: Optional[str] = None):
         if self.stream_executor.stream:
             prev = 0
@@ -768,6 +798,9 @@ class ProgramState:
 
     def __setitem__(self, name, value):
         self.set_var(name, value)
+
+    def __contains__(self, name):
+        return name in self.stream_executor.variables
 
     def __del__(self):
         self.stream_executor.end()

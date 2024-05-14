@@ -193,17 +193,11 @@ class SglFunction:
         backend = backend or global_config.default_backend
         return trace_program(self, kwargs, backend)
 
-    def pin(self, backend=None):
-        from sglang.lang.interpreter import pin_program
+    def cache(self, backend=None):
+        from sglang.lang.interpreter import cache_program
 
         backend = backend or global_config.default_backend
-        return pin_program(self, backend)
-
-    def unpin(self, backend=None):
-        from sglang.lang.interpreter import unpin_program
-
-        backend = backend or global_config.default_backend
-        return unpin_program(self, backend)
+        return cache_program(self, backend)
 
     def compile(self, *, backend=None):
         from sglang.lang.compiler import compile_func
@@ -334,6 +328,15 @@ class SglImage(SglExpr):
 
     def __repr__(self) -> str:
         return f"SglImage({self.path})"
+
+
+class SglVideo(SglExpr):
+    def __init__(self, path, num_frames):
+        self.path = path
+        self.num_frames = num_frames
+
+    def __repr__(self) -> str:
+        return f"SglVideo({self.path}, {self.num_frames})"
 
 
 class SglGen(SglExpr):

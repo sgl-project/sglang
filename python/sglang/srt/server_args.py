@@ -34,6 +34,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
+    log_requests: bool = False
     disable_log_stats: bool = False
     log_stats_interval: int = 10
     show_time_cost: bool = False
@@ -79,10 +80,12 @@ class ServerArgs:
             default=ServerArgs.tokenizer_path,
             help="The path of the tokenizer.",
         )
-        parser.add_argument("--host", type=str, default=ServerArgs.host,
-                            help="The host of the server.")
-        parser.add_argument("--port", type=int, default=ServerArgs.port,
-                            help="The port of the server.")
+        parser.add_argument(
+            "--host", type=str, default=ServerArgs.host, help="The host of the server."
+        )
+        parser.add_argument(
+            "--port", type=int, default=ServerArgs.port, help="The port of the server."
+        )
         parser.add_argument(
             "--additional-ports",
             type=int,
@@ -148,7 +151,8 @@ class ServerArgs:
             "--schedule-heuristic",
             type=str,
             default=ServerArgs.schedule_heuristic,
-            help="Schudule mode: [lpm, weight, random, fcfs]",
+            choices=["lpm", "random", "fcfs", "dfs-weight"],
+            help="Scheduling Heuristic.",
         )
         parser.add_argument(
             "--schedule-conservativeness",
@@ -179,6 +183,11 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level,
             help="Logging level",
+        )
+        parser.add_argument(
+            "--log-requests",
+            action="store_true",
+            help="Log all requests",
         )
         parser.add_argument(
             "--disable-log-stats",
@@ -241,7 +250,7 @@ class ServerArgs:
     def print_mode_args(self):
         return (
             f"enable_flashinfer={self.enable_flashinfer}, "
-            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}"
+            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}, "
             f"disable_radix_cache={self.disable_radix_cache}, "
             f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
             f"disable_disk_cache={self.disable_disk_cache}, "

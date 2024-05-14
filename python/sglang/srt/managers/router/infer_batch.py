@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import IntEnum, auto
 from typing import List
 
 import numpy as np
@@ -9,16 +9,27 @@ from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
 
-class ForwardMode(Enum):
+class ForwardMode(IntEnum):
     PREFILL = auto()
     EXTEND = auto()
     DECODE = auto()
 
 
-class FinishReason(Enum):
-    LENGTH = auto()
+class FinishReason(IntEnum):
     EOS_TOKEN = auto()
+    LENGTH = auto()
     STOP_STR = auto()
+
+    @staticmethod
+    def to_str(reason):
+        if reason == FinishReason.EOS_TOKEN:
+            return None
+        elif reason == FinishReason.LENGTH:
+            return "length"
+        elif reason == FinishReason.STOP_STR:
+            return "stop"
+        else:
+            return None
 
 
 class Req:
@@ -31,6 +42,7 @@ class Req:
         # Since jump forward may retokenize the prompt with partial outputs,
         # we maintain the original prompt length to report the correct usage.
         self.prompt_tokens = len(input_ids)
+
         # The number of decoded tokens for token usage report. Note that
         # this does not include the jump forward tokens.
         self.completion_tokens_wo_jump_forward = 0
@@ -41,12 +53,11 @@ class Req:
         self.image_offset = 0
         self.pad_value = None
 
+        # Sampling parameters
         self.sampling_params = None
-        self.return_logprob = False
-        self.logprob_start_len = 0
-        self.top_logprobs_num = 0
         self.stream = False
 
+        # Check finish
         self.tokenizer = None
         self.finished = False
         self.finish_reason = None
@@ -56,13 +67,17 @@ class Req:
         self.prefix_indices = []
         self.last_node = None
 
+        # Logprobs
+        self.return_logprob = False
+        self.logprob_start_len = 0
+        self.top_logprobs_num = 0
+        self.normalized_prompt_logprob = None
         self.prefill_token_logprobs = None
         self.decode_token_logprobs = None
-        self.normalized_prompt_logprob = None
         self.prefill_top_logprobs = None
         self.decode_top_logprobs = None
 
-        # For constrained decoding
+        # Constrained decoding
         self.regex_fsm = None
         self.regex_fsm_state = 0
         self.jump_forward_map = None
@@ -81,6 +96,9 @@ class Req:
         )
         if first_token.startswith("▁"):
             old_output_str = " " + old_output_str
+        if self.input_text is None:
+            # TODO(lmzheng): This can be wrong. Check with Liangsheng.
+            self.input_text = self.tokenizer.decode(self.input_ids)
         new_input_string = (
             self.input_text
             + self.output_and_jump_forward_str
@@ -165,8 +183,8 @@ class Batch:
     out_cache_cont_end: torch.Tensor = None
 
     # for processing logprobs
-    top_logprobs_nums: List[int] = None
     return_logprob: bool = False
+    top_logprobs_nums: List[int] = None
 
     # for multimodal
     pixel_values: List[torch.Tensor] = None
@@ -321,26 +339,26 @@ class Batch:
         )
 
         retracted_reqs = []
-        seq_lens_np = self.seq_lens.cpu().numpy()
-        req_pool_indices_np = self.req_pool_indices.cpu().numpy()
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
         while self.token_to_kv_pool.available_size() < len(self.reqs):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
 
-            self.tree_cache.dec_ref_counter(req.last_node)
+            # TODO: apply more fine-grained retraction
+            last_uncached_pos = len(req.prefix_indices)
+            token_indices = self.req_to_token_pool.req_to_token[
+                req_pool_indices_cpu[idx]
+            ][last_uncached_pos : seq_lens_cpu[idx]]
+            self.token_to_kv_pool.dec_refs(token_indices)
+
+            self.tree_cache.dec_lock_ref(req.last_node)
             req.prefix_indices = None
             req.last_node = None
             req.extend_input_len = 0
             req.output_ids = []
             req.regex_fsm_state = 0
-
-            # TODO: apply more fine-grained retraction
-
-            token_indices = self.req_to_token_pool.req_to_token[
-                req_pool_indices_np[idx]
-            ][: seq_lens_np[idx]]
-            self.token_to_kv_pool.dec_refs(token_indices)
 
         self.filter_batch(sorted_indices)
 
@@ -360,20 +378,18 @@ class Batch:
                     if len(jump_forward_str) <= 1:
                         continue
 
-                    # insert the old request into tree_cache
-                    token_ids_in_memory = tuple(req.input_ids + req.output_ids)[:-1]
                     if req_pool_indices_cpu is None:
-                        req_pool_indices_cpu = self.req_pool_indices.cpu().tolist()
-                    req_pool_idx = req_pool_indices_cpu[i]
-                    indices = self.req_to_token_pool.req_to_token[
-                        req_pool_idx, : len(token_ids_in_memory)
-                    ]
-                    prefix_len = self.tree_cache.insert(
-                        token_ids_in_memory, indices.clone()
+                        req_pool_indices_cpu = self.req_pool_indices.tolist()
+
+                    # insert the old request into tree_cache
+                    self.tree_cache.cache_req(
+                        token_ids=tuple(req.input_ids + req.output_ids)[:-1],
+                        last_uncached_pos=len(req.prefix_indices),
+                        req_pool_idx=req_pool_indices_cpu[i],
                     )
-                    self.token_to_kv_pool.dec_refs(indices[:prefix_len])
-                    self.req_to_token_pool.free(req_pool_idx)
-                    self.tree_cache.dec_ref_counter(req.last_node)
+
+                    # unlock the last node
+                    self.tree_cache.dec_lock_ref(req.last_node)
 
                     # jump-forward
                     req.jump_forward_and_retokenize(jump_forward_str, next_state)

@@ -14,7 +14,7 @@ def single():
     state = image_qa.run(
         image_path="images/cat.jpeg",
         question="What is this?",
-        max_new_tokens=64)
+        max_new_tokens=128)
     print(state["answer"], "\n")
 
 
@@ -36,7 +36,7 @@ def batch():
             {"image_path": "images/cat.jpeg", "question":"What is this?"},
             {"image_path": "images/dog.jpeg", "question":"What is this?"},
         ],
-        max_new_tokens=64,
+        max_new_tokens=128,
     )
     for s in states:
         print(s["answer"], "\n")

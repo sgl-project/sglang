@@ -1,4 +1,4 @@
-__version__ = "0.1.14"
+__version__ = "0.1.16"
 
 # SGL API Components
 from sglang.api import (
@@ -19,6 +19,7 @@ from sglang.api import (
     user,
     user_begin,
     user_end,
+    video,
 )
 
 # SGL Backends
@@ -46,6 +47,7 @@ __all__ = [
     "gen_int",
     "gen_string",
     "image",
+    "video",
     "select",
     "system",
     "user",

@@ -5,7 +5,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 
-from sglang.srt.backend_config import GLOBAL_BACKEND_CONFIG
+from sglang.global_config import global_config
 from sglang.srt.managers.router.model_rpc import ModelRpcClient
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_exception_traceback
@@ -30,7 +30,7 @@ class RouterManager:
         self.recv_reqs = []
 
         # Init some configs
-        self.extend_dependency_time = GLOBAL_BACKEND_CONFIG.extend_dependency_time
+        self.request_dependency_time = global_config.request_dependency_time
 
     async def loop_for_forward(self):
         while True:
@@ -46,9 +46,9 @@ class RouterManager:
             if len(out_pyobjs) != 0:
                 has_finished = any([obj.finished for obj in out_pyobjs])
                 if has_finished:
-                    if self.extend_dependency_time > 0:
+                    if self.request_dependency_time > 0:
                         slept = True
-                        await asyncio.sleep(self.extend_dependency_time)
+                        await asyncio.sleep(self.request_dependency_time)
 
             if not slept:
                 await asyncio.sleep(0.0006)
@@ -60,9 +60,7 @@ class RouterManager:
 
 
 def start_router_process(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-    pipe_writer,
+    server_args: ServerArgs, port_args: PortArgs, pipe_writer, model_overide_args
 ):
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
@@ -70,7 +68,7 @@ def start_router_process(
     )
 
     try:
-        model_client = ModelRpcClient(server_args, port_args)
+        model_client = ModelRpcClient(server_args, port_args, model_overide_args)
         router = RouterManager(model_client, port_args)
     except Exception:
         pipe_writer.send(get_exception_traceback())

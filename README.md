@@ -297,7 +297,6 @@ curl http://localhost:30000/generate \
 Learn more about the argument format [here](docs/sampling_params.md).
 
 ### OpenAI Compatible API
-
 In addition, the server supports an experimental OpenAI-compatible API.
 
 ```python
@@ -327,15 +326,17 @@ response = client.chat.completions.create(
 print(response)
 ```
 
-In above example, the server uses the chat template specified in the model tokenizer.
-You can override the chat template if needed when launching the server:
+
+By default, the server uses the chat template specified in the model tokenizer from Hugging Face. It should just work for most official models such as Llama-2/Llama-3.
+
+If needed, you can also override the chat template when launching the server:
 
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --chat-template llama-2
 ```
 
 If the chat template you are looking for is missing, you are welcome to contribute it.
-Meanwhile, you can also temporary register your chat template as follows:
+Meanwhile, you can also temporarily register your chat template as follows:
 
 ```json
 {
@@ -386,7 +387,6 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/model_support.md).
 
 ## Benchmark And Performance
-
 - Llama-7B on NVIDIA A10G, FP16, Tensor Parallelism=1
 ![llama_7b](assets/llama_7b.jpg)
 
@@ -409,8 +409,5 @@ https://github.com/sgl-project/sglang/issues/157
       primaryClass={cs.AI}
 }
 ```
-
-[![Paper page](https://huggingface.co/datasets/huggingface/badges/resolve/main/paper-page-md.svg)](https://huggingface.co/papers/2312.07104)
-
 
 We learned from the design and reused some code of the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), [LMQL](https://github.com/eth-sri/lmql).

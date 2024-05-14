@@ -5,9 +5,13 @@ from typing import List, Optional
 import numpy as np
 import torch
 from torch import nn
-from transformers import CLIPVisionModel, LlavaConfig
+from transformers import CLIPVisionModel, LlavaConfig, CLIPVisionConfig, Qwen2Config
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.weight_utils import (
+    default_weight_loader,
+    hf_model_weights_iterator,
+)
 
 from sglang.srt.managers.router.infer_batch import ForwardMode
 from sglang.srt.managers.router.model_runner import InputMetadata
@@ -16,11 +20,10 @@ from sglang.srt.mm_utils import (
     unpad_image,
     unpad_image_shape,
 )
-from sglang.srt.models.llama2 import LlamaForCausalLM
-from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
+from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
 
-class LlavaLlamaForCausalLM(nn.Module):
+class LlavaQwenForCausalLM(nn.Module):
     def __init__(
         self,
         config: LlavaConfig,
@@ -29,10 +32,23 @@ class LlavaLlamaForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.vision_tower = None
+        if getattr(self.config, "vision_config", None) is None:
+            self.config.vision_config = CLIPVisionConfig(self.config.mm_vision_tower)
+
+        if getattr(self.config, "text_config", None) is None:
+            self.config.text_config = Qwen2Config(self.config._name_or_path)
+
         self.config.vision_config.hidden_size = config.mm_hidden_size
         self.config.text_config.hidden_size = config.hidden_size
+
+        if getattr(self.config, "projector_hidden_act", None) is None:
+            self.config.projector_hidden_act = "gelu"
+
+        if getattr(self.config, "image_token_index", None) is None:
+            self.config.image_token_index = 151646
+
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = LlamaForCausalLM(config, quant_config=quant_config)
+        self.language_model = Qwen2ForCausalLM(config, quant_config=quant_config)
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
@@ -328,4 +344,4 @@ def monkey_path_clip_vision_embed_forward():
     )
 
 
-EntryClass = LlavaLlamaForCausalLM
+EntryClass = LlavaQwenForCausalLM

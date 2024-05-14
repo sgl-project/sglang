@@ -27,44 +27,33 @@ class Scheduler:
             return forward_queue
         elif self.schedule_heuristic == "fcfs":
             return forward_queue
-        elif self.schedule_heuristic == "weight":
+        elif self.schedule_heuristic == "dfs-weight":
             last_node_to_reqs = defaultdict(list)
             for req in forward_queue:
                 last_node_to_reqs[req.last_node].append(req)
-            for node in last_node_to_reqs:
-                last_node_to_reqs[node].sort(key=lambda x: -len(x.prefix_indices))
 
             node_to_weight = defaultdict(int)
-            self._calc_weight_recursive(
-                self.tree_cache.root_node, last_node_to_reqs, node_to_weight
-            )
+            for node in last_node_to_reqs:
+                node_to_weight[node] = len(last_node_to_reqs[node])
+            self.calc_weight(self.tree_cache.root_node, node_to_weight)
 
-            tmp_queue = []
-            self._get_weight_priority_recursive(
-                self.tree_cache.root_node, node_to_weight, last_node_to_reqs, tmp_queue
+            q = []
+            self.get_dfs_priority(
+                self.tree_cache.root_node, node_to_weight, last_node_to_reqs, q
             )
-            assert len(tmp_queue) == len(forward_queue)
-            return tmp_queue
+            assert len(q) == len(forward_queue)
+            return q
         else:
             raise ValueError(f"Unknown schedule_heuristic: {self.schedule_heuristic}")
 
-    def _calc_weight_recursive(self, cur_node, last_node_to_reqs, node_to_weight):
-        node_to_weight[cur_node] = 1
-        if cur_node in last_node_to_reqs:
-            node_to_weight[cur_node] += len(last_node_to_reqs[cur_node])
+    def calc_weight(self, cur_node, node_to_weight):
         for child in cur_node.children.values():
-            self._calc_weight_recursive(child, last_node_to_reqs, node_to_weight)
+            self.calc_weight(child, node_to_weight)
             node_to_weight[cur_node] += node_to_weight[child]
 
-    def _get_weight_priority_recursive(
-        self, cur_node, node_to_wight, last_node_to_reqs, tmp_queue
-    ):
-        visit_list = [child for child in cur_node.children.values()]
-        visit_list.sort(key=lambda x: -node_to_wight[x])
-        # for node in visit_list:
-        #     print(f"{node_to_wight[node]} {len(node.value) if node.value is not None else 0}")
-        for child in visit_list:
-            self._get_weight_priority_recursive(
-                child, node_to_wight, last_node_to_reqs, tmp_queue
-            )
-        tmp_queue.extend(last_node_to_reqs[cur_node])
+    def get_dfs_priority(self, cur_node, node_to_priority, last_node_to_reqs, q):
+        childs = [child for child in cur_node.children.values()]
+        childs.sort(key=lambda x: -node_to_priority[x])
+        for child in childs:
+            self.get_dfs_priority(child, node_to_priority, last_node_to_reqs, q)
+        q.extend(last_node_to_reqs[cur_node])

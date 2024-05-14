@@ -220,7 +220,6 @@ class RuntimeEndpoint(BaseBackend):
             "sampling_params": {"max_new_tokens": 0},
             "return_logprob": True,
             "logprob_start_len": max(prompt_len - 2, 0),
-            "return_text_in_logprobs": True,
         }
         self._add_images(s, data)
         res = http_request(

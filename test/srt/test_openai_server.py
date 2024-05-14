@@ -163,7 +163,7 @@ def test_regex(args):
     regex = (
         r"""\{\n"""
         + r"""   "name": "[\w]+",\n"""
-        + r"""   "population": "[\w\d\s]+"\n"""
+        + r"""   "population": [\d]+\n"""
         + r"""\}"""
     )
 
