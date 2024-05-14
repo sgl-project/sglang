@@ -4,7 +4,7 @@ import multiprocessing
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List, Optional
 
 import rpyc
 import torch
@@ -16,6 +16,7 @@ try:
 except ImportError:
     from vllm.logger import logger as vllm_default_logger
 
+from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -156,9 +157,20 @@ class ModelRpcServer:
         self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
-        self.new_token_ratio = min(0.4 * server_args.schedule_conservativeness, 1.0)
-        self.min_new_token_ratio = min(0.2 * server_args.schedule_conservativeness, 1.0)
-        self.new_token_ratio_step = (0.0001, 0.05)  # (down, up)
+        assert (
+            server_args.schedule_conservativeness >= 0
+        ), "Invalid schedule_conservativeness"
+        self.new_token_ratio = min(
+            global_config.base_new_token_ratio * server_args.schedule_conservativeness,
+            1.0,
+        )
+        self.min_new_token_ratio = min(
+            global_config.base_min_new_token_ratio
+            * server_args.schedule_conservativeness,
+            1.0,
+        )
+        self.new_token_ratio_decay = global_config.new_token_ratio_decay
+        self.new_token_ratio_recovery = global_config.new_token_ratio_recovery
 
     def flush_cache(self):
         if len(self.forward_queue) == 0 and (
@@ -238,7 +250,9 @@ class ModelRpcServer:
                                 self.token_to_kv_pool.available_size()
                                 + self.tree_cache.evictable_size()
                             )
-                            throuhgput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
+                            throuhgput = self.num_generated_tokens / (
+                                time.time() - self.last_stats_tic
+                            )
                             self.num_generated_tokens = 0
                             self.last_stats_tic = time.time()
                             logger.info(
@@ -401,12 +415,12 @@ class ModelRpcServer:
                 f"#running_req: {running_req}. "
                 f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%."
             )
-            #logger.debug(
+            # logger.debug(
             #    f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
             #    f"fsm_cache_avg_init_time: {self.regex_fsm_cache.get_avg_init_time():.2f}s. "
             #    f"ff_cache_hit_rate: {100.0 * self.jump_forward_cache.get_cache_hit_rate():.2f}%. "
             #    f"ff_cache_avg_init_time: {self.jump_forward_cache.get_avg_init_time():.2f}s. "
-            #)
+            # )
 
         new_batch = Batch.init_new(
             can_run_list,
@@ -440,11 +454,10 @@ class ModelRpcServer:
 
             # Only transfer the selected logprobs of the next token to CPU to reduce overhead.
             if last_logprobs is not None:
-                last_token_logprobs = (
-                    last_logprobs[
-                        torch.arange(len(batch.reqs), device=next_token_ids.device),
-                        next_token_ids].tolist()
-                )
+                last_token_logprobs = last_logprobs[
+                    torch.arange(len(batch.reqs), device=next_token_ids.device),
+                    next_token_ids,
+                ].tolist()
 
             next_token_ids = next_token_ids.tolist()
         else:
@@ -501,7 +514,7 @@ class ModelRpcServer:
         # check if decode out of memory
         if not batch.check_decode_mem():
             old_ratio = self.new_token_ratio
-            self.new_token_ratio = min(old_ratio + self.new_token_ratio_step[1], 1.0)
+            self.new_token_ratio = min(old_ratio + self.new_token_ratio_recovery, 1.0)
 
             retracted_reqs = batch.retract_decode()
             logger.info(
@@ -512,7 +525,7 @@ class ModelRpcServer:
             self.forward_queue.extend(retracted_reqs)
         else:
             self.new_token_ratio = max(
-                self.new_token_ratio - self.new_token_ratio_step[0],
+                self.new_token_ratio - self.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
 
