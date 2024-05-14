@@ -33,17 +33,15 @@ class FinishReason(IntEnum):
 
 
 class Req:
-    def __init__(self, rid, input_text, input_ids):
+    def __init__(self, rid, origin_input_text, origin_input_ids):
         self.rid = rid
-        self.origin_input_text = input_text
-        self.origin_input_ids = input_ids
+        self.origin_input_text = origin_input_text
+        self.origin_input_ids = origin_input_ids
+        self.origin_input_ids_unpadded = origin_input_ids  # for image padding
         self.prev_output_str = ""
         self.prev_output_ids = []
         self.output_ids = []
-        # not including the image padding length
-        self.prompt_tokens = len(self.origin_input_ids)
-        # input_ids = origin_input_ids + prev_output_ids
-        self.input_ids = None
+        self.input_ids = None  # input_ids = origin_input_ids + prev_output_ids
 
         # The number of decoded tokens for token usage report. Note that
         # this does not include the jump forward tokens.
@@ -99,9 +97,12 @@ class Req:
         # there should be a leading space.
         cur_output_str = self.partial_decode(self.output_ids)
 
+        # TODO(lsyin): apply re-tokenize only for decode tokens so that we do not need origin_input_text anymore
         if self.origin_input_text is None:
-            # TODO(lsyin): apply re-tokenize only for decode tokens
-            self.origin_input_text = self.tokenizer.decode(self.origin_input_ids)
+            # Recovering text can only use unpadded ids
+            self.origin_input_text = self.tokenizer.decode(
+                self.origin_input_ids_unpadded
+            )
 
         all_text = (
             self.origin_input_text
@@ -110,9 +111,11 @@ class Req:
             + jump_forward_str
         )
         all_ids = self.tokenizer.encode(all_text)
-        self.origin_input_ids = all_ids[: self.prompt_tokens]
+        prompt_tokens = len(self.origin_input_ids_unpadded)
+        self.origin_input_ids = all_ids[: prompt_tokens]
+        self.origin_input_ids_unpadded = self.origin_input_ids
         # NOTE: the output ids may not strictly correspond to the output text
-        self.prev_output_ids = all_ids[self.prompt_tokens :]
+        self.prev_output_ids = all_ids[prompt_tokens :]
         self.prev_output_str = self.prev_output_str + cur_output_str + jump_forward_str
         self.output_ids = []
 
@@ -152,6 +155,7 @@ class Req:
             )
 
             for stop_str in self.sampling_params.stop_strs:
+                # FIXME: (minor) try incremental match in prev_output_str
                 if stop_str in tail_str or stop_str in self.prev_output_str:
                     self.finished = True
                     self.finish_reason = FinishReason.STOP_STR
@@ -330,6 +334,7 @@ class Batch:
 
     def retract_decode(self):
         sorted_indices = [i for i in range(len(self.reqs))]
+        # TODO(lsyin): improve the priority of retraction
         sorted_indices.sort(
             key=lambda i: (len(self.reqs[i].output_ids), -len(self.reqs[i].input_ids)),
             reverse=True,
@@ -355,7 +360,6 @@ class Batch:
 
             cur_output_str = req.partial_decode(req.output_ids)
             req.prev_output_str = req.prev_output_str + cur_output_str
-            print(f"\x1b[31m{req.prev_output_str}\x1b[0m")
             req.prev_output_ids.extend(req.output_ids)
 
             req.prefix_indices = None
@@ -403,7 +407,7 @@ class Batch:
                             req.origin_input_ids,
                             req.image_offset,
                         ) = model_runner.model.pad_input_ids(
-                            req.origin_input_ids,
+                            req.origin_input_ids_unpadded,
                             req.pad_value,
                             req.pixel_values.shape,
                             req.image_size,

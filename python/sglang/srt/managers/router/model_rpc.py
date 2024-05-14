@@ -291,7 +291,7 @@ class ModelRpcServer:
             req.image_size = recv_req.image_size
             req.origin_input_ids, req.image_offset = (
                 self.model_runner.model.pad_input_ids(
-                    req.origin_input_ids,
+                    req.origin_input_ids_unpadded,
                     req.pad_value,
                     req.pixel_values.shape,
                     req.image_size,
