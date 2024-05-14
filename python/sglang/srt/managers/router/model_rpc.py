@@ -24,7 +24,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.router.infer_batch import Batch, ForwardMode, Req
+from sglang.srt.managers.router.infer_batch import Batch, ForwardMode, Req, FinishReason
 from sglang.srt.managers.router.model_runner import ModelRunner
 from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.managers.router.scheduler import Scheduler
@@ -615,7 +615,7 @@ class ModelRpcServer:
                     + len(req.output_ids)
                     - req.prompt_tokens,
                     "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
-                    "finish_reason": req.finish_reason.to_str(),
+                    "finish_reason": FinishReason.to_str(req.finish_reason),
                     "hit_stop_str": req.hit_stop_str,
                 }
                 if req.return_logprob:
