@@ -1,4 +1,5 @@
 """Conversion between OpenAI APIs and native SRT APIs"""
+
 import json
 import os
 
@@ -31,8 +32,8 @@ from sglang.srt.openai_protocol import (
 )
 from sglang.srt.utils import jsonify_pydantic_model
 
-
 chat_template_name = None
+
 
 def load_chat_template_for_openai_api(chat_template_arg):
     global chat_template_name

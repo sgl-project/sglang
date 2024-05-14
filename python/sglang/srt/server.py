@@ -30,15 +30,18 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api_adapter import (
-    v1_completions, v1_chat_completions, load_chat_template_for_openai_api)
+    load_chat_template_for_openai_api,
+    v1_chat_completions,
+    v1_completions,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    API_KEY_HEADER_NAME,
+    APIKeyValidatorMiddleware,
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
     get_exception_traceback,
-    API_KEY_HEADER_NAME,
-    APIKeyValidatorMiddleware
 )
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())

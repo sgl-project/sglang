@@ -32,7 +32,9 @@ class GenerateReqInput:
     def post_init(self):
 
         if self.text is None:
-            assert self.input_ids is not None, "Either text or input_ids should be provided"
+            assert (
+                self.input_ids is not None
+            ), "Either text or input_ids should be provided"
         else:
             assert self.input_ids is None, "Either text or input_ids should be provided"
 

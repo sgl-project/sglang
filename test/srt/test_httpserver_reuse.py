@@ -9,7 +9,6 @@ import argparse
 
 import requests
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
