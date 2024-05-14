@@ -20,15 +20,16 @@ class FinishReason(IntEnum):
     LENGTH = auto()
     STOP_STR = auto()
 
-    def to_str(self):
-        if self == FinishReason.EOS_TOKEN:
+    @staticmethod
+    def to_str(reason):
+        if reason == FinishReason.EOS_TOKEN:
             return None
-        elif self == FinishReason.LENGTH:
+        elif reason == FinishReason.LENGTH:
             return "length"
-        elif self == FinishReason.STOP_STR:
+        elif reason == FinishReason.STOP_STR:
             return "stop"
         else:
-            raise ValueError(f"Invalid finish reason: {self}")
+            return None
 
 
 class Req:
