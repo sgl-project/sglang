@@ -24,7 +24,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.router.infer_batch import Batch, ForwardMode, Req, FinishReason
+from sglang.srt.managers.router.infer_batch import Batch, FinishReason, ForwardMode, Req
 from sglang.srt.managers.router.model_runner import ModelRunner
 from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.managers.router.scheduler import Scheduler
@@ -36,7 +36,6 @@ from sglang.srt.utils import (
     is_multimodal_model,
     set_random_seed,
 )
-
 
 logger = logging.getLogger("model_rpc")
 vllm_default_logger.setLevel(logging.WARN)
@@ -238,7 +237,9 @@ class ModelRpcServer:
                                 self.token_to_kv_pool.available_size()
                                 + self.tree_cache.evictable_size()
                             )
-                            throuhgput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
+                            throuhgput = self.num_generated_tokens / (
+                                time.time() - self.last_stats_tic
+                            )
                             self.num_generated_tokens = 0
                             self.last_stats_tic = time.time()
                             logger.info(
@@ -401,12 +402,12 @@ class ModelRpcServer:
                 f"#running_req: {running_req}. "
                 f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%."
             )
-            #logger.debug(
+            # logger.debug(
             #    f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
             #    f"fsm_cache_avg_init_time: {self.regex_fsm_cache.get_avg_init_time():.2f}s. "
             #    f"ff_cache_hit_rate: {100.0 * self.jump_forward_cache.get_cache_hit_rate():.2f}%. "
             #    f"ff_cache_avg_init_time: {self.jump_forward_cache.get_avg_init_time():.2f}s. "
-            #)
+            # )
 
         new_batch = Batch.init_new(
             can_run_list,
@@ -440,11 +441,10 @@ class ModelRpcServer:
 
             # Only transfer the selected logprobs of the next token to CPU to reduce overhead.
             if last_logprobs is not None:
-                last_token_logprobs = (
-                    last_logprobs[
-                        torch.arange(len(batch.reqs), device=next_token_ids.device),
-                        next_token_ids].tolist()
-                )
+                last_token_logprobs = last_logprobs[
+                    torch.arange(len(batch.reqs), device=next_token_ids.device),
+                    next_token_ids,
+                ].tolist()
 
             next_token_ids = next_token_ids.tolist()
         else:

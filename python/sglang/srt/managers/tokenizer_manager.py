@@ -72,7 +72,8 @@ def get_pixel_values(
             image_hash = hash(image_data)
             if image_aspect_ratio == "pad":
                 image = expand2square(
-                    image, tuple(int(x * 255) for x in processor.image_processor.image_mean)
+                    image,
+                    tuple(int(x * 255) for x in processor.image_processor.image_mean),
                 )
                 pixel_values = processor.image_processor(image)["pixel_values"][0]
             elif image_aspect_ratio == "anyres":
@@ -208,10 +209,12 @@ class TokenizerManager:
 
             while True:
                 await event.wait()
-                out = self.convert_logprob_style(state.out_list[-1],
-                                                 obj.return_logprob,
-                                                 obj.top_logprobs_num,
-                                                 obj.return_text_in_logprobs)
+                out = self.convert_logprob_style(
+                    state.out_list[-1],
+                    obj.return_logprob,
+                    obj.top_logprobs_num,
+                    obj.return_text_in_logprobs,
+                )
 
                 if self.server_args.log_requests and state.finished:
                     logger.info(f"in={obj.text}, out={out}")
@@ -275,10 +278,13 @@ class TokenizerManager:
                 state = self.rid_to_state[rid]
                 await state.event.wait()
                 output_list.append(
-                    self.convert_logprob_style(state.out_list[-1],
-                                               obj.return_logprob[i],
-                                               obj.top_logprobs_num[i],
-                                               obj.return_text_in_logprobs))
+                    self.convert_logprob_style(
+                        state.out_list[-1],
+                        obj.return_logprob[i],
+                        obj.top_logprobs_num[i],
+                        obj.return_text_in_logprobs,
+                    )
+                )
                 assert state.finished
                 del self.rid_to_state[rid]
 
@@ -311,7 +317,9 @@ class TokenizerManager:
             else:
                 raise ValueError(f"Invalid object: {recv_obj}")
 
-    def convert_logprob_style(self, ret, return_logprob, top_logprobs_num, return_text_in_logprobs):
+    def convert_logprob_style(
+        self, ret, return_logprob, top_logprobs_num, return_text_in_logprobs
+    ):
         if return_logprob:
             ret["meta_info"]["prefill_token_logprobs"] = self.detokenize_logprob_tokens(
                 ret["meta_info"]["prefill_token_logprobs"], return_text_in_logprobs
@@ -320,11 +328,15 @@ class TokenizerManager:
                 ret["meta_info"]["decode_token_logprobs"], return_text_in_logprobs
             )
         if top_logprobs_num > 0:
-            ret["meta_info"]["prefill_top_logprobs"] = self.detokenize_top_logprobs_tokens(
-                ret["meta_info"]["prefill_top_logprobs"], return_text_in_logprobs
+            ret["meta_info"]["prefill_top_logprobs"] = (
+                self.detokenize_top_logprobs_tokens(
+                    ret["meta_info"]["prefill_top_logprobs"], return_text_in_logprobs
+                )
             )
-            ret["meta_info"]["decode_top_logprobs"] = self.detokenize_top_logprobs_tokens(
-                ret["meta_info"]["decode_top_logprobs"], return_text_in_logprobs
+            ret["meta_info"]["decode_top_logprobs"] = (
+                self.detokenize_top_logprobs_tokens(
+                    ret["meta_info"]["decode_top_logprobs"], return_text_in_logprobs
+                )
             )
         return ret
 
