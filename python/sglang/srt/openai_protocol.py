@@ -1,4 +1,5 @@
 """pydantic models for OpenAI API protocol"""
+
 import time
 from typing import Dict, List, Optional, Union
 

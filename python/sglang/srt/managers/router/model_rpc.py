@@ -25,7 +25,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.router.infer_batch import Batch, ForwardMode, Req, FinishReason
+from sglang.srt.managers.router.infer_batch import Batch, FinishReason, ForwardMode, Req
 from sglang.srt.managers.router.model_runner import ModelRunner
 from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.managers.router.scheduler import Scheduler
@@ -37,7 +37,6 @@ from sglang.srt.utils import (
     is_multimodal_model,
     set_random_seed,
 )
-
 
 logger = logging.getLogger("model_rpc")
 vllm_default_logger.setLevel(logging.WARN)

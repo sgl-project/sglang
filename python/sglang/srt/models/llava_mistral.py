@@ -5,13 +5,9 @@ from typing import List, Optional
 import numpy as np
 import torch
 from torch import nn
-from transformers import CLIPVisionModel, LlavaConfig, CLIPVisionConfig, MistralConfig
+from transformers import CLIPVisionConfig, CLIPVisionModel, LlavaConfig, MistralConfig
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
 
 from sglang.srt.managers.router.infer_batch import ForwardMode
 from sglang.srt.managers.router.model_runner import InputMetadata
@@ -21,6 +17,7 @@ from sglang.srt.mm_utils import (
     unpad_image_shape,
 )
 from sglang.srt.models.mistral import MistralForCausalLM
+from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
 
 
 class LlavaMistralForCausalLM(nn.Module):

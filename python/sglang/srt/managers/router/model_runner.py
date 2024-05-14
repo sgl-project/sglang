@@ -17,8 +17,7 @@ from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
-from sglang.srt.utils import is_multimodal_model, get_available_gpu_memory
-
+from sglang.srt.utils import get_available_gpu_memory, is_multimodal_model
 
 QUANTIZATION_CONFIG_MAPPING = {
     "awq": AWQConfig,
