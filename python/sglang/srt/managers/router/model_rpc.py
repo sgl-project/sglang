@@ -289,8 +289,13 @@ class ModelRpcServer:
                 (recv_req.image_hash >> 64) % self.model_config.vocab_size,
             ]
             req.image_size = recv_req.image_size
-            req.input_ids, req.image_offset = self.model_runner.model.pad_input_ids(
-                req.input_ids, req.pad_value, req.pixel_values.shape, req.image_size
+            req.origin_input_ids, req.image_offset = (
+                self.model_runner.model.pad_input_ids(
+                    req.origin_input_ids,
+                    req.pad_value,
+                    req.pixel_values.shape,
+                    req.image_size,
+                )
             )
         req.sampling_params = recv_req.sampling_params
         req.return_logprob = recv_req.return_logprob
@@ -308,11 +313,11 @@ class ModelRpcServer:
                 )
 
         # Truncate long prompts
-        req.input_ids = req.input_ids[: self.model_config.context_len - 1]
+        req.origin_input_ids = req.origin_input_ids[: self.model_config.context_len - 1]
         req.sampling_params.max_new_tokens = min(
             req.sampling_params.max_new_tokens,
-            self.model_config.context_len - 1 - len(req.input_ids),
-            self.max_total_num_token - 128 - len(req.input_ids),
+            self.model_config.context_len - 1 - len(req.origin_input_ids),
+            self.max_total_num_token - 128 - len(req.origin_input_ids),
         )
         self.forward_queue.append(req)
 
@@ -324,6 +329,10 @@ class ModelRpcServer:
             return None
 
         for req in self.forward_queue:
+            assert (
+                len(req.output_ids) == 0
+            ), "The output ids should be empty when prefilling"
+            req.input_ids = req.origin_input_ids + req.prev_output_ids
             prefix_indices, last_node = self.tree_cache.match_prefix(req.input_ids)
             if req.return_logprob:
                 prefix_indices = prefix_indices[: req.logprob_start_len]
@@ -531,20 +540,7 @@ class ModelRpcServer:
 
         if not self.disable_regex_jump_forward:
             # check for jump-forward
-            jump_forward_reqs = batch.check_for_jump_forward()
-
-            # check for image jump-forward
-            for req in jump_forward_reqs:
-                if req.pixel_values is not None:
-                    (
-                        req.input_ids,
-                        req.image_offset,
-                    ) = self.model_runner.model.pad_input_ids(
-                        req.input_ids,
-                        req.pad_value,
-                        req.pixel_values.shape,
-                        req.image_size,
-                    )
+            jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
 
             self.forward_queue.extend(jump_forward_reqs)
             if batch.is_empty():
@@ -587,8 +583,8 @@ class ModelRpcServer:
 
     def handle_finished_requests(self, batch: Batch):
         output_rids = []
+        prev_output_strs = []
         output_tokens = []
-        output_and_jump_forward_strs = []
         output_hit_stop_str = []
         output_skip_special_tokens = []
         output_spaces_between_special_tokens = []
@@ -612,8 +608,8 @@ class ModelRpcServer:
                 )
             ):
                 output_rids.append(req.rid)
+                prev_output_strs.append(req.prev_output_str)
                 output_tokens.append(req.output_ids)
-                output_and_jump_forward_strs.append(req.output_and_jump_forward_str)
                 output_hit_stop_str.append(req.hit_stop_str)
                 output_skip_special_tokens.append(
                     req.sampling_params.skip_special_tokens
@@ -653,8 +649,8 @@ class ModelRpcServer:
             self.out_pyobjs.append(
                 BatchTokenIDOut(
                     output_rids,
+                    prev_output_strs,
                     output_tokens,
-                    output_and_jump_forward_strs,
                     output_hit_stop_str,
                     output_skip_special_tokens,
                     output_spaces_between_special_tokens,
