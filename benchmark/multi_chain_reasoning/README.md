@@ -7,7 +7,7 @@ wget https://raw.githubusercontent.com/openai/grade-school-math/master/grade_sch
 
 ### Benchmark sglang
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000  --schedule-conservativeness 1.3
 ```
 
 ```
@@ -39,5 +39,11 @@ python3 bench_other.py --num-questions 64 --backend lightllm
 
 ### Benchmark guidance
 ```
-python3 bench_other.py --num-questions 8 --backend guidance --parallel 1
+python3 bench_other.py --num-questions 8 --backend guidance --parallel 1 --n-ctx 4096 --model-path path/to/gguf
+```
+
+### Benchmark lmql
+    
+```
+python3 bench_other.py --num-questions 64 --backend lmql --parallel 1
 ```

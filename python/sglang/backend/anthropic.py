@@ -1,6 +1,7 @@
 from typing import List, Optional, Union
 
 import numpy as np
+
 from sglang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template
 from sglang.lang.interpreter import StreamExecutor
@@ -13,7 +14,7 @@ except ImportError as e:
 
 
 class Anthropic(BaseBackend):
-    def __init__(self, model_name):
+    def __init__(self, model_name, *args, **kwargs):
         super().__init__()
 
         if isinstance(anthropic, Exception):
@@ -21,6 +22,7 @@ class Anthropic(BaseBackend):
 
         self.model_name = model_name
         self.chat_template = get_chat_template("claude")
+        self.client = anthropic.Anthropic(*args, **kwargs)
 
     def get_chat_template(self):
         return self.chat_template
@@ -35,8 +37,14 @@ class Anthropic(BaseBackend):
         else:
             messages = [{"role": "user", "content": s.text_}]
 
-        ret = anthropic.Anthropic().messages.create(
+        if messages and messages[0]["role"] == "system":
+            system = messages.pop(0)["content"]
+        else:
+            system = ""
+
+        ret = self.client.messages.create(
             model=self.model_name,
+            system=system,
             messages=messages,
             **sampling_params.to_anthropic_kwargs(),
         )
@@ -54,8 +62,14 @@ class Anthropic(BaseBackend):
         else:
             messages = [{"role": "user", "content": s.text_}]
 
-        with anthropic.Anthropic().messages.stream(
+        if messages and messages[0]["role"] == "system":
+            system = messages.pop(0)["content"]
+        else:
+            system = ""
+
+        with self.client.messages.stream(
             model=self.model_name,
+            system=system,
             messages=messages,
             **sampling_params.to_anthropic_kwargs(),
         ) as stream:

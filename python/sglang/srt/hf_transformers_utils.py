@@ -6,7 +6,6 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 from huggingface_hub import snapshot_download
-from sglang.srt.utils import is_multimodal_model
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -14,6 +13,8 @@ from transformers import (
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
+
+from sglang.srt.utils import is_multimodal_model
 
 
 def download_from_hf(model_path: str):
@@ -29,10 +30,17 @@ def get_config_json(model_path: str):
     return config
 
 
-def get_config(model: str, trust_remote_code: bool, revision: Optional[str] = None):
+def get_config(
+    model: str,
+    trust_remote_code: bool,
+    revision: Optional[str] = None,
+    model_overide_args: Optional[dict] = None,
+):
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision
     )
+    if model_overide_args:
+        config.update(model_overide_args)
     return config
 
 

@@ -8,16 +8,22 @@ The `/generate` endpoint accepts the following arguments in the JSON format.
 class GenerateReqInput:
     # The input prompt
     text: Union[List[str], str]
+    # The token ids for text; one can either specify text or input_ids
+    input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The image input
     image_data: Optional[Union[List[str], str]] = None
     # The sampling_params
     sampling_params: Union[List[Dict], Dict] = None
     # The request id
     rid: Optional[Union[List[str], str]] = None
-    # Whether return logprobs of the prompts
+    # Whether to return logprobs
     return_logprob: Optional[Union[List[bool], bool]] = None
     # The start location of the prompt for return_logprob
     logprob_start_len: Optional[Union[List[int], int]] = None
+    # The number of top logprobs to return
+    top_logprobs_num: Optional[Union[List[int], int]] = None
+    # Whether to detokenize tokens in logprobs
+    return_text_in_logprobs: bool = False
     # Whether to stream output
     stream: bool = False
 ```

@@ -7,7 +7,7 @@ from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
-from sglang.utils import read_jsonl, dump_state_text
+from sglang.utils import dump_state_text, read_jsonl
 
 
 @sgl.function
@@ -79,7 +79,9 @@ Action 2: Search[Leonid Levin]
 Observation 2: Leonid Anatolievich Levin is a Soviet-American mathematician and computer scientist. 
 Thought 3: Leonid Levin is a mathematician and computer scientist. So Pavel Urysohn and Leonid Levin have the same type of work. 
 Action 3: Finish[yes]
-""" + question)
+"""
+        + question
+    )
     for i in range(1, len(triplets) + 2):
         s += "Thought " + str(i) + ":"
         # NOTE: This is an implementation for replaying a given trace for benchmark purposes. It is not an actual ReAct agent implementation.
@@ -90,17 +92,23 @@ Action 3: Finish[yes]
         # print(ss[0]["thought_action"])
         if i > len(triplets):
             break
-        s += (triplets[i - 1]["thought"] + "\nAction " + str(i) + ":" +
-              triplets[i - 1]["action"] + "\nObservation " + str(i) + ":" +
-              triplets[i - 1]["observation"] + "\n")
+        s += (
+            triplets[i - 1]["thought"]
+            + "\nAction "
+            + str(i)
+            + ":"
+            + triplets[i - 1]["action"]
+            + "\nObservation "
+            + str(i)
+            + ":"
+            + triplets[i - 1]["observation"]
+            + "\n"
+        )
 
 
 def main(args):
-    lines = read_jsonl(args.data_path)[:args.num_questions]
-    arguments = [{
-        "question": k,
-        "triplets": v
-    } for l in lines for k, v in l.items()]
+    lines = read_jsonl(args.data_path)[: args.num_questions]
+    arguments = [{"question": k, "triplets": v} for l in lines for k, v in l.items()]
 
     # Select backend
     backend = select_sglang_backend(args)
@@ -108,9 +116,12 @@ def main(args):
 
     states = []
     tic = time.time()
-    states = webthink.run_batch(arguments,
-                                temperature=0,
-                                num_threads=args.parallel)
+    states = webthink.run_batch(
+        arguments,
+        temperature=0,
+        num_threads=args.parallel,
+        progress_bar=True,
+    )
     latency = time.time() - tic
 
     # Compute accuracy

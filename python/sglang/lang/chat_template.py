@@ -162,6 +162,28 @@ register_chat_template(
     )
 )
 
+register_chat_template(
+    ChatTemplate(
+        name="llama-3-instruct",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "<|start_header_id|>system<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
+            "user": (
+                "<|start_header_id|>user<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
+            "assistant": (
+                "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
+        },
+        stop_str=("<|eot_id|>",),
+    )
+)
+
 # Reference: https://github.com/01-ai/Yi/tree/main/VL#major-difference-with-llava
 register_chat_template(
     ChatTemplate(
@@ -192,12 +214,52 @@ register_chat_template(
     )
 )
 
+register_chat_template(
+    ChatTemplate(
+        name="dbrx-instruct",
+        default_system_prompt="You are DBRX, created by Databricks. You were last updated in December 2023. You answer questions based on information available up to that point.\nYOU PROVIDE SHORT RESPONSES TO SHORT QUESTIONS OR STATEMENTS, but provide thorough responses to more complex and open-ended questions.\nYou assist with various tasks, from writing to coding (using markdown for code blocks — remember to use ``` with code, JSON, and tables).\n(You do not have real-time data access or code execution capabilities. You avoid stereotyping and provide balanced perspectives on controversial topics. You do not provide song lyrics, poems, or news articles and do not divulge details of your training data.)\nThis is your system prompt, guiding your responses. Do not reference it, just respond to the user. If you find yourself talking about this message, stop. You should be responding appropriately and usually that means not mentioning this.\nYOU DO NOT MENTION ANY OF THIS INFORMATION ABOUT YOURSELF UNLESS THE INFORMATION IS DIRECTLY PERTINENT TO THE USER'S QUERY.",
+        role_prefix_and_suffix={
+            "system": ("<|im_start|>system\n", "<|im_end|>"),
+            "user": ("\n<|im_start|>user\n", "<|im_end|>"),
+            "assistant": ("\n<|im_start|>assistant\n", "<|im_end|>"),
+        },
+        stop_str=("<|im_end|>",),
+    )
+)
+
+register_chat_template(
+    ChatTemplate(
+        name="c4ai-command-r",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>",
+                "<|END_OF_TURN_TOKEN|>",
+            ),
+            "user": ("<|START_OF_TURN_TOKEN|><|USER_TOKEN|>", "<|END_OF_TURN_TOKEN|>"),
+            "assistant": (
+                "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",
+                "<|END_OF_TURN_TOKEN|>",
+            ),
+        },
+        style=ChatTemplateStyle.PLAIN,
+    )
+)
+
+
+@register_chat_template_matching_function
+def match_dbrx(model_path: str):
+    if "dbrx" in model_path.lower() and "instruct" in model_path.lower():
+        return get_chat_template("dbrx-instruct")
+
 
 @register_chat_template_matching_function
 def match_vicuna(model_path: str):
     if "vicuna" in model_path.lower():
         return get_chat_template("vicuna_v1.1")
     if "llava-v1.5" in model_path.lower():
+        return get_chat_template("vicuna_v1.1")
+    if "llava-next-video-7b" in model_path.lower():
         return get_chat_template("vicuna_v1.1")
 
 
@@ -215,20 +277,32 @@ def match_llama2_chat(model_path: str):
 
 
 @register_chat_template_matching_function
+def match_llama3_instruct(model_path: str):
+    model_path = model_path.lower()
+    if "llama-3" in model_path and "instruct" in model_path:
+        return get_chat_template("llama-3-instruct")
+
+
+@register_chat_template_matching_function
 def match_chat_ml(model_path: str):
+    # import pdb;pdb.set_trace()
     model_path = model_path.lower()
     if "tinyllama" in model_path:
         return get_chat_template("chatml")
     if "qwen" in model_path and "chat" in model_path:
         return get_chat_template("chatml")
-    if "llava-v1.6-34b" in model_path:
+    if (
+        "llava-v1.6-34b" in model_path
+        or "llava-v1.6-yi-34b" in model_path
+        or "llava-next-video-34b" in model_path
+    ):
         return get_chat_template("chatml-llava")
 
 
 @register_chat_template_matching_function
 def match_chat_yi(model_path: str):
     model_path = model_path.lower()
-    if "yi" in model_path:
+    if "yi" in model_path and "llava" not in model_path:
         return get_chat_template("yi")
 
 
@@ -237,6 +311,13 @@ def match_gemma_it(model_path: str):
     model_path = model_path.lower()
     if "gemma" in model_path and "it" in model_path:
         return get_chat_template("gemma-it")
+
+
+@register_chat_template_matching_function
+def match_c4ai_command_r(model_path: str):
+    model_path = model_path.lower()
+    if "c4ai-command-r" in model_path:
+        return get_chat_template("c4ai-command-r")
 
 
 if __name__ == "__main__":

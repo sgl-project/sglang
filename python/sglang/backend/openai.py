@@ -3,6 +3,7 @@ import time
 from typing import Callable, List, Optional, Union
 
 import numpy as np
+
 from sglang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import ChatTemplate, get_chat_template_by_model_path
 from sglang.lang.interpreter import StreamExecutor
@@ -227,7 +228,7 @@ class OpenAI(BaseBackend):
             prompt_tokens.append(ret_token)
 
         decision = choices[np.argmax(scores)]
-        return decision, scores, scores
+        return decision, scores, None, None
 
 
 def openai_completion(client, retries=3, is_chat=None, prompt=None, **kwargs):

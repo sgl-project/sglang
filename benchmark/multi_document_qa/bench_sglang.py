@@ -2,10 +2,12 @@ import argparse
 import json
 import time
 
-import numpy as np
 import sglang as sgl
-from sglang.test.test_utils import add_common_sglang_args_and_parse, select_sglang_backend
-from sglang.utils import read_jsonl, dump_state_text
+from sglang.test.test_utils import (
+    add_common_sglang_args_and_parse,
+    select_sglang_backend,
+)
+from sglang.utils import dump_state_text, read_jsonl
 
 
 @sgl.function
@@ -19,7 +21,11 @@ def multi_document_qa(s, docs, question):
     forks.join("concate_and_append")
 
     s += "\nDocuments end."
-    s += ("\n\nBased on the above documents, please answer this question:\n" + question + "\nAnswer in three words or fewer.")
+    s += (
+        "\n\nBased on the above documents, please answer this question:\n"
+        + question
+        + "\nAnswer in three words or fewer."
+    )
     s += sgl.user_end()
     s += sgl.assistant(sgl.gen("answer", max_tokens=16))
 
@@ -29,11 +35,13 @@ def main(args):
     l = lines[0]
     arguments = []
     labels = []
-    for i in range(len(l["questions"][:args.num_questions])):
-        arguments.append({
-            "docs": l["documents"][:10],
-            "question": l["questions"][i],
-        })
+    for i in range(len(l["questions"][: args.num_questions])):
+        arguments.append(
+            {
+                "docs": l["documents"][:10],
+                "question": l["questions"][i],
+            }
+        )
         labels.append(l["answers"][i])
 
     # Select backend
@@ -43,10 +51,11 @@ def main(args):
     # Run requests
     tic = time.time()
     states = multi_document_qa.run_batch(
-        arguments, temperature=0, num_threads=args.parallel)
+        arguments, temperature=0, num_threads=args.parallel, progress_bar=True
+    )
     latency = time.time() - tic
 
-    # Compute accuracy 
+    # Compute accuracy
     print([s["answer"] for s in states])
     correct = 0
     for s, label in zip(states, labels):
@@ -71,7 +80,7 @@ def main(args):
             "other": {
                 "num_questions": args.num_questions,
                 "parallel": args.parallel,
-            }
+            },
         }
         fout.write(json.dumps(value) + "\n")
 

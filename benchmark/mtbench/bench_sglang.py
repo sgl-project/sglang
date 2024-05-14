@@ -5,7 +5,10 @@ import time
 import uuid
 
 import sglang as sgl
-from sglang.test.test_utils import add_common_sglang_args_and_parse, select_sglang_backend
+from sglang.test.test_utils import (
+    add_common_sglang_args_and_parse,
+    select_sglang_backend,
+)
 
 
 def load_questions(filename):
@@ -44,10 +47,9 @@ def answer_mt_bench(s, question_1, question_2):
 
 def main(args):
     # Construct prompts
-    questions = load_questions(args.question_file)[:args.num_questions]
+    questions = load_questions(args.question_file)[: args.num_questions]
     arguments = [
-        {"question_1": q["turns"][0], "question_2": q["turns"][1]}
-        for q in questions
+        {"question_1": q["turns"][0], "question_2": q["turns"][1]} for q in questions
     ]
 
     # Select backend
@@ -60,7 +62,9 @@ def main(args):
         arguments,
         temperature=0,
         max_new_tokens=256,
-        num_threads=args.parallel)
+        num_threads=args.parallel,
+        progress_bar=True,
+    )
     answers = [[s["answer_1"], s["answer_2"]] for s in rets]
     latency = time.time() - tic
 
@@ -81,7 +85,7 @@ def main(args):
             "other": {
                 "num_questions": args.num_questions,
                 "parallel": args.parallel,
-            }
+            },
         }
         fout.write(json.dumps(value) + "\n")
 

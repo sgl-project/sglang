@@ -7,8 +7,11 @@ import numpy as np
 import pandas as pd
 import tiktoken
 from tqdm import tqdm
-from sglang.test.test_utils import add_common_sglang_args_and_parse, select_sglang_backend
 
+from sglang.test.test_utils import (
+    add_common_sglang_args_and_parse,
+    select_sglang_backend,
+)
 
 choices = ["A", "B", "C", "D"]
 
@@ -22,23 +25,28 @@ def format_subject(subject):
         s += " " + entry
     return s
 
+
 def format_example(df, idx, include_answer=True):
     prompt = df.iloc[idx, 0]
     k = df.shape[1] - 2
     for j in range(k):
-        prompt += "\n{}. {}".format(choices[j], df.iloc[idx, j+1])
+        prompt += "\n{}. {}".format(choices[j], df.iloc[idx, j + 1])
     prompt += "\nAnswer:"
     if include_answer:
         prompt += " {}\n\n".format(df.iloc[idx, k + 1])
     return prompt
 
+
 def gen_prompt(train_df, subject, k=-1):
-    prompt = "The following are multiple choice questions (with answers) about{}.\n\n".format(format_subject(subject))
+    prompt = "The following are multiple choice questions (with answers) about{}.\n\n".format(
+        format_subject(subject)
+    )
     if k == -1:
         k = train_df.shape[0]
     for i in range(k):
         prompt += format_example(train_df, i)
     return prompt
+
 
 def evaluate(args, subject, dev_df, test_df):
     prompts = []
@@ -54,7 +62,7 @@ def evaluate(args, subject, dev_df, test_df):
         prompt_end = format_example(test_df, i, include_answer=False)
         prompts.append(prompt_end)
 
-        label = test_df.iloc[i, test_df.shape[1]-1]
+        label = test_df.iloc[i, test_df.shape[1] - 1]
         labels.append(label)
 
     arguments = [{"question": p} for p in prompts]
@@ -66,11 +74,14 @@ def evaluate(args, subject, dev_df, test_df):
     import sglang as sgl
 
     if args.backend.startswith("gpt-"):
+
         @sgl.function
         def few_shot_mmlu(s, examples, question):
             s += sgl.user(examples + question)
             s += sgl.assistant(sgl.gen("answer"))
+
     else:
+
         @sgl.function
         def few_shot_mmlu(s, examples, question):
             s += examples + question + sgl.gen("answer")
@@ -84,32 +95,50 @@ def evaluate(args, subject, dev_df, test_df):
 
     tic = time.time()
     states = few_shot_mmlu.bind(examples=few_shot_examples).run_batch(
-        arguments, temperature=0, max_new_tokens=1,
-        backend=backend, num_threads=args.parallel)
-    preds = [s["answer"].strip()[0] if len(s["answer"].strip()) > 0 else ""
-             for s in states]
+        arguments,
+        temperature=0,
+        max_new_tokens=1,
+        backend=backend,
+        num_threads=args.parallel,
+    )
+    preds = [
+        s["answer"].strip()[0] if len(s["answer"].strip()) > 0 else "" for s in states
+    ]
     latency = time.time() - tic
 
     cors = [pred == label for pred, label in zip(preds, labels)]
     acc = np.mean(cors)
     cors = np.array(cors)
 
-    print("Average accuracy {:.3f}, latency {:.2f}, #q: {} - {}".format(
-        acc, latency, len(prompts), subject))
+    print(
+        "Average accuracy {:.3f}, latency {:.2f}, #q: {} - {}".format(
+            acc, latency, len(prompts), subject
+        )
+    )
 
     return cors, acc, latency
 
 
 def main(args):
-    subjects = sorted([f.split("_test.csv")[0] for f in os.listdir(os.path.join(args.data_dir, "test")) if "_test.csv" in f])
+    subjects = sorted(
+        [
+            f.split("_test.csv")[0]
+            for f in os.listdir(os.path.join(args.data_dir, "test"))
+            if "_test.csv" in f
+        ]
+    )
 
     all_cors = []
     all_latencies = []
     num_requests = 0
 
-    for subject in tqdm(subjects[:args.nsub]):
-        dev_df = pd.read_csv(os.path.join(args.data_dir, "dev", subject + "_dev.csv"), header=None)[:args.ntrain]
-        test_df = pd.read_csv(os.path.join(args.data_dir, "test", subject + "_test.csv"), header=None)
+    for subject in tqdm(subjects[: args.nsub]):
+        dev_df = pd.read_csv(
+            os.path.join(args.data_dir, "dev", subject + "_dev.csv"), header=None
+        )[: args.ntrain]
+        test_df = pd.read_csv(
+            os.path.join(args.data_dir, "test", subject + "_test.csv"), header=None
+        )
 
         cors, acc, latency = evaluate(args, subject, dev_df, test_df)
         all_cors.append(cors)
@@ -134,7 +163,7 @@ def main(args):
             "other": {
                 "nsub": args.nsub,
                 "parallel": args.parallel,
-            }
+            },
         }
         fout.write(json.dumps(value) + "\n")
 

@@ -2,44 +2,26 @@
 
 import base64
 import json
+import os
+import sys
 import threading
+import traceback
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
 from tenacity import RetryCallState, retry, wait_fixed
 import requests
-import socket
 from urllib.parse import urlparse
 from urllib import error
 from memoization import cached
+import socket
+import numpy as np
 
-
-def get_available_gpu_memory(gpu_id, distributed=True):
-    """
-    Get available memory for cuda:gpu_id device.
-    When distributed is True, the available memory is the minimum available memory of all GPUs.
-    """
-    import torch
-
-    num_gpus = torch.cuda.device_count()
-    assert gpu_id < num_gpus
-
-    if torch.cuda.current_device() != gpu_id:
-        print(
-            f"WARNING: current device is not {gpu_id}, but {torch.cuda.current_device()}, ",
-            "which may cause useless memory allocation for torch CUDA context.",
-        )
-
-    free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
-
-    if distributed:
-        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
-            torch.device("cuda", gpu_id)
-        )
-        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
-        free_gpu_memory = tensor.item()
-
-    return free_gpu_memory / (1 << 30)
+def get_exception_traceback():
+    etype, value, tb = sys.exc_info()
+    err_str = "".join(traceback.format_exception(etype, value, tb))
+    return err_str
 
 
 def is_same_type(values):
@@ -128,6 +110,31 @@ def _should_retry(retry_state: RetryCallState):
     return False
 
 @retry(
+def _is_port_open(host, port, timeout=5):
+    """ Check if a port at a given address is open. """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    result = sock.connect_ex((host, port))
+    sock.close()
+    return result == 0
+
+def _should_retry(retry_state):
+    url = retry_state.args[0]  # Assumes the first argument to the function is the URL
+    exception = retry_state.outcome.exception()
+    try:
+        parsed_url = urlparse(url)
+        host = parsed_url.hostname
+        port = parsed_url.port
+        is_server_online = _is_port_open(host, port)
+    except:
+        is_server_online = False
+
+    if isinstance(exception, ConnectionResetError) and is_server_online(url):
+        print("ConnectionResetError: Retrying...")
+        return True
+    return False
+
+@retry(
     wait=wait_fixed(1),
     retry=_should_retry
 )
@@ -171,6 +178,74 @@ def encode_image_base64(image_path):
         buffered = BytesIO()
         image.save(buffered, format="PNG")
         return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+
+def encode_frame(frame):
+    import cv2  # pip install opencv-python-headless
+    from PIL import Image
+
+    # Convert the frame to RGB (OpenCV uses BGR by default)
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # Convert the frame to PIL Image to easily convert to bytes
+    im_pil = Image.fromarray(frame)
+
+    # Convert to bytes
+    buffered = BytesIO()
+
+    # frame_format = str(os.getenv('FRAME_FORMAT', "JPEG"))
+
+    im_pil.save(buffered, format="PNG")
+
+    frame_bytes = buffered.getvalue()
+
+    # Return the bytes of the frame
+    return frame_bytes
+
+
+def encode_video_base64(video_path, num_frames=16):
+    import cv2
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise IOError(f"Could not open video file:{video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"target_frames: {num_frames}")
+
+    frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+
+    frames = []
+    for i in range(total_frames):
+        ret, frame = cap.read()
+        if ret:
+            frames.append(frame)
+        else:
+            # Handle the case where the frame could not be read
+            # print(f"Warning: Could not read frame at index {i}.")
+            pass
+
+    cap.release()
+
+    # Safely select frames based on frame_indices, avoiding IndexError
+    frames = [frames[i] for i in frame_indices if i < len(frames)]
+
+    # If there are not enough frames, duplicate the last frame until we reach the target
+    while len(frames) < num_frames:
+        frames.append(frames[-1])
+
+    # Use ThreadPoolExecutor to process and encode frames in parallel
+    with ThreadPoolExecutor() as executor:
+        encoded_frames = list(executor.map(encode_frame, frames))
+
+    # encoded_frames = list(map(encode_frame, frames))
+
+    # Concatenate all frames bytes
+    video_bytes = b"".join(encoded_frames)
+
+    # Encode the concatenated bytes to base64
+    video_base64 = "video:" + base64.b64encode(video_bytes).decode("utf-8")
+
+    return video_base64
 
 
 def _is_chinese_char(cp):

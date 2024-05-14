@@ -31,6 +31,7 @@ if __name__ == "__main__":
             url + "/generate",
             json={
                 "text": f"{a}, ",
+                #"input_ids": [[2] * 256] * 196,
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,

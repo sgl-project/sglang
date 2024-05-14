@@ -5,16 +5,14 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+from transformers import CLIPVisionModel, LlavaConfig
+
 from sglang.srt.models.llava import (
     LlavaLlamaForCausalLM,
     clip_vision_embed_forward,
     monkey_path_clip_vision_embed_forward,
 )
-from transformers import CLIPVisionModel, LlavaConfig
-from vllm.model_executor.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
+from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
 
 
 class YiVLForCausalLM(LlavaLlamaForCausalLM):

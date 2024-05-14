@@ -4,29 +4,25 @@
 from typing import Optional, Tuple
 
 import torch
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.radix_attention import RadixAttention
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import LoRAConfig
-from vllm.model_executor.input_metadata import InputMetadata
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import GeluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    LinearMethodBase,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_world_size,
-)
-from vllm.model_executor.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
+
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.router.model_runner import InputMetadata
+from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
 
 
 class GemmaMLP(nn.Module):
@@ -34,17 +30,20 @@ class GemmaMLP(nn.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.down_proj = RowParallelLinear(
-            intermediate_size, hidden_size, bias=False, linear_method=linear_method
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
         )
         self.act_fn = GeluAndMul()
 
@@ -65,7 +64,7 @@ class GemmaAttention(nn.Module):
         layer_id: int = 0,
         max_position_embeddings: int = 8192,
         rope_theta: float = 10000,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -95,13 +94,13 @@ class GemmaAttention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=False,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
 
         self.rotary_emb = get_rope(
@@ -138,7 +137,7 @@ class GemmaDecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int = 0,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -150,12 +149,12 @@ class GemmaDecoderLayer(nn.Module):
             layer_id=layer_id,
             max_position_embeddings=config.max_position_embeddings,
             rope_theta=config.rope_theta,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.mlp = GemmaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -191,7 +190,7 @@ class GemmaModel(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -202,7 +201,7 @@ class GemmaModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                GemmaDecoderLayer(config, i, linear_method)
+                GemmaDecoderLayer(config, i, quant_config=quant_config)
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -263,14 +262,14 @@ class GemmaForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
     ) -> None:
         del lora_config  # Unused.
         super().__init__()
         self.config = config
-        self.linear_method = linear_method
-        self.model = GemmaModel(config, linear_method)
+        self.quant_config = quant_config
+        self.model = GemmaModel(config, quant_config=quant_config)
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()

@@ -1,6 +1,7 @@
 """The interpreter that executes SGL programs"""
 
 import asyncio
+import contextvars
 import multiprocessing
 import queue
 import threading
@@ -10,6 +11,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import tqdm
+
 from sglang.global_config import global_config
 from sglang.lang.ir import (
     SglCommitLazy,
@@ -26,8 +28,9 @@ from sglang.lang.ir import (
     SglVariable,
     SglVarScopeBegin,
     SglVarScopeEnd,
+    SglVideo,
 )
-from sglang.utils import encode_image_base64
+from sglang.utils import encode_image_base64, encode_video_base64, get_exception_traceback
 
 
 def run_internal(state, program, func_args, func_kwargs, sync):
@@ -84,9 +87,9 @@ def run_program_batch(
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
 
-    # Extract prefix by tracing and cache it
-    if len(batch_arguments) > 1:
-        pin_program(program, backend)
+    # Pre-cache the common prefix for a batch. The prefix is extracted by tracing the program.
+    if global_config.enable_precache_with_tracing and len(batch_arguments) > 1:
+        cache_program(program, backend)
 
     # Run all programs
     if num_threads == "auto":
@@ -152,21 +155,12 @@ def run_program_batch(
     return rets
 
 
-def pin_program(program, backend):
-    if global_config.enable_prefix_sharing and program.pin_prefix_rid is None:
-        # TODO: handle multiple backends
-        from sglang.lang.tracer import extract_prefix_by_tracing
+def cache_program(program, backend):
+    from sglang.lang.tracer import extract_prefix_by_tracing
 
-        prefix = extract_prefix_by_tracing(program, backend)
-        if prefix and len(prefix) > 64:
-            prefix_rid = backend.cache_prefix(prefix)
-            program.pin_prefix_rid = prefix_rid
-            return prefix_rid
-    return None
-
-
-def unpin_program(program, backend):
-    pass
+    prefix = extract_prefix_by_tracing(program, backend)
+    if prefix and len(prefix) > 64:
+        backend.cache_prefix(prefix)
 
 
 class StreamExecutor:
@@ -193,6 +187,7 @@ class StreamExecutor:
         self.variable_event = {}  # Dict[name: str -> event: threading.Event]
         self.meta_info = {}  # Dict[name: str -> info: str]
         self.is_finished = False
+        self.error = None
 
         # For completion
         self.text_ = ""  # The full text
@@ -217,7 +212,13 @@ class StreamExecutor:
         self.use_thread = use_thread
         if self.use_thread:
             self.queue = queue.Queue()
-            self.worker = threading.Thread(target=self._thread_worker_func)
+
+            def _run_worker_in_context():
+                self._thread_worker_func()
+
+            self.worker = threading.Thread(
+                target=contextvars.copy_context().run, args=(_run_worker_in_context,)
+            )
             self.worker.start()
 
         # For streaming
@@ -248,17 +249,24 @@ class StreamExecutor:
     def set_var(self, name, value):
         self.variables[name] = value
 
-    def get_meta_info(self, name):
+    def get_meta_info(self, name, timeout=None):
         if name in self.variable_event:
-            self.variable_event[name].wait()
+            got = self.variable_event[name].wait(timeout)
+            if not got:
+                raise TimeoutError(f"Timeout while waiting for event '{name}'")
         ret = self.meta_info.get(name, None)
         return ret
 
-    def fork(self, number: int, position_ids_offset: Optional[List[int]] = None):
-        self.submit(SglCommitLazy())
-        self.sync()
+    def fork(
+        self,
+        size: int = 1,
+        position_ids_offset: Optional[List[int]] = None,
+    ):
+        if size > 1:
+            self.submit(SglCommitLazy())
 
-        number = int(number)
+        self.sync()
+        size = int(size)
 
         exes = [
             StreamExecutor(
@@ -268,14 +276,15 @@ class StreamExecutor:
                 self.chat_template,
                 self.stream,
             )
-            for _ in range(number)
+            for _ in range(size)
         ]
-        for i in range(number):
+        for i in range(size):
             exes[i].variables = dict(self.variables)
             exes[i].text_ = str(self.text_)
             exes[i].messages_ = list(self.messages_)
             exes[i].cur_role = self.cur_role
             exes[i].fork_start_text_pos = len(self.text_)
+            exes[i].images_ = list(self.images_)
 
         return exes
 
@@ -294,16 +303,38 @@ class StreamExecutor:
         self.backend.end_program(self)
 
     def _thread_worker_func(self):
+        error = None
+
         while True:
             expr = self.queue.get()
             if expr is None:
                 self.queue.task_done()
                 break
 
-            self._execute(expr)
+            try:
+                self._execute(expr)
+            except Exception as e:
+                # print(f"Error in stream_executor: {get_exception_traceback()}")
+                error = e
+                break
             self.queue.task_done()
             if self.stream_text_event:
                 self.stream_text_event.set()
+
+        # Clean the queue and events
+        if error is not None:
+            try:
+                while True:
+                    self.queue.task_done()
+                    self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            for name in self.variable_event:
+                self.variable_event[name].set()
+            if self.stream_var_event:
+                for name in self.stream_var_event:
+                    self.stream_var_event[name].set()
+            self.error = error
 
         if self.stream_text_event:
             self.stream_text_event.set()
@@ -331,6 +362,8 @@ class StreamExecutor:
             self._execute_role_end(other)
         elif isinstance(other, SglImage):
             self._execute_image(other)
+        elif isinstance(other, SglVideo):
+            self._execute_video(other)
         elif isinstance(other, SglVariable):
             self._execute_variable(other)
         elif isinstance(other, SglVarScopeBegin):
@@ -362,6 +395,16 @@ class StreamExecutor:
         path = expr.path
 
         base64_data = encode_image_base64(path)
+
+        self.images_.append((path, base64_data))
+        self.cur_images.append((path, base64_data))
+        self.text_ += self.chat_template.image_token
+
+    def _execute_video(self, expr: SglVideo):
+        path = expr.path
+        num_frames = expr.num_frames
+
+        base64_data = encode_video_base64(path, num_frames)
 
         self.images_.append((path, base64_data))
         self.cur_images.append((path, base64_data))
@@ -454,15 +497,19 @@ class StreamExecutor:
             self.stream_var_event[name].set()
 
     def _execute_select(self, expr: SglSelect):
-        decision, normalized_prompt_logprob, prompt_logprob = self.backend.select(
-            self, expr.choices, expr.temperature
-        )
+        (
+            decision,
+            normalized_prompt_logprobs,
+            prefill_token_logprobs,
+            decode_token_logprobs,
+        ) = self.backend.select(self, expr.choices, expr.temperature)
         if expr.name is not None:
             name = expr.name
             self.variables[name] = decision
             self.meta_info[name] = {
-                "normalized_prompt_logprob": normalized_prompt_logprob,
-                "prompt_logprob": prompt_logprob,
+                "normalized_prompt_logprobs": normalized_prompt_logprobs,
+                "prefill_token_logprobs": prefill_token_logprobs,
+                "decode_token_logprobs": decode_token_logprobs,
             }
             self.variable_event[name].set()
         self.text_ += decision
@@ -634,8 +681,12 @@ class ProgramState:
         yield
         self.stream_executor.submit(SglVarScopeEnd(name))
 
-    def fork(self, number: int = 1, position_ids_offset: Optional[List[int]] = None):
-        stream_executors = self.stream_executor.fork(number, position_ids_offset)
+    def fork(
+        self,
+        size: int = 1,
+        position_ids_offset: Optional[List[int]] = None,
+    ):
+        stream_executors = self.stream_executor.fork(size, position_ids_offset)
         states = [ProgramState(x) for x in stream_executors]
         state_group = ProgramStateGroup(states, self)
         return state_group
@@ -656,6 +707,9 @@ class ProgramState:
 
     def sync(self):
         return self.stream_executor.sync()
+
+    def error(self):
+        return self.stream_executor.error
 
     def text_iter(self, var_name: Optional[str] = None):
         if self.stream_executor.stream:
@@ -744,6 +798,9 @@ class ProgramState:
 
     def __setitem__(self, name, value):
         self.set_var(name, value)
+
+    def __contains__(self, name):
+        return name in self.stream_executor.variables
 
     def __del__(self):
         self.stream_executor.end()

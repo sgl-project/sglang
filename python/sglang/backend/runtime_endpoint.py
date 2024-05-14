@@ -3,6 +3,7 @@ from typing import Callable, List, Optional, Union
 
 import numpy as np
 import requests
+
 from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config
 from sglang.lang.chat_template import get_chat_template_by_model_path
@@ -73,9 +74,11 @@ class RuntimeEndpoint(BaseBackend):
         assert res.status_code == 200
 
     def commit_lazy_operations(self, s: StreamExecutor):
+        data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
+        self._add_images(s, data)
         res = http_request(
             self.base_url + "/generate",
-            json={"text": s.text_, "sampling_params": {"max_new_tokens": 0}},
+            json=data,
             auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,
@@ -104,6 +107,7 @@ class RuntimeEndpoint(BaseBackend):
                 "text": s.text_,
                 "sampling_params": {
                     "skip_special_tokens": global_config.skip_special_tokens_in_output,
+                    "spaces_between_special_tokens": global_config.spaces_between_special_tokens_in_out,
                     **sampling_params.to_srt_kwargs(),
                 },
             }
@@ -112,6 +116,7 @@ class RuntimeEndpoint(BaseBackend):
                 "text": s.text_,
                 "sampling_params": {
                     "skip_special_tokens": global_config.skip_special_tokens_in_output,
+                    "spaces_between_special_tokens": global_config.spaces_between_special_tokens_in_out,
                     "dtype": "int",
                     **sampling_params.to_srt_kwargs(),
                 },
@@ -142,6 +147,7 @@ class RuntimeEndpoint(BaseBackend):
                 "text": s.text_,
                 "sampling_params": {
                     "skip_special_tokens": global_config.skip_special_tokens_in_output,
+                    "spaces_between_special_tokens": global_config.spaces_between_special_tokens_in_out,
                     **sampling_params.to_srt_kwargs(),
                 },
             }
@@ -150,6 +156,7 @@ class RuntimeEndpoint(BaseBackend):
                 "text": s.text_,
                 "sampling_params": {
                     "skip_special_tokens": global_config.skip_special_tokens_in_output,
+                    "spaces_between_special_tokens": global_config.spaces_between_special_tokens_in_out,
                     "dtype": "int",
                     **sampling_params.to_srt_kwargs(),
                 },
@@ -224,13 +231,19 @@ class RuntimeEndpoint(BaseBackend):
         )
         assert res.status_code == 200
         obj = res.json()
-        normalized_prompt_logprob = [
+        normalized_prompt_logprobs = [
             r["meta_info"]["normalized_prompt_logprob"] for r in obj
         ]
-        prompt_logprob = [r["meta_info"]["prompt_logprob"] for r in obj]
+        decision = choices[np.argmax(normalized_prompt_logprobs)]
+        prefill_token_logprobs = [r["meta_info"]["prefill_token_logprobs"] for r in obj]
+        decode_token_logprobs = [r["meta_info"]["decode_token_logprobs"] for r in obj]
 
-        decision = choices[np.argmax(normalized_prompt_logprob)]
-        return decision, normalized_prompt_logprob, prompt_logprob
+        return (
+            decision,
+            normalized_prompt_logprobs,
+            prefill_token_logprobs,
+            decode_token_logprobs,
+        )
 
     def concatenate_and_append(self, src_rids: List[str], dst_rid: str):
         res = http_request(
