@@ -4,6 +4,7 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+import warnings
 from typing import List
 
 import numpy as np
@@ -168,9 +169,10 @@ class TokenizerManager:
                 input_ids = obj.input_ids
 
             if len(input_ids) >= self.context_len:
-                raise ValueError(
+                warnings.warn(
                     f"The input ({len(input_ids)} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens)"
+                    f"model's context length ({self.context_len} tokens)."
+                    f"The input will be truncated."
                 )
 
             sampling_params = SamplingParams(**obj.sampling_params)
