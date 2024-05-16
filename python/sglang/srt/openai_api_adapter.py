@@ -144,7 +144,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     index=0,
                     text=delta,
                     logprobs=logprobs,
-                    finish_reason=None,
+                    finish_reason=content["meta_info"]["finish_reason"],
                 )
                 chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -193,7 +193,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
         index=0,
         text=text,
         logprobs=logprobs,
-        finish_reason=None,  # TODO(comaniac): Add finish reason.
+        finish_reason=ret["meta_info"]["finish_reason"],
     )
     response = CompletionResponse(
         id=ret["meta_info"]["id"],
@@ -273,7 +273,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=0,
                         delta=DeltaMessage(role="assistant"),
-                        finish_reason=None,
+                        finish_reason=content["meta_info"]["finish_reason"],
                     )
                     chunk = ChatCompletionStreamResponse(
                         id=content["meta_info"]["id"],
@@ -286,7 +286,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                 delta = text[len(stream_buffer) :]
                 stream_buffer = text
                 choice_data = ChatCompletionResponseStreamChoice(
-                    index=0, delta=DeltaMessage(content=delta), finish_reason=None
+                    index=0,
+                    delta=DeltaMessage(content=delta),
+                    finish_reason=content["meta_info"]["finish_reason"],
                 )
                 chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -305,7 +307,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     choice_data = ChatCompletionResponseChoice(
         index=0,
         message=ChatMessage(role="assistant", content=ret["text"]),
-        finish_reason=None,  # TODO(comaniac): Add finish reason.
+        finish_reason=ret["meta_info"]["finish_reason"],
     )
     response = ChatCompletionResponse(
         id=ret["meta_info"]["id"],
