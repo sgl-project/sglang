@@ -191,7 +191,7 @@ class StreamExecutor:
         self.variable_event = {}  # Dict[name: str -> event: threading.Event]
         self.meta_info = {}  # Dict[name: str -> info: str]
         self.is_finished = False
-        self.error = None
+        self.error_ = None
 
         # For completion
         self.text_ = ""  # The full text
@@ -300,6 +300,10 @@ class StreamExecutor:
         self.sync()
         return self.messages_
 
+    def error(self):
+        self.sync()
+        return self.error_
+
     def end(self):
         if self.use_thread:
             if self.worker.is_alive():
@@ -338,7 +342,7 @@ class StreamExecutor:
             if self.stream_var_event:
                 for name in self.stream_var_event:
                     self.stream_var_event[name].set()
-            self.error = error
+            self.error_ = error
 
         if self.stream_text_event:
             self.stream_text_event.set()
@@ -713,7 +717,7 @@ class ProgramState:
         return self.stream_executor.sync()
 
     def error(self):
-        return self.stream_executor.error
+        return self.stream_executor.error()
 
     def text_iter(self, var_name: Optional[str] = None):
         if self.stream_executor.stream:
