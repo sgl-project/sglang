@@ -158,6 +158,7 @@ class TokenizerManager:
         if self.to_create_loop:
             await self.create_handle_loop()
 
+        obj.post_init()
         is_single = obj.is_single
         if is_single:
             rid = obj.rid
@@ -170,7 +171,7 @@ class TokenizerManager:
             if len(input_ids) >= self.context_len:
                 raise ValueError(
                     f"The input ({len(input_ids)} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens)"
+                    f"model's context length ({self.context_len} tokens)."
                 )
 
             sampling_params = SamplingParams(**obj.sampling_params)
@@ -226,7 +227,8 @@ class TokenizerManager:
                     break
                 event.clear()
         else:
-            assert obj.stream is False
+            if obj.stream:
+                raise ValueError("Do not support stream for batch mode.")
 
             if obj.input_ids is None:
                 bs = len(obj.text)
@@ -315,7 +317,7 @@ class TokenizerManager:
                     state.finished = recv_obj.finished[i]
                     state.event.set()
             else:
-                raise ValueError(f"Invalid object: {recv_obj}")
+                raise ValueError(f"Invalid object: {recv_obj}.")
 
     def convert_logprob_style(
         self, ret, return_logprob, top_logprobs_num, return_text_in_logprobs

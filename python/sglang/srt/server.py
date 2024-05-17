@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from typing import List, Optional, Union
+from http import HTTPStatus
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -83,22 +84,24 @@ async def flush_cache():
 
 @app.post("/generate")
 async def generate_request(obj: GenerateReqInput):
-    obj.post_init()
-
     if obj.stream:
-
         async def stream_results():
-            async for out in tokenizer_manager.generate_request(obj):
+            try:
+                async for out in tokenizer_manager.generate_request(obj):
+                    yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
+            except ValueError as e:
+                out = {"error": {"message": str(e)}}
                 yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_results(), media_type="text/event-stream")
-
-    try:
-        ret = await tokenizer_manager.generate_request(obj).__anext__()
-        return ret
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+    else:
+        try:
+            ret = await tokenizer_manager.generate_request(obj).__anext__()
+            return ret
+        except ValueError as e:
+            return JSONResponse({"error": {"message": str(e)}},
+                                status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/v1/completions")
