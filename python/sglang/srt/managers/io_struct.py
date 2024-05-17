@@ -128,5 +128,10 @@ class FlushCacheReq:
 
 
 @dataclass
+class AbortReq:
+    rid: str
+
+
+@dataclass
 class DetokenizeReqInput:
     input_ids: List[int]

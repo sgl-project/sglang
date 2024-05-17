@@ -74,7 +74,7 @@ async def get_server_args():
 
 @app.get("/flush_cache")
 async def flush_cache():
-    await tokenizer_manager.flush_cache()
+    tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
@@ -83,11 +83,11 @@ async def flush_cache():
 
 
 @app.post("/generate")
-async def generate_request(obj: GenerateReqInput):
+async def generate_request(obj: GenerateReqInput, request: Request):
     if obj.stream:
         async def stream_results():
             try:
-                async for out in tokenizer_manager.generate_request(obj):
+                async for out in tokenizer_manager.generate_request(obj, request):
                     yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
@@ -97,7 +97,7 @@ async def generate_request(obj: GenerateReqInput):
         return StreamingResponse(stream_results(), media_type="text/event-stream")
     else:
         try:
-            ret = await tokenizer_manager.generate_request(obj).__anext__()
+            ret = await tokenizer_manager.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:
             return JSONResponse({"error": {"message": str(e)}},
@@ -186,6 +186,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
     if server_args.api_key and server_args.api_key != "":
         app.add_middleware(APIKeyValidatorMiddleware, api_key=server_args.api_key)
 
+    # Send a warmup request
     def _wait_and_warmup():
         headers = {}
         url = server_args.url()
@@ -228,6 +229,8 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 
     t = threading.Thread(target=_wait_and_warmup)
     t.start()
+
+    # Listen for requests
     try:
         uvicorn.run(
             app,

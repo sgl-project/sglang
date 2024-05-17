@@ -20,6 +20,7 @@ from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BatchTokenIDOut,
     FlushCacheReq,
     TokenizedGenerateReqInput,
@@ -110,6 +111,8 @@ class ModelRpcServer:
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
         )
         set_random_seed(server_args.random_seed)
+
+        # Print info
         logger.info(
             f"Rank {self.tp_rank}: "
             f"max_total_num_token={self.max_total_num_token}, "
@@ -160,24 +163,6 @@ class ModelRpcServer:
         self.min_new_token_ratio = min(0.2 * server_args.schedule_conservativeness, 1.0)
         self.new_token_ratio_step = (0.0001, 0.05)  # (down, up)
 
-    def flush_cache(self):
-        if len(self.forward_queue) == 0 and (
-            self.running_batch is None or len(self.running_batch.reqs) == 0
-        ):
-            self.tree_cache.reset()
-            self.tree_cache_metrics = {"total": 0, "hit": 0}
-            self.regex_fsm_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool.clear()
-            torch.cuda.empty_cache()
-            logger.info("Cache flushed successfully!")
-        else:
-            warnings.warn(
-                f"Cache not flushed because there are pending requests. "
-                f"#queue-req: {len(self.forward_queue)}, "
-                f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
-            )
-
     def exposed_step(self, recv_reqs):
         if self.tp_size != 1:
             recv_reqs = obtain(recv_reqs)
@@ -189,6 +174,8 @@ class ModelRpcServer:
                     self.handle_generate_request(recv_req)
                 elif isinstance(recv_req, FlushCacheReq):
                     self.flush_cache()
+                elif isinstance(recv_req, AbortReq):
+                    self.abort_request(recv_req)
                 else:
                     raise ValueError(f"Invalid request: {recv_req}")
 
@@ -207,9 +194,8 @@ class ModelRpcServer:
         new_batch = self.get_new_fill_batch()
 
         if new_batch is not None:
-            # Run new fill batch
+            # Run a new fill batch
             self.forward_fill_batch(new_batch)
-
             self.cache_filled_batch(new_batch)
 
             if not new_batch.is_empty():
@@ -225,14 +211,8 @@ class ModelRpcServer:
                     self.num_generated_tokens += len(self.running_batch.reqs)
                     self.forward_decode_batch(self.running_batch)
 
-                    if self.running_batch.is_empty():
-                        self.running_batch = None
-                        break
-
-                    if self.out_pyobjs and self.running_batch.reqs[0].stream:
-                        break
-
-                    if self.running_batch is not None and self.tp_rank == 0:
+                    # Print stats
+                    if self.tp_rank == 0:
                         if self.decode_forward_ct % 40 == 0:
                             num_used = self.max_total_num_token - (
                                 self.token_to_kv_pool.available_size()
@@ -250,8 +230,15 @@ class ModelRpcServer:
                                 f"gen throughput (token/s): {throuhgput:.2f}, "
                                 f"#queue-req: {len(self.forward_queue)}"
                             )
+
+                    if self.running_batch.is_empty():
+                        self.running_batch = None
+                        break
+
+                    if self.out_pyobjs and self.running_batch.reqs[0].stream:
+                        break
             else:
-                # check the available size
+                # Check the available size
                 available_size = (
                     self.token_to_kv_pool.available_size()
                     + self.tree_cache.evictable_size()
@@ -295,7 +282,7 @@ class ModelRpcServer:
                     req.sampling_params.regex
                 )
 
-        # Truncate long prompts
+        # Truncate prompts that are too long
         req.input_ids = req.input_ids[: self.model_config.context_len - 1]
         req.sampling_params.max_new_tokens = min(
             req.sampling_params.max_new_tokens,
@@ -311,6 +298,7 @@ class ModelRpcServer:
         ):
             return None
 
+        # Compute matched prefix length
         for req in self.forward_queue:
             prefix_indices, last_node = self.tree_cache.match_prefix(req.input_ids)
             if req.return_logprob:
@@ -383,6 +371,7 @@ class ModelRpcServer:
         if len(can_run_list) == 0:
             return None
 
+        # Print stats
         if self.tp_rank == 0:
             running_req = (
                 0 if self.running_batch is None else len(self.running_batch.reqs)
@@ -410,6 +399,7 @@ class ModelRpcServer:
             #    f"ff_cache_avg_init_time: {self.jump_forward_cache.get_avg_init_time():.2f}s. "
             # )
 
+        # Return the new batch
         new_batch = Batch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -487,7 +477,7 @@ class ModelRpcServer:
         self.handle_finished_requests(batch)
 
     def cache_filled_batch(self, batch: Batch):
-        req_pool_indices_cpu = batch.req_pool_indices.cpu().tolist()
+        req_pool_indices_cpu = batch.req_pool_indices.cpu().numpy()
         for i, req in enumerate(batch.reqs):
             new_prefix_indices, new_last_node = self.tree_cache.cache_req(
                 token_ids=tuple(req.input_ids + req.output_ids)[:-1],
@@ -670,6 +660,34 @@ class ModelRpcServer:
                 batch.filter_batch(unfinished_indices)
             else:
                 batch.reqs = []
+
+    def flush_cache(self):
+        if len(self.forward_queue) == 0 and (
+            self.running_batch is None or len(self.running_batch.reqs) == 0
+        ):
+            self.tree_cache.reset()
+            self.tree_cache_metrics = {"total": 0, "hit": 0}
+            self.regex_fsm_cache.reset()
+            self.req_to_token_pool.clear()
+            self.token_to_kv_pool.clear()
+            torch.cuda.empty_cache()
+            logger.info("Cache flushed successfully!")
+        else:
+            warnings.warn(
+                f"Cache not flushed because there are pending requests. "
+                f"#queue-req: {len(self.forward_queue)}, "
+                f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
+            )
+
+    def abort_request(self, recv_req):
+        to_del = None
+        for i, req in enumerate(self.forward_queue):
+            if req.rid == recv_req.rid:
+                to_del = i
+                break
+
+        if to_del is not None:
+            del self.forward_queue[to_del]
 
 
 class ModelRpcService(rpyc.Service):
