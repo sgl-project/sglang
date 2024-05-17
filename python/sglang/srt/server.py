@@ -81,7 +81,6 @@ async def flush_cache():
     )
 
 
-@app.post("/generate")
 async def generate_request(obj: GenerateReqInput):
     obj.post_init()
 
@@ -98,7 +97,11 @@ async def generate_request(obj: GenerateReqInput):
         ret = await tokenizer_manager.generate_request(obj).__anext__()
         return ret
     except ValueError as e:
+        print(f"Error: {e}")
         return JSONResponse({"error": str(e)}, status_code=400)
+
+app.post("/generate")(generate_request)
+app.put("/generate")(generate_request)
 
 
 @app.post("/v1/completions")
