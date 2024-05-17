@@ -5,7 +5,7 @@ wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/r
 
 ### SGLang
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --enable-flashinfer
 ```
 
 ```

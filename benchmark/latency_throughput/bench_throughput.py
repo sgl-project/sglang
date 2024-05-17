@@ -109,7 +109,7 @@ async def send_request(
     headers = {"User-Agent": "Benchmark Client"}
     if backend == "vllm":
         pload = {
-            "prompt": prompt,
+            "prompt": prompt * 4,
             "n": 1,
             "best_of": best_of,
             "use_beam_search": use_beam_search,
@@ -137,7 +137,7 @@ async def send_request(
             "max_new_tokens": output_len,
         }
         pload = {
-            "text": prompt,
+            "text": prompt * 4,
             "sampling_params": params,
         }
     elif backend == "lightllm":
