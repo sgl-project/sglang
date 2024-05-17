@@ -171,7 +171,6 @@ class TokenizerManager:
                 raise ValueError(
                     f"The input ({len(input_ids)} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens)"
-                    f"The input will be truncated."
                 )
 
             sampling_params = SamplingParams(**obj.sampling_params)
