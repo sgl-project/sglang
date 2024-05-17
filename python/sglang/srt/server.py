@@ -41,8 +41,9 @@ from sglang.srt.utils import (
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
-    get_exception_traceback,
 )
+from sglang.utils import get_exception_traceback
+
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 

@@ -8,7 +8,7 @@ import zmq.asyncio
 from sglang.global_config import global_config
 from sglang.srt.managers.router.model_rpc import ModelRpcClient
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_exception_traceback
+from sglang.utils import get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
