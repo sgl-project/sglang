@@ -168,7 +168,7 @@ class TokenizerManager:
                 input_ids = obj.input_ids
 
             if len(input_ids) >= self.context_len:
-                warnings.warn(
+                raise ValueError(
                     f"The input ({len(input_ids)} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens)."
                     f"The input will be truncated."
