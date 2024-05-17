@@ -82,7 +82,6 @@ async def flush_cache():
     )
 
 
-@app.post("/generate")
 async def generate_request(obj: GenerateReqInput, request: Request):
     if obj.stream:
         async def stream_results():
@@ -102,6 +101,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             return JSONResponse({"error": {"message": str(e)}},
                                 status_code=HTTPStatus.BAD_REQUEST)
+
+app.post("/generate")(generate_request)
+app.put("/generate")(generate_request)
 
 
 @app.post("/v1/completions")
