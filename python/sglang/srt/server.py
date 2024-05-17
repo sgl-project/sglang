@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from typing import List, Optional, Union
+from http import HTTPStatus
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -73,7 +74,7 @@ async def get_server_args():
 
 @app.get("/flush_cache")
 async def flush_cache():
-    await tokenizer_manager.flush_cache()
+    tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
@@ -81,24 +82,25 @@ async def flush_cache():
     )
 
 
-async def generate_request(obj: GenerateReqInput):
-    obj.post_init()
-
+async def generate_request(obj: GenerateReqInput, request: Request):
     if obj.stream:
-
         async def stream_results():
-            async for out in tokenizer_manager.generate_request(obj):
+            try:
+                async for out in tokenizer_manager.generate_request(obj, request):
+                    yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
+            except ValueError as e:
+                out = {"error": {"message": str(e)}}
                 yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_results(), media_type="text/event-stream")
-
-    try:
-        ret = await tokenizer_manager.generate_request(obj).__anext__()
-        return ret
-    except ValueError as e:
-        print(f"Error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=400)
+    else:
+        try:
+            ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+            return ret
+        except ValueError as e:
+            return JSONResponse({"error": {"message": str(e)}},
+                                status_code=HTTPStatus.BAD_REQUEST)
 
 app.post("/generate")(generate_request)
 app.put("/generate")(generate_request)
@@ -186,6 +188,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
     if server_args.api_key and server_args.api_key != "":
         app.add_middleware(APIKeyValidatorMiddleware, api_key=server_args.api_key)
 
+    # Send a warmup request
     def _wait_and_warmup():
         headers = {}
         url = server_args.url()
@@ -228,6 +231,8 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 
     t = threading.Thread(target=_wait_and_warmup)
     t.start()
+
+    # Listen for requests
     try:
         uvicorn.run(
             app,

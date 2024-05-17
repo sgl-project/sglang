@@ -9,7 +9,7 @@ import requests
 from sglang.backend.openai import OpenAI
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.global_config import global_config
-from sglang.srt.utils import get_exception_traceback
+from sglang.utils import get_exception_traceback
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):

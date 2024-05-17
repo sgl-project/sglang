@@ -93,8 +93,12 @@ def http_request(
             data = None
         else:
             data = bytes(dumps(json), encoding="utf-8")
-        resp = urllib.request.urlopen(req, data=data, cafile=verify)
-        return HttpResponse(resp)
+
+        try:
+            resp = urllib.request.urlopen(req, data=data, cafile=verify)
+            return HttpResponse(resp)
+        except urllib.error.HTTPError as e:
+            return HttpResponse(e)
 
 
 def encode_image_base64(image_path):

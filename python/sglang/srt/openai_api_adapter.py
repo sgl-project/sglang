@@ -335,7 +335,7 @@ def to_openai_style_logprobs(
             ret_logprobs.tokens.append(token_text)
             ret_logprobs.token_logprobs.append(logprob)
 
-            # Not Supported yet
+            # Not supported yet
             ret_logprobs.text_offset.append(-1)
 
     def append_top_logprobs(top_logprobs):
