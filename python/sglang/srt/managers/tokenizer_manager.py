@@ -20,7 +20,6 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.managers.io_struct import (
     BatchStrOut,
-    DetokenizeReqInput,
     FlushCacheReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
@@ -28,7 +27,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_exception_traceback, is_multimodal_model, load_image
+from sglang.srt.utils import is_multimodal_model, load_image
+from sglang.utils import get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 

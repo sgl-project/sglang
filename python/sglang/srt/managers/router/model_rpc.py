@@ -31,11 +31,12 @@ from sglang.srt.managers.router.scheduler import Scheduler
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    get_exception_traceback,
     get_int_token_logit_bias,
     is_multimodal_model,
     set_random_seed,
 )
+from sglang.utils import get_exception_traceback
+
 
 logger = logging.getLogger("model_rpc")
 vllm_default_logger.setLevel(logging.WARN)
