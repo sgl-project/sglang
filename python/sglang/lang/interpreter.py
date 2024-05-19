@@ -395,13 +395,17 @@ class StreamExecutor:
     def _execute_fill(self, value: str, prefix=False):
         value = str(value)
 
-        if (self.cur_role == "assistant" and self.backend.api_num_spec_tokens is not None and
-            self.backend.is_chat_model and not prefix):
+        if (
+            self.cur_role == "assistant"
+            and self.backend.api_num_spec_tokens is not None
+            and self.backend.is_chat_model
+            and not prefix
+        ):
             self.backend.spec_fill(value)
             return
 
         if self.speculated_text.startswith(value):
-            self.speculated_text = self.speculated_text[len(value):]
+            self.speculated_text = self.speculated_text[len(value) :]
         else:
             self.speculated_text = ""
 
@@ -436,12 +440,17 @@ class StreamExecutor:
         if not self.stream:
             if self.backend.api_num_spec_tokens is None or self.backend.is_chat_model:
                 comp, meta_info = self.backend.generate(
-                    self, sampling_params=sampling_params, name=name,
+                    self,
+                    sampling_params=sampling_params,
+                    name=name,
                 )
-                if self.backend.api_num_spec_tokens is not None and self.backend.is_chat_model:
+                if (
+                    self.backend.api_num_spec_tokens is not None
+                    and self.backend.is_chat_model
+                ):
                     return
 
-            else: # spec on model with completion
+            else:  # spec on model with completion
                 stop = sampling_params.stop
                 max_new_tokens = sampling_params.max_new_tokens
                 meta_info = {}
@@ -493,7 +502,9 @@ class StreamExecutor:
             self.meta_info[name] = meta_info
             self.variable_event[name].set()
         else:
-            assert self.backend.api_num_spec_tokens is None, "stream is not supported with api speculative execution"
+            assert (
+                self.backend.api_num_spec_tokens is None
+            ), "stream is not supported with api speculative execution"
             generator = self.backend.generate_stream(
                 self, sampling_params=sampling_params
             )
@@ -553,11 +564,15 @@ class StreamExecutor:
         self.cur_role_begin_pos = len(self.text_)
 
     def _execute_role_end(self, expr: SglRoleEnd):
-        if self.cur_role == "assistant" and self.backend.api_num_spec_tokens is not None and self.backend.is_chat_model:
+        if (
+            self.cur_role == "assistant"
+            and self.backend.api_num_spec_tokens is not None
+            and self.backend.is_chat_model
+        ):
             self.backend.role_end_generate(self)
         self.cur_role = None
 
-        new_text = self.text_[self.cur_role_begin_pos:].lstrip()
+        new_text = self.text_[self.cur_role_begin_pos :].lstrip()
 
         _, suffix = self.chat_template.get_prefix_and_suffix(expr.role, self.messages_)
         self._execute_fill(suffix)

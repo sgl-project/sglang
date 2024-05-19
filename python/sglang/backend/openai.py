@@ -82,7 +82,7 @@ class OpenAI(BaseBackend):
                 self.is_chat_model = True
 
         self.chat_prefix = self.chat_template.role_prefix_and_suffix["assistant"][0]
-        
+
         self.spec_kwargs = {}
         self.spec_format = []
         self.spec_max_num_tries = None
@@ -112,18 +112,27 @@ class OpenAI(BaseBackend):
                     if "max_tokens" not in self.spec_kwargs:
                         self.spec_kwargs["max_tokens"] = self.api_num_spec_tokens
                     else:
-                        assert self.spec_kwargs["max_tokens"] == self.api_num_spec_tokens
+                        assert (
+                            self.spec_kwargs["max_tokens"] == self.api_num_spec_tokens
+                        )
                     params = sampling_params.to_openai_kwargs()
                     for key, value in params.items():
-                        if key in ["stop"]: continue
+                        if key in ["stop"]:
+                            continue
                         if key in ["max_tokens"]:
-                            warnings.warn("The parameter max_tokens will be overwritten by speculated number of tokens.")
+                            warnings.warn(
+                                "The parameter max_tokens will be overwritten by speculated number of tokens."
+                            )
                             continue
                         if key not in self.spec_kwargs:
                             self.spec_kwargs[key] = value
                         else:
-                            assert value == self.spec_kwargs[key], "sampling parameters should be consistent if turn on endpoint speculative execution."
-                    self.spec_format.append({"text": "", "stop": params["stop"], "name": name})
+                            assert (
+                                value == self.spec_kwargs[key]
+                            ), "sampling parameters should be consistent if turn on endpoint speculative execution."
+                    self.spec_format.append(
+                        {"text": "", "stop": params["stop"], "name": name}
+                    )
                     return "", {}
             else:
                 prompt = s.text_
@@ -137,7 +146,9 @@ class OpenAI(BaseBackend):
                 **kwargs,
             )
         elif sampling_params.dtype in [str, "str", "string"]:
-            assert not self.is_chat_model, "constrained type not supported on chat model"
+            assert (
+                not self.is_chat_model
+            ), "constrained type not supported on chat model"
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
             comp = openai_completion(
@@ -150,7 +161,9 @@ class OpenAI(BaseBackend):
             )
             comp = '"' + comp + '"'
         elif sampling_params.dtype in [int, "int"]:
-            assert not self.is_chat_model, "constrained type not supported on chat model"
+            assert (
+                not self.is_chat_model
+            ), "constrained type not supported on chat model"
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
             comp = openai_completion(
@@ -176,7 +189,7 @@ class OpenAI(BaseBackend):
             text = term["text"]
             if text != "":
                 if comp.startswith(text):
-                    comp = comp[len(text):]
+                    comp = comp[len(text) :]
                 else:
                     return False
             else:
