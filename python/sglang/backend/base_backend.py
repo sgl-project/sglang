@@ -9,6 +9,7 @@ class BaseBackend:
     def __init__(self) -> None:
         self.support_concate_and_append = False
         self.chat_template = get_chat_template("default")
+        self.api_num_spec_tokens = None
 
     def get_model_name(self):
         raise NotImplementedError()

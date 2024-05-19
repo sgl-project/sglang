@@ -183,7 +183,6 @@ class StreamExecutor:
     ):
         self.sid = uuid.uuid4().hex
         self.backend = backend
-        self.backend.api_num_spec_tokens = api_num_spec_tokens
         self.arguments: Dict[str, Any] = arguments
         self.default_sampling_para = default_sampling_para
         self.stream = stream
@@ -198,6 +197,9 @@ class StreamExecutor:
         self.text_ = ""  # The full text
 
         # For speculative execution
+        from sglang.backend.openai import OpenAI
+        if isinstance(backend, OpenAI):
+            self.backend.set_api_num_spec_tokens(api_num_spec_tokens)
         self.speculated_text = ""
 
         # For chat
@@ -438,19 +440,22 @@ class StreamExecutor:
         name = expr.name
 
         if not self.stream:
-            if self.backend.api_num_spec_tokens is None or self.backend.is_chat_model:
+            if self.backend.api_num_spec_tokens is None:
+                comp, meta_info = self.backend.generate(
+                    self,
+                    sampling_params=sampling_params,
+                )
+
+            elif self.backend.is_chat_model:
+                # spec on model with only chat interface
                 comp, meta_info = self.backend.generate(
                     self,
                     sampling_params=sampling_params,
                     name=name,
                 )
-                if (
-                    self.backend.api_num_spec_tokens is not None
-                    and self.backend.is_chat_model
-                ):
-                    return
+                return
 
-            else:  # spec on model with completion
+            else: # spec on model with completion
                 stop = sampling_params.stop
                 max_new_tokens = sampling_params.max_new_tokens
                 meta_info = {}

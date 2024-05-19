@@ -85,7 +85,11 @@ class OpenAI(BaseBackend):
 
         self.spec_kwargs = {}
         self.spec_format = []
-        self.spec_max_num_tries = None
+        self.spec_max_num_tries = 3
+        self.api_num_spec_tokens = None
+
+    def set_api_num_spec_tokens(self, num):
+        self.api_num_spec_tokens = num
 
     def get_chat_template(self):
         return self.chat_template
@@ -94,17 +98,16 @@ class OpenAI(BaseBackend):
         self,
         s: StreamExecutor,
         sampling_params: SglSamplingParams,
-        spec_max_num_tries=3,
         name=None,
     ):
-        self.spec_max_num_tries = spec_max_num_tries
         if sampling_params.dtype is None:
             if self.is_chat_model:
                 if self.api_num_spec_tokens is None:
                     if not s.text_.endswith(self.chat_prefix):
                         raise RuntimeError(
-                            "This use case is not supported. "
-                            "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
+                            "This use case is not supported if api speculative execution is off. "
+                            "For OpenAI chat models, sgl.gen must be right after sgl.assistant."
+                            "Example of adding api speculative execution: @function(api_num_spec_tokens=128)."
                         )
                     prompt = s.messages_
                 else:
@@ -129,7 +132,7 @@ class OpenAI(BaseBackend):
                         else:
                             assert (
                                 value == self.spec_kwargs[key]
-                            ), "sampling parameters should be consistent if turn on endpoint speculative execution."
+                            ), "sampling parameters should be consistent if turn on api speculative execution."
                     self.spec_format.append(
                         {"text": "", "stop": params["stop"], "name": name}
                     )
@@ -226,7 +229,7 @@ class OpenAI(BaseBackend):
 
         for term in self.spec_format:
             stop = term["stop"] if term["stop"] is not None else ""
-            s.text_ += term["text"] + stop
+            s.text_ += term["text"]
             name = term["name"]
             if name is not None:
                 s.variables[name] = term["text"]
