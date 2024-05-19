@@ -1,5 +1,6 @@
 import logging
 import time
+import warnings
 from typing import Callable, List, Optional, Union
 
 import numpy as np
@@ -80,7 +81,15 @@ class OpenAI(BaseBackend):
             else:
                 self.is_chat_model = True
 
-        self.chat_begin_str = self.chat_template.role_prefix_and_suffix["assistant"][0]
+        self.chat_prefix = self.chat_template.role_prefix_and_suffix["assistant"][0]
+
+        self.spec_kwargs = {}
+        self.spec_format = []
+        self.spec_max_num_tries = 3
+        self.api_num_spec_tokens = None
+
+    def set_api_num_spec_tokens(self, num):
+        self.api_num_spec_tokens = num
 
     def get_chat_template(self):
         return self.chat_template
@@ -89,15 +98,45 @@ class OpenAI(BaseBackend):
         self,
         s: StreamExecutor,
         sampling_params: SglSamplingParams,
+        name=None,
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
-                if not s.text_.endswith(self.chat_begin_str):
-                    raise RuntimeError(
-                        "This use case is not supported. "
-                        "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
+                if self.api_num_spec_tokens is None:
+                    if not s.text_.endswith(self.chat_prefix):
+                        raise RuntimeError(
+                            "This use case is not supported if api speculative execution is off. "
+                            "For OpenAI chat models, sgl.gen must be right after sgl.assistant."
+                            "Example of adding api speculative execution: @function(api_num_spec_tokens=128)."
+                        )
+                    prompt = s.messages_
+                else:
+                    # collect assistant answer format
+                    if "max_tokens" not in self.spec_kwargs:
+                        self.spec_kwargs["max_tokens"] = self.api_num_spec_tokens
+                    else:
+                        assert (
+                            self.spec_kwargs["max_tokens"] == self.api_num_spec_tokens
+                        )
+                    params = sampling_params.to_openai_kwargs()
+                    for key, value in params.items():
+                        if key in ["stop"]:
+                            continue
+                        if key in ["max_tokens"]:
+                            warnings.warn(
+                                "The parameter max_tokens will be overwritten by speculated number of tokens."
+                            )
+                            continue
+                        if key not in self.spec_kwargs:
+                            self.spec_kwargs[key] = value
+                        else:
+                            assert (
+                                value == self.spec_kwargs[key]
+                            ), "sampling parameters should be consistent if turn on api speculative execution."
+                    self.spec_format.append(
+                        {"text": "", "stop": params["stop"], "name": name}
                     )
-                prompt = s.messages_
+                    return "", {}
             else:
                 prompt = s.text_
 
@@ -110,6 +149,9 @@ class OpenAI(BaseBackend):
                 **kwargs,
             )
         elif sampling_params.dtype in [str, "str", "string"]:
+            assert (
+                not self.is_chat_model
+            ), "constrained type not supported on chat model"
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
             comp = openai_completion(
@@ -122,6 +164,9 @@ class OpenAI(BaseBackend):
             )
             comp = '"' + comp + '"'
         elif sampling_params.dtype in [int, "int"]:
+            assert (
+                not self.is_chat_model
+            ), "constrained type not supported on chat model"
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
             comp = openai_completion(
@@ -138,6 +183,62 @@ class OpenAI(BaseBackend):
 
         return comp, {}
 
+    def spec_fill(self, value: str):
+        assert self.is_chat_model
+        self.spec_format.append({"text": value, "stop": None, "name": None})
+
+    def spec_pattern_match(self, comp):
+        for i, term in enumerate(self.spec_format):
+            text = term["text"]
+            if text != "":
+                if comp.startswith(text):
+                    comp = comp[len(text) :]
+                else:
+                    return False
+            else:
+                pos = comp.find(term["stop"])
+                if pos != -1:
+                    term["text"] = comp[:pos]
+                    comp = comp[pos:]
+                else:
+                    if i == len(self.spec_format) - 1:
+                        term["text"] = comp
+                    else:
+                        return False
+        return True
+
+    def role_end_generate(
+        self,
+        s: StreamExecutor,
+    ):
+        if self.api_num_spec_tokens is None or not s.text_.endswith(self.chat_prefix):
+            return
+
+        comp = ""
+        if not all(x["name"] is None for x in self.spec_format):
+            for i in range(self.spec_max_num_tries):
+                comp = openai_completion(
+                    client=self.client,
+                    is_chat=self.is_chat_model,
+                    model=self.model_name,
+                    prompt=s.messages_,
+                    **self.spec_kwargs,
+                )
+                if self.spec_pattern_match(comp):
+                    break
+
+        for term in self.spec_format:
+            stop = term["stop"] if term["stop"] is not None else ""
+            s.text_ += term["text"]
+            name = term["name"]
+            if name is not None:
+                s.variables[name] = term["text"]
+                s.meta_info[name] = {}
+                s.variable_event[name].set()
+
+        self.spec_kwargs = {}
+        self.spec_format = []
+
     def generate_stream(
         self,
         s: StreamExecutor,
@@ -145,7 +246,7 @@ class OpenAI(BaseBackend):
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
-                if not s.text_.endswith(self.chat_begin_str):
+                if not s.text_.endswith(self.chat_prefix):
                     raise RuntimeError(
                         "This use case is not supported. "
                         "For OpenAI chat models, sgl.gen must be right after sgl.assistant"

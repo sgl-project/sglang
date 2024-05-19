@@ -19,7 +19,6 @@ from packaging import version as pkg_version
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -157,7 +156,9 @@ def allocate_init_ports(
         cur_port += 1
 
     if port and ret_ports[0] != port:
-        logger.warn(f"WARNING: Port {port} is not available. Use port {ret_ports[0]} instead.")
+        logger.warn(
+            f"WARNING: Port {port} is not available. Use port {ret_ports[0]} instead."
+        )
 
     return ret_ports[0], ret_ports[1:]
 

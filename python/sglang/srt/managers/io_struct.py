@@ -31,8 +31,9 @@ class GenerateReqInput:
 
     def post_init(self):
 
-        if ((self.text is None and self.input_ids is None) or
-            (self.text is not None and self.input_ids is not None)):
+        if (self.text is None and self.input_ids is None) or (
+            self.text is not None and self.input_ids is not None
+        ):
             raise ValueError("Either text or input_ids should be provided.")
 
         if self.text is not None:

@@ -341,7 +341,6 @@ class TokenizerManager:
         return top_logprobs
 
 
-
 global global_processor
 
 
