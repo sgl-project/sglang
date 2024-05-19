@@ -1,6 +1,6 @@
 """
 Usage:
-***Note: for speculative execution to work, user must put all "gen" in "assistant". Show in "assistant" the desired answer format.
+***Note: for speculative execution to work, user must put all "gen" in "assistant". Show in "assistant" the desired answer format. Each "gen" term should have a stop token. The stream mode is not supported in speculative execution.
 E.g. 
 correct: 
     sgl.assistant("\nName:" + sgl.gen("name", stop="\n") + "\nBirthday:" + sgl.gen("birthday", stop="\n") + "\nJob:" + sgl.gen("job", stop="\n"))
@@ -49,7 +49,7 @@ def multi_turn_question(s, question_1, question_2):
 
 
 def test_spec_single_turn():
-    state = gen_character_spec.run(max_new_tokens=64)
+    state = gen_character_spec.run()
     for m in state.messages():
         print(m["role"], ":", m["content"])
 
@@ -59,7 +59,7 @@ def test_spec_single_turn():
 
 
 def test_inaccurate_spec_single_turn():
-    state = gen_character_spec_no_few_shot.run(max_new_tokens=64)
+    state = gen_character_spec_no_few_shot.run()
     for m in state.messages():
         print(m["role"], ":", m["content"])
 
@@ -87,7 +87,7 @@ def test_spec_multi_turn():
     print("\n-- answer_2 --\n", state["answer_2"])
 
 
-def test_spec_stream():
+def test_spec_multi_turn_stream():
     state = multi_turn_question.run(
         question_1="What is the capital of the United States?",
         question_2="List two local attractions.",
@@ -99,22 +99,25 @@ def test_spec_stream():
 
 
 if __name__ == "__main__":
-    # set_default_backend(OpenAI("gpt-3.5-turbo-instruct"))
     set_default_backend(OpenAI("gpt-4-turbo"))
 
-    # TODO add assert
-
     print("\n========== test spec single turn ==========\n")
+    # expect reasonable answer for each field
     test_spec_single_turn()
 
     print("\n========== test inaccurate spec single turn ==========\n")
+    # expect incomplete or unreasonable answers
     test_inaccurate_spec_single_turn()
 
     print("\n========== test normal single turn ==========\n")
+    # expect reasonable answer
     test_normal_single_turn()
 
     print("\n========== test spec multi turn ==========\n")
+    # expect answer with same format as in the few shot
     test_spec_multi_turn()
 
-    print("\n========== test spec stream ==========\n")
-    test_spec_stream()
+    print("\n========== test spec multi turn stream ==========\n")
+    # expect error in stream_executor: stream is not supported...
+    test_spec_multi_turn_stream()
+
