@@ -9,8 +9,8 @@ import os
 import sys
 import threading
 import time
-from typing import List, Optional, Union
 from http import HTTPStatus
+from typing import List, Optional, Union
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -44,7 +44,6 @@ from sglang.srt.utils import (
     enable_show_time_cost,
 )
 from sglang.utils import get_exception_traceback
-
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -84,6 +83,7 @@ async def flush_cache():
 
 async def generate_request(obj: GenerateReqInput, request: Request):
     if obj.stream:
+
         async def stream_results():
             try:
                 async for out in tokenizer_manager.generate_request(obj, request):
@@ -99,8 +99,10 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await tokenizer_manager.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:
-            return JSONResponse({"error": {"message": str(e)}},
-                                status_code=HTTPStatus.BAD_REQUEST)
+            return JSONResponse(
+                {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+            )
+
 
 app.post("/generate")(generate_request)
 app.put("/generate")(generate_request)
