@@ -58,7 +58,7 @@ class RadixCache:
 
     def insert(self, key, value=None):
         if self.disable:
-            return len(key)
+            return 0
 
         if value is None:
             value = [x for x in key]
@@ -75,6 +75,12 @@ class RadixCache:
         # Insert the request into radix cache
         indices = self.req_to_token_pool.req_to_token[req_pool_idx, : len(token_ids)]
         new_prefix_len = self.insert(token_ids, indices.clone())
+
+        if self.disable:
+            if del_in_memory_pool:
+                self.token_to_kv_pool.dec_refs(indices)
+            else:
+                return torch.tensor([], dtype=torch.int64), self.root_node
 
         # Radix Cache takes one ref in memory pool
         self.token_to_kv_pool.dec_refs(indices[last_uncached_pos:new_prefix_len])
