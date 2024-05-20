@@ -1,6 +1,7 @@
 import logging
 import time
 import warnings
+import dataclasses
 from typing import Callable, List, Optional, Union
 
 import numpy as np
@@ -40,6 +41,15 @@ def create_logit_bias_int(tokenizer):
 INSTRUCT_MODEL_NAMES = [
     "gpt-3.5-turbo-instruct",
 ]
+
+
+@dataclasses.dataclass
+class TokenUsage:
+    prompt_tokens: int
+    completion_tokens: int
+
+    def reset(self):
+        self.prompt_tokens = self.completion_tokens = 0
 
 
 class OpenAI(BaseBackend):
@@ -83,66 +93,73 @@ class OpenAI(BaseBackend):
 
         self.chat_prefix = self.chat_template.role_prefix_and_suffix["assistant"][0]
 
+        # Usage
+        self.token_usage = TokenUsage(0, 0)
+
+        # API speculative execution
+        # TODO(ying): This does not support multi-threading (run_batch)
         self.spec_kwargs = {}
         self.spec_format = []
         self.spec_max_num_tries = 3
-        self.api_num_spec_tokens = None
-
-    def set_api_num_spec_tokens(self, num):
-        self.api_num_spec_tokens = num
 
     def get_chat_template(self):
         return self.chat_template
+
+    def _prepare_spec_execution(self, sampling_params: SglSamplingParams,
+                                api_num_spec_tokens: int, spec_var_name: str):
+        if "max_tokens" not in self.spec_kwargs:
+            self.spec_kwargs["max_tokens"] = api_num_spec_tokens
+        else:
+            assert (
+                self.spec_kwargs["max_tokens"] == api_num_spec_tokens
+            )
+
+        params = sampling_params.to_openai_kwargs()
+        for key, value in params.items():
+            if key in ["stop"]:
+                continue
+            if key in ["max_tokens"]:
+                warnings.warn(
+                    "The parameter max_tokens will be overwritten by speculated number of tokens."
+                )
+                continue
+            if key not in self.spec_kwargs:
+                self.spec_kwargs[key] = value
+            else:
+                assert (
+                    value == self.spec_kwargs[key]
+                ), "sampling parameters should be consistent if turn on api speculative execution."
+        self.spec_format.append(
+            {"text": "", "stop": params["stop"], "name": spec_var_name}
+        )
+        return "", {}
 
     def generate(
         self,
         s: StreamExecutor,
         sampling_params: SglSamplingParams,
-        name=None,
+        spec_var_name: str = None,
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
-                if self.api_num_spec_tokens is None:
+                if s.api_num_spec_tokens is None:
                     if not s.text_.endswith(self.chat_prefix):
                         raise RuntimeError(
                             "This use case is not supported if api speculative execution is off. "
-                            "For OpenAI chat models, sgl.gen must be right after sgl.assistant."
+                            "For OpenAI chat models, sgl.gen must be right after sgl.assistant. "
                             "Example of adding api speculative execution: @function(api_num_spec_tokens=128)."
                         )
                     prompt = s.messages_
                 else:
-                    # collect assistant answer format
-                    if "max_tokens" not in self.spec_kwargs:
-                        self.spec_kwargs["max_tokens"] = self.api_num_spec_tokens
-                    else:
-                        assert (
-                            self.spec_kwargs["max_tokens"] == self.api_num_spec_tokens
-                        )
-                    params = sampling_params.to_openai_kwargs()
-                    for key, value in params.items():
-                        if key in ["stop"]:
-                            continue
-                        if key in ["max_tokens"]:
-                            warnings.warn(
-                                "The parameter max_tokens will be overwritten by speculated number of tokens."
-                            )
-                            continue
-                        if key not in self.spec_kwargs:
-                            self.spec_kwargs[key] = value
-                        else:
-                            assert (
-                                value == self.spec_kwargs[key]
-                            ), "sampling parameters should be consistent if turn on api speculative execution."
-                    self.spec_format.append(
-                        {"text": "", "stop": params["stop"], "name": name}
-                    )
-                    return "", {}
+                    return self._prepare_spec_execution(sampling_params,
+                        s.api_num_spec_tokens, spec_var_name)
             else:
                 prompt = s.text_
 
             kwargs = sampling_params.to_openai_kwargs()
             comp = openai_completion(
                 client=self.client,
+                token_usage=self.token_usage,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=prompt,
@@ -156,6 +173,7 @@ class OpenAI(BaseBackend):
             kwargs.pop("stop")
             comp = openai_completion(
                 client=self.client,
+                token_usage=self.token_usage,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=s.text_ + '"',
@@ -171,6 +189,7 @@ class OpenAI(BaseBackend):
             kwargs.pop("stop")
             comp = openai_completion(
                 client=self.client,
+                token_usage=self.token_usage,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=s.text_,
@@ -211,7 +230,7 @@ class OpenAI(BaseBackend):
         self,
         s: StreamExecutor,
     ):
-        if self.api_num_spec_tokens is None or not s.text_.endswith(self.chat_prefix):
+        if s.api_num_spec_tokens is None or not s.text_.endswith(self.chat_prefix):
             return
 
         comp = ""
@@ -219,6 +238,7 @@ class OpenAI(BaseBackend):
             for i in range(self.spec_max_num_tries):
                 comp = openai_completion(
                     client=self.client,
+                    token_usage=self.token_usage,
                     is_chat=self.is_chat_model,
                     model=self.model_name,
                     prompt=s.messages_,
@@ -228,7 +248,6 @@ class OpenAI(BaseBackend):
                     break
 
         for term in self.spec_format:
-            stop = term["stop"] if term["stop"] is not None else ""
             s.text_ += term["text"]
             name = term["name"]
             if name is not None:
@@ -258,6 +277,7 @@ class OpenAI(BaseBackend):
             kwargs = sampling_params.to_openai_kwargs()
             generator = openai_completion_stream(
                 client=self.client,
+                token_usage=self.token_usage,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=prompt,
@@ -303,6 +323,8 @@ class OpenAI(BaseBackend):
             )
             ret_str = ret.choices[0].text
             ret_token = self.tokenizer.encode(ret_str)[0]
+            self.token_usage.prompt_tokens += ret.usage.prompt_tokens
+            self.token_usage.completion_tokens= ret.usage.completion_tokens
 
             # TODO:
             # 1. return logits as the scores
@@ -332,7 +354,7 @@ class OpenAI(BaseBackend):
         return decision, scores, None, None
 
 
-def openai_completion(client, retries=3, is_chat=None, prompt=None, **kwargs):
+def openai_completion(client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs):
     for attempt in range(retries):
         try:
             if is_chat:
@@ -346,6 +368,9 @@ def openai_completion(client, retries=3, is_chat=None, prompt=None, **kwargs):
                     comp = [c.text for c in ret.choices]
                 else:
                     comp = ret.choices[0].text
+
+            token_usage.prompt_tokens += ret.usage.prompt_tokens
+            token_usage.completion_tokens += ret.usage.completion_tokens
             break
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError) as e:
             logger.error(f"OpenAI Error: {e}. Waiting 5 seconds...")
@@ -359,16 +384,19 @@ def openai_completion(client, retries=3, is_chat=None, prompt=None, **kwargs):
     return comp
 
 
-def openai_completion_stream(client, retries=3, is_chat=None, prompt=None, **kwargs):
+def openai_completion_stream(client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs):
     for attempt in range(retries):
         try:
             if is_chat:
                 if "stop" in kwargs and kwargs["stop"] is None:
                     kwargs.pop("stop")
                 generator = client.chat.completions.create(
-                    messages=prompt, stream=True, **kwargs
+                    messages=prompt, stream=True, stream_options={"include_usage": True},
+                    **kwargs
                 )
                 for ret in generator:
+                    if len(ret.choices) == 0:
+                        continue
                     try:
                         content = ret.choices[0].delta.content
                     except IndexError:
@@ -376,11 +404,17 @@ def openai_completion_stream(client, retries=3, is_chat=None, prompt=None, **kwa
                     yield content or "", {}
             else:
                 generator = client.completions.create(
-                    prompt=prompt, stream=True, **kwargs
+                    prompt=prompt, stream=True, stream_options={"include_usage": True},
+                    **kwargs
                 )
                 for ret in generator:
+                    if len(ret.choices) == 0:
+                        continue
                     content = ret.choices[0].text
                     yield content or "", {}
+
+            token_usage.prompt_tokens += ret.usage.prompt_tokens
+            token_usage.completion_tokens += ret.usage.completion_tokens
             break
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError) as e:
             logger.error(f"OpenAI Error: {e}. Waiting 5 seconds...")
