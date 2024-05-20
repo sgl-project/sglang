@@ -14,6 +14,8 @@ from sglang.test.test_programs import (
     test_select,
     test_stream,
     test_tool_use,
+    test_completion_speculative,
+    test_chat_completion_speculative
 )
 
 
@@ -78,6 +80,14 @@ class TestOpenAIBackend(unittest.TestCase):
         set_default_backend(self.backend)
         test_stream()
 
+    def test_completion_speculative(self):
+        set_default_backend(self.backend)
+        test_completion_speculative()
+
+    def test_chat_completion_speculative(self):
+        set_default_backend(self.chat_backend)
+        test_chat_completion_speculative()
+
 
 if __name__ == "__main__":
     unittest.main(warnings="ignore")
@@ -87,4 +97,4 @@ if __name__ == "__main__":
     # global_config.verbosity = 2
     # t = TestOpenAIBackend()
     # t.setUp()
-    # t.test_few_shot_qa()
+    # t.test_chat_completion_speculative()
