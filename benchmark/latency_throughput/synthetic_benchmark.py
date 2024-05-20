@@ -1,10 +1,15 @@
 """Benchmark online serving throughput.
 
 On the server side, run one of the following commands:
+    (SRT backend)
+    python -m sglang.launch_server \
+        --model <your_model> --tp <num_gpus> \
+        --port 30000 --enable-flashinfer --disable-radix-cache
+
     (vLLM backend)
     python -m vllm.entrypoints.api_server \
-        --model <your_model> --swap-space 16 \
-        --disable-log-requests
+        --model <your_model> --tensor <num_gpus> --swap-space 16 \
+        --disable-log-requests --port 30000
 
     (TGI backend)
     ./launch_hf_server.sh <your_model>
@@ -12,8 +17,12 @@ On the server side, run one of the following commands:
 On the client side, run:
     python benchmarks/benchmark_serving.py \
         --backend <backend> \
-        --tokenizer <your_model> --dataset <target_dataset> \
+        --tokenizer <your_model> \
+        --num-prompt <num_prompts> \
         --request-rate <request_rate>
+        --input-len <input_len> \
+        --output-len <output_len> \
+        --port 30000
 """
 
 import argparse
@@ -27,55 +36,23 @@ import aiohttp
 import numpy as np
 from tqdm.asyncio import tqdm_asyncio
 from transformers import PreTrainedTokenizerBase
-from vllm.transformers_utils.tokenizer import get_tokenizer
 
-# (prompt len, output len, latency)
-REQUEST_LATENCY: List[Tuple[int, int, float]] = []
+from sglang.srt.hf_transformers_utils import get_tokenizer
 
 
 def sample_requests(
-    dataset_path: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
+    input_len: int,
+    output_len: int,
 ) -> List[Tuple[str, int, int]]:
-    # Load the dataset.
-    with open(dataset_path) as f:
-        dataset = json.load(f)
-    # Filter out the conversations with less than 2 turns.
-    dataset = [data for data in dataset if len(data["conversations"]) >= 2]
-    # Only keep the first two turns of each conversation.
-    dataset = [
-        (data["conversations"][0]["value"], data["conversations"][1]["value"])
-        for data in dataset
-    ]
-
-    # Tokenize the prompts and completions.
-    prompts = [prompt for prompt, _ in dataset]
-    prompt_token_ids = tokenizer(prompts).input_ids
-    completions = [completion for _, completion in dataset]
-    completion_token_ids = tokenizer(completions).input_ids
-    tokenized_dataset = []
-    for i in range(len(dataset)):
-        output_len = len(completion_token_ids[i])
-        tokenized_dataset.append((prompts[i], prompt_token_ids[i], output_len))
-
-    # Filter out too long sequences.
-    filtered_dataset: List[Tuple[str, int, int]] = []
-    for prompt, prompt_token_ids, output_len in tokenized_dataset:
-        prompt_len = len(prompt_token_ids)
-        if prompt_len < 4 or output_len < 4:
-            # Prune too short sequences.
-            # This is because TGI causes errors when the input or output length
-            # is too short.
-            continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
-            # Prune too long sequences.
-            continue
-        filtered_dataset.append((prompt, prompt_len, output_len))
-
-    # Sample the requests.
-    sampled_requests = random.sample(filtered_dataset, num_requests)
-    return sampled_requests
+    prompt = "Hello " * input_len
+    prompt_token_ids = list(tokenizer(prompt).input_ids)
+    requests = []
+    for i in range(num_requests):
+        requests.append((prompt, len(prompt_token_ids), output_len))
+    
+    return requests
 
 
 async def get_request(
@@ -104,8 +81,6 @@ async def send_request(
     best_of: int,
     use_beam_search: bool,
 ) -> None:
-    request_start_time = time.perf_counter()
-
     headers = {"User-Agent": "Benchmark Client"}
     if backend == "vllm":
         pload = {
@@ -153,12 +128,16 @@ async def send_request(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    request_start_time = time.perf_counter()
+    first_token_latency = None
     timeout = aiohttp.ClientTimeout(total=3 * 3600)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             async with session.post(api_url, headers=headers, json=pload) as response:
                 chunks = []
                 async for chunk, _ in response.content.iter_chunks():
+                    if first_token_latency is None:
+                        first_token_latency = time.perf_counter() - request_start_time
                     chunks.append(chunk)
             output = b"".join(chunks).decode("utf-8")
             output = json.loads(output)
@@ -167,9 +146,8 @@ async def send_request(
             if "error" not in output:
                 break
 
-    request_end_time = time.perf_counter()
-    request_latency = request_end_time - request_start_time
-    REQUEST_LATENCY.append((prompt_len, output_len, request_latency))
+    request_latency = time.perf_counter() - request_start_time
+    return (prompt_len, output_len, request_latency, first_token_latency)
 
 
 async def benchmark(
@@ -195,7 +173,8 @@ async def benchmark(
             )
         )
         tasks.append(task)
-    await tqdm_asyncio.gather(*tasks)
+    request_latency = await tqdm_asyncio.gather(*tasks)
+    return request_latency
 
 
 def main(args: argparse.Namespace):
@@ -205,10 +184,11 @@ def main(args: argparse.Namespace):
 
     api_url = f"http://{args.host}:{args.port}/generate"
     tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=args.trust_remote_code)
-    input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
+    input_requests = sample_requests(args.num_prompts, tokenizer, args.input_len, args.output_len)
 
     benchmark_start_time = time.perf_counter()
-    asyncio.run(
+    # (prompt len, output len, latency, first_token_latency)
+    request_latency = asyncio.run(
         benchmark(
             args.backend,
             api_url,
@@ -221,22 +201,32 @@ def main(args: argparse.Namespace):
     benchmark_end_time = time.perf_counter()
     benchmark_time = benchmark_end_time - benchmark_start_time
     print(f"Total time: {benchmark_time:.2f} s")
-    print(f"Throughput: {args.num_prompts / benchmark_time:.2f} requests/s")
 
-    # Compute the latency statistics.
-    avg_latency = np.mean([latency for _, _, latency in REQUEST_LATENCY])
-    print(f"Average latency: {avg_latency:.2f} s")
+    # Compute the perf statistics.
+    throughput = np.sum([output_len for _, output_len, _, _ in request_latency]) / benchmark_time
+    print(f"Throughput: {throughput} token/s")
     avg_per_token_latency = np.mean(
         [
             latency / (prompt_len + output_len)
-            for prompt_len, output_len, latency in REQUEST_LATENCY
+            for prompt_len, output_len, latency, _ in request_latency
         ]
     )
     print(f"Average latency per token: {avg_per_token_latency:.2f} s")
     avg_per_output_token_latency = np.mean(
-        [latency / output_len for _, output_len, latency in REQUEST_LATENCY]
+        [(latency - first_token_latency) / output_len for _, output_len, latency, first_token_latency in request_latency]
     )
-    print("Average latency per output token: " f"{avg_per_output_token_latency:.2f} s")
+    print(f"Average TPOT: {avg_per_output_token_latency * 1000:.0f} ms")
+    avg_first_token_latency = np.mean(
+        [first_token_latency for _, _, _, first_token_latency in request_latency]
+    )
+    print(f"Average TTFT: {avg_first_token_latency:.2f} s")
+
+    stats = {"num_prompts": args.num_prompts, "input_len": args.input_len, "output_len": args.output_len,
+            "total_time (s)": benchmark_time, "throughput (token/s)": throughput, "avg_per_token_latency (s)": avg_per_token_latency,
+            "TPOT (ms)": avg_per_output_token_latency, "TTFT (s)": avg_first_token_latency}
+
+    with open(args.output_file, "a") as f:
+        f.write(json.dumps(stats) + "\n")
 
 
 if __name__ == "__main__":
@@ -251,9 +241,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument(
-        "--dataset", type=str, required=True, help="Path to the dataset."
-    )
     parser.add_argument(
         "--tokenizer", type=str, required=True, help="Name or path of the tokenizer."
     )
@@ -281,6 +268,24 @@ if __name__ == "__main__":
         "--trust-remote-code",
         action="store_true",
         help="trust remote code from huggingface",
+    )
+    parser.add_argument(
+        "--input-len",
+        type=int,
+        default=512,
+        help="Number of input tokens"
+    )
+    parser.add_argument(
+        "--output-len",
+        type=int,
+        default=128,
+        help="Number of output tokens"
+    )
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        default="perf_stats.jsonl",
+        help="output file path for performance statistics"
     )
     args = parser.parse_args()
     main(args)
