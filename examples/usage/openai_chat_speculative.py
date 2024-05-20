@@ -111,7 +111,6 @@ if __name__ == "__main__":
     print("\n========== test spec single turn ==========\n")
     # expect reasonable answer for each field
     test_spec_single_turn()
-    exit(0)
 
     print("\n========== test inaccurate spec single turn ==========\n")
     # expect incomplete or unreasonable answers

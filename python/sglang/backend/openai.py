@@ -235,6 +235,7 @@ class OpenAI(BaseBackend):
 
         comp = ""
         if not all(x["name"] is None for x in self.spec_format):
+            # TODO(ying): throw errors or warnings
             for i in range(self.spec_max_num_tries):
                 comp = openai_completion(
                     client=self.client,
