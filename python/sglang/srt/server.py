@@ -93,7 +93,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(stream_results(), media_type="text/event-stream")
+        return StreamingResponse(stream_results(), media_type="text/event-stream",
+                                 background=tokenizer_manager.create_abort_task(obj))
     else:
         try:
             ret = await tokenizer_manager.generate_request(obj, request).__anext__()

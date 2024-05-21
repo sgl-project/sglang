@@ -679,6 +679,7 @@ class ModelRpcServer:
             )
 
     def abort_request(self, recv_req):
+        # Delete requests in the waiting queue
         to_del = None
         for i, req in enumerate(self.forward_queue):
             if req.rid == recv_req.rid:
@@ -687,6 +688,14 @@ class ModelRpcServer:
 
         if to_del is not None:
             del self.forward_queue[to_del]
+
+        # Delete requests in the running batch
+        if self.running_batch:
+            for req in self.running_batch.reqs:
+                if req.rid == recv_req.rid:
+                    req.finished = True
+                    req.finish_reason = FinishReason.ABORT
+                    break
 
 
 class ModelRpcService(rpyc.Service):
