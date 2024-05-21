@@ -15,10 +15,9 @@ class ModelConfig:
         self.path = path
         self.trust_remote_code = trust_remote_code
         self.revision = revision
-        self.hf_config = get_config(self.path, trust_remote_code, revision)
-
-        if model_overide_args is not None:
-            self.hf_config.update(model_overide_args)
+        self.model_overide_args = model_overide_args
+        self.hf_config = get_config(self.path, trust_remote_code, revision,
+                                    model_overide_args=model_overide_args)
 
         if context_length is not None:
             self.context_len = context_length

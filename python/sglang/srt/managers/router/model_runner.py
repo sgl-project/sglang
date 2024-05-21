@@ -9,7 +9,8 @@ from typing import List, Optional, Type
 import numpy as np
 import torch
 import torch.nn as nn
-from vllm.config import ModelConfig, DeviceConfig, LoadConfig
+from vllm.config import DeviceConfig, LoadConfig
+from vllm.config import ModelConfig as VllmModelConfig
 from vllm.distributed import initialize_model_parallel
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
@@ -256,7 +257,7 @@ class ModelRunner:
 
         device_config = DeviceConfig()
         load_config = LoadConfig()
-        model_config = ModelConfig(
+        vllm_model_config = VllmModelConfig(
             model=self.model_config.path,
             tokenizer=None,
             tokenizer_mode=None,
@@ -266,8 +267,11 @@ class ModelRunner:
             revision=self.model_config.revision,
             skip_tokenizer_init=True,
         )
+        if self.model_config.model_overide_args is not None:
+            vllm_model_config.hf_config.update(self.model_config.model_overide_args)
+
         self.model = get_model(
-            model_config=model_config,
+            model_config=vllm_model_config,
             device_config=device_config,
             load_config=load_config,
             lora_config=None,
