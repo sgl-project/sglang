@@ -69,20 +69,13 @@ class ModelRpcServer:
         )
 
         # For model end global settings
-        server_args_dict = {
-            "enable_flashinfer": server_args.enable_flashinfer,
-            "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
-        }
-
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
             nccl_port=port_args.nccl_port,
-            load_format=server_args.load_format,
-            trust_remote_code=server_args.trust_remote_code,
-            server_args_dict=server_args_dict,
+            server_args=server_args,
         )
         if is_multimodal_model(server_args.model_path):
             self.processor = get_processor(

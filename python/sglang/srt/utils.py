@@ -106,6 +106,7 @@ def get_available_gpu_memory(gpu_id, distributed=True):
             "which may cause useless memory allocation for torch CUDA context.",
         )
 
+    torch.cuda.empty_cache()
     free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     if distributed:
