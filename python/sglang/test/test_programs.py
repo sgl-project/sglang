@@ -353,7 +353,7 @@ def test_regex():
 
 
 def test_completion_speculative():
-    @sgl.function(api_num_spec_tokens=64)
+    @sgl.function(num_api_spec_tokens=64)
     def gen_character_spec(s):
         s += "Construct a character within the following format:\n"
         s += "Name: Steve Jobs.\nBirthday: February 24, 1955.\nJob: Apple CEO.\n"
@@ -384,7 +384,7 @@ def test_completion_speculative():
 
 
 def test_chat_completion_speculative():
-    @sgl.function(api_num_spec_tokens=256)
+    @sgl.function(num_api_spec_tokens=256)
     def gen_character_spec(s):
         s += sgl.system("You are a helpful assistant.")
         s += sgl.user("Construct a character within the following format:")
