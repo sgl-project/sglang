@@ -580,8 +580,8 @@ class StreamExecutor:
     def _execute_role_end(self, expr: SglRoleEnd):
         if (
             self.cur_role == "assistant"
-            and self.backend.is_chat_model
             and self.api_num_spec_tokens is not None
+            and self.backend.is_chat_model
         ):
             # Execute the stored lazy generation calls
             self.backend.role_end_generate(self)

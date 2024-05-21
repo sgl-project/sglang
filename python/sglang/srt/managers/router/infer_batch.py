@@ -19,6 +19,7 @@ class FinishReason(IntEnum):
     EOS_TOKEN = auto()
     LENGTH = auto()
     STOP_STR = auto()
+    ABORT = auto()
 
     @staticmethod
     def to_str(reason):
@@ -28,6 +29,8 @@ class FinishReason(IntEnum):
             return "length"
         elif reason == FinishReason.STOP_STR:
             return "stop"
+        elif reason == FinishReason.ABORT:
+            return "abort"
         else:
             return None
 
@@ -86,6 +89,35 @@ class Req:
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
 
+    def check_finished(self):
+        if self.finished:
+            return
+
+        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+            self.finished = True
+            self.finish_reason = FinishReason.LENGTH
+            return
+
+        if (
+            self.output_ids[-1] == self.tokenizer.eos_token_id
+            and self.sampling_params.ignore_eos == False
+        ):
+            self.finished = True
+            self.finish_reason = FinishReason.EOS_TOKEN
+            return
+
+        if len(self.sampling_params.stop_strs) > 0:
+            tail_str = self.tokenizer.decode(
+                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
+            )
+
+            for stop_str in self.sampling_params.stop_strs:
+                if stop_str in tail_str:
+                    self.finished = True
+                    self.finish_reason = FinishReason.STOP_STR
+                    self.hit_stop_str = stop_str
+                    return
+
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
         old_output_str = self.tokenizer.decode(self.output_ids)
         # FIXME: This logic does not really solve the problem of determining whether
@@ -131,35 +163,6 @@ class Req:
 
         # print(f"Output and jump forward str:\n{self.output_and_jump_forward_str}")
         # print("*" * 100)
-
-    def check_finished(self):
-        if self.finished:
-            return
-
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished = True
-            self.finish_reason = FinishReason.LENGTH
-            return
-
-        if (
-            self.output_ids[-1] == self.tokenizer.eos_token_id
-            and self.sampling_params.ignore_eos == False
-        ):
-            self.finished = True
-            self.finish_reason = FinishReason.EOS_TOKEN
-            return
-
-        if len(self.sampling_params.stop_strs) > 0:
-            tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
-            )
-
-            for stop_str in self.sampling_params.stop_strs:
-                if stop_str in tail_str:
-                    self.finished = True
-                    self.finish_reason = FinishReason.STOP_STR
-                    self.hit_stop_str = stop_str
-                    return
 
     def __repr__(self):
         return f"rid(n={self.rid}, " f"input_ids={self.input_ids}, "
