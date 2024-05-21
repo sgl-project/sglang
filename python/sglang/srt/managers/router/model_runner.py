@@ -283,7 +283,7 @@ class ModelRunner:
             parallel_config=None,
             scheduler_config=None,
         )
-        logger.info(f"Rank {self.tp_rank}: load weight end.")
+        logger.info(f"Rank {self.tp_rank}: load weight end. {type(self.model)}")
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(

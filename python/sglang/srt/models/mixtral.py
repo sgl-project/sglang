@@ -30,6 +30,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.utils import print_warning_once
 
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -80,7 +81,7 @@ class MixtralMoE(nn.Module):
                                      params_dtype=self.params_dtype,
                                      quant_config=None)
 
-        if self.use_fp8:
+        if self.use_fp8 and self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
 
         self.w13_weight = nn.Parameter(
@@ -500,6 +501,11 @@ class MixtralForCausalLM(nn.Module):
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
+
+
+def all_close_1d(x: torch.Tensor) -> bool:
+    assert len(x.shape) == 1
+    return all(torch.allclose(x[0], x[i]) for i in range(x.shape[0]))
 
 
 EntryClass = MixtralForCausalLM
