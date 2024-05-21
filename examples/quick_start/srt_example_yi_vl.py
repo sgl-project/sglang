@@ -1,5 +1,7 @@
 """
 Usage: python3 srt_example_yi_vl.py
+
+Requirements: transformers==4.38
 """
 import sglang as sgl
 
