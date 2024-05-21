@@ -106,12 +106,12 @@ class OpenAI(BaseBackend):
         return self.chat_template
 
     def _prepare_spec_execution(self, sampling_params: SglSamplingParams,
-                                api_num_spec_tokens: int, spec_var_name: str):
+                                num_api_spec_tokens: int, spec_var_name: str):
         if "max_tokens" not in self.spec_kwargs:
-            self.spec_kwargs["max_tokens"] = api_num_spec_tokens
+            self.spec_kwargs["max_tokens"] = num_api_spec_tokens
         else:
             assert (
-                self.spec_kwargs["max_tokens"] == api_num_spec_tokens
+                self.spec_kwargs["max_tokens"] == num_api_spec_tokens
             )
 
         params = sampling_params.to_openai_kwargs()
@@ -142,17 +142,17 @@ class OpenAI(BaseBackend):
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
-                if s.api_num_spec_tokens is None:
+                if s.num_api_spec_tokens is None:
                     if not s.text_.endswith(self.chat_prefix):
                         raise RuntimeError(
                             "This use case is not supported if api speculative execution is off. "
                             "For OpenAI chat models, sgl.gen must be right after sgl.assistant. "
-                            "Example of adding api speculative execution: @function(api_num_spec_tokens=128)."
+                            "Example of adding api speculative execution: @function(num_api_spec_tokens=128)."
                         )
                     prompt = s.messages_
                 else:
                     return self._prepare_spec_execution(sampling_params,
-                        s.api_num_spec_tokens, spec_var_name)
+                        s.num_api_spec_tokens, spec_var_name)
             else:
                 prompt = s.text_
 
@@ -230,7 +230,7 @@ class OpenAI(BaseBackend):
         self,
         s: StreamExecutor,
     ):
-        if s.api_num_spec_tokens is None or not s.text_.endswith(self.chat_prefix):
+        if s.num_api_spec_tokens is None or not s.text_.endswith(self.chat_prefix):
             return
 
         comp = ""
