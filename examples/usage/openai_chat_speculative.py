@@ -19,7 +19,7 @@ import sglang as sgl
 from sglang import function, set_default_backend, OpenAI
 
 
-@function(api_num_spec_tokens=256)
+@function(num_api_spec_tokens=256)
 def gen_character_spec(s):
     s += sgl.system("You are a helpful assistant.")
     s += sgl.user("Construct a character within the following format:")
@@ -28,7 +28,7 @@ def gen_character_spec(s):
     s += sgl.assistant("Name:" + sgl.gen("name", stop="\n") + "\nBirthday:" + sgl.gen("birthday", stop="\n") + "\nJob:" + sgl.gen("job", stop="\n"))
 
 
-@function(api_num_spec_tokens=256)
+@function(num_api_spec_tokens=256)
 def gen_character_spec_no_few_shot(s):
     s += sgl.user("Construct a character. For each field stop with a newline\n")
     s += sgl.assistant("Name:" + sgl.gen("name", stop="\n") + "\nAge:" + sgl.gen("age", stop="\n") + "\nJob:" + sgl.gen("job", stop="\n"))
@@ -41,7 +41,7 @@ def gen_character_normal(s):
     s += sgl.assistant(sgl.gen("answer", max_tokens=64))
 
 
-@function(api_num_spec_tokens=1024)
+@function(num_api_spec_tokens=1024)
 def multi_turn_question(s, question_1, question_2):
     s += sgl.system("You are a helpful assistant.")
     s += sgl.user("Answer questions in the following format:")

@@ -5,7 +5,7 @@ python3 openai_speculative.py
 from sglang import function, gen, set_default_backend, OpenAI
 
 
-@function(api_num_spec_tokens=64)
+@function(num_api_spec_tokens=64)
 def gen_character_spec(s):
     s += "Construct a character within the following format:\n"
     s += "Name: Steve Jobs.\nBirthday: February 24, 1955.\nJob: Apple CEO.\n"
@@ -23,7 +23,7 @@ def gen_character_no_spec(s):
     s += "\nJob:" + gen("job", stop="\n") + "\n"
 
 
-@function(api_num_spec_tokens=64)
+@function(num_api_spec_tokens=64)
 def gen_character_spec_no_few_shot(s):
     # s += "Construct a character with name, birthday, and job:\n"
     s += "Construct a character:\n"
