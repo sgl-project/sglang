@@ -393,13 +393,3 @@ class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
             )
         response = await call_next(request)
         return response
-
-
-# FIXME: Remove this once we drop support for pydantic 1.x
-IS_PYDANTIC_1 = int(pydantic.VERSION.split(".")[0]) == 1
-
-
-def jsonify_pydantic_model(obj: BaseModel):
-    if IS_PYDANTIC_1:
-        return obj.json(ensure_ascii=False)
-    return obj.model_dump_json()
