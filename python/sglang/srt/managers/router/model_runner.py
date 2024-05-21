@@ -261,7 +261,7 @@ class ModelRunner:
             tokenizer=None,
             tokenizer_mode=None,
             trust_remote_code=self.model_config.trust_remote_code,
-            dtype="auto",
+            dtype=torch.float16,
             seed=42,
             revision=self.model_config.revision,
             skip_tokenizer_init=True,
