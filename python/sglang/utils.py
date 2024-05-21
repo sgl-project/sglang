@@ -141,7 +141,7 @@ def encode_frame(frame):
 
 
 def encode_video_base64(video_path, num_frames=16):
-    import cv2
+    import cv2  # pip install opencv-python-headless
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
