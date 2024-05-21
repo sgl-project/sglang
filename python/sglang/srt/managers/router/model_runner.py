@@ -249,9 +249,9 @@ class ModelRunner:
         total_gpu_memory = get_available_gpu_memory(
             self.tp_rank, distributed=self.tp_size > 1
         ) * (1 << 30)
-        logger.info(f"Before: {get_available_gpu_memory(self.tp_rank, False):.2f} GB")
+        # logger.info(f"Before: {get_available_gpu_memory(self.tp_rank, False):.2f} GB")
         self.load_model()
-        logger.info(f"After: {get_available_gpu_memory(self.tp_rank, False):.2f} GB")
+        # logger.info(f"After: {get_available_gpu_memory(self.tp_rank, False):.2f} GB")
         self.init_memory_pool(total_gpu_memory)
 
         self.is_multimodal_model = is_multimodal_model(self.model_config)
