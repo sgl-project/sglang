@@ -1,7 +1,7 @@
 # Adapted from
-# https://github.com/vllm-project/vllm/blob/d0215a58e78572d91dadafe9d832a2db89b09a13/vllm/model_executor/models/mixtral.py#L1
+# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/mixtral_quant.py#L1
 """Inference-only Mixtral model."""
-from typing import Optional
+from typing import Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -25,11 +25,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.router.model_runner import InputMetadata
-from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
 
 
 class MixtralMLP(nn.Module):
@@ -107,7 +108,7 @@ class MixtralMoE(nn.Module):
             ]
         )
         self.gate = ReplicatedLinear(
-            config.hidden_size, self.num_total_experts, bias=False, linear_method=None
+            config.hidden_size, self.num_total_experts, bias=False, quant_config=None
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -333,13 +334,7 @@ class MixtralForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
 
-    def load_weights(
-        self,
-        model_name_or_path: str,
-        cache_dir: Optional[str] = None,
-        load_format: str = "auto",
-        revision: Optional[str] = None,
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -348,13 +343,7 @@ class MixtralForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in hf_model_weights_iterator(
-            model_name_or_path,
-            cache_dir,
-            load_format,
-            revision,
-            fall_back_to_pt=False,
-        ):
+        for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
