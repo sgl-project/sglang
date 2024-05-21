@@ -15,6 +15,7 @@ class ServerArgs:
     chat_template: Optional[str] = None
     trust_remote_code: bool = True
     context_length: Optional[int] = None
+    quantization: Optional[str] = None
 
     # Port
     host: str = "127.0.0.1"
@@ -134,6 +135,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.context_length,
             help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
+        )
+        parser.add_argument(
+            "--quantization",
+            type=str,
+            default=ServerArgs.quantization,
+            help="The quantization method.",
         )
         parser.add_argument(
             "--mem-fraction-static",
