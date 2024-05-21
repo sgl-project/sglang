@@ -1,63 +1,28 @@
 import importlib
 import importlib.resources
-import inspect
 import logging
 import pkgutil
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List
+from typing import List, Optional, Type
 
 import numpy as np
 import torch
+import torch.nn as nn
+from vllm.config import ModelConfig, DeviceConfig, LoadConfig
 from vllm.distributed import initialize_model_parallel
-from vllm.model_executor.layers.quantization.awq import AWQConfig
-from vllm.model_executor.layers.quantization.gptq import GPTQConfig
-from vllm.model_executor.layers.quantization.marlin import MarlinConfig
-from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models import ModelRegistry
 
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.utils import get_available_gpu_memory, is_multimodal_model
 
-QUANTIZATION_CONFIG_MAPPING = {
-    "awq": AWQConfig,
-    "gptq": GPTQConfig,
-    "marlin": MarlinConfig,
-}
 
 logger = logging.getLogger("model_runner")
 
 # for server args in model endpoints
 global_server_args_dict = {}
-
-
-@lru_cache()
-def import_model_classes():
-    model_arch_name_to_cls = {}
-    package_name = "sglang.srt.models"
-    package = importlib.import_module(package_name)
-    for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
-        if not ispkg:
-            module = importlib.import_module(name)
-            if hasattr(module, "EntryClass"):
-                model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
-    return model_arch_name_to_cls
-
-
-def get_model_cls_by_arch_name(model_arch_names):
-    model_arch_name_to_cls = import_model_classes()
-
-    model_class = None
-    for arch in model_arch_names:
-        if arch in model_arch_name_to_cls:
-            model_class = model_arch_name_to_cls[arch]
-            break
-    else:
-        raise ValueError(
-            f"Unsupported architectures: {arch}. "
-            f"Supported list: {list(model_arch_name_to_cls.keys())}"
-        )
-    return model_class
 
 
 @dataclass
@@ -287,49 +252,29 @@ class ModelRunner:
         self.is_multimodal_model = is_multimodal_model(self.model_config)
 
     def load_model(self):
-        """See also vllm/model_executor/model_loader.py::get_model"""
-        # Select model class
-        architectures = getattr(self.model_config.hf_config, "architectures", [])
-        model_class = get_model_cls_by_arch_name(architectures)
         logger.info(f"Rank {self.tp_rank}: load weight begin.")
 
-        # Load weights
-        quant_config = None
-
-        quant_cfg = getattr(self.model_config.hf_config, "quantization_config", None)
-        if quant_cfg is not None:
-            quant_method = quant_cfg.get("quant_method", "").lower()
-            # compat: autogptq >=0.8.0 use checkpoint_format: str
-            # compat: autogptq <=0.7.1 is_marlin_format: bool
-            is_format_marlin = quant_cfg.get(
-                "checkpoint_format"
-            ) == "marlin" or quant_cfg.get("is_marlin_format", False)
-
-            # Use marlin if the GPTQ model is serialized in marlin format.
-            if quant_method == "gptq" and is_format_marlin:
-                quant_method = "marlin"
-
-            quant_config_class = QUANTIZATION_CONFIG_MAPPING.get(quant_method)
-
-            if quant_config_class is None:
-                raise ValueError(f"Unsupported quantization method: {quant_method}")
-
-            quant_config = quant_config_class.from_config(quant_cfg)
-            logger.info(f"quant_config: {quant_config}")
-
-        with set_default_torch_dtype(torch.float16):
-            with torch.device("cuda"):
-                model = model_class(
-                    config=self.model_config.hf_config, quant_config=quant_config
-                )
-            model.load_weights(
-                self.model_config.path,
-                cache_dir=None,
-                load_format=self.load_format,
-                revision=None,
-            )
-        self.model = model.eval()
-
+        device_config = DeviceConfig()
+        load_config = LoadConfig()
+        model_config = ModelConfig(
+            model=self.model_config.path,
+            tokenizer=None,
+            tokenizer_mode=None,
+            trust_remote_code=self.model_config.trust_remote_code,
+            dtype="auto",
+            seed=42,
+            revision=self.model_config.revision,
+            skip_tokenizer_init=True,
+        )
+        self.model = get_model(
+            model_config=model_config,
+            device_config=device_config,
+            load_config=load_config,
+            lora_config=None,
+            vision_language_config=None,
+            parallel_config=None,
+            scheduler_config=None,
+        )
         logger.info(f"Rank {self.tp_rank}: load weight end.")
 
     def profile_max_num_token(self, total_gpu_memory):
@@ -455,3 +400,30 @@ class ModelRunner:
             return self.forward_prefill(batch)
         else:
             raise ValueError(f"Invaid forward mode: {forward_mode}")
+
+
+@lru_cache()
+def import_model_classes():
+    model_arch_name_to_cls = {}
+    package_name = "sglang.srt.models"
+    package = importlib.import_module(package_name)
+    for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
+        if not ispkg:
+            module = importlib.import_module(name)
+            if hasattr(module, "EntryClass"):
+                model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
+    return model_arch_name_to_cls
+
+
+def load_model_cls_srt(model_arch: str) -> Optional[Type[nn.Module]]:
+    model_arch_name_to_cls = import_model_classes()
+    if model_arch not in model_arch_name_to_cls:
+        raise ValueError(
+            f"Unsupported architectures: {model_arch}. "
+            f"Supported list: {list(model_arch_name_to_cls.keys())}"
+        )
+    return model_arch_name_to_cls[model_arch]
+
+
+# Monkey patch model loader
+setattr(ModelRegistry, "load_model_cls", load_model_cls_srt)

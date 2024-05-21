@@ -41,6 +41,7 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger("model_rpc")
 vllm_default_logger.setLevel(logging.WARN)
 logging.getLogger("vllm.utils").setLevel(logging.WARN)
+logging.getLogger("vllm.selector").setLevel(logging.WARN)
 
 
 class ModelRpcServer:
