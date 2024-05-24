@@ -166,6 +166,8 @@ async def send_request(
             # Re-send the request if it failed.
             if "error" not in output:
                 break
+            else:
+                print(output)
 
     request_end_time = time.perf_counter()
     request_latency = request_end_time - request_start_time
@@ -205,7 +207,16 @@ def main(args: argparse.Namespace):
 
     api_url = f"http://{args.host}:{args.port}/generate"
     tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=args.trust_remote_code)
-    input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
+
+    if args.dataset:
+        input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
+    else:
+        prompt_len = args.input_len
+        output_len = args.output_len
+        input_requests = []
+        for i in range(args.num_prompts):
+            prompt = tokenizer.decode([(i + j) % tokenizer.vocab_size for j in range(prompt_len)])
+            input_requests.append((prompt, prompt_len, output_len))
 
     benchmark_start_time = time.perf_counter()
     asyncio.run(
@@ -246,16 +257,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        default="vllm",
+        default="srt",
         choices=["vllm", "tgi", "srt", "lightllm"],
     )
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
-        "--dataset", type=str, required=True, help="Path to the dataset."
+        "--dataset", type=str, help="Path to the dataset."
     )
+    parser.add_argument("--input-len", type=str, default=1024)
+    parser.add_argument("--output-len", type=str, default=128)
     parser.add_argument(
-        "--tokenizer", type=str, required=True, help="Name or path of the tokenizer."
+        "--tokenizer", type=str,
+        default="NousResearch/Meta-Llama-3-8B",
+        help="Name or path of the tokenizer."
     )
     parser.add_argument(
         "--best-of",
