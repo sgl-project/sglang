@@ -17,14 +17,14 @@ def image_qa(s, image, question):
 
 def single():
     image_url = "https://farm4.staticflickr.com/3175/2653711032_804ff86d81_z.jpg"
-    pil_image = load_image(image_url)
+    pil_image, _ = load_image(image_url)
     state = image_qa.run(image=pil_image, question="What is this?", max_new_tokens=512)
     print(state["answer"], "\n")
 
 
 def stream():
     image_url = "https://farm4.staticflickr.com/3175/2653711032_804ff86d81_z.jpg"
-    pil_image = load_image(image_url)
+    pil_image, _ = load_image(image_url)
     state = image_qa.run(
         image=pil_image,
         question="Please generate short caption for this image.",
@@ -40,7 +40,7 @@ def stream():
 
 def batch():
     image_url = "https://farm4.staticflickr.com/3175/2653711032_804ff86d81_z.jpg"
-    pil_image = load_image(image_url)
+    pil_image, _ = load_image(image_url)
     states = image_qa.run_batch(
         [
             {"image": pil_image, "question": "What is this?"},
