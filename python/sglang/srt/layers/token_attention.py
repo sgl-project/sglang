@@ -17,6 +17,12 @@ else:
 
 
 @triton.jit
+def tanh(x):
+    # Tanh is just a scaled sigmoid
+    return 2 * tl.sigmoid(2 * x) - 1
+
+
+@triton.jit
 def _fwd_kernel_stage1(
     Q,
     K_Buffer,
@@ -35,6 +41,7 @@ def _fwd_kernel_stage1(
     kv_group_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    logit_cap: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -77,6 +84,10 @@ def _fwd_kernel_stage1(
         ).to(REDUCE_TRITON_TYPE)
         att_value = tl.sum(q[None, :] * k, 1)
         att_value *= sm_scale
+
+        if logit_cap > 0:
+            att_value = logit_cap * tanh(att_value / logit_cap)
+
         off_o = cur_head * att_stride_h + (cur_batch_in_all_start_index + offs_n)
         tl.store(Att_Out + off_o, att_value, mask=offs_n_new < cur_batch_end_index)
 
@@ -165,6 +176,7 @@ def _token_att_m_fwd(
     B_Start_Loc,
     B_Seqlen,
     max_len_in_batch,
+    logit_cap,
 ):
     BLOCK = 32
     # shape constraints
@@ -223,6 +235,7 @@ def _token_att_m_fwd(
         kv_group_num=kv_group_num,
         BLOCK_DMODEL=Lk,
         BLOCK_N=BLOCK,
+        logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=1,
     )
@@ -304,6 +317,7 @@ def token_attention_fwd(
     max_len_in_batch,
     other_kv_index,
     total_num_tokens,
+    logit_cap=-1,
     att_m=None,
 ):
     if att_m is None:
@@ -320,6 +334,7 @@ def token_attention_fwd(
         b_start_loc,
         b_seq_len,
         max_len_in_batch,
+        logit_cap,
     )
     _token_softmax_reducev_fwd(
         att_m,
