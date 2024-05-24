@@ -106,8 +106,7 @@ class ModelRpcServer:
         set_random_seed(server_args.random_seed)
 
         # Print info
-        logger.info(
-            f"Rank {self.tp_rank}: "
+        logger.info(f"[rank={self.tp_rank}] "
             f"max_total_num_token={self.max_total_num_token}, "
             f"max_prefill_num_token={self.max_prefill_num_token}, "
             f"context_len={self.model_config.context_len}, "
@@ -752,7 +751,7 @@ def _init_service(port):
         protocol_config={
             "allow_public_attrs": True,
             "allow_pickle": True,
-            "sync_request_timeout": 1800,
+            "sync_request_timeout": 3600,
         },
     )
     t.start()
@@ -772,7 +771,7 @@ def start_model_process(port):
                 config={
                     "allow_public_attrs": True,
                     "allow_pickle": True,
-                    "sync_request_timeout": 1800,
+                    "sync_request_timeout": 3600,
                 },
             )
             break

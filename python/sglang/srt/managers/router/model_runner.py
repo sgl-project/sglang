@@ -235,8 +235,8 @@ class ModelRunner:
         }
 
         # Init torch distributed
-        logger.debug("Init torch begin.")
         torch.cuda.set_device(self.tp_rank)
+        logger.info(f"[rank={self.tp_rank}] Init torch begin. Avail mem={get_available_gpu_memory(self.tp_rank):.2f} GB")
         torch.distributed.init_process_group(
             backend="nccl",
             world_size=self.tp_size,
@@ -244,20 +244,22 @@ class ModelRunner:
             init_method=f"tcp://127.0.0.1:{self.nccl_port}",
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
-        logger.debug("Init torch end.")
+        logger.info(f"[rank={self.tp_rank}] Init torch end.")
 
-        total_gpu_memory = get_available_gpu_memory(
-            self.tp_rank, distributed=self.tp_size > 1
-        ) * (1 << 30)
-        # logger.info(f"Before: {get_available_gpu_memory(self.tp_rank, False):.2f} GB")
+        total_gpu_memory = get_available_gpu_memory(self.tp_rank, distributed=self.tp_size > 1)
+
+        if self.tp_size > 1:
+            total_local_gpu_memory = get_available_gpu_memory(self.tp_rank)
+            if total_local_gpu_memory < total_gpu_memory * 0.9:
+                raise ValueError("The memory capacity is unbalanced. Some GPUs may be occupied by other processes.")
+
         self.load_model()
-        # logger.info(f"After: {get_available_gpu_memory(self.tp_rank, False):.2f} GB")
         self.init_memory_pool(total_gpu_memory)
 
         self.is_multimodal_model = is_multimodal_model(self.model_config)
 
     def load_model(self):
-        logger.info(f"Rank {self.tp_rank}: load weight begin.")
+        logger.info(f"[rank={self.tp_rank}] Load weight begin.")
 
         device_config = DeviceConfig()
         load_config = LoadConfig(load_format=self.server_args.load_format)
@@ -283,19 +285,19 @@ class ModelRunner:
             parallel_config=None,
             scheduler_config=None,
         )
-        logger.info(f"Rank {self.tp_rank}: load weight end. {type(self.model)}")
+        logger.info(f"[rank={self.tp_rank}] Load weight end. "
+                    f"Type={type(self.model).__name__}. "
+                    f"Avail mem={get_available_gpu_memory(self.tp_rank):.2f} GB")
 
     def profile_max_num_token(self, total_gpu_memory):
-        available_gpu_memory = get_available_gpu_memory(
-            self.tp_rank, distributed=self.tp_size > 1
-        ) * (1 << 30)
+        available_gpu_memory = get_available_gpu_memory(self.tp_rank, distributed=self.tp_size > 1)
         head_dim = self.model_config.head_dim
         head_num = self.model_config.num_key_value_heads // self.tp_size
         cell_size = head_num * head_dim * self.model_config.num_hidden_layers * 2 * 2
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
-        max_num_token = int(rest_memory // cell_size)
+        max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
     def init_memory_pool(self, total_gpu_memory):

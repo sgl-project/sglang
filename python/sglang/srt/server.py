@@ -203,7 +203,6 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
             time.sleep(0.5)
             try:
                 requests.get(url + "/get_model_info", timeout=5, headers=headers)
-                success = True  # Set flag to True if request succeeds
                 break
             except requests.exceptions.RequestException as e:
                 pass
@@ -213,7 +212,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
             res = requests.post(
                 url + "/generate",
                 json={
-                    "text": "Say this is a warmup request.",
+                    "text": "The capital city of France is",
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": 16,

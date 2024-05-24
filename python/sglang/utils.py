@@ -2,7 +2,8 @@
 
 import base64
 import json
-import os
+import logging
+import signal
 import sys
 import threading
 import traceback
@@ -13,6 +14,9 @@ from json import dumps
 
 import numpy as np
 import requests
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_exception_traceback():
@@ -247,3 +251,12 @@ def run_with_timeout(func, args=(), kwargs=None, timeout=None):
         raise RuntimeError()
 
     return ret_value[0]
+
+
+def graceful_registry(sub_module_name):
+    def graceful_shutdown(signum, frame):
+        logger.info(f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown...")
+        if signum == signal.SIGTERM:
+            logger.info(f"{sub_module_name} recive sigterm")
+
+    signal.signal(signal.SIGTERM, graceful_shutdown)
