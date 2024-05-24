@@ -1,5 +1,6 @@
 import unittest
-
+import openai
+import os
 import sglang as sgl
 from sglang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template
@@ -67,8 +68,9 @@ class TestTracing(unittest.TestCase):
 
         compiled = tip_suggestion.compile()
         compiled.print_graph()
-
-        sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo-instruct"))
+        api_key = os.getenv("OPENAI_API_KEY", "ACTUAL_OPENAI_API_KEY_HERE")
+        openai.api_key = api_key
+        sgl.set_default_backend(sgl.OpenAI(api_key=api_key,model_name="gpt-3.5-turbo-instruct"))
         state = compiled.run(topic="staying healthy")
         print(state.text() + "\n")
 
@@ -119,8 +121,9 @@ class TestTracing(unittest.TestCase):
 
         tracer = tip_suggestion.trace()
         print(tracer.last_node.print_graph_dfs())
-
-        a = tip_suggestion.run(backend=sgl.OpenAI("gpt-3.5-turbo-instruct"))
+        api_key = os.getenv("OPENAI_API_KEY", "ACTUAL_OPENAI_API_KEY_HERE")
+        openai.api_key = api_key
+        a = tip_suggestion.run(backend=sgl.OpenAI(api_key=api_key,model_name="gpt-3.5-turbo-instruct"))
         print(a.text())
 
 

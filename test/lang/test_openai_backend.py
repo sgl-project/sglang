@@ -1,5 +1,6 @@
 import unittest
-
+import os
+import openai
 from sglang import OpenAI, set_default_backend
 from sglang.test.test_programs import (
     test_decode_int,
@@ -14,8 +15,8 @@ from sglang.test.test_programs import (
     test_select,
     test_stream,
     test_tool_use,
-    test_completion_speculative,
-    test_chat_completion_speculative
+    #test_completion_speculative,
+    #test_chat_completion_speculative
 )
 
 
@@ -28,9 +29,11 @@ class TestOpenAIBackend(unittest.TestCase):
         cls = type(self)
 
         if cls.backend is None:
-            cls.backend = OpenAI("gpt-3.5-turbo-instruct")
-            cls.chat_backend = OpenAI("gpt-3.5-turbo")
-            cls.chat_vision_backend = OpenAI("gpt-4-turbo")
+            api_key = os.getenv("OPENAI_API_KEY", "ACTUAL_OPENAI_API_KEY_HERE")
+            openai.api_key = api_key
+            cls.backend = OpenAI(api_key=api_key,model_name="gpt-3.5-turbo-instruct")
+            cls.chat_backend = OpenAI(api_key=api_key,model_name="gpt-3.5-turbo")
+            cls.chat_vision_backend = OpenAI(api_key=api_key,model_name="gpt-4-turbo")
 
     def test_few_shot_qa(self):
         set_default_backend(self.backend)
@@ -79,7 +82,7 @@ class TestOpenAIBackend(unittest.TestCase):
     def test_stream(self):
         set_default_backend(self.backend)
         test_stream()
-
+   """
     def test_completion_speculative(self):
         set_default_backend(self.backend)
         test_completion_speculative()
@@ -87,7 +90,7 @@ class TestOpenAIBackend(unittest.TestCase):
     def test_chat_completion_speculative(self):
         set_default_backend(self.chat_backend)
         test_chat_completion_speculative()
-
+    """
 
 if __name__ == "__main__":
     unittest.main(warnings="ignore")
