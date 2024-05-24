@@ -30,7 +30,7 @@ if __name__ == "__main__":
         response = requests.post(
             url + "/generate",
             json={
-                "text": f"{a}, ",
+                "text": f"The capital of France is",
                 # "input_ids": [[2] * 256] * 196,
                 "sampling_params": {
                     "temperature": 0,
