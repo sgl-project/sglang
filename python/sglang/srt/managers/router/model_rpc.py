@@ -341,7 +341,7 @@ class ModelRpcServer:
             )
 
         for req in self.forward_queue:
-            if req.return_logprob:
+            if req.return_logprob and req.normalized_prompt_logprob is None:
                 # Need at least two tokens to compute normalized logprob
                 if req.extend_input_len < 2:
                     delta = 2 - req.extend_input_len
@@ -463,28 +463,53 @@ class ModelRpcServer:
             req.check_finished()
 
             if req.return_logprob:
-                req.normalized_prompt_logprob = normalized_prompt_logprobs[i]
+                if req.normalized_prompt_logprob is None:
+                    req.normalized_prompt_logprob = normalized_prompt_logprobs[i]
 
-                # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
-                req.prefill_token_logprobs = list(
-                    zip(
-                        prefill_token_logprobs[pt : pt + req.extend_input_len - 1],
-                        req.input_ids[-req.extend_input_len + 1 :],
+                if req.prefill_token_logprobs is None:
+                    # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
+                    req.prefill_token_logprobs = list(
+                        zip(
+                            prefill_token_logprobs[pt : pt + req.extend_input_len - 1],
+                            req.input_ids[-req.extend_input_len + 1 :],
+                        )
                     )
-                )
-                if req.logprob_start_len == 0:
-                    req.prefill_token_logprobs = [
-                        (None, req.input_ids[0])
-                    ] + req.prefill_token_logprobs
-                req.decode_token_logprobs = [
+                    if req.logprob_start_len == 0:
+                        req.prefill_token_logprobs = [
+                            (None, req.input_ids[0])
+                        ] + req.prefill_token_logprobs
+
+                if req.last_update_decode_tokens != 0:
+                    req.decode_token_logprobs.extend(
+                        list(
+                            zip(
+                                prefill_token_logprobs[
+                                    pt
+                                    + req.extend_input_len
+                                    - req.last_update_decode_tokens : pt
+                                    + req.extend_input_len
+                                    - 1
+                                ],
+                                req.input_ids[-req.last_update_decode_tokens + 1 :],
+                            )
+                        )
+                    )
+
+                req.decode_token_logprobs.append(
                     (last_token_logprobs[i], next_token_ids[i])
-                ]
+                )
 
             if req.top_logprobs_num > 0:
-                req.prefill_top_logprobs = prefill_top_logprobs[i]
-                if req.logprob_start_len == 0:
-                    req.prefill_top_logprobs = [None] + req.prefill_top_logprobs
-                req.decode_top_logprobs = [decode_top_logprobs[i]]
+                if req.prefill_top_logprobs is None:
+                    req.prefill_top_logprobs = prefill_top_logprobs[i]
+                    if req.logprob_start_len == 0:
+                        req.prefill_top_logprobs = [None] + req.prefill_top_logprobs
+
+                if req.last_update_decode_tokens != 0:
+                    req.decode_top_logprobs.extend(
+                        prefill_top_logprobs[i][-req.last_update_decode_tokens + 1 :]
+                    )
+                req.decode_top_logprobs.append(decode_top_logprobs[i])
 
             pt += req.extend_input_len
 

@@ -76,9 +76,12 @@ class Req:
         self.top_logprobs_num = 0
         self.normalized_prompt_logprob = None
         self.prefill_token_logprobs = None
-        self.decode_token_logprobs = None
+        self.decode_token_logprobs = []
         self.prefill_top_logprobs = None
-        self.decode_top_logprobs = None
+        self.decode_top_logprobs = []
+        # The tokens is prefilled but need to be considered as decode tokens
+        # and should be updated for the decode logprobs
+        self.last_update_decode_tokens = 0
 
         # Constrained decoding
         self.regex_fsm = None
@@ -156,6 +159,13 @@ class Req:
         self.output_ids = []
 
         self.regex_fsm_state = next_state
+
+        if self.return_logprob:
+            # For fast-forward part's logprobs
+            self.decode_token_logprobs = []
+            self.decode_top_logprobs = []
+            self.logprobs_start_len = prompt_tokens
+            self.last_update_decode_tokens = len(self.prev_output_ids)
 
         # print("=" * 100)
         # print(f"Catch jump forward:\n{jump_forward_str}")
@@ -369,6 +379,10 @@ class Batch:
             req.last_node = None
             req.extend_input_len = 0
             req.output_ids = []
+
+            # For incremental logprobs
+            req.last_update_decode_tokens = 0
+            req.logprob_start_len = 10**9
 
         self.filter_batch(sorted_indices)
 
