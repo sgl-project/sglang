@@ -154,6 +154,7 @@ class Req:
         self.origin_input_ids = all_ids[:prompt_tokens]
         self.origin_input_ids_unpadded = self.origin_input_ids
         # NOTE: the output ids may not strictly correspond to the output text
+        old_prev_output_ids = self.prev_output_ids
         self.prev_output_ids = all_ids[prompt_tokens:]
         self.prev_output_str = self.prev_output_str + cur_output_str + jump_forward_str
         self.output_ids = []
@@ -162,10 +163,16 @@ class Req:
 
         if self.return_logprob:
             # For fast-forward part's logprobs
-            self.decode_token_logprobs = []
-            self.decode_top_logprobs = []
-            self.logprob_start_len = prompt_tokens
-            self.last_update_decode_tokens = len(self.prev_output_ids)
+            k = 0
+            for i, old_id in enumerate(old_prev_output_ids):
+                if old_id == self.prev_output_ids[i]:
+                    k = k + 1
+                else:
+                    break
+            self.decode_token_logprobs = self.decode_token_logprobs[:k]
+            self.decode_top_logprobs = self.decode_top_logprobs[:k]
+            self.logprob_start_len = prompt_tokens + k
+            self.last_update_decode_tokens = len(self.prev_output_ids) - k
 
         # print("=" * 100)
         # print(f"Catch jump forward:\n{jump_forward_str}")
