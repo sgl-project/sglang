@@ -23,8 +23,17 @@ def openai_api_request(name):
         "logprobs": 3,
     }
     res = http_request(base_url + "/v1/completions", json=data).json()
-    with open(f"json_logprobs_{name.replace(' ', '_')}_tmp.json", "w") as fout:
-        fout.write(json.dumps(res, indent=4))
+
+    # with open(f"json_logprobs_{name.replace(' ', '_')}_tmp.json", "w") as fout:
+    #     fout.write(json.dumps(res, indent=4))
+
+    logprobs = res["choices"][0]["logprobs"]
+    usage = res["usage"]
+    assert len(logprobs["token_logprobs"]) == len(logprobs["tokens"])
+    assert len(logprobs["token_logprobs"]) == len(logprobs["top_logprobs"])
+    assert len(logprobs["token_logprobs"]) == usage["completion_tokens"] - 1
+
+    return res
 
 
 def srt_api_request(name):
@@ -53,6 +62,8 @@ def srt_api_request(name):
     assert len(meta_info["decode_token_logprobs"]) == len(
         meta_info["decode_top_logprobs"]
     )
+    assert len(meta_info["prefill_token_logprobs"]) == meta_info["prompt_tokens"]
+    assert len(meta_info["decode_token_logprobs"]) == meta_info["completion_tokens"] - 1
 
     return res
 

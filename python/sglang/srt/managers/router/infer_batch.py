@@ -164,7 +164,7 @@ class Req:
             # For fast-forward part's logprobs
             self.decode_token_logprobs = []
             self.decode_top_logprobs = []
-            self.logprobs_start_len = prompt_tokens
+            self.logprob_start_len = prompt_tokens
             self.last_update_decode_tokens = len(self.prev_output_ids)
 
         # print("=" * 100)
