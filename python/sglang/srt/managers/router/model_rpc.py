@@ -602,10 +602,8 @@ class ModelRpcServer:
                 )
 
                 meta_info = {
-                    "prompt_tokens": req.prompt_tokens,
-                    "completion_tokens": len(req.input_ids)
-                    + len(req.output_ids)
-                    - req.prompt_tokens,
+                    "prompt_tokens": len(req.origin_input_ids),
+                    "completion_tokens": len(req.prev_output_ids) + len(req.output_ids),
                     "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
                     "finish_reason": FinishReason.to_str(req.finish_reason),
                     "hit_stop_str": req.hit_stop_str,

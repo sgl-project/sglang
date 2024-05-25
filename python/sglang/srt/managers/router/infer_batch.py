@@ -40,7 +40,7 @@ class Req:
         self.rid = rid
         self.origin_input_text = origin_input_text
         self.origin_input_ids = origin_input_ids
-        self.origin_input_ids_unpadded = origin_input_ids  # for image padding
+        self.origin_input_ids_unpadded = origin_input_ids  # before image padding
         self.prev_output_str = ""
         self.prev_output_ids = []
         self.output_ids = []
