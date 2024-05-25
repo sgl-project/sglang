@@ -31,12 +31,10 @@ class GenerateReqInput:
 
     def post_init(self):
 
-        if self.text is None:
-            assert (
-                self.input_ids is not None
-            ), "Either text or input_ids should be provided"
-        else:
-            assert self.input_ids is None, "Either text or input_ids should be provided"
+        if (self.text is None and self.input_ids is None) or (
+            self.text is not None and self.input_ids is not None
+        ):
+            raise ValueError("Either text or input_ids should be provided.")
 
         if self.text is not None:
             is_single = isinstance(self.text, str)
@@ -71,7 +69,8 @@ class GenerateReqInput:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(num)]
             else:
-                assert isinstance(self.rid, list)
+                if not isinstance(self.rid, list):
+                    raise ValueError("The rid should be a list.")
 
             if self.return_logprob is None:
                 self.return_logprob = [False] * num
@@ -127,6 +126,11 @@ class BatchStrOut:
 @dataclass
 class FlushCacheReq:
     pass
+
+
+@dataclass
+class AbortReq:
+    rid: str
 
 
 @dataclass

@@ -19,6 +19,7 @@ class FinishReason(IntEnum):
     EOS_TOKEN = auto()
     LENGTH = auto()
     STOP_STR = auto()
+    ABORT = auto()
 
     @staticmethod
     def to_str(reason):
@@ -28,6 +29,8 @@ class FinishReason(IntEnum):
             return "length"
         elif reason == FinishReason.STOP_STR:
             return "stop"
+        elif reason == FinishReason.ABORT:
+            return "abort"
         else:
             return None
 
@@ -92,43 +95,6 @@ class Req:
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
 
-    def jump_forward_and_retokenize(self, jump_forward_str, next_state):
-        # FIXME: This logic does not really solve the problem of determining whether
-        # there should be a leading space.
-        cur_output_str = self.partial_decode(self.output_ids)
-
-        # TODO(lsyin): apply re-tokenize only for decode tokens so that we do not need origin_input_text anymore
-        if self.origin_input_text is None:
-            # Recovering text can only use unpadded ids
-            self.origin_input_text = self.tokenizer.decode(
-                self.origin_input_ids_unpadded
-            )
-
-        all_text = (
-            self.origin_input_text
-            + self.prev_output_str
-            + cur_output_str
-            + jump_forward_str
-        )
-        all_ids = self.tokenizer.encode(all_text)
-        prompt_tokens = len(self.origin_input_ids_unpadded)
-        self.origin_input_ids = all_ids[: prompt_tokens]
-        self.origin_input_ids_unpadded = self.origin_input_ids
-        # NOTE: the output ids may not strictly correspond to the output text
-        self.prev_output_ids = all_ids[prompt_tokens :]
-        self.prev_output_str = self.prev_output_str + cur_output_str + jump_forward_str
-        self.output_ids = []
-
-        self.regex_fsm_state = next_state
-
-        # print("=" * 100)
-        # print(f"Catch jump forward:\n{jump_forward_str}")
-        # print(self.tokenizer.convert_ids_to_tokens(self.input_ids))
-        # print(self.tokenizer.convert_ids_to_tokens(new_input_ids))
-
-        # print(f"Output and jump forward str:\n{self.output_and_jump_forward_str}")
-        # print("*" * 100)
-
     def check_finished(self):
         if self.finished:
             return
@@ -161,6 +127,43 @@ class Req:
                     self.finish_reason = FinishReason.STOP_STR
                     self.hit_stop_str = stop_str
                     return
+
+    def jump_forward_and_retokenize(self, jump_forward_str, next_state):
+        # FIXME: This logic does not really solve the problem of determining whether
+        # there should be a leading space.
+        cur_output_str = self.partial_decode(self.output_ids)
+
+        # TODO(lsyin): apply re-tokenize only for decode tokens so that we do not need origin_input_text anymore
+        if self.origin_input_text is None:
+            # Recovering text can only use unpadded ids
+            self.origin_input_text = self.tokenizer.decode(
+                self.origin_input_ids_unpadded
+            )
+
+        all_text = (
+            self.origin_input_text
+            + self.prev_output_str
+            + cur_output_str
+            + jump_forward_str
+        )
+        all_ids = self.tokenizer.encode(all_text)
+        prompt_tokens = len(self.origin_input_ids_unpadded)
+        self.origin_input_ids = all_ids[:prompt_tokens]
+        self.origin_input_ids_unpadded = self.origin_input_ids
+        # NOTE: the output ids may not strictly correspond to the output text
+        self.prev_output_ids = all_ids[prompt_tokens:]
+        self.prev_output_str = self.prev_output_str + cur_output_str + jump_forward_str
+        self.output_ids = []
+
+        self.regex_fsm_state = next_state
+
+        # print("=" * 100)
+        # print(f"Catch jump forward:\n{jump_forward_str}")
+        # print(self.tokenizer.convert_ids_to_tokens(self.input_ids))
+        # print(self.tokenizer.convert_ids_to_tokens(new_input_ids))
+
+        # print(f"Output and jump forward str:\n{self.output_and_jump_forward_str}")
+        # print("*" * 100)
 
     def __repr__(self):
         return f"rid(n={self.rid}, " f"input_ids={self.origin_input_ids}, "

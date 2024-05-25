@@ -1,6 +1,7 @@
 """Common utilities."""
 
 import base64
+import logging
 import os
 import random
 import socket
@@ -18,7 +19,8 @@ from packaging import version as pkg_version
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from sglang.utils import get_exception_traceback
+logger = logging.getLogger(__name__)
+
 
 show_time_cost = False
 time_infos = {}
@@ -90,7 +92,7 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(gpu_id, distributed=True):
+def get_available_gpu_memory(gpu_id, distributed=False):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
@@ -104,6 +106,7 @@ def get_available_gpu_memory(gpu_id, distributed=True):
             "which may cause useless memory allocation for torch CUDA context.",
         )
 
+    torch.cuda.empty_cache()
     free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     if distributed:
@@ -124,31 +127,12 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def alloc_usable_network_port(num, used_list=()):
-    port_list = []
-    for port in range(10000, 65536):
-        if port in used_list:
-            continue
-
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                s.bind(("", port))
-                s.listen(1)  # Attempt to listen on the port
-                port_list.append(port)
-            except socket.error:
-                pass  # If any error occurs, this port is not usable
-
-            if len(port_list) == num:
-                return port_list
-    return None
-
-
-def check_port(port):
+def is_port_available(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("", port))
+            s.listen(1)
             return True
         except socket.error:
             return False
@@ -159,31 +143,25 @@ def allocate_init_ports(
     additional_ports: Optional[List[int]] = None,
     tp_size: int = 1,
 ):
-    port = 30000 if port is None else port
-    additional_ports = [] if additional_ports is None else additional_ports
-    additional_ports = (
-        [additional_ports] if isinstance(additional_ports, int) else additional_ports
-    )
-    # first check on server port
-    if not check_port(port):
-        new_port = alloc_usable_network_port(1, used_list=[port])[0]
-        print(f"WARNING: Port {port} is not available. Use {new_port} instead.")
-        port = new_port
+    if additional_ports:
+        ret_ports = [port] + additional_ports
+    else:
+        ret_ports = [port]
 
-    # then we check on additional ports
-    additional_unique_ports = set(additional_ports) - {port}
-    # filter out ports that are already in use
-    can_use_ports = [port for port in additional_unique_ports if check_port(port)]
+    ret_ports = list(set(x for x in ret_ports if is_port_available(x)))
+    cur_port = ret_ports[-1] + 1 if len(ret_ports) > 0 else 10000
 
-    num_specified_ports = len(can_use_ports)
-    if num_specified_ports < 4 + tp_size:
-        addtional_can_use_ports = alloc_usable_network_port(
-            num=4 + tp_size - num_specified_ports, used_list=can_use_ports + [port]
+    while len(ret_ports) < 5 + tp_size:
+        if cur_port not in ret_ports and is_port_available(cur_port):
+            ret_ports.append(cur_port)
+        cur_port += 1
+
+    if port and ret_ports[0] != port:
+        logger.warn(
+            f"WARNING: Port {port} is not available. Use port {ret_ports[0]} instead."
         )
-        can_use_ports.extend(addtional_can_use_ports)
 
-    additional_ports = can_use_ports[: 4 + tp_size]
-    return port, additional_ports
+    return ret_ports[0], ret_ports[1:]
 
 
 def get_int_token_logit_bias(tokenizer, vocab_size):
@@ -416,13 +394,3 @@ class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
             )
         response = await call_next(request)
         return response
-
-
-# FIXME: Remove this once we drop support for pydantic 1.x
-IS_PYDANTIC_1 = int(pydantic.VERSION.split(".")[0]) == 1
-
-
-def jsonify_pydantic_model(obj: BaseModel):
-    if IS_PYDANTIC_1:
-        return obj.json(ensure_ascii=False)
-    return obj.model_dump_json()

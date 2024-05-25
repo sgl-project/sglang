@@ -1,5 +1,7 @@
 import logging
 import time
+import warnings
+import dataclasses
 from typing import Callable, List, Optional, Union
 
 import numpy as np
@@ -41,6 +43,15 @@ INSTRUCT_MODEL_NAMES = [
 ]
 
 
+@dataclasses.dataclass
+class TokenUsage:
+    prompt_tokens: int
+    completion_tokens: int
+
+    def reset(self):
+        self.prompt_tokens = self.completion_tokens = 0
+
+
 class OpenAI(BaseBackend):
     def __init__(
         self,
@@ -80,40 +91,89 @@ class OpenAI(BaseBackend):
             else:
                 self.is_chat_model = True
 
-        self.chat_begin_str = self.chat_template.role_prefix_and_suffix["assistant"][0]
+        self.chat_prefix = self.chat_template.role_prefix_and_suffix["assistant"][0]
+
+        # Usage
+        self.token_usage = TokenUsage(0, 0)
+
+        # API speculative execution
+        # TODO(ying): This does not support multi-threading (run_batch)
+        self.spec_kwargs = {}
+        self.spec_format = []
+        self.spec_max_num_tries = 3
 
     def get_chat_template(self):
         return self.chat_template
+
+    def _prepare_spec_execution(self, sampling_params: SglSamplingParams,
+                                num_api_spec_tokens: int, spec_var_name: str):
+        if "max_tokens" not in self.spec_kwargs:
+            self.spec_kwargs["max_tokens"] = num_api_spec_tokens
+        else:
+            assert (
+                self.spec_kwargs["max_tokens"] == num_api_spec_tokens
+            )
+
+        params = sampling_params.to_openai_kwargs()
+        for key, value in params.items():
+            if key in ["stop"]:
+                continue
+            if key in ["max_tokens"]:
+                warnings.warn(
+                    "The parameter max_tokens will be overwritten by speculated number of tokens."
+                )
+                continue
+            if key not in self.spec_kwargs:
+                self.spec_kwargs[key] = value
+            else:
+                assert (
+                    value == self.spec_kwargs[key]
+                ), "sampling parameters should be consistent if turn on api speculative execution."
+        self.spec_format.append(
+            {"text": "", "stop": params["stop"], "name": spec_var_name}
+        )
+        return "", {}
 
     def generate(
         self,
         s: StreamExecutor,
         sampling_params: SglSamplingParams,
+        spec_var_name: str = None,
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
-                if not s.text_.endswith(self.chat_begin_str):
-                    raise RuntimeError(
-                        "This use case is not supported. "
-                        "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
-                    )
-                prompt = s.messages_
+                if s.num_api_spec_tokens is None:
+                    if not s.text_.endswith(self.chat_prefix):
+                        raise RuntimeError(
+                            "This use case is not supported if api speculative execution is off. "
+                            "For OpenAI chat models, sgl.gen must be right after sgl.assistant. "
+                            "Example of adding api speculative execution: @function(num_api_spec_tokens=128)."
+                        )
+                    prompt = s.messages_
+                else:
+                    return self._prepare_spec_execution(sampling_params,
+                        s.num_api_spec_tokens, spec_var_name)
             else:
                 prompt = s.text_
 
             kwargs = sampling_params.to_openai_kwargs()
             comp = openai_completion(
                 client=self.client,
+                token_usage=self.token_usage,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=prompt,
                 **kwargs,
             )
         elif sampling_params.dtype in [str, "str", "string"]:
+            assert (
+                not self.is_chat_model
+            ), "constrained type not supported on chat model"
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
             comp = openai_completion(
                 client=self.client,
+                token_usage=self.token_usage,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=s.text_ + '"',
@@ -122,10 +182,14 @@ class OpenAI(BaseBackend):
             )
             comp = '"' + comp + '"'
         elif sampling_params.dtype in [int, "int"]:
+            assert (
+                not self.is_chat_model
+            ), "constrained type not supported on chat model"
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
             comp = openai_completion(
                 client=self.client,
+                token_usage=self.token_usage,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=s.text_,
@@ -138,6 +202,63 @@ class OpenAI(BaseBackend):
 
         return comp, {}
 
+    def spec_fill(self, value: str):
+        assert self.is_chat_model
+        self.spec_format.append({"text": value, "stop": None, "name": None})
+
+    def spec_pattern_match(self, comp):
+        for i, term in enumerate(self.spec_format):
+            text = term["text"]
+            if text != "":
+                if comp.startswith(text):
+                    comp = comp[len(text) :]
+                else:
+                    return False
+            else:
+                pos = comp.find(term["stop"])
+                if pos != -1:
+                    term["text"] = comp[:pos]
+                    comp = comp[pos:]
+                else:
+                    if i == len(self.spec_format) - 1:
+                        term["text"] = comp
+                    else:
+                        return False
+        return True
+
+    def role_end_generate(
+        self,
+        s: StreamExecutor,
+    ):
+        if s.num_api_spec_tokens is None or not s.text_.endswith(self.chat_prefix):
+            return
+
+        comp = ""
+        if not all(x["name"] is None for x in self.spec_format):
+            # TODO(ying): throw errors or warnings
+            for i in range(self.spec_max_num_tries):
+                comp = openai_completion(
+                    client=self.client,
+                    token_usage=self.token_usage,
+                    is_chat=self.is_chat_model,
+                    model=self.model_name,
+                    prompt=s.messages_,
+                    **self.spec_kwargs,
+                )
+                if self.spec_pattern_match(comp):
+                    break
+
+        for term in self.spec_format:
+            s.text_ += term["text"]
+            name = term["name"]
+            if name is not None:
+                s.variables[name] = term["text"]
+                s.meta_info[name] = {}
+                s.variable_event[name].set()
+
+        self.spec_kwargs = {}
+        self.spec_format = []
+
     def generate_stream(
         self,
         s: StreamExecutor,
@@ -145,7 +266,7 @@ class OpenAI(BaseBackend):
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
-                if not s.text_.endswith(self.chat_begin_str):
+                if not s.text_.endswith(self.chat_prefix):
                     raise RuntimeError(
                         "This use case is not supported. "
                         "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
@@ -157,6 +278,7 @@ class OpenAI(BaseBackend):
             kwargs = sampling_params.to_openai_kwargs()
             generator = openai_completion_stream(
                 client=self.client,
+                token_usage=self.token_usage,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=prompt,
@@ -202,6 +324,8 @@ class OpenAI(BaseBackend):
             )
             ret_str = ret.choices[0].text
             ret_token = self.tokenizer.encode(ret_str)[0]
+            self.token_usage.prompt_tokens += ret.usage.prompt_tokens
+            self.token_usage.completion_tokens= ret.usage.completion_tokens
 
             # TODO:
             # 1. return logits as the scores
@@ -231,7 +355,7 @@ class OpenAI(BaseBackend):
         return decision, scores, None, None
 
 
-def openai_completion(client, retries=3, is_chat=None, prompt=None, **kwargs):
+def openai_completion(client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs):
     for attempt in range(retries):
         try:
             if is_chat:
@@ -245,6 +369,9 @@ def openai_completion(client, retries=3, is_chat=None, prompt=None, **kwargs):
                     comp = [c.text for c in ret.choices]
                 else:
                     comp = ret.choices[0].text
+
+            token_usage.prompt_tokens += ret.usage.prompt_tokens
+            token_usage.completion_tokens += ret.usage.completion_tokens
             break
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError) as e:
             logger.error(f"OpenAI Error: {e}. Waiting 5 seconds...")
@@ -258,16 +385,19 @@ def openai_completion(client, retries=3, is_chat=None, prompt=None, **kwargs):
     return comp
 
 
-def openai_completion_stream(client, retries=3, is_chat=None, prompt=None, **kwargs):
+def openai_completion_stream(client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs):
     for attempt in range(retries):
         try:
             if is_chat:
                 if "stop" in kwargs and kwargs["stop"] is None:
                     kwargs.pop("stop")
                 generator = client.chat.completions.create(
-                    messages=prompt, stream=True, **kwargs
+                    messages=prompt, stream=True, stream_options={"include_usage": True},
+                    **kwargs
                 )
                 for ret in generator:
+                    if len(ret.choices) == 0:
+                        continue
                     try:
                         content = ret.choices[0].delta.content
                     except IndexError:
@@ -275,11 +405,17 @@ def openai_completion_stream(client, retries=3, is_chat=None, prompt=None, **kwa
                     yield content or "", {}
             else:
                 generator = client.completions.create(
-                    prompt=prompt, stream=True, **kwargs
+                    prompt=prompt, stream=True, stream_options={"include_usage": True},
+                    **kwargs
                 )
                 for ret in generator:
+                    if len(ret.choices) == 0:
+                        continue
                     content = ret.choices[0].text
                     yield content or "", {}
+
+            token_usage.prompt_tokens += ret.usage.prompt_tokens
+            token_usage.completion_tokens += ret.usage.completion_tokens
             break
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError) as e:
             logger.error(f"OpenAI Error: {e}. Waiting 5 seconds...")

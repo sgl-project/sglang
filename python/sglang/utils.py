@@ -2,7 +2,8 @@
 
 import base64
 import json
-import os
+import logging
+import signal
 import sys
 import threading
 import traceback
@@ -13,6 +14,9 @@ from json import dumps
 
 import numpy as np
 import requests
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_exception_traceback():
@@ -93,8 +97,12 @@ def http_request(
             data = None
         else:
             data = bytes(dumps(json), encoding="utf-8")
-        resp = urllib.request.urlopen(req, data=data, cafile=verify)
-        return HttpResponse(resp)
+
+        try:
+            resp = urllib.request.urlopen(req, data=data, cafile=verify)
+            return HttpResponse(resp)
+        except urllib.error.HTTPError as e:
+            return HttpResponse(e)
 
 
 def encode_image_base64(image_path):
@@ -137,7 +145,7 @@ def encode_frame(frame):
 
 
 def encode_video_base64(video_path, num_frames=16):
-    import cv2
+    import cv2  # pip install opencv-python-headless
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -243,3 +251,12 @@ def run_with_timeout(func, args=(), kwargs=None, timeout=None):
         raise RuntimeError()
 
     return ret_value[0]
+
+
+def graceful_registry(sub_module_name):
+    def graceful_shutdown(signum, frame):
+        logger.info(f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown...")
+        if signum == signal.SIGTERM:
+            logger.info(f"{sub_module_name} recive sigterm")
+
+    signal.signal(signal.SIGTERM, graceful_shutdown)

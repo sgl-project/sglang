@@ -1,40 +1,33 @@
 """Inference-only Yi-VL model."""
 
-import os
-from typing import List, Optional
+from typing import Tuple, Iterable
 
 import torch
 import torch.nn as nn
 from transformers import CLIPVisionModel, LlavaConfig
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.models.llava import (
     LlavaLlamaForCausalLM,
-    clip_vision_embed_forward,
     monkey_path_clip_vision_embed_forward,
 )
-from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
 
 
 class YiVLForCausalLM(LlavaLlamaForCausalLM):
-    def __init__(self, *args, **kwargs):
-        self.config = kwargs["config"]
-        super().__init__(self.config)
+    def __init__(
+        self, config, quant_config = None,
+    ) -> None:
+        super().__init__(config, quant_config)
 
         self.multi_modal_projector = YiVLMultiModalProjector(self.config)
         self.vision_tower_subfolder = self.config.mm_vision_tower.replace(
             "./", ""
         )  # Everything after "./"
 
-    def load_weights(
-        self,
-        model_name_or_path: str,
-        cache_dir: Optional[str] = None,
-        load_format: str = "auto",
-        revision: Optional[str] = None,
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # We have to use the subfolder of the main model directory (e.g. 01-ai/Yi-VL-6B)
         self.vision_tower = CLIPVisionModel.from_pretrained(
-            model_name_or_path,
+            self.config._name_or_path,
             torch_dtype=torch.float16,
             subfolder=self.vision_tower_subfolder,
         ).cuda()
@@ -68,9 +61,8 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
         }
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in hf_model_weights_iterator(
-            model_name_or_path, cache_dir, load_format, revision
-        ):
+        weights = list(weights)
+        for name, loaded_weight in weights:
             if "projector" in name or "vision_tower" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
@@ -80,9 +72,7 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
                 weight_loader(param, loaded_weight)
 
         # load language model
-        self.language_model.load_weights(
-            model_name_or_path, cache_dir, load_format, revision
-        )
+        self.language_model.load_weights(weights)
 
         monkey_path_clip_vision_embed_forward()
 
@@ -103,7 +93,7 @@ class YiVLMultiModalProjector(nn.Module):
 
     def forward(self, image_features):
         hidden_states = self.linear_1(image_features)
-        hidden_state = self.ln_1(hidden_states)
+        hidden_states = self.ln_1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.linear_2(hidden_states)
         hidden_states = self.ln_2(hidden_states)

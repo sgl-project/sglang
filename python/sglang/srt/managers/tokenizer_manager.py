@@ -11,6 +11,7 @@ import transformers
 import uvloop
 import zmq
 import zmq.asyncio
+from fastapi import BackgroundTasks
 
 from sglang.srt.hf_transformers_utils import (
     get_config,
@@ -19,8 +20,8 @@ from sglang.srt.hf_transformers_utils import (
     get_tokenizer,
 )
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BatchStrOut,
-    DetokenizeReqInput,
     FlushCacheReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
@@ -28,7 +29,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_exception_traceback, is_multimodal_model, load_image
+from sglang.srt.utils import is_multimodal_model, load_image
+from sglang.utils import get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -40,52 +42,6 @@ class ReqState:
     out_list: List
     finished: bool
     event: asyncio.Event
-
-
-global global_processor
-
-
-def init_global_processor(server_args: ServerArgs):
-    global global_processor
-    transformers.logging.set_verbosity_error()
-    global_processor = get_processor(
-        server_args.tokenizer_path,
-        tokenizer_mode=server_args.tokenizer_mode,
-        trust_remote_code=server_args.trust_remote_code,
-    )
-
-
-def get_pixel_values(
-    image_data, image_aspect_ratio=None, image_grid_pinpoints=None, processor=None
-):
-    try:
-        processor = processor or global_processor
-        image, image_size = load_image(image_data)
-        if image_size != None:
-            image_hash = hash(image_data)
-            pixel_values = processor.image_processor(image)["pixel_values"]
-            for _ in range(len(pixel_values)):
-                pixel_values[_] = pixel_values[_].astype(np.float16)
-            pixel_values = np.stack(pixel_values, axis=0)
-            return pixel_values, image_hash, image_size
-        else:
-            image_hash = hash(image_data)
-            if image_aspect_ratio == "pad":
-                image = expand2square(
-                    image,
-                    tuple(int(x * 255) for x in processor.image_processor.image_mean),
-                )
-                pixel_values = processor.image_processor(image)["pixel_values"][0]
-            elif image_aspect_ratio == "anyres":
-                pixel_values = process_anyres_image(
-                    image, processor.image_processor, image_grid_pinpoints
-                )
-            else:
-                pixel_values = processor.image_processor(image)["pixel_values"][0]
-            pixel_values = pixel_values.astype(np.float16)
-            return pixel_values, image_hash, image.size
-    except Exception:
-        print("Exception in TokenizerManager:\n" + get_exception_traceback())
 
 
 class TokenizerManager:
@@ -154,10 +110,11 @@ class TokenizerManager:
                 image_data, aspect_ratio, grid_pinpoints, self.processor
             )
 
-    async def generate_request(self, obj: GenerateReqInput):
+    async def generate_request(self, obj: GenerateReqInput, request=None):
         if self.to_create_loop:
-            await self.create_handle_loop()
+            self.create_handle_loop()
 
+        obj.post_init()
         is_single = obj.is_single
         if is_single:
             rid = obj.rid
@@ -170,7 +127,7 @@ class TokenizerManager:
             if len(input_ids) >= self.context_len:
                 raise ValueError(
                     f"The input ({len(input_ids)} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens)"
+                    f"model's context length ({self.context_len} tokens)."
                 )
 
             sampling_params = SamplingParams(**obj.sampling_params)
@@ -208,7 +165,14 @@ class TokenizerManager:
             self.rid_to_state[rid] = state
 
             while True:
-                await event.wait()
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=4)
+                except asyncio.TimeoutError:
+                    if request is not None and await request.is_disconnected():
+                        self.abort_request(rid)
+                        raise ValueError(f"Abort request {rid}")
+                    continue
+
                 out = self.convert_logprob_style(
                     state.out_list[-1],
                     obj.return_logprob,
@@ -226,7 +190,8 @@ class TokenizerManager:
                     break
                 event.clear()
         else:
-            assert obj.stream is False
+            if obj.stream:
+                raise ValueError("Do not support stream for batch mode.")
 
             if obj.input_ids is None:
                 bs = len(obj.text)
@@ -276,7 +241,18 @@ class TokenizerManager:
             for i in range(bs):
                 rid = obj.rid[i]
                 state = self.rid_to_state[rid]
-                await state.event.wait()
+
+                while True:
+                    try:
+                        await asyncio.wait_for(state.event.wait(), timeout=4)
+                        break
+                    except asyncio.TimeoutError:
+                        if request is not None and await request.is_disconnected():
+                            for rid in obj.rid:
+                                self.abort_request(rid)
+                            raise ValueError(f"Abort request {rid}")
+                        continue
+
                 output_list.append(
                     self.convert_logprob_style(
                         state.out_list[-1],
@@ -290,11 +266,32 @@ class TokenizerManager:
 
             yield output_list
 
-    async def flush_cache(self):
-        flush_cache_req = FlushCacheReq()
-        self.send_to_router.send_pyobj(flush_cache_req)
+    def flush_cache(self):
+        req = FlushCacheReq()
+        self.send_to_router.send_pyobj(req)
 
-    async def create_handle_loop(self):
+    def abort_request(self, rid):
+        if rid not in self.rid_to_state:
+            return
+        del self.rid_to_state[rid]
+        req = AbortReq(rid)
+        self.send_to_router.send_pyobj(req)
+
+    def create_abort_task(self, obj):
+        # Abort the request if the client is disconnected.
+        async def abort_request():
+            await asyncio.sleep(3)
+            if obj.is_single:
+                self.abort_request(obj.rid)
+            else:
+                for rid in obj.rids:
+                    self.abort_request(rid)
+
+        background_tasks = BackgroundTasks()
+        background_tasks.add_task(abort_request)
+        return background_tasks
+
+    def create_handle_loop(self):
         self.to_create_loop = False
         loop = asyncio.get_event_loop()
         loop.create_task(self.handle_loop())
@@ -305,17 +302,20 @@ class TokenizerManager:
 
             if isinstance(recv_obj, BatchStrOut):
                 for i, rid in enumerate(recv_obj.rids):
+                    state = self.rid_to_state.get(rid, None)
+                    if state is None:
+                        continue
+
                     recv_obj.meta_info[i]["id"] = rid
                     out_dict = {
                         "text": recv_obj.output_str[i],
                         "meta_info": recv_obj.meta_info[i],
                     }
-                    state = self.rid_to_state[rid]
                     state.out_list.append(out_dict)
                     state.finished = recv_obj.finished[i]
                     state.event.set()
             else:
-                raise ValueError(f"Invalid object: {recv_obj}")
+                raise ValueError(f"Invalid object: {recv_obj}.")
 
     def convert_logprob_style(
         self, ret, return_logprob, top_logprobs_num, return_text_in_logprobs
@@ -356,3 +356,49 @@ class TokenizerManager:
             if t:
                 top_logprobs[i] = self.detokenize_logprob_tokens(t, decode_to_text)
         return top_logprobs
+
+
+global global_processor
+
+
+def init_global_processor(server_args: ServerArgs):
+    global global_processor
+    transformers.logging.set_verbosity_error()
+    global_processor = get_processor(
+        server_args.tokenizer_path,
+        tokenizer_mode=server_args.tokenizer_mode,
+        trust_remote_code=server_args.trust_remote_code,
+    )
+
+
+def get_pixel_values(
+    image_data, image_aspect_ratio=None, image_grid_pinpoints=None, processor=None
+):
+    try:
+        processor = processor or global_processor
+        image, image_size = load_image(image_data)
+        if image_size != None:
+            image_hash = hash(image_data)
+            pixel_values = processor.image_processor(image)["pixel_values"]
+            for _ in range(len(pixel_values)):
+                pixel_values[_] = pixel_values[_].astype(np.float16)
+            pixel_values = np.stack(pixel_values, axis=0)
+            return pixel_values, image_hash, image_size
+        else:
+            image_hash = hash(image_data)
+            if image_aspect_ratio == "pad":
+                image = expand2square(
+                    image,
+                    tuple(int(x * 255) for x in processor.image_processor.image_mean),
+                )
+                pixel_values = processor.image_processor(image)["pixel_values"][0]
+            elif image_aspect_ratio == "anyres":
+                pixel_values = process_anyres_image(
+                    image, processor.image_processor, image_grid_pinpoints
+                )
+            else:
+                pixel_values = processor.image_processor(image)["pixel_values"][0]
+            pixel_values = pixel_values.astype(np.float16)
+            return pixel_values, image_hash, image.size
+    except Exception:
+        print("Exception in TokenizerManager:\n" + get_exception_traceback())

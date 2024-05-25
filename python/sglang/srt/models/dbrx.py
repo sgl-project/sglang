@@ -1,7 +1,7 @@
 # Adapted from:
-# https://github.com/vllm-project/vllm/blob/14ccd94c89d0ffd9da283545d93ab1dfea5da340/vllm/model_executor/models/dbrx.py
+# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/dbrx.py#L1
 # coding=utf-8
-from typing import Optional
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -24,12 +24,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.transformers_utils.configs.dbrx import DbrxConfig
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.router.model_runner import InputMetadata
-from sglang.srt.models.dbrx_config import DbrxConfig
-from sglang.srt.weight_utils import default_weight_loader, hf_model_weights_iterator
 
 
 class DbrxRouter(nn.Module):
@@ -377,13 +377,7 @@ class DbrxForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
 
-    def load_weights(
-        self,
-        model_name_or_path: str,
-        cache_dir: Optional[str] = None,
-        load_format: str = "auto",
-        revision: Optional[str] = None,
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = [
             (
                 "ws" if weight_name in ["w1", "v1"] else "w2s",
@@ -392,9 +386,7 @@ class DbrxForCausalLM(nn.Module):
             for weight_name in ["w1", "v1", "w2"]
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in hf_model_weights_iterator(
-            model_name_or_path, cache_dir, load_format, revision
-        ):
+        for name, loaded_weight in weights:
             for param_name, weight_name in expert_params_mapping:
                 if weight_name not in name:
                     continue

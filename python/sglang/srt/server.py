@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import time
+from http import HTTPStatus
 from typing import List, Optional, Union
 
 # Fix a bug of Python threading
@@ -41,8 +42,8 @@ from sglang.srt.utils import (
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
-    get_exception_traceback,
 )
+from sglang.utils import get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -72,7 +73,7 @@ async def get_server_args():
 
 @app.get("/flush_cache")
 async def flush_cache():
-    await tokenizer_manager.flush_cache()
+    tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
@@ -80,24 +81,32 @@ async def flush_cache():
     )
 
 
-@app.post("/generate")
-async def generate_request(obj: GenerateReqInput):
-    obj.post_init()
-
+async def generate_request(obj: GenerateReqInput, request: Request):
     if obj.stream:
 
         async def stream_results():
-            async for out in tokenizer_manager.generate_request(obj):
+            try:
+                async for out in tokenizer_manager.generate_request(obj, request):
+                    yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
+            except ValueError as e:
+                out = {"error": {"message": str(e)}}
                 yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(stream_results(), media_type="text/event-stream")
+        return StreamingResponse(stream_results(), media_type="text/event-stream",
+                                 background=tokenizer_manager.create_abort_task(obj))
+    else:
+        try:
+            ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+            return ret
+        except ValueError as e:
+            return JSONResponse(
+                {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+            )
 
-    try:
-        ret = await tokenizer_manager.generate_request(obj).__anext__()
-        return ret
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+
+app.post("/generate")(generate_request)
+app.put("/generate")(generate_request)
 
 
 @app.post("/v1/completions")
@@ -182,6 +191,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
     if server_args.api_key and server_args.api_key != "":
         app.add_middleware(APIKeyValidatorMiddleware, api_key=server_args.api_key)
 
+    # Send a warmup request
     def _wait_and_warmup():
         headers = {}
         url = server_args.url()
@@ -193,7 +203,6 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
             time.sleep(0.5)
             try:
                 requests.get(url + "/get_model_info", timeout=5, headers=headers)
-                success = True  # Set flag to True if request succeeds
                 break
             except requests.exceptions.RequestException as e:
                 pass
@@ -203,7 +212,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
             res = requests.post(
                 url + "/generate",
                 json={
-                    "text": "Say this is a warmup request.",
+                    "text": "The capital city of France is",
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": 16,
@@ -224,6 +233,8 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 
     t = threading.Thread(target=_wait_and_warmup)
     t.start()
+
+    # Listen for requests
     try:
         uvicorn.run(
             app,

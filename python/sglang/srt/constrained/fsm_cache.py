@@ -6,6 +6,9 @@ class FSMCache(BaseCache):
     def __init__(self, tokenizer_path, tokenizer_args_dict, enable=True):
         super().__init__(enable=enable)
 
+        if tokenizer_path.endswith(".json"):
+            return
+
         from importlib.metadata import version
 
         if version("outlines") >= "0.0.35":
