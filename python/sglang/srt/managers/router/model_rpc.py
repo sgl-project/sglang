@@ -91,26 +91,27 @@ class ModelRpcServer:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
             )
-        self.max_total_num_token = self.model_runner.max_total_num_token
-        self.max_num_running_seq = self.max_total_num_token // 2
-        self.max_prefill_num_token = max(
+        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        self.max_prefill_tokens = max(
             self.model_config.context_len,
             (
-                self.max_total_num_token // 6
-                if server_args.max_prefill_num_token is None
-                else server_args.max_prefill_num_token
+                self.max_total_num_tokens // 6
+                if server_args.max_prefill_tokens is None
+                else server_args.max_prefill_tokens
             ),
         )
+        self.max_running_requests = (self.max_total_num_tokens // 2
+            if server_args.max_running_requests is None else server_args.max_running_requests)
+
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
         )
         set_random_seed(server_args.random_seed)
 
         # Print info
-        logger.info(
-            f"[rank={self.tp_rank}] "
-            f"max_total_num_token={self.max_total_num_token}, "
-            f"max_prefill_num_token={self.max_prefill_num_token}, "
+        logger.info(f"[rank={self.tp_rank}] "
+            f"max_total_num_tokens={self.max_total_num_tokens}, "
+            f"max_prefill_tokens={self.max_prefill_tokens}, "
             f"context_len={self.model_config.context_len}, "
         )
         if self.tp_rank == 0:
@@ -125,9 +126,9 @@ class ModelRpcServer:
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.scheduler = Scheduler(
             self.schedule_heuristic,
-            self.max_num_running_seq,
-            self.max_prefill_num_token,
-            self.max_total_num_token,
+            self.max_running_requests,
+            self.max_prefill_tokens,
+            self.max_total_num_tokens,
             self.tree_cache,
         )
         self.req_to_token_pool = self.model_runner.req_to_token_pool
@@ -219,7 +220,7 @@ class ModelRpcServer:
                     # Print stats
                     if self.tp_rank == 0:
                         if self.decode_forward_ct % 40 == 0:
-                            num_used = self.max_total_num_token - (
+                            num_used = self.max_total_num_tokens - (
                                 self.token_to_kv_pool.available_size()
                                 + self.tree_cache.evictable_size()
                             )
@@ -231,7 +232,7 @@ class ModelRpcServer:
                             logger.info(
                                 f"#running-req: {len(self.running_batch.reqs)}, "
                                 f"#token: {num_used}, "
-                                f"token usage: {num_used / self.max_total_num_token:.2f}, "
+                                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                                 f"gen throughput (token/s): {throuhgput:.2f}, "
                                 f"#queue-req: {len(self.forward_queue)}"
                             )
@@ -248,10 +249,10 @@ class ModelRpcServer:
                     self.token_to_kv_pool.available_size()
                     + self.tree_cache.evictable_size()
                 )
-                if available_size != self.max_total_num_token:
+                if available_size != self.max_total_num_tokens:
                     warnings.warn(
                         "Warning: "
-                        f"available_size={available_size}, max_total_num_token={self.max_total_num_token}\n"
+                        f"available_size={available_size}, max_total_num_tokens={self.max_total_num_tokens}\n"
                         "KV cache pool leak detected!"
                     )
 
@@ -296,15 +297,20 @@ class ModelRpcServer:
         req.origin_input_ids = req.origin_input_ids[: self.model_config.context_len - 1]
         req.sampling_params.max_new_tokens = min(
             req.sampling_params.max_new_tokens,
+<<<<<<< HEAD
             self.model_config.context_len - 1 - len(req.origin_input_ids),
             self.max_total_num_token - 128 - len(req.origin_input_ids),
+=======
+            self.model_config.context_len - 1 - len(req.input_ids),
+            self.max_total_num_tokens - 128 - len(req.input_ids),
+>>>>>>> c04c0dd (improve benchmark)
         )
         self.forward_queue.append(req)
 
     def get_new_fill_batch(self):
         if (
             self.running_batch is not None
-            and len(self.running_batch.reqs) > self.max_num_running_seq
+            and len(self.running_batch.reqs) > self.max_running_requests
         ):
             return None
 
@@ -360,7 +366,7 @@ class ModelRpcServer:
                 req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
                 < available_size
                 and req.extend_input_len + new_batch_input_tokens
-                < self.max_prefill_num_token
+                < self.max_prefill_tokens
             ):
                 delta = self.tree_cache.inc_lock_ref(req.last_node)
                 available_size += delta

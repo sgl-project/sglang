@@ -301,19 +301,19 @@ class ModelRunner:
         return max_num_token
 
     def init_memory_pool(self, total_gpu_memory):
-        self.max_total_num_token = self.profile_max_num_token(total_gpu_memory)
+        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
-        if self.max_total_num_token <= 0:
+        if self.max_total_num_tokens <= 0:
             raise RuntimeError(
                 "Not enought memory. " "Please try to increase --mem-fraction-static."
             )
 
         self.req_to_token_pool = ReqToTokenPool(
-            int(self.max_total_num_token / self.model_config.context_len * 256),
+            int(self.max_total_num_tokens / self.model_config.context_len * 256),
             self.model_config.context_len + 8,
         )
         self.token_to_kv_pool = TokenToKVPool(
-            self.max_total_num_token,
+            self.max_total_num_tokens,
             dtype=torch.float16,
             head_num=self.model_config.num_key_value_heads // self.tp_size,
             head_dim=self.model_config.head_dim,
