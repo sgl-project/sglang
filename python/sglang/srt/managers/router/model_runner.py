@@ -236,9 +236,7 @@ class ModelRunner:
 
         # Init torch distributed
         torch.cuda.set_device(self.tp_rank)
-        logger.info(
-            f"[rank={self.tp_rank}] Init torch begin. Avail mem={get_available_gpu_memory(self.tp_rank):.2f} GB"
-        )
+        logger.info(f"[rank={self.tp_rank}] Init torch begin. Avail mem={get_available_gpu_memory(self.tp_rank):.2f} GB")
         torch.distributed.init_process_group(
             backend="nccl",
             world_size=self.tp_size,
@@ -248,16 +246,12 @@ class ModelRunner:
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         logger.info(f"[rank={self.tp_rank}] Init torch end.")
 
-        total_gpu_memory = get_available_gpu_memory(
-            self.tp_rank, distributed=self.tp_size > 1
-        )
+        total_gpu_memory = get_available_gpu_memory(self.tp_rank, distributed=self.tp_size > 1)
 
         if self.tp_size > 1:
             total_local_gpu_memory = get_available_gpu_memory(self.tp_rank)
             if total_local_gpu_memory < total_gpu_memory * 0.9:
-                raise ValueError(
-                    "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
-                )
+                raise ValueError("The memory capacity is unbalanced. Some GPUs may be occupied by other processes.")
 
         self.load_model()
         self.init_memory_pool(total_gpu_memory)
@@ -291,16 +285,12 @@ class ModelRunner:
             parallel_config=None,
             scheduler_config=None,
         )
-        logger.info(
-            f"[rank={self.tp_rank}] Load weight end. "
-            f"Type={type(self.model).__name__}. "
-            f"Avail mem={get_available_gpu_memory(self.tp_rank):.2f} GB"
-        )
+        logger.info(f"[rank={self.tp_rank}] Load weight end. "
+                    f"Type={type(self.model).__name__}. "
+                    f"Avail mem={get_available_gpu_memory(self.tp_rank):.2f} GB")
 
     def profile_max_num_token(self, total_gpu_memory):
-        available_gpu_memory = get_available_gpu_memory(
-            self.tp_rank, distributed=self.tp_size > 1
-        )
+        available_gpu_memory = get_available_gpu_memory(self.tp_rank, distributed=self.tp_size > 1)
         head_dim = self.model_config.head_dim
         head_num = self.model_config.num_key_value_heads // self.tp_size
         cell_size = head_num * head_dim * self.model_config.num_hidden_layers * 2 * 2
@@ -432,7 +422,7 @@ def import_model_classes():
             module = importlib.import_module(name)
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
-                if isinstance(entry, list):
+                if isinstance(entry, list): # To support multiple model classes in one module
                     for cls in entry:
                         model_arch_name_to_cls[cls.__name__] = cls
                 else:
