@@ -297,13 +297,8 @@ class ModelRpcServer:
         req.origin_input_ids = req.origin_input_ids[: self.model_config.context_len - 1]
         req.sampling_params.max_new_tokens = min(
             req.sampling_params.max_new_tokens,
-<<<<<<< HEAD
-            self.model_config.context_len - 1 - len(req.origin_input_ids),
-            self.max_total_num_token - 128 - len(req.origin_input_ids),
-=======
             self.model_config.context_len - 1 - len(req.input_ids),
             self.max_total_num_tokens - 128 - len(req.input_ids),
->>>>>>> c04c0dd (improve benchmark)
         )
         self.forward_queue.append(req)
 
