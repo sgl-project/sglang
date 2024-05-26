@@ -421,7 +421,12 @@ def import_model_classes():
         if not ispkg:
             module = importlib.import_module(name)
             if hasattr(module, "EntryClass"):
-                model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
+                entry = module.EntryClass
+                if isinstance(entry, list): # To support multiple model classes in one module
+                    for cls in entry:
+                        model_arch_name_to_cls[cls.__name__] = cls
+                else:
+                    model_arch_name_to_cls[entry.__name__] = entry
     return model_arch_name_to_cls
 
 
