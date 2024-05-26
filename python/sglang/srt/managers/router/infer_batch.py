@@ -66,6 +66,7 @@ class Req:
         self.finish_reason = None
         self.hit_stop_str = None
 
+        # Prefix info
         self.extend_input_len = 0
         self.prefix_indices = []
         self.last_node = None
@@ -76,8 +77,8 @@ class Req:
         self.top_logprobs_num = 0
         self.normalized_prompt_logprob = None
         self.prefill_token_logprobs = None
-        self.decode_token_logprobs = []
         self.prefill_top_logprobs = None
+        self.decode_token_logprobs = []
         self.decode_top_logprobs = []
         # The tokens is prefilled but need to be considered as decode tokens
         # and should be updated for the decode logprobs
