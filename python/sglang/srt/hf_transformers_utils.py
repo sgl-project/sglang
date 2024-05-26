@@ -183,13 +183,13 @@ class TiktokenTokenizer:
         self.eos_token_id = tokenizer.eos_token
         self.vocab_size = tokenizer.n_vocab
 
-    def encode(self, x):
+    def encode(self, x, add_special_tokens=False):
         return self.tokenizer.encode(x)
 
     def decode(self, x):
         return self.tokenizer.decode(x)
 
-    def batch_decode(self, batch, skip_special_tokens,  spaces_between_special_tokens):
+    def batch_decode(self, batch, skip_special_tokens=True,  spaces_between_special_tokens=False):
         return self.tokenizer.decode_batch(batch)
 
     def convert_ids_to_tokens(self, index):
