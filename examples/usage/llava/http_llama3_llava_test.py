@@ -22,11 +22,7 @@ import aiohttp
 import requests
 
 from llava.conversation import (
-    default_conversation,
-    conv_templates,
-    SeparatorStyle,
     conv_llava_llama_3,
-    conv_qwen,
 )
 
 
@@ -43,7 +39,8 @@ async def test_concurrent(args):
 
     prompt = "<image>\nPlease generate caption towards this image."
     conv_template = copy.deepcopy(conv_llava_llama_3)
-    conv_template.append_message(role="user", message=prompt)
+    conv_template.append_message(role=conv_template.roles[0], message=prompt)
+    conv_template.append_message(role=conv_template.roles[1], message=None)
     prompt_with_template = conv_template.get_prompt()
     response = []
     for i in range(1):
@@ -74,7 +71,8 @@ def test_streaming(args):
     url = f"{args.host}:{args.port}"
     prompt = "<image>\nPlease generate caption towards this image."
     conv_template = copy.deepcopy(conv_llava_llama_3)
-    conv_template.append_message(role="user", message=prompt)
+    conv_template.append_message(role=conv_template.roles[0], message=prompt)
+    conv_template.append_message(role=conv_template.roles[1], message=None)
     prompt_with_template = conv_template.get_prompt()
     pload = {
         "text": prompt_with_template,
