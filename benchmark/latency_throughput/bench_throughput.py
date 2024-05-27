@@ -290,9 +290,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset", type=str, help="Path to the dataset."
     )
-    parser.add_argument("--input-len", type=str, default=1024)
-    parser.add_argument("--output-len", type=str, default=128)
-    parser.add_argument("--range-ratio", type=float, default=1)
+    parser.add_argument("--input-len", type=str, default=2048)
+    parser.add_argument("--output-len", type=str, default=256)
+    parser.add_argument("--range-ratio", type=float, default=0.5)
     parser.add_argument(
         "--tokenizer", type=str,
         default="NousResearch/Meta-Llama-3-8B",
