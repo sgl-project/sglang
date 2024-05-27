@@ -235,6 +235,7 @@ class ModelRunner:
         }
 
         # Init torch distributed
+        logger.info(f"[rank={self.tp_rank}] Set cuda device.")
         torch.cuda.set_device(self.tp_rank)
         logger.info(f"[rank={self.tp_rank}] Init torch begin. Avail mem={get_available_gpu_memory(self.tp_rank):.2f} GB")
         torch.distributed.init_process_group(
