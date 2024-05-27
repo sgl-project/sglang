@@ -233,8 +233,10 @@ def main(args: argparse.Namespace):
     if args.dataset:
         input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
     else:
-        input_lens = np.random.randint(args.input_len * args.range_ratio, args.input_len + 1, size=args.num_prompts)
-        output_lens = np.random.randint(args.output_len * args.range_ratio, args.output_len + 1, size=args.num_prompts)
+        input_lens = np.random.randint(
+            int(args.input_len * args.range_ratio), args.input_len + 1, size=args.num_prompts)
+        output_lens = np.random.randint(
+            int(args.output_len * args.range_ratio), args.output_len + 1, size=args.num_prompts)
         offsets = np.random.randint(0, tokenizer.vocab_size, size=args.num_prompts)
         input_requests = []
         for i in range(args.num_prompts):
@@ -284,13 +286,13 @@ if __name__ == "__main__":
         choices=["vllm", "tgi", "srt", "lightllm", "xinfer"],
     )
     parser.add_argument("--host", type=str, default="localhost")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=30000)
     parser.add_argument(
         "--dataset", type=str, help="Path to the dataset."
     )
-    parser.add_argument("--input-len", type=str, default=1024)
-    parser.add_argument("--output-len", type=str, default=128)
-    parser.add_argument("--range-ratio", type=float, default=1.0)
+    parser.add_argument("--input-len", type=str, default=2048)
+    parser.add_argument("--output-len", type=str, default=256)
+    parser.add_argument("--range-ratio", type=float, default=0.5)
     parser.add_argument(
         "--tokenizer", type=str,
         default="NousResearch/Meta-Llama-3-8B",
