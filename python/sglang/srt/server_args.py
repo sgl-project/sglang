@@ -235,7 +235,7 @@ class ServerArgs:
             "--dp-size",
             type=int,
             default=ServerArgs.dp_size,
-            help="Number of tensor parallelism group for data parallelism.",
+            help="Data parallelism size.",
         )
         parser.add_argument(
             "--dispatch-method",
