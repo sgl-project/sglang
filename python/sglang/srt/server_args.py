@@ -241,6 +241,7 @@ class ServerArgs:
             "--dispatch-method",
             type=str,
             default=ServerArgs.dispatch_method,
+            help="Load balancing strategy for data parallelism.",
             choices=[
                 "round_robin",
                 "shortest_queue",
