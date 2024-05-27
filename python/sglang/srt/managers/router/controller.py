@@ -148,7 +148,6 @@ class Controller:
                     for worker in list(self.workers.keys()):
                         self.put_req_to_worker(worker, recv_req)
             else:
-                # FIXME: incomplete support
                 logger.error(f"Invalid object: {recv_req}")
 
 

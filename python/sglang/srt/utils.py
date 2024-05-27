@@ -387,7 +387,11 @@ def init_rpyc_service(service: rpyc.Service, port: int):
     t = ThreadedServer(
         service=service,
         port=port,
-        protocol_config={"allow_pickle": True, "sync_request_timeout": 1800},
+        protocol_config={
+            "allow_public_attrs": True,
+            "allow_pickle": True,
+            "sync_request_timeout": 3600
+        },
     )
     t.start()
 
@@ -401,7 +405,11 @@ def connect_to_rpyc_service(port, host="localhost"):
             con = rpyc.connect(
                 host,
                 port,
-                config={"allow_pickle": True, "sync_request_timeout": 1800},
+                config={
+                    "allow_public_attrs": True,
+                    "allow_pickle": True,
+                    "sync_request_timeout": 3600
+                },
             )
             break
         except ConnectionRefusedError:

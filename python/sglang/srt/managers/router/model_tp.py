@@ -60,6 +60,7 @@ class ModelTpServer:
         # Copy arguments
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
+        self.dp_size = server_args.dp_size
         self.schedule_heuristic = server_args.schedule_heuristic
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
         self.worker_id = worker_id
@@ -178,7 +179,8 @@ class ModelTpServer:
         self.new_token_ratio_recovery = global_config.new_token_ratio_recovery
 
     def exposed_step(self, recv_reqs):
-        recv_reqs = obtain(recv_reqs)
+        if self.tp_size * self.dp_size != 1:
+            recv_reqs = obtain(recv_reqs)
 
         try:
             # Recv requests
@@ -749,11 +751,6 @@ class ModelTpClient:
         server_args, model_port_args = obtain(server_args), obtain(model_port_args)
         self.worker_id = worker_id
         self.tp_size = server_args.tp_size
-
-        if model_port_args is None:
-            # This is because remote model_tp part may not know the tp-size in advance
-            tp_ports = alloc_usable_network_port(self.tp_size + 1)
-            model_port_args = ModelPortArgs(tp_ports[0], tp_ports[1:])
 
         if self.tp_size * server_args.dp_size == 1:
             # Init model
