@@ -7,6 +7,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
@@ -78,54 +79,8 @@ class Controller:
                     f"Failed to start local worker {i}\n{get_exception_traceback()}"
                 )
 
-    def set_dispatch_method(self, dispatch_method: str):
-        self.dispatch_method = DispatchMethod.from_str(dispatch_method)
-        self.dispatching = self.dispatch_lookup[self.dispatch_method]
-
     def have_any_live_worker(self):
         return any(worker_thread.liveness for worker_thread in self.workers.values())
-
-    def alloc_worker_id(self):
-        if len(self.workers) == 0:
-            return 0
-        return max(self.workers.keys()) + 1
-
-    def register_worker(
-        self,
-        worker_host,
-        worker_port,
-        server_args: ServerArgs,
-        model_overide_args,
-        gpu_ids,
-    ):
-        # resolve default gpu ids for remote worker
-        if gpu_ids is None:
-            gpu_ids = list(range(0, server_args.tp_size))
-
-        if len(gpu_ids) != server_args.tp_size:
-            logger.error(
-                f"Invalid gpu nums for {worker_host}:{worker_port}, "
-                f"expect {server_args.tp_size}gpus but got {len(gpu_ids)}"
-            )
-            return
-
-        try:
-            new_worker_id = self.alloc_worker_id()
-            worker_thread = connect_and_start_remote_worker(
-                worker_host,
-                worker_port,
-                server_args,
-                model_overide_args,
-                gpu_ids,
-                new_worker_id,
-                self.port_args.detokenizer_port,
-            )
-            self.workers[new_worker_id] = worker_thread
-        except Exception:
-            logger.error(
-                f"Failed to connect to worker {worker_host}:{worker_port}\n"
-                f"{get_exception_traceback()}"
-            )
 
     def put_req_to_worker(self, worker_id, req):
         self.workers[worker_id].request_queue.put(req)
@@ -147,14 +102,6 @@ class Controller:
             self.put_req_to_worker(worker, r)
         return
 
-    async def get_worker_status(self, worker_id: int):
-        try:
-            return await asyncio.wait_for(
-                self.workers[worker_id].model_client.get_status(), timeout=0.1
-            )
-        except asyncio.TimeoutError:
-            return None
-
     async def remove_dead_workers(self):
         for i in list(self.workers.keys()):
             worker_thread = self.workers[i]
@@ -175,6 +122,8 @@ class Controller:
                 self.recv_reqs = []
                 if next_step_input:
                     await self.dispatching(next_step_input)
+            else:
+                logger.error("There is no live worker.")
 
             await asyncio.sleep(0.001)
 
@@ -187,7 +136,19 @@ class Controller:
                     worker_thread.request_queue.put(recv_req)
             elif isinstance(recv_req, TokenizedGenerateReqInput):
                 self.recv_reqs.append(recv_req)
+            elif isinstance(recv_req, AbortReq):
+                in_queue = False
+                for i, req in enumerate(self.recv_reqs):
+                    if req.rid == recv_req.rid:
+                        self.recv_reqs[i] = recv_req
+                        in_queue = True
+                        break
+                if not in_queue:
+                    # send abort req to all TP groups
+                    for worker in list(self.workers.keys()):
+                        self.put_req_to_worker(worker, recv_req)
             else:
+                # FIXME: incomplete support
                 logger.error(f"Invalid object: {recv_req}")
 
 
