@@ -247,6 +247,7 @@ class ModelRunner:
             f"worker_id={self.worker_id}, "
             f"tp_rank={self.tp_rank}. "
         )
+
         torch.distributed.init_process_group(
             backend="nccl",
             world_size=self.tp_size,
