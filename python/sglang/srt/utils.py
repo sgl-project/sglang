@@ -1,6 +1,7 @@
 """Common utilities."""
 
 import base64
+import multiprocessing
 import logging
 import os
 import random
@@ -12,8 +13,13 @@ from typing import List, Optional
 
 import numpy as np
 import requests
+import rpyc
 import torch
+<<<<<<< HEAD
 import triton
+=======
+from rpyc.utils.server import ThreadedServer
+>>>>>>> 87edb05 (add dp)
 from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -138,30 +144,48 @@ def is_port_available(port):
             return False
 
 
+def alloc_usable_network_port(num, used_list=()):
+    port_list = []
+    for port in range(10000, 65536):
+        if port in used_list:
+            continue
+        if is_port_available(port):
+            port_list.append(port)
+        if len(port_list) == num:
+            return port_list
+    return port_list
+
+
 def allocate_init_ports(
     port: Optional[int] = None,
     additional_ports: Optional[List[int]] = None,
     tp_size: int = 1,
+    dp_size: int = 1,
 ):
-    if additional_ports:
-        ret_ports = [port] + additional_ports
-    else:
-        ret_ports = [port]
+    ret_ports = []
+    if port is not None:
+        ret_ports.append(port)
+    if additional_ports is not None:
+        for x in additional_ports:
+            if x not in ret_ports:
+                ret_ports.append(x)
 
-    ret_ports = list(set(x for x in ret_ports if is_port_available(x)))
-    cur_port = ret_ports[-1] + 1 if len(ret_ports) > 0 else 10000
+    ret_ports = [x for x in ret_ports if is_port_available(x)]
 
-    while len(ret_ports) < 5 + tp_size:
-        if cur_port not in ret_ports and is_port_available(cur_port):
-            ret_ports.append(cur_port)
-        cur_port += 1
+    # HTTP + Tokenizer + Controller + Detokenizer + (nccl + tp_size) * dp_size
+    num_ports_needed = 4 + dp_size * (1 + tp_size)
+    ret_ports.extend(
+        alloc_usable_network_port(
+            num_ports_needed - len(ret_ports), used_list=ret_ports
+        )
+    )
 
-    if port and ret_ports[0] != port:
+    if port is not None and ret_ports[0] != port:
         logger.warn(
             f"WARNING: Port {port} is not available. Use port {ret_ports[0]} instead."
         )
 
-    return ret_ports[0], ret_ports[1:]
+    return ret_ports[0], ret_ports[1:num_ports_needed]
 
 
 def get_int_token_logit_bias(tokenizer, vocab_size):
@@ -181,12 +205,8 @@ def wrap_kernel_launcher(kernel):
     if int(triton.__version__.split(".")[0]) >= 3:
         return None
 
-    if dist.is_initialized():
-        rank = dist.get_rank()
-    else:
-        rank = 0
-
-    kernels = kernel.cache[rank].values()
+    gpu_id = torch.cuda.current_device()
+    kernels = kernel.cache[gpu_id].values()
     kernel = next(iter(kernels))
 
     # Different trition versions use different low-level names
@@ -361,6 +381,45 @@ def load_image(image_file):
         image = Image.open(BytesIO(base64.b64decode(image_file)))
 
     return image, image_size
+
+
+def init_rpyc_service(service: rpyc.Service, port: int):
+    t = ThreadedServer(
+        service=service,
+        port=port,
+        protocol_config={"allow_pickle": True, "sync_request_timeout": 1800},
+    )
+    t.start()
+
+
+def connect_to_rpyc_service(port, host="localhost"):
+    time.sleep(1)
+
+    repeat_count = 0
+    while repeat_count < 20:
+        try:
+            con = rpyc.connect(
+                host,
+                port,
+                config={"allow_pickle": True, "sync_request_timeout": 1800},
+            )
+            break
+        except ConnectionRefusedError:
+            time.sleep(1)
+        repeat_count += 1
+    if repeat_count == 20:
+        raise RuntimeError("init rpc env error!")
+
+    return con.root
+
+
+def start_rpyc_process(service: rpyc.Service, port: int):
+    # return the proxy and the process
+    proc = multiprocessing.Process(target=init_rpyc_service, args=(service, port))
+    proc.start()
+    proxy = connect_to_rpyc_service(port)
+    assert proc.is_alive()
+    return proxy, proc
 
 
 def assert_pkg_version(pkg: str, min_version: str):

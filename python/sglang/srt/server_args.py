@@ -44,6 +44,10 @@ class ServerArgs:
     # Other
     api_key: str = ""
 
+    # distribued arguments
+    dp_size: int = 1
+    dispatch_method: str = "round_robin"
+
     # Optimization/debug options
     enable_flashinfer: bool = False
     attention_reduce_in_fp32: bool = False
@@ -226,6 +230,23 @@ class ServerArgs:
             help="Set API key of the server",
         )
 
+        # distributed arguments
+        parser.add_argument(
+            "--dp-size",
+            type=int,
+            default=ServerArgs.dp_size,
+            help="Number of tensor parallelism group for data parallelism.",
+        )
+        parser.add_argument(
+            "--dispatch-method",
+            type=str,
+            default=ServerArgs.dispatch_method,
+            choices=[
+                "round_robin",
+                "shortest_queue",
+            ],
+        )
+
         # Optimization/debug options
         parser.add_argument(
             "--enable-flashinfer",
@@ -272,9 +293,14 @@ class ServerArgs:
 
 
 @dataclasses.dataclass
+class ModelPortArgs:
+    nccl_port: int
+    model_tp_ports: List[int]
+
+
+@dataclasses.dataclass
 class PortArgs:
     tokenizer_port: int
     router_port: int
     detokenizer_port: int
-    nccl_port: int
-    model_rpc_ports: List[int]
+    model_port_args: List[ModelPortArgs]

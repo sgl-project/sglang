@@ -1,3 +1,4 @@
+# FIXME: RouterManager is the original design for no data parallelism, which will be deprecated gradually.
 import asyncio
 import logging
 
@@ -6,7 +7,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.global_config import global_config
-from sglang.srt.managers.router.model_rpc import ModelRpcClient
+from sglang.srt.managers.router.model_tp import ModelTpClient
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.utils import get_exception_traceback
 
@@ -14,7 +15,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 class RouterManager:
-    def __init__(self, model_client: ModelRpcClient, port_args: PortArgs):
+    def __init__(self, model_client: ModelTpClient, port_args: PortArgs):
         # Init communication
         context = zmq.asyncio.Context(2)
         self.recv_from_tokenizer = context.socket(zmq.PULL)
@@ -68,7 +69,12 @@ def start_router_process(
     )
 
     try:
-        model_client = ModelRpcClient(server_args, port_args, model_overide_args)
+        model_client = ModelTpClient(
+            server_args,
+            port_args.model_port_args[0],
+            model_overide_args,
+            gpu_ids = list(range(server_args.tp_size)),
+        )
         router = RouterManager(model_client, port_args)
     except Exception:
         pipe_writer.send(get_exception_traceback())
