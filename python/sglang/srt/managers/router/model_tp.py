@@ -64,7 +64,6 @@ class ModelTpServer:
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
         self.worker_id = worker_id
         self.gpu_id = gpu_id
-        self.idle = True
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -253,7 +252,6 @@ class ModelTpServer:
                     if self.out_pyobjs and self.running_batch.reqs[0].stream:
                         break
             else:
-                self.idle = True
                 # Check the available size
                 available_size = (
                     self.token_to_kv_pool.available_size()
@@ -318,8 +316,6 @@ class ModelTpServer:
             and len(self.running_batch.reqs) > self.max_running_requests
         ):
             return None
-
-        self.idle = False
 
         # Compute matched prefix length
         for req in self.forward_queue:
@@ -436,10 +432,6 @@ class ModelTpServer:
         )
         self.forward_queue = [x for x in self.forward_queue if x not in can_run_list]
         return new_batch
-
-    def exposed_get_status(self):
-        # can extend to return more status for scheduling
-        return {"idle": self.idle, "queue_length": len(self.forward_queue)}
 
     def forward_fill_batch(self, batch: Batch):
         # Build batch tensors
@@ -783,7 +775,6 @@ class ModelTpClient:
                 return _func
 
             self.step = async_wrap(self.model_server.exposed_step)
-            self.get_status = async_wrap(self.model_server.exposed_get_status)
         else:
             with ThreadPoolExecutor(self.tp_size) as executor:
                 # Launch model processes
@@ -819,4 +810,3 @@ class ModelTpClient:
                 return _func
 
             self.step = async_wrap("step")
-            self.get_status = async_wrap("get_status")

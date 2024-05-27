@@ -48,7 +48,6 @@ class RemoteWorkerService(rpyc.Service):
                 return _func
 
             self.exposed_step = async_loop_wrap("step")
-            self.exposed_get_status = async_loop_wrap("get_status")
 
 
 class WorkerThread(threading.Thread):
@@ -69,7 +68,6 @@ class WorkerThread(threading.Thread):
         self.send_to_detokenizer.connect(f"tcp://127.0.0.1:{detokenizer_port}")
 
         self.step = None
-        self.get_status = None
 
     async def loop_for_forward(self):
         while self.liveness:
@@ -131,7 +129,6 @@ def start_local_worker(
         detokenizer_port=port_args.detokenizer_port,
     )
     worker_thread.step = model_tp_client.step
-    worker_thread.get_status = model_tp_client.get_status
     worker_thread.start()
     return worker_thread
 
@@ -164,7 +161,6 @@ def connect_and_start_remote_worker(
         return _func
 
     worker_thread.step = async_wrap("step")
-    worker_thread.get_status = async_wrap("get_status")
 
     worker_thread.start()
     return worker_thread
