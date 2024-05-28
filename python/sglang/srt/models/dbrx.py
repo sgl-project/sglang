@@ -29,7 +29,7 @@ from vllm.transformers_utils.configs.dbrx import DbrxConfig
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.router.model_runner import InputMetadata
+from sglang.srt.managers.controller.model_runner import InputMetadata
 
 
 class DbrxRouter(nn.Module):

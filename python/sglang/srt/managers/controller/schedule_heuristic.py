@@ -2,7 +2,7 @@ import random
 from collections import defaultdict
 
 
-class Scheduler:
+class ScheduleHeuristic:
     def __init__(
         self,
         schedule_heuristic,

@@ -1,20 +1,13 @@
 import asyncio
 import logging
-import multiprocessing
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional
+from typing import List
 
 import rpyc
 import torch
 from rpyc.utils.classic import obtain
-from rpyc.utils.server import ThreadedServer
-
-try:
-    from vllm.logger import _default_handler as vllm_default_logger
-except ImportError:
-    from vllm.logger import logger as vllm_default_logger
 
 from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
@@ -26,38 +19,41 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.router.infer_batch import Batch, FinishReason, ForwardMode, Req
-from sglang.srt.managers.router.model_runner import ModelRunner
-from sglang.srt.managers.router.radix_cache import RadixCache
-from sglang.srt.managers.router.scheduler import Scheduler
+from sglang.srt.managers.controller.infer_batch import Batch, FinishReason, ForwardMode, Req
+from sglang.srt.managers.controller.model_runner import ModelRunner
+from sglang.srt.managers.controller.radix_cache import RadixCache
+from sglang.srt.managers.controller.schedule_heuristic import ScheduleHeuristic
 from sglang.srt.model_config import ModelConfig
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import ModelPortArgs, ServerArgs
 from sglang.srt.utils import (
     get_int_token_logit_bias,
     is_multimodal_model,
     set_random_seed,
+    start_rpyc_process,
+    suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
 
-logger = logging.getLogger("model_rpc")
-vllm_default_logger.setLevel(logging.WARN)
-logging.getLogger("vllm.utils").setLevel(logging.WARN)
-logging.getLogger("vllm.selector").setLevel(logging.WARN)
+logger = logging.getLogger("srt.model_tp")
 
 
-class ModelRpcServer:
+class ModelTpServer:
     def __init__(
         self,
+        gpu_id: int,
         tp_rank: int,
         server_args: ServerArgs,
-        port_args: PortArgs,
-        model_overide_args: Optional[dict] = None,
+        model_port_args: ModelPortArgs,
+        model_overide_args,
     ):
-        server_args, port_args = [obtain(x) for x in [server_args, port_args]]
+        server_args, model_port_args = obtain(server_args), obtain(model_port_args)
+        suppress_other_loggers()
 
         # Copy arguments
+        self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
+        self.dp_size = server_args.dp_size
         self.schedule_heuristic = server_args.schedule_heuristic
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
 
@@ -68,16 +64,16 @@ class ModelRpcServer:
             context_length=server_args.context_length,
             model_overide_args=model_overide_args,
         )
-
-        # For model end global settings
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
+            gpu_id=gpu_id,
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
-            nccl_port=port_args.nccl_port,
+            nccl_port=model_port_args.nccl_port,
             server_args=server_args,
         )
+
         if is_multimodal_model(server_args.model_path):
             self.processor = get_processor(
                 server_args.tokenizer_path,
@@ -95,21 +91,21 @@ class ModelRpcServer:
         self.max_prefill_tokens = max(
             self.model_config.context_len,
             (
-                self.max_total_num_tokens // 6
+                min(self.max_total_num_tokens // 6, 65536)
                 if server_args.max_prefill_tokens is None
                 else server_args.max_prefill_tokens
             ),
         )
         self.max_running_requests = (self.max_total_num_tokens // 2
             if server_args.max_running_requests is None else server_args.max_running_requests)
-
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
         )
         set_random_seed(server_args.random_seed)
 
         # Print info
-        logger.info(f"[rank={self.tp_rank}] "
+        logger.info(
+            f"[gpu_id={self.gpu_id}] "
             f"max_total_num_tokens={self.max_total_num_tokens}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
             f"context_len={self.model_config.context_len}, "
@@ -124,7 +120,7 @@ class ModelRpcServer:
             disable=server_args.disable_radix_cache,
         )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
-        self.scheduler = Scheduler(
+        self.scheduler = ScheduleHeuristic(
             self.schedule_heuristic,
             self.max_running_requests,
             self.max_prefill_tokens,
@@ -170,7 +166,7 @@ class ModelRpcServer:
         self.new_token_ratio_recovery = global_config.new_token_ratio_recovery
 
     def exposed_step(self, recv_reqs):
-        if self.tp_size != 1:
+        if self.tp_size * self.dp_size != 1:
             recv_reqs = obtain(recv_reqs)
 
         try:
@@ -188,7 +184,7 @@ class ModelRpcServer:
             # Forward
             self.forward_step()
         except Exception:
-            logger.error("Exception in ModelRpcClient:\n" + get_exception_traceback())
+            logger.error("Exception in ModelTpClient:\n" + get_exception_traceback())
 
         # Return results
         ret = self.out_pyobjs
@@ -224,16 +220,17 @@ class ModelRpcServer:
                                 self.token_to_kv_pool.available_size()
                                 + self.tree_cache.evictable_size()
                             )
-                            throuhgput = self.num_generated_tokens / (
+                            throughput = self.num_generated_tokens / (
                                 time.time() - self.last_stats_tic
                             )
                             self.num_generated_tokens = 0
                             self.last_stats_tic = time.time()
                             logger.info(
+                                f"[gpu_id={self.gpu_id}] "
                                 f"#running-req: {len(self.running_batch.reqs)}, "
                                 f"#token: {num_used}, "
                                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                                f"gen throughput (token/s): {throuhgput:.2f}, "
+                                f"gen throughput (token/s): {throughput:.2f}, "
                                 f"#queue-req: {len(self.forward_queue)}"
                             )
 
@@ -405,7 +402,7 @@ class ModelRpcServer:
                 f"#new_token: {new_batch_input_tokens}. "
                 f"#remaining_req: {len(self.forward_queue) - len(can_run_list)}. "
                 f"#running_req: {running_req}. "
-                f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%."
+                f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%. "
             )
             # logger.debug(
             #    f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
@@ -724,20 +721,30 @@ class ModelRpcServer:
                     break
 
 
-class ModelRpcService(rpyc.Service):
-    exposed_ModelRpcServer = ModelRpcServer
+class ModelTpService(rpyc.Service):
+    exposed_ModelTpServer = ModelTpServer
 
 
-class ModelRpcClient:
+class ModelTpClient:
     def __init__(
-        self, server_args: ServerArgs, port_args: PortArgs, model_overide_args
+        self,
+        gpu_ids: List[int],
+        server_args: ServerArgs,
+        model_port_args: ModelPortArgs,
+        model_overide_args,
     ):
-        tp_size = server_args.tp_size
+        server_args, model_port_args = obtain(server_args), obtain(model_port_args)
+        self.tp_size = server_args.tp_size
 
-        if tp_size == 1:
+        if self.tp_size * server_args.dp_size == 1:
             # Init model
-            self.model_server = ModelRpcService().exposed_ModelRpcServer(
-                0, server_args, port_args, model_overide_args
+            assert len(gpu_ids) == 1
+            self.model_server = ModelTpService().exposed_ModelTpServer(
+                0,
+                gpu_ids[0],
+                server_args,
+                model_port_args,
+                model_overide_args,
             )
 
             # Wrap functions
@@ -749,19 +756,26 @@ class ModelRpcClient:
 
             self.step = async_wrap(self.model_server.exposed_step)
         else:
-            with ThreadPoolExecutor(tp_size) as executor:
+            with ThreadPoolExecutor(self.tp_size) as executor:
                 # Launch model processes
-                rets = executor.map(start_model_process, port_args.model_rpc_ports)
-                self.remote_services = [x[0] for x in rets]
+                rets = executor.map(
+                    lambda args: start_rpyc_process(*args),
+                    [(ModelTpService, p) for p in model_port_args.model_tp_ports],
+                )
+                self.model_services = [x[0] for x in rets]
                 self.procs = [x[1] for x in rets]
 
                 # Init model
                 def init_model(i):
-                    return self.remote_services[i].ModelRpcServer(
-                        i, server_args, port_args, model_overide_args
+                    return self.model_services[i].ModelTpServer(
+                        gpu_ids[i],
+                        i,
+                        server_args,
+                        model_port_args,
+                        model_overide_args,
                     )
 
-                self.model_servers = executor.map(init_model, range(tp_size))
+                self.model_servers = executor.map(init_model, range(self.tp_size))
 
             # Wrap functions
             def async_wrap(func_name):
@@ -775,44 +789,3 @@ class ModelRpcClient:
                 return _func
 
             self.step = async_wrap("step")
-
-
-def _init_service(port):
-    t = ThreadedServer(
-        ModelRpcService(),
-        port=port,
-        protocol_config={
-            "allow_public_attrs": True,
-            "allow_pickle": True,
-            "sync_request_timeout": 3600,
-        },
-    )
-    t.start()
-
-
-def start_model_process(port):
-    proc = multiprocessing.Process(target=_init_service, args=(port,))
-    proc.start()
-    time.sleep(1)
-
-    repeat_count = 0
-    while repeat_count < 20:
-        try:
-            con = rpyc.connect(
-                "localhost",
-                port,
-                config={
-                    "allow_public_attrs": True,
-                    "allow_pickle": True,
-                    "sync_request_timeout": 3600,
-                },
-            )
-            break
-        except ConnectionRefusedError:
-            time.sleep(1)
-        repeat_count += 1
-    if repeat_count == 20:
-        raise RuntimeError("init rpc env error!")
-
-    assert proc.is_alive()
-    return con.root, proc
