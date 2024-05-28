@@ -14,6 +14,7 @@ A healthy range for `#queue-req` is `100 - 3000`.
 ### Tune `--schedule-conservativeness`
 `token usage` indicates the KV cache memory utilization of the server. `token usage > 0.9` means good utilization.
 If you frequently see `token usage < 0.9` and `#queue-req > 0`, it means the server is too conservative about taking in new requests. You can decrease `--schedule-conservativeness` to a value like 0.5.
+The case of serving being too conservative can happen when users send many requests with a large `max_new_tokens` but the requests stop very early due to EOS or stop strings.
 
 On the other hand, if you see `token usage` very high and you frequently see warnings like
 `decode out of memory happened, #retracted_reqs: 1, #new_token_ratio: 0.9998 -> 1.0000`, you can increase `--schedule-conservativeness` to a value like 1.3.
@@ -26,4 +27,4 @@ If you have many shared prefixes, use the default `--schedule-heuristic lpm`. `l
 When you have no shared prefixes at all, you can try `--schedule-heuristic fcfs`. `fcfs` stands for first come first serve.
 
 ### (Minor) Tune `--max-prefill-tokens`, `--mem-fraction-static`, `--max-running-requests`.
-If you see out of memory errors, you can decrease them. Otherwise, the default value should work well. 
+If you see out of memory errors, you can decrease them. Otherwise, the default value should work well.
