@@ -71,7 +71,6 @@ class Controller:
         self.recv_reqs = []
 
         # Start data parallel workers
-        # TODO: parallelize this
         self.workers: Dict[int, DataParallelWorkerThread] = {}
         tp_size = server_args.tp_size
 
