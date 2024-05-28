@@ -44,9 +44,9 @@ class ServerArgs:
     # Other
     api_key: str = ""
 
-    # distribued arguments
+    # Data parallelism
     dp_size: int = 1
-    dispatch_method: str = "round_robin"
+    load_balance_method: str = "round_robin"
 
     # Optimization/debug options
     enable_flashinfer: bool = False
@@ -230,7 +230,7 @@ class ServerArgs:
             help="Set API key of the server",
         )
 
-        # distributed arguments
+        # Data parallelism
         parser.add_argument(
             "--dp-size",
             type=int,
@@ -238,9 +238,9 @@ class ServerArgs:
             help="Data parallelism size.",
         )
         parser.add_argument(
-            "--dispatch-method",
+            "--load-balance-method",
             type=str,
-            default=ServerArgs.dispatch_method,
+            default=ServerArgs.load_balance_method,
             help="Load balancing strategy for data parallelism.",
             choices=[
                 "round_robin",

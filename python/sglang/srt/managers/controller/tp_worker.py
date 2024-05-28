@@ -9,11 +9,6 @@ import rpyc
 import torch
 from rpyc.utils.classic import obtain
 
-try:
-    from vllm.logger import _default_handler as vllm_default_logger
-except ImportError:
-    from vllm.logger import logger as vllm_default_logger
-
 from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
@@ -24,47 +19,43 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.router.infer_batch import Batch, FinishReason, ForwardMode, Req
-from sglang.srt.managers.router.model_runner import ModelRunner
-from sglang.srt.managers.router.radix_cache import RadixCache
-from sglang.srt.managers.router.scheduler import Scheduler
+from sglang.srt.managers.controller.infer_batch import Batch, FinishReason, ForwardMode, Req
+from sglang.srt.managers.controller.model_runner import ModelRunner
+from sglang.srt.managers.controller.radix_cache import RadixCache
+from sglang.srt.managers.controller.schedule_heuristic import ScheduleHeuristic
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.server_args import ModelPortArgs, ServerArgs
 from sglang.srt.utils import (
-    alloc_usable_network_port,
     get_int_token_logit_bias,
     is_multimodal_model,
     set_random_seed,
     start_rpyc_process,
+    suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
 
-logger = logging.getLogger("model_tp")
-vllm_default_logger.setLevel(logging.WARN)
-logging.getLogger("vllm.utils").setLevel(logging.WARN)
-logging.getLogger("vllm.selector").setLevel(logging.WARN)
+logger = logging.getLogger("srt.model_tp")
 
 
 class ModelTpServer:
     def __init__(
         self,
+        gpu_id: int,
         tp_rank: int,
         server_args: ServerArgs,
         model_port_args: ModelPortArgs,
         model_overide_args,
-        worker_id: int = 0,
-        gpu_id: int = 0,
     ):
         server_args, model_port_args = obtain(server_args), obtain(model_port_args)
+        suppress_other_loggers()
 
         # Copy arguments
+        self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
         self.schedule_heuristic = server_args.schedule_heuristic
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
-        self.worker_id = worker_id
-        self.gpu_id = gpu_id
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -73,16 +64,14 @@ class ModelTpServer:
             context_length=server_args.context_length,
             model_overide_args=model_overide_args,
         )
-
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
+            gpu_id=gpu_id,
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
             nccl_port=model_port_args.nccl_port,
             server_args=server_args,
-            worker_id=self.worker_id,
-            gpu_id=gpu_id,
         )
 
         if is_multimodal_model(server_args.model_path):
@@ -109,7 +98,6 @@ class ModelTpServer:
         )
         self.max_running_requests = (self.max_total_num_tokens // 2
             if server_args.max_running_requests is None else server_args.max_running_requests)
-
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
         )
@@ -121,7 +109,6 @@ class ModelTpServer:
             f"max_total_num_tokens={self.max_total_num_tokens}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
             f"context_len={self.model_config.context_len}, "
-            f"worker_id={self.worker_id}"
         )
         if self.tp_rank == 0:
             logger.info(f"server_args: {server_args.print_mode_args()}")
@@ -133,7 +120,7 @@ class ModelTpServer:
             disable=server_args.disable_radix_cache,
         )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
-        self.scheduler = Scheduler(
+        self.scheduler = ScheduleHeuristic(
             self.schedule_heuristic,
             self.max_running_requests,
             self.max_prefill_tokens,
@@ -239,7 +226,7 @@ class ModelTpServer:
                             self.num_generated_tokens = 0
                             self.last_stats_tic = time.time()
                             logger.info(
-                                f"gpu id: {self.gpu_id}, "
+                                f"[gpu_id={self.gpu_id}] "
                                 f"#running-req: {len(self.running_batch.reqs)}, "
                                 f"#token: {num_used}, "
                                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -416,7 +403,6 @@ class ModelTpServer:
                 f"#remaining_req: {len(self.forward_queue) - len(can_run_list)}. "
                 f"#running_req: {running_req}. "
                 f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%. "
-                f"worker_id={self.worker_id}"
             )
             # logger.debug(
             #    f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
@@ -742,14 +728,12 @@ class ModelTpService(rpyc.Service):
 class ModelTpClient:
     def __init__(
         self,
+        gpu_ids: List[int],
         server_args: ServerArgs,
         model_port_args: ModelPortArgs,
         model_overide_args,
-        gpu_ids: List[int],
-        worker_id: int = 0,
     ):
         server_args, model_port_args = obtain(server_args), obtain(model_port_args)
-        self.worker_id = worker_id
         self.tp_size = server_args.tp_size
 
         if self.tp_size * server_args.dp_size == 1:
@@ -757,11 +741,10 @@ class ModelTpClient:
             assert len(gpu_ids) == 1
             self.model_server = ModelTpService().exposed_ModelTpServer(
                 0,
+                gpu_ids[0],
                 server_args,
                 model_port_args,
                 model_overide_args,
-                worker_id,
-                gpu_ids[0],
             )
 
             # Wrap functions
@@ -785,12 +768,11 @@ class ModelTpClient:
                 # Init model
                 def init_model(i):
                     return self.model_services[i].ModelTpServer(
+                        gpu_ids[i],
                         i,
                         server_args,
                         model_port_args,
                         model_overide_args,
-                        self.worker_id,
-                        gpu_ids[i],
                     )
 
                 self.model_servers = executor.map(init_model, range(self.tp_size))

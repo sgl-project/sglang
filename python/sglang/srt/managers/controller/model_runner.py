@@ -15,13 +15,13 @@ from vllm.distributed import initialize_model_parallel
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
-from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
+from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_available_gpu_memory, is_multimodal_model
 
 
-logger = logging.getLogger("model_runner")
+logger = logging.getLogger("srt.model_runner")
 
 # for server args in model endpoints
 global_server_args_dict = {}
@@ -215,22 +215,20 @@ class ModelRunner:
     def __init__(
         self,
         model_config,
-        mem_fraction_static,
-        tp_rank,
-        tp_size,
-        nccl_port,
+        mem_fraction_static: float,
+        gpu_id: int,
+        tp_rank: int,
+        tp_size: int,
+        nccl_port: int,
         server_args: ServerArgs,
-        worker_id: int = 0,
-        gpu_id: int = 0,
     ):
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
+        self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.worker_id = worker_id
         self.nccl_port = nccl_port
         self.server_args = server_args
-        self.gpu_id = gpu_id
 
         global global_server_args_dict
         global_server_args_dict = {
@@ -239,15 +237,9 @@ class ModelRunner:
         }
 
         # Init torch distributed
-        logger.info(f"[rank={self.tp_rank}] Set cuda device.")
-        torch.cuda.set_device(self.tp_rank)
-        logger.info(f"[rank={self.tp_rank}] Init torch begin. Avail mem={get_available_gpu_memory(self.tp_rank):.2f} GB")
-        logger.info(
-            f"[gpu_id={self.gpu_id}] "
-            f"worker_id={self.worker_id}, "
-            f"tp_rank={self.tp_rank}. "
-        )
-
+        logger.info(f"[gpu_id={self.gpu_id}] Set cuda device.")
+        torch.cuda.set_device(self.gpu_id)
+        logger.info(f"[gpu_id={self.gpu_id}] Init nccl begin.")
         torch.distributed.init_process_group(
             backend="nccl",
             world_size=self.tp_size,
@@ -255,8 +247,6 @@ class ModelRunner:
             init_method=f"tcp://127.0.0.1:{self.nccl_port}",
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
-        logger.info(f"[gpu_id={self.gpu_id}] Init torch end.")
-
         total_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
         )
@@ -270,15 +260,12 @@ class ModelRunner:
 
         self.load_model()
         self.init_memory_pool(total_gpu_memory)
-
         self.is_multimodal_model = is_multimodal_model(self.model_config)
 
     def load_model(self):
         logger.info(
-            f"[gpu_id={self.gpu_id}] "
-            f"worker_id={self.worker_id}, "
-            f"tp_rank={self.tp_rank}. "
-            "Load weight begin."
+            f"[gpu_id={self.gpu_id}] Load weight begin. "
+            f"Avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
         device_config = DeviceConfig()
@@ -329,7 +316,7 @@ class ModelRunner:
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
-                "Not enought memory. " "Please try to increase --mem-fraction-static."
+                "Not enought memory. Please try to increase --mem-fraction-static."
             )
 
         self.req_to_token_pool = ReqToTokenPool(
@@ -447,8 +434,8 @@ def import_model_classes():
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
                 if isinstance(entry, list): # To support multiple model classes in one module
-                    for cls in entry:
-                        model_arch_name_to_cls[cls.__name__] = cls
+                    for tmp in entry:
+                        model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
                     model_arch_name_to_cls[entry.__name__] = entry
     return model_arch_name_to_cls

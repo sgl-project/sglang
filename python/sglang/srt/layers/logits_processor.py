@@ -5,7 +5,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 
-from sglang.srt.managers.router.model_runner import ForwardMode, InputMetadata
+from sglang.srt.managers.controller.model_runner import ForwardMode, InputMetadata
 
 
 class LogitsProcessor(nn.Module):

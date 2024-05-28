@@ -28,8 +28,8 @@ from sglang.srt.constrained import disable_cache
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.router.controller import start_controller_process
-from sglang.srt.managers.router.manager import start_router_process
+from sglang.srt.managers.controller.manager_single import start_controller_process as start_controller_process_single
+from sglang.srt.managers.controller.manager_multi import start_controller_process as start_controller_process_multi
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api_adapter import (
     load_chat_template_for_openai_api,
@@ -147,6 +147,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
         server_args.tp_size,
         server_args.dp_size,
     )
+
     # Init local models port args
     ports = server_args.additional_ports
     tp = server_args.tp_size
@@ -171,9 +172,9 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
     if server_args.dp_size == 1:
-        start_process = start_router_process
+        start_process = start_controller_process_single
     else:
-        start_process = start_controller_process
+        start_process = start_controller_process_multi
     proc_router = mp.Process(
         target=start_process,
         args=(server_args, port_args, pipe_router_writer, model_overide_args),

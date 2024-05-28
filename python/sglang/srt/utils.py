@@ -15,15 +15,12 @@ import numpy as np
 import requests
 import rpyc
 import torch
-<<<<<<< HEAD
 import triton
-=======
 from rpyc.utils.server import ThreadedServer
->>>>>>> 87edb05 (add dp)
 from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
 from starlette.middleware.base import BaseHTTPMiddleware
-import torch.distributed as dist
+
 
 logger = logging.getLogger(__name__)
 
@@ -126,14 +123,16 @@ def get_available_gpu_memory(gpu_id, distributed=False):
 
 
 def set_random_seed(seed: int) -> None:
+    """Set the random seed for all libraries."""
     random.seed(seed)
-
+    np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
 def is_port_available(port):
+    """Return whether a port is available."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -144,41 +143,27 @@ def is_port_available(port):
             return False
 
 
-def alloc_usable_network_port(num, used_list=()):
-    port_list = []
-    for port in range(10000, 65536):
-        if port in used_list:
-            continue
-        if is_port_available(port):
-            port_list.append(port)
-        if len(port_list) == num:
-            return port_list
-    return port_list
-
-
 def allocate_init_ports(
     port: Optional[int] = None,
     additional_ports: Optional[List[int]] = None,
     tp_size: int = 1,
     dp_size: int = 1,
 ):
-    ret_ports = []
-    if port is not None:
-        ret_ports.append(port)
-    if additional_ports is not None:
-        for x in additional_ports:
-            if x not in ret_ports:
-                ret_ports.append(x)
+    """Allocate ports for all connections."""
+    if additional_ports:
+        ret_ports = [port] + additional_ports
+    else:
+        ret_ports = [port]
 
-    ret_ports = [x for x in ret_ports if is_port_available(x)]
+    ret_ports = list(set(x for x in ret_ports if is_port_available(x)))
+    cur_port = ret_ports[-1] + 1 if len(ret_ports) > 0 else 10000
 
-    # HTTP + Tokenizer + Controller + Detokenizer + (nccl + tp_size) * dp_size
+    # HTTP + Tokenizer + Controller + Detokenizer + dp_size * (nccl + tp_size)
     num_ports_needed = 4 + dp_size * (1 + tp_size)
-    ret_ports.extend(
-        alloc_usable_network_port(
-            num_ports_needed - len(ret_ports), used_list=ret_ports
-        )
-    )
+    while len(ret_ports) < num_ports_needed:
+        if cur_port not in ret_ports and is_port_available(cur_port):
+            ret_ports.append(cur_port)
+        cur_port += 1
 
     if port is not None and ret_ports[0] != port:
         logger.warn(
@@ -189,6 +174,7 @@ def allocate_init_ports(
 
 
 def get_int_token_logit_bias(tokenizer, vocab_size):
+    """Get the logit bias for integer-only tokens."""
     # a bug when model's vocab size > tokenizer.vocab_size
     vocab_size = tokenizer.vocab_size
     logit_bias = np.zeros(vocab_size, dtype=np.float32)
@@ -393,6 +379,7 @@ def init_rpyc_service(service: rpyc.Service, port: int):
             "sync_request_timeout": 3600
         },
     )
+    t.logger.setLevel(logging.WARN)
     t.start()
 
 
@@ -422,12 +409,21 @@ def connect_to_rpyc_service(port, host="localhost"):
 
 
 def start_rpyc_process(service: rpyc.Service, port: int):
-    # return the proxy and the process
+    # Return the proxy and the process
     proc = multiprocessing.Process(target=init_rpyc_service, args=(service, port))
     proc.start()
     proxy = connect_to_rpyc_service(port)
     assert proc.is_alive()
     return proxy, proc
+
+
+def suppress_other_loggers():
+    from vllm.logger import logger as vllm_default_logger
+
+    vllm_default_logger.setLevel(logging.WARN)
+    logging.getLogger("vllm.utils").setLevel(logging.WARN)
+    logging.getLogger("vllm.selector").setLevel(logging.WARN)
+    logging.getLogger("vllm.config").setLevel(logging.ERROR)
 
 
 def assert_pkg_version(pkg: str, min_version: str):

@@ -1,3 +1,8 @@
+"""
+A controller that manages multiple data parallel workers.
+Each data parallel worker can manage multiple tensor parallel workers.
+"""
+
 import asyncio
 import logging
 from enum import Enum, auto
@@ -6,15 +11,15 @@ from typing import Dict
 import zmq
 import zmq.asyncio
 
+from sglang.global_config import global_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.router.worker import (
-    WorkerThread,
-    connect_and_start_remote_worker,
-    start_local_worker,
+from sglang.srt.managers.controller.dp_worker import (
+    DataParallelWorkerThread,
+    start_data_parallel_worker,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.utils import get_exception_traceback
@@ -22,7 +27,7 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger("srt.controller")
 
 
-class DispatchMethod(Enum):
+class LoadBalanceMethod(Enum):
     ROUND_ROBIN = auto()
     SHORTEST_QUEUE = auto()
 
@@ -32,29 +37,29 @@ class DispatchMethod(Enum):
         try:
             return cls[method]
         except KeyError as exc:
-            raise ValueError(f"Invalid dispatch method: {method}") from exc
+            raise ValueError(f"Invalid load balance method: {method}") from exc
 
 
 class Controller:
     def __init__(
         self,
-        dispatch_method: str,
+        load_balance_method: str,
         server_args: ServerArgs,
         port_args: PortArgs,
         model_overide_args,
     ):
-        self.dispatch_method = DispatchMethod.from_str(dispatch_method)
+        self.load_balance_method = LoadBalanceMethod.from_str(load_balance_method)
         self.server_args = server_args
         self.port_args = port_args
 
-        if self.dispatch_method == DispatchMethod.ROUND_ROBIN:
+        if self.load_balance_method == LoadBalanceMethod.ROUND_ROBIN:
             self.round_robin_counter = 0
 
         self.dispatch_lookup = {
-            DispatchMethod.ROUND_ROBIN: self.round_robin_scheduler,
-            DispatchMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
+            LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
+            LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
         }
-        self.dispatching = self.dispatch_lookup[self.dispatch_method]
+        self.dispatching = self.dispatch_lookup[self.load_balance_method]
 
         # Init communication
         context = zmq.asyncio.Context()
@@ -64,13 +69,14 @@ class Controller:
         # Init status
         self.recv_reqs = []
 
-        # start local workers
-        self.workers: Dict[int, WorkerThread] = {}
+        # Start data parallel workers
+        # TODO: parallelize this
+        self.workers: Dict[int, DataParallelWorkerThread] = {}
         tp_size = server_args.tp_size
         for i in range(server_args.dp_size):
             try:
                 gpu_ids = list(range(i * tp_size, (i + 1) * tp_size))
-                worker_thread = start_local_worker(
+                worker_thread = start_data_parallel_worker(
                     server_args, port_args, model_overide_args, gpu_ids, i
                 )
                 self.workers[i] = worker_thread
@@ -122,10 +128,10 @@ class Controller:
                 self.recv_reqs = []
                 if next_step_input:
                     await self.dispatching(next_step_input)
-            else:
-                logger.error("There is no live worker.")
+            #else:
+            #    logger.error("There is no live worker.")
 
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(global_config.wait_for_new_request_delay)
 
     async def loop_for_recv_requests(self):
         while True:
@@ -144,7 +150,7 @@ class Controller:
                         in_queue = True
                         break
                 if not in_queue:
-                    # send abort req to all TP groups
+                    # Send abort req to all TP groups
                     for worker in list(self.workers.keys()):
                         self.put_req_to_worker(worker, recv_req)
             else:
@@ -164,7 +170,7 @@ def start_controller_process(
 
     try:
         controller = Controller(
-            server_args.dispatch_method, server_args, port_args, model_overide_args
+            server_args.load_balance_method, server_args, port_args, model_overide_args
         )
     except Exception:
         pipe_writer.send(get_exception_traceback())
