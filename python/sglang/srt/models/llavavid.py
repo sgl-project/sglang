@@ -10,8 +10,8 @@ from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.managers.router.infer_batch import ForwardMode
-from sglang.srt.managers.router.model_runner import InputMetadata
+from sglang.srt.managers.controller.infer_batch import ForwardMode
+from sglang.srt.managers.controller.model_runner import InputMetadata
 from sglang.srt.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,

@@ -37,7 +37,7 @@ from vllm.utils import print_warning_once
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.fused_moe import fused_moe
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.router.model_runner import InputMetadata
+from sglang.srt.managers.controller.model_runner import InputMetadata
 
 
 use_fused = True

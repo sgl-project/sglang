@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from http import HTTPStatus
-from typing import List, Optional, Union
+from typing import Optional
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -28,14 +28,15 @@ from sglang.srt.constrained import disable_cache
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.router.manager import start_router_process
+from sglang.srt.managers.controller.manager_single import start_controller_process as start_controller_process_single
+from sglang.srt.managers.controller.manager_multi import start_controller_process as start_controller_process_multi
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api_adapter import (
     load_chat_template_for_openai_api,
     v1_chat_completions,
     v1_completions,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import ModelPortArgs, PortArgs, ServerArgs
 from sglang.srt.utils import (
     API_KEY_HEADER_NAME,
     APIKeyValidatorMiddleware,
@@ -141,14 +142,28 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 
     # Allocate ports
     server_args.port, server_args.additional_ports = allocate_init_ports(
-        server_args.port, server_args.additional_ports, server_args.tp_size
+        server_args.port,
+        server_args.additional_ports,
+        server_args.tp_size,
+        server_args.dp_size,
     )
+
+    # Init local models port args
+    ports = server_args.additional_ports
+    tp = server_args.tp_size
+    model_port_args = []
+    for i in range(server_args.dp_size):
+        model_port_args.append(
+            ModelPortArgs(
+                nccl_port=ports[3 + i * (tp + 1)],
+                model_tp_ports=ports[3 + i * (tp + 1) + 1 : 3 + (i + 1) * (tp + 1)],
+            )
+        )
     port_args = PortArgs(
-        tokenizer_port=server_args.additional_ports[0],
-        router_port=server_args.additional_ports[1],
-        detokenizer_port=server_args.additional_ports[2],
-        nccl_port=server_args.additional_ports[3],
-        model_rpc_ports=server_args.additional_ports[4:],
+        tokenizer_port=ports[0],
+        router_port=ports[1],
+        detokenizer_port=ports[2],
+        model_port_args=model_port_args,
     )
 
     # Launch processes
@@ -156,8 +171,12 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
     pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
+    if server_args.dp_size == 1:
+        start_process = start_controller_process_single
+    else:
+        start_process = start_controller_process_multi
     proc_router = mp.Process(
-        target=start_router_process,
+        target=start_process,
         args=(server_args, port_args, pipe_router_writer, model_overide_args),
     )
     proc_router.start()
@@ -251,19 +270,20 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 class Runtime:
     def __init__(
         self,
-        log_evel: str = "error",
+        log_level: str = "error",
         model_overide_args: Optional[dict] = None,
         *args,
         **kwargs,
     ):
         """See the arguments in server_args.py::ServerArgs"""
-        self.server_args = ServerArgs(*args, log_level=log_evel, **kwargs)
+        self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
 
         # Pre-allocate ports
         self.server_args.port, self.server_args.additional_ports = allocate_init_ports(
             self.server_args.port,
             self.server_args.additional_ports,
             self.server_args.tp_size,
+            self.server_args.dp_size,
         )
 
         self.url = self.server_args.url()

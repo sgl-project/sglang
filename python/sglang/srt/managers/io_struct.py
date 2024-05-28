@@ -27,7 +27,6 @@ class GenerateReqInput:
     return_text_in_logprobs: bool = False
     # Whether to stream output
     stream: bool = False
-    # TODO: make all parameters a Union[List[T], T] to allow for batched requests
 
     def post_init(self):
 
