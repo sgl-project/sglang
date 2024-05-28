@@ -86,8 +86,12 @@ class Controller:
                     f"Failed to start local worker {i}\n{get_exception_traceback()}"
                 )
 
-        with ThreadPoolExecutor(server_args.dp_size) as executor:
-             executor.map(start_dp_worker, range(server_args.dp_size))
+        for i in range(server_args.dp_size):
+            start_dp_worker(i)
+
+        # Parallel launch is slower, probably due to the disk bandwidth limitations.
+        # with ThreadPoolExecutor(server_args.dp_size) as executor:
+        #     executor.map(start_dp_worker, range(server_args.dp_size))
 
     def have_any_live_worker(self):
         return any(worker_thread.liveness for worker_thread in self.workers.values())
