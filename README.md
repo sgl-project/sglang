@@ -359,7 +359,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --tp 2
 ```
-- Add `--dp 2` to enable data parallelism. It can also be used together with dp. Data parallelism is better for throughput if there is enough memory.
+- Add `--dp 2` to enable data parallelism. It can also be used together with tp. Data parallelism is better for throughput if there is enough memory.
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --dp 2 --tp 2
 ```
