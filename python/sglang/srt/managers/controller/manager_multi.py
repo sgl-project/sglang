@@ -5,6 +5,7 @@ Each data parallel worker can manage multiple tensor parallel workers.
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, auto
 from typing import Dict
 
@@ -73,7 +74,8 @@ class Controller:
         # TODO: parallelize this
         self.workers: Dict[int, DataParallelWorkerThread] = {}
         tp_size = server_args.tp_size
-        for i in range(server_args.dp_size):
+
+        def start_dp_worker(i):
             try:
                 gpu_ids = list(range(i * tp_size, (i + 1) * tp_size))
                 worker_thread = start_data_parallel_worker(
@@ -84,6 +86,9 @@ class Controller:
                 logger.error(
                     f"Failed to start local worker {i}\n{get_exception_traceback()}"
                 )
+
+        with ThreadPoolExecutor(server_args.dp_size) as executor:
+             executor.map(start_dp_worker, range(server_args.dp_size))
 
     def have_any_live_worker(self):
         return any(worker_thread.liveness for worker_thread in self.workers.values())

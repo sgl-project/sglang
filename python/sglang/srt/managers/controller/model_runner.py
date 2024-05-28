@@ -330,6 +330,10 @@ class ModelRunner:
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
         )
+        logger.info(
+            f"[gpu_id={self.gpu_id}] Memory pool end. "
+            f"Avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+        )
 
     @torch.inference_mode()
     def forward_prefill(self, batch: Batch):

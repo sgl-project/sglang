@@ -1,9 +1,9 @@
 import asyncio
 import logging
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import List
-import time
 
 import rpyc
 import torch
@@ -91,7 +91,7 @@ class ModelTpServer:
         self.max_prefill_tokens = max(
             self.model_config.context_len,
             (
-                self.max_total_num_tokens // 6
+                min(self.max_total_num_tokens // 6, 65536)
                 if server_args.max_prefill_tokens is None
                 else server_args.max_prefill_tokens
             ),
