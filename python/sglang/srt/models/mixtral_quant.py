@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import MixtralConfig
+from vllm.config import CacheConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -313,6 +314,7 @@ class QuantMixtralForCausalLM(nn.Module):
         self,
         config: MixtralConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
