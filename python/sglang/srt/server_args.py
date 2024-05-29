@@ -194,7 +194,7 @@ class ServerArgs:
             "--random-seed",
             type=int,
             default=ServerArgs.random_seed,
-            help="Random seed.",
+            help="The global random seed of the server.",
         )
         parser.add_argument(
             "--log-level",
