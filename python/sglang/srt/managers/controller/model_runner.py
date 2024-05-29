@@ -291,6 +291,7 @@ class ModelRunner:
             vision_language_config=None,
             parallel_config=None,
             scheduler_config=None,
+            cache_config=None,
         )
         logger.info(
             f"[gpu_id={self.gpu_id}] Load weight end. "
