@@ -25,6 +25,7 @@ from sglang.api import (
 # SGL Backends
 from sglang.backend.anthropic import Anthropic
 from sglang.backend.openai import OpenAI
+from sglang.backend.groq import Groq
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.backend.vertexai import VertexAI
 
@@ -36,6 +37,7 @@ __all__ = [
     "global_config",
     "Anthropic",
     "OpenAI",
+    "Groq",
     "RuntimeEndpoint",
     "VertexAI",
     "function",

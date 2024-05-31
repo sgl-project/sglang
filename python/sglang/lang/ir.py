@@ -52,6 +52,19 @@ class SglSamplingParams:
             "presence_penalty": self.presence_penalty,
         }
 
+    def to_groq_kwargs(self):
+       
+        if self.regex is not None:
+            warnings.warn("Regular expression is not supported in the Groq backend.")
+        return {
+            "max_tokens": self.max_new_tokens,
+            "stop": self.stop or None,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+        }
+
     def to_vertexai_kwargs(self):
         if self.regex is not None:
             warnings.warn(
