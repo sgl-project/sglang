@@ -1,3 +1,4 @@
+"""Meta data for requests and batches"""
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import List
@@ -5,7 +6,7 @@ from typing import List
 import numpy as np
 import torch
 
-from sglang.srt.managers.router.radix_cache import RadixCache
+from sglang.srt.managers.controller.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
 
@@ -36,15 +37,15 @@ class FinishReason(IntEnum):
 
 
 class Req:
-    def __init__(self, rid, input_text, input_ids):
+    def __init__(self, rid, origin_input_text, origin_input_ids):
         self.rid = rid
-        self.input_text = input_text
-        self.input_ids = input_ids
+        self.origin_input_text = origin_input_text
+        self.origin_input_ids = origin_input_ids
+        self.origin_input_ids_unpadded = origin_input_ids  # before image padding
+        self.prev_output_str = ""
+        self.prev_output_ids = []
         self.output_ids = []
-
-        # Since jump forward may retokenize the prompt with partial outputs,
-        # we maintain the original prompt length to report the correct usage.
-        self.prompt_tokens = len(input_ids)
+        self.input_ids = None  # input_ids = origin_input_ids + prev_output_ids
 
         # The number of decoded tokens for token usage report. Note that
         # this does not include the jump forward tokens.
@@ -66,6 +67,7 @@ class Req:
         self.finish_reason = None
         self.hit_stop_str = None
 
+        # Prefix info
         self.extend_input_len = 0
         self.prefix_indices = []
         self.last_node = None
@@ -76,15 +78,24 @@ class Req:
         self.top_logprobs_num = 0
         self.normalized_prompt_logprob = None
         self.prefill_token_logprobs = None
-        self.decode_token_logprobs = None
         self.prefill_top_logprobs = None
-        self.decode_top_logprobs = None
+        self.decode_token_logprobs = []
+        self.decode_top_logprobs = []
+        # The tokens is prefilled but need to be considered as decode tokens
+        # and should be updated for the decode logprobs
+        self.last_update_decode_tokens = 0
 
         # Constrained decoding
         self.regex_fsm = None
         self.regex_fsm_state = 0
         self.jump_forward_map = None
-        self.output_and_jump_forward_str = ""
+
+    def partial_decode(self, ids):
+        first_token = self.tokenizer.convert_ids_to_tokens(ids[0])
+        first_token = (
+            first_token.decode() if isinstance(first_token, bytes) else first_token
+        )
+        return (" " if first_token.startswith("▁") else "") + self.tokenizer.decode(ids)
 
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
@@ -93,7 +104,10 @@ class Req:
         if self.finished:
             return
 
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+        if (
+            len(self.prev_output_ids) + len(self.output_ids)
+            >= self.sampling_params.max_new_tokens
+        ):
             self.finished = True
             self.finish_reason = FinishReason.LENGTH
             return
@@ -112,60 +126,66 @@ class Req:
             )
 
             for stop_str in self.sampling_params.stop_strs:
-                if stop_str in tail_str:
+                # FIXME: (minor) try incremental match in prev_output_str
+                if stop_str in tail_str or stop_str in self.prev_output_str:
                     self.finished = True
                     self.finish_reason = FinishReason.STOP_STR
                     self.hit_stop_str = stop_str
                     return
 
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
-        old_output_str = self.tokenizer.decode(self.output_ids)
         # FIXME: This logic does not really solve the problem of determining whether
         # there should be a leading space.
-        first_token = self.tokenizer.convert_ids_to_tokens(self.output_ids[0])
-        first_token = (
-            first_token.decode() if isinstance(first_token, bytes) else first_token
-        )
-        if first_token.startswith("▁"):
-            old_output_str = " " + old_output_str
-        if self.input_text is None:
-            # TODO(lmzheng): This can be wrong. Check with Liangsheng.
-            self.input_text = self.tokenizer.decode(self.input_ids)
-        new_input_string = (
-            self.input_text
-            + self.output_and_jump_forward_str
-            + old_output_str
+        cur_output_str = self.partial_decode(self.output_ids)
+
+        # TODO(lsyin): apply re-tokenize only for decode tokens so that we do not need origin_input_text anymore
+        if self.origin_input_text is None:
+            # Recovering text can only use unpadded ids
+            self.origin_input_text = self.tokenizer.decode(
+                self.origin_input_ids_unpadded
+            )
+
+        all_text = (
+            self.origin_input_text
+            + self.prev_output_str
+            + cur_output_str
             + jump_forward_str
         )
-        new_input_ids = self.tokenizer.encode(new_input_string)
-        if self.pixel_values is not None:
-            # NOTE: This is a hack because the old input_ids contains the image padding
-            jump_forward_tokens_len = len(self.tokenizer.encode(jump_forward_str))
-        else:
-            jump_forward_tokens_len = (
-                len(new_input_ids) - len(self.input_ids) - len(self.output_ids)
-            )
+        all_ids = self.tokenizer.encode(all_text)
+        prompt_tokens = len(self.origin_input_ids_unpadded)
+        self.origin_input_ids = all_ids[:prompt_tokens]
+        self.origin_input_ids_unpadded = self.origin_input_ids
+        # NOTE: the output ids may not strictly correspond to the output text
+        old_prev_output_ids = self.prev_output_ids
+        self.prev_output_ids = all_ids[prompt_tokens:]
+        self.prev_output_str = self.prev_output_str + cur_output_str + jump_forward_str
+        self.output_ids = []
+
+        self.regex_fsm_state = next_state
+
+        if self.return_logprob:
+            # For fast-forward part's logprobs
+            k = 0
+            for i, old_id in enumerate(old_prev_output_ids):
+                if old_id == self.prev_output_ids[i]:
+                    k = k + 1
+                else:
+                    break
+            self.decode_token_logprobs = self.decode_token_logprobs[:k]
+            self.decode_top_logprobs = self.decode_top_logprobs[:k]
+            self.logprob_start_len = prompt_tokens + k
+            self.last_update_decode_tokens = len(self.prev_output_ids) - k
 
         # print("=" * 100)
         # print(f"Catch jump forward:\n{jump_forward_str}")
         # print(self.tokenizer.convert_ids_to_tokens(self.input_ids))
         # print(self.tokenizer.convert_ids_to_tokens(new_input_ids))
 
-        self.input_ids = new_input_ids
-        self.output_ids = []
-        self.sampling_params.max_new_tokens = max(
-            self.sampling_params.max_new_tokens - jump_forward_tokens_len, 0
-        )
-        self.regex_fsm_state = next_state
-        self.output_and_jump_forward_str = (
-            self.output_and_jump_forward_str + old_output_str + jump_forward_str
-        )
-
         # print(f"Output and jump forward str:\n{self.output_and_jump_forward_str}")
         # print("*" * 100)
 
     def __repr__(self):
-        return f"rid(n={self.rid}, " f"input_ids={self.input_ids}, "
+        return f"rid(n={self.rid}, " f"input_ids={self.origin_input_ids}, "
 
 
 @dataclass
@@ -336,6 +356,7 @@ class Batch:
 
     def retract_decode(self):
         sorted_indices = [i for i in range(len(self.reqs))]
+        # TODO(lsyin): improve the priority of retraction
         sorted_indices.sort(
             key=lambda i: (len(self.reqs[i].output_ids), -len(self.reqs[i].input_ids)),
             reverse=True,
@@ -356,18 +377,27 @@ class Batch:
             ][last_uncached_pos : seq_lens_cpu[idx]]
             self.token_to_kv_pool.dec_refs(token_indices)
 
+            # release the last node
             self.tree_cache.dec_lock_ref(req.last_node)
+
+            cur_output_str = req.partial_decode(req.output_ids)
+            req.prev_output_str = req.prev_output_str + cur_output_str
+            req.prev_output_ids.extend(req.output_ids)
+
             req.prefix_indices = None
             req.last_node = None
             req.extend_input_len = 0
             req.output_ids = []
-            req.regex_fsm_state = 0
+
+            # For incremental logprobs
+            req.last_update_decode_tokens = 0
+            req.logprob_start_len = 10**9
 
         self.filter_batch(sorted_indices)
 
         return retracted_reqs
 
-    def check_for_jump_forward(self):
+    def check_for_jump_forward(self, model_runner):
         jump_forward_reqs = []
         filter_indices = [i for i in range(len(self.reqs))]
 
@@ -396,6 +426,18 @@ class Batch:
 
                     # jump-forward
                     req.jump_forward_and_retokenize(jump_forward_str, next_state)
+
+                    # re-applying image padding
+                    if req.pixel_values is not None:
+                        (
+                            req.origin_input_ids,
+                            req.image_offset,
+                        ) = model_runner.model.pad_input_ids(
+                            req.origin_input_ids_unpadded,
+                            req.pad_value,
+                            req.pixel_values.shape,
+                            req.image_size,
+                        )
 
                     jump_forward_reqs.append(req)
                     filter_indices.remove(i)

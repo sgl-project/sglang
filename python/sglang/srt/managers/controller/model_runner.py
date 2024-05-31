@@ -15,13 +15,13 @@ from vllm.distributed import initialize_model_parallel
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
-from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
+from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_available_gpu_memory, is_multimodal_model
 
 
-logger = logging.getLogger("model_runner")
+logger = logging.getLogger("srt.model_runner")
 
 # for server args in model endpoints
 global_server_args_dict = {}
@@ -215,14 +215,16 @@ class ModelRunner:
     def __init__(
         self,
         model_config,
-        mem_fraction_static,
-        tp_rank,
-        tp_size,
-        nccl_port,
+        mem_fraction_static: float,
+        gpu_id: int,
+        tp_rank: int,
+        tp_size: int,
+        nccl_port: int,
         server_args: ServerArgs,
     ):
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
+        self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.nccl_port = nccl_port
@@ -235,8 +237,9 @@ class ModelRunner:
         }
 
         # Init torch distributed
-        logger.debug("Init torch begin.")
-        torch.cuda.set_device(self.tp_rank)
+        logger.info(f"[gpu_id={self.gpu_id}] Set cuda device.")
+        torch.cuda.set_device(self.gpu_id)
+        logger.info(f"[gpu_id={self.gpu_id}] Init nccl begin.")
         torch.distributed.init_process_group(
             backend="nccl",
             world_size=self.tp_size,
@@ -244,20 +247,26 @@ class ModelRunner:
             init_method=f"tcp://127.0.0.1:{self.nccl_port}",
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
-        logger.debug("Init torch end.")
-
         total_gpu_memory = get_available_gpu_memory(
-            self.tp_rank, distributed=self.tp_size > 1
-        ) * (1 << 30)
-        # logger.info(f"Before: {get_available_gpu_memory(self.tp_rank, False):.2f} GB")
-        self.load_model()
-        # logger.info(f"After: {get_available_gpu_memory(self.tp_rank, False):.2f} GB")
-        self.init_memory_pool(total_gpu_memory)
+            self.gpu_id, distributed=self.tp_size > 1
+        )
 
+        if self.tp_size > 1:
+            total_local_gpu_memory = get_available_gpu_memory(self.gpu_id)
+            if total_local_gpu_memory < total_gpu_memory * 0.9:
+                raise ValueError(
+                    "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
+                )
+
+        self.load_model()
+        self.init_memory_pool(total_gpu_memory)
         self.is_multimodal_model = is_multimodal_model(self.model_config)
 
     def load_model(self):
-        logger.info(f"Rank {self.tp_rank}: load weight begin.")
+        logger.info(
+            f"[gpu_id={self.gpu_id}] Load weight begin. "
+            f"Avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+        )
 
         device_config = DeviceConfig()
         load_config = LoadConfig(load_format=self.server_args.load_format)
@@ -283,39 +292,47 @@ class ModelRunner:
             parallel_config=None,
             scheduler_config=None,
         )
-        logger.info(f"Rank {self.tp_rank}: load weight end. {type(self.model)}")
+        logger.info(
+            f"[gpu_id={self.gpu_id}] Load weight end. "
+            f"Type={type(self.model).__name__}. "
+            f"Avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+        )
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(
-            self.tp_rank, distributed=self.tp_size > 1
-        ) * (1 << 30)
+            self.gpu_id, distributed=self.tp_size > 1
+        )
         head_dim = self.model_config.head_dim
         head_num = self.model_config.num_key_value_heads // self.tp_size
         cell_size = head_num * head_dim * self.model_config.num_hidden_layers * 2 * 2
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
-        max_num_token = int(rest_memory // cell_size)
+        max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
     def init_memory_pool(self, total_gpu_memory):
-        self.max_total_num_token = self.profile_max_num_token(total_gpu_memory)
+        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
-        if self.max_total_num_token <= 0:
+        if self.max_total_num_tokens <= 0:
             raise RuntimeError(
-                "Not enought memory. " "Please try to increase --mem-fraction-static."
+                "Not enought memory. Please try to increase --mem-fraction-static."
             )
 
         self.req_to_token_pool = ReqToTokenPool(
-            int(self.max_total_num_token / self.model_config.context_len * 256),
+            int(self.max_total_num_tokens / self.model_config.context_len * 256),
             self.model_config.context_len + 8,
         )
         self.token_to_kv_pool = TokenToKVPool(
-            self.max_total_num_token,
+            self.max_total_num_tokens,
             dtype=torch.float16,
             head_num=self.model_config.num_key_value_heads // self.tp_size,
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
+        )
+        logger.info(
+            f"[gpu_id={self.gpu_id}] Memory pool end. "
+            f"Avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
     @torch.inference_mode()
@@ -419,7 +436,12 @@ def import_model_classes():
         if not ispkg:
             module = importlib.import_module(name)
             if hasattr(module, "EntryClass"):
-                model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
+                entry = module.EntryClass
+                if isinstance(entry, list): # To support multiple model classes in one module
+                    for tmp in entry:
+                        model_arch_name_to_cls[tmp.__name__] = tmp
+                else:
+                    model_arch_name_to_cls[entry.__name__] = entry
     return model_arch_name_to_cls
 
 

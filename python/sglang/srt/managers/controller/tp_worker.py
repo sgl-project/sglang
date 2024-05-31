@@ -1,21 +1,15 @@
 import asyncio
 import logging
-import multiprocessing
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List
 
 import rpyc
 import torch
 from rpyc.utils.classic import obtain
-from rpyc.utils.server import ThreadedServer
 
-try:
-    from vllm.logger import _default_handler as vllm_default_logger
-except ImportError:
-    from vllm.logger import logger as vllm_default_logger
-
+from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -25,38 +19,41 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.router.infer_batch import Batch, FinishReason, ForwardMode, Req
-from sglang.srt.managers.router.model_runner import ModelRunner
-from sglang.srt.managers.router.radix_cache import RadixCache
-from sglang.srt.managers.router.scheduler import Scheduler
+from sglang.srt.managers.controller.infer_batch import Batch, FinishReason, ForwardMode, Req
+from sglang.srt.managers.controller.model_runner import ModelRunner
+from sglang.srt.managers.controller.radix_cache import RadixCache
+from sglang.srt.managers.controller.schedule_heuristic import ScheduleHeuristic
 from sglang.srt.model_config import ModelConfig
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import ModelPortArgs, ServerArgs
 from sglang.srt.utils import (
     get_int_token_logit_bias,
     is_multimodal_model,
     set_random_seed,
+    start_rpyc_process,
+    suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
 
-logger = logging.getLogger("model_rpc")
-vllm_default_logger.setLevel(logging.WARN)
-logging.getLogger("vllm.utils").setLevel(logging.WARN)
-logging.getLogger("vllm.selector").setLevel(logging.WARN)
+logger = logging.getLogger("srt.model_tp")
 
 
-class ModelRpcServer:
+class ModelTpServer:
     def __init__(
         self,
+        gpu_id: int,
         tp_rank: int,
         server_args: ServerArgs,
-        port_args: PortArgs,
-        model_overide_args: Optional[dict] = None,
+        model_port_args: ModelPortArgs,
+        model_overide_args,
     ):
-        server_args, port_args = [obtain(x) for x in [server_args, port_args]]
+        server_args, model_port_args = obtain(server_args), obtain(model_port_args)
+        suppress_other_loggers()
 
         # Copy arguments
+        self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
+        self.dp_size = server_args.dp_size
         self.schedule_heuristic = server_args.schedule_heuristic
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
 
@@ -67,16 +64,16 @@ class ModelRpcServer:
             context_length=server_args.context_length,
             model_overide_args=model_overide_args,
         )
-
-        # For model end global settings
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
+            gpu_id=gpu_id,
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
-            nccl_port=port_args.nccl_port,
+            nccl_port=model_port_args.nccl_port,
             server_args=server_args,
         )
+
         if is_multimodal_model(server_args.model_path):
             self.processor = get_processor(
                 server_args.tokenizer_path,
@@ -90,26 +87,28 @@ class ModelRpcServer:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
             )
-        self.max_total_num_token = self.model_runner.max_total_num_token
-        self.max_num_running_seq = self.max_total_num_token // 2
-        self.max_prefill_num_token = max(
+        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        self.max_prefill_tokens = max(
             self.model_config.context_len,
             (
-                self.max_total_num_token // 6
-                if server_args.max_prefill_num_token is None
-                else server_args.max_prefill_num_token
+                min(self.max_total_num_tokens // 6, 65536)
+                if server_args.max_prefill_tokens is None
+                else server_args.max_prefill_tokens
             ),
         )
+        self.max_running_requests = (self.max_total_num_tokens // 2
+            if server_args.max_running_requests is None else server_args.max_running_requests)
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
         )
-        set_random_seed(server_args.random_seed)
+        if server_args.random_seed is not None:
+            set_random_seed(server_args.random_seed)
 
         # Print info
         logger.info(
-            f"Rank {self.tp_rank}: "
-            f"max_total_num_token={self.max_total_num_token}, "
-            f"max_prefill_num_token={self.max_prefill_num_token}, "
+            f"[gpu_id={self.gpu_id}] "
+            f"max_total_num_tokens={self.max_total_num_tokens}, "
+            f"max_prefill_tokens={self.max_prefill_tokens}, "
             f"context_len={self.model_config.context_len}, "
         )
         if self.tp_rank == 0:
@@ -122,11 +121,11 @@ class ModelRpcServer:
             disable=server_args.disable_radix_cache,
         )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
-        self.scheduler = Scheduler(
+        self.scheduler = ScheduleHeuristic(
             self.schedule_heuristic,
-            self.max_num_running_seq,
-            self.max_prefill_num_token,
-            self.max_total_num_token,
+            self.max_running_requests,
+            self.max_prefill_tokens,
+            self.max_total_num_tokens,
             self.tree_cache,
         )
         self.req_to_token_pool = self.model_runner.req_to_token_pool
@@ -152,12 +151,23 @@ class ModelRpcServer:
         self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
-        self.new_token_ratio = min(0.4 * server_args.schedule_conservativeness, 1.0)
-        self.min_new_token_ratio = min(0.2 * server_args.schedule_conservativeness, 1.0)
-        self.new_token_ratio_step = (0.0001, 0.05)  # (down, up)
+        assert (
+            server_args.schedule_conservativeness >= 0
+        ), "Invalid schedule_conservativeness"
+        self.new_token_ratio = min(
+            global_config.base_new_token_ratio * server_args.schedule_conservativeness,
+            1.0,
+        )
+        self.min_new_token_ratio = min(
+            global_config.base_min_new_token_ratio
+            * server_args.schedule_conservativeness,
+            1.0,
+        )
+        self.new_token_ratio_decay = global_config.new_token_ratio_decay
+        self.new_token_ratio_recovery = global_config.new_token_ratio_recovery
 
     def exposed_step(self, recv_reqs):
-        if self.tp_size != 1:
+        if self.tp_size * self.dp_size != 1:
             recv_reqs = obtain(recv_reqs)
 
         try:
@@ -175,7 +185,7 @@ class ModelRpcServer:
             # Forward
             self.forward_step()
         except Exception:
-            logger.error("Exception in ModelRpcClient:\n" + get_exception_traceback())
+            logger.error("Exception in ModelTpClient:\n" + get_exception_traceback())
 
         # Return results
         ret = self.out_pyobjs
@@ -207,20 +217,21 @@ class ModelRpcServer:
                     # Print stats
                     if self.tp_rank == 0:
                         if self.decode_forward_ct % 40 == 0:
-                            num_used = self.max_total_num_token - (
+                            num_used = self.max_total_num_tokens - (
                                 self.token_to_kv_pool.available_size()
                                 + self.tree_cache.evictable_size()
                             )
-                            throuhgput = self.num_generated_tokens / (
+                            throughput = self.num_generated_tokens / (
                                 time.time() - self.last_stats_tic
                             )
                             self.num_generated_tokens = 0
                             self.last_stats_tic = time.time()
                             logger.info(
+                                f"[gpu_id={self.gpu_id}] "
                                 f"#running-req: {len(self.running_batch.reqs)}, "
                                 f"#token: {num_used}, "
-                                f"token usage: {num_used / self.max_total_num_token:.2f}, "
-                                f"gen throughput (token/s): {throuhgput:.2f}, "
+                                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                                f"gen throughput (token/s): {throughput:.2f}, "
                                 f"#queue-req: {len(self.forward_queue)}"
                             )
 
@@ -236,10 +247,10 @@ class ModelRpcServer:
                     self.token_to_kv_pool.available_size()
                     + self.tree_cache.evictable_size()
                 )
-                if available_size != self.max_total_num_token:
+                if available_size != self.max_total_num_tokens:
                     warnings.warn(
                         "Warning: "
-                        f"available_size={available_size}, max_total_num_token={self.max_total_num_token}\n"
+                        f"available_size={available_size}, max_total_num_tokens={self.max_total_num_tokens}\n"
                         "KV cache pool leak detected!"
                     )
 
@@ -257,8 +268,13 @@ class ModelRpcServer:
                 (recv_req.image_hash >> 64) % self.model_config.vocab_size,
             ]
             req.image_size = recv_req.image_size
-            req.input_ids, req.image_offset = self.model_runner.model.pad_input_ids(
-                req.input_ids, req.pad_value, req.pixel_values.shape, req.image_size
+            req.origin_input_ids, req.image_offset = (
+                self.model_runner.model.pad_input_ids(
+                    req.origin_input_ids_unpadded,
+                    req.pad_value,
+                    req.pixel_values.shape,
+                    req.image_size,
+                )
             )
         req.sampling_params = recv_req.sampling_params
         req.return_logprob = recv_req.return_logprob
@@ -276,23 +292,27 @@ class ModelRpcServer:
                 )
 
         # Truncate prompts that are too long
-        req.input_ids = req.input_ids[: self.model_config.context_len - 1]
+        req.origin_input_ids = req.origin_input_ids[: self.model_config.context_len - 1]
         req.sampling_params.max_new_tokens = min(
             req.sampling_params.max_new_tokens,
-            self.model_config.context_len - 1 - len(req.input_ids),
-            self.max_total_num_token - 128 - len(req.input_ids),
+            self.model_config.context_len - 1 - len(req.origin_input_ids),
+            self.max_total_num_tokens - 128 - len(req.origin_input_ids),
         )
         self.forward_queue.append(req)
 
     def get_new_fill_batch(self):
         if (
             self.running_batch is not None
-            and len(self.running_batch.reqs) > self.max_num_running_seq
+            and len(self.running_batch.reqs) > self.max_running_requests
         ):
             return None
 
         # Compute matched prefix length
         for req in self.forward_queue:
+            assert (
+                len(req.output_ids) == 0
+            ), "The output ids should be empty when prefilling"
+            req.input_ids = req.origin_input_ids + req.prev_output_ids
             prefix_indices, last_node = self.tree_cache.match_prefix(req.input_ids)
             if req.return_logprob:
                 prefix_indices = prefix_indices[: req.logprob_start_len]
@@ -320,7 +340,7 @@ class ModelRpcServer:
             )
 
         for req in self.forward_queue:
-            if req.return_logprob:
+            if req.return_logprob and req.normalized_prompt_logprob is None:
                 # Need at least two tokens to compute normalized logprob
                 if req.extend_input_len < 2:
                     delta = 2 - req.extend_input_len
@@ -339,7 +359,7 @@ class ModelRpcServer:
                 req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
                 < available_size
                 and req.extend_input_len + new_batch_input_tokens
-                < self.max_prefill_num_token
+                < self.max_prefill_tokens
             ):
                 delta = self.tree_cache.inc_lock_ref(req.last_node)
                 available_size += delta
@@ -383,7 +403,7 @@ class ModelRpcServer:
                 f"#new_token: {new_batch_input_tokens}. "
                 f"#remaining_req: {len(self.forward_queue) - len(can_run_list)}. "
                 f"#running_req: {running_req}. "
-                f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%."
+                f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%. "
             )
             # logger.debug(
             #    f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
@@ -442,28 +462,53 @@ class ModelRpcServer:
             req.check_finished()
 
             if req.return_logprob:
-                req.normalized_prompt_logprob = normalized_prompt_logprobs[i]
+                if req.normalized_prompt_logprob is None:
+                    req.normalized_prompt_logprob = normalized_prompt_logprobs[i]
 
-                # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
-                req.prefill_token_logprobs = list(
-                    zip(
-                        prefill_token_logprobs[pt : pt + req.extend_input_len - 1],
-                        req.input_ids[-req.extend_input_len + 1 :],
+                if req.prefill_token_logprobs is None:
+                    # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
+                    req.prefill_token_logprobs = list(
+                        zip(
+                            prefill_token_logprobs[pt : pt + req.extend_input_len - 1],
+                            req.input_ids[-req.extend_input_len + 1 :],
+                        )
                     )
-                )
-                if req.logprob_start_len == 0:
-                    req.prefill_token_logprobs = [
-                        (None, req.input_ids[0])
-                    ] + req.prefill_token_logprobs
-                req.decode_token_logprobs = [
+                    if req.logprob_start_len == 0:
+                        req.prefill_token_logprobs = [
+                            (None, req.input_ids[0])
+                        ] + req.prefill_token_logprobs
+
+                if req.last_update_decode_tokens != 0:
+                    req.decode_token_logprobs.extend(
+                        list(
+                            zip(
+                                prefill_token_logprobs[
+                                    pt
+                                    + req.extend_input_len
+                                    - req.last_update_decode_tokens : pt
+                                    + req.extend_input_len
+                                    - 1
+                                ],
+                                req.input_ids[-req.last_update_decode_tokens + 1 :],
+                            )
+                        )
+                    )
+
+                req.decode_token_logprobs.append(
                     (last_token_logprobs[i], next_token_ids[i])
-                ]
+                )
 
             if req.top_logprobs_num > 0:
-                req.prefill_top_logprobs = prefill_top_logprobs[i]
-                if req.logprob_start_len == 0:
-                    req.prefill_top_logprobs = [None] + req.prefill_top_logprobs
-                req.decode_top_logprobs = [decode_top_logprobs[i]]
+                if req.prefill_top_logprobs is None:
+                    req.prefill_top_logprobs = prefill_top_logprobs[i]
+                    if req.logprob_start_len == 0:
+                        req.prefill_top_logprobs = [None] + req.prefill_top_logprobs
+
+                if req.last_update_decode_tokens != 0:
+                    req.decode_top_logprobs.extend(
+                        prefill_top_logprobs[i][-req.last_update_decode_tokens + 1 :]
+                    )
+                req.decode_top_logprobs.append(decode_top_logprobs[i])
 
             pt += req.extend_input_len
 
@@ -485,7 +530,7 @@ class ModelRpcServer:
         # check if decode out of memory
         if not batch.check_decode_mem():
             old_ratio = self.new_token_ratio
-            self.new_token_ratio = min(old_ratio + self.new_token_ratio_step[1], 1.0)
+            self.new_token_ratio = min(old_ratio + self.new_token_ratio_recovery, 1.0)
 
             retracted_reqs = batch.retract_decode()
             logger.info(
@@ -496,26 +541,13 @@ class ModelRpcServer:
             self.forward_queue.extend(retracted_reqs)
         else:
             self.new_token_ratio = max(
-                self.new_token_ratio - self.new_token_ratio_step[0],
+                self.new_token_ratio - self.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
 
         if not self.disable_regex_jump_forward:
             # check for jump-forward
-            jump_forward_reqs = batch.check_for_jump_forward()
-
-            # check for image jump-forward
-            for req in jump_forward_reqs:
-                if req.pixel_values is not None:
-                    (
-                        req.input_ids,
-                        req.image_offset,
-                    ) = self.model_runner.model.pad_input_ids(
-                        req.input_ids,
-                        req.pad_value,
-                        req.pixel_values.shape,
-                        req.image_size,
-                    )
+            jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
 
             self.forward_queue.extend(jump_forward_reqs)
             if batch.is_empty():
@@ -558,8 +590,8 @@ class ModelRpcServer:
 
     def handle_finished_requests(self, batch: Batch):
         output_rids = []
+        prev_output_strs = []
         output_tokens = []
-        output_and_jump_forward_strs = []
         output_hit_stop_str = []
         output_skip_special_tokens = []
         output_spaces_between_special_tokens = []
@@ -583,8 +615,8 @@ class ModelRpcServer:
                 )
             ):
                 output_rids.append(req.rid)
+                prev_output_strs.append(req.prev_output_str)
                 output_tokens.append(req.output_ids)
-                output_and_jump_forward_strs.append(req.output_and_jump_forward_str)
                 output_hit_stop_str.append(req.hit_stop_str)
                 output_skip_special_tokens.append(
                     req.sampling_params.skip_special_tokens
@@ -594,10 +626,8 @@ class ModelRpcServer:
                 )
 
                 meta_info = {
-                    "prompt_tokens": req.prompt_tokens,
-                    "completion_tokens": len(req.input_ids)
-                    + len(req.output_ids)
-                    - req.prompt_tokens,
+                    "prompt_tokens": len(req.origin_input_ids),
+                    "completion_tokens": len(req.prev_output_ids) + len(req.output_ids),
                     "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
                     "finish_reason": FinishReason.to_str(req.finish_reason),
                     "hit_stop_str": req.hit_stop_str,
@@ -624,8 +654,8 @@ class ModelRpcServer:
             self.out_pyobjs.append(
                 BatchTokenIDOut(
                     output_rids,
+                    prev_output_strs,
                     output_tokens,
-                    output_and_jump_forward_strs,
                     output_hit_stop_str,
                     output_skip_special_tokens,
                     output_spaces_between_special_tokens,
@@ -692,20 +722,30 @@ class ModelRpcServer:
                     break
 
 
-class ModelRpcService(rpyc.Service):
-    exposed_ModelRpcServer = ModelRpcServer
+class ModelTpService(rpyc.Service):
+    exposed_ModelTpServer = ModelTpServer
 
 
-class ModelRpcClient:
+class ModelTpClient:
     def __init__(
-        self, server_args: ServerArgs, port_args: PortArgs, model_overide_args
+        self,
+        gpu_ids: List[int],
+        server_args: ServerArgs,
+        model_port_args: ModelPortArgs,
+        model_overide_args,
     ):
-        tp_size = server_args.tp_size
+        server_args, model_port_args = obtain(server_args), obtain(model_port_args)
+        self.tp_size = server_args.tp_size
 
-        if tp_size == 1:
+        if self.tp_size * server_args.dp_size == 1:
             # Init model
-            self.model_server = ModelRpcService().exposed_ModelRpcServer(
-                0, server_args, port_args, model_overide_args
+            assert len(gpu_ids) == 1
+            self.model_server = ModelTpService().exposed_ModelTpServer(
+                0,
+                gpu_ids[0],
+                server_args,
+                model_port_args,
+                model_overide_args,
             )
 
             # Wrap functions
@@ -717,19 +757,26 @@ class ModelRpcClient:
 
             self.step = async_wrap(self.model_server.exposed_step)
         else:
-            with ThreadPoolExecutor(tp_size) as executor:
+            with ThreadPoolExecutor(self.tp_size) as executor:
                 # Launch model processes
-                rets = executor.map(start_model_process, port_args.model_rpc_ports)
-                self.remote_services = [x[0] for x in rets]
+                rets = executor.map(
+                    lambda args: start_rpyc_process(*args),
+                    [(ModelTpService, p) for p in model_port_args.model_tp_ports],
+                )
+                self.model_services = [x[0] for x in rets]
                 self.procs = [x[1] for x in rets]
 
                 # Init model
                 def init_model(i):
-                    return self.remote_services[i].ModelRpcServer(
-                        i, server_args, port_args, model_overide_args
+                    return self.model_services[i].ModelTpServer(
+                        gpu_ids[i],
+                        i,
+                        server_args,
+                        model_port_args,
+                        model_overide_args,
                     )
 
-                self.model_servers = executor.map(init_model, range(tp_size))
+                self.model_servers = executor.map(init_model, range(self.tp_size))
 
             # Wrap functions
             def async_wrap(func_name):
@@ -743,44 +790,3 @@ class ModelRpcClient:
                 return _func
 
             self.step = async_wrap("step")
-
-
-def _init_service(port):
-    t = ThreadedServer(
-        ModelRpcService(),
-        port=port,
-        protocol_config={
-            "allow_public_attrs": True,
-            "allow_pickle": True,
-            "sync_request_timeout": 1800,
-        },
-    )
-    t.start()
-
-
-def start_model_process(port):
-    proc = multiprocessing.Process(target=_init_service, args=(port,))
-    proc.start()
-    time.sleep(1)
-
-    repeat_count = 0
-    while repeat_count < 20:
-        try:
-            con = rpyc.connect(
-                "localhost",
-                port,
-                config={
-                    "allow_public_attrs": True,
-                    "allow_pickle": True,
-                    "sync_request_timeout": 1800,
-                },
-            )
-            break
-        except ConnectionRefusedError:
-            time.sleep(1)
-        repeat_count += 1
-    if repeat_count == 20:
-        raise RuntimeError("init rpc env error!")
-
-    assert proc.is_alive()
-    return con.root, proc

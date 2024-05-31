@@ -9,6 +9,12 @@ CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
 @triton.jit
+def tanh(x):
+    # Tanh is just a scaled sigmoid
+    return 2 * tl.sigmoid(2 * x) - 1
+
+
+@triton.jit
 def _fwd_kernel(
     Q_Extend,
     K_Extend,
@@ -39,6 +45,7 @@ def _fwd_kernel(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    logit_cap: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -90,6 +97,10 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
         qk *= sm_scale
+
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+
         qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
@@ -126,6 +137,10 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
         qk *= sm_scale
+
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+
         mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
             start_n + offs_n[None, :]
         )
@@ -176,6 +191,7 @@ def extend_attention_fwd(
     b_seq_len_extend,
     max_len_in_batch,
     max_len_extend,
+    logit_cap=-1,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -271,6 +287,7 @@ def extend_attention_fwd(
         BLOCK_N=BLOCK_N,
         num_warps=num_warps,
         num_stages=num_stages,
+        logit_cap=logit_cap,
     )
     cached_kernel = wrap_kernel_launcher(_fwd_kernel)
 

@@ -26,8 +26,7 @@ from typing import AsyncGenerator, List, Tuple
 import aiohttp
 import numpy as np
 from tqdm.asyncio import tqdm_asyncio
-from transformers import PreTrainedTokenizerBase
-from vllm.transformers_utils.tokenizer import get_tokenizer
+from transformers import AutoTokenizer
 
 # (prompt len, output len, latency)
 REQUEST_LATENCY: List[Tuple[int, int, float]] = []
@@ -36,7 +35,7 @@ REQUEST_LATENCY: List[Tuple[int, int, float]] = []
 def sample_requests(
     dataset_path: str,
     num_requests: int,
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: AutoTokenizer,
 ) -> List[Tuple[str, int, int]]:
     # Load the dataset.
     with open(dataset_path) as f:
@@ -150,22 +149,47 @@ async def send_request(
             "inputs": prompt,
             "parameters": params,
         }
+    elif backend == "xinfer":
+        pass
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    timeout = aiohttp.ClientTimeout(total=3 * 3600)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            async with session.post(api_url, headers=headers, json=pload) as response:
-                chunks = []
-                async for chunk, _ in response.content.iter_chunks():
-                    chunks.append(chunk)
-            output = b"".join(chunks).decode("utf-8")
-            output = json.loads(output)
+    if backend != "xinfer":
+        timeout = aiohttp.ClientTimeout(total=3 * 3600)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while True:
+                async with session.post(api_url, headers=headers, json=pload) as response:
+                    chunks = []
+                    async for chunk, _ in response.content.iter_chunks():
+                        chunks.append(chunk)
+                output = b"".join(chunks).decode("utf-8")
+                output = json.loads(output)
 
-            # Re-send the request if it failed.
-            if "error" not in output:
-                break
+                # Re-send the request if it failed.
+                if "error" not in output:
+                    break
+                else:
+                    print(output)
+    else:
+        import grpc
+        from xlm.proto import sampler_pb2, sampler_pb2_grpc
+
+        api_url = api_url.replace("http://", "").replace("/generate", "")
+        sampler_channel = grpc.aio.insecure_channel(api_url)
+        sampler = sampler_pb2_grpc.SamplerStub(sampler_channel)
+
+        request_end_time = time.perf_counter()
+        sample_request = sampler_pb2.SampleTextRequest(
+            prompt=prompt,
+            settings=sampler_pb2.SampleSettings(
+                max_len=output_len,
+                rng_seed=0,
+                temperature=0,
+                nucleus_p=1,
+            ),
+        )
+        stream = sampler.SampleText(sample_request)
+        response = "".join([x.text async for x in stream])
 
     request_end_time = time.perf_counter()
     request_latency = request_end_time - request_start_time
@@ -204,8 +228,20 @@ def main(args: argparse.Namespace):
     np.random.seed(args.seed)
 
     api_url = f"http://{args.host}:{args.port}/generate"
-    tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=args.trust_remote_code)
-    input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=args.trust_remote_code)
+
+    if args.dataset:
+        input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
+    else:
+        input_lens = np.random.randint(
+            int(args.input_len * args.range_ratio), args.input_len + 1, size=args.num_prompts)
+        output_lens = np.random.randint(
+            int(args.output_len * args.range_ratio), args.output_len + 1, size=args.num_prompts)
+        offsets = np.random.randint(0, tokenizer.vocab_size, size=args.num_prompts)
+        input_requests = []
+        for i in range(args.num_prompts):
+            prompt = tokenizer.decode([(offsets[i] + i + j) % tokenizer.vocab_size for j in range(input_lens[i])])
+            input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
 
     benchmark_start_time = time.perf_counter()
     asyncio.run(
@@ -246,16 +282,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        default="vllm",
-        choices=["vllm", "tgi", "srt", "lightllm"],
+        default="srt",
+        choices=["vllm", "tgi", "srt", "lightllm", "xinfer"],
     )
     parser.add_argument("--host", type=str, default="localhost")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=30000)
     parser.add_argument(
-        "--dataset", type=str, required=True, help="Path to the dataset."
+        "--dataset", type=str, help="Path to the dataset."
     )
+    parser.add_argument("--input-len", type=str, default=2048)
+    parser.add_argument("--output-len", type=str, default=256)
+    parser.add_argument("--range-ratio", type=float, default=0.5)
     parser.add_argument(
-        "--tokenizer", type=str, required=True, help="Name or path of the tokenizer."
+        "--tokenizer", type=str,
+        default="NousResearch/Meta-Llama-3-8B",
+        help="Name or path of the tokenizer."
     )
     parser.add_argument(
         "--best-of",

@@ -88,6 +88,33 @@ def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
     return pred
 
 
+def call_generate_xinfer(prompt, temperature, max_tokens, stop=None, url=None):
+    import grpc
+    from xlm.proto import sampler_pb2, sampler_pb2_grpc
+
+    sampler_channel = grpc.insecure_channel(url.replace("http://", ""))
+    sampler = sampler_pb2_grpc.SamplerStub(sampler_channel)
+
+    if stop is None:
+        stop_strings = None
+    else:
+        stop_strings = [stop]
+
+    sample_request = sampler_pb2.SampleTextRequest(
+        prompt=prompt,
+        settings=sampler_pb2.SampleSettings(
+            max_len=max_tokens,
+            rng_seed=0,
+            temperature=max(temperature, 1e-7),
+            nucleus_p=1,
+            stop_strings=stop_strings,
+        ),
+    )
+    stream = sampler.SampleText(sample_request)
+    response = "".join([x.text for x in stream])
+    return response
+
+
 def call_generate_guidance(
     prompt, temperature, max_tokens, stop=None, n=1, regex=None, model=None
 ):
@@ -228,6 +255,7 @@ def add_common_other_args_and_parse(parser):
             "vllm",
             "outlines",
             "lightllm",
+            "xinfer",
             "guidance",
             "lmql",
             "srt-raw",
@@ -248,6 +276,7 @@ def add_common_other_args_and_parse(parser):
             "lightllm": 22000,
             "lmql": 23000,
             "srt-raw": 30000,
+            "xinfer": 9988,
         }
         args.port = default_port.get(args.backend, None)
     return args
@@ -283,6 +312,8 @@ def _get_call_generate(args):
         return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "srt-raw":
         return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
+    elif args.backend == "xinfer":
+        return partial(call_generate_xinfer, url=f"{args.host}:{args.port}")
     elif args.backend == "outlines":
         return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "guidance":

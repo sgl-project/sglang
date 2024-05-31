@@ -2,19 +2,19 @@ import random
 from collections import defaultdict
 
 
-class Scheduler:
+class ScheduleHeuristic:
     def __init__(
         self,
         schedule_heuristic,
-        max_running_seq,
-        max_prefill_num_token,
-        max_total_num_token,
+        max_running_seqs,
+        max_prefill_num_tokens,
+        max_total_num_tokens,
         tree_cache,
     ):
         self.schedule_heuristic = schedule_heuristic
-        self.max_running_seq = max_running_seq
-        self.max_prefill_num_token = max_prefill_num_token
-        self.max_total_num_token = max_total_num_token
+        self.max_running_seqs = max_running_seqs
+        self.max_prefill_num_tokens = max_prefill_num_tokens
+        self.max_total_num_tokens = max_total_num_tokens
         self.tree_cache = tree_cache
 
     def get_priority_queue(self, forward_queue):
