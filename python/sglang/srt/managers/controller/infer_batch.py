@@ -380,9 +380,9 @@ class Batch:
             # release the last node
             self.tree_cache.dec_lock_ref(req.last_node)
 
-            cur_output_str = req.partial_decode(req.output_ids)
-            req.prev_output_str = req.prev_output_str + cur_output_str
-            req.prev_output_ids.extend(req.output_ids)
+            # cur_output_str = req.partial_decode(req.output_ids)
+            # req.prev_output_str = req.prev_output_str + cur_output_str
+            # req.prev_output_ids.extend(req.output_ids)
 
             req.prefix_indices = None
             req.last_node = None
