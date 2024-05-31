@@ -3,15 +3,15 @@
 ##### USAGE #####
 #    - First node:
 #      ```sh
-#      bash examples/quick_start/srt_example_llava_v.sh K 0 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
+#      bash examples/usage/llava_video/srt_example_llava_v.sh K 0 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
 #      ```
 #    - Second node:
 #      ```sh
-#      bash examples/quick_start/srt_example_llava_v.sh K 1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
+#      bash examples/usage/llava_video/srt_example_llava_v.sh K 1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
 #      ```
 #    - The K node:
 #      ```sh
-#      bash examples/quick_start/srt_example_llava_v.sh K K-1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
+#      bash examples/usage/llava_video/srt_example_llava_v.sh K K-1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
 #      ```
 
 
@@ -64,7 +64,7 @@ echo "Number of GPUs in GPULIST: $LOCAL_CHUNKS"
 ALL_CHUNKS=$((NUM_NODES * LOCAL_CHUNKS))
 
 # Calculate GPUs per chunk
-GPUS_PER_CHUNK=8
+GPUS_PER_CHUNK=1
 
 echo $GPUS_PER_CHUNK
 
