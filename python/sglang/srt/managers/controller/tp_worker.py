@@ -101,8 +101,7 @@ class ModelTpServer:
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
         )
-        if server_args.random_seed is not None:
-            set_random_seed(server_args.random_seed)
+        set_random_seed(server_args.random_seed)
 
         # Print info
         logger.info(

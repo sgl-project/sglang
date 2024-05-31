@@ -32,7 +32,7 @@ class ServerArgs:
     # Other runtime options
     tp_size: int = 1
     stream_interval: int = 8
-    random_seed: Optional[int] = None
+    random_seed: int = 42
 
     # Logging
     log_level: str = "info"
@@ -194,7 +194,7 @@ class ServerArgs:
             "--random-seed",
             type=int,
             default=ServerArgs.random_seed,
-            help="The global random seed of the server.",
+            help="Random seed.",
         )
         parser.add_argument(
             "--log-level",
