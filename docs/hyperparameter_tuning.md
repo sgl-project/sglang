@@ -22,10 +22,13 @@ On the other hand, if you see `token usage` very high and you frequently see war
 ### Tune `--dp-size` and `--tp-size`
 Data parallelism is better for throughput. When there is enough GPU memory, always favor data parallelism for throughput.
 
+### (Minor) Tune `--max-prefill-tokens`, `--mem-fraction-static`, `--max-running-requests`.
+If you see out of memory (OOM) errors, you can decrease these parameters.
+If OOM happens during prefill, try to decrease `--max-prefill-tokens`.
+If OOM happens during decoding, try to decrease `--max-running-requests`.
+You can also try to decrease `--mem-fraction-static`, which reduces the memory usage of the KV cache memory pool and helps both prefill and decoding.
+
 ### (Minor) Tune `--schedule-heuristic`
 If you have many shared prefixes, use the default `--schedule-heuristic lpm`. `lpm` stands for longest prefix match.
 When you have no shared prefixes at all or you always send the requests with the shared prefixes together,
 you can try `--schedule-heuristic fcfs`. `fcfs` stands for first come first serve.
-
-### (Minor) Tune `--max-prefill-tokens`, `--mem-fraction-static`, `--max-running-requests`.
-If you see out of memory errors, you can decrease them. Otherwise, the default value should work well.
