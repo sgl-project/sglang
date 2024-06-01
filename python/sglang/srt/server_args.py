@@ -2,6 +2,7 @@
 
 import argparse
 import dataclasses
+import random
 from typing import List, Optional, Union
 
 
@@ -32,7 +33,7 @@ class ServerArgs:
     # Other runtime options
     tp_size: int = 1
     stream_interval: int = 8
-    random_seed: int = 42
+    random_seed: Optional[int] = None
 
     # Logging
     log_level: str = "info"
@@ -71,6 +72,9 @@ class ServerArgs:
             self.additional_ports = [self.additional_ports]
         elif self.additional_ports is None:
             self.additional_ports = []
+
+        if self.random_seed is None:
+            self.random_seed = random.randint(0, 1 << 30)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
