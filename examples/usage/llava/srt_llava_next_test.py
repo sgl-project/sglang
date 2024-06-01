@@ -44,7 +44,7 @@ def batch():
     states = image_qa.run_batch(
         [
             {"image": pil_image, "question": "What is this?"},
-            {"image": pil_image, "question": "What is this?"},
+            # {"image": pil_image, "question": "What is this?"}, adding more requests for batch testing
         ],
         max_new_tokens=512,
     )
@@ -59,6 +59,7 @@ if __name__ == "__main__":
     runtime = sgl.Runtime(
         model_path="lmms-lab/llama3-llava-next-8b",
         tokenizer_path="lmms-lab/llama3-llava-next-8b-tokenizer",
+        # port=8000, Optional: specify the port number for the HTTP server if meets rpc issue or connection reset by peer issue.
     )
     runtime.endpoint.chat_template = get_chat_template("llama-3-instruct")
     # runtime = sgl.Runtime(
