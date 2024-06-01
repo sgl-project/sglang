@@ -44,11 +44,7 @@ pip install -e "python[all]"
 ```
 
 ### Notes
-- If you are using older GPUs (NVIDIA V100, T4), please pick the correct triton compiler version to avoid some known bugs.
-  - For NVIDIA T4, please use `pip install "triton>=2.2.0"`.
-  - For NVIDIA V100, please install the [nightly](https://triton-lang.org/main/getting-started/installation.html) version.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`
-
 
 ## Quick Start
 The example below shows how to use sglang to answer a mulit-turn question.
@@ -367,7 +363,8 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --mem-fraction-static 0.7
 ```
-- You can turn on [flashinfer](docs/flashinfer.md) to accelerate the inference by using highly optimized CUDA kernels.
+- See [flashinfer.md](docs/flashinfer.md) on accelerating inference using highly optimized CUDA kernels.
+- See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
 
 ### Supported Models
 - Llama
