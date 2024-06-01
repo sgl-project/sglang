@@ -5,6 +5,7 @@
 Achieving a large batch size is the most important thing for attaining high throughput.
 
 When the server is running at full load, look for the following in the log:
+
 ```[gpu_id=0] #running-req: 233, #token: 370959, token usage: 0.82, gen throughput (token/s): 4594.01, #queue-req: 417```
 
 ### Tune Your Request Submission Speed
@@ -22,10 +23,10 @@ On the other hand, if you see `token usage` very high and you frequently see war
 ### Tune `--dp-size` and `--tp-size`
 Data parallelism is better for throughput. When there is enough GPU memory, always favor data parallelism for throughput.
 
-### (Minor) Tune `--max-prefill-tokens`, `--mem-fraction-static`, `--max-running-requests`.
-If you see out of memory (OOM) errors, you can decrease these parameters.
-If OOM happens during prefill, try to decrease `--max-prefill-tokens`.
-If OOM happens during decoding, try to decrease `--max-running-requests`.
+### (Minor) Tune `--max-prefill-tokens`, `--mem-fraction-static`, `--max-running-requests`
+If you see out of memory (OOM) errors, you can decrease these parameters.  
+If OOM happens during prefill, try to decrease `--max-prefill-tokens`.  
+If OOM happens during decoding, try to decrease `--max-running-requests`.  
 You can also try to decrease `--mem-fraction-static`, which reduces the memory usage of the KV cache memory pool and helps both prefill and decoding.
 
 ### (Minor) Tune `--schedule-heuristic`
