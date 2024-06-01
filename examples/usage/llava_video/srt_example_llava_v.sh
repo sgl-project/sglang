@@ -3,20 +3,21 @@
 ##### USAGE #####
 #    - First node:
 #      ```sh
-#      bash examples/quick_start/srt_example_llava_v.sh K 0 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
+#      bash examples/usage/llava_video/srt_example_llava_v.sh K 0 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
 #      ```
 #    - Second node:
 #      ```sh
-#      bash examples/quick_start/srt_example_llava_v.sh K 1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
+#      bash examples/usage/llava_video/srt_example_llava_v.sh K 1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
 #      ```
 #    - The K node:
 #      ```sh
-#      bash examples/quick_start/srt_example_llava_v.sh K K-1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
+#      bash examples/usage/llava_video/srt_example_llava_v.sh K K-1 YOUR_VIDEO_PATH YOUR_MODEL_PATH FRAMES_PER_VIDEO
 #      ```
 
 
 # Replace `K`, `YOUR_VIDEO_PATH`, `YOUR_MODEL_PATH`, and `FRAMES_PER_VIDEO` with your specific details.
-CURRENT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+# CURRENT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+CURRENT_ROOT=$(dirname "$0")
 
 echo ${CURRENT_ROOT}
 
@@ -64,7 +65,7 @@ echo "Number of GPUs in GPULIST: $LOCAL_CHUNKS"
 ALL_CHUNKS=$((NUM_NODES * LOCAL_CHUNKS))
 
 # Calculate GPUs per chunk
-GPUS_PER_CHUNK=8
+GPUS_PER_CHUNK=1
 
 echo $GPUS_PER_CHUNK
 
@@ -93,7 +94,7 @@ for IDX in $(seq 1 $LOCAL_CHUNKS); do
             echo "Running chunk $(($LOCAL_IDX - 1)) on GPUs $CHUNK_GPUS_STR with port $PORT. Attempt $(($RETRY_COUNT + 1))"
             
 #!/bin/bash
-            CUDA_VISIBLE_DEVICES=$CHUNK_GPUS_STR python3 examples/usage/llava_video/srt_example_llava_v.py \
+            CUDA_VISIBLE_DEVICES=$CHUNK_GPUS_STR python3 srt_example_llava_v.py \
             --port $PORT \
             --num-chunks $ALL_CHUNKS \
             --chunk-idx $(($LOCAL_IDX - 1)) \
