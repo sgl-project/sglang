@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
-from vllm.distributed import initialize_model_parallel
+from vllm.distributed import initialize_model_parallel, init_distributed_environment
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
@@ -240,11 +240,11 @@ class ModelRunner:
         logger.info(f"[gpu_id={self.gpu_id}] Set cuda device.")
         torch.cuda.set_device(self.gpu_id)
         logger.info(f"[gpu_id={self.gpu_id}] Init nccl begin.")
-        torch.distributed.init_process_group(
+        init_distributed_environment(
             backend="nccl",
             world_size=self.tp_size,
             rank=self.tp_rank,
-            init_method=f"tcp://127.0.0.1:{self.nccl_port}",
+            distributed_init_method=f"tcp://127.0.0.1:{self.nccl_port}",
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         total_gpu_memory = get_available_gpu_memory(
