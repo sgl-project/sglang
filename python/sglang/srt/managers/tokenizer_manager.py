@@ -327,7 +327,7 @@ class TokenizerManager:
             ret["meta_info"]["decode_token_logprobs"] = self.detokenize_logprob_tokens(
                 ret["meta_info"]["decode_token_logprobs"], return_text_in_logprobs
             )
-        if top_logprobs_num > 0:
+        if return_logprob and top_logprobs_num > 0:
             ret["meta_info"]["prefill_top_logprobs"] = (
                 self.detokenize_top_logprobs_tokens(
                     ret["meta_info"]["prefill_top_logprobs"], return_text_in_logprobs

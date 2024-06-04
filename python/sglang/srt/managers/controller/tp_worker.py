@@ -497,7 +497,7 @@ class ModelTpServer:
                     (last_token_logprobs[i], next_token_ids[i])
                 )
 
-            if req.top_logprobs_num > 0:
+            if req.return_logprob and req.top_logprobs_num > 0:
                 if req.prefill_top_logprobs is None:
                     req.prefill_top_logprobs = prefill_top_logprobs[i]
                     if req.logprob_start_len == 0:
