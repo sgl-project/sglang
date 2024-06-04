@@ -18,7 +18,7 @@ if __name__ == "__main__":
             args.port = 21000
         elif args.backend == "lightllm":
             args.port = 22000
-        elif args.backend == "xinfer":
+        elif args.backend == "ginfer":
             args.port = 9988
         else:
             raise ValueError(f"Invalid backend: {args.backend}")
@@ -60,9 +60,9 @@ if __name__ == "__main__":
                 "max_tokens": max_new_tokens,
             },
         )
-    elif args.backend == "xinfer":
+    elif args.backend == "ginfer":
         import grpc
-        from xlm.proto import sampler_pb2, sampler_pb2_grpc
+        from ginfer import sampler_pb2, sampler_pb2_grpc
 
         sampler_channel = grpc.insecure_channel(url.replace("http://", ""))
         sampler = sampler_pb2_grpc.SamplerStub(sampler_channel)

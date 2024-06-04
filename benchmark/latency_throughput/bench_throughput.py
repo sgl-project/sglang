@@ -149,12 +149,12 @@ async def send_request(
             "inputs": prompt,
             "parameters": params,
         }
-    elif backend == "xinfer":
+    elif backend == "ginfer":
         pass
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    if backend != "xinfer":
+    if backend != "ginfer":
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             while True:
@@ -172,7 +172,7 @@ async def send_request(
                     print(output)
     else:
         import grpc
-        from xlm.proto import sampler_pb2, sampler_pb2_grpc
+        from ginfer import sampler_pb2, sampler_pb2_grpc
 
         api_url = api_url.replace("http://", "").replace("/generate", "")
         sampler_channel = grpc.aio.insecure_channel(api_url)
@@ -283,7 +283,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         default="srt",
-        choices=["vllm", "tgi", "srt", "lightllm", "xinfer"],
+        choices=["vllm", "tgi", "srt", "lightllm", "ginfer"],
     )
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=30000)
