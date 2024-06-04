@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sglang"
 version = "0.1.16"
-description = "A structured generation langauge for LLMs." 
+description = "A structured generation langauge for LLMs."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {file = "LICENSE"}
@@ -23,7 +23,8 @@ srt = ["aiohttp", "fastapi", "psutil", "rpyc", "torch", "uvloop", "uvicorn",
        "zmq", "vllm==0.4.2", "interegular", "pydantic", "pillow", "packaging", "huggingface_hub", "hf_transfer", "outlines>=0.0.34"]
 openai = ["openai>=1.0", "numpy", "tiktoken"]
 anthropic = ["anthropic>=0.20.0", "numpy"]
-all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]"]
+litellm = ["litellm>=1.0.0"]
+all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
