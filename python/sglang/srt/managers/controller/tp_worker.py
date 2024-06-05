@@ -643,7 +643,7 @@ class ModelTpServer:
                         req.normalized_prompt_logprob,
                     )
                 output_meta_info.append(meta_info)
-                output_finished_reason.append(req.finish_reason)
+                output_finished_reason.append(req.finished_reason)
 
         # Send to detokenizer
         if output_rids:
