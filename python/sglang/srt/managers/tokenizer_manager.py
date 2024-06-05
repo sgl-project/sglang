@@ -184,12 +184,17 @@ class TokenizerManager:
                 if self.server_args.log_requests and state.finished:
                     logger.info(f"in={obj.text}, out={out}")
 
-                yield out
                 state.out_list = []
                 if state.finished:
                     del self.rid_to_state[rid]
+
+                    yield out
+
                     break
+
                 event.clear()
+
+                yield out
         else:
             if obj.stream:
                 raise ValueError("Do not support stream for batch mode.")
