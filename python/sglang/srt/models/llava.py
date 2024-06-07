@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from transformers import CLIPVisionModel, CLIPVisionConfig, LlavaConfig, Qwen2Config, MistralConfig 
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
+from vllm.config import CacheConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -27,6 +28,7 @@ class LlavaLlamaForCausalLM(nn.Module):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -294,8 +296,9 @@ class LlavaQwenForCausalLM(LlavaLlamaForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
     ) -> None:
-        super().__init__(config, quant_config=quant_config)
+        super().__init__(config, quant_config=quant_config, cache_config=cache_config)
         self.config = config
         self.vision_tower = None
         if getattr(self.config, "vision_config", None) is None:
@@ -356,8 +359,9 @@ class LlavaMistralForCausalLM(LlavaLlamaForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
     ) -> None:
-        super().__init__(config, quant_config=quant_config)
+        super().__init__(config, quant_config=quant_config, cache_config=cache_config)
         self.config = config
         self.vision_tower = None
         if getattr(self.config, "vision_config", None) is None:

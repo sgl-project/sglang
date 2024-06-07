@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Tuple, Iterable
 
 import torch
 from torch import nn
+from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -251,6 +252,7 @@ class Qwen2ForCausalLM(nn.Module):
         self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config

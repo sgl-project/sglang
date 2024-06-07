@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Iterable, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -227,6 +228,7 @@ class QWenLMHeadModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
     ):
         super().__init__()
         self.config = config

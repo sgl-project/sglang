@@ -30,6 +30,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn.parameter import Parameter
 from transformers import PretrainedConfig
+from vllm.config import CacheConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -304,6 +305,7 @@ class CohereForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
