@@ -9,9 +9,9 @@
 SGLang is a structured generation language designed for large language models (LLMs).
 It makes your interaction with LLMs faster and more controllable by co-designing the frontend language and the runtime system.
 
-The core features of SGLang include:
+The core features include:
 - **A Flexible Front-End Language**: This allows for easy programming of LLM applications with multiple chained generation calls, advanced prompting techniques, control flow, multiple modalities, parallelism, and external interaction.
-- **A High-Performance Runtime with RadixAttention**: This feature significantly accelerates the execution of complex LLM programs by automatic KV cache reuse across multiple calls. It also supports other common techniques like continuous batching and tensor parallelism.
+- **A High-Performance Runtime with RadixAttention**: This feature significantly accelerates the execution of complex LLM programs by automatically reusing the KV cache across multiple calls. It can also be used as a standalone serving engine with all common techniques implemented, such as continuous batching and tensor parallelism.
 
 ## News
 - [2024/02] 🔥 SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
