@@ -421,9 +421,10 @@ def suppress_other_loggers():
     from vllm.logger import logger as vllm_default_logger
 
     vllm_default_logger.setLevel(logging.WARN)
-    logging.getLogger("vllm.utils").setLevel(logging.WARN)
-    logging.getLogger("vllm.selector").setLevel(logging.WARN)
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
+    logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(logging.WARN)
+    logging.getLogger("vllm.selector").setLevel(logging.WARN)
+    logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
 
 def assert_pkg_version(pkg: str, min_version: str):
