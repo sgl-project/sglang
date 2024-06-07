@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Iterable
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
@@ -225,6 +226,7 @@ class StableLmForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config

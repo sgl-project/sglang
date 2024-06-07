@@ -6,7 +6,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.config import LoRAConfig
+from vllm.config import LoRAConfig, CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import GeluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -264,6 +264,7 @@ class GemmaForCausalLM(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
     ) -> None:
         del lora_config  # Unused.
         super().__init__()
