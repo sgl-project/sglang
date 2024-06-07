@@ -9,6 +9,7 @@ try:
     import litellm
 except ImportError as e:
     litellm = e
+    litellm.num_retries = 1
 
 
 class LiteLLM(BaseBackend):
