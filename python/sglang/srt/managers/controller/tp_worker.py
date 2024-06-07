@@ -111,7 +111,10 @@ class ModelTpServer:
             f"context_len={self.model_config.context_len}, "
         )
         if self.tp_rank == 0:
-            logger.info(f"server_args: {server_args.print_mode_args()}")
+            logger.info(
+                f"[gpu_id={self.gpu_id}] "
+                f"server_args: {server_args.print_mode_args()}"
+            )
 
         # Init cache
         self.tree_cache = RadixCache(
@@ -226,7 +229,7 @@ class ModelTpServer:
                             self.num_generated_tokens = 0
                             self.last_stats_tic = time.time()
                             logger.info(
-                                f"[gpu_id={self.gpu_id}] "
+                                f"[gpu_id={self.gpu_id}] Decode batch. "
                                 f"#running-req: {len(self.running_batch.reqs)}, "
                                 f"#token: {num_used}, "
                                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -397,12 +400,13 @@ class ModelTpServer:
                 self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
             )
             logger.info(
-                f"new fill batch. #seq: {len(can_run_list)}. "
-                f"#cached_token: {hit_tokens}. "
-                f"#new_token: {new_batch_input_tokens}. "
-                f"#remaining_req: {len(self.forward_queue) - len(can_run_list)}. "
-                f"#running_req: {running_req}. "
-                f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%. "
+                f"[gpu_id={self.gpu_id}] Prefil batch. "
+                f"#new-seq: {len(can_run_list)}, "
+                f"#new-token: {new_batch_input_tokens}, "
+                f"#cached-token: {hit_tokens}, "
+                f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                f"#running-req: {running_req}, "
+                f"#queue-req: {len(self.forward_queue) - len(can_run_list)}"
             )
             # logger.debug(
             #    f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
