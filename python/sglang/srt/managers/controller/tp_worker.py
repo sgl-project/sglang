@@ -111,7 +111,10 @@ class ModelTpServer:
             f"context_len={self.model_config.context_len}, "
         )
         if self.tp_rank == 0:
-            logger.info(f"server_args: {server_args.print_mode_args()}")
+            logger.info(
+                f"[gpu_id={self.gpu_id}] "
+                f"server_args: {server_args.print_mode_args()}"
+            )
 
         # Init cache
         self.tree_cache = RadixCache(
@@ -397,6 +400,7 @@ class ModelTpServer:
                 self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
             )
             logger.info(
+                f"[gpu_id={self.gpu_id}] "
                 f"new fill batch. #seq: {len(can_run_list)}. "
                 f"#cached_token: {hit_tokens}. "
                 f"#new_token: {new_batch_input_tokens}. "
