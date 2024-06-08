@@ -245,6 +245,7 @@ class ModelRunner:
             backend="nccl",
             world_size=self.tp_size,
             rank=self.tp_rank,
+            local_rank=self.gpu_id,
             distributed_init_method=f"tcp://127.0.0.1:{self.nccl_port}",
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
