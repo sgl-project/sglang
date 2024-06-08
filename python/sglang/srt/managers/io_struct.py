@@ -1,3 +1,8 @@
+"""
+The definition of objects transfered between different
+processes (TokenizerManager, DetokenizerManager, Controller).
+"""
+
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union

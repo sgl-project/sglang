@@ -1,6 +1,4 @@
-"""
-This file contains the SGL programs used for unit testing.
-"""
+"""This file contains the SGL programs used for unit testing."""
 
 import json
 import re

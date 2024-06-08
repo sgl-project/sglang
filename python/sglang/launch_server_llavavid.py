@@ -1,3 +1,4 @@
+"""Launch the inference server for Llava-video model."""
 import argparse
 import multiprocessing as mp
 

@@ -1,3 +1,7 @@
+"""
+Faster constrained decoding.
+Reference: https://lmsys.org/blog/2024-02-05-compressed-fsm/
+"""
 import interegular
 
 from sglang.srt.constrained import FSMInfo, disk_cache, make_deterministic_fsm
