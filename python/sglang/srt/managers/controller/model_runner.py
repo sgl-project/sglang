@@ -443,15 +443,19 @@ def import_model_classes():
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
                     model_arch_name_to_cls[entry.__name__] = entry
+
+            # compat: some models such as chatglm has incorrect class set in config.json
+            # usage: [ tuple("From_Entry_Class_Name": EntryClass), ]
+            if hasattr(module, "EntryClassRemapping") and isinstance(module.EntryClassRemapping, list):
+                for remap in module.EntryClassRemapping:
+                    if isinstance(remap, tuple) and len(remap) == 2:
+                        model_arch_name_to_cls[remap[0]] = remap[1]
+
     return model_arch_name_to_cls
 
 
 def load_model_cls_srt(model_arch: str) -> Optional[Type[nn.Module]]:
     model_arch_name_to_cls = import_model_classes()
-
-    # compat
-    if model_arch == "ChatGLMModel":
-        model_arch = "ChatGLMForCausalLM"
 
     if model_arch not in model_arch_name_to_cls:
         raise ValueError(

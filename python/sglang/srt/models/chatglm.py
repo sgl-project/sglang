@@ -386,3 +386,5 @@ class ChatGLMForCausalLM(nn.Module):
             weight_loader(param, loaded_weight)
 
 EntryClass = ChatGLMForCausalLM
+# compat: glm model.config class == ChatGLMModel
+EntryClassRemapping = [("ChatGLMModel", ChatGLMForCausalLM)]
