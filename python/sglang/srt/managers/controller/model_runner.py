@@ -18,7 +18,7 @@ from vllm.model_executor.models import ModelRegistry
 from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_available_gpu_memory, is_multimodal_model
+from sglang.srt.utils import get_available_gpu_memory, is_multimodal_model, monkey_patch_vllm_p2p_access_check
 
 
 logger = logging.getLogger("srt.model_runner")
@@ -240,10 +240,12 @@ class ModelRunner:
         logger.info(f"[gpu_id={self.gpu_id}] Set cuda device.")
         torch.cuda.set_device(self.gpu_id)
         logger.info(f"[gpu_id={self.gpu_id}] Init nccl begin.")
+        monkey_patch_vllm_p2p_access_check()
         init_distributed_environment(
             backend="nccl",
             world_size=self.tp_size,
             rank=self.tp_rank,
+            local_rank=self.gpu_id,
             distributed_init_method=f"tcp://127.0.0.1:{self.nccl_port}",
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
@@ -265,7 +267,7 @@ class ModelRunner:
     def load_model(self):
         logger.info(
             f"[gpu_id={self.gpu_id}] Load weight begin. "
-            f"Avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
         device_config = DeviceConfig()
@@ -295,8 +297,8 @@ class ModelRunner:
         )
         logger.info(
             f"[gpu_id={self.gpu_id}] Load weight end. "
-            f"Type={type(self.model).__name__}. "
-            f"Avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"type={type(self.model).__name__}, "
+            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
     def profile_max_num_token(self, total_gpu_memory):
@@ -333,7 +335,7 @@ class ModelRunner:
         )
         logger.info(
             f"[gpu_id={self.gpu_id}] Memory pool end. "
-            f"Avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
     @torch.inference_mode()

@@ -34,7 +34,7 @@ from sglang.srt.utils import (
 )
 from sglang.utils import get_exception_traceback
 
-logger = logging.getLogger("srt.model_tp")
+logger = logging.getLogger("srt.tp_worker")
 
 
 class ModelTpServer:
@@ -187,7 +187,8 @@ class ModelTpServer:
             # Forward
             self.forward_step()
         except Exception:
-            logger.error("Exception in ModelTpClient:\n" + get_exception_traceback())
+            logger.error("Exception in ModelTpServer:\n" + get_exception_traceback())
+            raise
 
         # Return results
         ret = self.out_pyobjs
