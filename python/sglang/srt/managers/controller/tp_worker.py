@@ -594,8 +594,9 @@ class ModelTpServer:
 
     def handle_finished_requests(self, batch: Batch):
         output_rids = []
-        prev_output_strs = []
-        output_tokens = []
+        decoded_texts = []
+        surr_output_ids = []
+        read_output_ids = []
         output_skip_special_tokens = []
         output_spaces_between_special_tokens = []
         output_meta_info = []
@@ -618,8 +619,10 @@ class ModelTpServer:
                 )
             ):
                 output_rids.append(req.rid)
-                prev_output_strs.append(req.prev_output_str)
-                output_tokens.append(req.output_ids)
+                decoded_texts.append(req.decoded_text)
+                surr_ids, read_ids, _ = req.init_detokenize_incrementally()
+                surr_output_ids.append(surr_ids)
+                read_output_ids.append(read_ids)
                 output_skip_special_tokens.append(
                     req.sampling_params.skip_special_tokens
                 )
@@ -655,8 +658,9 @@ class ModelTpServer:
             self.out_pyobjs.append(
                 BatchTokenIDOut(
                     output_rids,
-                    prev_output_strs,
-                    output_tokens,
+                    decoded_texts,
+                    surr_output_ids,
+                    read_output_ids,
                     output_skip_special_tokens,
                     output_spaces_between_special_tokens,
                     output_meta_info,

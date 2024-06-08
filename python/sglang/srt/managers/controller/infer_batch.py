@@ -1,4 +1,5 @@
 """Meta data for requests and batches"""
+
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import List
@@ -9,11 +10,14 @@ import torch
 from sglang.srt.managers.controller.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
+INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
+
 
 class ForwardMode(IntEnum):
     PREFILL = auto()
     EXTEND = auto()
     DECODE = auto()
+
 
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
@@ -62,12 +66,16 @@ class Req:
     def __init__(self, rid, origin_input_text, origin_input_ids):
         self.rid = rid
         self.origin_input_text = origin_input_text
+        self.origin_input_ids_unpadded = origin_input_ids  # Before image padding
         self.origin_input_ids = origin_input_ids
-        self.origin_input_ids_unpadded = origin_input_ids  # before image padding
-        self.prev_output_str = ""
-        self.prev_output_ids = []
-        self.output_ids = []
+        self.prev_output_ids = []  # Ids already outputted but not finished yet
+        self.output_ids = []  # Each decode stage's output ids
         self.input_ids = None  # input_ids = origin_input_ids + prev_output_ids
+
+        # For incremental decode
+        self.decoded_text = ""
+        self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
+        self.read_offset = None
 
         # The number of decoded tokens for token usage report. Note that
         # this does not include the jump forward tokens.
@@ -115,12 +123,42 @@ class Req:
     def finished(self) -> bool:
         return self.finished_reason is not None
 
-    def partial_decode(self, ids):
-        first_token = self.tokenizer.convert_ids_to_tokens(ids[0])
-        first_token = (
-            first_token.decode() if isinstance(first_token, bytes) else first_token
+    # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
+    def init_detokenize_incrementally(self):
+        first_iter = self.surr_offset is None or self.read_offset is None
+
+        if first_iter:
+            self.read_offset = len(self.origin_input_ids_unpadded)
+            self.surr_offset = max(
+                self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
+            )
+
+        all_ids = (
+            self.origin_input_ids_unpadded + self.prev_output_ids + self.output_ids
         )
-        return (" " if first_token.startswith("▁") else "") + self.tokenizer.decode(ids)
+        surr_ids = all_ids[self.surr_offset : self.read_offset]
+        read_ids = all_ids[self.surr_offset :]
+
+        return surr_ids, read_ids, len(all_ids)
+
+    def detokenize_incrementally(self):
+        surr_ids, read_ids, new_read_offset = self.init_detokenize_incrementally()
+
+        surr_text = self.tokenizer.decode(
+            surr_ids,
+            skip_special_tokens=self.sampling_params.skip_special_tokens,
+            spaces_between_special_tokens=self.sampling_params.spaces_between_special_tokens,
+        )
+        new_text = self.tokenizer.decode(
+            read_ids,
+            skip_special_tokens=self.sampling_params.skip_special_tokens,
+            spaces_between_special_tokens=self.sampling_params.spaces_between_special_tokens,
+        )
+
+        if len(new_text) > len(surr_text) and not new_text.endswith("�"):
+            self.decoded_text += new_text[len(surr_text) :]
+            self.surr_offset = self.read_offset
+            self.read_offset = new_read_offset
 
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
@@ -133,14 +171,18 @@ class Req:
             len(self.prev_output_ids) + len(self.output_ids)
             >= self.sampling_params.max_new_tokens
         ):
-            self.finished_reason = FINISH_LENGTH(len(self.prev_output_ids) + len(self.output_ids))
+            self.finished_reason = FINISH_LENGTH(
+                len(self.prev_output_ids) + len(self.output_ids)
+            )
             return
 
         if (
             self.output_ids[-1] == self.tokenizer.eos_token_id
             and not self.sampling_params.ignore_eos
         ):
-            self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.tokenizer.eos_token_id)
+            self.finished_reason = FINISH_MATCHED_TOKEN(
+                matched=self.tokenizer.eos_token_id
+            )
             return
 
         if len(self.sampling_params.stop_strs) > 0:
@@ -149,38 +191,33 @@ class Req:
             )
 
             for stop_str in self.sampling_params.stop_strs:
-                # FIXME: (minor) try incremental match in prev_output_str
-                if stop_str in tail_str or stop_str in self.prev_output_str:
+                if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
 
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
-        # FIXME: This logic does not really solve the problem of determining whether
-        # there should be a leading space.
-        cur_output_str = self.partial_decode(self.output_ids)
+        # Detokenize the currently output tokens
+        self.detokenize_incrementally()
 
-        # TODO(lsyin): apply re-tokenize only for decode tokens so that we do not need origin_input_text anymore
         if self.origin_input_text is None:
             # Recovering text can only use unpadded ids
             self.origin_input_text = self.tokenizer.decode(
                 self.origin_input_ids_unpadded
             )
-
-        all_text = (
-            self.origin_input_text
-            + self.prev_output_str
-            + cur_output_str
-            + jump_forward_str
-        )
+        all_text = self.origin_input_text + self.decoded_text + jump_forward_str
         all_ids = self.tokenizer.encode(all_text)
         prompt_tokens = len(self.origin_input_ids_unpadded)
-        self.origin_input_ids = all_ids[:prompt_tokens]
-        self.origin_input_ids_unpadded = self.origin_input_ids
-        # NOTE: the output ids may not strictly correspond to the output text
+
+        if all_ids[prompt_tokens - 1] != self.origin_input_ids_unpadded[-1]:
+            # TODO(lsyin): fix the fusion token between input and output
+            return False
+
         old_prev_output_ids = self.prev_output_ids
         self.prev_output_ids = all_ids[prompt_tokens:]
-        self.prev_output_str = self.prev_output_str + cur_output_str + jump_forward_str
         self.output_ids = []
+        self.decoded_text = self.decoded_text + jump_forward_str
+        self.surr_offset = prompt_tokens
+        self.read_offset = len(all_ids)
 
         self.regex_fsm_state = next_state
 
@@ -196,6 +233,8 @@ class Req:
             self.decode_top_logprobs = self.decode_top_logprobs[:k]
             self.logprob_start_len = prompt_tokens + k
             self.last_update_decode_tokens = len(self.prev_output_ids) - k
+
+        return True
 
         # print("=" * 100)
         # print(f"Catch jump forward:\n{jump_forward_str}")
@@ -401,10 +440,7 @@ class Batch:
             # release the last node
             self.tree_cache.dec_lock_ref(req.last_node)
 
-            cur_output_str = req.partial_decode(req.output_ids)
-            req.prev_output_str = req.prev_output_str + cur_output_str
             req.prev_output_ids.extend(req.output_ids)
-
             req.prefix_indices = None
             req.last_node = None
             req.extend_input_len = 0
@@ -432,21 +468,24 @@ class Batch:
                     if len(jump_forward_str) <= 1:
                         continue
 
-                    if req_pool_indices_cpu is None:
-                        req_pool_indices_cpu = self.req_pool_indices.tolist()
+                    # jump-forward
+                    old_ids = tuple(req.input_ids + req.output_ids)[:-1]
+                    if not req.jump_forward_and_retokenize(
+                        jump_forward_str, next_state
+                    ):
+                        continue
 
                     # insert the old request into tree_cache
+                    if req_pool_indices_cpu is None:
+                        req_pool_indices_cpu = self.req_pool_indices.tolist()
                     self.tree_cache.cache_req(
-                        token_ids=tuple(req.input_ids + req.output_ids)[:-1],
+                        token_ids=old_ids,
                         last_uncached_pos=len(req.prefix_indices),
                         req_pool_idx=req_pool_indices_cpu[i],
                     )
 
                     # unlock the last node
                     self.tree_cache.dec_lock_ref(req.last_node)
-
-                    # jump-forward
-                    req.jump_forward_and_retokenize(jump_forward_str, next_state)
 
                     # re-applying image padding
                     if req.pixel_values is not None:
