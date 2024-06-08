@@ -1,4 +1,4 @@
-"""Some Public API Definitions"""
+"""Public APIs of the language."""
 
 import os
 import re
