@@ -273,7 +273,8 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 class Runtime:
     """
     A wrapper for the server.
-    This is used for launching the server in a python program without using commond line interface.
+    This is used for launching the server in a python program without
+    using the commond line interface.
     """
 
     def __init__(
