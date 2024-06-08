@@ -1,4 +1,7 @@
-"""SRT: SGLang Runtime"""
+"""
+The entry point of inference server.
+SRT = SGLang Runtime.
+"""
 
 import asyncio
 import dataclasses
@@ -10,7 +13,7 @@ import sys
 import threading
 import time
 from http import HTTPStatus
-from typing import Optional
+from typing import Optional, Dict
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -148,7 +151,6 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
         server_args.dp_size,
     )
 
-    # Init local models port args
     ports = server_args.additional_ports
     tp = server_args.tp_size
     model_port_args = []
@@ -269,6 +271,12 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 
 
 class Runtime:
+    """
+    A wrapper for the server.
+    This is used for launching the server in a python program without
+    using the commond line interface.
+    """
+
     def __init__(
         self,
         log_level: str = "error",
@@ -339,7 +347,7 @@ class Runtime:
     async def add_request(
         self,
         prompt: str,
-        sampling_params,
+        sampling_params: Dict,
     ):
         json_data = {
             "text": prompt,

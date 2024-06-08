@@ -1,3 +1,5 @@
+"""Launch the inference server."""
+
 import argparse
 
 from sglang.srt.server import ServerArgs, launch_server

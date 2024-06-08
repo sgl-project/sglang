@@ -1,4 +1,6 @@
 """
+Flush the KV cache.
+
 Usage:
 python3 -m sglang.srt.flush_cache --url http://localhost:30000
 """
