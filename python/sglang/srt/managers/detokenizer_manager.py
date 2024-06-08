@@ -87,7 +87,7 @@ def start_detokenizer_process(
 
     try:
         manager = DetokenizerManager(server_args, port_args)
-    except Exception as e:
+    except Exception:
         pipe_writer.send(get_exception_traceback())
         raise
     pipe_writer.send("init ok")

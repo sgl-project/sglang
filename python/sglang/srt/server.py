@@ -228,20 +228,21 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 
         # Send a warmup request
         try:
-            res = requests.post(
-                url + "/generate",
-                json={
-                    "text": "The capital city of France is",
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": 16,
+            for _ in range(server_args.dp_size):
+                res = requests.post(
+                    url + "/generate",
+                    json={
+                        "text": "The capital city of France is",
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 16,
+                        },
                     },
-                },
-                headers=headers,
-                timeout=600,
-            )
-            assert res.status_code == 200
-        except Exception as e:
+                    headers=headers,
+                    timeout=600,
+                )
+                assert res.status_code == 200
+        except Exception:
             if pipe_finish_writer is not None:
                 pipe_finish_writer.send(get_exception_traceback())
             print(f"Initialization failed. warmup error: {e}")

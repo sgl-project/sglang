@@ -12,6 +12,7 @@ from sglang.global_config import global_config
 from sglang.srt.managers.controller.tp_worker import ModelTpClient
 from sglang.srt.managers.io_struct import BatchTokenIDOut
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import kill_parent_process
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger("srt.controller")
@@ -58,6 +59,10 @@ class DataParallelWorkerThread(threading.Thread):
                     f"{get_exception_traceback()}"
                 )
                 self.liveness = False
+                # Crash the whole server when there are any errors.
+                # TODO(lianmin): make this an option.
+                kill_parent_process()
+                return
 
             for obj in out_pyobjs:
                 self.send_to_detokenizer.send_pyobj(obj)
