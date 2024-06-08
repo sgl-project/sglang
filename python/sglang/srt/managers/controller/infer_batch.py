@@ -15,6 +15,7 @@ class ForwardMode(IntEnum):
     EXTEND = auto()
     DECODE = auto()
 
+
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
         self.is_error = is_error
