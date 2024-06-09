@@ -4,7 +4,7 @@ from typing import Dict, Optional, Union
 from outlines.caching import cache as disk_cache
 from outlines.caching import disable_cache
 from outlines.fsm.fsm import RegexFSM
-from outlines.fsm.regex import FSMInfo, make_deterministic_fsm
+from outlines.fsm.regex import FSMInfo, make_deterministic_fsm, make_byte_level_fsm
 from outlines.models.transformers import TransformerTokenizer
 from pydantic import BaseModel
 
@@ -35,4 +35,5 @@ __all__ = [
     "TransformerTokenizer",
     "disk_cache",
     "disable_cache",
+    "make_byte_level_fsm",
 ]

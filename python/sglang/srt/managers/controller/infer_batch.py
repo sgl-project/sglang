@@ -3,12 +3,15 @@
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import List
+import warnings
 
 import numpy as np
 import torch
 
 from sglang.srt.managers.controller.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.constrained.jump_forward import JumpForwardMap
+from sglang.srt.constrained import RegexFSM
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -115,9 +118,9 @@ class Req:
         self.last_update_decode_tokens = 0
 
         # Constrained decoding
-        self.regex_fsm = None
-        self.regex_fsm_state = 0
-        self.jump_forward_map = None
+        self.regex_fsm: RegexFSM = None
+        self.regex_fsm_state: int = 0
+        self.jump_forward_map: JumpForwardMap = None
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -141,8 +144,8 @@ class Req:
 
         return surr_ids, read_ids, len(all_ids)
 
-    def detokenize_incrementally(self):
-        surr_ids, read_ids, new_read_offset = self.init_detokenize_incrementally()
+    def detokenize_incrementally(self, inplace: bool = True):
+        surr_ids, read_ids, num_all_tokens = self.init_detokenize_incrementally()
 
         surr_text = self.tokenizer.decode(
             surr_ids,
@@ -156,9 +159,15 @@ class Req:
         )
 
         if len(new_text) > len(surr_text) and not new_text.endswith("�"):
-            self.decoded_text += new_text[len(surr_text) :]
-            self.surr_offset = self.read_offset
-            self.read_offset = new_read_offset
+            new_text = new_text[len(surr_text) :]
+            if inplace:
+                self.decoded_text += new_text
+                self.surr_offset = self.read_offset
+                self.read_offset = num_all_tokens
+
+            return True, new_text
+
+        return False, ""
 
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
@@ -196,20 +205,21 @@ class Req:
                     return
 
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
-        # Detokenize the currently output tokens
-        self.detokenize_incrementally()
-
         if self.origin_input_text is None:
             # Recovering text can only use unpadded ids
             self.origin_input_text = self.tokenizer.decode(
                 self.origin_input_ids_unpadded
             )
+
         all_text = self.origin_input_text + self.decoded_text + jump_forward_str
         all_ids = self.tokenizer.encode(all_text)
         prompt_tokens = len(self.origin_input_ids_unpadded)
 
         if all_ids[prompt_tokens - 1] != self.origin_input_ids_unpadded[-1]:
-            # TODO(lsyin): fix the fusion token between input and output
+            # TODO(lsyin): fix token fusion
+            warnings.warn(
+                "Token fusion between input and output, try to avoid this by removing the space at the end of the input."
+            )
             return False
 
         old_prev_output_ids = self.prev_output_ids
@@ -235,14 +245,6 @@ class Req:
             self.last_update_decode_tokens = len(self.prev_output_ids) - k
 
         return True
-
-        # print("=" * 100)
-        # print(f"Catch jump forward:\n{jump_forward_str}")
-        # print(self.tokenizer.convert_ids_to_tokens(self.input_ids))
-        # print(self.tokenizer.convert_ids_to_tokens(new_input_ids))
-
-        # print(f"Output and jump forward str:\n{self.output_and_jump_forward_str}")
-        # print("*" * 100)
 
     def __repr__(self):
         return f"rid(n={self.rid}, " f"input_ids={self.origin_input_ids}, "
@@ -462,24 +464,53 @@ class Batch:
 
         for i, req in enumerate(self.reqs):
             if req.jump_forward_map is not None:
-                res = req.jump_forward_map.jump_forward(req.regex_fsm_state)
-                if res is not None:
-                    jump_forward_str, next_state = res
-                    if len(jump_forward_str) <= 1:
+                jump_forward_bytes = req.jump_forward_map.jump_forward_byte(
+                    req.regex_fsm_state
+                )
+                if jump_forward_bytes is not None and len(jump_forward_bytes) > 1:
+                    suffix_bytes = []
+                    continuation_range = range(0x80, 0xC0)
+                    cur_state = req.regex_fsm_state
+                    while (
+                        len(jump_forward_bytes)
+                        and jump_forward_bytes[0][0] in continuation_range
+                    ):
+                        # continuation bytes
+                        byte_edge = jump_forward_bytes.pop(0)
+                        suffix_bytes.append(byte_edge[0])
+                        cur_state = byte_edge[1]
+
+                    suffix_tokens = [f"<0x{hex(b)[2:].upper()}>" for b in suffix_bytes]
+                    suffix_ids = req.tokenizer.convert_tokens_to_ids(suffix_tokens)
+
+                    # Current ids, for cache and revert
+                    cur_all_ids = tuple(req.input_ids + req.output_ids)[:-1]
+                    cur_output_ids = req.output_ids
+
+                    req.output_ids.extend(suffix_ids)
+                    decode_res, new_text = req.detokenize_incrementally(inplace=False)
+                    if not decode_res:
+                        req.output_ids = cur_output_ids
                         continue
 
-                    # jump-forward
-                    old_ids = tuple(req.input_ids + req.output_ids)[:-1]
+                    jump_forward_str, next_state = (
+                        req.jump_forward_map.jump_forward_symbol(cur_state)
+                    )
+
+                    # Make the incrementally decoded text part of jump_forward_str
+                    # so that the UTF-8 will not corrupt
+                    jump_forward_str = new_text + jump_forward_str
                     if not req.jump_forward_and_retokenize(
                         jump_forward_str, next_state
                     ):
+                        req.output_ids = cur_output_ids
                         continue
 
                     # insert the old request into tree_cache
                     if req_pool_indices_cpu is None:
                         req_pool_indices_cpu = self.req_pool_indices.tolist()
                     self.tree_cache.cache_req(
-                        token_ids=old_ids,
+                        token_ids=cur_all_ids,
                         last_uncached_pos=len(req.prefix_indices),
                         req_pool_idx=req_pool_indices_cpu[i],
                     )
