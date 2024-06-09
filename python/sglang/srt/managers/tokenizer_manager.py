@@ -1,3 +1,4 @@
+"""TokenizerManager is a process that tokenizes the text."""
 import asyncio
 import concurrent.futures
 import dataclasses
@@ -283,7 +284,7 @@ class TokenizerManager:
         req = AbortReq(rid)
         self.send_to_router.send_pyobj(req)
 
-    def create_abort_task(self, obj):
+    def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(3)

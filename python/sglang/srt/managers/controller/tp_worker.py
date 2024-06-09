@@ -1,3 +1,5 @@
+"""A tensor parallel worker."""
+
 import asyncio
 import logging
 import time

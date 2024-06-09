@@ -1,3 +1,4 @@
+"""Cache for the compressed finite state machine."""
 from sglang.srt.constrained import RegexGuide, TransformerTokenizer
 from sglang.srt.constrained.base_cache import BaseCache
 
