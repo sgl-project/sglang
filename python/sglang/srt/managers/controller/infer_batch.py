@@ -229,6 +229,15 @@ class Req:
         self.surr_offset = prompt_tokens
         self.read_offset = len(all_ids)
 
+        # NOTE: A trick to reduce the surrouding tokens decoding overhead
+        for i in range(0, INIT_INCREMENTAL_DETOKENIZATION_OFFSET):
+            surr_text_ = self.tokenizer.decode(
+                all_ids[self.read_offset - i : self.read_offset]
+            )
+            if not surr_text_.endswith("�"):
+                self.surr_offset = self.read_offset - i
+                break
+
         self.regex_fsm_state = next_state
 
         if self.return_logprob:

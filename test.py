@@ -40,7 +40,7 @@ def main():
     sgl.set_default_backend(backend)
     ret = regex_chinese.run(temperature=0)
     print(ret.text())
-    ret = character_gen.run("Harry Potter")
+    ret = character_gen.run("Harry Potter", temperature=0)
     print(ret.text())
 
 
