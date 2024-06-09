@@ -11,7 +11,7 @@ import torch
 from sglang.srt.managers.controller.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.constrained.jump_forward import JumpForwardMap
-from sglang.srt.constrained import RegexFSM
+from sglang.srt.constrained import RegexGuide
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -118,7 +118,7 @@ class Req:
         self.last_update_decode_tokens = 0
 
         # Constrained decoding
-        self.regex_fsm: RegexFSM = None
+        self.regex_fsm: RegexGuide = None
         self.regex_fsm_state: int = 0
         self.jump_forward_map: JumpForwardMap = None
 
@@ -651,7 +651,7 @@ class Batch:
                 if req.regex_fsm is not None:
                     allowed_mask.zero_()
                     allowed_mask[
-                        req.regex_fsm.allowed_token_ids(req.regex_fsm_state)
+                        req.regex_fsm.get_next_instruction(req.regex_fsm_state).tokens
                     ] = 1
                     logits[i].masked_fill_(~allowed_mask, float("-inf"))
 
@@ -670,7 +670,7 @@ class Batch:
             batch_next_token_ids_cpu = batch_next_token_ids.cpu().numpy()
             for i, req in enumerate(self.reqs):
                 if req.regex_fsm is not None:
-                    req.regex_fsm_state = req.regex_fsm.next_state(
+                    req.regex_fsm_state = req.regex_fsm.get_next_state(
                         req.regex_fsm_state, batch_next_token_ids_cpu[i]
                     )
 
