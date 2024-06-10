@@ -71,9 +71,8 @@ class Req:
         self.origin_input_text = origin_input_text
         self.origin_input_ids_unpadded = origin_input_ids  # Before image padding
         self.origin_input_ids = origin_input_ids
-        self.prev_output_ids = []  # Ids already outputted but not finished yet
         self.output_ids = []  # Each decode stage's output ids
-        self.input_ids = None  # input_ids = origin_input_ids + prev_output_ids
+        self.input_ids = None  # input_ids = origin_input_ids + output_ids
 
         # For incremental decode
         self.decoded_text = ""
@@ -136,9 +135,7 @@ class Req:
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
 
-        all_ids = (
-            self.origin_input_ids_unpadded + self.prev_output_ids + self.output_ids
-        )
+        all_ids = self.origin_input_ids_unpadded + self.output_ids
         surr_ids = all_ids[self.surr_offset : self.read_offset]
         read_ids = all_ids[self.surr_offset :]
 
@@ -176,13 +173,8 @@ class Req:
         if self.finished():
             return
 
-        if (
-            len(self.prev_output_ids) + len(self.output_ids)
-            >= self.sampling_params.max_new_tokens
-        ):
-            self.finished_reason = FINISH_LENGTH(
-                len(self.prev_output_ids) + len(self.output_ids)
-            )
+        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+            self.finished_reason = FINISH_LENGTH(len(self.output_ids))
             return
 
         if (
@@ -222,9 +214,8 @@ class Req:
             )
             return False
 
-        old_prev_output_ids = self.prev_output_ids
-        self.prev_output_ids = all_ids[prompt_tokens:]
-        self.output_ids = []
+        old_output_ids = self.output_ids
+        self.output_ids = all_ids[prompt_tokens:]
         self.decoded_text = self.decoded_text + jump_forward_str
         self.surr_offset = prompt_tokens
         self.read_offset = len(all_ids)
@@ -243,15 +234,15 @@ class Req:
         if self.return_logprob:
             # For fast-forward part's logprobs
             k = 0
-            for i, old_id in enumerate(old_prev_output_ids):
-                if old_id == self.prev_output_ids[i]:
+            for i, old_id in enumerate(old_output_ids):
+                if old_id == self.output_ids[i]:
                     k = k + 1
                 else:
                     break
             self.decode_token_logprobs = self.decode_token_logprobs[:k]
             self.decode_top_logprobs = self.decode_top_logprobs[:k]
             self.logprob_start_len = prompt_tokens + k
-            self.last_update_decode_tokens = len(self.prev_output_ids) - k
+            self.last_update_decode_tokens = len(self.output_ids) - k
 
         return True
 
@@ -429,7 +420,10 @@ class Batch:
         sorted_indices = [i for i in range(len(self.reqs))]
         # TODO(lsyin): improve the priority of retraction
         sorted_indices.sort(
-            key=lambda i: (len(self.reqs[i].output_ids), -len(self.reqs[i].input_ids)),
+            key=lambda i: (
+                len(self.reqs[i].output_ids),
+                -len(self.reqs[i].origin_input_ids),
+            ),
             reverse=True,
         )
 
@@ -451,11 +445,9 @@ class Batch:
             # release the last node
             self.tree_cache.dec_lock_ref(req.last_node)
 
-            req.prev_output_ids.extend(req.output_ids)
             req.prefix_indices = None
             req.last_node = None
             req.extend_input_len = 0
-            req.output_ids = []
 
             # For incremental logprobs
             req.last_update_decode_tokens = 0
@@ -493,7 +485,7 @@ class Batch:
                     suffix_ids = req.tokenizer.convert_tokens_to_ids(suffix_tokens)
 
                     # Current ids, for cache and revert
-                    cur_all_ids = tuple(req.input_ids + req.output_ids)[:-1]
+                    cur_all_ids = tuple(req.origin_input_ids + req.output_ids)[:-1]
                     cur_output_ids = req.output_ids
 
                     req.output_ids.extend(suffix_ids)
