@@ -2,6 +2,7 @@
 Faster constrained decoding.
 Reference: https://lmsys.org/blog/2024-02-05-compressed-fsm/
 """
+
 import interegular
 import dataclasses
 from collections import defaultdict
@@ -49,6 +50,8 @@ class JumpForwardMap:
             state_to_jump_forward = {}
 
             for (state, id_), next_state in transitions.items():
+                if id_ == fsm_info.alphabet_anything_value:
+                    continue
                 symbols = id_to_symbol[id_]
                 for c in symbols:
                     if len(c) > 1:
@@ -69,6 +72,8 @@ class JumpForwardMap:
             # Process the byte level jump forward
             outgoings_ct = defaultdict(int)
             for (state, id_), next_state in transitions.items():
+                if id_ == fsm_info.alphabet_anything_value:
+                    continue
                 symbols = id_to_symbol[id_]
                 for c in symbols:
                     byte_ = None
