@@ -2,7 +2,7 @@ import json
 import os
 import sglang as sgl
 from sglang.test.test_utils import select_sglang_backend, add_common_sglang_args_and_parse
-import tqmd
+from tqdm import tqdm
 import time
 import argparse
 from sglang.utils import read_jsonl, dump_state_text
