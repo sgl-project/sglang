@@ -453,14 +453,18 @@ def kill_parent_process():
     os.kill(parent_process.pid, 9)
 
 
-def monkey_patch_vllm_p2p_access_check():
+def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     """
     Monkey patch the slow p2p access check in vllm.
     NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
     """
-    import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
 
-    setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
+    # TODO: need a better check than just dev str name match
+    # compat: skip RTX 40 series as they do not have P2P feature and even checking for them may cause errors
+    device_name = torch.cuda.get_device_name(gpu_id)
+    if "RTX 40" not in device_name:
+        import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+        setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
 
 API_KEY_HEADER_NAME = "X-API-Key"
