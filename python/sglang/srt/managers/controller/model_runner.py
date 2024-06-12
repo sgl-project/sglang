@@ -241,7 +241,7 @@ class ModelRunner:
         logger.info(f"[gpu_id={self.gpu_id}] Set cuda device.")
         torch.cuda.set_device(self.gpu_id)
         logger.info(f"[gpu_id={self.gpu_id}] Init nccl begin.")
-        monkey_patch_vllm_p2p_access_check()
+        monkey_patch_vllm_p2p_access_check(self.gpu_id)
         init_distributed_environment(
             backend="nccl",
             world_size=self.tp_size,
