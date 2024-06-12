@@ -1,3 +1,4 @@
+"""ModelRunner runs the forward passes of the models."""
 import importlib
 import importlib.resources
 import logging
@@ -11,14 +12,14 @@ import torch
 import torch.nn as nn
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
-from vllm.distributed import initialize_model_parallel
+from vllm.distributed import initialize_model_parallel, init_distributed_environment
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_available_gpu_memory, is_multimodal_model
+from sglang.srt.utils import get_available_gpu_memory, is_multimodal_model, monkey_patch_vllm_p2p_access_check
 
 
 logger = logging.getLogger("srt.model_runner")
@@ -240,11 +241,13 @@ class ModelRunner:
         logger.info(f"[gpu_id={self.gpu_id}] Set cuda device.")
         torch.cuda.set_device(self.gpu_id)
         logger.info(f"[gpu_id={self.gpu_id}] Init nccl begin.")
-        torch.distributed.init_process_group(
+        monkey_patch_vllm_p2p_access_check(self.gpu_id)
+        init_distributed_environment(
             backend="nccl",
             world_size=self.tp_size,
             rank=self.tp_rank,
-            init_method=f"tcp://127.0.0.1:{self.nccl_port}",
+            local_rank=self.gpu_id,
+            distributed_init_method=f"tcp://127.0.0.1:{self.nccl_port}",
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         total_gpu_memory = get_available_gpu_memory(
@@ -265,7 +268,7 @@ class ModelRunner:
     def load_model(self):
         logger.info(
             f"[gpu_id={self.gpu_id}] Load weight begin. "
-            f"Avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
         device_config = DeviceConfig()
@@ -291,11 +294,12 @@ class ModelRunner:
             vision_language_config=None,
             parallel_config=None,
             scheduler_config=None,
+            cache_config=None,
         )
         logger.info(
             f"[gpu_id={self.gpu_id}] Load weight end. "
-            f"Type={type(self.model).__name__}. "
-            f"Avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"type={type(self.model).__name__}, "
+            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
     def profile_max_num_token(self, total_gpu_memory):
@@ -326,13 +330,13 @@ class ModelRunner:
         self.token_to_kv_pool = TokenToKVPool(
             self.max_total_num_tokens,
             dtype=torch.float16,
-            head_num=self.model_config.num_key_value_heads // self.tp_size,
+            head_num=self.model_config.get_num_kv_heads(self.tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
         )
         logger.info(
             f"[gpu_id={self.gpu_id}] Memory pool end. "
-            f"Avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
     @torch.inference_mode()
@@ -442,11 +446,20 @@ def import_model_classes():
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
                     model_arch_name_to_cls[entry.__name__] = entry
+
+            # compat: some models such as chatglm has incorrect class set in config.json
+            # usage: [ tuple("From_Entry_Class_Name": EntryClass), ]
+            if hasattr(module, "EntryClassRemapping") and isinstance(module.EntryClassRemapping, list):
+                for remap in module.EntryClassRemapping:
+                    if isinstance(remap, tuple) and len(remap) == 2:
+                        model_arch_name_to_cls[remap[0]] = remap[1]
+
     return model_arch_name_to_cls
 
 
 def load_model_cls_srt(model_arch: str) -> Optional[Type[nn.Module]]:
     model_arch_name_to_cls = import_model_classes()
+
     if model_arch not in model_arch_name_to_cls:
         raise ValueError(
             f"Unsupported architectures: {model_arch}. "

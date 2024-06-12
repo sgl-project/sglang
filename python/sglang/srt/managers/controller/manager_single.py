@@ -1,6 +1,7 @@
 """A controller that manages a group of tensor parallel workers."""
 import asyncio
 import logging
+import time
 
 import uvloop
 import zmq
@@ -9,9 +10,12 @@ import zmq.asyncio
 from sglang.global_config import global_config
 from sglang.srt.managers.controller.tp_worker import ModelTpClient
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import kill_parent_process
 from sglang.utils import get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+logger = logging.getLogger("srt.controller")
 
 
 class ControllerSingle:
@@ -45,7 +49,7 @@ class ControllerSingle:
             # async sleep for receiving the subsequent request and avoiding cache miss
             slept = False
             if len(out_pyobjs) != 0:
-                has_finished = any([obj.finished for obj in out_pyobjs])
+                has_finished = any([obj.finished_reason is not None for obj in out_pyobjs])
                 if has_finished:
                     if self.request_dependency_delay > 0:
                         slept = True
@@ -85,4 +89,9 @@ def start_controller_process(
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.create_task(controller.loop_for_recv_requests())
-    loop.run_until_complete(controller.loop_for_forward())
+    try:
+        loop.run_until_complete(controller.loop_for_forward())
+    except Exception:
+        logger.error("Exception in ControllerSingle:\n" + get_exception_traceback())
+    finally:
+        kill_parent_process()

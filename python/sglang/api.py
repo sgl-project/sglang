@@ -1,4 +1,4 @@
-"""Some Public API Definitions"""
+"""Public APIs of the language."""
 
 import os
 import re
@@ -43,14 +43,14 @@ def set_default_backend(backend: BaseBackend):
     global_config.default_backend = backend
 
 
-def flush_cache(backend: BaseBackend = None):
+def flush_cache(backend: Optional[BaseBackend] = None):
     backend = backend or global_config.default_backend
     if backend is None:
         return False
     return backend.flush_cache()
 
 
-def get_server_args(backend: BaseBackend = None):
+def get_server_args(backend: Optional[BaseBackend] = None):
     backend = backend or global_config.default_backend
     if backend is None:
         return None
@@ -158,7 +158,7 @@ def video(path: str, num_frames: int):
 
 def select(
     name: Optional[str] = None,
-    choices: List[str] = None,
+    choices: Optional[List[str]] = None,
     temperature: float = 0.0,
 ):
     assert choices is not None

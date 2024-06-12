@@ -1,4 +1,4 @@
-__version__ = "0.1.16"
+__version__ = "0.1.17"
 
 # SGL API Components
 from sglang.api import (
@@ -27,6 +27,7 @@ from sglang.backend.anthropic import Anthropic
 from sglang.backend.openai import OpenAI
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.backend.vertexai import VertexAI
+from sglang.backend.litellm import LiteLLM
 
 # Global Configurations
 from sglang.global_config import global_config
@@ -35,6 +36,7 @@ from sglang.global_config import global_config
 __all__ = [
     "global_config",
     "Anthropic",
+    "LiteLLM",
     "OpenAI",
     "RuntimeEndpoint",
     "VertexAI",

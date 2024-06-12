@@ -9,9 +9,9 @@
 SGLang is a structured generation language designed for large language models (LLMs).
 It makes your interaction with LLMs faster and more controllable by co-designing the frontend language and the runtime system.
 
-The core features of SGLang include:
-- **A Flexible Front-End Language**: This allows for easy programming of LLM applications with multiple chained generation calls, advanced prompting techniques, control flow, multiple modalities, parallelism, and external interaction.
-- **A High-Performance Runtime with RadixAttention**: This feature significantly accelerates the execution of complex LLM programs by automatic KV cache reuse across multiple calls. It also supports other common techniques like continuous batching and tensor parallelism.
+The core features include:
+- **Flexible Frontend Language**: Enables easy programming of LLM applications with chained generation calls, advanced prompting, control flow, multiple modalities, parallelism, and external interactions.
+- **High-Performance Backend Runtime**: Features RadixAttention for accelerating complex LLM programs by reusing the KV cache across multiple calls. It can also serve as a standalone engine with all common techniques implemented (e.g., continuous batching and tensor parallelism).
 
 ## News
 - [2024/02] 🔥 SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
@@ -44,11 +44,7 @@ pip install -e "python[all]"
 ```
 
 ### Notes
-- If you are using older GPUs (NVIDIA V100, T4), please pick the correct triton compiler version to avoid some known bugs.
-  - For NVIDIA T4, please use `pip install "triton>=2.2.0"`.
-  - For NVIDIA V100, please install the [nightly](https://triton-lang.org/main/getting-started/installation.html) version.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`
-
 
 ## Quick Start
 The example below shows how to use sglang to answer a mulit-turn question.
@@ -367,7 +363,8 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --mem-fraction-static 0.7
 ```
-- You can turn on [flashinfer](docs/flashinfer.md) to accelerate the inference by using highly optimized CUDA kernels.
+- See [flashinfer.md](docs/flashinfer.md) on accelerating inference using highly optimized CUDA kernels.
+- See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
 
 ### Supported Models
 - Llama
@@ -406,10 +403,10 @@ https://github.com/sgl-project/sglang/issues/157
 
 ## Citation And Acknowledgment
 ```
-@misc{zheng2023efficiently,
-      title={Efficiently Programming Large Language Models using SGLang},
-      author={Lianmin Zheng and Liangsheng Yin and Zhiqiang Xie and Jeff Huang and Chuyue Sun and Cody Hao Yu and Shiyi Cao and Christos Kozyrakis and Ion Stoica and Joseph E. Gonzalez and Clark Barrett and Ying Sheng},
-      year={2023},
+@misc{zheng2024sglang,
+      title={SGLang: Efficient Execution of Structured Language Model Programs},
+      author={Lianmin Zheng and Liangsheng Yin and Zhiqiang Xie and Chuyue Sun and Jeff Huang and Cody Hao Yu and Shiyi Cao and Christos Kozyrakis and Ion Stoica and Joseph E. Gonzalez and Clark Barrett and Ying Sheng},
+      year={2024},
       eprint={2312.07104},
       archivePrefix={arXiv},
       primaryClass={cs.AI}

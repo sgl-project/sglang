@@ -88,9 +88,9 @@ def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
     return pred
 
 
-def call_generate_xinfer(prompt, temperature, max_tokens, stop=None, url=None):
+def call_generate_ginfer(prompt, temperature, max_tokens, stop=None, url=None):
     import grpc
-    from xlm.proto import sampler_pb2, sampler_pb2_grpc
+    from ginfer import sampler_pb2, sampler_pb2_grpc
 
     sampler_channel = grpc.insecure_channel(url.replace("http://", ""))
     sampler = sampler_pb2_grpc.SamplerStub(sampler_channel)
@@ -255,7 +255,7 @@ def add_common_other_args_and_parse(parser):
             "vllm",
             "outlines",
             "lightllm",
-            "xinfer",
+            "ginfer",
             "guidance",
             "lmql",
             "srt-raw",
@@ -276,7 +276,7 @@ def add_common_other_args_and_parse(parser):
             "lightllm": 22000,
             "lmql": 23000,
             "srt-raw": 30000,
-            "xinfer": 9988,
+            "ginfer": 9988,
         }
         args.port = default_port.get(args.backend, None)
     return args
@@ -312,8 +312,8 @@ def _get_call_generate(args):
         return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "srt-raw":
         return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "xinfer":
-        return partial(call_generate_xinfer, url=f"{args.host}:{args.port}")
+    elif args.backend == "ginfer":
+        return partial(call_generate_ginfer, url=f"{args.host}:{args.port}")
     elif args.backend == "outlines":
         return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "guidance":

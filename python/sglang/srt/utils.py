@@ -12,6 +12,7 @@ from io import BytesIO
 from typing import List, Optional
 
 import numpy as np
+import psutil
 import requests
 import rpyc
 import torch
@@ -421,9 +422,10 @@ def suppress_other_loggers():
     from vllm.logger import logger as vllm_default_logger
 
     vllm_default_logger.setLevel(logging.WARN)
-    logging.getLogger("vllm.utils").setLevel(logging.WARN)
-    logging.getLogger("vllm.selector").setLevel(logging.WARN)
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
+    logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(logging.WARN)
+    logging.getLogger("vllm.selector").setLevel(logging.WARN)
+    logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
 
 def assert_pkg_version(pkg: str, min_version: str):
@@ -438,6 +440,31 @@ def assert_pkg_version(pkg: str, min_version: str):
         raise Exception(
             f"{pkg} with minimum required version {min_version} is not installed"
         )
+
+
+def kill_parent_process():
+    """Kill the parent process and all children of the parent process."""
+    current_process = psutil.Process()
+    parent_process = current_process.parent()
+    children = current_process.children(recursive=True)
+    for child in children:
+        if child.pid != current_process.pid:
+            os.kill(child.pid, 9)
+    os.kill(parent_process.pid, 9)
+
+
+def monkey_patch_vllm_p2p_access_check(gpu_id: int):
+    """
+    Monkey patch the slow p2p access check in vllm.
+    NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
+    """
+
+    # TODO: need a better check than just dev str name match
+    # compat: skip RTX 40 series as they do not have P2P feature and even checking for them may cause errors
+    device_name = torch.cuda.get_device_name(gpu_id)
+    if "RTX 40" not in device_name:
+        import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+        setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
 
 API_KEY_HEADER_NAME = "X-API-Key"
@@ -458,3 +485,4 @@ class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
             )
         response = await call_next(request)
         return response
+

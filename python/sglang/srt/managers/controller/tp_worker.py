@@ -1,3 +1,5 @@
+"""A tensor parallel worker."""
+
 import asyncio
 import logging
 import time
@@ -19,7 +21,13 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.controller.infer_batch import Batch, FinishReason, ForwardMode, Req
+from sglang.srt.managers.controller.infer_batch import (
+    BaseFinishReason,
+    Batch,
+    FINISH_ABORT,
+    ForwardMode,
+    Req,
+)
 from sglang.srt.managers.controller.model_runner import ModelRunner
 from sglang.srt.managers.controller.radix_cache import RadixCache
 from sglang.srt.managers.controller.schedule_heuristic import ScheduleHeuristic
@@ -34,7 +42,7 @@ from sglang.srt.utils import (
 )
 from sglang.utils import get_exception_traceback
 
-logger = logging.getLogger("srt.model_tp")
+logger = logging.getLogger("srt.tp_worker")
 
 
 class ModelTpServer:
@@ -96,8 +104,11 @@ class ModelTpServer:
                 else server_args.max_prefill_tokens
             ),
         )
-        self.max_running_requests = (self.max_total_num_tokens // 2
-            if server_args.max_running_requests is None else server_args.max_running_requests)
+        self.max_running_requests = (
+            self.max_total_num_tokens // 2
+            if server_args.max_running_requests is None
+            else server_args.max_running_requests
+        )
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
         )
@@ -111,7 +122,10 @@ class ModelTpServer:
             f"context_len={self.model_config.context_len}, "
         )
         if self.tp_rank == 0:
-            logger.info(f"server_args: {server_args.print_mode_args()}")
+            logger.info(
+                f"[gpu_id={self.gpu_id}] "
+                f"server_args: {server_args.print_mode_args()}"
+            )
 
         # Init cache
         self.tree_cache = RadixCache(
@@ -184,7 +198,8 @@ class ModelTpServer:
             # Forward
             self.forward_step()
         except Exception:
-            logger.error("Exception in ModelTpClient:\n" + get_exception_traceback())
+            logger.error("Exception in ModelTpServer:\n" + get_exception_traceback())
+            raise
 
         # Return results
         ret = self.out_pyobjs
@@ -226,7 +241,7 @@ class ModelTpServer:
                             self.num_generated_tokens = 0
                             self.last_stats_tic = time.time()
                             logger.info(
-                                f"[gpu_id={self.gpu_id}] "
+                                f"[gpu_id={self.gpu_id}] Decode batch. "
                                 f"#running-req: {len(self.running_batch.reqs)}, "
                                 f"#token: {num_used}, "
                                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -308,10 +323,7 @@ class ModelTpServer:
 
         # Compute matched prefix length
         for req in self.forward_queue:
-            assert (
-                len(req.output_ids) == 0
-            ), "The output ids should be empty when prefilling"
-            req.input_ids = req.origin_input_ids + req.prev_output_ids
+            req.input_ids = req.origin_input_ids + req.output_ids
             prefix_indices, last_node = self.tree_cache.match_prefix(req.input_ids)
             if req.return_logprob:
                 prefix_indices = prefix_indices[: req.logprob_start_len]
@@ -397,12 +409,13 @@ class ModelTpServer:
                 self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
             )
             logger.info(
-                f"new fill batch. #seq: {len(can_run_list)}. "
-                f"#cached_token: {hit_tokens}. "
-                f"#new_token: {new_batch_input_tokens}. "
-                f"#remaining_req: {len(self.forward_queue) - len(can_run_list)}. "
-                f"#running_req: {running_req}. "
-                f"tree_cache_hit_rate: {100.0 * tree_cache_hit_rate:.2f}%. "
+                f"[gpu_id={self.gpu_id}] Prefil batch. "
+                f"#new-seq: {len(can_run_list)}, "
+                f"#new-token: {new_batch_input_tokens}, "
+                f"#cached-token: {hit_tokens}, "
+                f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                f"#running-req: {running_req}, "
+                f"#queue-req: {len(self.forward_queue) - len(can_run_list)}"
             )
             # logger.debug(
             #    f"fsm_cache_hit_rate: {100.0 * self.regex_fsm_cache.get_cache_hit_rate():.2f}%. "
@@ -457,7 +470,7 @@ class ModelTpServer:
         pt = 0
         for i, req in enumerate(batch.reqs):
             req.completion_tokens_wo_jump_forward += 1
-            req.output_ids = [next_token_ids[i]]
+            req.output_ids.append(next_token_ids[i])
             req.check_finished()
 
             if req.return_logprob:
@@ -517,7 +530,7 @@ class ModelTpServer:
         req_pool_indices_cpu = batch.req_pool_indices.cpu().numpy()
         for i, req in enumerate(batch.reqs):
             new_prefix_indices, new_last_node = self.tree_cache.cache_req(
-                token_ids=tuple(req.input_ids + req.output_ids)[:-1],
+                token_ids=tuple(req.origin_input_ids + req.output_ids)[:-1],
                 last_uncached_pos=len(req.prefix_indices),
                 req_pool_idx=req_pool_indices_cpu[i],
                 del_in_memory_pool=False,
@@ -589,22 +602,22 @@ class ModelTpServer:
 
     def handle_finished_requests(self, batch: Batch):
         output_rids = []
-        prev_output_strs = []
-        output_tokens = []
-        output_hit_stop_str = []
+        decoded_texts = []
+        surr_output_ids = []
+        read_output_ids = []
         output_skip_special_tokens = []
         output_spaces_between_special_tokens = []
         output_meta_info = []
-        output_finished = []
+        output_finished_reason: List[BaseFinishReason] = []
         finished_indices = []
         unfinished_indices = []
         for i, req in enumerate(batch.reqs):
-            if req.finished:
+            if req.finished():
                 finished_indices.append(i)
             else:
                 unfinished_indices.append(i)
 
-            if req.finished or (
+            if req.finished() or (
                 (
                     req.stream
                     and (
@@ -614,9 +627,10 @@ class ModelTpServer:
                 )
             ):
                 output_rids.append(req.rid)
-                prev_output_strs.append(req.prev_output_str)
-                output_tokens.append(req.output_ids)
-                output_hit_stop_str.append(req.hit_stop_str)
+                decoded_texts.append(req.decoded_text)
+                surr_ids, read_ids, _ = req.init_detokenize_incrementally()
+                surr_output_ids.append(surr_ids)
+                read_output_ids.append(read_ids)
                 output_skip_special_tokens.append(
                     req.sampling_params.skip_special_tokens
                 )
@@ -626,10 +640,9 @@ class ModelTpServer:
 
                 meta_info = {
                     "prompt_tokens": len(req.origin_input_ids),
-                    "completion_tokens": len(req.prev_output_ids) + len(req.output_ids),
+                    "completion_tokens": len(req.output_ids),
                     "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
-                    "finish_reason": FinishReason.to_str(req.finish_reason),
-                    "hit_stop_str": req.hit_stop_str,
+                    "finish_reason": str(req.finished_reason),
                 }
                 if req.return_logprob:
                     (
@@ -646,20 +659,20 @@ class ModelTpServer:
                         req.normalized_prompt_logprob,
                     )
                 output_meta_info.append(meta_info)
-                output_finished.append(req.finished)
+                output_finished_reason.append(req.finished_reason)
 
         # Send to detokenizer
         if output_rids:
             self.out_pyobjs.append(
                 BatchTokenIDOut(
                     output_rids,
-                    prev_output_strs,
-                    output_tokens,
-                    output_hit_stop_str,
+                    decoded_texts,
+                    surr_output_ids,
+                    read_output_ids,
                     output_skip_special_tokens,
                     output_spaces_between_special_tokens,
                     output_meta_info,
-                    output_finished,
+                    output_finished_reason,
                 )
             )
 
@@ -670,7 +683,7 @@ class ModelTpServer:
             for i in finished_indices:
                 req = batch.reqs[i]
                 self.tree_cache.cache_req(
-                    token_ids=tuple(req.input_ids + req.output_ids)[:-1],
+                    token_ids=tuple(req.origin_input_ids + req.output_ids)[:-1],
                     last_uncached_pos=len(req.prefix_indices),
                     req_pool_idx=req_pool_indices_cpu[i],
                 )
@@ -716,8 +729,7 @@ class ModelTpServer:
         if self.running_batch:
             for req in self.running_batch.reqs:
                 if req.rid == recv_req.rid:
-                    req.finished = True
-                    req.finish_reason = FinishReason.ABORT
+                    req.finished_reason = FINISH_ABORT()
                     break
 
 

@@ -1,8 +1,14 @@
+"""
+The definition of objects transfered between different
+processes (TokenizerManager, DetokenizerManager, Controller).
+"""
+
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.sampling_params import SamplingParams
+from sglang.srt.managers.controller.infer_batch import BaseFinishReason
 
 
 @dataclass
@@ -105,13 +111,13 @@ class TokenizedGenerateReqInput:
 @dataclass
 class BatchTokenIDOut:
     rids: List[str]
-    prev_output_strs : List[str]
-    output_tokens: List[List[int]]
-    hit_stop_str: List[Optional[str]]
+    decoded_texts: List[str]
+    surr_output_ids: List[List[int]]
+    read_output_ids: List[List[int]]
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
     meta_info: List[Dict]
-    finished: List[bool]
+    finished_reason: List[BaseFinishReason]
 
 
 @dataclass
@@ -119,7 +125,7 @@ class BatchStrOut:
     rids: List[str]
     output_str: List[str]
     meta_info: List[Dict]
-    finished: List[bool]
+    finished_reason: List[BaseFinishReason]
 
 
 @dataclass
