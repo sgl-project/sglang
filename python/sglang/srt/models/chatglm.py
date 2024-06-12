@@ -5,7 +5,6 @@
 from typing import Iterable, List, Optional, Tuple
 
 import torch
-from peft import LoraConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.controller.model_runner import InputMetadata
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -30,6 +29,8 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 from vllm.transformers_utils.configs import ChatGLMConfig
 
+
+LoraConfig = None
 
 
 class GLMAttention(nn.Module):
