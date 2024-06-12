@@ -1,5 +1,5 @@
 """Cache for the compressed finite state machine."""
-from sglang.srt.constrained import RegexFSM, TransformerTokenizer
+from sglang.srt.constrained import RegexGuide, TransformerTokenizer
 from sglang.srt.constrained.base_cache import BaseCache
 
 
@@ -26,4 +26,4 @@ class FSMCache(BaseCache):
             )
 
     def init_value(self, regex):
-        return RegexFSM(regex, self.outlines_tokenizer)
+        return RegexGuide(regex, self.outlines_tokenizer)
