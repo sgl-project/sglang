@@ -26,7 +26,7 @@ class GlobalConfig:
         self.concate_and_append_mode = "no_adjust"
 
         # Request dependency time due to network delay
-        self.request_dependency_delay = 0.03
+        self.request_dependency_delay = 0.02
         self.wait_for_new_request_delay = 0.0006
 
         # New generation token ratio estimation
