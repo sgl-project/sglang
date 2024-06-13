@@ -81,12 +81,10 @@ class SglSamplingParams:
             "top_p": self.top_p,
             "top_k": self.top_k,
         }
-        
+
     def to_litellm_kwargs(self):
         if self.regex is not None:
-            warnings.warn(
-                "Regular expression is not supported in the LiteLLM backend."
-            )
+            warnings.warn("Regular expression is not supported in the LiteLLM backend.")
         return {
             "max_tokens": self.max_new_tokens,
             "stop": self.stop or None,

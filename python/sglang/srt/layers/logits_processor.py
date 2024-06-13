@@ -1,4 +1,5 @@
 """Logits processing."""
+
 import torch
 from torch import nn
 from vllm.distributed import (

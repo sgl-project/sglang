@@ -1,6 +1,6 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/qwen.py#L1
-from typing import Any, Dict, Optional, Iterable, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn

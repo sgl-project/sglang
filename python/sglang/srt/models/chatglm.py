@@ -5,30 +5,32 @@
 from typing import Iterable, List, Optional, Tuple
 
 import torch
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.controller.model_runner import InputMetadata
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from torch import nn
 from torch.nn import LayerNorm
-
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               QKVParallelLinear,
-                                               RowParallelLinear)
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 from vllm.transformers_utils.configs import ChatGLMConfig
 
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.controller.model_runner import InputMetadata
 
 LoraConfig = None
 
@@ -49,9 +51,11 @@ class GLMAttention(nn.Module):
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
         self.multi_query_attention = config.multi_query_attention
-        self.total_num_kv_heads = (config.multi_query_group_num
-                                   if config.multi_query_attention else
-                                   config.num_attention_heads)
+        self.total_num_kv_heads = (
+            config.multi_query_group_num
+            if config.multi_query_attention
+            else config.num_attention_heads
+        )
         if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
@@ -91,11 +95,13 @@ class GLMAttention(nn.Module):
             base=10000 * rope_ratio,
             is_neox_style=False,
         )
-        self.attn = RadixAttention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads,
-                              layer_id=layer_id)
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+        )
 
     def forward(
         self,
@@ -176,14 +182,16 @@ class GLMBlock(nn.Module):
     ):
         super().__init__()
         self.apply_residual_connection_post_layernorm = (
-            config.apply_residual_connection_post_layernorm)
+            config.apply_residual_connection_post_layernorm
+        )
 
         self.fp32_residual_connection = config.fp32_residual_connection
 
         layer_norm_func = RMSNorm if config.rmsnorm else LayerNorm
         # Layernorm on the input data.
-        self.input_layernorm = layer_norm_func(config.hidden_size,
-                                               eps=config.layernorm_epsilon)
+        self.input_layernorm = layer_norm_func(
+            config.hidden_size, eps=config.layernorm_epsilon
+        )
 
         # Self attention.
         self.self_attention = GLMAttention(config, layer_id, cache_config, quant_config)
@@ -191,7 +199,8 @@ class GLMBlock(nn.Module):
 
         # Layernorm on the attention output
         self.post_attention_layernorm = layer_norm_func(
-            config.hidden_size, eps=config.layernorm_epsilon)
+            config.hidden_size, eps=config.layernorm_epsilon
+        )
 
         # MLP
         self.mlp = GLMMLP(config, quant_config)
@@ -250,16 +259,19 @@ class GLMTransformer(nn.Module):
         self.num_layers = config.num_layers
 
         # Transformer layers.
-        self.layers = nn.ModuleList([
-            GLMBlock(config, i, cache_config, quant_config)
-            for i in range(self.num_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                GLMBlock(config, i, cache_config, quant_config)
+                for i in range(self.num_layers)
+            ]
+        )
 
         if self.post_layer_norm:
             layer_norm_func = RMSNorm if config.rmsnorm else LayerNorm
             # Final layer norm before output.
             self.final_layernorm = layer_norm_func(
-                config.hidden_size, eps=config.layernorm_epsilon)
+                config.hidden_size, eps=config.layernorm_epsilon
+            )
 
     def forward(
         self,
@@ -291,16 +303,16 @@ class ChatGLMModel(nn.Module):
     ):
         super().__init__()
 
-        self.embedding = VocabParallelEmbedding(config.padded_vocab_size,
-                                                config.hidden_size)
+        self.embedding = VocabParallelEmbedding(
+            config.padded_vocab_size, config.hidden_size
+        )
 
         self.num_layers = config.num_layers
         self.multi_query_group_num = config.multi_query_group_num
         self.kv_channels = config.kv_channels
         self.encoder = GLMTransformer(config, cache_config, quant_config)
 
-        self.output_layer = ParallelLMHead(config.padded_vocab_size,
-                                           config.hidden_size)
+        self.output_layer = ParallelLMHead(config.padded_vocab_size, config.hidden_size)
 
     def forward(
         self,
@@ -322,7 +334,7 @@ class ChatGLMModel(nn.Module):
 class ChatGLMForCausalLM(nn.Module):
     packed_modules_mapping = {
         "query_key_value": ["query_key_value"],
-        "dense_h_to_4h": ["dense_h_to_4h"]
+        "dense_h_to_4h": ["dense_h_to_4h"],
     }
     # LoRA specific attributes
     supported_lora_modules = [
@@ -344,8 +356,7 @@ class ChatGLMForCausalLM(nn.Module):
         super().__init__()
         self.config: ChatGLMConfig = config
         self.quant_config = quant_config
-        self.max_position_embeddings = getattr(config, "max_sequence_length",
-                                               8192)
+        self.max_position_embeddings = getattr(config, "max_sequence_length", 8192)
         self.transformer = ChatGLMModel(config, cache_config, quant_config)
         self.lm_head = self.transformer.output_layer
         self.logits_processor = LogitsProcessor(config)
@@ -357,8 +368,7 @@ class ChatGLMForCausalLM(nn.Module):
         positions: torch.Tensor,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions,
-                                         input_metadata)
+        hidden_states = self.transformer(input_ids, positions, input_metadata)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
@@ -382,9 +392,9 @@ class ChatGLMForCausalLM(nn.Module):
             if name.endswith(".bias") and name not in params_dict:
                 continue
             param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
+
 
 EntryClass = ChatGLMForCausalLM
 # compat: glm model.config class == ChatGLMModel

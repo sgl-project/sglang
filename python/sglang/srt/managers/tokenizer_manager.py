@@ -1,11 +1,12 @@
 """TokenizerManager is a process that tokenizes the text."""
+
 import asyncio
 import concurrent.futures
 import dataclasses
 import logging
 import multiprocessing as mp
 import os
-from typing import List, Dict
+from typing import Dict, List
 
 import numpy as np
 import transformers
@@ -23,11 +24,11 @@ from sglang.srt.hf_transformers_utils import (
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchStrOut,
+    BatchTokenIDOut,
     FlushCacheReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.io_struct import BatchTokenIDOut
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -91,7 +92,7 @@ class TokenizerManager:
             )
 
         self.to_create_loop = True
-        self.rid_to_state: Dict[str, ReqState] = {} 
+        self.rid_to_state: Dict[str, ReqState] = {}
 
     async def get_pixel_values(self, image_data):
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
@@ -321,7 +322,6 @@ class TokenizerManager:
                 state.out_list.append(out_dict)
                 state.finished = recv_obj.finished_reason[i] is not None
                 state.event.set()
-
 
     def convert_logprob_style(
         self, ret, return_logprob, top_logprobs_num, return_text_in_logprobs

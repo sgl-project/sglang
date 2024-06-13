@@ -7,8 +7,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
-from sglang.srt.sampling_params import SamplingParams
 from sglang.srt.managers.controller.infer_batch import BaseFinishReason
+from sglang.srt.sampling_params import SamplingParams
 
 
 @dataclass
