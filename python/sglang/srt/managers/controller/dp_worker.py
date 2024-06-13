@@ -4,7 +4,7 @@ import asyncio
 import logging
 import queue
 import threading
-from typing import Callable, List
+from typing import List, Callable
 
 import uvloop
 import zmq
@@ -70,9 +70,7 @@ class DataParallelWorkerThread(threading.Thread):
 
             # async sleep for receiving the subsequent request and avoiding cache miss
             if len(out_pyobjs) != 0:
-                has_finished = any(
-                    [obj.finished_reason is not None for obj in out_pyobjs]
-                )
+                has_finished = any([obj.finished_reason is not None for obj in out_pyobjs])
                 if has_finished:
                     await asyncio.sleep(self.request_dependency_delay)
             await asyncio.sleep(global_config.wait_for_new_request_delay)

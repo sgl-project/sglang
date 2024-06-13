@@ -2,8 +2,6 @@ import unittest
 
 from sglang import OpenAI, set_default_backend
 from sglang.test.test_programs import (
-    test_chat_completion_speculative,
-    test_completion_speculative,
     test_decode_int,
     test_decode_json,
     test_expert_answer,
@@ -16,6 +14,8 @@ from sglang.test.test_programs import (
     test_select,
     test_stream,
     test_tool_use,
+    test_completion_speculative,
+    test_chat_completion_speculative
 )
 
 

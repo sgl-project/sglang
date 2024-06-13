@@ -1,7 +1,6 @@
 """Radix attention."""
-
-import numpy as np
 import torch
+import numpy as np
 from torch import nn
 
 from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
@@ -11,9 +10,7 @@ from sglang.srt.managers.controller.model_runner import ForwardMode, InputMetada
 
 
 class RadixAttention(nn.Module):
-    def __init__(
-        self, num_heads, head_dim, scaling, num_kv_heads, layer_id, logit_cap=-1
-    ):
+    def __init__(self, num_heads, head_dim, scaling, num_kv_heads, layer_id, logit_cap=-1):
         super().__init__()
         self.tp_q_head_num = num_heads
         self.tp_k_head_num = num_kv_heads
@@ -46,7 +43,6 @@ class RadixAttention(nn.Module):
             input_metadata.start_loc,
             input_metadata.seq_lens,
             input_metadata.max_seq_len,
-            self.logit_cap,
         )
         self.store_kv_cache(k, v, input_metadata)
 

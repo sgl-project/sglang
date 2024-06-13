@@ -15,6 +15,7 @@ from json import dumps
 import numpy as np
 import requests
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -254,9 +255,7 @@ def run_with_timeout(func, args=(), kwargs=None, timeout=None):
 
 def graceful_registry(sub_module_name):
     def graceful_shutdown(signum, frame):
-        logger.info(
-            f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
-        )
+        logger.info(f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown...")
         if signum == signal.SIGTERM:
             logger.info(f"{sub_module_name} recive sigterm")
 

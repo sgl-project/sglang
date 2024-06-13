@@ -4,10 +4,10 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.managers.controller.model_runner import ModelRunner
 from sglang.srt.model_config import ModelConfig
-
+from typing import List
 
 @dataclass
 class BenchBatch:
@@ -22,6 +22,9 @@ class BenchBatch:
     out_cache_loc: torch.Tensor = None
     out_cache_cont_start: torch.Tensor = None
     out_cache_cont_end: torch.Tensor = None
+    top_logprobs_nums: List[int] = None
+    return_logprob: bool = False
+
 
     def __init__(self, model_runner: ModelRunner):
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -90,13 +93,7 @@ class BenchBatch:
 
 def prefill(model_runner: ModelRunner, batch: BenchBatch):
     logits, _ = model_runner.forward_extend(
-        batch.input_ids,
-        batch.req_pool_indices,
-        batch.seq_lens,
-        batch.prefix_lens,
-        batch.position_ids_offsets,
-        batch.out_cache_loc,
-        False,
+        batch
     )
 
     prob_out = torch.softmax(logits, dim=-1)
@@ -108,13 +105,7 @@ def prefill(model_runner: ModelRunner, batch: BenchBatch):
 
 def extend(model_runner: ModelRunner, batch: BenchBatch):
     logits, _ = model_runner.forward_extend(
-        batch.input_ids,
-        batch.req_pool_indices,
-        batch.seq_lens,
-        batch.prefix_lens,
-        batch.position_ids_offsets,
-        batch.out_cache_loc,
-        True,
+        batch
     )
 
     prob_out = torch.softmax(logits, dim=-1)
@@ -125,15 +116,8 @@ def extend(model_runner: ModelRunner, batch: BenchBatch):
 
 
 def decode(model_runner: ModelRunner, batch: BenchBatch):
-    logits = model_runner.forward_decode(
-        batch.input_ids,
-        batch.req_pool_indices,
-        batch.seq_lens,
-        None,
-        batch.position_ids_offsets,
-        None,
-        batch.out_cache_cont_start,
-        batch.out_cache_cont_end,
+    logits, _= model_runner.forward_decode(
+        batch
     )
 
     prob_out = torch.softmax(logits, dim=-1)
@@ -163,7 +147,8 @@ def bench_generate_worker(
         tp_rank=tp_rank,
         tp_size=tp_size,
         nccl_port=28888,
-        server_args_dict=server_args_dict,
+        server_args= ServerArgs(model_path=model_path),
+        gpu_id=0
     )
 
     batch = BenchBatch(model_runner)
