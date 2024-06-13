@@ -1,7 +1,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
-from typing import Any, Dict, Optional, Tuple, Iterable
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import tqdm
@@ -10,7 +10,7 @@ from transformers import LlamaConfig
 from vllm.config import CacheConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size
+    get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -158,9 +158,11 @@ class LlamaDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
-                config, "original_max_position_embeddings", None):
+            config, "original_max_position_embeddings", None
+        ):
             rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings)
+                config.original_max_position_embeddings
+            )
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = LlamaAttention(
             hidden_size=self.hidden_size,

@@ -6,7 +6,7 @@ import os
 from http import HTTPStatus
 
 from fastapi import Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from sglang.srt.conversation import (
     Conversation,
@@ -40,21 +40,18 @@ chat_template_name = None
 def create_error_response(
     message: str,
     err_type: str = "BadRequestError",
-    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST):
-    error = ErrorResponse(message=message,
-                          type=err_type,
-                          code=status_code.value)
-    return JSONResponse(content=error.model_dump(),
-                        status_code=error.code)
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+):
+    error = ErrorResponse(message=message, type=err_type, code=status_code.value)
+    return JSONResponse(content=error.model_dump(), status_code=error.code)
 
 
 def create_streaming_error_response(
     message: str,
     err_type: str = "BadRequestError",
-    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> str:
-    error = ErrorResponse(message=message,
-                          type=err_type,
-                          code=status_code.value)
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+) -> str:
+    error = ErrorResponse(message=message, type=err_type, code=status_code.value)
     json_str = json.dumps({"error": error.model_dump()})
     return json_str
 
@@ -125,7 +122,8 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
             n_prev_token = 0
             try:
                 async for content in tokenizer_manager.generate_request(
-                    adapted_request, raw_request):
+                    adapted_request, raw_request
+                ):
                     text = content["text"]
                     prompt_tokens = content["meta_info"]["prompt_tokens"]
                     completion_tokens = content["meta_info"]["completion_tokens"]
@@ -154,12 +152,14 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                             decode_token_logprobs=content["meta_info"][
                                 "decode_token_logprobs"
                             ][n_prev_token:],
-                            decode_top_logprobs=content["meta_info"]["decode_top_logprobs"][
-                                n_prev_token:
-                            ],
+                            decode_top_logprobs=content["meta_info"][
+                                "decode_top_logprobs"
+                            ][n_prev_token:],
                         )
 
-                        n_prev_token = len(content["meta_info"]["decode_token_logprobs"])
+                        n_prev_token = len(
+                            content["meta_info"]["decode_token_logprobs"]
+                        )
                     else:
                         logprobs = None
 
@@ -188,13 +188,17 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                 yield f"data: {error}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(generate_stream_resp(), media_type="text/event-stream",
-                                 background=tokenizer_manager.create_abort_task(adapted_request))
+        return StreamingResponse(
+            generate_stream_resp(),
+            media_type="text/event-stream",
+            background=tokenizer_manager.create_abort_task(adapted_request),
+        )
 
     # Non-streaming response.
     try:
         ret = await tokenizer_manager.generate_request(
-            adapted_request, raw_request).__anext__()
+            adapted_request, raw_request
+        ).__anext__()
     except ValueError as e:
         return create_error_response(str(e))
 
@@ -299,7 +303,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
             stream_buffer = ""
             try:
-                async for content in tokenizer_manager.generate_request(adapted_request, raw_request):
+                async for content in tokenizer_manager.generate_request(
+                    adapted_request, raw_request
+                ):
                     if is_first:
                         # First chunk with role
                         is_first = False
@@ -334,13 +340,17 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                 yield f"data: {error}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(generate_stream_resp(), media_type="text/event-stream",
-                                 background=tokenizer_manager.create_abort_task(adapted_request))
+        return StreamingResponse(
+            generate_stream_resp(),
+            media_type="text/event-stream",
+            background=tokenizer_manager.create_abort_task(adapted_request),
+        )
 
     # Non-streaming response.
     try:
         ret = await tokenizer_manager.generate_request(
-            adapted_request, raw_request).__anext__()
+            adapted_request, raw_request
+        ).__anext__()
     except ValueError as e:
         return create_error_response(str(e))
 

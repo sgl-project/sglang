@@ -1,17 +1,17 @@
 """Meta data for requests and batches"""
 
+import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import List
-import warnings
 
 import numpy as np
 import torch
 
+from sglang.srt.constrained import RegexGuide
+from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.managers.controller.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
-from sglang.srt.constrained.jump_forward import JumpForwardMap
-from sglang.srt.constrained import RegexGuide
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 

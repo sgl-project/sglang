@@ -1,8 +1,8 @@
 """Common utilities."""
 
 import base64
-import multiprocessing
 import logging
+import multiprocessing
 import os
 import random
 import socket
@@ -17,11 +17,10 @@ import requests
 import rpyc
 import torch
 import triton
-from rpyc.utils.server import ThreadedServer
 from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
+from rpyc.utils.server import ThreadedServer
 from starlette.middleware.base import BaseHTTPMiddleware
-
 
 logger = logging.getLogger(__name__)
 
@@ -377,7 +376,7 @@ def init_rpyc_service(service: rpyc.Service, port: int):
         protocol_config={
             "allow_public_attrs": True,
             "allow_pickle": True,
-            "sync_request_timeout": 3600
+            "sync_request_timeout": 3600,
         },
     )
     t.logger.setLevel(logging.WARN)
@@ -396,7 +395,7 @@ def connect_to_rpyc_service(port, host="localhost"):
                 config={
                     "allow_public_attrs": True,
                     "allow_pickle": True,
-                    "sync_request_timeout": 3600
+                    "sync_request_timeout": 3600,
                 },
             )
             break
@@ -423,7 +422,9 @@ def suppress_other_loggers():
 
     vllm_default_logger.setLevel(logging.WARN)
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
-    logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(logging.WARN)
+    logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
+        logging.WARN
+    )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
     logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
@@ -464,6 +465,7 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     device_name = torch.cuda.get_device_name(gpu_id)
     if "RTX 40" not in device_name:
         import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+
         setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
 
@@ -485,4 +487,3 @@ class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
             )
         response = await call_next(request)
         return response
-

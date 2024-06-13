@@ -1,4 +1,5 @@
 """A controller that manages a group of tensor parallel workers."""
+
 import asyncio
 import logging
 import time
@@ -49,7 +50,9 @@ class ControllerSingle:
             # async sleep for receiving the subsequent request and avoiding cache miss
             slept = False
             if len(out_pyobjs) != 0:
-                has_finished = any([obj.finished_reason is not None for obj in out_pyobjs])
+                has_finished = any(
+                    [obj.finished_reason is not None for obj in out_pyobjs]
+                )
                 if has_finished:
                     if self.request_dependency_delay > 0:
                         slept = True

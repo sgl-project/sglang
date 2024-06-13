@@ -2,7 +2,7 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/stablelm.py#L1
 """Inference-only StableLM-2 (https://huggingface.co/stabilityai/stablelm-2-1_6b)
 model compatible with HuggingFace weights."""
-from typing import Optional, Tuple, Iterable
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn

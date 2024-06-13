@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from http import HTTPStatus
-from typing import Optional, Dict
+from typing import Dict, Optional
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -29,10 +29,14 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.constrained import disable_cache
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.managers.controller.manager_multi import (
+    start_controller_process as start_controller_process_multi,
+)
+from sglang.srt.managers.controller.manager_single import (
+    start_controller_process as start_controller_process_single,
+)
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.controller.manager_single import start_controller_process as start_controller_process_single
-from sglang.srt.managers.controller.manager_multi import start_controller_process as start_controller_process_multi
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api_adapter import (
     load_chat_template_for_openai_api,
@@ -97,8 +101,11 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(stream_results(), media_type="text/event-stream",
-                                 background=tokenizer_manager.create_abort_task(obj))
+        return StreamingResponse(
+            stream_results(),
+            media_type="text/event-stream",
+            background=tokenizer_manager.create_abort_task(obj),
+        )
     else:
         try:
             ret = await tokenizer_manager.generate_request(obj, request).__anext__()
