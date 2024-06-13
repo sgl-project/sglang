@@ -158,7 +158,9 @@ async def send_request(
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             while True:
-                async with session.post(api_url, headers=headers, json=pload) as response:
+                async with session.post(
+                    api_url, headers=headers, json=pload
+                ) as response:
                     chunks = []
                     async for chunk, _ in response.content.iter_chunks():
                         chunks.append(chunk)
@@ -228,19 +230,32 @@ def main(args: argparse.Namespace):
     np.random.seed(args.seed)
 
     api_url = f"http://{args.host}:{args.port}/generate"
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer, trust_remote_code=args.trust_remote_code
+    )
 
     if args.dataset:
         input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
     else:
         input_lens = np.random.randint(
-            int(args.input_len * args.range_ratio), args.input_len + 1, size=args.num_prompts)
+            int(args.input_len * args.range_ratio),
+            args.input_len + 1,
+            size=args.num_prompts,
+        )
         output_lens = np.random.randint(
-            int(args.output_len * args.range_ratio), args.output_len + 1, size=args.num_prompts)
+            int(args.output_len * args.range_ratio),
+            args.output_len + 1,
+            size=args.num_prompts,
+        )
         offsets = np.random.randint(0, tokenizer.vocab_size, size=args.num_prompts)
         input_requests = []
         for i in range(args.num_prompts):
-            prompt = tokenizer.decode([(offsets[i] + i + j) % tokenizer.vocab_size for j in range(input_lens[i])])
+            prompt = tokenizer.decode(
+                [
+                    (offsets[i] + i + j) % tokenizer.vocab_size
+                    for j in range(input_lens[i])
+                ]
+            )
             input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
 
     benchmark_start_time = time.perf_counter()
@@ -287,16 +302,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=30000)
-    parser.add_argument(
-        "--dataset", type=str, help="Path to the dataset."
-    )
+    parser.add_argument("--dataset", type=str, help="Path to the dataset.")
     parser.add_argument("--input-len", type=int, default=2048)
     parser.add_argument("--output-len", type=int, default=256)
     parser.add_argument("--range-ratio", type=float, default=1.0)
     parser.add_argument(
-        "--tokenizer", type=str,
+        "--tokenizer",
+        type=str,
         default="NousResearch/Meta-Llama-3-8B",
-        help="Name or path of the tokenizer."
+        help="Name or path of the tokenizer.",
     )
     parser.add_argument(
         "--best-of",

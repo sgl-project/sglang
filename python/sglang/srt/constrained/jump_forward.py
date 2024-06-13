@@ -8,11 +8,12 @@ from collections import defaultdict
 
 import interegular
 import outlines.caching
+
 from sglang.srt.constrained import (
     FSMInfo,
     disk_cache,
-    make_deterministic_fsm,
     make_byte_level_fsm,
+    make_deterministic_fsm,
 )
 from sglang.srt.constrained.base_cache import BaseCache
 

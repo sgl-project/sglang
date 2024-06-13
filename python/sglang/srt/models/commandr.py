@@ -23,7 +23,7 @@
 
 # This file is based on the LLama model definition file in transformers
 """PyTorch Cohere model."""
-from typing import Optional, Tuple, Iterable
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.utils.checkpoint
@@ -44,8 +44,8 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.utils import set_weight_attrs
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
