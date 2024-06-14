@@ -5,7 +5,7 @@ import logging
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from typing import List, Optional
 
 import rpyc
 import torch
@@ -253,7 +253,7 @@ class ModelTpServer:
                         self.running_batch = None
                         break
 
-                    if self.out_pyobjs and self.running_batch.reqs[0].stream:
+                    if self.out_pyobjs and self.running_batch.has_stream():
                         break
             else:
                 # Check the available size
@@ -314,7 +314,7 @@ class ModelTpServer:
         )
         self.forward_queue.append(req)
 
-    def get_new_fill_batch(self):
+    def get_new_fill_batch(self) -> Optional[Batch]:
         if (
             self.running_batch is not None
             and len(self.running_batch.reqs) > self.max_running_requests
