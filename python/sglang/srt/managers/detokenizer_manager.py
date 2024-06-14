@@ -1,4 +1,5 @@
 """DetokenizerManager is a process that detokenizes the token ids."""
+
 import asyncio
 import inspect
 
@@ -7,10 +8,10 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.managers.controller.infer_batch import FINISH_MATCHED_STR
 from sglang.srt.managers.io_struct import BatchStrOut, BatchTokenIDOut
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.utils import get_exception_traceback, graceful_registry
-from sglang.srt.managers.controller.infer_batch import FINISH_MATCHED_STR
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 

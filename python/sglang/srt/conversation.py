@@ -1,4 +1,5 @@
 """Conversation templates."""
+
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 import dataclasses

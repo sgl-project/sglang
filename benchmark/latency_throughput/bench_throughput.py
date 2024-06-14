@@ -19,6 +19,7 @@ On the client side, run:
 import argparse
 import asyncio
 import json
+import os
 import random
 import time
 from typing import AsyncGenerator, List, Tuple
@@ -37,43 +38,62 @@ def sample_requests(
     num_requests: int,
     tokenizer: AutoTokenizer,
 ) -> List[Tuple[str, int, int]]:
-    # Load the dataset.
-    with open(dataset_path) as f:
-        dataset = json.load(f)
-    # Filter out the conversations with less than 2 turns.
-    dataset = [data for data in dataset if len(data["conversations"]) >= 2]
-    # Only keep the first two turns of each conversation.
-    dataset = [
-        (data["conversations"][0]["value"], data["conversations"][1]["value"])
-        for data in dataset
-    ]
 
-    # Tokenize the prompts and completions.
-    prompts = [prompt for prompt, _ in dataset]
-    prompt_token_ids = tokenizer(prompts).input_ids
-    completions = [completion for _, completion in dataset]
-    completion_token_ids = tokenizer(completions).input_ids
-    tokenized_dataset = []
-    for i in range(len(dataset)):
-        output_len = len(completion_token_ids[i])
-        tokenized_dataset.append((prompts[i], prompt_token_ids[i], output_len))
+    def load_dataset():
+        with open(dataset_path, encoding="utf-8") as f:
+            dataset = json.load(f)
+        # Filter out the conversations with less than 2 turns.
+        dataset = [data for data in dataset if len(data["conversations"]) >= 2]
+        # Only keep the first two turns of each conversation.
+        dataset = [
+            (data["conversations"][0]["value"], data["conversations"][1]["value"])
+            for data in dataset
+        ]
 
-    # Filter out too long sequences.
-    filtered_dataset: List[Tuple[str, int, int]] = []
-    for prompt, prompt_token_ids, output_len in tokenized_dataset:
-        prompt_len = len(prompt_token_ids)
-        if prompt_len < 4 or output_len < 4:
-            # Prune too short sequences.
-            # This is because TGI causes errors when the input or output length
-            # is too short.
-            continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
-            # Prune too long sequences.
-            continue
-        filtered_dataset.append((prompt, prompt_len, output_len))
+        # Tokenize the prompts and completions.
+        prompts = [prompt for prompt, _ in dataset]
+        prompt_token_ids = tokenizer(prompts).input_ids
+        completions = [completion for _, completion in dataset]
+        completion_token_ids = tokenizer(completions).input_ids
+        tokenized_dataset = []
+        for i in range(len(dataset)):
+            output_len = len(completion_token_ids[i])
+            tokenized_dataset.append((prompts[i], prompt_token_ids[i], output_len))
+
+        # Filter out too long sequences.
+        filtered_dataset: List[Tuple[str, int, int]] = []
+        for prompt, prompt_token_ids, output_len in tokenized_dataset:
+            prompt_len = len(prompt_token_ids)
+            if prompt_len < 4 or output_len < 4:
+                # Prune too short sequences.
+                # This is because TGI causes errors when the input or output length
+                # is too short.
+                continue
+            if prompt_len > 1024 or prompt_len + output_len > 2048:
+                # Prune too long sequences.
+                continue
+            filtered_dataset.append((prompt, prompt_len, output_len))
+
+        return filtered_dataset
+
+    try:
+        from diskcache import Cache
+
+        home_dir = os.path.expanduser("~")
+        cache = Cache(f"{home_dir}/.cache/sglang")
+        with Cache(cache.directory) as reference:
+            reference_key = f"{dataset_path}_{tokenizer.name_or_path}"
+            if reference_key in reference:
+                print("Reading dataset from cache...")
+                dataset = reference[reference_key]
+            else:
+                dataset = load_dataset()
+                reference[reference_key] = dataset
+    except ImportError:
+        dataset = load_dataset()
 
     # Sample the requests.
-    sampled_requests = random.sample(filtered_dataset, num_requests)
+    sampled_requests = random.sample(dataset, num_requests)
     return sampled_requests
 
 
@@ -158,7 +178,9 @@ async def send_request(
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             while True:
-                async with session.post(api_url, headers=headers, json=pload) as response:
+                async with session.post(
+                    api_url, headers=headers, json=pload
+                ) as response:
                     chunks = []
                     async for chunk, _ in response.content.iter_chunks():
                         chunks.append(chunk)
@@ -228,19 +250,32 @@ def main(args: argparse.Namespace):
     np.random.seed(args.seed)
 
     api_url = f"http://{args.host}:{args.port}/generate"
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer, trust_remote_code=args.trust_remote_code
+    )
 
     if args.dataset:
         input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
     else:
         input_lens = np.random.randint(
-            int(args.input_len * args.range_ratio), args.input_len + 1, size=args.num_prompts)
+            int(args.input_len * args.range_ratio),
+            args.input_len + 1,
+            size=args.num_prompts,
+        )
         output_lens = np.random.randint(
-            int(args.output_len * args.range_ratio), args.output_len + 1, size=args.num_prompts)
+            int(args.output_len * args.range_ratio),
+            args.output_len + 1,
+            size=args.num_prompts,
+        )
         offsets = np.random.randint(0, tokenizer.vocab_size, size=args.num_prompts)
         input_requests = []
         for i in range(args.num_prompts):
-            prompt = tokenizer.decode([(offsets[i] + i + j) % tokenizer.vocab_size for j in range(input_lens[i])])
+            prompt = tokenizer.decode(
+                [
+                    (offsets[i] + i + j) % tokenizer.vocab_size
+                    for j in range(input_lens[i])
+                ]
+            )
             input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
 
     benchmark_start_time = time.perf_counter()
@@ -287,16 +322,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=30000)
+    parser.add_argument("--dataset", type=str, help="Path to the dataset.")
+    parser.add_argument("--input-len", type=int, default=2048)
+    parser.add_argument("--output-len", type=int, default=256)
+    parser.add_argument("--range-ratio", type=float, default=1.0)
     parser.add_argument(
-        "--dataset", type=str, help="Path to the dataset."
-    )
-    parser.add_argument("--input-len", type=str, default=2048)
-    parser.add_argument("--output-len", type=str, default=256)
-    parser.add_argument("--range-ratio", type=float, default=0.5)
-    parser.add_argument(
-        "--tokenizer", type=str,
+        "--tokenizer",
+        type=str,
         default="NousResearch/Meta-Llama-3-8B",
-        help="Name or path of the tokenizer."
+        help="Name or path of the tokenizer.",
     )
     parser.add_argument(
         "--best-of",

@@ -507,7 +507,7 @@ class StreamExecutor:
                     )
                     return
 
-                else: # Speculative execution on models with completion interface
+                else:  # Speculative execution on models with completion interface
                     comp, meta_info = self._spec_gen(sampling_params)
 
             self.text_ += comp

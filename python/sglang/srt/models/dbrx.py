@@ -24,8 +24,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.dbrx import DbrxConfig
 
 from sglang.srt.layers.logits_processor import LogitsProcessor

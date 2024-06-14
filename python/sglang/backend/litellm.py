@@ -33,7 +33,8 @@ class LiteLLM(BaseBackend):
         self.model_name = model_name
 
         self.chat_template = chat_template or get_chat_template_by_model_path(
-            model_name)
+            model_name
+        )
 
         self.client_params = {
             "api_key": api_key,

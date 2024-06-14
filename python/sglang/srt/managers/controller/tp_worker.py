@@ -15,22 +15,22 @@ from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.io_struct import (
-    AbortReq,
-    BatchTokenIDOut,
-    FlushCacheReq,
-    TokenizedGenerateReqInput,
-)
 from sglang.srt.managers.controller.infer_batch import (
+    FINISH_ABORT,
     BaseFinishReason,
     Batch,
-    FINISH_ABORT,
     ForwardMode,
     Req,
 )
 from sglang.srt.managers.controller.model_runner import ModelRunner
 from sglang.srt.managers.controller.radix_cache import RadixCache
 from sglang.srt.managers.controller.schedule_heuristic import ScheduleHeuristic
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchTokenIDOut,
+    FlushCacheReq,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.server_args import ModelPortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -96,13 +96,13 @@ class ModelTpServer:
                 trust_remote_code=server_args.trust_remote_code,
             )
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
-        self.max_prefill_tokens = max(
-            self.model_config.context_len,
-            (
-                min(self.max_total_num_tokens // 6, 65536)
-                if server_args.max_prefill_tokens is None
-                else server_args.max_prefill_tokens
-            ),
+        self.max_prefill_tokens = (
+            max(
+                self.model_config.context_len,
+                min(self.max_total_num_tokens // 6, 65536),
+            )
+            if server_args.max_prefill_tokens is None
+            else server_args.max_prefill_tokens
         )
         self.max_running_requests = (
             self.max_total_num_tokens // 2

@@ -27,7 +27,7 @@ class GlobalConfig:
 
         # Request dependency time due to network delay
         self.request_dependency_delay = 0.02
-        self.wait_for_new_request_delay = 0.0004
+        self.wait_for_new_request_delay = 0.0006
 
         # New generation token ratio estimation
         self.base_new_token_ratio = 0.4
