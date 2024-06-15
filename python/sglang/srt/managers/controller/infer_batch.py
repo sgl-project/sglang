@@ -303,6 +303,10 @@ class Batch:
     def is_empty(self):
         return len(self.reqs) == 0
 
+    # whether batch has at least 1 streaming request
+    def has_stream(self) -> bool:
+        return any(r.stream for r in self.reqs)
+
     def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
         device = "cuda"
         bs = len(self.reqs)
