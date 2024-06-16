@@ -771,10 +771,10 @@ class ModelTpClient:
         else:
             with ThreadPoolExecutor(self.tp_size) as executor:
                 # Launch model processes
-                if server_args.rpyc_server_addrs:
+                if server_args.nnodes and server_args.nnodes > 1:
                     self.model_services = list(executor.map(
                         lambda args: connect_rpyc_service(*args),
-                        [addr.split(":") for addr in server_args.rpyc_server_addrs]
+                        [(ip, port) for ip, port in zip(model_port_args.model_tp_ips, model_port_args.model_tp_ports)]
                     ))
                 else:
                     self.procs = list(executor.map(

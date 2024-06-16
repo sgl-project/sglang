@@ -35,6 +35,7 @@ from sglang.srt.managers.controller.manager_multi import (
 from sglang.srt.managers.controller.manager_single import (
     start_controller_process as start_controller_process_single,
 )
+from sglang.srt.managers.controller.tp_worker import ModelTpService
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -52,8 +53,10 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     send_addrs_to_rank_0,
     receive_addrs,
+    start_rpyc_service_process,
 )
 from sglang.utils import get_exception_traceback
+
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -180,13 +183,17 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 
     # TODO multi-node dp is not supported
     assert not (server_args.dp_size > 1 and server_args.node_rank is not None)
-    if server_args.node_rank is not None:
+    if server_args.nnodes is not None and server_args.nnodes > 1:
         if server_args.node_rank != 0:
             send_addrs_to_rank_0(model_port_args[0], server_args)
         else:
             receive_addrs(model_port_args[0], server_args)
-    print(model_port_args[0])
-    exit()
+        for i in range(tp_size_local):
+            start_rpyc_service_process(ModelTpService, model_port_args[0].model_tp_ports[i])
+        if server_args.node_rank != 0:
+            print("Listen for connections...")
+            while True:
+                pass
 
     # Launch processes
     tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
