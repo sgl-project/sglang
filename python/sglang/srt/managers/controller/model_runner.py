@@ -107,7 +107,7 @@ class InputMetadata:
             self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD"
             )
-            args = [
+            self.prefill_wrapper.begin_forward(
                 self.qo_indptr,
                 self.kv_indptr,
                 self.kv_indices,
@@ -115,9 +115,8 @@ class InputMetadata:
                 self.model_runner.model_config.num_attention_heads // tp_size,
                 self.model_runner.model_config.num_key_value_heads // tp_size,
                 self.model_runner.model_config.head_dim,
-            ]
-
-            self.prefill_wrapper.begin_forward(*args)
+                1
+            )
         else:
             self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD"
@@ -130,8 +129,8 @@ class InputMetadata:
                 self.model_runner.model_config.num_key_value_heads // tp_size,
                 self.model_runner.model_config.head_dim,
                 1,
-                "NONE",
-                "float16",
+                pos_encoding_mode="NONE",
+                data_type="float16",
             )
 
     def init_extend_args(self):
