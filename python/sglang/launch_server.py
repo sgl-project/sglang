@@ -2,7 +2,8 @@
 
 import argparse
 
-from sglang.srt.server import ServerArgs, launch_server
+from sglang.srt.server import launch_server
+from sglang.srt.server_args import ServerArgs
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

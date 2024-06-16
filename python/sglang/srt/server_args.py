@@ -57,8 +57,9 @@ class ServerArgs:
     disable_disk_cache: bool = False
 
     # Distributed args
-    nccl_init_addr: Optional[str] = None
-    rpyc_server_addrs: Optional[List[str]] = None
+    master_addr: Optional[str] = None
+    nnodes: Optional[int] = None
+    node_rank: Optional[int] = None
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -256,16 +257,21 @@ class ServerArgs:
             ],
         )
 
+        # Multi-node distributed serving args
         parser.add_argument(
-            "--nccl-init-addr",
+            "--master-addr",
             type=str,
-            help="The address of nccl init method."
+            help="The master address of multi-node server."
         )
         parser.add_argument(
-            "--rpyc-server-addrs",
-            type=str,
-            nargs='+',
-            help="The addresses of rpyc servers."
+            "--nnodes",
+            type=int,
+            help="Number of nodes"
+        )
+        parser.add_argument(
+            "--node-rank",
+            type=int,
+            help="The node rank."
         )
 
         # Optimization/debug options
@@ -316,6 +322,7 @@ class ServerArgs:
 @dataclasses.dataclass
 class ModelPortArgs:
     nccl_port: int
+    model_tp_ips: List[str]
     model_tp_ports: List[int]
 
 

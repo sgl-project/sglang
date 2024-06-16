@@ -50,6 +50,8 @@ from sglang.srt.utils import (
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
+    send_addrs_to_rank_0,
+    receive_addrs,
 )
 from sglang.utils import get_exception_traceback
 
@@ -151,21 +153,22 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
         load_chat_template_for_openai_api(server_args.chat_template)
 
     # Allocate ports
+    tp_size_local = server_args.tp_size // server_args.nnodes
     server_args.port, server_args.additional_ports = allocate_init_ports(
         server_args.port,
         server_args.additional_ports,
-        server_args.tp_size,
+        tp_size_local,
         server_args.dp_size,
     )
 
     ports = server_args.additional_ports
-    tp = server_args.tp_size
     model_port_args = []
     for i in range(server_args.dp_size):
         model_port_args.append(
             ModelPortArgs(
-                nccl_port=ports[3 + i * (tp + 1)],
-                model_tp_ports=ports[3 + i * (tp + 1) + 1 : 3 + (i + 1) * (tp + 1)],
+                nccl_port=ports[3 + i * (tp_size_local + 1)],
+                model_tp_ips=[None] * tp_size_local,
+                model_tp_ports=ports[3 + i * (tp_size_local + 1) + 1 : 3 + (i + 1) * (tp_size_local + 1)],
             )
         )
     port_args = PortArgs(
@@ -174,6 +177,16 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
         detokenizer_port=ports[2],
         model_port_args=model_port_args,
     )
+
+    # TODO multi-node dp is not supported
+    assert not (server_args.dp_size > 1 and server_args.node_rank is not None)
+    if server_args.node_rank is not None:
+        if server_args.node_rank != 0:
+            send_addrs_to_rank_0(model_port_args[0], server_args)
+        else:
+            receive_addrs(model_port_args[0], server_args)
+    print(model_port_args[0])
+    exit()
 
     # Launch processes
     tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
