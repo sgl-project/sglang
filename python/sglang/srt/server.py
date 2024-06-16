@@ -183,7 +183,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 
     # TODO multi-node dp is not supported
     assert not (server_args.dp_size > 1 and server_args.node_rank is not None)
-    if server_args.nnodes is not None and server_args.nnodes > 1:
+    if server_args.nnodes > 1:
         if server_args.node_rank != 0:
             send_addrs_to_rank_0(model_port_args[0], server_args)
         else:

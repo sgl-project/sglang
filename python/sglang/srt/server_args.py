@@ -58,7 +58,7 @@ class ServerArgs:
 
     # Distributed args
     master_addr: Optional[str] = None
-    nnodes: Optional[int] = None
+    nnodes: int = 1
     node_rank: Optional[int] = None
 
     def __post_init__(self):
@@ -266,6 +266,7 @@ class ServerArgs:
         parser.add_argument(
             "--nnodes",
             type=int,
+            default=1,
             help="Number of nodes"
         )
         parser.add_argument(

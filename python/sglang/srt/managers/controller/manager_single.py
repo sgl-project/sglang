@@ -76,8 +76,9 @@ def start_controller_process(
     )
 
     try:
+        tp_size_local = server_args.tp_size // server_args.nnodes
         model_client = ModelTpClient(
-            list(range(server_args.tp_size)),
+            [i for _ in range(server_args.nnodes) for i in range(tp_size_local)],
             server_args,
             port_args.model_port_args[0],
             model_overide_args,
