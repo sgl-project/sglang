@@ -56,6 +56,10 @@ class ServerArgs:
     disable_regex_jump_forward: bool = False
     disable_disk_cache: bool = False
 
+    # Distributed args
+    nccl_init_addr: Optional[str] = None
+    rpyc_server_addrs: Optional[List[str]] = None
+
     def __post_init__(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -250,6 +254,18 @@ class ServerArgs:
                 "round_robin",
                 "shortest_queue",
             ],
+        )
+
+        parser.add_argument(
+            "--nccl-init-addr",
+            type=str,
+            help="The address of nccl init method."
+        )
+        parser.add_argument(
+            "--rpyc-server-addrs",
+            type=str,
+            nargs='+',
+            help="The addresses of rpyc servers."
         )
 
         # Optimization/debug options

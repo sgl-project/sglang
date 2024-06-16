@@ -246,12 +246,16 @@ class ModelRunner:
         torch.cuda.set_device(self.gpu_id)
         logger.info(f"[gpu_id={self.gpu_id}] Init nccl begin.")
         monkey_patch_vllm_p2p_access_check(self.gpu_id)
+        if server_args.nccl_init_addr:
+            nccl_init_method = f"tcp://{server_args.nccl_init_addr}"
+        else:
+            nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port}"
         init_distributed_environment(
             backend="nccl",
             world_size=self.tp_size,
             rank=self.tp_rank,
             local_rank=self.gpu_id,
-            distributed_init_method=f"tcp://127.0.0.1:{self.nccl_port}",
+            distributed_init_method=nccl_init_method
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         total_gpu_memory = get_available_gpu_memory(

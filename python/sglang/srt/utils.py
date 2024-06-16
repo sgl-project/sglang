@@ -369,23 +369,7 @@ def load_image(image_file):
     return image, image_size
 
 
-def init_rpyc_service(service: rpyc.Service, port: int):
-    t = ThreadedServer(
-        service=service,
-        port=port,
-        protocol_config={
-            "allow_public_attrs": True,
-            "allow_pickle": True,
-            "sync_request_timeout": 3600,
-        },
-    )
-    t.logger.setLevel(logging.WARN)
-    t.start()
-
-
-def connect_to_rpyc_service(port, host="localhost"):
-    time.sleep(1)
-
+def connect_rpyc_service(host, port):
     repeat_count = 0
     while repeat_count < 20:
         try:
@@ -399,22 +383,33 @@ def connect_to_rpyc_service(port, host="localhost"):
                 },
             )
             break
-        except ConnectionRefusedError:
+        except ConnectionRefusedError as e:
             time.sleep(1)
         repeat_count += 1
     if repeat_count == 20:
-        raise RuntimeError("init rpc env error!")
+        raise RuntimeError(f"Connect rpyc error: {e}")
 
     return con.root
 
 
-def start_rpyc_process(service: rpyc.Service, port: int):
-    # Return the proxy and the process
-    proc = multiprocessing.Process(target=init_rpyc_service, args=(service, port))
+def start_rpyc_service(service: rpyc.Service, port: int):
+    t = ThreadedServer(
+        service=service,
+        port=port,
+        protocol_config={
+            "allow_public_attrs": True,
+            "allow_pickle": True,
+            "sync_request_timeout": 3600,
+        },
+    )
+    t.logger.setLevel(logging.WARN)
+    t.start()
+
+
+def start_rpyc_service_process(service: rpyc.Service, port: int):
+    proc = multiprocessing.Process(target=start_rpyc_service, args=(service, port))
     proc.start()
-    proxy = connect_to_rpyc_service(port)
-    assert proc.is_alive()
-    return proxy, proc
+    return proc
 
 
 def suppress_other_loggers():
