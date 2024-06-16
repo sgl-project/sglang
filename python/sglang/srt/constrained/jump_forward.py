@@ -81,8 +81,10 @@ class JumpForwardMap:
                     if len(c) == 1 and ord(c) < 0x80:
                         # ASCII character
                         byte_ = ord(c)
-                    elif len(c) == 2:
-                        byte_ = int(symbols[0], 16)
+                    elif len(c) > 1:
+                        # FIXME: This logic is due to the leading \x00
+                        # https://github.com/outlines-dev/outlines/pull/930
+                        byte_ = int(symbols[0][1:], 16)
 
                     if byte_ is not None:
                         outgoings_ct[state] += 1
