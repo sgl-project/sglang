@@ -258,6 +258,7 @@ class ModelRunner:
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
                 )
 
+        # Set some global args
         global global_server_args_dict
         global_server_args_dict = {
             "enable_flashinfer": server_args.enable_flashinfer,
