@@ -34,7 +34,6 @@ global_server_args_dict = {}
 
 @dataclass
 class InputMetadata:
-    model_runner: "ModelRunner"
     forward_mode: ForwardMode
     batch_size: int
     total_num_tokens: int
@@ -65,10 +64,10 @@ class InputMetadata:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
     kv_last_page_len: torch.Tensor = None
-    prefill_wrapper: Any = None
-    decode_wrapper: Any = None
+    flashinfer_prefill_wrapper: "BatchPrefillWithPagedKVCacheWrapper" = None
+    flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
 
-    def init_flashinfer_args(self, tp_size):
+    def init_flashinfer_args(self, num_attention_heads, num_key_value_heads, head_dim):
         self.kv_indptr = torch.zeros(
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
         )
@@ -97,26 +96,26 @@ class InputMetadata:
             )
             self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
 
-            self.prefill_wrapper.end_forward()
-            self.prefill_wrapper.begin_forward(
+            self.flashinfer_prefill_wrapper.end_forward()
+            self.flashinfer_prefill_wrapper.begin_forward(
                 self.qo_indptr,
                 self.kv_indptr,
                 self.kv_indices,
                 self.kv_last_page_len,
-                self.model_runner.model_config.num_attention_heads // tp_size,
-                self.model_runner.model_config.num_key_value_heads // tp_size,
-                self.model_runner.model_config.head_dim,
+                num_attention_heads,
+                num_key_value_heads,
+                head_dim,
                 1
             )
         else:
-            self.decode_wrapper.end_forward()
-            self.decode_wrapper.begin_forward(
+            self.flashinfer_decode_wrapper.end_forward()
+            self.flashinfer_decode_wrapper.begin_forward(
                 self.kv_indptr,
                 self.kv_indices,
                 self.kv_last_page_len,
-                self.model_runner.model_config.num_attention_heads // tp_size,
-                self.model_runner.model_config.num_key_value_heads // tp_size,
-                self.model_runner.model_config.head_dim,
+                num_attention_heads,
+                num_key_value_heads,
+                head_dim,
                 1,
                 pos_encoding_mode="NONE",
                 data_type="float16",
@@ -143,8 +142,8 @@ class InputMetadata:
         out_cache_cont_end=None,
         top_logprobs_nums=None,
         return_logprob=False,
-        prefill_wrapper=None,
-        decode_wrapper=None,
+        flashinfer_prefill_wrapper=None,
+        flashinfer_decode_wrapper=None,
     ):
         batch_size = len(req_pool_indices)
         start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
@@ -177,7 +176,6 @@ class InputMetadata:
             other_kv_index = None
 
         ret = cls(
-            model_runner=model_runner,
             forward_mode=forward_mode,
             batch_size=batch_size,
             total_num_tokens=total_num_tokens,
@@ -195,15 +193,19 @@ class InputMetadata:
             other_kv_index=other_kv_index,
             return_logprob=return_logprob,
             top_logprobs_nums=top_logprobs_nums,
-            prefill_wrapper=prefill_wrapper,
-            decode_wrapper=decode_wrapper,
+            flashinfer_prefill_wrapper=flashinfer_prefill_wrapper,
+            flashinfer_decode_wrapper=flashinfer_decode_wrapper,
         )
 
         if forward_mode == ForwardMode.EXTEND:
             ret.init_extend_args()
 
         if global_server_args_dict.get("enable_flashinfer", False):
-            ret.init_flashinfer_args(tp_size)
+            ret.init_flashinfer_args(
+                model_runner.model_config.num_attention_heads // tp_size,
+                model_runner.model_config.num_key_value_heads // tp_size,
+                model_runner.model_config.head_dim
+            )
 
         return ret
 
@@ -226,12 +228,7 @@ class ModelRunner:
         self.tp_size = tp_size
         self.nccl_port = nccl_port
         self.server_args = server_args
-
-        global global_server_args_dict
-        global_server_args_dict = {
-            "enable_flashinfer": server_args.enable_flashinfer,
-            "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
-        }
+        self.is_multimodal_model = is_multimodal_model(self.model_config)
 
         # Init torch distributed
         logger.info(f"[gpu_id={self.gpu_id}] Set cuda device.")
@@ -261,24 +258,16 @@ class ModelRunner:
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
                 )
 
+        global global_server_args_dict
+        global_server_args_dict = {
+            "enable_flashinfer": server_args.enable_flashinfer,
+            "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
+        }
+
+        # Load the model and create memory pool
         self.load_model()
         self.init_memory_pool(total_gpu_memory)
-        self.is_multimodal_model = is_multimodal_model(self.model_config)
-
-        if global_server_args_dict.get("enable_flashinfer", False):
-            from flashinfer import (
-                BatchDecodeWithPagedKVCacheWrapper,
-                BatchPrefillWithPagedKVCacheWrapper,
-            )
-            workspace_buffer = torch.empty(
-                32 * 1024 * 1024, dtype=torch.int8, device="cuda"
-            )
-            self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD"
-            )
-            self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD"
-            )
+        self.init_flash_infer()
 
     def load_model(self):
         logger.info(
@@ -354,6 +343,22 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
+    def init_flash_infer(self):
+        if global_server_args_dict.get("enable_flashinfer", False):
+            from flashinfer import (
+                BatchPrefillWithPagedKVCacheWrapper,
+                BatchDecodeWithPagedKVCacheWrapper,
+            )
+            workspace_buffer = torch.empty(
+                32 * 1024 * 1024, dtype=torch.int8, device="cuda"
+            )
+            self.flashinfer_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer, "NHD"
+            )
+            self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                workspace_buffer, "NHD"
+            )
+
     @torch.inference_mode()
     def forward_prefill(self, batch: Batch):
         input_metadata = InputMetadata.create(
@@ -367,8 +372,8 @@ class ModelRunner:
             out_cache_loc=batch.out_cache_loc,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
-            prefill_wrapper=self.prefill_wrapper,
-            decode_wrapper=self.decode_wrapper,
+            flashinfer_prefill_wrapper=self.flashinfer_prefill_wrapper,
+            flashinfer_decode_wrapper=self.flashinfer_decode_wrapper,
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -387,8 +392,8 @@ class ModelRunner:
             out_cache_loc=batch.out_cache_loc,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
-            prefill_wrapper=self.prefill_wrapper,
-            decode_wrapper=self.decode_wrapper,
+            flashinfer_prefill_wrapper=self.flashinfer_prefill_wrapper,
+            flashinfer_decode_wrapper=self.flashinfer_decode_wrapper,
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -409,8 +414,8 @@ class ModelRunner:
             out_cache_cont_end=batch.out_cache_cont_end,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
-            prefill_wrapper=self.prefill_wrapper,
-            decode_wrapper=self.decode_wrapper,
+            flashinfer_prefill_wrapper=self.flashinfer_prefill_wrapper,
+            flashinfer_decode_wrapper=self.flashinfer_decode_wrapper,
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -429,8 +434,8 @@ class ModelRunner:
             out_cache_loc=batch.out_cache_loc,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
-            prefill_wrapper=self.prefill_wrapper,
-            decode_wrapper=self.decode_wrapper,
+            flashinfer_prefill_wrapper=self.flashinfer_prefill_wrapper,
+            flashinfer_decode_wrapper=self.flashinfer_decode_wrapper,
         )
         return self.model.forward(
             batch.input_ids,

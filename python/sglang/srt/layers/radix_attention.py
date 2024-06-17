@@ -12,7 +12,8 @@ from sglang.srt.managers.controller.model_runner import ForwardMode, InputMetada
 
 class RadixAttention(nn.Module):
     def __init__(
-        self, num_heads, head_dim, scaling, num_kv_heads, layer_id, logit_cap=-1
+        self, num_heads: int, head_dim: int, scaling: float, num_kv_heads: int,
+        layer_id: int, logit_cap: int = -1
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -29,6 +30,7 @@ class RadixAttention(nn.Module):
             self.prefill_forward = self.prefill_forward_flashinfer
             self.extend_forward = self.prefill_forward_flashinfer
             self.decode_forward = self.decode_forward_flashinfer
+            # flashinfer only accepts a boolean logit_cap argument
             if logit_cap > 0:
                 assert logit_cap == 30
                 self.logit_cap = True
@@ -105,7 +107,7 @@ class RadixAttention(nn.Module):
     def prefill_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         self.store_kv_cache(k, v, input_metadata)
 
-        o = input_metadata.prefill_wrapper.forward(
+        o = input_metadata.flashinfer_prefill_wrapper.forward(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
             input_metadata.token_to_kv_pool.kv_data[self.layer_id],
             logits_cap=self.logit_cap,
@@ -116,7 +118,7 @@ class RadixAttention(nn.Module):
     def decode_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         self.store_kv_cache(k, v, input_metadata)
 
-        o = input_metadata.decode_wrapper.forward(
+        o = input_metadata.flashinfer_decode_wrapper.forward(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
             input_metadata.token_to_kv_pool.kv_data[self.layer_id],
             logits_cap=self.logit_cap,
