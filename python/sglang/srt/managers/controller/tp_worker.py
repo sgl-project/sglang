@@ -771,20 +771,17 @@ class ModelTpClient:
         else:
             with ThreadPoolExecutor(self.tp_size) as executor:
                 # Launch model processes
-                if server_args.nnodes > 1:
-                    self.model_services = list(executor.map(
-                        lambda args: connect_rpyc_service(*args),
-                        [(ip, port) for ip, port in zip(model_port_args.model_tp_ips, model_port_args.model_tp_ports)]
-                    ))
-                else:
+                if server_args.nnodes == 1:
                     self.procs = list(executor.map(
                         lambda args: start_rpyc_service_process(*args),
                         [(ModelTpService, p) for p in model_port_args.model_tp_ports],
                     ))
-                    self.model_services = list(executor.map(
-                        lambda args: connect_rpyc_service(*args),
-                        [("localhost", p) for p in model_port_args.model_tp_ports],
-                    ))
+                    addrs = [("localhost", p) for p in model_port_args.model_tp_ports]
+                else:
+                    addrs = [(ip, port) for ip, port in zip(model_port_args.model_tp_ips, model_port_args.model_tp_ports)]
+
+                self.model_services = list(executor.map(
+                    lambda args: connect_rpyc_service(*args), addrs))
 
                 # Init model
                 def init_model(i):
