@@ -1,11 +1,13 @@
 """Common utilities."""
 
 import base64
+import fcntl
 import logging
 import multiprocessing
 import os
 import random
 import socket
+import struct
 import time
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
@@ -491,20 +493,14 @@ def get_ip_address(ifname):
     :param ifname: Name of the network interface (e.g., 'eth0')
     :return: IP address of the network interface
     """
-    import socket
-    import fcntl
-    import struct
- 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        ip_address = fcntl.ioctl(
-            s.fileno(),
-            0x8915,  # SIOCGIFADDR
-            struct.pack('256s', bytes(ifname[:15], 'utf-8'))
-        )[20:24]
-        return socket.inet_ntoa(ip_address)
-    except Exception as e:
-        return f"Error: {e}"
+    ip_address = fcntl.ioctl(
+        s.fileno(),
+        0x8915,  # SIOCGIFADDR
+        struct.pack('256s', bytes(ifname[:15], 'utf-8'))
+    )[20:24]
+    return socket.inet_ntoa(ip_address)
+
 
 def send_addrs_to_rank_0(model_port_args, server_args):
     assert server_args.node_rank != 0 and server_args.dp_size == 1
@@ -518,7 +514,7 @@ def send_addrs_to_rank_0(model_port_args, server_args):
     ip_addr = [int(x) for x in ip_addr.split(".")]
     addrs_tensor = torch.tensor(ip_addr + model_port_args.model_tp_ports, dtype=torch.int)
 
-    init_method = f"tcp://{server_args.master_addr}"
+    init_method = f"tcp://{server_args.nccl_init_addr}"
     dist.init_process_group(backend="gloo", init_method=init_method, rank=server_args.node_rank, world_size=server_args.nnodes)
     dist.send(addrs_tensor, dst=0)
     print(f"Node {server_args.node_rank} sent: ip_address {ip_addr} and ports {model_port_args.model_tp_ports}")
@@ -537,7 +533,7 @@ def receive_addrs(model_port_args, server_args):
     num_tp_ports = server_args.tp_size // server_args.nnodes
     model_port_args.model_tp_ips[:num_tp_ports] = [ip_addr] * num_tp_ports
 
-    init_method = f"tcp://{server_args.master_addr}"
+    init_method = f"tcp://{server_args.nccl_init_addr}"
     dist.init_process_group(backend="gloo", init_method=init_method, rank=server_args.node_rank, world_size=server_args.nnodes)
 
     for src_rank in range(1, server_args.nnodes):

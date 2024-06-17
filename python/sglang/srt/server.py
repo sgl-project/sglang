@@ -156,6 +156,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
         load_chat_template_for_openai_api(server_args.chat_template)
 
     # Allocate ports
+    assert server_args.tp_size % server_args.nnodes == 0
     tp_size_local = server_args.tp_size // server_args.nnodes
     server_args.port, server_args.additional_ports = allocate_init_ports(
         server_args.port,

@@ -57,7 +57,7 @@ class ServerArgs:
     disable_disk_cache: bool = False
 
     # Distributed args
-    master_addr: Optional[str] = None
+    nccl_init_addr: Optional[str] = None
     nnodes: int = 1
     node_rank: Optional[int] = None
 
@@ -259,9 +259,9 @@ class ServerArgs:
 
         # Multi-node distributed serving args
         parser.add_argument(
-            "--master-addr",
+            "--nccl-init-addr",
             type=str,
-            help="The master address of multi-node server."
+            help="The nccl init address of multi-node server."
         )
         parser.add_argument(
             "--nnodes",
