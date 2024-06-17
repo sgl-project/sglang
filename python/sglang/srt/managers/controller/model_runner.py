@@ -6,7 +6,7 @@ import logging
 import pkgutil
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional, Type
+from typing import List, Optional, Type, Any
 
 import numpy as np
 import torch
@@ -65,15 +65,10 @@ class InputMetadata:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
     kv_last_page_len: torch.Tensor = None
-    prefill_wrapper = None
-    decode_wrapper = None
+    prefill_wrapper: Any = None
+    decode_wrapper: Any = None
 
     def init_flashinfer_args(self, tp_size):
-        from flashinfer import (
-            BatchDecodeWithPagedKVCacheWrapper,
-            BatchPrefillWithPagedKVCacheWrapper,
-        )
-
         self.kv_indptr = torch.zeros(
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
         )
@@ -93,9 +88,6 @@ class InputMetadata:
             dim=0,
         ).contiguous()
 
-        workspace_buffer = torch.empty(
-            32 * 1024 * 1024, dtype=torch.int8, device="cuda"
-        )
         if (
             self.forward_mode == ForwardMode.PREFILL
             or self.forward_mode == ForwardMode.EXTEND
@@ -104,9 +96,7 @@ class InputMetadata:
                 (self.batch_size + 1,), dtype=torch.int32, device="cuda"
             )
             self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
-            self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD"
-            )
+
             self.prefill_wrapper.begin_forward(
                 self.qo_indptr,
                 self.kv_indptr,
@@ -118,9 +108,6 @@ class InputMetadata:
                 1
             )
         else:
-            self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD"
-            )
             self.decode_wrapper.begin_forward(
                 self.kv_indptr,
                 self.kv_indices,
@@ -154,6 +141,8 @@ class InputMetadata:
         out_cache_cont_end=None,
         top_logprobs_nums=None,
         return_logprob=False,
+        prefill_wrapper=None,
+        decode_wrapper=None,
     ):
         batch_size = len(req_pool_indices)
         start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
@@ -204,6 +193,8 @@ class InputMetadata:
             other_kv_index=other_kv_index,
             return_logprob=return_logprob,
             top_logprobs_nums=top_logprobs_nums,
+            prefill_wrapper=prefill_wrapper,
+            decode_wrapper=decode_wrapper,
         )
 
         if forward_mode == ForwardMode.EXTEND:
@@ -271,6 +262,21 @@ class ModelRunner:
         self.load_model()
         self.init_memory_pool(total_gpu_memory)
         self.is_multimodal_model = is_multimodal_model(self.model_config)
+
+        if global_server_args_dict.get("enable_flashinfer", False):
+            from flashinfer import (
+                BatchDecodeWithPagedKVCacheWrapper,
+                BatchPrefillWithPagedKVCacheWrapper,
+            )
+            workspace_buffer = torch.empty(
+                32 * 1024 * 1024, dtype=torch.int8, device="cuda"
+            )
+            self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer, "NHD"
+            )
+            self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                workspace_buffer, "NHD"
+            )
 
     def load_model(self):
         logger.info(
@@ -359,6 +365,8 @@ class ModelRunner:
             out_cache_loc=batch.out_cache_loc,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
+            prefill_wrapper=self.prefill_wrapper,
+            decode_wrapper=self.decode_wrapper,
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -377,6 +385,8 @@ class ModelRunner:
             out_cache_loc=batch.out_cache_loc,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
+            prefill_wrapper=self.prefill_wrapper,
+            decode_wrapper=self.decode_wrapper,
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -397,6 +407,8 @@ class ModelRunner:
             out_cache_cont_end=batch.out_cache_cont_end,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
+            prefill_wrapper=self.prefill_wrapper,
+            decode_wrapper=self.decode_wrapper,
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -415,6 +427,8 @@ class ModelRunner:
             out_cache_loc=batch.out_cache_loc,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
+            prefill_wrapper=self.prefill_wrapper,
+            decode_wrapper=self.decode_wrapper,
         )
         return self.model.forward(
             batch.input_ids,
