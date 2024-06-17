@@ -97,6 +97,7 @@ class InputMetadata:
             )
             self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
 
+            self.prefill_wrapper.end_forward()
             self.prefill_wrapper.begin_forward(
                 self.qo_indptr,
                 self.kv_indptr,
@@ -108,6 +109,7 @@ class InputMetadata:
                 1
             )
         else:
+            self.decode_wrapper.end_forward()
             self.decode_wrapper.begin_forward(
                 self.kv_indptr,
                 self.kv_indices,
