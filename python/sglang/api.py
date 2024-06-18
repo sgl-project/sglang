@@ -67,6 +67,10 @@ def gen(
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
+    return_logprob: Optional[Union[List[bool], bool]] = None,
+    logprob_start_len: Optional[Union[List[int], int]] = None,
+    top_logprobs_num: Optional[Union[List[int], int]] = None,
+    return_text_in_logprobs: Optional[bool] = None,
     dtype: Optional[type] = None,
     choices: Optional[List[str]] = None,
     regex: Optional[str] = None,
@@ -91,6 +95,10 @@ def gen(
         frequency_penalty,
         presence_penalty,
         ignore_eos,
+        return_logprob,
+        logprob_start_len,
+        top_logprobs_num,
+        return_text_in_logprobs,
         dtype,
         regex,
     )
@@ -106,6 +114,10 @@ def gen_int(
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
+    return_logprob: Optional[Union[List[bool], bool]] = None,
+    logprob_start_len: Optional[Union[List[int], int]] = None,
+    top_logprobs_num: Optional[Union[List[int], int]] = None,
+    return_text_in_logprobs: Optional[bool] = None,
 ):
     return SglGen(
         name,
@@ -117,6 +129,10 @@ def gen_int(
         frequency_penalty,
         presence_penalty,
         ignore_eos,
+        return_logprob,
+        logprob_start_len,
+        top_logprobs_num,
+        return_text_in_logprobs,
         int,
         None,
     )
@@ -132,6 +148,10 @@ def gen_string(
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
+    return_logprob: Optional[Union[List[bool], bool]] = None,
+    logprob_start_len: Optional[Union[List[int], int]] = None,
+    top_logprobs_num: Optional[Union[List[int], int]] = None,
+    return_text_in_logprobs: Optional[bool] = None,
 ):
     return SglGen(
         name,
@@ -143,6 +163,10 @@ def gen_string(
         frequency_penalty,
         presence_penalty,
         ignore_eos,
+        return_logprob,
+        logprob_start_len,
+        top_logprobs_num,
+        return_text_in_logprobs,
         str,
         None,
     )

@@ -67,7 +67,11 @@ class HttpResponse:
         self.resp = resp
 
     def json(self):
-        return json.loads(self.resp.read())
+        try:
+            text = self.resp.read()
+            return json.loads(text)
+        except json.decoder.JSONDecodeError:
+            return text.decode("utf-8")
 
     @property
     def status_code(self):
