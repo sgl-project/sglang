@@ -315,7 +315,7 @@ class ModelRunner:
             self.gpu_id, distributed=self.tp_size > 1
         )
         head_dim = self.model_config.head_dim
-        head_num = self.model_config.num_key_value_heads // self.tp_size
+        head_num = self.model_config.get_num_kv_heads(self.tp_size)
         cell_size = head_num * head_dim * self.model_config.num_hidden_layers * 2 * 2
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
@@ -328,7 +328,7 @@ class ModelRunner:
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
-                "Not enought memory. Please try to increase --mem-fraction-static."
+                "Not enough memory. Please try to increase --mem-fraction-static."
             )
 
         self.req_to_token_pool = ReqToTokenPool(
