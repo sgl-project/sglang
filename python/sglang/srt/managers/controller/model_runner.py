@@ -246,12 +246,16 @@ class ModelRunner:
         torch.cuda.set_device(self.gpu_id)
         logger.info(f"[gpu_id={self.gpu_id}] Init nccl begin.")
         monkey_patch_vllm_p2p_access_check(self.gpu_id)
+        if server_args.nccl_init_addr:
+            nccl_init_method = f"tcp://{server_args.nccl_init_addr}"
+        else:
+            nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port}"
         init_distributed_environment(
             backend="nccl",
             world_size=self.tp_size,
             rank=self.tp_rank,
             local_rank=self.gpu_id,
-            distributed_init_method=f"tcp://127.0.0.1:{self.nccl_port}",
+            distributed_init_method=nccl_init_method
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         total_gpu_memory = get_available_gpu_memory(
@@ -311,7 +315,7 @@ class ModelRunner:
             self.gpu_id, distributed=self.tp_size > 1
         )
         head_dim = self.model_config.head_dim
-        head_num = self.model_config.num_key_value_heads // self.tp_size
+        head_num = self.model_config.get_num_kv_heads(self.tp_size)
         cell_size = head_num * head_dim * self.model_config.num_hidden_layers * 2 * 2
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
@@ -324,7 +328,7 @@ class ModelRunner:
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
-                "Not enought memory. Please try to increase --mem-fraction-static."
+                "Not enough memory. Please try to increase --mem-fraction-static."
             )
 
         self.req_to_token_pool = ReqToTokenPool(

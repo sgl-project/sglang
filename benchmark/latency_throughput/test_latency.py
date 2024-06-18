@@ -24,7 +24,7 @@ if __name__ == "__main__":
             raise ValueError(f"Invalid backend: {args.backend}")
 
     url = f"{args.host}:{args.port}"
-    a = random.randint(0, 1 << 20)
+    a = 20
     max_new_tokens = 256
     prompt = f"{a, }"
 
