@@ -67,7 +67,7 @@ class InputMetadata:
     flashinfer_prefill_wrapper: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
 
-    def init_flashinfer_args(self, num_attention_heads, num_key_value_heads, head_dim):
+    def init_flashinfer_args(self, num_qo_heads, num_kv_heads, head_dim):
         self.kv_indptr = torch.zeros(
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
         )
@@ -102,8 +102,8 @@ class InputMetadata:
                 self.kv_indptr,
                 self.kv_indices,
                 self.kv_last_page_len,
-                num_attention_heads,
-                num_key_value_heads,
+                num_qo_heads,
+                num_kv_heads,
                 head_dim,
                 1
             )
@@ -113,8 +113,8 @@ class InputMetadata:
                 self.kv_indptr,
                 self.kv_indices,
                 self.kv_last_page_len,
-                num_attention_heads,
-                num_key_value_heads,
+                num_qo_heads,
+                num_kv_heads,
                 head_dim,
                 1,
                 pos_encoding_mode="NONE",
