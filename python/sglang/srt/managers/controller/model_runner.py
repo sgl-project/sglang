@@ -203,7 +203,7 @@ class InputMetadata:
         if global_server_args_dict.get("enable_flashinfer", False):
             ret.init_flashinfer_args(
                 model_runner.model_config.num_attention_heads // tp_size,
-                model_runner.model_config.num_key_value_heads // tp_size,
+                model_runner.model_config.get_num_kv_heads(tp_size),
                 model_runner.model_config.head_dim
             )
 
@@ -350,6 +350,15 @@ class ModelRunner:
                 BatchPrefillWithPagedKVCacheWrapper,
                 BatchDecodeWithPagedKVCacheWrapper,
             )
+            from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
+
+            if not _grouped_size_compiled_for_decode_kernels(
+                self.model_config.num_attention_heads // self.tp_size,
+                self.model_config.get_num_kv_heads(self.tp_size)):
+                use_tensor_cores = True
+            else:
+                use_tensor_cores = False
+
             workspace_buffer = torch.empty(
                 32 * 1024 * 1024, dtype=torch.int8, device="cuda"
             )
@@ -357,7 +366,7 @@ class ModelRunner:
                 workspace_buffer, "NHD"
             )
             self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD"
+                workspace_buffer, "NHD", use_tensor_cores=use_tensor_cores
             )
 
     @torch.inference_mode()
