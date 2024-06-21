@@ -368,6 +368,8 @@ class ModelRunner:
             self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD", use_tensor_cores=use_tensor_cores
             )
+        else:
+            self.flashinfer_prefill_wrapper = self.flashinfer_decode_wrapper = None
 
     @torch.inference_mode()
     def forward_prefill(self, batch: Batch):
