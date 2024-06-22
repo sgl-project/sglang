@@ -441,33 +441,25 @@ class ModelTpServer:
             self.model_config.vocab_size, self.int_token_logit_bias
         )
 
+        # Forward and sample the next tokens
         if batch.extend_num_tokens != 0:
-            # Forward
-            logits, (
-                prefill_token_logprobs,
-                normalized_prompt_logprobs,
-                prefill_top_logprobs,
-                decode_top_logprobs,
-                last_logprobs,
-            ) = self.model_runner.forward(batch, ForwardMode.EXTEND)
-            if prefill_token_logprobs is not None:
-                prefill_token_logprobs = prefill_token_logprobs.tolist()
-                normalized_prompt_logprobs = normalized_prompt_logprobs.tolist()
+            output = self.model_runner.forward(batch, ForwardMode.EXTEND)
+            next_token_ids, _ = batch.sample(output.next_token_logits)
 
-            next_token_ids, _ = batch.sample(logits)
-
-            # Only transfer the selected logprobs of the next token to CPU to reduce overhead.
-            if last_logprobs is not None:
-                last_token_logprobs = last_logprobs[
-                    torch.arange(len(batch.reqs), device=next_token_ids.device),
+            # Move logprobs to cpu
+            if output.next_token_logprobs is not None:
+                output.next_token_logprobs = output.next_token_logprobs[
+                    torch.arange(len(next_token_ids), device=next_token_ids.device),
                     next_token_ids,
                 ].tolist()
+                output.prefill_token_logprobs = output.prefill_token_logprobs.tolist()
+                output.normalized_prompt_logprobs = output.normalized_prompt_logprobs.tolist()
 
             next_token_ids = next_token_ids.tolist()
         else:
             next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
 
-        # Check finish condition
+        # Check finish conditions
         pt = 0
         for i, req in enumerate(batch.reqs):
             req.completion_tokens_wo_jump_forward += 1
@@ -475,57 +467,59 @@ class ModelTpServer:
             req.check_finished()
 
             if req.return_logprob:
-                if req.normalized_prompt_logprob is None:
-                    req.normalized_prompt_logprob = normalized_prompt_logprobs[i]
-
-                if req.prefill_token_logprobs is None:
-                    # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
-                    req.prefill_token_logprobs = list(
-                        zip(
-                            prefill_token_logprobs[pt : pt + req.extend_input_len - 1],
-                            req.input_ids[-req.extend_input_len + 1 :],
-                        )
-                    )
-                    if req.logprob_start_len == 0:
-                        req.prefill_token_logprobs = [
-                            (None, req.input_ids[0])
-                        ] + req.prefill_token_logprobs
-
-                if req.last_update_decode_tokens != 0:
-                    req.decode_token_logprobs.extend(
-                        list(
-                            zip(
-                                prefill_token_logprobs[
-                                    pt
-                                    + req.extend_input_len
-                                    - req.last_update_decode_tokens : pt
-                                    + req.extend_input_len
-                                    - 1
-                                ],
-                                req.input_ids[-req.last_update_decode_tokens + 1 :],
-                            )
-                        )
-                    )
-
-                req.decode_token_logprobs.append(
-                    (last_token_logprobs[i], next_token_ids[i])
-                )
-
-            if req.top_logprobs_num > 0:
-                if req.prefill_top_logprobs is None:
-                    req.prefill_top_logprobs = prefill_top_logprobs[i]
-                    if req.logprob_start_len == 0:
-                        req.prefill_top_logprobs = [None] + req.prefill_top_logprobs
-
-                if req.last_update_decode_tokens != 0:
-                    req.decode_top_logprobs.extend(
-                        prefill_top_logprobs[i][-req.last_update_decode_tokens + 1 :]
-                    )
-                req.decode_top_logprobs.append(decode_top_logprobs[i])
-
-            pt += req.extend_input_len
+                self.add_logprob_return_values(i, req, pt, next_token_ids, output)
+                pt += req.extend_input_len
 
         self.handle_finished_requests(batch)
+
+    def add_logprob_return_values(self, i, req, pt, next_token_ids, output):
+        if req.normalized_prompt_logprob is None:
+            req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
+
+        if req.prefill_token_logprobs is None:
+            # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
+            req.prefill_token_logprobs = list(
+                zip(
+                    output.prefill_token_logprobs[pt : pt + req.extend_input_len - 1],
+                    req.input_ids[-req.extend_input_len + 1 :],
+                )
+            )
+            if req.logprob_start_len == 0:
+                req.prefill_token_logprobs = [
+                    (None, req.input_ids[0])
+                ] + req.prefill_token_logprobs
+
+        if req.last_update_decode_tokens != 0:
+            req.decode_token_logprobs.extend(
+                list(
+                    zip(
+                        output.prefill_token_logprobs[
+                            pt
+                            + req.extend_input_len
+                            - req.last_update_decode_tokens : pt
+                            + req.extend_input_len
+                            - 1
+                        ],
+                        req.input_ids[-req.last_update_decode_tokens + 1 :],
+                    )
+                )
+            )
+
+        req.decode_token_logprobs.append(
+            (output.next_token_logprobs[i], next_token_ids[i])
+        )
+
+        if req.top_logprobs_num > 0:
+            if req.prefill_top_logprobs is None:
+                req.prefill_top_logprobs = output.prefill_top_logprobs[i]
+                if req.logprob_start_len == 0:
+                    req.prefill_top_logprobs = [None] + req.prefill_top_logprobs
+
+            if req.last_update_decode_tokens != 0:
+                req.decode_top_logprobs.extend(
+                    output.prefill_top_logprobs[i][-req.last_update_decode_tokens + 1 :]
+                )
+            req.decode_top_logprobs.append(output.decode_top_logprobs[i])
 
     def cache_filled_batch(self, batch: Batch):
         req_pool_indices_cpu = batch.req_pool_indices.cpu().numpy()
@@ -540,7 +534,7 @@ class ModelTpServer:
             req.prefix_indices, req.last_node = new_prefix_indices, new_last_node
 
     def forward_decode_batch(self, batch: Batch):
-        # check if decode out of memory
+        # Check if decode out of memory
         if not batch.check_decode_mem():
             old_ratio = self.new_token_ratio
             self.new_token_ratio = min(old_ratio + self.new_token_ratio_recovery, 1.0)
@@ -559,9 +553,8 @@ class ModelTpServer:
             )
 
         if not self.disable_regex_jump_forward:
-            # check for jump-forward
+            # Check for jump-forward
             jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
-
             self.forward_queue.extend(jump_forward_reqs)
             if batch.is_empty():
                 return
@@ -570,22 +563,18 @@ class ModelTpServer:
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         batch.prepare_for_decode()
 
-        # Forward
-        logits, (
-            _,
-            _,
-            _,
-            decode_top_logprobs,
-            last_logprobs,
-        ) = self.model_runner.forward(batch, ForwardMode.DECODE)
-        next_token_ids, _ = batch.sample(logits)
-        next_token_ids = next_token_ids.tolist()
+        # Forward and sample the next tokens
+        output = self.model_runner.forward(batch, ForwardMode.DECODE)
+        next_token_ids, _ = batch.sample(output.next_token_logits)
 
-        # Only batch transfer the selected logprobs of the next token to CPU to reduce overhead.
-        if last_logprobs is not None:
-            new_token_logprobs = last_logprobs[
-                torch.arange(len(batch.reqs)), next_token_ids
+        # Move logprobs to cpu
+        if output.next_token_logprobs is not None:
+            next_token_logprobs = output.next_token_logprobs[
+                torch.arange(len(next_token_ids), device=next_token_ids.device),
+                next_token_ids,
             ].tolist()
+
+        next_token_ids = next_token_ids.tolist()
 
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -594,10 +583,9 @@ class ModelTpServer:
             req.check_finished()
 
             if req.return_logprob:
-                req.decode_token_logprobs.append((new_token_logprobs[i], next_token_id))
-
-            if req.top_logprobs_num > 0:
-                req.decode_top_logprobs.append(decode_top_logprobs[i])
+                req.decode_token_logprobs.append((next_token_logprobs[i], next_token_id))
+                if req.top_logprobs_num > 0:
+                    req.decode_top_logprobs.append(output.decode_top_logprobs[i])
 
         self.handle_finished_requests(batch)
 
