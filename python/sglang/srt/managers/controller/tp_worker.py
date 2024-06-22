@@ -472,7 +472,7 @@ class ModelTpServer:
 
         self.handle_finished_requests(batch)
 
-    def add_logprob_return_values(self, i, req, pt, next_token_ids, output):
+    def add_logprob_return_values(self, i, req, pt, output):
         if req.normalized_prompt_logprob is None:
             req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
 
