@@ -253,7 +253,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
             try:
                 requests.get(url + "/get_model_info", timeout=5, headers=headers)
                 break
-            except requests.exceptions.RequestException as e:
+            except requests.exceptions.RequestException:
                 pass
 
         # Send a warmup request
@@ -265,14 +265,14 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
                         "text": "The capital city of France is",
                         "sampling_params": {
                             "temperature": 0,
-                            "max_new_tokens": 16,
+                            "max_new_tokens": 8,
                         },
                     },
                     headers=headers,
                     timeout=600,
                 )
                 assert res.status_code == 200
-        except Exception:
+        except Exception as e:
             if pipe_finish_writer is not None:
                 pipe_finish_writer.send(get_exception_traceback())
             print(f"Initialization failed. warmup error: {e}")
