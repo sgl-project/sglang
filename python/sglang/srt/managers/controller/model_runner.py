@@ -360,7 +360,7 @@ class ModelRunner:
                 use_tensor_cores = False
 
             workspace_buffer = torch.empty(
-                32 * 1024 * 1024, dtype=torch.int8, device="cuda"
+                128 * 1024 * 1024, dtype=torch.int8, device="cuda"
             )
             self.flashinfer_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD"
