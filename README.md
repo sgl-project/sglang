@@ -36,7 +36,7 @@ pip install "sglang[all]"
 
 ### Method 2: From source
 ```
-git clone git@github.com:sgl-project/sglang.git
+git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
