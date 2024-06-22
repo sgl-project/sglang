@@ -636,17 +636,17 @@ class ModelTpServer:
                 }
                 if req.return_logprob:
                     (
-                        meta_info["normalized_prompt_logprob"],
                         meta_info["prefill_token_logprobs"],
                         meta_info["decode_token_logprobs"],
                         meta_info["prefill_top_logprobs"],
                         meta_info["decode_top_logprobs"],
+                        meta_info["normalized_prompt_logprob"],
                     ) = (
-                        req.normalized_prompt_logprob,
                         req.prefill_token_logprobs,
                         req.decode_token_logprobs,
                         req.prefill_top_logprobs,
                         req.decode_top_logprobs,
+                        req.normalized_prompt_logprob,
                     )
                 output_meta_info.append(meta_info)
                 output_finished_reason.append(req.finished_reason)
