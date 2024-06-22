@@ -584,9 +584,8 @@ class ModelTpServer:
 
             if req.return_logprob:
                 req.decode_token_logprobs.append((next_token_logprobs[i], next_token_id))
-
-            if req.top_logprobs_num > 0:
-                req.decode_top_logprobs.append(output.decode_top_logprobs[i])
+                if req.top_logprobs_num > 0:
+                    req.decode_top_logprobs.append(output.decode_top_logprobs[i])
 
         self.handle_finished_requests(batch)
 
