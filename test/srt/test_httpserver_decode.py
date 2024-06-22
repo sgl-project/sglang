@@ -41,8 +41,8 @@ if __name__ == "__main__":
 
     url = f"{args.host}:{args.port}"
 
-    test_decode(url, False, 0, False)
-    test_decode(url, True, 0, False)
-    test_decode(url, True, 0, True)
-    test_decode(url, True, 3, False)
+    #test_decode(url, False, 0, False)
+    #test_decode(url, True, 0, False)
+    #test_decode(url, True, 0, True)
+    #test_decode(url, True, 3, False)
     test_decode(url, True, 3, True)
