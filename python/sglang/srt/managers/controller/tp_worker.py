@@ -467,12 +467,12 @@ class ModelTpServer:
             req.check_finished()
 
             if req.return_logprob:
-                self.add_logprob_return_values(i, req, pt, output)
+                self.add_logprob_return_values(i, req, pt, next_token_ids, output)
                 pt += req.extend_input_len
 
         self.handle_finished_requests(batch)
 
-    def add_logprob_return_values(self, i, req, pt, output):
+    def add_logprob_return_values(self, i, req, pt, next_token_ids, output):
         if req.normalized_prompt_logprob is None:
             req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
 
