@@ -43,7 +43,8 @@ class LlamaForClassification(nn.Module):
         hidden_states = hidden_states[is_eos_token]
         scores = self.classification_head(hidden_states)
 
-        if scores.shape[0] == 0:
+        if scores.shape[0] != input_metadata.batch_size:
+            print("Warning: the EOS tokens are missing in some sentences.")
             scores = torch.ones((input_metadata.batch_size, self.config.classification_out_size)).to(input_ids.device)
 
         return LogitProcessorOutput(

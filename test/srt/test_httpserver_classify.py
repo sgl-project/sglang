@@ -4,30 +4,42 @@ python3 test_httpserver_classify.py
 """
 
 import argparse
+
+import numpy as np
 import requests
 
 
-def test_classify(url):
+def get_logits(url, prompt):
     response = requests.post(
         url + "/generate",
         json={
-            "text": [
-                "The capital of France is<|eot_id|>",
-                "How about you?<|eot_id|>",
-            ],
-
+            "text": prompt,
             "sampling_params": {
                 "max_new_tokens": 0,
             },
             "return_logprob": True,
         },
     )
-    print(response.json())
+    return response.json()["meta_info"]["normalized_prompt_logprob"]
 
-    logits = response.json()[0]["meta_info"]["normalized_prompt_logprob"]
-    print("logits", logits)
-    logits = response.json()[1]["meta_info"]["normalized_prompt_logprob"]
-    print("logits", logits)
+
+def get_logits_batch(url, prompts):
+    response = requests.post(
+        url + "/generate",
+        json={
+            "text": prompts,
+            "sampling_params": {
+                "max_new_tokens": 0,
+            },
+            "return_logprob": True,
+        },
+    )
+    ret = response.json()
+    logits = np.array(list(
+        ret[i]["meta_info"]["normalized_prompt_logprob"]
+        for i in range(len(prompts))
+    ))
+    return logits
 
 
 if __name__ == "__main__":
@@ -38,4 +50,16 @@ if __name__ == "__main__":
 
     url = f"{args.host}:{args.port}"
 
-    test_classify(url)
+    # A single request
+    prompt = "This is a test prompt.<|eot_id|>"
+    logits = get_logits(url, prompt)
+    print(f"{logits=}")
+
+    # A batch of requests
+    prompts = [
+        "This is a test prompt.<|eot_id|>",
+        "This is another test prompt.<|eot_id|>",
+        "This is a long long long long test prompt.<|eot_id|>",
+    ]
+    logits = get_logits_batch(url, prompts)
+    print(f"{logits=}")
