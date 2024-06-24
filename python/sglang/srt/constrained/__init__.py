@@ -11,7 +11,7 @@ try:
     from outlines.fsm.regex import FSMInfo, make_byte_level_fsm, make_deterministic_fsm
     from outlines.models.transformers import TransformerTokenizer
 except ImportError as e:
-    print(f"\nError: {e}. Please install outlines>=0.0.44 by `pip install outlines>=0.0.44`\n")
+    print(f'\nError: {e}. Please install a new version of outlines by `pip install "outlines>=0.0.44"`\n')
     raise
 
 try:
