@@ -512,8 +512,13 @@ def fused_moe(
     # Check constraints.
     assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
 
-    topk_weights, topk_ids = fused_topk(hidden_states, gating_output, topk,
-                                        renormalize)
+    if hasattr(ops, "topk_softmax"):
+        topk_weights, topk_ids = fused_topk(hidden_states, gating_output, topk,
+                                            renormalize)
+    else:
+        topk_weights, topk_ids = fused_topk_v0_4_3(hidden_states, gating_output, topk,
+                                                   renormalize)
+
     return fused_experts(hidden_states,
                          w1,
                          w2,
@@ -526,3 +531,33 @@ def fused_moe(
                          w2_scale=w2_scale,
                          a1_scale=a1_scale,
                          a2_scale=a2_scale)
+
+
+
+def fused_topk_v0_4_3(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+):
+    import vllm._moe_C as moe_kernels
+    M, _ = hidden_states.shape
+
+    topk_weights = torch.empty(
+        M, topk, dtype=torch.float32, device=hidden_states.device
+    )
+    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+    token_expert_indicies = torch.empty(
+        M, topk, dtype=torch.int32, device=hidden_states.device
+    )
+    moe_kernels.topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output.float(),  # TODO(woosuk): Optimize this.
+    )
+    del token_expert_indicies  # Not used. Will be used in the future.
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    return topk_weights, topk_ids
