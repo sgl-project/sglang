@@ -222,7 +222,7 @@ def latency_test(
         torch.cuda.synchronize()
         latency = time.time() - tic
         throughput = bench_args.input_len * bench_args.batch_size / latency
-        rank_print(f"Prefill. latency: {latency:6.3f} ms, throughput: {throughput:8.2f} token/s")
+        rank_print(f"Prefill. latency: {latency:6.3f} ms, throughput: {throughput:9.2f} token/s")
 
         # Decode
         for _ in range(output_len):
@@ -232,7 +232,7 @@ def latency_test(
             torch.cuda.synchronize()
             latency = time.time() - tic
             throughput = bench_args.batch_size / latency
-            rank_print(f"Decode . latency: {latency:6.3f} ms, throughput: {throughput:8.2f} token/s")
+            rank_print(f"Decode . latency: {latency:6.3f} ms, throughput: {throughput:9.2f} token/s")
 
     # Warm up
     run_once(4)
