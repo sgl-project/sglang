@@ -1,7 +1,6 @@
 ## Download data
 ```
-wget https://people.eecs.berkeley.edu/~hendrycks/data.tar
-tar xf data.tar
+bash download_data.sh
 ```
 
 ## Run benchmark
