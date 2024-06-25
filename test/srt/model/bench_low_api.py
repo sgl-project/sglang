@@ -1,9 +1,24 @@
 """
 Usage:
-python bench_llama_low_api.py --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
+python bench_low_api.py --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
 
+Reference output:
+prefill logits (first half) tensor([[-10.0312,  -9.5000,   0.8936,  ...,  -4.9414,  -3.2402,  -3.3633],
+        [-10.0312,  -9.5000,   0.8936,  ...,  -4.9414,  -3.2402,  -3.3633],
+        [ -9.1875, -10.2500,   2.7109,  ...,  -4.3359,  -4.0664,  -4.1328]],
+       device='cuda:0', dtype=torch.float16)
+prefill logits (final) tensor([[-8.3203, -7.1211,  3.3379,  ..., -4.9570, -4.1328, -3.4141],
+        [-8.9062, -9.0156,  4.1445,  ..., -4.9922, -4.4961, -4.0742],
+        [-9.6328, -9.0547,  4.0117,  ..., -5.3047, -4.7148, -4.4609]],
+       device='cuda:0', dtype=torch.float16)
+<s> The capital of France is.
+The capital of the United States is Washington, D.C.
 
-
+<s> The capital of the United Kindom is.
+The capital of the United Kingdom is London.
+The capital of the
+<s> Today is a sunny day and I like go for a walk in the park.
+I'm going to the park
 """
 
 import argparse

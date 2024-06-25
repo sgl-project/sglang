@@ -2,7 +2,7 @@
 Usage:
 python3 reference_hf.py --model TinyLlama/TinyLlama-1.1B-Chat-v0.4
 
-Example output:
+Reference output:
 <s> The capital of France is Paris.
 The capital of the United States is Washington, D.C.
 The capital of Canada is Ottawa.
