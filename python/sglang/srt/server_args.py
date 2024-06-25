@@ -37,9 +37,8 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
+    log_level_http: Optional[str] = None
     log_requests: bool = False
-    disable_log_stats: bool = False
-    log_stats_interval: int = 10
     show_time_cost: bool = False
 
     # Other
@@ -106,7 +105,7 @@ class ServerArgs:
             type=int,
             nargs="*",
             default=[],
-            help="Additional ports specified for the server.",
+            help="The additional ports specified for the server.",
         )
         parser.add_argument(
             "--load-format",
@@ -179,7 +178,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.schedule_heuristic,
             choices=["lpm", "random", "fcfs", "dfs-weight"],
-            help="Scheduling Heuristic.",
+            help="The scheduling heuristic.",
         )
         parser.add_argument(
             "--schedule-conservativeness",
@@ -191,7 +190,7 @@ class ServerArgs:
             "--tp-size",
             type=int,
             default=ServerArgs.tp_size,
-            help="Tensor parallelism size.",
+            help="The tensor parallelism size.",
         )
         parser.add_argument(
             "--stream-interval",
@@ -203,29 +202,24 @@ class ServerArgs:
             "--random-seed",
             type=int,
             default=ServerArgs.random_seed,
-            help="Random seed.",
+            help="The random seed.",
         )
         parser.add_argument(
             "--log-level",
             type=str,
             default=ServerArgs.log_level,
-            help="Logging level",
+            help="The logging level of all loggers.",
+        )
+        parser.add_argument(
+            "--log-level-http",
+            type=str,
+            default=ServerArgs.log_level_http,
+            help="The logging level of HTTP server. If not set, reuse --log-level by default.",
         )
         parser.add_argument(
             "--log-requests",
             action="store_true",
-            help="Log all requests",
-        )
-        parser.add_argument(
-            "--disable-log-stats",
-            action="store_true",
-            help="Disable logging throughput stats.",
-        )
-        parser.add_argument(
-            "--log-stats-interval",
-            type=int,
-            default=ServerArgs.log_stats_interval,
-            help="Log stats interval in second.",
+            help="Log the inputs and outputs of all requests.",
         )
         parser.add_argument(
             "--show-time-cost",
@@ -244,13 +238,13 @@ class ServerArgs:
             "--dp-size",
             type=int,
             default=ServerArgs.dp_size,
-            help="Data parallelism size.",
+            help="The data parallelism size.",
         )
         parser.add_argument(
             "--load-balance-method",
             type=str,
             default=ServerArgs.load_balance_method,
-            help="Load balancing strategy for data parallelism.",
+            help="The load balancing strategy for data parallelism.",
             choices=[
                 "round_robin",
                 "shortest_queue",
@@ -267,7 +261,7 @@ class ServerArgs:
             "--nnodes",
             type=int,
             default=1,
-            help="Number of nodes"
+            help="The number of nodes."
         )
         parser.add_argument(
             "--node-rank",
