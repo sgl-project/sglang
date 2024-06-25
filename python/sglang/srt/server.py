@@ -58,6 +58,8 @@ from sglang.srt.utils import (
 from sglang.utils import get_exception_traceback
 
 
+logger = logging.getLogger(__name__)
+
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
@@ -192,7 +194,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
         for i in range(tp_size_local):
             start_rpyc_service_process(ModelTpService, model_port_args[0].model_tp_ports[i])
         if server_args.node_rank != 0:
-            print("Listen for connections...")
+            logger.info(f"[node_rank={server_args.node_rank}]: Listen for connections...")
             while True:
                 pass
 
@@ -275,9 +277,10 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
         except Exception as e:
             if pipe_finish_writer is not None:
                 pipe_finish_writer.send(get_exception_traceback())
-            print(f"Initialization failed. warmup error: {e}")
+            print(f"Initialization failed. warmup error: {e}", flush=True)
             raise e
 
+        logger.info("The server is fired up and ready to roll!")
         if pipe_finish_writer is not None:
             pipe_finish_writer.send("init ok")
 
@@ -290,7 +293,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
             app,
             host=server_args.host,
             port=server_args.port,
-            log_level=server_args.log_level,
+            log_level=server_args.log_level_http or server_args.log_level_http,
             timeout_keep_alive=5,
             loop="uvloop",
         )
