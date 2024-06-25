@@ -410,7 +410,7 @@ class ModelTpServer:
                 self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
             )
             logger.info(
-                f"[gpu_id={self.gpu_id}] Prefil batch. "
+                f"[gpu_id={self.gpu_id}] Prefill batch. "
                 f"#new-seq: {len(can_run_list)}, "
                 f"#new-token: {new_batch_input_tokens}, "
                 f"#cached-token: {hit_tokens}, "
