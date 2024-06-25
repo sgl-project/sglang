@@ -466,6 +466,48 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
         setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
 
+def monkey_patch_vllm_dummy_weight_loader():
+    """
+    Monkey patch the dummy weight loader in vllm to call process_weights_after_loading.
+    """
+
+    from vllm.model_executor.model_loader.loader import (
+        ModelConfig, DeviceConfig, LoRAConfig, VisionLanguageConfig,
+        ParallelConfig, SchedulerConfig, CacheConfig, nn,
+        set_default_torch_dtype, _initialize_model, initialize_dummy_weights,
+        DummyModelLoader
+    )
+
+    def load_model(self, *, model_config: ModelConfig,
+                   device_config: DeviceConfig,
+                   lora_config: Optional[LoRAConfig],
+                   vision_language_config: Optional[VisionLanguageConfig],
+                   parallel_config: ParallelConfig,
+                   scheduler_config: SchedulerConfig,
+                   cache_config: CacheConfig) -> nn.Module:
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(model_config, self.load_config,
+                                          lora_config, vision_language_config,
+                                          cache_config)
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    quant_method.process_weights_after_loading(module)
+                # FIXME: Remove this after Mixtral is updated
+                # to use quant_method.
+                if hasattr(module, "process_weights_after_loading"):
+                    module.process_weights_after_loading()
+
+            # NOTE(woosuk): For accurate performance evaluation, we assign
+            # random values to the weights.
+            initialize_dummy_weights(model)
+        return model.eval()
+
+    setattr(DummyModelLoader, "load_model", load_model)
+
+
 API_KEY_HEADER_NAME = "X-API-Key"
 
 

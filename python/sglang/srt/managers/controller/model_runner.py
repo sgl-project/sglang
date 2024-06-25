@@ -23,6 +23,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_multimodal_model,
+    monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
 )
 
@@ -229,6 +230,7 @@ class ModelRunner:
         self.nccl_port = nccl_port
         self.server_args = server_args
         self.is_multimodal_model = is_multimodal_model(self.model_config)
+        monkey_patch_vllm_dummy_weight_loader()
 
         # Init torch distributed
         logger.info(f"[gpu_id={self.gpu_id}] Set cuda device.")
