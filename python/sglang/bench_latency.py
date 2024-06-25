@@ -1,11 +1,13 @@
 """
-## Usage (latency test):
-python bench_low_api.py --model-path meta-llama/Meta-Llama-3-8B-Instruct  --load-format dummy
+Benchmark the latency of a given model. It accepts arguments similar to those of launch_server.py.
 
-## Usage (correctness test):
-python bench_low_api.py --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
+# Usage (latency test):
+python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct --load-format dummy
 
-#### Reference output:
+# Usage (correctness test):
+python -m sglang.bench_latency --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
+
+### Reference output:
 prefill logits (first half) tensor([[-10.0312,  -9.5000,   0.8936,  ...,  -4.9414,  -3.2402,  -3.3633],
         [-10.0312,  -9.5000,   0.8936,  ...,  -4.9414,  -3.2402,  -3.3633],
         [ -9.1875, -10.2500,   2.7109,  ...,  -4.3359,  -4.0664,  -4.1328]],
@@ -39,6 +41,7 @@ from sglang.srt.managers.controller.model_runner import ModelRunner
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import suppress_other_loggers
 
 
 @dataclasses.dataclass
@@ -64,6 +67,8 @@ class BenchArgs:
 
 
 def load_model(server_args, tp_rank):
+    suppress_other_loggers()
+
     model_config = ModelConfig(path=server_args.model_path)
     model_runner = ModelRunner(
         model_config=model_config,
