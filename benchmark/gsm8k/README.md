@@ -1,6 +1,6 @@
 ## Download data
 ```
-wget https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+bash download_data.sh
 ```
 
 ## Run benchmark
