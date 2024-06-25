@@ -290,7 +290,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
             app,
             host=server_args.host,
             port=server_args.port,
-            log_level=server_args.log_level,
+            log_level=server_args.log_level_http or server_args.log_level_http,
             timeout_keep_alive=5,
             loop="uvloop",
         )
