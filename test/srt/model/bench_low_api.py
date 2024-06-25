@@ -1,8 +1,11 @@
 """
-Usage:
+## Usage (latency test):
+python bench_low_api.py --model-path meta-llama/Meta-Llama-3-8B-Instruct  --load-format dummy
+
+## Usage (correctness test):
 python bench_low_api.py --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
 
-Reference output:
+#### Reference output:
 prefill logits (first half) tensor([[-10.0312,  -9.5000,   0.8936,  ...,  -4.9414,  -3.2402,  -3.3633],
         [-10.0312,  -9.5000,   0.8936,  ...,  -4.9414,  -3.2402,  -3.3633],
         [ -9.1875, -10.2500,   2.7109,  ...,  -4.3359,  -4.0664,  -4.1328]],
@@ -27,8 +30,8 @@ import multiprocessing
 import time
 
 import numpy as np
+import torch
 import torch.distributed as dist
-
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode, Req
@@ -41,8 +44,8 @@ from sglang.srt.server_args import ServerArgs
 @dataclasses.dataclass
 class BenchArgs:
     batch_size: int = 1
-    input_len: int = 128
-    output_len: int = 16
+    input_len: int = 1024
+    output_len: int = 8
     cut_len: int = 4
     correctness_test: bool = False
 
@@ -117,6 +120,24 @@ def prepare_extend_inputs(bench_args, input_ids, reqs, model_runner):
     return reqs
 
 
+def prepare_synthetic_inputs(bench_args, tokenizer):
+    input_ids = np.ones((bench_args.batch_size, bench_args.input_len), dtype=np.int32)
+    sampling_params = SamplingParams(
+        temperature=0,
+        max_new_tokens=BenchArgs.output_len,
+    )
+
+    reqs = []
+    for i in range(len(input_ids)):
+        req = Req(rid=i, origin_input_text="", origin_input_ids=list(input_ids[i]))
+        req.prefix_indices = []
+        req.sampling_params = sampling_params
+        req.input_ids = req.origin_input_ids
+        reqs.append(req)
+
+    return reqs
+
+
 def extend(reqs, model_runner):
     batch = Batch.init_new(
         reqs=reqs,
@@ -175,7 +196,43 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
-    pass
+    # Load the model
+    model_runner, tokenizer = load_model(server_args, tp_rank)
+
+    # Prepare inputs
+    reqs = prepare_synthetic_inputs(bench_args, tokenizer)
+
+    def clear():
+        model_runner.req_to_token_pool.clear()
+        model_runner.token_to_kv_pool.clear()
+
+    @torch.inference_mode()
+    def run_once(output_len):
+        # Prefill
+        torch.cuda.synchronize()
+        tic = time.time()
+        next_token_ids, _, batch = extend(reqs, model_runner)
+        torch.cuda.synchronize()
+        latency = time.time() - tic
+        throughput = bench_args.input_len * bench_args.batch_size / latency
+        print(f"Prefill. latency: {latency:6.3f} ms, throughput: {throughput:8.2f} token/s")
+
+        # Decode
+        for _ in range(output_len):
+            torch.cuda.synchronize()
+            tic = time.time()
+            next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+            torch.cuda.synchronize()
+            latency = time.time() - tic
+            throughput = bench_args.batch_size / latency
+            print(f"Decode . latency: {latency:6.3f} ms, throughput: {throughput:8.2f} token/s")
+
+    # Warm up
+    run_once(4)
+    clear()
+
+    # Run again
+    run_once(bench_args.output_len)
 
 
 def main(server_args, bench_args):
