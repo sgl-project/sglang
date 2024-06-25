@@ -28,6 +28,7 @@ I'm going to the park
 
 import argparse
 import dataclasses
+import logging
 import multiprocessing
 import time
 
@@ -48,17 +49,18 @@ from sglang.srt.utils import suppress_other_loggers
 class BenchArgs:
     batch_size: int = 1
     input_len: int = 1024
-    output_len: int = 8
-    cut_len: int = 4
+    output_len: int = 4
     correctness_test: bool = False
+    # This is only used for correctness test
+    cut_len: int = 4
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--batch-size", type=int, default=BenchArgs.batch_size)
         parser.add_argument("--input-len", type=int, default=BenchArgs.input_len)
         parser.add_argument("--output-len", type=int, default=BenchArgs.output_len)
-        parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
         parser.add_argument("--correctness-test", action="store_true")
+        parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -167,6 +169,8 @@ def correctness_test(
     bench_args,
     tp_rank,
 ):
+    rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
+
     # Load the model
     model_runner, tokenizer = load_model(server_args, tp_rank)
 
@@ -175,14 +179,14 @@ def correctness_test(
 
     # Prefill
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-    print("prefill logits (first half)", next_token_logits)
+    rank_print("prefill logits (first half)", next_token_logits)
 
     # Prepare extend inputs
     reqs = prepare_extend_inputs(bench_args, input_ids, reqs, model_runner)
 
     # Extend
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-    print("prefill logits (final)", next_token_logits)
+    rank_print("prefill logits (final)", next_token_logits)
 
     # Decode
     output_ids = [list(req.input_ids) for req in reqs]
@@ -201,13 +205,13 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
+    rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
+
     # Load the model
     model_runner, tokenizer = load_model(server_args, tp_rank)
 
     # Prepare inputs
     reqs = prepare_synthetic_inputs(bench_args, tokenizer)
-
-    rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     def clear():
         model_runner.req_to_token_pool.clear()
@@ -232,7 +236,7 @@ def latency_test(
             torch.cuda.synchronize()
             latency = time.time() - tic
             throughput = bench_args.batch_size / latency
-            rank_print(f"Decode . latency: {latency:6.3f} ms, throughput: {throughput:9.2f} token/s")
+            rank_print(f"Decode.  latency: {latency:6.3f} ms, throughput: {throughput:9.2f} token/s")
 
     # Warm up
     run_once(4)
@@ -275,5 +279,10 @@ if __name__ == "__main__":
 
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
+
+    logging.basicConfig(
+        level=getattr(logging, server_args.log_level.upper()),
+        format="%(message)s",
+    )
 
     main(server_args, bench_args)
