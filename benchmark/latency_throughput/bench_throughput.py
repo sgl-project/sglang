@@ -250,9 +250,14 @@ def main(args: argparse.Namespace):
     np.random.seed(args.seed)
 
     api_url = f"http://{args.host}:{args.port}/generate"
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer, trust_remote_code=args.trust_remote_code
-    )
+    if args.tokenizer.endswith(".json") or args.tokenizer.endswith(".model"):
+        from sglang.srt.hf_transformers_utils import get_tokenizer
+
+        tokenizer = get_tokenizer(args.tokenizer)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer, trust_remote_code=args.trust_remote_code
+        )
 
     if args.dataset:
         input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
@@ -272,7 +277,7 @@ def main(args: argparse.Namespace):
         for i in range(args.num_prompts):
             prompt = tokenizer.decode(
                 [
-                    (offsets[i] + i + j) % tokenizer.vocab_size
+                    (offsets[i] + i + j) % (tokenizer.vocab_size - 129) + 128
                     for j in range(input_lens[i])
                 ]
             )
