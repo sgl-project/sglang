@@ -1,8 +1,13 @@
-import transformers
+import argparse
 import code
 
-#name = "meta-llama/Llama-2-7b-chat-hf"
-name = "meta-llama/Meta-Llama-3-8B-Instruct"
+from sglang.srt.hf_transformers_utils import get_tokenizer
 
-t = transformers.AutoTokenizer.from_pretrained(name)
-code.interact(local=locals())
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
+    args = parser.parse_args()
+
+    t = get_tokenizer(args.name)
+    code.interact(local=locals())
