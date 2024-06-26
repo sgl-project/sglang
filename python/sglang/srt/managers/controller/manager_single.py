@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-import time
+from concurrent.futures import ThreadPoolExecutor
 
 import uvloop
 import zmq
@@ -91,6 +91,7 @@ def start_controller_process(
     pipe_writer.send("init ok")
 
     loop = asyncio.new_event_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=256))
     asyncio.set_event_loop(loop)
     loop.create_task(controller.loop_for_recv_requests())
     try:
