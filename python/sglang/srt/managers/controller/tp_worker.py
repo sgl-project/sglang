@@ -100,7 +100,7 @@ class ModelTpServer:
         self.max_prefill_tokens = (
             max(
                 self.model_config.context_len,
-                min(self.max_total_num_tokens // 6, 65536),
+                min(self.max_total_num_tokens // 6, 32768),
             )
             if server_args.max_prefill_tokens is None
             else server_args.max_prefill_tokens

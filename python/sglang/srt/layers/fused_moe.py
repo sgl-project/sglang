@@ -321,7 +321,7 @@ def get_default_config(
         config = {
             'BLOCK_SIZE_M': 128,
             'BLOCK_SIZE_N': 256,
-            'BLOCK_SIZE_K': 126,
+            'BLOCK_SIZE_K': 128,
             'GROUP_SIZE_M': 32,
             "num_warps": 8,
             "num_stages": 4

@@ -250,7 +250,7 @@ def main(args: argparse.Namespace):
     np.random.seed(args.seed)
 
     api_url = f"http://{args.host}:{args.port}/generate"
-    if args.tokenizer.endswith(".json"):
+    if args.tokenizer.endswith(".json") or args.tokenizer.endswith(".model"):
         from sglang.srt.hf_transformers_utils import get_tokenizer
 
         tokenizer = get_tokenizer(args.tokenizer)
