@@ -62,7 +62,7 @@ def main(args):
     labels = []
     num_questions = []
 
-    for subject in tqdm(subjects[: args.nsub]):
+    for subject in subjects[: args.nsub]:
         dev_df = pd.read_csv(
             os.path.join(args.data_dir, "dev", subject + "_dev.csv"), header=None
         )[: args.ntrain]
@@ -122,6 +122,7 @@ def main(args):
         max_new_tokens=1,
         backend=backend,
         num_threads=args.parallel,
+        progress_bar=True,
     )
     preds = [
         s["answer"].strip()[0] if len(s["answer"].strip()) > 0 else "" for s in states
