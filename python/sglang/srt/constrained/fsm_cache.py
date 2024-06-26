@@ -8,7 +8,8 @@ class FSMCache(BaseCache):
     def __init__(self, tokenizer_path, tokenizer_args_dict, enable=True):
         super().__init__(enable=enable)
 
-        if tokenizer_path.endswith(".json"):
+        if tokenizer_path.endswith(".json") or tokenizer_path.endswith(".model"):
+            # Do not support TiktokenTokenizer or SentencePieceTokenizer
             return
 
         from importlib.metadata import version
