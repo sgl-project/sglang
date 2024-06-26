@@ -8,6 +8,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--backend", type=str, default="srt")
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=256)
     args = parser.parse_args()
 
@@ -33,7 +34,7 @@ if __name__ == "__main__":
         response = requests.post(
             url + "/generate",
             json={
-                "text": prompt,
+                "text": [prompt] * args.batch_size,
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,
@@ -90,5 +91,5 @@ if __name__ == "__main__":
         ret = response.json()
     print(ret)
 
-    speed = max_new_tokens / latency
+    speed = args.batch_size * max_new_tokens / latency
     print(f"latency: {latency:.2f} s, speed: {speed:.2f} token/s")

@@ -317,19 +317,38 @@ def get_default_config(
     topk: int,
     dtype: Optional[str],
 ) -> Dict[str, int]:
-    config = {
-        'BLOCK_SIZE_M': 64,
-        'BLOCK_SIZE_N': 64,
-        'BLOCK_SIZE_K': 32,
-        'GROUP_SIZE_M': 8
-    }
-    if M <= E:
+    if dtype == "float8":
         config = {
-            'BLOCK_SIZE_M': 16,
-            'BLOCK_SIZE_N': 32,
-            'BLOCK_SIZE_K': 64,
-            'GROUP_SIZE_M': 1
+            'BLOCK_SIZE_M': 128,
+            'BLOCK_SIZE_N': 256,
+            'BLOCK_SIZE_K': 128,
+            'GROUP_SIZE_M': 32,
+            "num_warps": 8,
+            "num_stages": 4
         }
+        if M <= E:
+            config = {
+                'BLOCK_SIZE_M': 64,
+                'BLOCK_SIZE_N': 128,
+                'BLOCK_SIZE_K': 128,
+                'GROUP_SIZE_M': 1,
+                "num_warps": 4,
+                "num_stages": 4
+            }
+    else:
+        config = {
+            'BLOCK_SIZE_M': 64,
+            'BLOCK_SIZE_N': 64,
+            'BLOCK_SIZE_K': 32,
+            'GROUP_SIZE_M': 8
+        }
+        if M <= E:
+            config = {
+                'BLOCK_SIZE_M': 16,
+                'BLOCK_SIZE_N': 32,
+                'BLOCK_SIZE_K': 64,
+                'GROUP_SIZE_M': 1
+            }
     return config
 
 
