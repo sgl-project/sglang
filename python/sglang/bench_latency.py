@@ -230,7 +230,7 @@ def latency_test(
         latency = time.time() - tic
         tot_latency += latency
         throughput = bench_args.input_len * bench_args.batch_size / latency
-        rank_print(f"Prefill. latency: {latency:6.3f} ms, throughput: {throughput:9.2f} token/s")
+        rank_print(f"Prefill. latency: {latency:6.5f} ms, throughput: {throughput:9.2f} token/s")
 
         # Decode
         for i in range(output_len):
@@ -241,7 +241,7 @@ def latency_test(
             latency = time.time() - tic
             tot_latency += latency
             throughput = bench_args.batch_size / latency
-            if i < 5: rank_print(f"Decode.  latency: {latency:6.3f} ms, throughput: {throughput:9.2f} token/s")
+            if i < 5: rank_print(f"Decode.  latency: {latency:6.5f} ms, throughput: {throughput:9.2f} token/s")
         
         throughput = (bench_args.input_len + bench_args.output_len) * bench_args.batch_size / tot_latency
         rank_print(f"Total. latency: {tot_latency:6.3f} ms, throughput: {throughput:9.2f} token/s")
