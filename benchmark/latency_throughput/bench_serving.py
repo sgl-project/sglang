@@ -312,7 +312,7 @@ def main(args: argparse.Namespace):
         output_len for _, output_len, _ in REQUEST_LATENCY]) / benchmark_time
 
     print(f"Total time: {benchmark_time:.2f} s")
-    print(f"Request  throughput: {args.num_prompts / benchmark_time:.2f} requests/s")
+    print(f"Request throughput: {args.num_prompts / benchmark_time:.2f} requests/s")
     print(f"Decoding throughput: {decoding_throughput:.2f} token/s")
     print(f"Average latency: {avg_latency:.2f} s")
     print(f"Average latency per token: {avg_per_token_latency:.2f} s")
