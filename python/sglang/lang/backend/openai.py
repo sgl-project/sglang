@@ -1,4 +1,6 @@
 import dataclasses
+import inspect
+import json
 import logging
 import time
 import warnings
@@ -228,6 +230,123 @@ class OpenAI(BaseBackend):
                     else:
                         return False
         return True
+
+    def function_calling(
+        self,
+        s: StreamExecutor,
+        tools: List[str],
+        tool_choice: str,
+    ):
+        # chat model vs. non chat model
+        # stream vs non stream
+        if self.model_name not in [
+            "gpt-4o",
+            "gpt-4o-2024-05-13",
+            "gpt-4-turbo",
+            "gpt-4-turbo-2024-04-09",
+            "gpt-4-turbo-preview",
+            "gpt-4-0125-preview",
+            "gpt-4-1106-preview",
+            "gpt-4",
+            "gpt-4-0613",
+            "gpt-3.5-turbo",
+            "gpt-3.5-turbo-0125",
+            "gpt-3.5-turbo-1106",
+            "gpt-3.5-turbo-0613",
+        ]:
+            raise RuntimeError(
+                "This model currently does not support function calling."
+            )
+
+        def convert_param_type(type):
+            if type == "int" or type == "integer":
+                return "integer"
+            if type == "str" or type == "string":
+                return "string"
+            return type
+
+        def function_to_json_schema(func):
+            signature = inspect.signature(func)
+            parameters = signature.parameters
+            func_schema = {
+                "type": "function",
+                "function": {
+                    "name": func.__name__,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            param.name: {
+                                "type": convert_param_type(
+                                    str(param.annotation)
+                                    .replace("<class '", "")
+                                    .replace("'>", "")
+                                )
+                            }
+                            for param in parameters.values()
+                        },
+                    },
+                },
+            }
+            return func_schema
+
+        tools_to_use = []
+        if self.tools:
+            tools_to_use = [
+                function_to_json_schema(tool_to_use) for tool_to_use in self.tools
+            ]
+        tool_choice = "auto"
+        if self.tool_choice:
+            tool_choice = (
+                self.tool_choice
+                if self.tool_choice in ["auto", "required", "none"]
+                else {"type": "function", "function": {"name": self.tool_choice}}
+            )
+
+        # should we append "Never mention what tools you use." or provide a system prompt input argument
+        messages = s.text_
+        comp = openai_completion(
+            client=self.client,
+            token_usage=self.token_usage,
+            is_chat=self.is_chat_model,
+            model=self.model_name,
+            prompt=messages,
+            tools=tools_to_use,
+            tool_choice=tool_choice,
+            **self.spec_kwargs,
+        )
+        response_message = comp.choices[0].message
+        tool_calls = response_message.tool_calls
+        # Check if the model wanted to call a function
+        if tool_calls:
+            # Call the function
+            # Note: the JSON response may not always be valid; be sure to handle errors
+            available_functions = ()
+            for tool_name in tools:
+                available_functions.append({tool_name: globals()[tool_name]})
+            messages.append(response_message)
+            # Send the info for each function call and function response to the model
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_to_call = available_functions[function_name]
+                function_args = json.loads(tool_call.function.arguments)
+                function_response = function_to_call(**function_args)
+                messages.append(
+                    {
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": function_name,
+                        "content": function_response,
+                    }
+                )
+            comp = openai_completion(
+                client=self.client,
+                token_usage=self.token_usage,
+                is_chat=self.is_chat_model,
+                model=self.model_name,
+                prompt=s.text_,
+                **self.spec_kwargs,
+            )
+            s.text_ += comp
 
     def role_end_generate(
         self,

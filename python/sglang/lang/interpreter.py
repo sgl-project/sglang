@@ -23,6 +23,7 @@ from sglang.lang.ir import (
     SglFunction,
     SglGen,
     SglImage,
+    SglFuncCall,
     SglRoleBegin,
     SglRoleEnd,
     SglSelect,
@@ -368,6 +369,8 @@ class StreamExecutor:
         elif isinstance(other, SglExprList):
             for x in other.expr_list:
                 self._execute(x)
+        elif isinstance(other, SglFuncCall):
+            self._execute_func_call(other)
         elif isinstance(other, SglRoleBegin):
             self._execute_role_begin(other)
         elif isinstance(other, SglRoleEnd):
@@ -489,6 +492,7 @@ class StreamExecutor:
     def _execute_gen(self, expr: SglGen):
         sampling_params = self._resolve_sampling_params(expr.sampling_params)
         name = expr.name
+        print("0-", self)
 
         if not self.stream:
             if self.num_api_spec_tokens is None:
@@ -511,11 +515,14 @@ class StreamExecutor:
                 else:  # Speculative execution on models with completion interface
                     comp, meta_info = self._spec_gen(sampling_params)
 
+            print("1-", comp)
             self.text_ += comp
+            print("2-", self.text_)
 
             self.variables[name] = comp
             self.meta_info[name] = meta_info
             self.variable_event[name].set()
+            print("3-", self.variables[name], name, self.meta_info[name])
         else:
             assert (
                 self.num_api_spec_tokens is None
@@ -554,6 +561,9 @@ class StreamExecutor:
             }
             self.variable_event[name].set()
         self.text_ += decision
+
+    def _execute_func_call(self, expr: SglFuncCall):
+        self.backend.function_calling(self, expr.tools, expr.tool_choice)
 
     def _execute_variable(self, expr: SglVariable):
         src_executor = expr.source_stream_executor

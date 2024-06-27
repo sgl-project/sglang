@@ -472,6 +472,19 @@ class SglSelect(SglExpr):
         return f"Select({self.name}, choices={self.choices})"
 
 
+class SglFuncCall(SglExpr):
+    def __init__(self, name, tools, tool_choice):
+        super().__init__()
+        self.name = name
+        self.tools = tools
+        self.tool_choice = tool_choice
+
+    def __repr__(self):
+        return (
+            f"FuncCall({self.name}, tools={self.tools}, tool_choice={self.tool_choice})"
+        )
+
+
 class SglFork(SglExpr):
     def __init__(self, number: int, position_ids_offset=None):
         super().__init__()
