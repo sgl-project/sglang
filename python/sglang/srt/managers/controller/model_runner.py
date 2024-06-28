@@ -6,7 +6,7 @@ import logging
 import pkgutil
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional, Type, Any
+from typing import List, Optional, Type
 
 import numpy as np
 import torch
@@ -119,7 +119,7 @@ class InputMetadata:
                 head_dim,
                 1,
                 pos_encoding_mode="NONE",
-                data_type="float16",
+                data_type=self.token_to_kv_pool.kv_data[0].dtype
             )
 
     def init_extend_args(self):
@@ -287,10 +287,11 @@ class ModelRunner:
             tokenizer=None,
             tokenizer_mode=None,
             trust_remote_code=self.server_args.trust_remote_code,
-            dtype=torch.float16,
+            dtype=self.server_args.dtype,
             seed=42,
             skip_tokenizer_init=True,
         )
+        self.dtype = vllm_model_config.dtype
         if self.model_config.model_overide_args is not None:
             vllm_model_config.hf_config.update(self.model_config.model_overide_args)
 
@@ -337,7 +338,7 @@ class ModelRunner:
         )
         self.token_to_kv_pool = TokenToKVPool(
             self.max_total_num_tokens,
-            dtype=torch.float16,
+            dtype=self.dtype,
             head_num=self.model_config.get_num_kv_heads(self.tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
