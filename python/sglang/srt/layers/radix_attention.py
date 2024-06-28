@@ -107,11 +107,23 @@ class RadixAttention(nn.Module):
     def prefill_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         self.store_kv_cache(k, v, input_metadata)
 
-        o = input_metadata.flashinfer_prefill_wrapper.forward(
+        o1, s1 = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-            input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+            k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
+            v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
             logits_cap=self.logit_cap,
         )
+
+        # o2, s2 = input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
+        #     q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+        #     input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+        #     causal=False,
+        #     logits_cap=self.logit_cap,
+        # )
+
+        # from flashinfer.cascade import merge_state
+        # o, _ = merge_state(o1, s1, o2, s2)
+        o = o1
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 

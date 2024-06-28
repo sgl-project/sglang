@@ -247,7 +247,7 @@ def latency_test(
         rank_print(f"Total. latency: {tot_latency:6.3f} ms, throughput: {throughput:9.2f} token/s")
 
     # Warm up
-    run_once(4)
+    run_once(10)
     clear()
 
     # Run again
