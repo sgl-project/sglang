@@ -308,6 +308,7 @@ class ModelRunner:
         logger.info(
             f"[gpu_id={self.gpu_id}] Load weight end. "
             f"type={type(self.model).__name__}, "
+            f"dtype={self.dtype}, "
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
