@@ -6,6 +6,7 @@ from sglang.api import (
     assistant_end,
     flush_cache,
     function,
+    func_call,
     gen,
     gen_int,
     gen_string,
@@ -58,4 +59,5 @@ __all__ = [
     "user_end",
     "assistant_begin",
     "assistant_end",
+    "func_call",
 ]

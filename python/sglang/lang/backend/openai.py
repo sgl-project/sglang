@@ -154,6 +154,8 @@ class OpenAI(BaseBackend):
                             "Example of adding api speculative execution: @function(num_api_spec_tokens=128)."
                         )
                     prompt = s.messages_
+                    for function_call in s.function_calls:
+                        prompt.append(function_call)
                 else:
                     return self._prepare_spec_execution(
                         sampling_params, s.num_api_spec_tokens, spec_var_name
@@ -237,8 +239,8 @@ class OpenAI(BaseBackend):
         tools: List[str],
         tool_choice: str,
     ):
-        # chat model vs. non chat model
-        # stream vs non stream
+        assert self.is_chat_model, "function calling only supported on chat model"
+        # TODO: special handling for chat model vs. non chat model, stream vs non stream
         if self.model_name not in [
             "gpt-4o",
             "gpt-4o-2024-05-13",
@@ -290,63 +292,52 @@ class OpenAI(BaseBackend):
             return func_schema
 
         tools_to_use = []
-        if self.tools:
+        if tools:
             tools_to_use = [
-                function_to_json_schema(tool_to_use) for tool_to_use in self.tools
+                function_to_json_schema(tool_to_use) for tool_to_use in tools
             ]
-        tool_choice = "auto"
-        if self.tool_choice:
-            tool_choice = (
-                self.tool_choice
-                if self.tool_choice in ["auto", "required", "none"]
-                else {"type": "function", "function": {"name": self.tool_choice}}
+        cur_tool_choice = "auto"
+        if tool_choice:
+            cur_tool_choice = (
+                tool_choice
+                if tool_choice in ["auto", "required", "none"]
+                else {"type": "function", "function": {"name": tool_choice}}
             )
 
-        # should we append "Never mention what tools you use." or provide a system prompt input argument
-        messages = s.text_
-        comp = openai_completion(
-            client=self.client,
-            token_usage=self.token_usage,
-            is_chat=self.is_chat_model,
+        # TODO: "Never mention what tools you use." or provide a system prompt input argument
+        response = self.client.chat.completions.create(
             model=self.model_name,
-            prompt=messages,
+            messages=s.messages_,
             tools=tools_to_use,
-            tool_choice=tool_choice,
+            tool_choice=cur_tool_choice,
             **self.spec_kwargs,
         )
-        response_message = comp.choices[0].message
+        response_message = response.choices[0].message
         tool_calls = response_message.tool_calls
         # Check if the model wanted to call a function
+        ret_messages = []
         if tool_calls:
             # Call the function
             # Note: the JSON response may not always be valid; be sure to handle errors
-            available_functions = ()
-            for tool_name in tools:
-                available_functions.append({tool_name: globals()[tool_name]})
-            messages.append(response_message)
+            available_functions = {}
+            for tool in tools:
+                available_functions[tool.__name__] = tool
+            ret_messages.append(response_message)
             # Send the info for each function call and function response to the model
             for tool_call in tool_calls:
                 function_name = tool_call.function.name
                 function_to_call = available_functions[function_name]
                 function_args = json.loads(tool_call.function.arguments)
                 function_response = function_to_call(**function_args)
-                messages.append(
+                ret_messages.append(
                     {
                         "tool_call_id": tool_call.id,
                         "role": "tool",
                         "name": function_name,
-                        "content": function_response,
+                        "content": str(function_response),
                     }
                 )
-            comp = openai_completion(
-                client=self.client,
-                token_usage=self.token_usage,
-                is_chat=self.is_chat_model,
-                model=self.model_name,
-                prompt=s.text_,
-                **self.spec_kwargs,
-            )
-            s.text_ += comp
+        return ret_messages
 
     def role_end_generate(
         self,

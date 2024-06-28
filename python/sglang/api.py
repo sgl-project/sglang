@@ -16,6 +16,7 @@ from sglang.lang.ir import (
     SglRoleEnd,
     SglSelect,
     SglVideo,
+    SglFuncCall,
 )
 
 
@@ -224,3 +225,11 @@ def assistant_begin():
 
 def assistant_end():
     return SglRoleEnd("assistant")
+
+
+def func_call(
+    name: Optional[str] = None,
+    tools: Optional[List[str]] = None,
+    tool_choice: Optional[str] = "auto",
+):
+    return SglFuncCall(name, tools, tool_choice)
