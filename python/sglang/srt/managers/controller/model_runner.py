@@ -6,7 +6,7 @@ import logging
 import pkgutil
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional, Type, Any
+from typing import List, Optional, Type
 
 import numpy as np
 import torch
@@ -119,7 +119,7 @@ class InputMetadata:
                 head_dim,
                 1,
                 pos_encoding_mode="NONE",
-                data_type="float16",
+                data_type=self.token_to_kv_pool.kv_data[0].dtype
             )
 
     def init_extend_args(self):
@@ -287,10 +287,11 @@ class ModelRunner:
             tokenizer=None,
             tokenizer_mode=None,
             trust_remote_code=self.server_args.trust_remote_code,
-            dtype=torch.float16,
+            dtype=self.server_args.dtype,
             seed=42,
             skip_tokenizer_init=True,
         )
+        self.dtype = vllm_model_config.dtype
         if self.model_config.model_overide_args is not None:
             vllm_model_config.hf_config.update(self.model_config.model_overide_args)
 
@@ -307,6 +308,7 @@ class ModelRunner:
         logger.info(
             f"[gpu_id={self.gpu_id}] Load weight end. "
             f"type={type(self.model).__name__}, "
+            f"dtype={self.dtype}, "
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
@@ -316,7 +318,7 @@ class ModelRunner:
         )
         head_dim = self.model_config.head_dim
         head_num = self.model_config.get_num_kv_heads(self.tp_size)
-        cell_size = head_num * head_dim * self.model_config.num_hidden_layers * 2 * 2
+        cell_size = head_num * head_dim * self.model_config.num_hidden_layers * 2 * torch._utils._element_size(self.dtype)
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
@@ -337,7 +339,7 @@ class ModelRunner:
         )
         self.token_to_kv_pool = TokenToKVPool(
             self.max_total_num_tokens,
-            dtype=torch.float16,
+            dtype=self.dtype,
             head_num=self.model_config.get_num_kv_heads(self.tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,

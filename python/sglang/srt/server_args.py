@@ -11,12 +11,13 @@ class ServerArgs:
     # Model and tokenizer
     model_path: str
     tokenizer_path: Optional[str] = None
-    load_format: str = "auto"
     tokenizer_mode: str = "auto"
-    chat_template: Optional[str] = None
+    load_format: str = "auto"
+    dtype: str = "auto"
     trust_remote_code: bool = True
     context_length: Optional[int] = None
     quantization: Optional[str] = None
+    chat_template: Optional[str] = None
 
     # Port
     host: str = "127.0.0.1"
@@ -108,6 +109,15 @@ class ServerArgs:
             help="The additional ports specified for the server.",
         )
         parser.add_argument(
+            "--tokenizer-mode",
+            type=str,
+            default=ServerArgs.tokenizer_mode,
+            choices=["auto", "slow"],
+            help="Tokenizer mode. 'auto' will use the fast "
+            "tokenizer if available, and 'slow' will "
+            "always use the slow tokenizer.",
+        )
+        parser.add_argument(
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
@@ -124,20 +134,20 @@ class ServerArgs:
             "which is mainly for profiling.",
         )
         parser.add_argument(
-            "--tokenizer-mode",
+            "--dtype",
             type=str,
-            default=ServerArgs.tokenizer_mode,
-            choices=["auto", "slow"],
-            help="Tokenizer mode. 'auto' will use the fast "
-            "tokenizer if available, and 'slow' will "
-            "always use the slow tokenizer.",
-        )
-        parser.add_argument(
-            "--chat-template",
-            type=str,
-            default=ServerArgs.chat_template,
-            help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server",
-        )
+            default=ServerArgs.dtype,
+            choices=[
+                "auto", "half", "float16", "bfloat16", "float", "float32"
+            ],
+            help='Data type for model weights and activations.\n\n'
+            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
+            'BF16 precision for BF16 models.\n'
+            '* "half" for FP16. Recommended for AWQ quantization.\n'
+            '* "float16" is the same as "half".\n'
+            '* "bfloat16" for a balance between precision and range.\n'
+            '* "float" is shorthand for FP32 precision.\n'
+            '* "float32" for FP32 precision.')
         parser.add_argument(
             "--trust-remote-code",
             action="store_true",
@@ -154,6 +164,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.quantization,
             help="The quantization method.",
+        )
+        parser.add_argument(
+            "--chat-template",
+            type=str,
+            default=ServerArgs.chat_template,
+            help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
         )
         parser.add_argument(
             "--mem-fraction-static",
