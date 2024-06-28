@@ -65,7 +65,7 @@ class InputMetadata:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
     kv_last_page_len: torch.Tensor = None
-    flashinfer_prefill_wrapper: "BatchPrefillWithPagedKVCacheWrapper" = None
+    flashinfer_prefill_wrapper: "BatchPrefillWithRaggedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
 
     def init_flashinfer_args(self, num_qo_heads, num_kv_heads, head_dim):
@@ -100,13 +100,10 @@ class InputMetadata:
             self.flashinfer_prefill_wrapper.end_forward()
             self.flashinfer_prefill_wrapper.begin_forward(
                 self.qo_indptr,
-                self.kv_indptr,
-                self.kv_indices,
-                self.kv_last_page_len,
+                self.qo_indptr.clone(),
                 num_qo_heads,
                 num_kv_heads,
                 head_dim,
-                1
             )
         else:
             self.flashinfer_decode_wrapper.end_forward()
@@ -361,7 +358,7 @@ class ModelRunner:
     def init_flash_infer(self):
         if global_server_args_dict.get("enable_flashinfer", False):
             from flashinfer import (
-                BatchPrefillWithPagedKVCacheWrapper,
+                BatchPrefillWithRaggedKVCacheWrapper,
                 BatchDecodeWithPagedKVCacheWrapper,
             )
             from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
@@ -376,7 +373,7 @@ class ModelRunner:
             workspace_buffer = torch.empty(
                 128 * 1024 * 1024, dtype=torch.int8, device="cuda"
             )
-            self.flashinfer_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            self.flashinfer_prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
                 workspace_buffer, "NHD"
             )
             self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(

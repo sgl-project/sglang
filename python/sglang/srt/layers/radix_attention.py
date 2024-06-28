@@ -109,7 +109,8 @@ class RadixAttention(nn.Module):
 
         o = input_metadata.flashinfer_prefill_wrapper.forward(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-            input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+            k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
+            v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
             logits_cap=self.logit_cap,
         )
 
