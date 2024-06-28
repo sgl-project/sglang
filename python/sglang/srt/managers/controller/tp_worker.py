@@ -120,7 +120,7 @@ class ModelTpServer:
             f"[gpu_id={self.gpu_id}] "
             f"max_total_num_tokens={self.max_total_num_tokens}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
-            f"context_len={self.model_config.context_len}, "
+            f"context_len={self.model_config.context_len}"
         )
         if self.tp_rank == 0:
             logger.info(
