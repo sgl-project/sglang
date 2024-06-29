@@ -154,6 +154,8 @@ class OpenAI(BaseBackend):
                             "Example of adding api speculative execution: @function(num_api_spec_tokens=128)."
                         )
                     prompt = s.messages_
+                    # Open AI model requires function call information to be sent to the model
+                    # along with the prompt.
                     for function_call in s.function_calls:
                         prompt.append(function_call)
                 else:

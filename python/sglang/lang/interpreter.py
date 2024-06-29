@@ -767,6 +767,8 @@ class ProgramState:
         return self.stream_executor.text()
 
     def messages(self):
+        # We do not want to expose tool use information to users in the final response, 
+        # so removing the auxillary information from final messages.
         filtered_list = [
             item
             for item in self.stream_executor.messages()
