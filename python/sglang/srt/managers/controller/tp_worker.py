@@ -283,13 +283,14 @@ class ModelTpServer:
                 (recv_req.image_hash >> 64) % self.model_config.vocab_size,
             ]
             req.image_size = recv_req.image_size
-            req.origin_input_ids, req.image_offset = (
-                self.model_runner.model.pad_input_ids(
-                    req.origin_input_ids_unpadded,
-                    req.pad_value,
-                    req.pixel_values.shape,
-                    req.image_size,
-                )
+            (
+                req.origin_input_ids,
+                req.image_offset,
+            ) = self.model_runner.model.pad_input_ids(
+                req.origin_input_ids_unpadded,
+                req.pad_value,
+                req.pixel_values.shape,
+                req.image_size,
             )
         req.sampling_params = recv_req.sampling_params
         req.return_logprob = recv_req.return_logprob

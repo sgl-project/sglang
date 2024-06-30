@@ -35,7 +35,6 @@ class GenerateReqInput:
     stream: bool = False
 
     def post_init(self):
-
         if (self.text is None and self.input_ids is None) or (
             self.text is not None and self.input_ids is not None
         ):

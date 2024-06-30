@@ -521,7 +521,6 @@ class Grok1DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-
         hidden_states = (
             self.post_attn_norm(
                 self.self_attn(

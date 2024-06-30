@@ -4,7 +4,7 @@ from queue import Queue
 from typing import List, Union
 
 from sglang.global_config import global_config
-from sglang.lang.interpreter import ProgramState, StreamExecutor, pin_program
+from sglang.lang.interpreter import ProgramState, StreamExecutor, cache_program
 from sglang.lang.ir import (
     SglArgument,
     SglConstantText,
@@ -184,7 +184,7 @@ class CompiledFunction:
 
         # Extract prefix by tracing and cache it
         if len(batch_kwargs) > 1:
-            pin_program(self.function, backend)
+            cache_program(self.function, backend)
 
         # Run all programs
         if num_threads == "auto":
