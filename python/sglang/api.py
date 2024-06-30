@@ -16,7 +16,6 @@ from sglang.lang.ir import (
     SglRoleEnd,
     SglSelect,
     SglVideo,
-    SglFuncCall,
 )
 
 
@@ -133,6 +132,8 @@ def gen_string(
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
+    tools: Optional[List[str]] = None,
+    tool_choice: Optional[str] = "auto",
 ):
     return SglGen(
         name,
@@ -146,6 +147,8 @@ def gen_string(
         ignore_eos,
         str,
         None,
+        tools,
+        tool_choice,
     )
 
 
@@ -199,11 +202,3 @@ def assistant_begin():
 
 def assistant_end():
     return SglRoleEnd("assistant")
-
-
-def func_call(
-    name: Optional[str] = None,
-    tools: Optional[List[str]] = None,
-    tool_choice: Optional[str] = "auto",
-):
-    return SglFuncCall(name, tools, tool_choice)

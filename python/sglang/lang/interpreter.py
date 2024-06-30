@@ -23,7 +23,6 @@ from sglang.lang.ir import (
     SglFunction,
     SglGen,
     SglImage,
-    SglFuncCall,
     SglRoleBegin,
     SglRoleEnd,
     SglSelect,
@@ -371,8 +370,6 @@ class StreamExecutor:
         elif isinstance(other, SglExprList):
             for x in other.expr_list:
                 self._execute(x)
-        elif isinstance(other, SglFuncCall):
-            self._execute_func_call(other)
         elif isinstance(other, SglRoleBegin):
             self._execute_role_begin(other)
         elif isinstance(other, SglRoleEnd):
@@ -491,9 +488,22 @@ class StreamExecutor:
 
         return comp, meta_info
 
+    def _build_and_append_func_call_messages(self, expr: SglGen):
+        # TODO: Should we clear the previous function call states for the next function call
+        if self.backend.is_chat_model:
+            self.function_calls = self.backend.function_calling(
+                self, expr.tools, expr.tool_choice
+            )
+            for function_call in self.function_calls:
+                self.messages_.append(function_call)
+        # TODO: handle text appending
+
     def _execute_gen(self, expr: SglGen):
         sampling_params = self._resolve_sampling_params(expr.sampling_params)
         name = expr.name
+
+        if expr.tools:
+            self._build_and_append_func_call_messages(expr)
 
         if not self.stream:
             if self.num_api_spec_tokens is None:
@@ -559,12 +569,6 @@ class StreamExecutor:
             }
             self.variable_event[name].set()
         self.text_ += decision
-
-    def _execute_func_call(self, expr: SglFuncCall):
-        # TODO: Should we clear the previous function call states for the next function call
-        self.function_calls = self.backend.function_calling(
-            self, expr.tools, expr.tool_choice
-        )
 
     def _execute_variable(self, expr: SglVariable):
         src_executor = expr.source_stream_executor
@@ -762,7 +766,7 @@ class ProgramState:
         return self.stream_executor.text()
 
     def messages(self):
-        # We do not want to expose tool use information to users in the final response, 
+        # We do not want to expose tool use information to users in the final response,
         # so removing the auxillary information from final messages.
         filtered_list = [
             item

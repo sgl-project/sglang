@@ -366,6 +366,8 @@ class SglGen(SglExpr):
         ignore_eos,
         dtype,
         regex,
+        tools,
+        tool_choice,
     ):
         super().__init__()
         self.name = name
@@ -381,6 +383,8 @@ class SglGen(SglExpr):
             dtype=dtype,
             regex=regex,
         )
+        self.tools = tools
+        self.tool_choice = tool_choice
 
     def __repr__(self):
         return f"Gen('{self.name}')"
@@ -422,19 +426,6 @@ class SglSelect(SglExpr):
 
     def __repr__(self):
         return f"Select({self.name}, choices={self.choices})"
-
-
-class SglFuncCall(SglExpr):
-    def __init__(self, name, tools, tool_choice):
-        super().__init__()
-        self.name = name
-        self.tools = tools
-        self.tool_choice = tool_choice
-
-    def __repr__(self):
-        return (
-            f"FuncCall({self.name}, tools={self.tools}, tool_choice={self.tool_choice})"
-        )
 
 
 class SglFork(SglExpr):

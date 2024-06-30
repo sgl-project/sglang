@@ -154,10 +154,6 @@ class OpenAI(BaseBackend):
                             "Example of adding api speculative execution: @function(num_api_spec_tokens=128)."
                         )
                     prompt = s.messages_
-                    # Open AI model requires function call information to be sent to the model
-                    # along with the prompt.
-                    for function_call in s.function_calls:
-                        prompt.append(function_call)
                 else:
                     return self._prepare_spec_execution(
                         sampling_params, s.num_api_spec_tokens, spec_var_name
@@ -241,7 +237,6 @@ class OpenAI(BaseBackend):
         tools: List[str],
         tool_choice: str,
     ):
-        assert self.is_chat_model, "function calling only supported on chat model"
         # TODO: special handling for chat model vs. non chat model, stream vs non stream
         if self.model_name not in [
             "gpt-4o",
@@ -293,25 +288,29 @@ class OpenAI(BaseBackend):
             }
             return func_schema
 
+        def build_tool_choice_param():
+            if tool_choice in ["auto", "required", "none"]:
+                return tool_choice
+            else:
+                assert (
+                    tool_choice in tools
+                ), "could not find a candidate function that matches the provided tool choice"
+                return {"type": "function", "function": {"name": tool_choice}}
+
         tools_to_use = []
         if tools:
             tools_to_use = [
                 function_to_json_schema(tool_to_use) for tool_to_use in tools
             ]
-        cur_tool_choice = "auto"
         if tool_choice:
-            cur_tool_choice = (
-                tool_choice
-                if tool_choice in ["auto", "required", "none"]
-                else {"type": "function", "function": {"name": tool_choice}}
-            )
+            tool_choice = build_tool_choice_param()
 
         # TODO: "Never mention what tools you use." or provide a system prompt input argument
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=s.messages_,
             tools=tools_to_use,
-            tool_choice=cur_tool_choice,
+            tool_choice=tool_choice,
             **self.spec_kwargs,
         )
         response_message = response.choices[0].message
