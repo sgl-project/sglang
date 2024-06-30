@@ -6,7 +6,6 @@ import multiprocessing as mp
 from sglang.srt.server import ServerArgs, launch_server
 
 if __name__ == "__main__":
-
     model_overide_args = {}
 
     model_overide_args["mm_spatial_pool_stride"] = 2

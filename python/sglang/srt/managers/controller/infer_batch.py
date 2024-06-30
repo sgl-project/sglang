@@ -498,9 +498,10 @@ class Batch:
                         req.output_ids = cur_output_ids
                         continue
 
-                    jump_forward_str, next_state = (
-                        req.jump_forward_map.jump_forward_symbol(cur_state)
-                    )
+                    (
+                        jump_forward_str,
+                        next_state,
+                    ) = req.jump_forward_map.jump_forward_symbol(cur_state)
 
                     # Make the incrementally decoded text part of jump_forward_str
                     # so that the UTF-8 will not corrupt

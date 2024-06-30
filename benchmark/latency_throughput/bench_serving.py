@@ -38,7 +38,6 @@ def sample_requests(
     num_requests: int,
     tokenizer: AutoTokenizer,
 ) -> List[Tuple[str, int, int]]:
-
     def load_dataset():
         with open(dataset_path, encoding="utf-8") as f:
             dataset = json.load(f)
