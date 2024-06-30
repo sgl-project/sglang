@@ -36,7 +36,6 @@ LoraConfig = None
 
 
 class GLMAttention(nn.Module):
-
     def __init__(
         self,
         config,
@@ -294,7 +293,6 @@ class GLMTransformer(nn.Module):
 
 
 class ChatGLMModel(nn.Module):
-
     def __init__(
         self,
         config,
