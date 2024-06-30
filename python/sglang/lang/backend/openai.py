@@ -44,6 +44,27 @@ INSTRUCT_MODEL_NAMES = [
     "gpt-3.5-turbo-instruct",
 ]
 
+PARALLEL_FUNC_CALL_ENABLED_MODEL_NAMES = [
+    "gpt-4o",
+    "gpt-4o-2024-05-13",
+    "gpt-4o-mini",
+    "gpt-4o-mini-2024-07-18",
+    "gpt-4-turbo",
+    "gpt-4-turbo-2024-04-09",
+    "gpt-4-turbo-preview",
+    "gpt-4-0125-preview",
+    "gpt-4-1106-preview",
+    "gpt-3.5-turbo-0125",
+    "gpt-3.5-turbo-1106",
+]
+
+FUNC_CALL_ENABLED_MODEL_NAMES = PARALLEL_FUNC_CALL_ENABLED_MODEL_NAMES + [
+    "gpt-4",
+    "gpt-4-0613",
+    "gpt-3.5-turbo",
+    "gpt-3.5-turbo-0613",
+]
+
 
 @dataclasses.dataclass
 class TokenUsage:
@@ -142,6 +163,7 @@ class OpenAI(BaseBackend):
         self,
         s: StreamExecutor,
         sampling_params: SglSamplingParams,
+        function_call_messages: List = [],
         spec_var_name: str = None,
     ):
         if sampling_params.dtype is None:
@@ -153,11 +175,7 @@ class OpenAI(BaseBackend):
                             "For OpenAI chat models, sgl.gen must be right after sgl.assistant. "
                             "Example of adding api speculative execution: @function(num_api_spec_tokens=128)."
                         )
-                    prompt = s.messages_
-                    # Open AI model requires function call information to be sent to the model
-                    # along with the prompt.
-                    for function_call in s.function_calls:
-                        prompt.append(function_call)
+                    prompt = s.messages_ + function_call_messages
                 else:
                     return self._prepare_spec_execution(
                         sampling_params, s.num_api_spec_tokens, spec_var_name
@@ -235,32 +253,18 @@ class OpenAI(BaseBackend):
                         return False
         return True
 
-    def function_calling(
+    def build_function_call_messages(
         self,
         s: StreamExecutor,
         tools: List[str],
         tool_choice: str,
     ):
-        assert self.is_chat_model, "function calling only supported on chat model"
-        # TODO: special handling for chat model vs. non chat model, stream vs non stream
-        if self.model_name not in [
-            "gpt-4o",
-            "gpt-4o-2024-05-13",
-            "gpt-4-turbo",
-            "gpt-4-turbo-2024-04-09",
-            "gpt-4-turbo-preview",
-            "gpt-4-0125-preview",
-            "gpt-4-1106-preview",
-            "gpt-4",
-            "gpt-4-0613",
-            "gpt-3.5-turbo",
-            "gpt-3.5-turbo-0125",
-            "gpt-3.5-turbo-1106",
-            "gpt-3.5-turbo-0613",
-        ]:
-            raise RuntimeError(
-                "This model currently does not support function calling."
-            )
+        assert (
+            s.num_api_spec_tokens is None
+        ), "function calling is not supported with api speculative execution"
+        assert (
+            self.model_name in FUNC_CALL_ENABLED_MODEL_NAMES
+        ), "function calling is not supported with the provided model"
 
         def convert_param_type(type):
             if type == "int" or type == "integer":
@@ -293,25 +297,28 @@ class OpenAI(BaseBackend):
             }
             return func_schema
 
+        def build_tool_choice_param():
+            if tool_choice in ["auto", "required", "none"]:
+                return tool_choice
+            else:
+                assert tool_choice in [
+                    tool.__name__ for tool in tools
+                ], "could not find a candidate function that matches the provided tool choice"
+                return {"type": "function", "function": {"name": tool_choice}}
+
         tools_to_use = []
         if tools:
             tools_to_use = [
                 function_to_json_schema(tool_to_use) for tool_to_use in tools
             ]
-        cur_tool_choice = "auto"
         if tool_choice:
-            cur_tool_choice = (
-                tool_choice
-                if tool_choice in ["auto", "required", "none"]
-                else {"type": "function", "function": {"name": tool_choice}}
-            )
+            tool_choice = build_tool_choice_param()
 
-        # TODO: "Never mention what tools you use." or provide a system prompt input argument
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=s.messages_,
             tools=tools_to_use,
-            tool_choice=cur_tool_choice,
+            tool_choice=tool_choice,
             **self.spec_kwargs,
         )
         response_message = response.choices[0].message
@@ -378,6 +385,7 @@ class OpenAI(BaseBackend):
         self,
         s: StreamExecutor,
         sampling_params: SglSamplingParams,
+        function_call_messages: List = [],
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
@@ -386,7 +394,7 @@ class OpenAI(BaseBackend):
                         "This use case is not supported. "
                         "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
                     )
-                prompt = s.messages_
+                prompt = s.messages_ + function_call_messages
             else:
                 prompt = s.text_
 

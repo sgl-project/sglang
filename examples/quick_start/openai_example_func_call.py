@@ -23,23 +23,25 @@ def get_current_weather(location: str, unit: str = "fahrenheit"):
 
 
 @sgl.function
-def multi_turn_question(s, question_1, functions=[]):
+def question(s, question, tools=[]):
     s += sgl.system("You are a helpful assistant.")
-    s += sgl.user(question_1)
-    s += sgl.func_call("func_call_1", tools=functions, tool_choice="auto")
-    s += sgl.assistant(sgl.gen("answer_1", max_tokens=256))
+    s += sgl.user(question)
+    s += sgl.assistant(
+        sgl.gen("answer_1", max_tokens=256, tools=tools, tool_choice="auto")
+    )
 
 
 def single():
-    state = multi_turn_question.run(
-        question_1="What's the weather like in San Francisco, Tokyo, Paris, and Beijing?",
-        functions=[get_current_weather],
+    state = question.run(
+        question="What's the weather like in San Francisco, Tokyo, Paris, and Beijing?",
+        tools=[get_current_weather],
     )
 
     for m in state.messages():
         print(m["role"], ":", m["content"])
 
     print("\n-- answer_1 --\n", state["answer_1"])
+    # TODO: do we need to add another check for function call results
 
 
 if __name__ == "__main__":

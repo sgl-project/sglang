@@ -16,7 +16,6 @@ from sglang.lang.ir import (
     SglRoleEnd,
     SglSelect,
     SglVideo,
-    SglFuncCall,
 )
 
 
@@ -75,6 +74,8 @@ def gen(
     dtype: Optional[type] = None,
     choices: Optional[List[str]] = None,
     regex: Optional[str] = None,
+    tools: Optional[List[str]] = None,
+    tool_choice: Optional[str] = "auto",
 ):
     """Call the model to generate. See the meaning of the arguments in docs/sampling_params.md"""
 
@@ -104,6 +105,8 @@ def gen(
         return_text_in_logprobs,
         dtype,
         regex,
+        tools,
+        tool_choice,
     )
 
 
@@ -225,11 +228,3 @@ def assistant_begin():
 
 def assistant_end():
     return SglRoleEnd("assistant")
-
-
-def func_call(
-    name: Optional[str] = None,
-    tools: Optional[List[str]] = None,
-    tool_choice: Optional[str] = "auto",
-):
-    return SglFuncCall(name, tools, tool_choice)
