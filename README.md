@@ -396,7 +396,8 @@ Instructions for supporting a new model are [here](https://github.com/sgl-projec
 - Mixtral-8x7B on NVIDIA A10G, FP16, Tensor Parallelism=8
 ![mixtral_8x7b](assets/mixtral_8x7b.jpg)
 
-Learn more [here](docs/benchmark_results.md).
+- Learn more about the above [results](docs/benchmark_results.md).
+- Synthetic latency and throughput benchmark [scripts](https://github.com/sgl-project/sglang/tree/main/benchmark/latency_throughput).
 
 ## Roadmap
 https://github.com/sgl-project/sglang/issues/157
