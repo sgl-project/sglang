@@ -98,10 +98,7 @@ class ModelTpServer:
             )
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = (
-            max(
-                self.model_config.context_len,
-                min(self.max_total_num_tokens // 6, 32768),
-            )
+            4096
             if server_args.max_prefill_tokens is None
             else server_args.max_prefill_tokens
         )
@@ -371,8 +368,9 @@ class ModelTpServer:
             if (
                 req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
                 < available_size
-                and req.extend_input_len + new_batch_input_tokens
-                < self.max_prefill_tokens
+                and (req.extend_input_len + new_batch_input_tokens
+                <= self.max_prefill_tokens
+                or len(can_run_list) == 0)
             ):
                 delta = self.tree_cache.inc_lock_ref(req.last_node)
                 available_size += delta

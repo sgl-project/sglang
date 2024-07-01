@@ -1,13 +1,8 @@
 ## SRT Unit Tests
 
-### Low-level API
+### Latency Alignment
 ```
-cd sglang/test/srt/model
-
-python3 test_llama_low_api.py
-python3 test_llama_extend.py
-python3 test_llava_low_api.py
-python3 bench_llama_low_api.py
+python -m sglang.bench_latency --model-path meta-llama/Llama-2-7b-chat-hf --mem-fraction-static 0.8 --batch 32 --input-len 512 --output-len 256
 ```
 
 ### High-level API
