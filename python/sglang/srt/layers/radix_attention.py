@@ -26,7 +26,7 @@ class RadixAttention(nn.Module):
 
         from sglang.srt.managers.controller.model_runner import global_server_args_dict
 
-        if global_server_args_dict.get("enable_flashinfer", False):
+        if not global_server_args_dict.get("disable_flashinfer", False):
             self.prefill_forward = self.prefill_forward_flashinfer
             self.extend_forward = self.prefill_forward_flashinfer
             self.decode_forward = self.decode_forward_flashinfer

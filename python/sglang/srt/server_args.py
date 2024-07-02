@@ -50,7 +50,7 @@ class ServerArgs:
     load_balance_method: str = "round_robin"
 
     # Optimization/debug options
-    enable_flashinfer: bool = False
+    disable_flashinfer: bool = True
     attention_reduce_in_fp32: bool = False
     disable_radix_cache: bool = False
     disable_regex_jump_forward: bool = False
@@ -287,9 +287,9 @@ class ServerArgs:
 
         # Optimization/debug options
         parser.add_argument(
-            "--enable-flashinfer",
+            "--disable-flashinfer",
             action="store_true",
-            help="Enable flashinfer inference kernels",
+            help="Disable flashinfer inference kernels",
         )
         parser.add_argument(
             "--attention-reduce-in-fp32",
@@ -322,7 +322,7 @@ class ServerArgs:
 
     def print_mode_args(self):
         return (
-            f"enable_flashinfer={self.enable_flashinfer}, "
+            f"disable_flashinfer={self.disable_flashinfer}, "
             f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}, "
             f"disable_radix_cache={self.disable_radix_cache}, "
             f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
