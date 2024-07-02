@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.global_config import global_config
 from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
 from sglang.srt.layers.extend_attention import extend_attention_fwd
 from sglang.srt.layers.token_attention import token_attention_fwd
@@ -119,6 +120,9 @@ class RadixAttention(nn.Module):
             input_metadata.token_to_kv_pool.kv_data[self.layer_id],
             logits_soft_cap=self.logit_cap,
         )
+
+        if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
+            torch.cuda.synchronize()
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
