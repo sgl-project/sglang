@@ -57,6 +57,8 @@ class DetokenizerManager:
             output_strs = []
             for i in range(len(recv_obj.rids)):
                 new_text = read_texts[i][len(surr_texts[i]) :]
+                if new_text.endswith('�'):
+                    new_text = new_text[:-1]
                 output_strs.append(recv_obj.decoded_texts[i] + new_text)
 
                 if isinstance(recv_obj.finished_reason[i], FINISH_MATCHED_STR):
