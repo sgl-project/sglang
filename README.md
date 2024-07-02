@@ -34,6 +34,8 @@ The core features include:
 pip install "sglang[all]"
 ```
 
+Next, [install FlashInfer](https://docs.flashinfer.ai/installation.html) for attention CUDA kernels.
+
 ### Method 2: From source
 ```
 git clone https://github.com/sgl-project/sglang.git
@@ -43,7 +45,11 @@ pip install --upgrade pip
 pip install -e "python[all]"
 ```
 
+Next, [install FlashInfer](https://docs.flashinfer.ai/installation.html) for attention CUDA kernels.
+
 ### Notes
+- If you see triton errors, please install the [Triton Nightly](https://triton-lang.org/main/getting-started/installation.html).
+- If you cannot install FlashInfer, you can use the slower triton kernels by adding `--disable-flashinfer` when launching the server.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`
 
 ## Quick Start
@@ -363,7 +369,6 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --mem-fraction-static 0.7
 ```
-- See [flashinfer.md](docs/flashinfer.md) on accelerating inference using highly optimized CUDA kernels.
 - See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
 
 ### Supported Models

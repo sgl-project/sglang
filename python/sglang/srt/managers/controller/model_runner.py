@@ -201,7 +201,7 @@ class InputMetadata:
         if forward_mode == ForwardMode.EXTEND:
             ret.init_extend_args()
 
-        if global_server_args_dict.get("enable_flashinfer", False):
+        if not global_server_args_dict.get("disable_flashinfer", False):
             ret.init_flashinfer_args(
                 model_runner.model_config.num_attention_heads // tp_size,
                 model_runner.model_config.get_num_kv_heads(tp_size),
@@ -263,7 +263,7 @@ class ModelRunner:
         # Set some global args
         global global_server_args_dict
         global_server_args_dict = {
-            "enable_flashinfer": server_args.enable_flashinfer,
+            "disable_flashinfer": server_args.disable_flashinfer,
             "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
         }
 
@@ -359,7 +359,7 @@ class ModelRunner:
         return c
 
     def init_flash_infer(self):
-        if global_server_args_dict.get("enable_flashinfer", False):
+        if not global_server_args_dict.get("disable_flashinfer", False):
             from flashinfer import (
                 BatchPrefillWithPagedKVCacheWrapper,
                 BatchDecodeWithPagedKVCacheWrapper,
