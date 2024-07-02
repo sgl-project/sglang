@@ -51,6 +51,7 @@ class LlamaMLP(nn.Module):
             intermediate_size,
             hidden_size,
             bias=False,
+            reduce_results=True,
             quant_config=quant_config,
         )
         if hidden_act != "silu":
@@ -61,9 +62,14 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        # print("x shape before gate_up", x.shape)
         gate_up, _ = self.gate_up_proj(x)
+        # x = 2e-3 * torch.rand(131072, 8192, dtype=torch.float16) - 1e-3
+        # print("gate_up shape", gate_up.shape)
         x = self.act_fn(gate_up)
+        # print("x shape before down_proj", x.shape)
         x, _ = self.down_proj(x)
+        # print("x shape", x.shape)
         return x
 
 
