@@ -56,6 +56,8 @@ class DetokenizerManager:
             # TODO(lmzheng): handle the case where multiple stop strs are hit
             output_strs = []
             for i in range(len(recv_obj.rids)):
+                if new_text.endswith('�'):
+                    new_text = new_text[:-1]
                 new_text = read_texts[i][len(surr_texts[i]) :]
                 output_strs.append(recv_obj.decoded_texts[i] + new_text)
 
