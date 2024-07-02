@@ -1,4 +1,6 @@
 import dataclasses
+import inspect
+import json
 import logging
 import time
 import warnings
@@ -228,6 +230,115 @@ class OpenAI(BaseBackend):
                     else:
                         return False
         return True
+
+    def function_calling(
+        self,
+        s: StreamExecutor,
+        tools: List[str],
+        tool_choice: str,
+    ):
+        # TODO: special handling for chat model vs. non chat model, stream vs non stream
+        if self.model_name not in [
+            "gpt-4o",
+            "gpt-4o-2024-05-13",
+            "gpt-4-turbo",
+            "gpt-4-turbo-2024-04-09",
+            "gpt-4-turbo-preview",
+            "gpt-4-0125-preview",
+            "gpt-4-1106-preview",
+            "gpt-4",
+            "gpt-4-0613",
+            "gpt-3.5-turbo",
+            "gpt-3.5-turbo-0125",
+            "gpt-3.5-turbo-1106",
+            "gpt-3.5-turbo-0613",
+        ]:
+            raise RuntimeError(
+                "This model currently does not support function calling."
+            )
+
+        def convert_param_type(type):
+            if type == "int" or type == "integer":
+                return "integer"
+            if type == "str" or type == "string":
+                return "string"
+            return type
+
+        def function_to_json_schema(func):
+            signature = inspect.signature(func)
+            parameters = signature.parameters
+            func_schema = {
+                "type": "function",
+                "function": {
+                    "name": func.__name__,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            param.name: {
+                                "type": convert_param_type(
+                                    str(param.annotation)
+                                    .replace("<class '", "")
+                                    .replace("'>", "")
+                                )
+                            }
+                            for param in parameters.values()
+                        },
+                    },
+                },
+            }
+            return func_schema
+
+        def build_tool_choice_param():
+            if tool_choice in ["auto", "required", "none"]:
+                return tool_choice
+            else:
+                assert (
+                    tool_choice in tools
+                ), "could not find a candidate function that matches the provided tool choice"
+                return {"type": "function", "function": {"name": tool_choice}}
+
+        tools_to_use = []
+        if tools:
+            tools_to_use = [
+                function_to_json_schema(tool_to_use) for tool_to_use in tools
+            ]
+        if tool_choice:
+            tool_choice = build_tool_choice_param()
+
+        # TODO: "Never mention what tools you use." or provide a system prompt input argument
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=s.messages_,
+            tools=tools_to_use,
+            tool_choice=tool_choice,
+            **self.spec_kwargs,
+        )
+        response_message = response.choices[0].message
+        tool_calls = response_message.tool_calls
+        # Check if the model wanted to call a function
+        ret_messages = []
+        if tool_calls:
+            # Call the function
+            # Note: the JSON response may not always be valid; be sure to handle errors
+            available_functions = {}
+            for tool in tools:
+                available_functions[tool.__name__] = tool
+            ret_messages.append(response_message)
+            # Send the info for each function call and function response to the model
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_to_call = available_functions[function_name]
+                function_args = json.loads(tool_call.function.arguments)
+                function_response = function_to_call(**function_args)
+                ret_messages.append(
+                    {
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": function_name,
+                        "content": str(function_response),
+                    }
+                )
+        return ret_messages
 
     def role_end_generate(
         self,

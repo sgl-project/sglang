@@ -378,6 +378,8 @@ class SglGen(SglExpr):
         ignore_eos,
         dtype,
         regex,
+        tools,
+        tool_choice,
     ):
         super().__init__()
         self.name = name
@@ -393,6 +395,8 @@ class SglGen(SglExpr):
             dtype=dtype,
             regex=regex,
         )
+        self.tools = tools
+        self.tool_choice = tool_choice
 
     def __repr__(self):
         return f"Gen('{self.name}')"

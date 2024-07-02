@@ -132,6 +132,8 @@ def gen_string(
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
+    tools: Optional[List[str]] = None,
+    tool_choice: Optional[str] = "auto",
 ):
     return SglGen(
         name,
@@ -145,6 +147,8 @@ def gen_string(
         ignore_eos,
         str,
         None,
+        tools,
+        tool_choice,
     )
 
 

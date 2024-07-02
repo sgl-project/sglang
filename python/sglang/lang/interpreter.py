@@ -202,6 +202,9 @@ class StreamExecutor:
         self.cur_role = None
         self.cur_role_begin_pos = None
 
+        # For function calling
+        self.function_calls = []  # The messages in the OpenAI API format
+
         # For vision
         self.images_ = []
         self.cur_images = []
@@ -485,9 +488,22 @@ class StreamExecutor:
 
         return comp, meta_info
 
+    def _build_and_append_func_call_messages(self, expr: SglGen):
+        # TODO: Should we clear the previous function call states for the next function call
+        if self.backend.is_chat_model:
+            self.function_calls = self.backend.function_calling(
+                self, expr.tools, expr.tool_choice
+            )
+            for function_call in self.function_calls:
+                self.messages_.append(function_call)
+        # TODO: handle text appending
+
     def _execute_gen(self, expr: SglGen):
         sampling_params = self._resolve_sampling_params(expr.sampling_params)
         name = expr.name
+
+        if expr.tools:
+            self._build_and_append_func_call_messages(expr)
 
         if not self.stream:
             if self.num_api_spec_tokens is None:
@@ -750,7 +766,14 @@ class ProgramState:
         return self.stream_executor.text()
 
     def messages(self):
-        return self.stream_executor.messages()
+        # We do not want to expose tool use information to users in the final response,
+        # so removing the auxillary information from final messages.
+        filtered_list = [
+            item
+            for item in self.stream_executor.messages()
+            if item not in self.stream_executor.function_calls
+        ]
+        return filtered_list
 
     def sync(self):
         return self.stream_executor.sync()
