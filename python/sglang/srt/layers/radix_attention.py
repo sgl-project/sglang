@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.global_config import global_config
 from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
 from sglang.srt.layers.extend_attention import extend_attention_fwd
 from sglang.srt.layers.token_attention import token_attention_fwd
@@ -103,11 +104,28 @@ class RadixAttention(nn.Module):
     def prefill_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         self.store_kv_cache(k, v, input_metadata)
 
-        o = input_metadata.flashinfer_prefill_wrapper.forward(
+        o1, s1 = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-            input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+            k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
+            v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
             logits_soft_cap=self.logit_cap,
         )
+
+        if input_metadata.no_prefix:
+            o = o1
+        else:
+            o2, s2 = input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
+                q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+                input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+                causal=False,
+                logits_soft_cap=self.logit_cap,
+            )
+
+            from flashinfer.cascade import merge_state
+            o, _ = merge_state(o1, s1, o2, s2)
+
+        if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
+            torch.cuda.synchronize()
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
