@@ -104,21 +104,14 @@ class RadixAttention(nn.Module):
     def prefill_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         self.store_kv_cache(k, v, input_metadata)
 
-        # o = input_metadata.flashinfer_prefill_wrapper.forward(
-        #     q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-        #     input_metadata.token_to_kv_pool.kv_data[self.layer_id],
-        #     logits_soft_cap=self.logit_cap,
-        # )
-
         o1, s1 = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
             k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
             v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
             logits_soft_cap=self.logit_cap,
         )
-        o = o1
 
-        if torch.all(input_metadata.prefix_lens == 0):
+        if input_metadata.no_prefix:
             o = o1
         else:
             o2, s2 = input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(

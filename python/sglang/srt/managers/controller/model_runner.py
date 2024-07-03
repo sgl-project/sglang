@@ -70,13 +70,33 @@ class InputMetadata:
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
 
     def init_flashinfer_args(self, num_qo_heads, num_kv_heads, head_dim):
+        if (
+            self.forward_mode == ForwardMode.PREFILL
+            or self.forward_mode == ForwardMode.EXTEND
+        ):
+            paged_kernel_lens = self.prefix_lens
+            self.no_prefix = torch.all(self.prefix_lens == 0)
+        else:
+            paged_kernel_lens = self.seq_lens
+
         self.kv_indptr = torch.zeros(
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
         )
+        self.kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
         self.kv_last_page_len = torch.ones(
             (self.batch_size,), dtype=torch.int32, device="cuda"
         )
         req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
+        paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
+        self.kv_indices = torch.cat(
+            [
+                self.req_to_token_pool.req_to_token[
+                    req_pool_indices_cpu[i], : paged_kernel_lens_cpu[i]
+                ]
+                for i in range(self.batch_size)
+            ],
+            dim=0,
+        ).contiguous()
 
         if (
             self.forward_mode == ForwardMode.PREFILL
@@ -98,30 +118,6 @@ class InputMetadata:
             )
 
             # cached part
-            self.kv_indptr[1:] = torch.cumsum(self.prefix_lens, dim=0)
-            prefix_lens_cpu = self.prefix_lens.cpu().numpy()
-            self.kv_indices = torch.cat(
-                [
-                    self.req_to_token_pool.req_to_token[
-                        req_pool_indices_cpu[i], : prefix_lens_cpu[i]
-                    ]
-                    for i in range(self.batch_size)
-                ],
-                dim=0,
-            ).contiguous()
-
-            # self.kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
-            # seq_lens_cpu = self.seq_lens.cpu().numpy()
-            # self.kv_indices = torch.cat(
-            #     [
-            #         self.req_to_token_pool.req_to_token[
-            #             req_pool_indices_cpu[i], : seq_lens_cpu[i]
-            #         ]
-            #         for i in range(self.batch_size)
-            #     ],
-            #     dim=0,
-            # ).contiguous()
-
             self.flashinfer_prefill_wrapper_paged.end_forward()
             self.flashinfer_prefill_wrapper_paged.begin_forward(
                 self.qo_indptr,
@@ -134,18 +130,6 @@ class InputMetadata:
                 1
             )
         else:
-            self.kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
-            seq_lens_cpu = self.seq_lens.cpu().numpy()
-            self.kv_indices = torch.cat(
-                [
-                    self.req_to_token_pool.req_to_token[
-                        req_pool_indices_cpu[i], : seq_lens_cpu[i]
-                    ]
-                    for i in range(self.batch_size)
-                ],
-                dim=0,
-            ).contiguous()
-
             self.flashinfer_decode_wrapper.end_forward()
             self.flashinfer_decode_wrapper.begin_forward(
                 self.kv_indptr,
@@ -414,7 +398,7 @@ class ModelRunner:
                 use_tensor_cores = False
 
             workspace_buffers = torch.empty(
-                3, 128 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+                3, 96 * 1024 * 1024, dtype=torch.uint8, device="cuda"
             )
             self.flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
                 workspace_buffers[0], "NHD"

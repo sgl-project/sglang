@@ -115,8 +115,6 @@ def main(args):
     backend = select_sglang_backend(args)
 
     # Run
-    print(num_questions)
-    print(len(arguments))
     tic = time.time()
     states = few_shot_mmlu.run_batch(
         arguments,
