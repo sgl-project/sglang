@@ -118,7 +118,7 @@ class RadixAttention(nn.Module):
         )
         o = o1
 
-        if torch.all(input_metadata.prefix_lens == 0) and False:
+        if torch.all(input_metadata.prefix_lens == 0):
             o = o1
         else:
             o2, s2 = input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
