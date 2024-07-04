@@ -426,17 +426,19 @@ def suppress_other_loggers():
     logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
 
-def assert_pkg_version(pkg: str, min_version: str):
+def assert_pkg_version(pkg: str, min_version: str, message: str):
     try:
         installed_version = version(pkg)
         if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
             raise Exception(
-                f"{pkg} is installed with version {installed_version} which "
-                f"is less than the minimum required version {min_version}"
+                f"{pkg} is installed with version {installed_version}, which "
+                f"is less than the minimum required version {min_version}. " +
+                message
             )
     except PackageNotFoundError:
         raise Exception(
-            f"{pkg} with minimum required version {min_version} is not installed"
+            f"{pkg} with minimum required version {min_version} is not installed. " +
+            message
         )
 
 
