@@ -49,10 +49,10 @@ pip install -e "python[all]"
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 ```
 
-### Method 3: Using Docker
-The docker images are vailable on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags).
+### Method 3: Using docker
+The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags).
 
-### Notes
+### Common Notes
 - If you see errors from the Triton compiler, please install the [Triton Nightly](https://triton-lang.org/main/getting-started/installation.html).
 - If you cannot install FlashInfer, check out its [installation](https://docs.flashinfer.ai/installation.html#) page. If you still cannot install it, you can use the slower Triton kernels by adding `--disable-flashinfer` when launching the server.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
