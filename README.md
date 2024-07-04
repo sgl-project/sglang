@@ -11,7 +11,7 @@ It makes your interaction with LLMs faster and more controllable by co-designing
 
 The core features include:
 - **Flexible Frontend Language**: Enables easy programming of LLM applications with chained generation calls, advanced prompting, control flow, multiple modalities, parallelism, and external interactions.
-- **High-Performance Backend Runtime**: Features RadixAttention for accelerating complex LLM programs by reusing the KV cache across multiple calls. It can also serve as a standalone engine with all common techniques implemented (e.g., continuous batching and tensor parallelism).
+- **High-Performance Backend Runtime**: Features RadixAttention for accelerating complex LLM programs by reusing the KV cache across multiple calls. It can also serve as a standalone inference engine with all common techniques implemented (e.g., continuous batching and tensor parallelism).
 
 ## News
 - [2024/02] 🔥 SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
