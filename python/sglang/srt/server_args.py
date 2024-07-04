@@ -50,11 +50,11 @@ class ServerArgs:
     load_balance_method: str = "round_robin"
 
     # Optimization/debug options
-    disable_flashinfer: bool = True
-    attention_reduce_in_fp32: bool = False
+    disable_flashinfer: bool = False
     disable_radix_cache: bool = False
     disable_regex_jump_forward: bool = False
     disable_disk_cache: bool = False
+    attention_reduce_in_fp32: bool = False
 
     # Distributed args
     nccl_init_addr: Optional[str] = None
