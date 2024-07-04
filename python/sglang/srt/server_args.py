@@ -292,11 +292,6 @@ class ServerArgs:
             help="Disable flashinfer inference kernels",
         )
         parser.add_argument(
-            "--attention-reduce-in-fp32",
-            action="store_true",
-            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16.",
-        )
-        parser.add_argument(
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention",
@@ -310,6 +305,12 @@ class ServerArgs:
             "--disable-disk-cache",
             action="store_true",
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
+        )
+        parser.add_argument(
+            "--attention-reduce-in-fp32",
+            action="store_true",
+            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
+            "This only affects Triton attention kernels",
         )
 
     @classmethod

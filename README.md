@@ -32,9 +32,10 @@ The core features include:
 ### Method 1: With pip
 ```
 pip install "sglang[all]"
-```
 
-Next, [install FlashInfer](https://docs.flashinfer.ai/installation.html) for attention CUDA kernels.
+# Install FlashInfer CUDA kernels
+pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
+```
 
 ### Method 2: From source
 ```
@@ -43,14 +44,15 @@ cd sglang
 
 pip install --upgrade pip
 pip install -e "python[all]"
+
+# Install FlashInfer CUDA kernels
+pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 ```
 
-Next, [install FlashInfer](https://docs.flashinfer.ai/installation.html) for attention CUDA kernels.
-
 ### Notes
-- If you see triton errors, please install the [Triton Nightly](https://triton-lang.org/main/getting-started/installation.html).
-- If you cannot install FlashInfer, you can use the slower triton kernels by adding `--disable-flashinfer` when launching the server.
-- If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`
+- If you see errors from the Triton compiler, please install the [Triton Nightly](https://triton-lang.org/main/getting-started/installation.html).
+- If you cannot install FlashInfer, check out its [installation](https://docs.flashinfer.ai/installation.html#) page. If you still cannot install it, you can use the slower Triton kernels by adding `--disable-flashinfer` when launching the server.
+- If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
 
 ## Quick Start
 The example below shows how to use sglang to answer a mulit-turn question.
