@@ -127,7 +127,7 @@ class InputMetadata:
                 num_qo_heads,
                 num_kv_heads,
                 head_dim,
-                1
+                1,
             )
         else:
             self.flashinfer_decode_wrapper.end_forward()
@@ -140,7 +140,7 @@ class InputMetadata:
                 head_dim,
                 1,
                 pos_encoding_mode="NONE",
-                data_type=self.token_to_kv_pool.kv_data[0].dtype
+                data_type=self.token_to_kv_pool.kv_data[0].dtype,
             )
 
     def init_extend_args(self):
@@ -228,7 +228,7 @@ class InputMetadata:
             ret.init_flashinfer_args(
                 model_runner.model_config.num_attention_heads // tp_size,
                 model_runner.model_config.get_num_kv_heads(tp_size),
-                model_runner.model_config.head_dim
+                model_runner.model_config.head_dim,
             )
 
         return ret
@@ -269,7 +269,7 @@ class ModelRunner:
             world_size=self.tp_size,
             rank=self.tp_rank,
             local_rank=self.gpu_id,
-            distributed_init_method=nccl_init_method
+            distributed_init_method=nccl_init_method,
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         total_gpu_memory = get_available_gpu_memory(
@@ -341,7 +341,13 @@ class ModelRunner:
         )
         head_dim = self.model_config.head_dim
         head_num = self.model_config.get_num_kv_heads(self.tp_size)
-        cell_size = head_num * head_dim * self.model_config.num_hidden_layers * 2 * torch._utils._element_size(self.dtype)
+        cell_size = (
+            head_num
+            * head_dim
+            * self.model_config.num_hidden_layers
+            * 2
+            * torch._utils._element_size(self.dtype)
+        )
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
@@ -384,15 +390,16 @@ class ModelRunner:
     def init_flash_infer(self):
         if not global_server_args_dict.get("disable_flashinfer", False):
             from flashinfer import (
-                BatchPrefillWithRaggedKVCacheWrapper,
-                BatchPrefillWithPagedKVCacheWrapper,
                 BatchDecodeWithPagedKVCacheWrapper,
+                BatchPrefillWithPagedKVCacheWrapper,
+                BatchPrefillWithRaggedKVCacheWrapper,
             )
             from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
             if not _grouped_size_compiled_for_decode_kernels(
                 self.model_config.num_attention_heads // self.tp_size,
-                self.model_config.get_num_kv_heads(self.tp_size)):
+                self.model_config.get_num_kv_heads(self.tp_size),
+            ):
                 use_tensor_cores = True
             else:
                 use_tensor_cores = False
@@ -400,8 +407,8 @@ class ModelRunner:
             workspace_buffers = torch.empty(
                 3, 96 * 1024 * 1024, dtype=torch.uint8, device="cuda"
             )
-            self.flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-                workspace_buffers[0], "NHD"
+            self.flashinfer_prefill_wrapper_ragged = (
+                BatchPrefillWithRaggedKVCacheWrapper(workspace_buffers[0], "NHD")
             )
             self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
                 workspace_buffers[1], "NHD"
@@ -410,7 +417,9 @@ class ModelRunner:
                 workspace_buffers[2], "NHD", use_tensor_cores=use_tensor_cores
             )
         else:
-            self.flashinfer_prefill_wrapper_ragged = self.flashinfer_prefill_wrapper_paged = None
+            self.flashinfer_prefill_wrapper_ragged = (
+                self.flashinfer_prefill_wrapper_paged
+            ) = None
             self.flashinfer_decode_wrapper = None
 
     @torch.inference_mode()

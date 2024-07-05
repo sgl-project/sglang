@@ -51,12 +51,11 @@ from sglang.srt.utils import (
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
-    send_addrs_to_rank_0,
     receive_addrs,
+    send_addrs_to_rank_0,
     start_rpyc_service_process,
 )
 from sglang.utils import get_exception_traceback
-
 
 logger = logging.getLogger(__name__)
 
@@ -152,9 +151,13 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
     if server_args.disable_disk_cache:
         disable_cache()
     if not server_args.disable_flashinfer:
-        assert_pkg_version("flashinfer", "0.0.8", "Please uninstall the old version and "
-                           "reinstall the latest version by following the instructions "
-                           "at https://docs.flashinfer.ai/installation.html.")
+        assert_pkg_version(
+            "flashinfer",
+            "0.0.8",
+            "Please uninstall the old version and "
+            "reinstall the latest version by following the instructions "
+            "at https://docs.flashinfer.ai/installation.html.",
+        )
     if server_args.chat_template:
         # TODO: replace this with huggingface transformers template
         load_chat_template_for_openai_api(server_args.chat_template)
@@ -176,7 +179,9 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
             ModelPortArgs(
                 nccl_port=ports[3 + i * (tp_size_local + 1)],
                 model_tp_ips=[None] * tp_size_local,
-                model_tp_ports=ports[3 + i * (tp_size_local + 1) + 1 : 3 + (i + 1) * (tp_size_local + 1)],
+                model_tp_ports=ports[
+                    3 + i * (tp_size_local + 1) + 1 : 3 + (i + 1) * (tp_size_local + 1)
+                ],
             )
         )
     port_args = PortArgs(
@@ -194,9 +199,13 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
         else:
             receive_addrs(model_port_args[0], server_args)
         for i in range(tp_size_local):
-            start_rpyc_service_process(ModelTpService, model_port_args[0].model_tp_ports[i])
+            start_rpyc_service_process(
+                ModelTpService, model_port_args[0].model_tp_ports[i]
+            )
         if server_args.node_rank != 0:
-            logger.info(f"[node_rank={server_args.node_rank}]: Listen for connections...")
+            logger.info(
+                f"[node_rank={server_args.node_rank}]: Listen for connections..."
+            )
             while True:
                 pass
 

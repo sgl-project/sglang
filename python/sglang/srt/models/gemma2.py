@@ -5,19 +5,23 @@ from typing import Iterable, List, Optional, Set, Tuple, Union
 import torch
 from torch import nn
 from transformers import Gemma2Config
-
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+
+# FIXME: temporary solution, remove after next vllm release
+from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.activation import GeluAndMul
+
 # from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               QKVParallelLinear,
-                                               RowParallelLinear)
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
 # from vllm.model_executor.layers.rotary_embedding import GemmaRotaryEmbedding
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding)
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 
@@ -26,8 +30,6 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.controller.model_runner import InputMetadata
 
 
-# FIXME: temporary solution, remove after next vllm release
-from vllm.model_executor.custom_op import CustomOp
 class GemmaRMSNorm(CustomOp):
     """RMS normalization for Gemma.
 
@@ -76,13 +78,19 @@ class GemmaRMSNorm(CustomOp):
 
 # FIXME: temporary solution, remove after next vllm release
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+
 class GemmaRotaryEmbedding(RotaryEmbedding):
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         # https://github.com/huggingface/transformers/blob/v4.41.2/src/transformers/models/gemma/modeling_gemma.py#L107
-        inv_freq = 1.0 / (base**(
-            torch.arange(0, self.rotary_dim, 2, dtype=torch.int64).float() /
-            self.rotary_dim))
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.int64).float()
+                / self.rotary_dim
+            )
+        )
         return inv_freq
 
 
@@ -98,18 +106,17 @@ class Gemma2MLP(nn.Module):
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config)
-        self.down_proj = RowParallelLinear(intermediate_size,
-                                           hidden_size,
-                                           bias=False,
-                                           quant_config=quant_config)
+            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size, hidden_size, bias=False, quant_config=quant_config
+        )
         if not (hidden_act == hidden_activation == "gelu_pytorch_tanh"):
             raise ValueError(
                 "Gemma2 uses `gelu_pytorch_tanh` as the hidden activation "
                 "function. Please set `hidden_act` and `hidden_activation` to "
-                "`gelu_pytorch_tanh`.")
+                "`gelu_pytorch_tanh`."
+            )
         self.act_fn = GeluAndMul(approximate="tanh")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -121,17 +128,19 @@ class Gemma2MLP(nn.Module):
 
 class Gemma2Attention(nn.Module):
 
-    def __init__(self,
-                 layer_idx: int,
-                 config: Gemma2Config,
-                 hidden_size: int,
-                 num_heads: int,
-                 num_kv_heads: int,
-                 head_dim: int,
-                 max_position_embeddings: int,
-                 rope_theta: float,
-                 cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None) -> None:
+    def __init__(
+        self,
+        layer_idx: int,
+        config: Gemma2Config,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        max_position_embeddings: int,
+        rope_theta: float,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -183,15 +192,16 @@ class Gemma2Attention(nn.Module):
         # from vLLM: FIXME(woosuk): While Gemma 2 uses sliding window attention for every
         # odd layer, vLLM currently ignores it and uses global attention for
         # all layers.
-        use_sliding_window = (layer_idx % 2 == 1
-                              and config.sliding_window is not None)
+        use_sliding_window = layer_idx % 2 == 1 and config.sliding_window is not None
         del use_sliding_window  # Unused.
-        self.attn = RadixAttention(self.num_heads,
-                                   self.head_dim,
-                                   self.scaling,
-                                   num_kv_heads=self.num_kv_heads,
-                                   layer_id=layer_idx,
-                                   logit_cap=self.config.attn_logit_softcapping)
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_idx,
+            logit_cap=self.config.attn_logit_softcapping,
+        )
 
     def forward(
         self,
@@ -238,14 +248,16 @@ class Gemma2DecoderLayer(nn.Module):
             hidden_activation=config.hidden_activation,
             quant_config=quant_config,
         )
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size,
-                                            eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size,
-                                                     eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = GemmaRMSNorm(config.hidden_size,
-                                                      eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = GemmaRMSNorm(config.hidden_size,
-                                                       eps=config.rms_norm_eps)
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_feedforward_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_feedforward_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -258,8 +270,7 @@ class Gemma2DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -268,7 +279,8 @@ class Gemma2DecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         hidden_states, residual = self.pre_feedforward_layernorm(
-            hidden_states, residual)
+            hidden_states, residual
+        )
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         return hidden_states, residual
@@ -289,10 +301,12 @@ class Gemma2Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.layers = nn.ModuleList([
-            Gemma2DecoderLayer(layer_idx, config, cache_config, quant_config)
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                Gemma2DecoderLayer(layer_idx, config, cache_config, quant_config)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Normalize the embedding by sqrt(hidden_size)
@@ -392,7 +406,7 @@ class Gemma2ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-            for (param_name, shard_name, shard_id) in stacked_params_mapping:
+            for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue
                 name = name.replace(shard_name, param_name)
@@ -412,8 +426,7 @@ class Gemma2ForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
@@ -421,7 +434,8 @@ class Gemma2ForCausalLM(nn.Module):
         if unloaded_params:
             raise RuntimeError(
                 "Some weights are not initialized from checkpoints: "
-                f"{unloaded_params}")
+                f"{unloaded_params}"
+            )
 
 
 EntryClass = Gemma2ForCausalLM
