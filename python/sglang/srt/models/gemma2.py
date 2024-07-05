@@ -191,8 +191,7 @@ class Gemma2Attention(nn.Module):
                                    self.scaling,
                                    num_kv_heads=self.num_kv_heads,
                                    layer_id=layer_idx,
-                                   logit_cap=self.config.attn_logit_softcapping,
-                                  )
+                                   logit_cap=self.config.attn_logit_softcapping)
 
     def forward(
         self,
