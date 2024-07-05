@@ -1,4 +1,5 @@
 """Radix attention."""
+
 import numpy as np
 import torch
 from torch import nn
@@ -11,8 +12,13 @@ from sglang.srt.managers.controller.model_runner import ForwardMode, InputMetada
 
 class RadixAttention(nn.Module):
     def __init__(
-        self, num_heads: int, head_dim: int, scaling: float, num_kv_heads: int,
-        layer_id: int, logit_cap: int = -1
+        self,
+        num_heads: int,
+        head_dim: int,
+        scaling: float,
+        num_kv_heads: int,
+        layer_id: int,
+        logit_cap: int = -1,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -112,6 +118,7 @@ class RadixAttention(nn.Module):
             )
 
             from flashinfer.cascade import merge_state
+
             o, _ = merge_state(o1, s1, o2, s2)
 
         if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:

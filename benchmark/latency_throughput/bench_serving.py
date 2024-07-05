@@ -307,8 +307,9 @@ def main(args: argparse.Namespace):
     avg_per_output_token_latency = np.mean(
         [latency / output_len for _, output_len, latency in REQUEST_LATENCY]
     )
-    decoding_throughput = np.sum([
-        output_len for _, output_len, _ in REQUEST_LATENCY]) / benchmark_time
+    decoding_throughput = (
+        np.sum([output_len for _, output_len, _ in REQUEST_LATENCY]) / benchmark_time
+    )
 
     print(f"Total time: {benchmark_time:.2f} s")
     print(f"Request throughput: {args.num_prompts / benchmark_time:.2f} requests/s")

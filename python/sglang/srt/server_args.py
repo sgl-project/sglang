@@ -137,17 +137,16 @@ class ServerArgs:
             "--dtype",
             type=str,
             default=ServerArgs.dtype,
-            choices=[
-                "auto", "half", "float16", "bfloat16", "float", "float32"
-            ],
-            help='Data type for model weights and activations.\n\n'
+            choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
+            help="Data type for model weights and activations.\n\n"
             '* "auto" will use FP16 precision for FP32 and FP16 models, and '
-            'BF16 precision for BF16 models.\n'
+            "BF16 precision for BF16 models.\n"
             '* "half" for FP16. Recommended for AWQ quantization.\n'
             '* "float16" is the same as "half".\n'
             '* "bfloat16" for a balance between precision and range.\n'
             '* "float" is shorthand for FP32 precision.\n'
-            '* "float32" for FP32 precision.')
+            '* "float32" for FP32 precision.',
+        )
         parser.add_argument(
             "--trust-remote-code",
             action="store_true",
@@ -271,19 +270,12 @@ class ServerArgs:
         parser.add_argument(
             "--nccl-init-addr",
             type=str,
-            help="The nccl init address of multi-node server."
+            help="The nccl init address of multi-node server.",
         )
         parser.add_argument(
-            "--nnodes",
-            type=int,
-            default=1,
-            help="The number of nodes."
+            "--nnodes", type=int, default=1, help="The number of nodes."
         )
-        parser.add_argument(
-            "--node-rank",
-            type=int,
-            help="The node rank."
-        )
+        parser.add_argument("--node-rank", type=int, help="The node rank.")
 
         # Optimization/debug options
         parser.add_argument(
