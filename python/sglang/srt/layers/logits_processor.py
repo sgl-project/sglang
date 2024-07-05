@@ -109,9 +109,9 @@ class LogitsProcessor(nn.Module):
         last_logits = last_logits[:, : self.config.vocab_size]
 
         if hasattr(self.config, "final_logit_softcapping"):
-            last_logits = last_logits / self.config.final_logit_softcapping
+            last_logits /= self.config.final_logit_softcapping
             last_logits = torch.tanh(last_logits)
-            last_logits = last_logits * self.config.final_logit_softcapping
+            last_logits *= self.config.final_logit_softcapping
 
         # Return only last_logits if logprob is not requested
         if not input_metadata.return_logprob:
