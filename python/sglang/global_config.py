@@ -39,4 +39,5 @@ class GlobalConfig:
         # This can improve the speed for large batch sizes during prefill.
         self.layer_sync_threshold = 8192
 
+
 global_config = GlobalConfig()

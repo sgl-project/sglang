@@ -185,8 +185,10 @@ class SglFunction:
             batch_kwargs = [
                 {self.arg_names[i]: v for i, v in enumerate(arg_values)}
                 for arg_values in batch_kwargs
-                if isinstance(arg_values, (list, tuple)) and
-                   len(self.arg_names) - len(self.arg_defaults) <= len(arg_values) <= len(self.arg_names)
+                if isinstance(arg_values, (list, tuple))
+                and len(self.arg_names) - len(self.arg_defaults)
+                <= len(arg_values)
+                <= len(self.arg_names)
             ]
             # Ensure to raise an exception if the number of arguments mismatch
             if len(batch_kwargs) != num_programs:

@@ -37,10 +37,12 @@ def get_logits_batch(url, prompts):
         },
     )
     ret = response.json()
-    logits = np.array(list(
-        ret[i]["meta_info"]["normalized_prompt_logprob"]
-        for i in range(len(prompts))
-    ))
+    logits = np.array(
+        list(
+            ret[i]["meta_info"]["normalized_prompt_logprob"]
+            for i in range(len(prompts))
+        )
+    )
     return logits
 
 
