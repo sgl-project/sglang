@@ -37,7 +37,8 @@ class RadixAttention(nn.Module):
             self.logit_cap = logit_cap if logit_cap is not None else 0
 
     def prefill_forward_triton(self, q, k, v, input_metadata: InputMetadata):
-        # In SGLang, the typical prefill and prefill with cache are all merged into extend.
+        # In SGLang, we call both the typical "prefill" and "prefill with cache" as "extend".
+        # See the extend_forward_xxx functions.
         raise NotImplementedError()
 
     def extend_forward_triton(self, q, k, v, input_metadata: InputMetadata):
