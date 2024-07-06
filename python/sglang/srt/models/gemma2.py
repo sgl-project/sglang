@@ -1,10 +1,10 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/56b325e977435af744f8b3dca7af0ca209663558/vllm/model_executor/models/gemma2.py
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import Gemma2Config
+from transformers import PretrainedConfig
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 
@@ -131,7 +131,7 @@ class Gemma2Attention(nn.Module):
     def __init__(
         self,
         layer_idx: int,
-        config: Gemma2Config,
+        config: PretrainedConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -222,7 +222,7 @@ class Gemma2DecoderLayer(nn.Module):
     def __init__(
         self,
         layer_idx: int,
-        config: Gemma2Config,
+        config: PretrainedConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
@@ -290,7 +290,7 @@ class Gemma2Model(nn.Module):
 
     def __init__(
         self,
-        config: Gemma2Config,
+        config: PretrainedConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
@@ -369,7 +369,7 @@ class Gemma2ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Gemma2Config,
+        config: PretrainedConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
