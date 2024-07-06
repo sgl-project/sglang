@@ -3,7 +3,7 @@
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import List
+from typing import List, Union
 
 import numpy as np
 import torch
@@ -31,7 +31,7 @@ class BaseFinishReason:
 
 
 class FINISH_MATCHED_TOKEN(BaseFinishReason):
-    def __init__(self, matched: int | List[int]):
+    def __init__(self, matched: Union[int, List[int]]):
         super().__init__()
         self.matched = matched
 

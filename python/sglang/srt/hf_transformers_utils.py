@@ -264,7 +264,9 @@ class TiktokenTokenizer:
         return self.tokenizer.decode_batch(batch)
 
     def apply_chat_template(self, messages, tokenize, add_generation_prompt):
-        ret = self.chat_template.render(messages=messages, add_generation_prompt=add_generation_prompt)
+        ret = self.chat_template.render(
+            messages=messages, add_generation_prompt=add_generation_prompt
+        )
         return self.encode(ret) if tokenize else ret
 
 
@@ -297,5 +299,7 @@ class SentencePieceTokenizer:
         return self.tokenizer.decode(batch)
 
     def apply_chat_template(self, messages, tokenize, add_generation_prompt):
-        ret = self.chat_template.render(messages=messages, add_generation_prompt=add_generation_prompt)
+        ret = self.chat_template.render(
+            messages=messages, add_generation_prompt=add_generation_prompt
+        )
         return self.encode(ret) if tokenize else ret

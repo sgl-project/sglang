@@ -1,8 +1,7 @@
 import json
-from typing import Callable, List, Optional, Union
+from typing import List, Optional
 
 import numpy as np
-import requests
 
 from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config

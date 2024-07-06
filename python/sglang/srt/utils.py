@@ -426,17 +426,18 @@ def suppress_other_loggers():
     logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
 
-def assert_pkg_version(pkg: str, min_version: str):
+def assert_pkg_version(pkg: str, min_version: str, message: str):
     try:
         installed_version = version(pkg)
         if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
             raise Exception(
-                f"{pkg} is installed with version {installed_version} which "
-                f"is less than the minimum required version {min_version}"
+                f"{pkg} is installed with version {installed_version}, which "
+                f"is less than the minimum required version {min_version}. " + message
             )
     except PackageNotFoundError:
         raise Exception(
-            f"{pkg} with minimum required version {min_version} is not installed"
+            f"{pkg} with minimum required version {min_version} is not installed. "
+            + message
         )
 
 
@@ -472,24 +473,40 @@ def monkey_patch_vllm_dummy_weight_loader():
     """
 
     from vllm.model_executor.model_loader.loader import (
-        ModelConfig, DeviceConfig, LoRAConfig, VisionLanguageConfig,
-        ParallelConfig, SchedulerConfig, CacheConfig, nn,
-        set_default_torch_dtype, _initialize_model, initialize_dummy_weights,
-        DummyModelLoader
+        CacheConfig,
+        DeviceConfig,
+        DummyModelLoader,
+        LoRAConfig,
+        ModelConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        VisionLanguageConfig,
+        _initialize_model,
+        initialize_dummy_weights,
+        nn,
+        set_default_torch_dtype,
     )
 
-    def load_model(self, *, model_config: ModelConfig,
-                   device_config: DeviceConfig,
-                   lora_config: Optional[LoRAConfig],
-                   vision_language_config: Optional[VisionLanguageConfig],
-                   parallel_config: ParallelConfig,
-                   scheduler_config: SchedulerConfig,
-                   cache_config: CacheConfig) -> nn.Module:
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+        lora_config: Optional[LoRAConfig],
+        vision_language_config: Optional[VisionLanguageConfig],
+        parallel_config: ParallelConfig,
+        scheduler_config: SchedulerConfig,
+        cache_config: CacheConfig,
+    ) -> nn.Module:
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config,
-                                          lora_config, vision_language_config,
-                                          cache_config)
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    lora_config,
+                    vision_language_config,
+                    cache_config,
+                )
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -539,7 +556,7 @@ def get_ip_address(ifname):
     ip_address = fcntl.ioctl(
         s.fileno(),
         0x8915,  # SIOCGIFADDR
-        struct.pack('256s', bytes(ifname[:15], 'utf-8'))
+        struct.pack("256s", bytes(ifname[:15], "utf-8")),
     )[20:24]
     return socket.inet_ntoa(ip_address)
 
@@ -548,44 +565,66 @@ def send_addrs_to_rank_0(model_port_args, server_args):
     assert server_args.node_rank != 0 and server_args.dp_size == 1
     import torch.distributed as dist
 
-    ifname = os.environ.get("SGLANG_SOCKET_IFNAME", os.environ.get("NCCL_SOCKET_IFNAME", "eth0"))
+    ifname = os.environ.get(
+        "SGLANG_SOCKET_IFNAME", os.environ.get("NCCL_SOCKET_IFNAME", "eth0")
+    )
     ip_addr = get_ip_address(ifname)
 
     num_tp_ports = server_args.tp_size // server_args.nnodes
     model_port_args.model_tp_ips[:num_tp_ports] = [ip_addr] * num_tp_ports
     ip_addr = [int(x) for x in ip_addr.split(".")]
-    addrs_tensor = torch.tensor(ip_addr + model_port_args.model_tp_ports, dtype=torch.int)
+    addrs_tensor = torch.tensor(
+        ip_addr + model_port_args.model_tp_ports, dtype=torch.int
+    )
 
     init_method = f"tcp://{server_args.nccl_init_addr}"
-    dist.init_process_group(backend="gloo", init_method=init_method, rank=server_args.node_rank, world_size=server_args.nnodes)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=server_args.node_rank,
+        world_size=server_args.nnodes,
+    )
     dist.send(addrs_tensor, dst=0)
-    print(f"Node {server_args.node_rank} sent: ip_address {ip_addr} and ports {model_port_args.model_tp_ports}")
+    print(
+        f"Node {server_args.node_rank} sent: ip_address {ip_addr} and ports {model_port_args.model_tp_ports}"
+    )
 
     dist.barrier()
-    dist.destroy_process_group() 
+    dist.destroy_process_group()
 
 
 def receive_addrs(model_port_args, server_args):
     assert server_args.node_rank == 0 and server_args.dp_size == 1
     import torch.distributed as dist
 
-    ifname = os.environ.get("SGLANG_SOCKET_IFNAME", os.environ.get("NCCL_SOCKET_IFNAME", "eth0"))
+    ifname = os.environ.get(
+        "SGLANG_SOCKET_IFNAME", os.environ.get("NCCL_SOCKET_IFNAME", "eth0")
+    )
     ip_addr = get_ip_address(ifname)
 
     num_tp_ports = server_args.tp_size // server_args.nnodes
     model_port_args.model_tp_ips[:num_tp_ports] = [ip_addr] * num_tp_ports
 
     init_method = f"tcp://{server_args.nccl_init_addr}"
-    dist.init_process_group(backend="gloo", init_method=init_method, rank=server_args.node_rank, world_size=server_args.nnodes)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=server_args.node_rank,
+        world_size=server_args.nnodes,
+    )
 
     for src_rank in range(1, server_args.nnodes):
         tensor = torch.zeros(4 + num_tp_ports, dtype=torch.int)
         dist.recv(tensor, src=src_rank)
         ip = ".".join([str(x) for x in tensor[:4].tolist()])
         ports = tensor[4:].tolist()
-        model_port_args.model_tp_ips[num_tp_ports * src_rank: num_tp_ports * (src_rank + 1)] = [ip] * num_tp_ports
-        model_port_args.model_tp_ports[num_tp_ports * src_rank: num_tp_ports * (src_rank + 1)] = ports
+        model_port_args.model_tp_ips[
+            num_tp_ports * src_rank : num_tp_ports * (src_rank + 1)
+        ] = [ip] * num_tp_ports
+        model_port_args.model_tp_ports[
+            num_tp_ports * src_rank : num_tp_ports * (src_rank + 1)
+        ] = ports
         print(f"Node 0 received from rank {src_rank}: {tensor.tolist()}")
 
     dist.barrier()
-    dist.destroy_process_group() 
+    dist.destroy_process_group()

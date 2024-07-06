@@ -176,6 +176,7 @@ def _token_att_m_fwd(
     B_Start_Loc,
     B_Seqlen,
     max_len_in_batch,
+    sm_scale,
     logit_cap,
 ):
     BLOCK = 32
@@ -183,7 +184,6 @@ def _token_att_m_fwd(
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
     assert Lq == Lk
     assert Lk in {16, 32, 64, 128, 256}
-    sm_scale = 1.0 / (Lk**0.5)
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
 
@@ -317,6 +317,7 @@ def token_attention_fwd(
     max_len_in_batch,
     other_kv_index,
     total_num_tokens,
+    sm_scale=None,
     logit_cap=-1,
     att_m=None,
 ):
@@ -324,6 +325,7 @@ def token_attention_fwd(
         att_m = torch.empty(
             (q.shape[-2], total_num_tokens), dtype=REDUCE_TORCH_TYPE, device="cuda"
         )
+    sm_scale = 1.0 / (Lq**0.5) if sm_scale is None else sm_scale
 
     _token_att_m_fwd(
         q,
@@ -334,6 +336,7 @@ def token_attention_fwd(
         b_start_loc,
         b_seq_len,
         max_len_in_batch,
+        sm_scale,
         logit_cap,
     )
     _token_softmax_reducev_fwd(
