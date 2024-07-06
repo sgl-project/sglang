@@ -1,6 +1,6 @@
 """Inference-only LLaVa video model compatible with HuggingFace weights."""
 
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Iterable, Optional, Tuple
 
 import numpy as np
 import torch

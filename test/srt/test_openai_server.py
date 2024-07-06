@@ -3,7 +3,7 @@ First run the following command to launch the server.
 Note that TinyLlama adopts different chat templates in different versions.
 For v0.4, the chat template is chatml.
 
-python3 -m sglang.launch_server --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 \
+python -m sglang.launch_server --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 \
 --port 30000 --chat-template chatml
 
 Output example:

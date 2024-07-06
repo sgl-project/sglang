@@ -1,5 +1,4 @@
 """DetokenizerManager is a process that detokenizes the token ids."""
-
 import asyncio
 import inspect
 
@@ -8,10 +7,10 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.managers.controller.infer_batch import FINISH_MATCHED_STR
 from sglang.srt.managers.io_struct import BatchStrOut, BatchTokenIDOut
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.utils import get_exception_traceback, graceful_registry
+from sglang.srt.managers.controller.infer_batch import FINISH_MATCHED_STR
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -40,24 +39,30 @@ class DetokenizerManager:
             recv_obj: BatchTokenIDOut = await self.recv_from_router.recv_pyobj()
             assert isinstance(recv_obj, BatchTokenIDOut)
 
+            output_tokens = recv_obj.output_tokens
+
             # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
-            surr_texts = self.tokenizer.batch_decode(
-                recv_obj.surr_output_ids,
+            output_strs = self.tokenizer.batch_decode(
+                output_tokens,
                 skip_special_tokens=recv_obj.skip_special_tokens[0],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-            )
-            read_texts = self.tokenizer.batch_decode(
-                recv_obj.read_output_ids,
-                skip_special_tokens=recv_obj.skip_special_tokens[0],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
+                    0
+                ],
             )
 
             # Trim stop str
             # TODO(lmzheng): handle the case where multiple stop strs are hit
-            output_strs = []
-            for i in range(len(recv_obj.rids)):
-                new_text = read_texts[i][len(surr_texts[i]) :]
-                output_strs.append(recv_obj.decoded_texts[i] + new_text)
+            for i in range(len(output_strs)):
+                if len(output_tokens[i]) > 0:
+                    first_token = self.tokenizer.convert_ids_to_tokens(
+                        int(output_tokens[i][0])
+                    )
+                    if not isinstance(first_token, str):
+                        first_token = first_token.decode("utf-8", errors="ignore")
+                    if first_token.startswith("▁"):
+                        output_strs[i] = " " + output_strs[i]
+
+                output_strs[i] = recv_obj.prev_output_strs[i] + output_strs[i]
 
                 if isinstance(recv_obj.finished_reason[i], FINISH_MATCHED_STR):
                     pos = output_strs[i].find(recv_obj.finished_reason[i].matched)

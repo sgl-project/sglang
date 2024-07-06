@@ -4,17 +4,16 @@ import time
 import numpy as np
 import torch
 import torch.distributed as dist
-
+from sglang.srt.managers.router.infer_batch import Batch
 from sglang.srt.managers.controller.model_runner import ModelRunner
 from sglang.srt.model_config import ModelConfig
-
+from sglang.srt.server_args import ServerArgs
 
 def test_generate_worker(
     model_path, tp_rank, tp_size, batch_size, input_len, output_len
 ):
     model_config = ModelConfig(path=model_path)
-    model = ModelRunner(model_config, 0.8, tp_rank, tp_size, 28888)
-
+    model = ModelRunner(server_args=ServerArgs(model_path=model_path),model_config=model_config, mem_fraction_static=0.8, tp_rank=tp_rank, tp_size=tp_size,gpu_id=0,nccl_port=28888,)
     # Prepare data
     input_ids = np.vstack([np.arange(5, input_len + 5) for _ in range(batch_size)])
     input_ids = input_ids.reshape(-1)
@@ -45,15 +44,23 @@ def test_generate_worker(
 
     def prefill(print_logits):
         nonlocal predict_ids
+        batch_instance=Batch(
+          input_ids=input_ids,
+          req_pool_indices=req_pool_indices,
+          seq_lens=seq_lens,
+          prefix_lens=prefix_lens,
+          position_ids_offsets=position_ids_offsets,
+          out_cache_loc=out_cache_loc,
+          top_logprobs_nums=None,
+          return_logprob=False,
+          reqs=None,
+          req_to_token_pool=None,
+          token_to_kv_pool=None,
+          tree_cache=None
 
+        )
         logits, _ = model.forward_prefill(
-            input_ids,
-            req_pool_indices,
-            seq_lens,
-            prefix_lens,
-            position_ids_offsets,
-            out_cache_loc,
-            False,
+            batch_instance
         )
         prob_out = torch.softmax(logits, dim=-1)
         predict_ids = torch.argmax(prob_out, dim=1, keepdim=True)
@@ -72,16 +79,23 @@ def test_generate_worker(
         ) = model.token_to_kv_pool.alloc_contiguous(batch_size)
         model.req_to_token_pool.req_to_token[req_pool_indices, seq_lens] = out_cache_loc
         seq_lens.add_(1)
+        batch_instance2=Batch(
+          input_ids=torch.from_numpy(predict_ids).cuda().reshape(-1),
+          req_pool_indices=req_pool_indices,
+          seq_lens=seq_lens,
+          prefix_lens=None,
+          position_ids_offsets=position_ids_offsets,
+          top_logprobs_nums=None,
+          out_cache_cont_start=out_cache_cont_start,
+          out_cache_cont_end=out_cache_cont_end,
+          return_logprob=False,
+          reqs=None,
+          req_to_token_pool=None,
+          token_to_kv_pool=None,
+          tree_cache=None
+        )
         logits, _ = model.forward_decode(
-            torch.from_numpy(predict_ids).cuda().reshape(-1),
-            req_pool_indices,
-            seq_lens,
-            None,
-            position_ids_offsets,
-            None,
-            out_cache_cont_start,
-            out_cache_cont_end,
-            False,
+            batch_instance2
         )
         prob_out = torch.softmax(logits, dim=-1)
         predict_ids = torch.argmax(prob_out, dim=1, keepdim=True)

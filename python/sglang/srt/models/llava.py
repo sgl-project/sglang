@@ -1,17 +1,11 @@
 """Inference-only LLaVa model compatible with HuggingFace weights."""
 
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Iterable, Optional, Tuple
 
 import numpy as np
 import torch
 from torch import nn
-from transformers import (
-    CLIPVisionConfig,
-    CLIPVisionModel,
-    LlavaConfig,
-    MistralConfig,
-    Qwen2Config,
-)
+from transformers import CLIPVisionModel, CLIPVisionConfig, LlavaConfig, Qwen2Config, MistralConfig 
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 from vllm.config import CacheConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -25,8 +19,8 @@ from sglang.srt.mm_utils import (
     unpad_image_shape,
 )
 from sglang.srt.models.llama2 import LlamaForCausalLM
-from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.models.mistral import MistralForCausalLM
 
 
 class LlavaLlamaForCausalLM(nn.Module):
@@ -365,7 +359,6 @@ class LlavaMistralForCausalLM(LlavaLlamaForCausalLM):
 
 first_call = True
 
-
 def clip_vision_embed_forward(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
     batch_size = pixel_values.shape[0]
 
@@ -395,4 +388,8 @@ def monkey_path_clip_vision_embed_forward():
     )
 
 
-EntryClass = [LlavaLlamaForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM]
+EntryClass = [
+    LlavaLlamaForCausalLM, 
+    LlavaQwenForCausalLM,
+    LlavaMistralForCausalLM
+]

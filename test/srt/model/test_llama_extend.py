@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import transformers
-
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode, Req
 from sglang.srt.managers.controller.model_runner import ModelRunner
 from sglang.srt.model_config import ModelConfig
@@ -15,7 +15,7 @@ from sglang.srt.sampling_params import SamplingParams
 
 def test_generate_worker(model_path, tp_rank, tp_size):
     model_config = ModelConfig(path=model_path)
-    model = ModelRunner(model_config, 0.8, tp_rank, tp_size, 28888)
+    model = ModelRunner(server_args=ServerArgs(model_path=model_path),model_config=model_config, mem_fraction_static=0.8, tp_rank=tp_rank, tp_size=tp_size,gpu_id=0,nccl_port=28888,)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
 
     # Input
@@ -28,7 +28,9 @@ def test_generate_worker(model_path, tp_rank, tp_size):
     cut_num = 4
 
     reqs = []
+    print(f"lenprompts:{len(prompts)}")
     for i in range(len(prompts)):
+        print(f"length:{tokenizer.encode(prompts[i])}")
         input_ids = tokenizer.encode(prompts[i])[:cut_num]
         req = Req(i, prompts[i], input_ids)
         req.sampling_params = sampling_params
@@ -44,7 +46,8 @@ def test_generate_worker(model_path, tp_rank, tp_size):
     # Extend
     for i in range(len(prompts)):
         req = reqs[i]
-        req.input_ids += tokenizer.encode(prompts[i])[cut_num:]
+        print(f"Before encoding: req.input_ids = {req}")
+        req.input_ids =req.origin_input_ids + tokenizer.encode(prompts[i])[cut_num:]
         req.prefix_indices = model.req_to_token_pool.req_to_token[
             batch.req_pool_indices[i], :cut_num
         ]
@@ -74,6 +77,7 @@ def test_generate_worker(model_path, tp_rank, tp_size):
 def test_generate(model_path, tp_size):
     workers = []
     for tp_rank in range(tp_size):
+        print(f"tprank is {tp_rank}")
         proc = multiprocessing.Process(
             target=test_generate_worker,
             args=(

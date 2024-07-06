@@ -10,7 +10,8 @@ from sglang.srt.managers.controller.infer_batch import ForwardMode
 from sglang.srt.managers.controller.model_runner import InputMetadata, ModelRunner
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.utils import load_image
-
+from sglang.srt.managers.router.infer_batch import Batch
+from sglang.srt.server_args import ServerArgs
 
 def init_batch_data(model, batch_size, input_len):
     req_pool_indices = model.req_to_token_pool.alloc(batch_size)
@@ -34,9 +35,27 @@ def init_batch_data(model, batch_size, input_len):
 
 
 def prefill(model, tp_rank, params, print_logits):
+    batch_instance=Batch(
+      req_pool_indices=params[4],
+      seq_lens=params[5],
+      prefix_lens=params[6],
+      position_ids_offsets=params[7],
+      out_cache_loc=params[8],
+      input_ids=params[0],
+      pixel_values=params[1],
+      image_sizes=params[2],
+      image_offsets=params[3],
+      top_logprobs_nums=None,
+      return_logprob=False,
+      reqs=None,
+      req_to_token_pool=None,
+      token_to_kv_pool=None,
+      tree_cache=None
+
+    )
+
     logits, _ = model.forward_extend_multi_modal(
-        *params,
-        False,
+        batch_instance
     )
     prob_out = torch.softmax(logits, dim=-1)
     predict_ids = torch.argmax(prob_out, dim=1, keepdim=True)
@@ -64,16 +83,24 @@ def decode(step, model, tp_rank, batch_size, predict_ids, params, print_logits):
     ) = model.token_to_kv_pool.alloc_contiguous(batch_size)
     model.req_to_token_pool.req_to_token[req_pool_indices, seq_lens] = out_cache_loc
     seq_lens.add_(1)
+    batch_instance2=Batch(
+      req_pool_indices=req_pool_indices,
+      seq_lens=seq_lens,
+      prefix_lens=None,
+      position_ids_offsets=position_ids_offsets,
+      out_cache_loc=None,
+      input_ids=torch.from_numpy(predict_ids).cuda().reshape(-1),
+      out_cache_cont_start=out_cache_cont_start,
+      out_cache_cont_end=out_cache_cont_end,
+      top_logprobs_nums=None,
+      return_logprob=False,
+      reqs=None,
+      req_to_token_pool=None,
+      token_to_kv_pool=None,
+      tree_cache=None
+    )
     logits, _ = model.forward_decode(
-        torch.from_numpy(predict_ids).cuda().reshape(-1),
-        req_pool_indices,
-        seq_lens,
-        None,
-        position_ids_offsets,
-        None,
-        out_cache_cont_start,
-        out_cache_cont_end,
-        False,
+      batch_instance2
     )
     prob_out = torch.softmax(logits, dim=-1)
     predict_ids = torch.argmax(prob_out, dim=1, keepdim=True)
@@ -89,13 +116,13 @@ def test_generate_worker(
     tp_size,
 ):
     model_config = ModelConfig(path=model_path)
-    model = ModelRunner(model_config, 0.8, tp_rank, tp_size, 28888)
+    model = ModelRunner(server_args=ServerArgs(model_path=model_path),model_config=model_config, mem_fraction_static=0.8, tp_rank=tp_rank, tp_size=tp_size,gpu_id=0,nccl_port=28888,)
     # print(model.model)
 
     # Prepare data
     prompt = "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER: <image>\nDescribe this picture ASSISTANT:"
-    image_path = "/home/ubuntu/sglang/test/lang/test_image.png"
-    image = load_image(image_path)
+    image_path = "/content/drive/MyDrive/sglang2/test/srt/example_image.png"
+    image,_= load_image(image_path)
 
     processor = get_processor("llava-hf/llava-1.5-7b-hf")
     input_ids = processor.tokenizer.encode(prompt)

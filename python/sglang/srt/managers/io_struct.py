@@ -7,8 +7,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
-from sglang.srt.managers.controller.infer_batch import BaseFinishReason
 from sglang.srt.sampling_params import SamplingParams
+from sglang.srt.managers.controller.infer_batch import BaseFinishReason
 
 
 @dataclass
@@ -111,14 +111,12 @@ class TokenizedGenerateReqInput:
 @dataclass
 class BatchTokenIDOut:
     rids: List[str]
-    decoded_texts: List[str]
-    surr_output_ids: List[List[int]]
-    read_output_ids: List[List[int]]
+    prev_output_strs: List[str]
+    output_tokens: List[List[int]]
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
-
 
 @dataclass
 class BatchStrOut:

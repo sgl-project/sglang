@@ -1,5 +1,5 @@
 """
-python3 -m sglang.launch_server --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --port 30000
+python -m sglang.launch_server --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --port 30000
 
 Output:
 The capital of France is Paris.\nThe capital of the United States is Washington, D.C.
