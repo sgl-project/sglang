@@ -523,9 +523,9 @@ class StreamExecutor:
                 self, sampling_params=sampling_params
             )
 
+            self.variables[name] = ""
             self.stream_var_event[name].set()
 
-            self.variables[name] = ""
             for comp, meta_info in generator:
                 self.text_ += comp
                 self.variables[name] += comp
