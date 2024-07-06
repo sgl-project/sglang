@@ -18,7 +18,7 @@ from sglang.srt.mm_utils import (
     unpad_image,
     unpad_image_shape,
 )
-from sglang.srt.models.llama2 import LlamaForCausalLM
+from sglang.srt.models.llama import LlamaForCausalLM
 
 
 class LlavaVidForCausalLM(nn.Module):
