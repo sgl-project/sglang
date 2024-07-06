@@ -8,7 +8,7 @@ from sglang.global_config import global_config
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
-from sglang.utils import find_printable_text, http_request
+from sglang.utils import http_request
 
 
 class RuntimeEndpoint(BaseBackend):
@@ -187,11 +187,11 @@ class RuntimeEndpoint(BaseBackend):
                 if chunk == "data: [DONE]":
                     break
                 data = json.loads(chunk[5:].strip("\n"))
-                text = find_printable_text(data["text"][pos:])
+                chunk_text = data["text"][pos:]
+                incomplete_text = data["incomplete_text"]
                 meta_info = data["meta_info"]
-                pos += len(text)
-                incomplete_text = data["text"][pos:]
-                yield text, meta_info
+                pos += len(chunk_text)
+                yield chunk_text, meta_info
 
         if len(incomplete_text) > 0:
             yield incomplete_text, meta_info

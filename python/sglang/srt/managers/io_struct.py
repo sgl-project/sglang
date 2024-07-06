@@ -122,7 +122,8 @@ class BatchTokenIDOut:
 @dataclass
 class BatchStrOut:
     rids: List[str]
-    output_str: List[str]
+    output_strs: List[str]
+    incomplete_strs: List[str]
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
 
