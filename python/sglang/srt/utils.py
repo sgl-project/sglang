@@ -458,13 +458,8 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
     """
 
-    # TODO: need a better check than just dev str name match
-    # compat: skip RTX 40 series as they do not have P2P feature and even checking for them may cause errors
-    device_name = torch.cuda.get_device_name(gpu_id)
-    if "RTX 40" not in device_name:
-        import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
-
-        setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
+    import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+    setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
 
 def monkey_patch_vllm_dummy_weight_loader():
