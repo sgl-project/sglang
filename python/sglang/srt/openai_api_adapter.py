@@ -164,7 +164,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         logprobs = None
 
                     delta = text[len(stream_buffer) :]
-                    stream_buffer = content["text"]
+                    stream_buffer = stream_buffer + delta
                     choice_data = CompletionResponseStreamChoice(
                         index=0,
                         text=delta,
@@ -323,7 +323,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
                     text = content["text"]
                     delta = text[len(stream_buffer) :]
-                    stream_buffer = text
+                    stream_buffer = stream_buffer + delta
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=0,
                         delta=DeltaMessage(content=delta),

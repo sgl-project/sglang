@@ -180,7 +180,6 @@ class RuntimeEndpoint(BaseBackend):
         self._assert_success(res)
         pos = 0
 
-        incomplete_text = ""
         for chunk in res.iter_lines(decode_unicode=False):
             chunk = chunk.decode("utf-8")
             if chunk and chunk.startswith("data:"):
@@ -188,13 +187,9 @@ class RuntimeEndpoint(BaseBackend):
                     break
                 data = json.loads(chunk[5:].strip("\n"))
                 chunk_text = data["text"][pos:]
-                incomplete_text = data["incomplete_text"]
                 meta_info = data["meta_info"]
                 pos += len(chunk_text)
                 yield chunk_text, meta_info
-
-        if len(incomplete_text) > 0:
-            yield incomplete_text, meta_info
 
     def select(
         self,
