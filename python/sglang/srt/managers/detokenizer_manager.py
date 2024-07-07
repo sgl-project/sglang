@@ -55,13 +55,11 @@ class DetokenizerManager:
             # Trim stop str
             # TODO(lmzheng): handle the case where multiple stop strs are hit
             output_strs = []
-            incomplete_strs = []
             for i in range(len(recv_obj.rids)):
                 new_text = read_texts[i][len(surr_texts[i]) :]
-                complete_new_text = find_printable_text(new_text)
-                incomplete_new_text = new_text[len(complete_new_text) :]
-                output_strs.append(recv_obj.decoded_texts[i] + complete_new_text)
-                incomplete_strs.append(incomplete_new_text)
+                if recv_obj.finished_reason[i] is None:
+                    new_text = find_printable_text(new_text)
+                output_strs.append(recv_obj.decoded_texts[i] + new_text)
 
                 if isinstance(recv_obj.finished_reason[i], FINISH_MATCHED_STR):
                     pos = output_strs[i].find(recv_obj.finished_reason[i].matched)
@@ -72,7 +70,6 @@ class DetokenizerManager:
                 BatchStrOut(
                     rids=recv_obj.rids,
                     output_strs=output_strs,
-                    incomplete_strs=incomplete_strs,
                     meta_info=recv_obj.meta_info,
                     finished_reason=recv_obj.finished_reason,
                 )

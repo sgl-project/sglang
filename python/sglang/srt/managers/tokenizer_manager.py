@@ -317,7 +317,6 @@ class TokenizerManager:
                 recv_obj.meta_info[i]["id"] = rid
                 out_dict = {
                     "text": recv_obj.output_strs[i],
-                    "incomplete_text": recv_obj.incomplete_strs[i],
                     "meta_info": recv_obj.meta_info[i],
                 }
                 state.out_list.append(out_dict)
