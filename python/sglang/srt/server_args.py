@@ -55,6 +55,7 @@ class ServerArgs:
     disable_regex_jump_forward: bool = False
     disable_disk_cache: bool = False
     attention_reduce_in_fp32: bool = False
+    enable_p2p_check: bool = False
 
     # Distributed args
     nccl_init_addr: Optional[str] = None
@@ -303,6 +304,11 @@ class ServerArgs:
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels",
+        )
+        parser.add_argument(
+            "--enable-p2p-check",
+            action="store_true",
+            help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
         )
 
     @classmethod

@@ -259,7 +259,10 @@ class ModelRunner:
         logger.info(f"[gpu_id={self.gpu_id}] Set cuda device.")
         torch.cuda.set_device(self.gpu_id)
         logger.info(f"[gpu_id={self.gpu_id}] Init nccl begin.")
-        monkey_patch_vllm_p2p_access_check(self.gpu_id)
+
+        if not server_args.enable_p2p_check:
+            monkey_patch_vllm_p2p_access_check(self.gpu_id)
+
         if server_args.nccl_init_addr:
             nccl_init_method = f"tcp://{server_args.nccl_init_addr}"
         else:
