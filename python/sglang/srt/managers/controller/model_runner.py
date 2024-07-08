@@ -408,7 +408,7 @@ class ModelRunner:
                 use_tensor_cores = False
 
             workspace_buffers = torch.empty(
-                3, 96 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+                2, 96 * 1024 * 1024, dtype=torch.uint8, device="cuda"
             )
             self.flashinfer_prefill_wrapper_ragged = (
                 BatchPrefillWithRaggedKVCacheWrapper(workspace_buffers[0], "NHD")
@@ -417,7 +417,7 @@ class ModelRunner:
                 workspace_buffers[1], "NHD"
             )
             self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                workspace_buffers[2], "NHD", use_tensor_cores=use_tensor_cores
+                workspace_buffers[0], "NHD", use_tensor_cores=use_tensor_cores
             )
         else:
             self.flashinfer_prefill_wrapper_ragged = (
