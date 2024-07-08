@@ -4,6 +4,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from flashinfer.cascade import merge_state
+
 from sglang.global_config import global_config
 from sglang.srt.layers.extend_attention import extend_attention_fwd
 from sglang.srt.layers.token_attention import token_attention_fwd
@@ -95,8 +97,6 @@ class RadixAttention(nn.Module):
         return o
 
     def prefill_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
-        self.store_kv_cache(k, v, input_metadata)
-
         o1, s1 = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
             k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
@@ -117,9 +117,9 @@ class RadixAttention(nn.Module):
                 logits_soft_cap=self.logit_cap,
             )
 
-            from flashinfer.cascade import merge_state
-
             o, _ = merge_state(o1, s1, o2, s2)
+
+        self.store_kv_cache(k, v, input_metadata)
 
         if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
             torch.cuda.synchronize()
