@@ -459,6 +459,7 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     """
 
     import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
 

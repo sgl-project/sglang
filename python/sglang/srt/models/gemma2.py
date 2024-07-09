@@ -81,7 +81,6 @@ from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
 
 class GemmaRotaryEmbedding(RotaryEmbedding):
-
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         # https://github.com/huggingface/transformers/blob/v4.41.2/src/transformers/models/gemma/modeling_gemma.py#L107
         inv_freq = 1.0 / (
@@ -95,7 +94,6 @@ class GemmaRotaryEmbedding(RotaryEmbedding):
 
 
 class Gemma2MLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -127,7 +125,6 @@ class Gemma2MLP(nn.Module):
 
 
 class Gemma2Attention(nn.Module):
-
     def __init__(
         self,
         layer_idx: int,
@@ -218,7 +215,6 @@ class Gemma2Attention(nn.Module):
 
 
 class Gemma2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         layer_idx: int,
@@ -287,7 +283,6 @@ class Gemma2DecoderLayer(nn.Module):
 
 
 class Gemma2Model(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
