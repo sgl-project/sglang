@@ -67,14 +67,16 @@ def gen(
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
-    return_logprob: Optional[Union[List[bool], bool]] = None,
-    logprob_start_len: Optional[Union[List[int], int]] = None,
-    top_logprobs_num: Optional[Union[List[int], int]] = None,
+    return_logprob: Optional[bool] = None,
+    logprob_start_len: Optional[int] = None,
+    top_logprobs_num: Optional[int] = None,
     return_text_in_logprobs: Optional[bool] = None,
     dtype: Optional[type] = None,
     choices: Optional[List[str]] = None,
     regex: Optional[str] = None,
 ):
+    """Call the model to generate. See the meaning of the arguments in docs/sampling_params.md"""
+
     if choices:
         return SglSelect(name, choices, 0.0 if temperature is None else temperature)
 
@@ -114,9 +116,9 @@ def gen_int(
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
-    return_logprob: Optional[Union[List[bool], bool]] = None,
-    logprob_start_len: Optional[Union[List[int], int]] = None,
-    top_logprobs_num: Optional[Union[List[int], int]] = None,
+    return_logprob: Optional[bool] = None,
+    logprob_start_len: Optional[int] = None,
+    top_logprobs_num: Optional[int] = None,
     return_text_in_logprobs: Optional[bool] = None,
 ):
     return SglGen(
@@ -148,9 +150,9 @@ def gen_string(
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
-    return_logprob: Optional[Union[List[bool], bool]] = None,
-    logprob_start_len: Optional[Union[List[int], int]] = None,
-    top_logprobs_num: Optional[Union[List[int], int]] = None,
+    return_logprob: Optional[bool] = None,
+    logprob_start_len: Optional[int] = None,
+    top_logprobs_num: Optional[int] = None,
     return_text_in_logprobs: Optional[bool] = None,
 ):
     return SglGen(
