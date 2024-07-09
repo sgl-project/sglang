@@ -16,7 +16,6 @@ class ChatTemplate:
     stop_str: List[str] = ()
     image_token: str = "<image>"
     style: ChatTemplateStyle = ChatTemplateStyle.PLAIN
-    use_default_system: bool = False
 
     def get_prefix_and_suffix(
         self, role: str, hist_messages: List[Dict]
@@ -43,8 +42,7 @@ class ChatTemplate:
         prompt = ""
         for i, message in enumerate(messages):
             role, content = message["role"], message["content"]
-            # if use default system like qwen
-            if role == "system" and (content is None or self.use_default_system):
+            if role == "system" and content is None:
                 content = self.default_system_prompt
                 if content is None:
                     continue
@@ -132,7 +130,6 @@ register_chat_template(
         },
         style=ChatTemplateStyle.PLAIN,
         stop_str=("<|im_end|>",),
-        use_default_system=True
     )
 )
 
@@ -152,6 +149,7 @@ register_chat_template(
     )
 )
 
+# Reference: https://github.com/lm-sys/FastChat/blob/main/docs/vicuna_weights_version.md#prompt-template
 register_chat_template(
     ChatTemplate(
         name="vicuna_v1.1",
