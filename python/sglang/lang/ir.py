@@ -23,6 +23,10 @@ class SglSamplingParams:
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     ignore_eos: bool = False
+    return_logprob: Optional[Union[List[bool], bool]] = None
+    logprob_start_len: Optional[Union[List[int], int]] = None,
+    top_logprobs_num: Optional[Union[List[int], int]] = None,
+    return_text_in_logprobs: Optional[bool] = None,
 
     # for constrained generation, not included in to_xxx_kwargs
     dtype: Optional[str] = None
@@ -37,6 +41,11 @@ class SglSamplingParams:
             self.top_k,
             self.frequency_penalty,
             self.presence_penalty,
+            self.ignore_eos,
+            self.return_logprob,
+            self.logprob_start_len,
+            self.top_logprobs_num,
+            self.return_text_in_logprobs,
         )
 
     def to_openai_kwargs(self):
@@ -139,6 +148,10 @@ class SglFunction:
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         ignore_eos: bool = False,
+        return_logprob: Optional[Union[List[bool], bool]] = None,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        return_text_in_logprobs: Optional[bool] = None,
         stream: bool = False,
         backend=None,
         **kwargs,
@@ -154,6 +167,10 @@ class SglFunction:
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
             ignore_eos=ignore_eos,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            return_text_in_logprobs=return_text_in_logprobs,
         )
         backend = backend or global_config.default_backend
         return run_program(self, backend, args, kwargs, default_sampling_para, stream)
@@ -170,6 +187,10 @@ class SglFunction:
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         ignore_eos: bool = False,
+        return_logprob: Optional[Union[List[bool], bool]] = None,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        return_text_in_logprobs: bool = False,
         backend=None,
         num_threads: Union[str, int] = "auto",
         progress_bar: bool = False,
@@ -203,6 +224,10 @@ class SglFunction:
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
             ignore_eos=ignore_eos,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            return_text_in_logprobs=return_text_in_logprobs,
         )
         backend = backend or global_config.default_backend
         return run_program_batch(
@@ -378,6 +403,10 @@ class SglGen(SglExpr):
         frequency_penalty,
         presence_penalty,
         ignore_eos,
+        return_logprob,
+        logprob_start_len,
+        top_logprobs_num,
+        return_text_in_logprobs,
         dtype,
         regex,
     ):
@@ -392,6 +421,10 @@ class SglGen(SglExpr):
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
             ignore_eos=ignore_eos,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            return_text_in_logprobs=return_text_in_logprobs,
             dtype=dtype,
             regex=regex,
         )
