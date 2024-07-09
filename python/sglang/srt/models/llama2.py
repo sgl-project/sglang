@@ -163,9 +163,9 @@ class LlamaDecoderLayer(nn.Module):
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
-            rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings
-            )
+            rope_scaling[
+                "original_max_position_embeddings"
+            ] = config.original_max_position_embeddings
         rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = LlamaAttention(

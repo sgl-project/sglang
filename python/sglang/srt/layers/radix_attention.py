@@ -2,9 +2,8 @@
 
 import numpy as np
 import torch
-from torch import nn
-
 from flashinfer.cascade import merge_state
+from torch import nn
 
 from sglang.global_config import global_config
 from sglang.srt.layers.extend_attention import extend_attention_fwd
