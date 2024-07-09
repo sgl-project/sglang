@@ -333,17 +333,18 @@ class TokenizerManager:
             ret["meta_info"]["decode_token_logprobs"] = self.detokenize_logprob_tokens(
                 ret["meta_info"]["decode_token_logprobs"], return_text_in_logprobs
             )
-        if top_logprobs_num > 0:
-            ret["meta_info"][
-                "prefill_top_logprobs"
-            ] = self.detokenize_top_logprobs_tokens(
-                ret["meta_info"]["prefill_top_logprobs"], return_text_in_logprobs
-            )
-            ret["meta_info"][
-                "decode_top_logprobs"
-            ] = self.detokenize_top_logprobs_tokens(
-                ret["meta_info"]["decode_top_logprobs"], return_text_in_logprobs
-            )
+
+            if top_logprobs_num > 0:
+                ret["meta_info"][
+                    "prefill_top_logprobs"
+                ] = self.detokenize_top_logprobs_tokens(
+                    ret["meta_info"]["prefill_top_logprobs"], return_text_in_logprobs
+                )
+                ret["meta_info"][
+                    "decode_top_logprobs"
+                ] = self.detokenize_top_logprobs_tokens(
+                    ret["meta_info"]["decode_top_logprobs"], return_text_in_logprobs
+                )
         return ret
 
     def detokenize_logprob_tokens(self, token_logprobs, decode_to_text):
@@ -383,7 +384,7 @@ def get_pixel_values(
     try:
         processor = processor or global_processor
         image, image_size = load_image(image_data)
-        if image_size != None:
+        if image_size is not None:
             image_hash = hash(image_data)
             pixel_values = processor.image_processor(image)["pixel_values"]
             for _ in range(len(pixel_values)):
