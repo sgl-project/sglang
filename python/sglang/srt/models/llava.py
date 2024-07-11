@@ -8,6 +8,8 @@ from torch import nn
 from transformers import (
     CLIPVisionConfig,
     CLIPVisionModel,
+    SiglipVisionConfig,
+    SiglipVisionModel,
     LlavaConfig,
     MistralConfig,
     Qwen2Config,
@@ -247,9 +249,16 @@ class LlavaLlamaForCausalLM(nn.Module):
         # load clip vision model by cfg['mm_vision_tower']:
         #   huggingface_name or path_of_clip_relative_to_llava_model_dir
         vision_path = self.config.mm_vision_tower
-        self.vision_tower = CLIPVisionModel.from_pretrained(
-            vision_path, torch_dtype=torch.float16
-        ).cuda()
+        if "clip" in vision_path:
+            self.vision_tower = CLIPVisionModel.from_pretrained(
+                vision_path, torch_dtype=torch.float16
+            ).cuda()
+        elif "siglip" in vision_path:
+            self.vision_tower = SiglipVisionModel.from_pretrained(
+                vision_path, torch_dtype=torch.float16
+            ).cuda()
+            # Siglip needs all feature tokens
+            self.config.mm_vision_select_feature = "full"
         self.vision_tower.eval()
 
         self.vision_feature_layer = self.config.mm_vision_select_layer
@@ -261,8 +270,8 @@ class LlavaLlamaForCausalLM(nn.Module):
         self.image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
         self.image_grid_pinpoints = getattr(self.config, "image_grid_pinpoints", None)
 
-        self.image_feature_len = int((self.image_size / self.patch_size) ** 2)
-        if self.vision_feature_select_strategy == "patch":
+        self.image_feature_len = int((self.image_size // self.patch_size) ** 2)
+        if self.vision_feature_select_strategy == "patch" or self.vision_feature_select_strategy == "full":
             pass
         elif self.vision_feature_select_strategy == "cls_patch":
             self.image_feature_len += 1
