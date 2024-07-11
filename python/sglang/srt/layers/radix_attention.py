@@ -141,9 +141,7 @@ class RadixAttention(nn.Module):
         k = k.view(-1, self.tp_k_head_num, self.head_dim)
         v = v.view(-1, self.tp_v_head_num, self.head_dim)
 
-        if input_metadata.forward_mode == ForwardMode.PREFILL:
-            return self.prefill_forward(q, k, v, input_metadata)
-        elif input_metadata.forward_mode == ForwardMode.EXTEND:
+        if input_metadata.forward_mode == ForwardMode.EXTEND:
             return self.extend_forward(q, k, v, input_metadata)
         elif input_metadata.forward_mode == ForwardMode.DECODE:
             return self.decode_forward(q, k, v, input_metadata)

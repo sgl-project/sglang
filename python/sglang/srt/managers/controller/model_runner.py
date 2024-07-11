@@ -71,8 +71,7 @@ class InputMetadata:
 
     def init_flashinfer_args(self, num_qo_heads, num_kv_heads, head_dim):
         if (
-            self.forward_mode == ForwardMode.PREFILL
-            or self.forward_mode == ForwardMode.EXTEND
+            self.forward_mode == ForwardMode.EXTEND
         ):
             paged_kernel_lens = self.prefix_lens
             self.no_prefix = torch.all(self.prefix_lens == 0)
@@ -98,10 +97,7 @@ class InputMetadata:
             dim=0,
         ).contiguous()
 
-        if (
-            self.forward_mode == ForwardMode.PREFILL
-            or self.forward_mode == ForwardMode.EXTEND
-        ):
+        if self.forward_mode == ForwardMode.EXTEND:
             # extend part
             self.qo_indptr = torch.zeros(
                 (self.batch_size + 1,), dtype=torch.int32, device="cuda"
@@ -426,27 +422,6 @@ class ModelRunner:
             self.flashinfer_decode_wrapper = None
 
     @torch.inference_mode()
-    def forward_prefill(self, batch: Batch):
-        input_metadata = InputMetadata.create(
-            self,
-            forward_mode=ForwardMode.PREFILL,
-            tp_size=self.tp_size,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            prefix_lens=batch.prefix_lens,
-            position_ids_offsets=batch.position_ids_offsets,
-            out_cache_loc=batch.out_cache_loc,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            return_logprob=batch.return_logprob,
-            flashinfer_prefill_wrapper_ragged=self.flashinfer_prefill_wrapper_ragged,
-            flashinfer_prefill_wrapper_paged=self.flashinfer_prefill_wrapper_paged,
-            flashinfer_decode_wrapper=self.flashinfer_decode_wrapper,
-        )
-        return self.model.forward(
-            batch.input_ids, input_metadata.positions, input_metadata
-        )
-
-    @torch.inference_mode()
     def forward_extend(self, batch: Batch):
         input_metadata = InputMetadata.create(
             self,
@@ -523,8 +498,6 @@ class ModelRunner:
             return self.forward_decode(batch)
         elif forward_mode == ForwardMode.EXTEND:
             return self.forward_extend(batch)
-        elif forward_mode == ForwardMode.PREFILL:
-            return self.forward_prefill(batch)
         else:
             raise ValueError(f"Invaid forward mode: {forward_mode}")
 
