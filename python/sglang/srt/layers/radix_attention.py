@@ -31,21 +31,13 @@ class RadixAttention(nn.Module):
         self.layer_id = layer_id
 
         if not global_server_args_dict.get("disable_flashinfer", False):
-            self.prefill_forward = self.prefill_forward_flashinfer
-            self.extend_forward = self.prefill_forward_flashinfer
+            self.extend_forward = self.extend_forward_flashinfer
             self.decode_forward = self.decode_forward_flashinfer
-            # flashinfer now accepts float logit_cap argument
-            self.logit_cap = logit_cap if logit_cap is not None and logit_cap > 0 else 0
         else:
-            self.prefill_forward = self.prefill_forward_triton
             self.extend_forward = self.extend_forward_triton
             self.decode_forward = self.decode_forward_triton
-            self.logit_cap = logit_cap if logit_cap is not None else 0
 
-    def prefill_forward_triton(self, q, k, v, input_metadata: InputMetadata):
-        # In SGLang, we call both the typical "prefill" and "prefill with cache" as "extend".
-        # See the extend_forward_xxx functions.
-        raise NotImplementedError()
+        self.logit_cap = logit_cap if logit_cap is not None and logit_cap > 0 else 0
 
     def extend_forward_triton(self, q, k, v, input_metadata: InputMetadata):
         o = torch.empty_like(q)
@@ -86,7 +78,6 @@ class RadixAttention(nn.Module):
             input_metadata.start_loc,
             input_metadata.seq_lens,
             input_metadata.max_seq_len,
-            input_metadata.other_kv_index,
             input_metadata.total_num_tokens,
             sm_scale=self.scaling,
             logit_cap=self.logit_cap,
@@ -94,7 +85,7 @@ class RadixAttention(nn.Module):
 
         return o
 
-    def prefill_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
+    def extend_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         o1, s1 = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
             k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),

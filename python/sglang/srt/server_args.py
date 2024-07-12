@@ -53,6 +53,7 @@ class ServerArgs:
     disable_flashinfer: bool = False
     disable_radix_cache: bool = False
     disable_regex_jump_forward: bool = False
+    disable_cuda_graph: bool = False
     disable_disk_cache: bool = False
     attention_reduce_in_fp32: bool = False
     enable_p2p_check: bool = False
@@ -293,6 +294,11 @@ class ServerArgs:
             "--disable-regex-jump-forward",
             action="store_true",
             help="Disable regex jump-forward",
+        )
+        parser.add_argument(
+            "--disable-cuda-graph",
+            action="store_true",
+            help="Disable cuda graph.",
         )
         parser.add_argument(
             "--disable-disk-cache",
