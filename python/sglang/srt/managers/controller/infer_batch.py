@@ -722,12 +722,11 @@ class InputMetadata:
     extend_seq_lens: torch.Tensor
     extend_start_loc: torch.Tensor
     extend_no_prefix: bool
-    prefix_lens: torch.Tensor
 
     # Output location of the KV cache
     out_cache_loc: torch.Tensor = None
-    out_cache_cont_start: torch.Tensor = None
-    out_cache_cont_end: torch.Tensor = None
+    out_cache_cont_start: int = None
+    out_cache_cont_end: int = None
 
     # Output options
     return_logprob: bool = False
@@ -768,6 +767,7 @@ class InputMetadata:
         if forward_mode == ForwardMode.DECODE:
             positions = ((seq_lens - 1) + position_ids_offsets).to(torch.int64)
             extend_seq_lens = extend_start_loc = extend_no_prefix = None
+            total_num_tokens = None
         else:
             seq_lens_cpu = seq_lens.cpu().numpy()
             prefix_lens_cpu = prefix_lens.cpu().numpy()
@@ -789,6 +789,7 @@ class InputMetadata:
             extend_start_loc = torch.zeros_like(seq_lens)
             extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
             extend_no_prefix = torch.all(prefix_lens == 0)
+            total_num_tokens = int(torch.sum(seq_lens))
 
         ret = cls(
             forward_mode=forward_mode,
