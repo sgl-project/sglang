@@ -53,8 +53,6 @@ class InputMetadata:
     max_extend_len: int = 0
 
     out_cache_loc: torch.Tensor = None
-    out_cache_cont_start: torch.Tensor = None
-    out_cache_cont_end: torch.Tensor = None
 
     other_kv_index: torch.Tensor = None
     return_logprob: bool = False
@@ -160,8 +158,6 @@ class InputMetadata:
         prefix_lens,
         position_ids_offsets,
         out_cache_loc,
-        out_cache_cont_start=None,
-        out_cache_cont_end=None,
         top_logprobs_nums=None,
         return_logprob=False,
         flashinfer_prefill_wrapper_ragged=None,
@@ -211,8 +207,6 @@ class InputMetadata:
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            out_cache_cont_start=out_cache_cont_start,
-            out_cache_cont_end=out_cache_cont_end,
             other_kv_index=other_kv_index,
             return_logprob=return_logprob,
             top_logprobs_nums=top_logprobs_nums,
@@ -478,8 +472,6 @@ class ModelRunner:
             prefix_lens=batch.prefix_lens,
             position_ids_offsets=batch.position_ids_offsets,
             out_cache_loc=batch.out_cache_loc,
-            out_cache_cont_start=batch.out_cache_cont_start,
-            out_cache_cont_end=batch.out_cache_cont_end,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
             flashinfer_prefill_wrapper_ragged=self.flashinfer_prefill_wrapper_ragged,

@@ -62,6 +62,7 @@ class TokenToKVPool:
         return select_index.to(torch.int32)
 
     def alloc_contiguous(self, need_size):
+        # NOTE: This function is deprecated.
         empty_index = torch.nonzero(self.mem_state == 0).squeeze(1)[:need_size]
         if empty_index.shape[0] < need_size:
             return None

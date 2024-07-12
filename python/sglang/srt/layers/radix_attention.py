@@ -155,12 +155,5 @@ class RadixAttention(nn.Module):
         if input_metadata.out_cache_loc is not None:
             key_buffer[input_metadata.out_cache_loc] = cache_k
             value_buffer[input_metadata.out_cache_loc] = cache_v
-        elif input_metadata.out_cache_cont_start is not None:
-            key_buffer[
-                input_metadata.out_cache_cont_start : input_metadata.out_cache_cont_end
-            ] = cache_k
-            value_buffer[
-                input_metadata.out_cache_cont_start : input_metadata.out_cache_cont_end
-            ] = cache_v
         else:
             raise RuntimeError()
