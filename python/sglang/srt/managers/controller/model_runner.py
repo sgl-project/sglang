@@ -90,9 +90,6 @@ class ModelRunner:
         self.init_cublas()
         self.init_flash_infer()
 
-        # Capture cuda graphs
-        # self.init_cuda_graphs()
-
     def load_model(self):
         logger.info(
             f"[gpu_id={self.gpu_id}] Load weight begin. "
@@ -218,12 +215,6 @@ class ModelRunner:
                 self.flashinfer_prefill_wrapper_paged
             ) = None
             self.flashinfer_decode_wrapper = None
-
-    def init_cuda_graphs(self):
-        from sglang.srt.managers.controller.cuda_graph_runner import CudaGraphRunner
-
-        self.cuda_graph_runner = CudaGraphRunner(self.model)
-        self.cuda_graph_runner.capture([1])
 
     @torch.inference_mode()
     def forward_extend(self, batch: Batch):
