@@ -729,7 +729,6 @@ class InputMetadata:
     out_cache_cont_start: torch.Tensor = None
     out_cache_cont_end: torch.Tensor = None
 
-    other_kv_index: torch.Tensor = None
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
 
@@ -743,24 +742,19 @@ class InputMetadata:
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
 
     def init_flashinfer_args(self, num_qo_heads, num_kv_heads, head_dim):
-        if (
-            self.forward_mode == ForwardMode.EXTEND
-        ):
+        if self.forward_mode == ForwardMode.DECODE:
+            paged_kernel_lens = self.seq_lens
+        else:
             paged_kernel_lens = self.prefix_lens
             self.no_prefix = torch.all(self.prefix_lens == 0)
-        else:
-            paged_kernel_lens = self.seq_lens
 
-        self.kv_indptr = torch.zeros(
+        kv_indptr = torch.zeros(
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
         )
-        self.kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-        self.kv_last_page_len = torch.ones(
-            (self.batch_size,), dtype=torch.int32, device="cuda"
-        )
+        kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
         req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
         paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
-        self.kv_indices = torch.cat(
+        kv_indices = torch.cat(
             [
                 self.req_to_token_pool.req_to_token[
                     req_pool_indices_cpu[i], : paged_kernel_lens_cpu[i]
@@ -769,18 +763,34 @@ class InputMetadata:
             ],
             dim=0,
         ).contiguous()
+        kv_last_page_len = torch.ones(
+            (self.batch_size,), dtype=torch.int32, device="cuda"
+        )
 
-        if self.forward_mode == ForwardMode.EXTEND:
+        if self.forward_mode == ForwardMode.DECODE:
+            self.flashinfer_decode_wrapper.end_forward()
+            self.flashinfer_decode_wrapper.begin_forward(
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                pos_encoding_mode="NONE",
+                data_type=self.token_to_kv_pool.kv_data[0].dtype,
+            )
+        else:
             # extend part
-            self.qo_indptr = torch.zeros(
+            qo_indptr = torch.zeros(
                 (self.batch_size + 1,), dtype=torch.int32, device="cuda"
             )
-            self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
+            qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
 
             self.flashinfer_prefill_wrapper_ragged.end_forward()
             self.flashinfer_prefill_wrapper_ragged.begin_forward(
-                self.qo_indptr,
-                self.qo_indptr.clone(),
+                qo_indptr,
+                qo_indptr,
                 num_qo_heads,
                 num_kv_heads,
                 head_dim,
@@ -789,27 +799,14 @@ class InputMetadata:
             # cached part
             self.flashinfer_prefill_wrapper_paged.end_forward()
             self.flashinfer_prefill_wrapper_paged.begin_forward(
-                self.qo_indptr,
-                self.kv_indptr,
-                self.kv_indices,
-                self.kv_last_page_len,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len,
                 num_qo_heads,
                 num_kv_heads,
                 head_dim,
                 1,
-            )
-        else:
-            self.flashinfer_decode_wrapper.end_forward()
-            self.flashinfer_decode_wrapper.begin_forward(
-                self.kv_indptr,
-                self.kv_indices,
-                self.kv_last_page_len,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-                1,
-                pos_encoding_mode="NONE",
-                data_type=self.token_to_kv_pool.kv_data[0].dtype,
             )
 
     def init_extend_args(self):
@@ -822,7 +819,6 @@ class InputMetadata:
     def create(
         cls,
         model_runner,
-        tp_size,
         forward_mode,
         req_pool_indices,
         seq_lens,
@@ -833,9 +829,6 @@ class InputMetadata:
         out_cache_cont_end=None,
         top_logprobs_nums=None,
         return_logprob=False,
-        flashinfer_prefill_wrapper_ragged=None,
-        flashinfer_prefill_wrapper_paged=None,
-        flashinfer_decode_wrapper=None,
     ):
         batch_size = len(req_pool_indices)
         start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
@@ -845,9 +838,6 @@ class InputMetadata:
 
         if forward_mode == ForwardMode.DECODE:
             positions = ((seq_lens - 1) + position_ids_offsets).to(torch.int64)
-            other_kv_index = model_runner.req_to_token_pool.req_to_token[
-                req_pool_indices[0], seq_lens[0] - 1
-            ].item()
         else:
             seq_lens_cpu = seq_lens.cpu().numpy()
             prefix_lens_cpu = prefix_lens.cpu().numpy()
@@ -865,7 +855,6 @@ class InputMetadata:
                 ),
                 device="cuda",
             )
-            other_kv_index = None
 
         ret = cls(
             forward_mode=forward_mode,
@@ -882,12 +871,11 @@ class InputMetadata:
             out_cache_loc=out_cache_loc,
             out_cache_cont_start=out_cache_cont_start,
             out_cache_cont_end=out_cache_cont_end,
-            other_kv_index=other_kv_index,
             return_logprob=return_logprob,
             top_logprobs_nums=top_logprobs_nums,
-            flashinfer_prefill_wrapper_ragged=flashinfer_prefill_wrapper_ragged,
-            flashinfer_prefill_wrapper_paged=flashinfer_prefill_wrapper_paged,
-            flashinfer_decode_wrapper=flashinfer_decode_wrapper,
+            flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
+            flashinfer_prefill_wrapper_paged=model_runner.flashinfer_prefill_wrapper_paged,
+            flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
         )
 
         if forward_mode == ForwardMode.EXTEND:
@@ -895,8 +883,8 @@ class InputMetadata:
 
         if not global_server_args_dict.get("disable_flashinfer", False):
             ret.init_flashinfer_args(
-                model_runner.model_config.num_attention_heads // tp_size,
-                model_runner.model_config.get_num_kv_heads(tp_size),
+                model_runner.model_config.num_attention_heads // model_runner.tp_size,
+                model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
                 model_runner.model_config.head_dim,
             )
 
