@@ -47,6 +47,10 @@ class TokenToKVPool:
             for _ in range(layer_num)
         ]
 
+        # Prefetch buffer
+        self.prefetch_buffer = torch.empty(0, device="cuda", dtype=torch.int32)
+        self.prefetch_chunk_size = 256
+
     def get_key_buffer(self, layer_id):
         return self.kv_data[layer_id][:, 0]
 
@@ -54,12 +58,26 @@ class TokenToKVPool:
         return self.kv_data[layer_id][:, 1]
 
     def alloc(self, need_size):
-        select_index = torch.nonzero(self.mem_state == 0).squeeze(1)[:need_size]
-        if select_index.shape[0] < need_size:
+        buffer_len = len(self.prefetch_buffer)
+        if need_size <= buffer_len:
+            select_index = self.prefetch_buffer[:need_size]
+            self.prefetch_buffer = self.prefetch_buffer[need_size:]
+            return select_index.to(torch.int32)
+
+        addition_size = need_size - buffer_len
+        alloc_size = max(addition_size, self.prefetch_chunk_size)
+        select_index = torch.nonzero(self.mem_state == 0).squeeze(1)[:alloc_size]
+
+        if select_index.shape[0] < addition_size:
             return None
 
         self.add_refs(select_index)
-        return select_index.to(torch.int32)
+
+        self.prefetch_buffer = torch.cat((self.prefetch_buffer, select_index))
+        ret_index = self.prefetch_buffer[:need_size]
+        self.prefetch_buffer = self.prefetch_buffer[need_size:]
+
+        return ret_index.to(torch.int32)
 
     def alloc_contiguous(self, need_size):
         # NOTE: This function is deprecated.
@@ -85,7 +103,7 @@ class TokenToKVPool:
         return len(torch.nonzero(self.mem_state).squeeze(1))
 
     def available_size(self):
-        return torch.sum(self.mem_state == 0).item()
+        return torch.sum(self.mem_state == 0).item() + len(self.prefetch_buffer)
 
     def add_refs(self, token_index: torch.Tensor):
         self.total_ref_ct += len(token_index)
