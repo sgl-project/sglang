@@ -675,7 +675,11 @@ class Batch:
         # TODO(lmzheng): apply penalty
         probs = torch.softmax(logits, dim=-1)
         probs_sort, probs_idx = _top_p_top_k(probs, self.top_ps, self.top_ks)
-        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+        try:
+            sampled_index = torch.multinomial(probs_sort, num_samples=1)
+        except RuntimeError as e:
+            warnings.warn(f"Ignore errors in sampling: {e}")
+            sampled_index = torch.ones(probs_sort.shape[:-1] + (1,), dtype=torch.int64, device=probs.device)
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(
             -1
         )
@@ -757,9 +761,11 @@ class InputMetadata:
         out_cache_cont_end=None,
         top_logprobs_nums=None,
         return_logprob=False,
+        skip_flashinfer_init=False,
     ):
-        if not model_runner.server_args.disable_flashinfer:
-            init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens, prefix_lens)
+        if not skip_flashinfer_init and not model_runner.server_args.disable_flashinfer:
+            init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens, prefix_lens,
+                                 model_runner.flashinfer_decode_wrapper)
 
         batch_size = len(req_pool_indices)
 
@@ -826,7 +832,8 @@ class InputMetadata:
         return ret
 
 
-def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens, prefix_lens):
+def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens, prefix_lens,
+                         flashinfer_decode_wrapper):
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
     num_kv_heads = model_runner.model_config.get_num_kv_heads(model_runner.tp_size)
     head_dim = model_runner.model_config.head_dim
@@ -857,8 +864,8 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
     )
 
     if forward_mode == ForwardMode.DECODE:
-        model_runner.flashinfer_decode_wrapper.end_forward()
-        model_runner.flashinfer_decode_wrapper.begin_forward(
+        flashinfer_decode_wrapper.end_forward()
+        flashinfer_decode_wrapper.begin_forward(
             kv_indptr,
             kv_indices,
             kv_last_page_len,
