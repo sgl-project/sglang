@@ -138,11 +138,11 @@ class CudaGraphRunner:
         bs = self.batch_size_list[index]
 
         # Common inputs
-        self.input_ids[:bs] = batch.input_ids
-        self.req_pool_indices[:bs] = batch.req_pool_indices
-        self.seq_lens[:bs] = batch.seq_lens
-        self.position_ids_offsets[:bs] = batch.position_ids_offsets
-        self.out_cache_loc[:bs] = batch.out_cache_loc
+        self.input_ids[:raw_bs] = batch.input_ids
+        self.req_pool_indices[:raw_bs] = batch.req_pool_indices
+        self.seq_lens[:raw_bs] = batch.seq_lens
+        self.position_ids_offsets[:raw_bs] = batch.position_ids_offsets
+        self.out_cache_loc[:raw_bs] = batch.out_cache_loc
 
         # FlashInfer inputs
         init_flashinfer_args(
