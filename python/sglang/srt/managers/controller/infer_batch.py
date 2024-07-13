@@ -762,12 +762,16 @@ class InputMetadata:
             init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens, prefix_lens)
 
         batch_size = len(req_pool_indices)
-        total_num_tokens = int(torch.sum(seq_lens))
 
         if forward_mode == ForwardMode.DECODE:
             positions = ((seq_lens - 1) + position_ids_offsets).to(torch.int64)
             extend_seq_lens = extend_start_loc = extend_no_prefix = None
-            total_num_tokens = None
+            if model_runner.server_args.disable_flashinfer:
+                # This variable is not needed in this case,
+                # we do not compute it to make it compatbile with cuda graph.
+                total_num_tokens = None
+            else:
+                total_num_tokens = int(torch.sum(seq_lens))
         else:
             seq_lens_cpu = seq_lens.cpu().numpy()
             prefix_lens_cpu = prefix_lens.cpu().numpy()
