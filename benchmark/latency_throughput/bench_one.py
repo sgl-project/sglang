@@ -100,11 +100,12 @@ def run_one_batch_size(bs):
 
     with open("results.jsonl", "a") as fout:
         res = {
+            "backend": args.backend,
             "input_len": args.input_len,
             "output_len": args.max_tokens,
             "batch_size": bs,
             "latency": latency,
-            "output_throughput": output_throughput
+            "output_throughput": output_throughput,
         }
         fout.write(json.dumps(res) + "\n")
 
