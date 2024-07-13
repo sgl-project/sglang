@@ -394,6 +394,10 @@ class ModelTpServer:
                     new_batch_input_tokens += req.extend_input_len
             else:
                 break
+
+            if len(can_run_list) + len(self.running_batch.reqs) > self.max_running_requests:
+                break
+
         if len(can_run_list) == 0:
             return None
 
