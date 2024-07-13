@@ -104,8 +104,6 @@ class CudaGraphRunner:
                 prefix_lens=None,
                 position_ids_offsets=position_ids_offsets,
                 out_cache_loc=out_cache_loc,
-                out_cache_cont_start=None,
-                out_cache_cont_end=None,
                 return_logprob=False,
                 top_logprobs_nums=0,
                 skip_flashinfer_init=True,
