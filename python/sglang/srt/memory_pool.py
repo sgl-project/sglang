@@ -47,6 +47,8 @@ class TokenToKVPool:
             for _ in range(layer_num)
         ]
 
+        self.clear()
+
     def get_key_buffer(self, layer_id):
         return self.kv_data[layer_id][:, 0]
 
@@ -101,3 +103,6 @@ class TokenToKVPool:
     def clear(self):
         self.mem_state.fill_(0)
         self.total_ref_ct = 0
+
+        # This slot is used for writing dummy output for padded tokens
+        self.add_refs(torch.zeros(1))

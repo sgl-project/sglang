@@ -140,6 +140,7 @@ class CudaGraphRunner:
         # Common inputs
         if bs != raw_bs:
             self.seq_lens.zero_()
+            self.out_cache_loc.zero_()
         self.input_ids[:raw_bs] = batch.input_ids
         self.req_pool_indices[:raw_bs] = batch.req_pool_indices
         self.seq_lens[:raw_bs] = batch.seq_lens
