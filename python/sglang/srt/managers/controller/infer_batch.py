@@ -766,7 +766,7 @@ class InputMetadata:
         if forward_mode == ForwardMode.DECODE:
             positions = ((seq_lens - 1) + position_ids_offsets).to(torch.int64)
             extend_seq_lens = extend_start_loc = extend_no_prefix = None
-            if model_runner.server_args.disable_flashinfer:
+            if not model_runner.server_args.disable_flashinfer:
                 # This variable is not needed in this case,
                 # we do not compute it to make it compatbile with cuda graph.
                 total_num_tokens = None
