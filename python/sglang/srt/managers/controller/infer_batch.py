@@ -275,8 +275,6 @@ class Batch:
     prefix_lens: torch.Tensor = None
     position_ids_offsets: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
-    out_cache_cont_start: int = None
-    out_cache_cont_end: int = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -566,21 +564,12 @@ class Batch:
 
         # Alloc mem
         bs = len(self.reqs)
-        alloc_res = self.token_to_kv_pool.alloc_contiguous(bs)
-        if alloc_res is None:
-            self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
+        self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
-            if self.out_cache_loc is None:
-                print("Decode out of memory. This should never happen.")
-                self.tree_cache.pretty_print()
-                exit()
-
-            self.out_cache_cont_start = None
-            self.out_cache_cont_end = None
-        else:
-            self.out_cache_loc = alloc_res[0]
-            self.out_cache_cont_start = alloc_res[1]
-            self.out_cache_cont_end = alloc_res[2]
+        if self.out_cache_loc is None:
+            print("Decode out of memory. This should never happen.")
+            self.tree_cache.pretty_print()
+            exit()
 
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
@@ -594,7 +583,7 @@ class Batch:
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.prefix_lens = None
         self.position_ids_offsets = self.position_ids_offsets[new_indices]
-        self.out_cache_loc = self.out_cache_cont_start = self.out_cache_cont_end = None
+        self.out_cache_loc = None
         self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
@@ -622,7 +611,7 @@ class Batch:
         self.position_ids_offsets = torch.concat(
             [self.position_ids_offsets, other.position_ids_offsets]
         )
-        self.out_cache_loc = self.out_cache_cont_start = self.out_cache_cont_end = None
+        self.out_cache_loc = None
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
@@ -729,8 +718,6 @@ class InputMetadata:
 
     # Output location of the KV cache
     out_cache_loc: torch.Tensor = None
-    out_cache_cont_start: int = None
-    out_cache_cont_end: int = None
 
     # Output options
     return_logprob: bool = False
@@ -757,8 +744,6 @@ class InputMetadata:
         prefix_lens,
         position_ids_offsets,
         out_cache_loc,
-        out_cache_cont_start=None,
-        out_cache_cont_end=None,
         top_logprobs_nums=None,
         return_logprob=False,
         skip_flashinfer_init=False,
@@ -811,8 +796,6 @@ class InputMetadata:
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            out_cache_cont_start=out_cache_cont_start,
-            out_cache_cont_end=out_cache_cont_end,
             extend_seq_lens=extend_seq_lens,
             extend_start_loc=extend_start_loc,
             extend_no_prefix=extend_no_prefix,

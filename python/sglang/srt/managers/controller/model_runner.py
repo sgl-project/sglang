@@ -245,8 +245,6 @@ class ModelRunner:
             prefix_lens=batch.prefix_lens,
             position_ids_offsets=batch.position_ids_offsets,
             out_cache_loc=batch.out_cache_loc,
-            out_cache_cont_start=batch.out_cache_cont_start,
-            out_cache_cont_end=batch.out_cache_cont_end,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
         )
