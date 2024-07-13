@@ -675,7 +675,11 @@ class Batch:
         # TODO(lmzheng): apply penalty
         probs = torch.softmax(logits, dim=-1)
         probs_sort, probs_idx = _top_p_top_k(probs, self.top_ps, self.top_ks)
-        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+        try:
+            sampled_index = torch.multinomial(probs_sort, num_samples=1)
+        except RuntimeError as e:
+            warnings.warn(f"Ignore errors in sampling: {e}")
+            sampled_index = torch.ones(probs_sort.shape[:-1] + (1,), dtype=torch.int32, device=probs.device)
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(
             -1
         )
