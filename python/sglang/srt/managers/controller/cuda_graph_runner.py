@@ -1,9 +1,12 @@
 """Run the model with cuda graph."""
 
+import bisect
+
 import torch
 from vllm.distributed.parallel_state import graph_capture
 
 from sglang.global_config import global_config
+from sglang.srt.layers.logits_processor import LogitProcessorOutput
 from sglang.srt.managers.controller.infer_batch import (
     Batch, ForwardMode, InputMetadata, init_flashinfer_args
 )
@@ -19,12 +22,12 @@ class CudaGraphRunner:
         self.graph_memory_pool = None
 
         # Common inputs
-        max_bs = max_batch_size_to_capture
-        self.input_ids = torch.zeros((max_bs,), dtype=torch.int32, device="cuda")
-        self.req_pool_indices = torch.zeros((max_bs,), dtype=torch.int32, device="cuda")
-        self.seq_lens = torch.zeros((max_bs,), dtype=torch.int32, device="cuda")
-        self.position_ids_offsets = torch.zeros((max_bs,), dtype=torch.int32, device="cuda")
-        self.out_cache_loc = torch.zeros((max_bs,), dtype=torch.int32, device="cuda")
+        self.max_bs = max_batch_size_to_capture
+        self.input_ids = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+        self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+        self.seq_lens = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+        self.position_ids_offsets = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+        self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
 
         # Flashinfer inputs
         self.flashinfer_workspace_buffer = torch.empty(
@@ -32,16 +35,20 @@ class CudaGraphRunner:
             dtype=torch.uint8, device="cuda"
         )
         self.flashinfer_kv_indptr = torch.zeros(
-            (max_bs + 1,), dtype=torch.int32, device="cuda"
+            (self.max_bs + 1,), dtype=torch.int32, device="cuda"
         )
         self.flashinfer_kv_indices = torch.zeros(
-            (max_bs * model_runner.model_config.context_len,), dtype=torch.int32, device="cuda"
+            (self.max_bs * model_runner.model_config.context_len,), dtype=torch.int32, device="cuda"
         )
         self.flashinfer_kv_last_page_len = torch.ones(
-            (max_bs,), dtype=torch.int32, device="cuda"
+            (self.max_bs,), dtype=torch.int32, device="cuda"
         )
 
+    def can_run(self, batch_size):
+        return batch_size < self.max_bs
+
     def capture(self, batch_size_list):
+        self.batch_size_list = batch_size_list
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
             for bs in batch_size_list:
@@ -65,7 +72,7 @@ class CudaGraphRunner:
         position_ids_offsets = self.position_ids_offsets[:bs]
         out_cache_loc = self.out_cache_loc[:bs]
 
-        # Flashinfer inputs
+        # FlashInfer inputs
         if not _grouped_size_compiled_for_decode_kernels(
             self.model_runner.model_config.num_attention_heads // self.model_runner.tp_size,
             self.model_runner.model_config.get_num_kv_heads(self.model_runner.tp_size),
@@ -124,14 +131,20 @@ class CudaGraphRunner:
     def replay(self, batch: Batch):
         assert batch.out_cache_loc is not None
         assert not batch.return_logprob
-        bs = len(batch.reqs)
+        raw_bs = len(batch.reqs)
 
+        # Pad
+        index = bisect.bisect_left(self.batch_size_list, raw_bs)
+        bs = self.batch_size_list[index]
+
+        # Common inputs
         self.input_ids[:bs] = batch.input_ids
         self.req_pool_indices[:bs] = batch.req_pool_indices
         self.seq_lens[:bs] = batch.seq_lens
         self.position_ids_offsets[:bs] = batch.position_ids_offsets
         self.out_cache_loc[:bs] = batch.out_cache_loc
 
+        # FlashInfer inputs
         init_flashinfer_args(
             ForwardMode.DECODE,
             self.model_runner,
@@ -141,6 +154,20 @@ class CudaGraphRunner:
             self.flashinfer_handlers[bs],
         )
 
+        # Replay
         self.graphs[bs].replay()
+        output = self.output_buffers[bs]
 
-        return self.output_buffers[bs]
+        # Unpad
+        if bs == raw_bs:
+            return output
+        else:
+            output = LogitProcessorOutput(
+                next_token_logits=output.next_token_logits[:raw_bs],
+                next_token_logprobs=output.next_token_logprobs[:raw_bs] if output.next_token_logprobs is not None else None,
+                normalized_prompt_logprobs=None,
+                prefill_token_logprobs=None,
+                prefill_top_logprobs=None,
+                decode_top_logprobs=output.decode_top_logprobs[:raw_bs] if output.decode_top_logprobs is not None else None,
+            )
+        return output

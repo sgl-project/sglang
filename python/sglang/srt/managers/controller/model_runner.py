@@ -94,18 +94,6 @@ class ModelRunner:
         # Capture cuda graphs
         self.init_cuda_graphs()
 
-    def init_cuda_graphs(self):
-        from sglang.srt.managers.controller.cuda_graph_runner import CudaGraphRunner
-
-        if self.server_args.disable_cuda_graph:
-            self.cuda_graph_runner = None
-            return
-
-        logger.info(f"[gpu_id={self.gpu_id}] Capture cuda graph begin.")
-        batch_size_list = [1, 2, 3, 4] + [i * 8 for i in range(1, 16)]
-        self.cuda_graph_runner = CudaGraphRunner(self, max_batch_size_to_capture=max(batch_size_list))
-        self.cuda_graph_runner.capture(batch_size_list)
-
     def load_model(self):
         logger.info(
             f"[gpu_id={self.gpu_id}] Load weight begin. "
@@ -232,9 +220,21 @@ class ModelRunner:
             workspace_buffers[0], "NHD", use_tensor_cores=use_tensor_cores
         )
 
+    def init_cuda_graphs(self):
+        from sglang.srt.managers.controller.cuda_graph_runner import CudaGraphRunner
+
+        if self.server_args.disable_cuda_graph or self.server_args.disable_flashinfer:
+            self.cuda_graph_runner = None
+            return
+
+        logger.info(f"[gpu_id={self.gpu_id}] Capture cuda graph begin.")
+        batch_size_list = [1, 2, 4] + [i * 8 for i in range(1, 16)]
+        self.cuda_graph_runner = CudaGraphRunner(self, max_batch_size_to_capture=max(batch_size_list))
+        self.cuda_graph_runner.capture(batch_size_list)
+
     @torch.inference_mode()
     def forward_decode(self, batch: Batch):
-        if self.cuda_graph_runner and len(batch.reqs) in self.cuda_graph_runner.graphs:
+        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(len(batch.reqs)):
             return self.cuda_graph_runner.replay(batch)
 
         input_metadata = InputMetadata.create(
