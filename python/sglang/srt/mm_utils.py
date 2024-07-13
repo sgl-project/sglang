@@ -141,10 +141,13 @@ def process_anyres_image(image, processor, grid_pinpoints):
     best_resolution = select_best_resolution(image.size, possible_resolutions)
     image_padded = resize_and_pad_image(image, best_resolution)
 
-    patches = divide_to_patches(image_padded, processor.crop_size["height"])
+    # For Siglip processor, only have size but no crop size
+    crop_size = processor.crop_size["height"] if "crop_size" in processor.__dict__ else processor.size["height"]
+    shortest_edge = processor.size["shortest_edge"] if "shortest_edge" in processor.size else processor.size["height"]
+    patches = divide_to_patches(image_padded, crop_size)
 
     image_original_resize = image.resize(
-        (processor.size["shortest_edge"], processor.size["shortest_edge"])
+        (shortest_edge, shortest_edge)
     )
 
     image_patches = [image_original_resize] + patches
