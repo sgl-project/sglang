@@ -314,11 +314,9 @@ class ModelTpServer:
         self.forward_queue.append(req)
 
     def get_new_fill_batch(self) -> Optional[Batch]:
-        if (
-            self.running_batch is not None
-            and len(self.running_batch.reqs) > self.max_running_requests
-        ):
-            return None
+        running_bs = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        if running_bs > self.max_running_requests:
+            return
 
         # Compute matched prefix length
         for req in self.forward_queue:
@@ -395,7 +393,7 @@ class ModelTpServer:
             else:
                 break
 
-            if len(can_run_list) + len(self.running_batch.reqs) > self.max_running_requests:
+            if running_bs + len(can_run_list) > self.max_running_requests:
                 break
 
         if len(can_run_list) == 0:
