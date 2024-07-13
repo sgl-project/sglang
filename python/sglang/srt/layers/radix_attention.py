@@ -137,9 +137,6 @@ class RadixAttention(nn.Module):
 
     def store_kv_cache(self, cache_k, cache_v, input_metadata: InputMetadata):
         key_buffer = input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id)
+        key_buffer[input_metadata.out_cache_loc] = cache_k
         value_buffer = input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id)
-        if input_metadata.out_cache_loc is not None:
-            key_buffer[input_metadata.out_cache_loc] = cache_k
-            value_buffer[input_metadata.out_cache_loc] = cache_v
-        else:
-            raise RuntimeError()
+        value_buffer[input_metadata.out_cache_loc] = cache_v
