@@ -26,7 +26,7 @@ class GlobalConfig:
         self.layer_sync_threshold = 8192
 
         # Runtime constants: Flashinfer
-        self.flashinfer_workspace_size = 96 * 1024 * 1024
+        self.flashinfer_workspace_size = 128 * 1024 * 1024
 
         # Output tokenization configs
         self.skip_special_tokens_in_output = True

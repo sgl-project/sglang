@@ -679,7 +679,7 @@ class Batch:
             sampled_index = torch.multinomial(probs_sort, num_samples=1)
         except RuntimeError as e:
             warnings.warn(f"Ignore errors in sampling: {e}")
-            sampled_index = torch.ones(probs_sort.shape[:-1] + (1,), dtype=torch.int32, device=probs.device)
+            sampled_index = torch.ones(probs_sort.shape[:-1] + (1,), dtype=torch.int64, device=probs.device)
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(
             -1
         )
