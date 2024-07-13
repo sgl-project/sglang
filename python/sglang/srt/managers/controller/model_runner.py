@@ -182,39 +182,39 @@ class ModelRunner:
         return c
 
     def init_flash_infer(self):
-        if not global_server_args_dict.get("disable_flashinfer", False):
-            from flashinfer import (
-                BatchDecodeWithPagedKVCacheWrapper,
-                BatchPrefillWithPagedKVCacheWrapper,
-                BatchPrefillWithRaggedKVCacheWrapper,
-            )
-            from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
-
-            if not _grouped_size_compiled_for_decode_kernels(
-                self.model_config.num_attention_heads // self.tp_size,
-                self.model_config.get_num_kv_heads(self.tp_size),
-            ):
-                use_tensor_cores = True
-            else:
-                use_tensor_cores = False
-
-            workspace_buffers = torch.empty(
-                2, 96 * 1024 * 1024, dtype=torch.uint8, device="cuda"
-            )
-            self.flashinfer_prefill_wrapper_ragged = (
-                BatchPrefillWithRaggedKVCacheWrapper(workspace_buffers[0], "NHD")
-            )
-            self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffers[1], "NHD"
-            )
-            self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                workspace_buffers[0], "NHD", use_tensor_cores=use_tensor_cores
-            )
-        else:
-            self.flashinfer_prefill_wrapper_ragged = (
-                self.flashinfer_prefill_wrapper_paged
-            ) = None
+        if self.server_args.disable_flashinfer:
+            self.flashinfer_prefill_wrapper_ragged = None
+            self.flashinfer_prefill_wrapper_paged = None
             self.flashinfer_decode_wrapper = None
+            return
+
+        from flashinfer import (
+            BatchDecodeWithPagedKVCacheWrapper,
+            BatchPrefillWithPagedKVCacheWrapper,
+            BatchPrefillWithRaggedKVCacheWrapper,
+        )
+        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
+
+        if not _grouped_size_compiled_for_decode_kernels(
+            self.model_config.num_attention_heads // self.tp_size,
+            self.model_config.get_num_kv_heads(self.tp_size),
+        ):
+            use_tensor_cores = True
+        else:
+            use_tensor_cores = False
+
+        workspace_buffers = torch.empty(
+            3, 96 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+        )
+        self.flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+            workspace_buffers[0], "NHD"
+        )
+        self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffers[1], "NHD"
+        )
+        self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffers[2], "NHD", use_tensor_cores=use_tensor_cores
+        )
 
     @torch.inference_mode()
     def forward_extend(self, batch: Batch):
