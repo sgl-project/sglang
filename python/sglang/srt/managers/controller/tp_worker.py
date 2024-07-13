@@ -98,7 +98,7 @@ class ModelTpServer:
             )
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = (
-            4096
+            8192
             if server_args.max_prefill_tokens is None
             else server_args.max_prefill_tokens
         )
