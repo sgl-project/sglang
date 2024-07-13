@@ -1,19 +1,16 @@
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
-"""Inference-only LLaMA model compatible with HuggingFace weights."""
+"""Inference-only MiniCPM model compatible with HuggingFace weights."""
 
+import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
-import tqdm
 from torch import nn
-from transformers import LlamaConfig
+
 from vllm.config import CacheConfig
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from vllm.distributed import get_tensor_model_parallel_world_size
+
 from vllm.model_executor.layers.activation import SiluAndMul
+
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -33,7 +30,8 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.controller.model_runner import InputMetadata
 
 
-class LlamaMLP(nn.Module):
+class MiniCPMMLP(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -68,7 +66,8 @@ class LlamaMLP(nn.Module):
         return x
 
 
-class LlamaAttention(nn.Module):
+class MiniCPMAttention(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -77,7 +76,6 @@ class LlamaAttention(nn.Module):
         layer_id: int = 0,
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
-        rope_is_neox_style: bool = True,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
@@ -125,8 +123,9 @@ class LlamaAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=rope_is_neox_style,
         )
+        # set rope as fp32 instead of bf16
+        self.rotary_emb.cos_sin_cache = self.rotary_emb._compute_cos_sin_cache()
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -143,43 +142,40 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        orig_dtype = q.dtype
+        q, k = q.float(), k.float()
         q, k = self.rotary_emb(positions, q, k)
+        q, k = q.to(orig_dtype), k.to(orig_dtype)
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
         return output
 
 
-class LlamaDecoderLayer(nn.Module):
+class MiniCPMDecoderLayer(nn.Module):
+
     def __init__(
         self,
-        config: LlamaConfig,
+        config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(
-            config, "original_max_position_embeddings", None
-        ):
-            rope_scaling[
-                "original_max_position_embeddings"
-            ] = config.original_max_position_embeddings
-        rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = LlamaAttention(
+        self.self_attn = MiniCPMAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
-            rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
         )
-        self.mlp = LlamaMLP(
+        self.mlp = MiniCPMMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -198,27 +194,33 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             input_metadata=input_metadata,
         )
+        hidden_states = residual + hidden_states * (
+            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
+        )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        hidden_states = residual + hidden_states * (
+            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
+        )
+
+        return hidden_states, None
 
 
-class LlamaModel(nn.Module):
+class MiniCPMModel(nn.Module):
+
     def __init__(
         self,
-        config: LlamaConfig,
+        config,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -226,12 +228,13 @@ class LlamaModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
+            self.vocab_size,
             config.hidden_size,
+            org_num_embeddings=config.vocab_size,
         )
         self.layers = nn.ModuleList(
             [
-                LlamaDecoderLayer(config, i, quant_config=quant_config)
+                MiniCPMDecoderLayer(config, i, quant_config=quant_config)
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -245,10 +248,11 @@ class LlamaModel(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+            hidden_states = self.embed_tokens(input_ids) * self.config.scale_emb
         else:
             hidden_states = input_embeds
         residual = None
+
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -257,22 +261,33 @@ class LlamaModel(nn.Module):
                 input_metadata,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
-class LlamaForCausalLM(nn.Module):
+class MiniCPMForCausalLM(nn.Module):
     def __init__(
         self,
-        config: LlamaConfig,
+        config,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: Optional[CacheConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
+        
+        self.num_experts = getattr(self.config, "num_experts", 0)
         self.quant_config = quant_config
-        self.model = LlamaModel(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.model = MiniCPMModel(config, quant_config=quant_config)
+        # self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        if not self.config.tie_word_embeddings:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+            )
+
+        self.scale_width = self.config.hidden_size / self.config.dim_model_base
+
         self.logits_processor = LogitsProcessor(config)
 
     def forward(
@@ -282,9 +297,16 @@ class LlamaForCausalLM(nn.Module):
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        if input_embeds is not None:
+            input_embeds = input_embeds * self.config.scale_emb
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
+        hidden_states = hidden_states / self.scale_width
+        if self.config.tie_word_embeddings:
+            lm_head_weight = self.model.embed_tokens.weight
+        else:
+            lm_head_weight = self.lm_head.weight
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+            input_ids, hidden_states, lm_head_weight, input_metadata
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -296,16 +318,25 @@ class LlamaForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+        expert_params_mapping = [
+            # (param_name, weight_name, expert_id)
+            (
+                "ws" if weight_name in ["w1", "w3"] else "w2s",
+                f"experts.{expert_id}.{weight_name}.weight",
+                expert_id,
+            )
+            for expert_id in range(self.num_experts)
+            for weight_name in ["w1", "w2", "w3"]
+        ]
         params_dict = dict(self.named_parameters())
-        if get_tensor_model_parallel_rank() == 0:
-            weights = tqdm.tqdm(weights, total=int(len(params_dict) * 1.5))
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name or "projector" in name:
+            if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -313,21 +344,30 @@ class LlamaForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                if name.startswith("model.vision_tower") and name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name.startswith("model.vision_tower") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                for param_name, weight_name, expert_id in expert_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param, loaded_weight, weight_name, expert_id=expert_id
+                    )
+                    break
+                else:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
 
-EntryClass = LlamaForCausalLM
+EntryClass = MiniCPMForCausalLM

@@ -459,6 +459,7 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     """
 
     import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
 
@@ -475,7 +476,7 @@ def monkey_patch_vllm_dummy_weight_loader():
         ModelConfig,
         ParallelConfig,
         SchedulerConfig,
-        VisionLanguageConfig,
+        MultiModalConfig,
         _initialize_model,
         initialize_dummy_weights,
         nn,
@@ -488,7 +489,7 @@ def monkey_patch_vllm_dummy_weight_loader():
         model_config: ModelConfig,
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
-        vision_language_config: Optional[VisionLanguageConfig],
+        multimodal_config: Optional[MultiModalConfig],
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
         cache_config: CacheConfig,
@@ -499,7 +500,7 @@ def monkey_patch_vllm_dummy_weight_loader():
                     model_config,
                     self.load_config,
                     lora_config,
-                    vision_language_config,
+                    multimodal_config,
                     cache_config,
                 )
 

@@ -1,14 +1,13 @@
 """Radix attention."""
 
-import numpy as np
 import torch
-from torch import nn
-
 from flashinfer.cascade import merge_state
+from torch import nn
 
 from sglang.global_config import global_config
 from sglang.srt.layers.extend_attention import extend_attention_fwd
 from sglang.srt.layers.token_attention import token_attention_fwd
+from sglang.srt.managers.controller.infer_batch import global_server_args_dict
 from sglang.srt.managers.controller.model_runner import ForwardMode, InputMetadata
 
 
@@ -30,24 +29,14 @@ class RadixAttention(nn.Module):
         self.scaling = scaling
         self.layer_id = layer_id
 
-        from sglang.srt.managers.controller.model_runner import global_server_args_dict
-
         if not global_server_args_dict.get("disable_flashinfer", False):
-            self.prefill_forward = self.prefill_forward_flashinfer
-            self.extend_forward = self.prefill_forward_flashinfer
+            self.extend_forward = self.extend_forward_flashinfer
             self.decode_forward = self.decode_forward_flashinfer
-            # flashinfer now accepts float logit_cap argument
-            self.logit_cap = logit_cap if logit_cap is not None and logit_cap > 0 else 0
         else:
-            self.prefill_forward = self.prefill_forward_triton
             self.extend_forward = self.extend_forward_triton
             self.decode_forward = self.decode_forward_triton
-            self.logit_cap = logit_cap if logit_cap is not None else 0
 
-    def prefill_forward_triton(self, q, k, v, input_metadata: InputMetadata):
-        # In SGLang, we call both the typical "prefill" and "prefill with cache" as "extend".
-        # See the extend_forward_xxx functions.
-        raise NotImplementedError()
+        self.logit_cap = logit_cap if logit_cap is not None and logit_cap > 0 else 0
 
     def extend_forward_triton(self, q, k, v, input_metadata: InputMetadata):
         o = torch.empty_like(q)
@@ -61,13 +50,13 @@ class RadixAttention(nn.Module):
             input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id),
             input_metadata.req_to_token_pool.req_to_token,
             input_metadata.req_pool_indices,
-            input_metadata.start_loc,
+            input_metadata.triton_start_loc,
             input_metadata.seq_lens,
-            input_metadata.prefix_lens,
+            input_metadata.triton_prefix_lens,
             input_metadata.extend_start_loc,
             input_metadata.extend_seq_lens,
-            input_metadata.max_seq_len,
-            input_metadata.max_extend_len,
+            input_metadata.triton_max_seq_len,
+            input_metadata.triton_max_extend_len,
             sm_scale=self.scaling,
             logit_cap=self.logit_cap,
         )
@@ -85,10 +74,9 @@ class RadixAttention(nn.Module):
             o.view(-1, self.tp_q_head_num, self.head_dim),
             input_metadata.req_to_token_pool.req_to_token,
             input_metadata.req_pool_indices,
-            input_metadata.start_loc,
+            input_metadata.triton_start_loc,
             input_metadata.seq_lens,
-            input_metadata.max_seq_len,
-            input_metadata.other_kv_index,
+            input_metadata.triton_max_seq_len,
             input_metadata.total_num_tokens,
             sm_scale=self.scaling,
             logit_cap=self.logit_cap,
@@ -96,7 +84,7 @@ class RadixAttention(nn.Module):
 
         return o
 
-    def prefill_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
+    def extend_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         o1, s1 = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
             k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
@@ -106,7 +94,7 @@ class RadixAttention(nn.Module):
             logits_soft_cap=self.logit_cap,
         )
 
-        if input_metadata.no_prefix:
+        if input_metadata.extend_no_prefix:
             o = o1
         else:
             o2, s2 = input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
@@ -142,9 +130,7 @@ class RadixAttention(nn.Module):
         k = k.view(-1, self.tp_k_head_num, self.head_dim)
         v = v.view(-1, self.tp_v_head_num, self.head_dim)
 
-        if input_metadata.forward_mode == ForwardMode.PREFILL:
-            return self.prefill_forward(q, k, v, input_metadata)
-        elif input_metadata.forward_mode == ForwardMode.EXTEND:
+        if input_metadata.forward_mode == ForwardMode.EXTEND:
             return self.extend_forward(q, k, v, input_metadata)
         elif input_metadata.forward_mode == ForwardMode.DECODE:
             return self.decode_forward(q, k, v, input_metadata)

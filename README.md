@@ -42,7 +42,6 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
-pip install --upgrade pip
 pip install -e "python[all]"
 
 # Install FlashInfer CUDA kernels
@@ -53,7 +52,11 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags).
 
 ### Common Notes
-- If you see errors from the Triton compiler, please install the [Triton Nightly](https://triton-lang.org/main/getting-started/installation.html).
+- If you see errors from the Triton compiler, please install the [Triton Nightly](https://triton-lang.org/main/getting-started/installation.html) by
+```
+pip uninstall -y triton triton-nightly
+pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly
+```
 - If you cannot install FlashInfer, check out its [installation](https://docs.flashinfer.ai/installation.html#) page. If you still cannot install it, you can use the slower Triton kernels by adding `--disable-flashinfer` when launching the server.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
 
@@ -275,8 +278,8 @@ for out in state.text_iter():
 ```
 
 ### Tips and Implementation Details
-- The `choices` argument in `sgl.gen` is implemented by computing the normalized log probabilities of all choices and selecting the one with the highest probability.
-- The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex.
+- The `choices` argument in `sgl.gen` is implemented by computing the [token-length normalized log probabilities](https://blog.eleuther.ai/multiple-choice-normalization/) of all choices and selecting the one with the highest probability.
+- The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex. It is compatible with `temperature=0` and `temperature != 0`.
 
 ## Backend: SGLang Runtime (SRT)
 The SGLang Runtime (SRT) is designed to work best with the SGLang frontend.
@@ -333,7 +336,6 @@ response = client.chat.completions.create(
 print(response)
 ```
 
-
 By default, the server uses the chat template specified in the model tokenizer from Hugging Face. It should just work for most official models such as Llama-2/Llama-3.
 
 If needed, you can also override the chat template when launching the server:
@@ -380,9 +382,8 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 - Llama
 - Mistral
 - Mixtral
-- Qwen / Qwen 2
-- Gemma
-  - Please add a new flag `--attention-reduce-in-fp32` to avoid some precision errors.
+- Qwen / Qwen 2 / Qwen 2 MoE
+- Gemma / Gemma 2
   - `python -m sglang.launch_server --model-path google/gemma-7b-it --port 30000 --attention-reduce-in-fp32`
 - LLaVA
   - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
@@ -395,6 +396,8 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 - StableLM
 - Command-R
 - DBRX
+- Grok
+- ChatGLM
 - AWQ/GPTQ/Marlin quantization
 
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/model_support.md).

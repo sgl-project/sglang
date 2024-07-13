@@ -668,6 +668,10 @@ class StreamExecutor:
             "frequency_penalty",
             "presence_penalty",
             "ignore_eos",
+            "return_logprob",
+            "logprob_start_len",
+            "top_logprobs_num",
+            "return_text_in_logprobs",
             "dtype",
             "regex",
         ]:
