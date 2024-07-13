@@ -13,7 +13,6 @@ except ImportError as e:
 
 
 class LiteLLM(BaseBackend):
-
     def __init__(
         self,
         model_name,

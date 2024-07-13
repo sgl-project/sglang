@@ -1,12 +1,19 @@
 import json
 from typing import Dict, Optional, Union
 
-from outlines.caching import cache as disk_cache
-from outlines.caching import disable_cache
-from outlines.fsm.guide import RegexGuide
-from outlines.fsm.regex import FSMInfo, make_byte_level_fsm, make_deterministic_fsm
-from outlines.models.transformers import TransformerTokenizer
 from pydantic import BaseModel
+
+try:
+    from outlines.caching import cache as disk_cache
+    from outlines.caching import disable_cache
+    from outlines.fsm.guide import RegexGuide
+    from outlines.fsm.regex import FSMInfo, make_byte_level_fsm, make_deterministic_fsm
+    from outlines.models.transformers import TransformerTokenizer
+except ImportError as e:
+    print(
+        f'\nError: {e}. Please install a new version of outlines by `pip install "outlines>=0.0.44"`\n'
+    )
+    raise
 
 try:
     from outlines.fsm.json_schema import build_regex_from_object

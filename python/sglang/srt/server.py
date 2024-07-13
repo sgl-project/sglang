@@ -35,6 +35,7 @@ from sglang.srt.managers.controller.manager_multi import (
 from sglang.srt.managers.controller.manager_single import (
     start_controller_process as start_controller_process_single,
 )
+from sglang.srt.managers.controller.tp_worker import ModelTpService
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -50,8 +51,13 @@ from sglang.srt.utils import (
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
+    receive_addrs,
+    send_addrs_to_rank_0,
+    start_rpyc_service_process,
 )
 from sglang.utils import get_exception_traceback
+
+logger = logging.getLogger(__name__)
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -144,28 +150,38 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
         enable_show_time_cost()
     if server_args.disable_disk_cache:
         disable_cache()
-    if server_args.enable_flashinfer:
-        assert_pkg_version("flashinfer", "0.0.4")
+    if not server_args.disable_flashinfer:
+        assert_pkg_version(
+            "flashinfer",
+            "0.0.8",
+            "Please uninstall the old version and "
+            "reinstall the latest version by following the instructions "
+            "at https://docs.flashinfer.ai/installation.html.",
+        )
     if server_args.chat_template:
         # TODO: replace this with huggingface transformers template
         load_chat_template_for_openai_api(server_args.chat_template)
 
     # Allocate ports
+    assert server_args.tp_size % server_args.nnodes == 0
+    tp_size_local = server_args.tp_size // server_args.nnodes
     server_args.port, server_args.additional_ports = allocate_init_ports(
         server_args.port,
         server_args.additional_ports,
-        server_args.tp_size,
+        tp_size_local,
         server_args.dp_size,
     )
 
     ports = server_args.additional_ports
-    tp = server_args.tp_size
     model_port_args = []
     for i in range(server_args.dp_size):
         model_port_args.append(
             ModelPortArgs(
-                nccl_port=ports[3 + i * (tp + 1)],
-                model_tp_ports=ports[3 + i * (tp + 1) + 1 : 3 + (i + 1) * (tp + 1)],
+                nccl_port=ports[3 + i * (tp_size_local + 1)],
+                model_tp_ips=[None] * tp_size_local,
+                model_tp_ports=ports[
+                    3 + i * (tp_size_local + 1) + 1 : 3 + (i + 1) * (tp_size_local + 1)
+                ],
             )
         )
     port_args = PortArgs(
@@ -174,6 +190,24 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
         detokenizer_port=ports[2],
         model_port_args=model_port_args,
     )
+
+    # TODO multi-node dp is not supported
+    assert not (server_args.dp_size > 1 and server_args.node_rank is not None)
+    if server_args.nnodes > 1:
+        if server_args.node_rank != 0:
+            send_addrs_to_rank_0(model_port_args[0], server_args)
+        else:
+            receive_addrs(model_port_args[0], server_args)
+        for i in range(tp_size_local):
+            start_rpyc_service_process(
+                ModelTpService, model_port_args[0].model_tp_ports[i]
+            )
+        if server_args.node_rank != 0:
+            logger.info(
+                f"[node_rank={server_args.node_rank}]: Listen for connections..."
+            )
+            while True:
+                pass
 
     # Launch processes
     tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
@@ -232,7 +266,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
             try:
                 requests.get(url + "/get_model_info", timeout=5, headers=headers)
                 break
-            except requests.exceptions.RequestException as e:
+            except requests.exceptions.RequestException:
                 pass
 
         # Send a warmup request
@@ -244,19 +278,20 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
                         "text": "The capital city of France is",
                         "sampling_params": {
                             "temperature": 0,
-                            "max_new_tokens": 16,
+                            "max_new_tokens": 8,
                         },
                     },
                     headers=headers,
                     timeout=600,
                 )
                 assert res.status_code == 200
-        except Exception:
+        except Exception as e:
             if pipe_finish_writer is not None:
                 pipe_finish_writer.send(get_exception_traceback())
-            print(f"Initialization failed. warmup error: {e}")
+            print(f"Initialization failed. warmup error: {e}", flush=True)
             raise e
 
+        logger.info("The server is fired up and ready to roll!")
         if pipe_finish_writer is not None:
             pipe_finish_writer.send("init ok")
 
@@ -269,7 +304,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
             app,
             host=server_args.host,
             port=server_args.port,
-            log_level=server_args.log_level,
+            log_level=server_args.log_level_http or server_args.log_level,
             timeout_keep_alive=5,
             loop="uvloop",
         )

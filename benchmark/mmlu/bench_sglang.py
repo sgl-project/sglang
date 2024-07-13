@@ -48,24 +48,47 @@ def gen_prompt(train_df, subject, k=-1):
     return prompt
 
 
-def evaluate(args, subject, dev_df, test_df):
-    prompts = []
+def main(args):
+    subjects = sorted(
+        [
+            f.split("_test.csv")[0]
+            for f in os.listdir(os.path.join(args.data_dir, "test"))
+            if "_test.csv" in f
+        ]
+    )
+
+    # Build prompts
+    arguments = []
     labels = []
+    num_questions = []
 
-    k = args.ntrain
-    few_shot_examples = gen_prompt(dev_df, subject, k)
-    while len(tokenizer.encode(few_shot_examples)) > 1536:
-        k -= 1
+    for subject in subjects[: args.nsub]:
+        dev_df = pd.read_csv(
+            os.path.join(args.data_dir, "dev", subject + "_dev.csv"), header=None
+        )[: args.ntrain]
+        test_df = pd.read_csv(
+            os.path.join(args.data_dir, "test", subject + "_test.csv"), header=None
+        )
+        num_questions.append(test_df.shape[0])
+
+        k = args.ntrain
         few_shot_examples = gen_prompt(dev_df, subject, k)
+        while len(tokenizer.encode(few_shot_examples)) > 1536:
+            k -= 1
+            few_shot_examples = gen_prompt(dev_df, subject, k)
 
-    for i in range(test_df.shape[0]):
-        prompt_end = format_example(test_df, i, include_answer=False)
-        prompts.append(prompt_end)
+        for i in range(test_df.shape[0]):
+            prompt_end = format_example(test_df, i, include_answer=False)
 
-        label = test_df.iloc[i, test_df.shape[1] - 1]
-        labels.append(label)
+            arguments.append(
+                {
+                    "examples": few_shot_examples,
+                    "question": prompt_end,
+                }
+            )
 
-    arguments = [{"question": p} for p in prompts]
+            label = test_df.iloc[i, test_df.shape[1] - 1]
+            labels.append(label)
 
     #####################################
     ######### SGL Program Begin #########
@@ -93,62 +116,35 @@ def evaluate(args, subject, dev_df, test_df):
     # Select backend
     backend = select_sglang_backend(args)
 
+    # Run
     tic = time.time()
-    states = few_shot_mmlu.bind(examples=few_shot_examples).run_batch(
+    states = few_shot_mmlu.run_batch(
         arguments,
         temperature=0,
         max_new_tokens=1,
         backend=backend,
         num_threads=args.parallel,
+        progress_bar=True,
     )
     preds = [
         s["answer"].strip()[0] if len(s["answer"].strip()) > 0 else "" for s in states
     ]
     latency = time.time() - tic
 
+    # Compute accuracy
     cors = [pred == label for pred, label in zip(preds, labels)]
-    acc = np.mean(cors)
-    cors = np.array(cors)
 
-    print(
-        "Average accuracy {:.3f}, latency {:.2f}, #q: {} - {}".format(
-            acc, latency, len(prompts), subject
+    pt = 0
+    for subject, num_qs in zip(subjects[: args.nsub], num_questions):
+        print(
+            f"subject: {subject}, #q:{num_qs}, acc: {np.mean(cors[pt: pt + num_qs]):.3f}"
         )
-    )
+        pt += num_qs
+    assert pt == len(cors)
+    weighted_acc = np.mean(cors)
 
-    return cors, acc, latency
-
-
-def main(args):
-    subjects = sorted(
-        [
-            f.split("_test.csv")[0]
-            for f in os.listdir(os.path.join(args.data_dir, "test"))
-            if "_test.csv" in f
-        ]
-    )
-
-    all_cors = []
-    all_latencies = []
-    num_requests = 0
-
-    for subject in tqdm(subjects[: args.nsub]):
-        dev_df = pd.read_csv(
-            os.path.join(args.data_dir, "dev", subject + "_dev.csv"), header=None
-        )[: args.ntrain]
-        test_df = pd.read_csv(
-            os.path.join(args.data_dir, "test", subject + "_test.csv"), header=None
-        )
-
-        cors, acc, latency = evaluate(args, subject, dev_df, test_df)
-        all_cors.append(cors)
-        all_latencies.append(latency)
-        num_requests += len(test_df)
-
-    total_latency = np.sum(all_latencies)
-    print("Total latency: {:.3f}".format(total_latency))
-
-    weighted_acc = np.mean(np.concatenate(all_cors))
+    # Print results
+    print("Total latency: {:.3f}".format(latency))
     print("Average accuracy: {:.3f}".format(weighted_acc))
 
     # Write results
@@ -157,9 +153,9 @@ def main(args):
             "task": "mmlu",
             "backend": args.backend,
             "num_gpus": 1,
-            "latency": round(total_latency, 3),
+            "latency": round(latency, 3),
             "accuracy": round(weighted_acc, 3),
-            "num_requests": num_requests,
+            "num_requests": len(arguments),
             "other": {
                 "nsub": args.nsub,
                 "parallel": args.parallel,

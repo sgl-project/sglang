@@ -1,11 +1,13 @@
 """Common utilities."""
 
 import base64
+import fcntl
 import logging
 import multiprocessing
 import os
 import random
 import socket
+import struct
 import time
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
@@ -369,23 +371,7 @@ def load_image(image_file):
     return image, image_size
 
 
-def init_rpyc_service(service: rpyc.Service, port: int):
-    t = ThreadedServer(
-        service=service,
-        port=port,
-        protocol_config={
-            "allow_public_attrs": True,
-            "allow_pickle": True,
-            "sync_request_timeout": 3600,
-        },
-    )
-    t.logger.setLevel(logging.WARN)
-    t.start()
-
-
-def connect_to_rpyc_service(port, host="localhost"):
-    time.sleep(1)
-
+def connect_rpyc_service(host, port):
     repeat_count = 0
     while repeat_count < 20:
         try:
@@ -399,22 +385,33 @@ def connect_to_rpyc_service(port, host="localhost"):
                 },
             )
             break
-        except ConnectionRefusedError:
+        except ConnectionRefusedError as e:
             time.sleep(1)
         repeat_count += 1
     if repeat_count == 20:
-        raise RuntimeError("init rpc env error!")
+        raise RuntimeError(f"Connect rpyc error: {e}")
 
     return con.root
 
 
-def start_rpyc_process(service: rpyc.Service, port: int):
-    # Return the proxy and the process
-    proc = multiprocessing.Process(target=init_rpyc_service, args=(service, port))
+def start_rpyc_service(service: rpyc.Service, port: int):
+    t = ThreadedServer(
+        service=service,
+        port=port,
+        protocol_config={
+            "allow_public_attrs": True,
+            "allow_pickle": True,
+            "sync_request_timeout": 3600,
+        },
+    )
+    t.logger.setLevel(logging.WARN)
+    t.start()
+
+
+def start_rpyc_service_process(service: rpyc.Service, port: int):
+    proc = multiprocessing.Process(target=start_rpyc_service, args=(service, port))
     proc.start()
-    proxy = connect_to_rpyc_service(port)
-    assert proc.is_alive()
-    return proxy, proc
+    return proc
 
 
 def suppress_other_loggers():
@@ -429,17 +426,18 @@ def suppress_other_loggers():
     logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
 
-def assert_pkg_version(pkg: str, min_version: str):
+def assert_pkg_version(pkg: str, min_version: str, message: str):
     try:
         installed_version = version(pkg)
         if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
             raise Exception(
-                f"{pkg} is installed with version {installed_version} which "
-                f"is less than the minimum required version {min_version}"
+                f"{pkg} is installed with version {installed_version}, which "
+                f"is less than the minimum required version {min_version}. " + message
             )
     except PackageNotFoundError:
         raise Exception(
-            f"{pkg} with minimum required version {min_version} is not installed"
+            f"{pkg} with minimum required version {min_version} is not installed. "
+            + message
         )
 
 
@@ -460,13 +458,67 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
     """
 
-    # TODO: need a better check than just dev str name match
-    # compat: skip RTX 40 series as they do not have P2P feature and even checking for them may cause errors
-    device_name = torch.cuda.get_device_name(gpu_id)
-    if "RTX 40" not in device_name:
-        import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
+    import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
 
-        setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
+    setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
+
+
+def monkey_patch_vllm_dummy_weight_loader():
+    """
+    Monkey patch the dummy weight loader in vllm to call process_weights_after_loading.
+    """
+
+    from vllm.model_executor.model_loader.loader import (
+        CacheConfig,
+        DeviceConfig,
+        DummyModelLoader,
+        LoRAConfig,
+        ModelConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        MultiModalConfig,
+        _initialize_model,
+        initialize_dummy_weights,
+        nn,
+        set_default_torch_dtype,
+    )
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+        lora_config: Optional[LoRAConfig],
+        multimodal_config: Optional[MultiModalConfig],
+        parallel_config: ParallelConfig,
+        scheduler_config: SchedulerConfig,
+        cache_config: CacheConfig,
+    ) -> nn.Module:
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    lora_config,
+                    multimodal_config,
+                    cache_config,
+                )
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    quant_method.process_weights_after_loading(module)
+                # FIXME: Remove this after Mixtral is updated
+                # to use quant_method.
+                if hasattr(module, "process_weights_after_loading"):
+                    module.process_weights_after_loading()
+
+            # NOTE(woosuk): For accurate performance evaluation, we assign
+            # random values to the weights.
+            initialize_dummy_weights(model)
+        return model.eval()
+
+    setattr(DummyModelLoader, "load_model", load_model)
 
 
 API_KEY_HEADER_NAME = "X-API-Key"
@@ -487,3 +539,88 @@ class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
             )
         response = await call_next(request)
         return response
+
+
+def get_ip_address(ifname):
+    """
+    Get the IP address of a network interface.
+
+    :param ifname: Name of the network interface (e.g., 'eth0')
+    :return: IP address of the network interface
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ip_address = fcntl.ioctl(
+        s.fileno(),
+        0x8915,  # SIOCGIFADDR
+        struct.pack("256s", bytes(ifname[:15], "utf-8")),
+    )[20:24]
+    return socket.inet_ntoa(ip_address)
+
+
+def send_addrs_to_rank_0(model_port_args, server_args):
+    assert server_args.node_rank != 0 and server_args.dp_size == 1
+    import torch.distributed as dist
+
+    ifname = os.environ.get(
+        "SGLANG_SOCKET_IFNAME", os.environ.get("NCCL_SOCKET_IFNAME", "eth0")
+    )
+    ip_addr = get_ip_address(ifname)
+
+    num_tp_ports = server_args.tp_size // server_args.nnodes
+    model_port_args.model_tp_ips[:num_tp_ports] = [ip_addr] * num_tp_ports
+    ip_addr = [int(x) for x in ip_addr.split(".")]
+    addrs_tensor = torch.tensor(
+        ip_addr + model_port_args.model_tp_ports, dtype=torch.int
+    )
+
+    init_method = f"tcp://{server_args.nccl_init_addr}"
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=server_args.node_rank,
+        world_size=server_args.nnodes,
+    )
+    dist.send(addrs_tensor, dst=0)
+    print(
+        f"Node {server_args.node_rank} sent: ip_address {ip_addr} and ports {model_port_args.model_tp_ports}"
+    )
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def receive_addrs(model_port_args, server_args):
+    assert server_args.node_rank == 0 and server_args.dp_size == 1
+    import torch.distributed as dist
+
+    ifname = os.environ.get(
+        "SGLANG_SOCKET_IFNAME", os.environ.get("NCCL_SOCKET_IFNAME", "eth0")
+    )
+    ip_addr = get_ip_address(ifname)
+
+    num_tp_ports = server_args.tp_size // server_args.nnodes
+    model_port_args.model_tp_ips[:num_tp_ports] = [ip_addr] * num_tp_ports
+
+    init_method = f"tcp://{server_args.nccl_init_addr}"
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=server_args.node_rank,
+        world_size=server_args.nnodes,
+    )
+
+    for src_rank in range(1, server_args.nnodes):
+        tensor = torch.zeros(4 + num_tp_ports, dtype=torch.int)
+        dist.recv(tensor, src=src_rank)
+        ip = ".".join([str(x) for x in tensor[:4].tolist()])
+        ports = tensor[4:].tolist()
+        model_port_args.model_tp_ips[
+            num_tp_ports * src_rank : num_tp_ports * (src_rank + 1)
+        ] = [ip] * num_tp_ports
+        model_port_args.model_tp_ports[
+            num_tp_ports * src_rank : num_tp_ports * (src_rank + 1)
+        ] = ports
+        print(f"Node 0 received from rank {src_rank}: {tensor.tolist()}")
+
+    dist.barrier()
+    dist.destroy_process_group()

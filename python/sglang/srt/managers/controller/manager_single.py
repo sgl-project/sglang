@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-import time
+from concurrent.futures import ThreadPoolExecutor
 
 import uvloop
 import zmq
@@ -76,8 +76,9 @@ def start_controller_process(
     )
 
     try:
+        tp_size_local = server_args.tp_size // server_args.nnodes
         model_client = ModelTpClient(
-            list(range(server_args.tp_size)),
+            [i for _ in range(server_args.nnodes) for i in range(tp_size_local)],
             server_args,
             port_args.model_port_args[0],
             model_overide_args,
@@ -90,6 +91,7 @@ def start_controller_process(
     pipe_writer.send("init ok")
 
     loop = asyncio.new_event_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=256))
     asyncio.set_event_loop(loop)
     loop.create_task(controller.loop_for_recv_requests())
     try:

@@ -11,7 +11,7 @@ It makes your interaction with LLMs faster and more controllable by co-designing
 
 The core features include:
 - **Flexible Frontend Language**: Enables easy programming of LLM applications with chained generation calls, advanced prompting, control flow, multiple modalities, parallelism, and external interactions.
-- **High-Performance Backend Runtime**: Features RadixAttention for accelerating complex LLM programs by reusing the KV cache across multiple calls. It can also serve as a standalone engine with all common techniques implemented (e.g., continuous batching and tensor parallelism).
+- **High-Performance Backend Runtime**: Features RadixAttention for accelerating complex LLM programs by reusing the KV cache across multiple calls. It can also serve as a standalone inference engine with all common techniques implemented (e.g., continuous batching and tensor parallelism).
 
 ## News
 - [2024/02] 🔥 SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
@@ -32,19 +32,33 @@ The core features include:
 ### Method 1: With pip
 ```
 pip install "sglang[all]"
+
+# Install FlashInfer CUDA kernels
+pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 ```
 
 ### Method 2: From source
 ```
-git clone git@github.com:sgl-project/sglang.git
+git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
-pip install --upgrade pip
 pip install -e "python[all]"
+
+# Install FlashInfer CUDA kernels
+pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 ```
 
-### Notes
-- If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`
+### Method 3: Using docker
+The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags).
+
+### Common Notes
+- If you see errors from the Triton compiler, please install the [Triton Nightly](https://triton-lang.org/main/getting-started/installation.html) by
+```
+pip uninstall -y triton triton-nightly
+pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly
+```
+- If you cannot install FlashInfer, check out its [installation](https://docs.flashinfer.ai/installation.html#) page. If you still cannot install it, you can use the slower Triton kernels by adding `--disable-flashinfer` when launching the server.
+- If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
 
 ## Quick Start
 The example below shows how to use sglang to answer a mulit-turn question.
@@ -264,8 +278,8 @@ for out in state.text_iter():
 ```
 
 ### Tips and Implementation Details
-- The `choices` argument in `sgl.gen` is implemented by computing the normalized log probabilities of all choices and selecting the one with the highest probability.
-- The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex.
+- The `choices` argument in `sgl.gen` is implemented by computing the [token-length normalized log probabilities](https://blog.eleuther.ai/multiple-choice-normalization/) of all choices and selecting the one with the highest probability.
+- The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex. It is compatible with `temperature=0` and `temperature != 0`.
 
 ## Backend: SGLang Runtime (SRT)
 The SGLang Runtime (SRT) is designed to work best with the SGLang frontend.
@@ -322,7 +336,6 @@ response = client.chat.completions.create(
 print(response)
 ```
 
-
 By default, the server uses the chat template specified in the model tokenizer from Hugging Face. It should just work for most official models such as Llama-2/Llama-3.
 
 If needed, you can also override the chat template when launching the server:
@@ -351,7 +364,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 ```
 
 ### Additional Arguments
-- Add `--tp 2` to enable tensor parallelism.
+- Add `--tp 2` to enable tensor parallelism. If it indicates `peer access is not supported between these two devices`, add `--enable-p2p-check` option.
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --tp 2
 ```
@@ -363,16 +376,14 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --mem-fraction-static 0.7
 ```
-- See [flashinfer.md](docs/flashinfer.md) on accelerating inference using highly optimized CUDA kernels.
 - See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
 
 ### Supported Models
 - Llama
 - Mistral
 - Mixtral
-- Qwen / Qwen 2
-- Gemma
-  - Please add a new flag `--attention-reduce-in-fp32` to avoid some precision errors.
+- Qwen / Qwen 2 / Qwen 2 MoE
+- Gemma / Gemma 2
   - `python -m sglang.launch_server --model-path google/gemma-7b-it --port 30000 --attention-reduce-in-fp32`
 - LLaVA
   - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
@@ -385,6 +396,8 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 - StableLM
 - Command-R
 - DBRX
+- Grok
+- ChatGLM
 - AWQ/GPTQ/Marlin quantization
 
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/model_support.md).
@@ -396,7 +409,8 @@ Instructions for supporting a new model are [here](https://github.com/sgl-projec
 - Mixtral-8x7B on NVIDIA A10G, FP16, Tensor Parallelism=8
 ![mixtral_8x7b](assets/mixtral_8x7b.jpg)
 
-Learn more [here](docs/benchmark_results.md).
+- Learn more about the above [results](docs/benchmark_results.md).
+- Synthetic latency and throughput benchmark [scripts](https://github.com/sgl-project/sglang/tree/main/benchmark/latency_throughput).
 
 ## Roadmap
 https://github.com/sgl-project/sglang/issues/157

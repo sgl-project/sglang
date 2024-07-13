@@ -38,7 +38,6 @@ def sample_requests(
     num_requests: int,
     tokenizer: AutoTokenizer,
 ) -> List[Tuple[str, int, int]]:
-
     def load_dataset():
         with open(dataset_path, encoding="utf-8") as f:
             dataset = json.load(f)
@@ -250,9 +249,14 @@ def main(args: argparse.Namespace):
     np.random.seed(args.seed)
 
     api_url = f"http://{args.host}:{args.port}/generate"
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer, trust_remote_code=args.trust_remote_code
-    )
+    if args.tokenizer.endswith(".json") or args.tokenizer.endswith(".model"):
+        from sglang.srt.hf_transformers_utils import get_tokenizer
+
+        tokenizer = get_tokenizer(args.tokenizer)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer, trust_remote_code=args.trust_remote_code
+        )
 
     if args.dataset:
         input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
@@ -272,7 +276,7 @@ def main(args: argparse.Namespace):
         for i in range(args.num_prompts):
             prompt = tokenizer.decode(
                 [
-                    (offsets[i] + i + j) % tokenizer.vocab_size
+                    (offsets[i] + i + j) % (tokenizer.vocab_size - 129) + 128
                     for j in range(input_lens[i])
                 ]
             )
@@ -291,23 +295,28 @@ def main(args: argparse.Namespace):
     )
     benchmark_end_time = time.perf_counter()
     benchmark_time = benchmark_end_time - benchmark_start_time
-    print(f"Total time: {benchmark_time:.2f} s")
-    print(f"Throughput: {args.num_prompts / benchmark_time:.2f} requests/s")
 
-    # Compute the latency statistics.
+    # Compute the statistics.
     avg_latency = np.mean([latency for _, _, latency in REQUEST_LATENCY])
-    print(f"Average latency: {avg_latency:.2f} s")
     avg_per_token_latency = np.mean(
         [
             latency / (prompt_len + output_len)
             for prompt_len, output_len, latency in REQUEST_LATENCY
         ]
     )
-    print(f"Average latency per token: {avg_per_token_latency:.2f} s")
     avg_per_output_token_latency = np.mean(
         [latency / output_len for _, output_len, latency in REQUEST_LATENCY]
     )
-    print("Average latency per output token: " f"{avg_per_output_token_latency:.2f} s")
+    decoding_throughput = (
+        np.sum([output_len for _, output_len, _ in REQUEST_LATENCY]) / benchmark_time
+    )
+
+    print(f"Total time: {benchmark_time:.2f} s")
+    print(f"Request throughput: {args.num_prompts / benchmark_time:.2f} requests/s")
+    print(f"Decoding throughput: {decoding_throughput:.2f} token/s")
+    print(f"Average latency: {avg_latency:.2f} s")
+    print(f"Average latency per token: {avg_per_token_latency:.2f} s")
+    print(f"Average latency per output token: {avg_per_output_token_latency:.2f} s")
 
 
 if __name__ == "__main__":

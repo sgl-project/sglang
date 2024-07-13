@@ -11,7 +11,7 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.controller.infer_batch import FINISH_MATCHED_STR
 from sglang.srt.managers.io_struct import BatchStrOut, BatchTokenIDOut
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.utils import get_exception_traceback, graceful_registry
+from sglang.utils import find_printable_text, get_exception_traceback, graceful_registry
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -57,6 +57,8 @@ class DetokenizerManager:
             output_strs = []
             for i in range(len(recv_obj.rids)):
                 new_text = read_texts[i][len(surr_texts[i]) :]
+                if recv_obj.finished_reason[i] is None:
+                    new_text = find_printable_text(new_text)
                 output_strs.append(recv_obj.decoded_texts[i] + new_text)
 
                 if isinstance(recv_obj.finished_reason[i], FINISH_MATCHED_STR):
@@ -67,7 +69,7 @@ class DetokenizerManager:
             self.send_to_tokenizer.send_pyobj(
                 BatchStrOut(
                     rids=recv_obj.rids,
-                    output_str=output_strs,
+                    output_strs=output_strs,
                     meta_info=recv_obj.meta_info,
                     finished_reason=recv_obj.finished_reason,
                 )

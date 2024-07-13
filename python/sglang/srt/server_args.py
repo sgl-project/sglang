@@ -11,12 +11,13 @@ class ServerArgs:
     # Model and tokenizer
     model_path: str
     tokenizer_path: Optional[str] = None
-    load_format: str = "auto"
     tokenizer_mode: str = "auto"
-    chat_template: Optional[str] = None
+    load_format: str = "auto"
+    dtype: str = "auto"
     trust_remote_code: bool = True
     context_length: Optional[int] = None
     quantization: Optional[str] = None
+    chat_template: Optional[str] = None
 
     # Port
     host: str = "127.0.0.1"
@@ -37,9 +38,8 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
+    log_level_http: Optional[str] = None
     log_requests: bool = False
-    disable_log_stats: bool = False
-    log_stats_interval: int = 10
     show_time_cost: bool = False
 
     # Other
@@ -50,11 +50,18 @@ class ServerArgs:
     load_balance_method: str = "round_robin"
 
     # Optimization/debug options
-    enable_flashinfer: bool = False
-    attention_reduce_in_fp32: bool = False
+    disable_flashinfer: bool = False
     disable_radix_cache: bool = False
     disable_regex_jump_forward: bool = False
+    disable_cuda_graph: bool = False
     disable_disk_cache: bool = False
+    attention_reduce_in_fp32: bool = False
+    enable_p2p_check: bool = False
+
+    # Distributed args
+    nccl_init_addr: Optional[str] = None
+    nnodes: int = 1
+    node_rank: Optional[int] = None
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -101,7 +108,16 @@ class ServerArgs:
             type=int,
             nargs="*",
             default=[],
-            help="Additional ports specified for the server.",
+            help="The additional ports specified for the server.",
+        )
+        parser.add_argument(
+            "--tokenizer-mode",
+            type=str,
+            default=ServerArgs.tokenizer_mode,
+            choices=["auto", "slow"],
+            help="Tokenizer mode. 'auto' will use the fast "
+            "tokenizer if available, and 'slow' will "
+            "always use the slow tokenizer.",
         )
         parser.add_argument(
             "--load-format",
@@ -120,19 +136,18 @@ class ServerArgs:
             "which is mainly for profiling.",
         )
         parser.add_argument(
-            "--tokenizer-mode",
+            "--dtype",
             type=str,
-            default=ServerArgs.tokenizer_mode,
-            choices=["auto", "slow"],
-            help="Tokenizer mode. 'auto' will use the fast "
-            "tokenizer if available, and 'slow' will "
-            "always use the slow tokenizer.",
-        )
-        parser.add_argument(
-            "--chat-template",
-            type=str,
-            default=ServerArgs.chat_template,
-            help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server",
+            default=ServerArgs.dtype,
+            choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
+            help="Data type for model weights and activations.\n\n"
+            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
+            "BF16 precision for BF16 models.\n"
+            '* "half" for FP16. Recommended for AWQ quantization.\n'
+            '* "float16" is the same as "half".\n'
+            '* "bfloat16" for a balance between precision and range.\n'
+            '* "float" is shorthand for FP32 precision.\n'
+            '* "float32" for FP32 precision.',
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -150,6 +165,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.quantization,
             help="The quantization method.",
+        )
+        parser.add_argument(
+            "--chat-template",
+            type=str,
+            default=ServerArgs.chat_template,
+            help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
         )
         parser.add_argument(
             "--mem-fraction-static",
@@ -174,7 +195,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.schedule_heuristic,
             choices=["lpm", "random", "fcfs", "dfs-weight"],
-            help="Scheduling Heuristic.",
+            help="The scheduling heuristic.",
         )
         parser.add_argument(
             "--schedule-conservativeness",
@@ -186,7 +207,7 @@ class ServerArgs:
             "--tp-size",
             type=int,
             default=ServerArgs.tp_size,
-            help="Tensor parallelism size.",
+            help="The tensor parallelism size.",
         )
         parser.add_argument(
             "--stream-interval",
@@ -198,29 +219,24 @@ class ServerArgs:
             "--random-seed",
             type=int,
             default=ServerArgs.random_seed,
-            help="Random seed.",
+            help="The random seed.",
         )
         parser.add_argument(
             "--log-level",
             type=str,
             default=ServerArgs.log_level,
-            help="Logging level",
+            help="The logging level of all loggers.",
+        )
+        parser.add_argument(
+            "--log-level-http",
+            type=str,
+            default=ServerArgs.log_level_http,
+            help="The logging level of HTTP server. If not set, reuse --log-level by default.",
         )
         parser.add_argument(
             "--log-requests",
             action="store_true",
-            help="Log all requests",
-        )
-        parser.add_argument(
-            "--disable-log-stats",
-            action="store_true",
-            help="Disable logging throughput stats.",
-        )
-        parser.add_argument(
-            "--log-stats-interval",
-            type=int,
-            default=ServerArgs.log_stats_interval,
-            help="Log stats interval in second.",
+            help="Log the inputs and outputs of all requests.",
         )
         parser.add_argument(
             "--show-time-cost",
@@ -239,29 +255,35 @@ class ServerArgs:
             "--dp-size",
             type=int,
             default=ServerArgs.dp_size,
-            help="Data parallelism size.",
+            help="The data parallelism size.",
         )
         parser.add_argument(
             "--load-balance-method",
             type=str,
             default=ServerArgs.load_balance_method,
-            help="Load balancing strategy for data parallelism.",
+            help="The load balancing strategy for data parallelism.",
             choices=[
                 "round_robin",
                 "shortest_queue",
             ],
         )
 
-        # Optimization/debug options
+        # Multi-node distributed serving args
         parser.add_argument(
-            "--enable-flashinfer",
-            action="store_true",
-            help="Enable flashinfer inference kernels",
+            "--nccl-init-addr",
+            type=str,
+            help="The nccl init address of multi-node server.",
         )
         parser.add_argument(
-            "--attention-reduce-in-fp32",
+            "--nnodes", type=int, default=1, help="The number of nodes."
+        )
+        parser.add_argument("--node-rank", type=int, help="The node rank.")
+
+        # Optimization/debug options
+        parser.add_argument(
+            "--disable-flashinfer",
             action="store_true",
-            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16.",
+            help="Disable flashinfer inference kernels",
         )
         parser.add_argument(
             "--disable-radix-cache",
@@ -274,9 +296,25 @@ class ServerArgs:
             help="Disable regex jump-forward",
         )
         parser.add_argument(
+            "--disable-cuda-graph",
+            action="store_true",
+            help="Disable cuda graph.",
+        )
+        parser.add_argument(
             "--disable-disk-cache",
             action="store_true",
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
+        )
+        parser.add_argument(
+            "--attention-reduce-in-fp32",
+            action="store_true",
+            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
+            "This only affects Triton attention kernels",
+        )
+        parser.add_argument(
+            "--enable-p2p-check",
+            action="store_true",
+            help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
         )
 
     @classmethod
@@ -289,7 +327,7 @@ class ServerArgs:
 
     def print_mode_args(self):
         return (
-            f"enable_flashinfer={self.enable_flashinfer}, "
+            f"disable_flashinfer={self.disable_flashinfer}, "
             f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}, "
             f"disable_radix_cache={self.disable_radix_cache}, "
             f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
@@ -300,6 +338,7 @@ class ServerArgs:
 @dataclasses.dataclass
 class ModelPortArgs:
     nccl_port: int
+    model_tp_ips: List[str]
     model_tp_ports: List[int]
 
 

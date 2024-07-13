@@ -523,9 +523,9 @@ class StreamExecutor:
                 self, sampling_params=sampling_params
             )
 
+            self.variables[name] = ""
             self.stream_var_event[name].set()
 
-            self.variables[name] = ""
             for comp, meta_info in generator:
                 self.text_ += comp
                 self.variables[name] += comp
@@ -668,6 +668,10 @@ class StreamExecutor:
             "frequency_penalty",
             "presence_penalty",
             "ignore_eos",
+            "return_logprob",
+            "logprob_start_len",
+            "top_logprobs_num",
+            "return_text_in_logprobs",
             "dtype",
             "regex",
         ]:

@@ -35,7 +35,6 @@ class GenerateReqInput:
     stream: bool = False
 
     def post_init(self):
-
         if (self.text is None and self.input_ids is None) or (
             self.text is not None and self.input_ids is not None
         ):
@@ -123,7 +122,7 @@ class BatchTokenIDOut:
 @dataclass
 class BatchStrOut:
     rids: List[str]
-    output_str: List[str]
+    output_strs: List[str]
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
 

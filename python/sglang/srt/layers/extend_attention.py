@@ -191,6 +191,7 @@ def extend_attention_fwd(
     b_seq_len_extend,
     max_len_in_batch,
     max_len_extend,
+    sm_scale=None,
     logit_cap=-1,
 ):
     """
@@ -213,7 +214,7 @@ def extend_attention_fwd(
     else:
         BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
-    sm_scale = 1.0 / (Lq**0.5)
+    sm_scale = 1.0 / (Lq**0.5) if sm_scale is None else sm_scale
     batch_size, head_num = b_seq_len.shape[0], q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 

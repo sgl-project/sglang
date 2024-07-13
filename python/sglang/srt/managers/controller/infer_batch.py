@@ -3,7 +3,7 @@
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import List
+from typing import List, Union
 
 import numpy as np
 import torch
@@ -15,10 +15,16 @@ from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+# Store some global server args
+global_server_args_dict = {}
+
 
 class ForwardMode(IntEnum):
+    # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
     PREFILL = auto()
+    # Extend a sequence. The KV cache of the first part of the sequence is already computed (e.g., system prompt).
     EXTEND = auto()
+    # Decode one token.
     DECODE = auto()
 
 
@@ -31,7 +37,7 @@ class BaseFinishReason:
 
 
 class FINISH_MATCHED_TOKEN(BaseFinishReason):
-    def __init__(self, matched: int | List[int]):
+    def __init__(self, matched: Union[int, List[int]]):
         super().__init__()
         self.matched = matched
 
@@ -66,6 +72,8 @@ class FINISH_ABORT(BaseFinishReason):
 
 
 class Req:
+    """Store all inforamtion of a request."""
+
     def __init__(self, rid, origin_input_text, origin_input_ids):
         self.rid = rid
         self.origin_input_text = origin_input_text
@@ -74,7 +82,7 @@ class Req:
         self.output_ids = []  # Each decode stage's output ids
         self.input_ids = None  # input_ids = origin_input_ids + output_ids
 
-        # For incremental decode
+        # For incremental decoding
         self.decoded_text = ""
         self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
         self.read_offset = None
@@ -93,9 +101,8 @@ class Req:
         self.sampling_params = None
         self.stream = False
 
-        self.tokenizer = None
-
         # Check finish
+        self.tokenizer = None
         self.finished_reason = None
 
         # Prefix info
@@ -252,6 +259,8 @@ class Req:
 
 @dataclass
 class Batch:
+    """Store all inforamtion of a batch."""
+
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: TokenToKVPool
@@ -302,6 +311,10 @@ class Batch:
 
     def is_empty(self):
         return len(self.reqs) == 0
+
+    # whether batch has at least 1 streaming request
+    def has_stream(self) -> bool:
+        return any(r.stream for r in self.reqs)
 
     def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
         device = "cuda"
@@ -494,9 +507,10 @@ class Batch:
                         req.output_ids = cur_output_ids
                         continue
 
-                    jump_forward_str, next_state = (
-                        req.jump_forward_map.jump_forward_symbol(cur_state)
-                    )
+                    (
+                        jump_forward_str,
+                        next_state,
+                    ) = req.jump_forward_map.jump_forward_symbol(cur_state)
 
                     # Make the incrementally decoded text part of jump_forward_str
                     # so that the UTF-8 will not corrupt
@@ -687,3 +701,191 @@ def _top_p_top_k(probs: torch.Tensor, top_ps: torch.Tensor, top_ks: torch.Tensor
     ] = 0.0
     probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
     return probs_sort, probs_idx
+
+
+
+@dataclass
+class InputMetadata:
+    """Store all inforamtion of a forward pass."""
+
+    forward_mode: ForwardMode
+    batch_size: int
+    total_num_tokens: int
+    max_seq_len: int
+    req_pool_indices: torch.Tensor
+    start_loc: torch.Tensor
+    seq_lens: torch.Tensor
+    prefix_lens: torch.Tensor
+    positions: torch.Tensor
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool: TokenToKVPool
+
+    # for extend
+    extend_seq_lens: torch.Tensor = None
+    extend_start_loc: torch.Tensor = None
+    max_extend_len: int = 0
+
+    out_cache_loc: torch.Tensor = None
+    out_cache_cont_start: torch.Tensor = None
+    out_cache_cont_end: torch.Tensor = None
+
+    return_logprob: bool = False
+    top_logprobs_nums: List[int] = None
+
+    # for flashinfer
+    qo_indptr: torch.Tensor = None
+    kv_indptr: torch.Tensor = None
+    kv_indices: torch.Tensor = None
+    kv_last_page_len: torch.Tensor = None
+    flashinfer_prefill_wrapper_ragged: "BatchPrefillWithRaggedKVCacheWrapper" = None
+    flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
+    flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
+
+    def init_flashinfer_args(self, num_qo_heads, num_kv_heads, head_dim):
+        if self.forward_mode == ForwardMode.DECODE:
+            paged_kernel_lens = self.seq_lens
+        else:
+            paged_kernel_lens = self.prefix_lens
+            self.no_prefix = torch.all(self.prefix_lens == 0)
+
+        kv_indptr = torch.zeros(
+            (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+        )
+        kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
+        paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
+        kv_indices = torch.cat(
+            [
+                self.req_to_token_pool.req_to_token[
+                    req_pool_indices_cpu[i], : paged_kernel_lens_cpu[i]
+                ]
+                for i in range(self.batch_size)
+            ],
+            dim=0,
+        ).contiguous()
+        kv_last_page_len = torch.ones(
+            (self.batch_size,), dtype=torch.int32, device="cuda"
+        )
+
+        if self.forward_mode == ForwardMode.DECODE:
+            self.flashinfer_decode_wrapper.end_forward()
+            self.flashinfer_decode_wrapper.begin_forward(
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                pos_encoding_mode="NONE",
+                data_type=self.token_to_kv_pool.kv_data[0].dtype,
+            )
+        else:
+            # extend part
+            qo_indptr = torch.zeros(
+                (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+            )
+            qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
+
+            self.flashinfer_prefill_wrapper_ragged.end_forward()
+            self.flashinfer_prefill_wrapper_ragged.begin_forward(
+                qo_indptr,
+                qo_indptr,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+            )
+
+            # cached part
+            self.flashinfer_prefill_wrapper_paged.end_forward()
+            self.flashinfer_prefill_wrapper_paged.begin_forward(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+            )
+
+    def init_extend_args(self):
+        self.extend_seq_lens = self.seq_lens - self.prefix_lens
+        self.extend_start_loc = torch.zeros_like(self.seq_lens)
+        self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+        self.max_extend_len = int(torch.max(self.extend_seq_lens))
+
+    @classmethod
+    def create(
+        cls,
+        model_runner,
+        forward_mode,
+        req_pool_indices,
+        seq_lens,
+        prefix_lens,
+        position_ids_offsets,
+        out_cache_loc,
+        out_cache_cont_start=None,
+        out_cache_cont_end=None,
+        top_logprobs_nums=None,
+        return_logprob=False,
+    ):
+        batch_size = len(req_pool_indices)
+        start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
+        start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+        total_num_tokens = int(torch.sum(seq_lens))
+        max_seq_len = int(torch.max(seq_lens))
+
+        if forward_mode == ForwardMode.DECODE:
+            positions = ((seq_lens - 1) + position_ids_offsets).to(torch.int64)
+        else:
+            seq_lens_cpu = seq_lens.cpu().numpy()
+            prefix_lens_cpu = prefix_lens.cpu().numpy()
+            position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
+            positions = torch.tensor(
+                np.concatenate(
+                    [
+                        np.arange(
+                            prefix_lens_cpu[i] + position_ids_offsets_cpu[i],
+                            seq_lens_cpu[i] + position_ids_offsets_cpu[i],
+                        )
+                        for i in range(batch_size)
+                    ],
+                    axis=0,
+                ),
+                device="cuda",
+            )
+
+        ret = cls(
+            forward_mode=forward_mode,
+            batch_size=batch_size,
+            total_num_tokens=total_num_tokens,
+            max_seq_len=max_seq_len,
+            req_pool_indices=req_pool_indices,
+            start_loc=start_loc,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            positions=positions,
+            req_to_token_pool=model_runner.req_to_token_pool,
+            token_to_kv_pool=model_runner.token_to_kv_pool,
+            out_cache_loc=out_cache_loc,
+            out_cache_cont_start=out_cache_cont_start,
+            out_cache_cont_end=out_cache_cont_end,
+            return_logprob=return_logprob,
+            top_logprobs_nums=top_logprobs_nums,
+            flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
+            flashinfer_prefill_wrapper_paged=model_runner.flashinfer_prefill_wrapper_paged,
+            flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
+        )
+
+        if forward_mode == ForwardMode.EXTEND:
+            ret.init_extend_args()
+
+        if not global_server_args_dict.get("disable_flashinfer", False):
+            ret.init_flashinfer_args(
+                model_runner.model_config.num_attention_heads // model_runner.tp_size,
+                model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
+                model_runner.model_config.head_dim,
+            )
+
+        return ret

@@ -35,5 +35,9 @@ class GlobalConfig:
         self.new_token_ratio_decay = 0.0001
         self.new_token_ratio_recovery = 0.05
 
+        # The threshold (number of tokens) to trigger layer-wise cuda sync.
+        # This can improve the speed for large batch sizes during prefill.
+        self.layer_sync_threshold = 8192
+
 
 global_config = GlobalConfig()

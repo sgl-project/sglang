@@ -1,5 +1,4 @@
 import argparse
-import random
 import time
 
 import requests
@@ -9,6 +8,8 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--backend", type=str, default="srt")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-tokens", type=int, default=256)
     args = parser.parse_args()
 
     if args.port is None:
@@ -24,8 +25,8 @@ if __name__ == "__main__":
             raise ValueError(f"Invalid backend: {args.backend}")
 
     url = f"{args.host}:{args.port}"
-    a = random.randint(0, 1 << 20)
-    max_new_tokens = 256
+    a = 20
+    max_new_tokens = args.max_tokens
     prompt = f"{a, }"
 
     tic = time.time()
@@ -33,10 +34,11 @@ if __name__ == "__main__":
         response = requests.post(
             url + "/generate",
             json={
-                "text": prompt,
+                "text": [prompt] * args.batch_size,
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
                 },
             },
         )
@@ -48,6 +50,7 @@ if __name__ == "__main__":
                 "parameters": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
                 },
             },
         )
@@ -58,6 +61,7 @@ if __name__ == "__main__":
                 "prompt": prompt,
                 "temperature": 0,
                 "max_tokens": max_new_tokens,
+                "ignore_eos": True,
             },
         )
     elif args.backend == "ginfer":
@@ -87,5 +91,5 @@ if __name__ == "__main__":
         ret = response.json()
     print(ret)
 
-    speed = max_new_tokens / latency
+    speed = args.batch_size * max_new_tokens / latency
     print(f"latency: {latency:.2f} s, speed: {speed:.2f} token/s")
