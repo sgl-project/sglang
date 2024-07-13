@@ -276,17 +276,13 @@ class ModelRunner:
         input_metadata = InputMetadata.create(
             self,
             forward_mode=ForwardMode.EXTEND,
-            tp_size=self.tp_size,
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             prefix_lens=batch.prefix_lens,
             position_ids_offsets=batch.position_ids_offsets,
             out_cache_loc=batch.out_cache_loc,
-            top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
-            flashinfer_prefill_wrapper_ragged=self.flashinfer_prefill_wrapper_ragged,
-            flashinfer_prefill_wrapper_paged=self.flashinfer_prefill_wrapper_paged,
-            flashinfer_decode_wrapper=self.flashinfer_decode_wrapper,
+            top_logprobs_nums=batch.top_logprobs_nums,
         )
         return self.model.forward(
             batch.input_ids,
