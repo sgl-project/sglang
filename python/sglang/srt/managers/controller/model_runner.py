@@ -90,6 +90,17 @@ class ModelRunner:
         self.init_cublas()
         self.init_flash_infer()
 
+        # Capture cuda graphs
+        self.init_cuda_graphs()
+
+    def init_cuda_graphs(self):
+        if self.server_args.disable_cuda_graph:
+            return
+
+        from sglang.srt.managers.controller.cuda_graph_runner import CudaGraphRunner
+        self.cuda_graph_runner = CudaGraphRunner(self)
+        self.cuda_graph_runner.capture([1])
+
     def load_model(self):
         logger.info(
             f"[gpu_id={self.gpu_id}] Load weight begin. "
@@ -212,9 +223,30 @@ class ModelRunner:
         self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffers[1], "NHD"
         )
-        self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-            workspace_buffers[2], "NHD", use_tensor_cores=use_tensor_cores
-        )
+
+        if self.server_args.disable_cuda_graph:
+            self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                workspace_buffers[2], "NHD", use_tensor_cores=use_tensor_cores
+            )
+        else:
+            max_bs = 1
+            self.flashinfer_kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device="cuda"
+            )
+            self.flashinfer_kv_indices = torch.zeros(
+                (max_bs * 1024,), dtype=torch.int32, device="cuda"
+            )
+            self.flashinfer_kv_last_page_len = torch.ones(
+                (max_bs,), dtype=torch.int32, device="cuda"
+            )
+            self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                workspace_buffers[2], "NHD",
+                use_cuda_graph=True,
+                use_tensor_cores=use_tensor_cores,
+                paged_kv_indptr_buffer=self.flashinfer_kv_indptr,
+                paged_kv_indices_buffer=self.flashinfer_kv_indices,
+                paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len,
+            )
 
     @torch.inference_mode()
     def forward_extend(self, batch: Batch):
