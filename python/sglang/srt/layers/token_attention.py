@@ -312,7 +312,7 @@ def token_attention_fwd(
     b_seq_len,
     max_len_in_batch,
     total_num_tokens,
-    sm_scale=None,
+    sm_scale,
     logit_cap=-1,
     att_m=None,
 ):
@@ -320,7 +320,6 @@ def token_attention_fwd(
         att_m = torch.empty(
             (q.shape[-2], total_num_tokens), dtype=REDUCE_TORCH_TYPE, device="cuda"
         )
-    sm_scale = 1.0 / (Lq**0.5) if sm_scale is None else sm_scale
 
     _token_att_m_fwd(
         q,
