@@ -132,7 +132,8 @@ class CudaGraphRunner:
         index = bisect.bisect_left(self.batch_size_list, raw_bs)
         bs = self.batch_size_list[index]
         if bs != raw_bs:
-            self.seq_lens.fill_(1)
+            self.seq_lens.zero_()
+            self.position_ids_offsets.fill_(1)
             self.out_cache_loc.zero_()
 
         # Common inputs
