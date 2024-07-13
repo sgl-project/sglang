@@ -46,7 +46,7 @@ class TokenToKVPool:
 
         # [size, key/value, head_num, head_dim] for each layer
         self.kv_data = [
-            torch.empty((size, 2, head_num, head_dim), dtype=dtype, device="cuda")
+            torch.empty((size + 1, 2, head_num, head_dim), dtype=dtype, device="cuda")
             for _ in range(layer_num)
         ]
 
