@@ -207,17 +207,17 @@ class ModelRunner:
         else:
             use_tensor_cores = False
 
-        workspace_buffers = torch.empty(
+        self.flashinfer_workspace_buffers = torch.empty(
             2, global_config.flashinfer_workspace_size, dtype=torch.uint8, device="cuda"
         )
         self.flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            workspace_buffers[0], "NHD"
+            self.flashinfer_workspace_buffers[0], "NHD"
         )
         self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffers[1], "NHD"
+            self.flashinfer_workspace_buffers[1], "NHD"
         )
         self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-            workspace_buffers[0], "NHD", use_tensor_cores=use_tensor_cores
+            self.flashinfer_workspace_buffers[0], "NHD", use_tensor_cores=use_tensor_cores
         )
 
     def init_cuda_graphs(self):

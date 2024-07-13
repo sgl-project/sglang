@@ -25,15 +25,12 @@ class CudaGraphRunner:
         self.max_bs = max_batch_size_to_capture
         self.input_ids = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
         self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
-        self.seq_lens = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+        self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int32, device="cuda")
         self.position_ids_offsets = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
         self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
 
         # Flashinfer inputs
-        self.flashinfer_workspace_buffer = torch.empty(
-            global_config.flashinfer_workspace_size,
-            dtype=torch.uint8, device="cuda"
-        )
+        self.flashinfer_workspace_buffer = self.model_runner.flashinfer_workspace_buffers
         self.flashinfer_kv_indptr = torch.zeros(
             (self.max_bs + 1,), dtype=torch.int32, device="cuda"
         )
@@ -139,7 +136,7 @@ class CudaGraphRunner:
 
         # Common inputs
         if bs != raw_bs:
-            self.seq_lens.zero_()
+            self.seq_lens.ones_()
             self.out_cache_loc.zero_()
         self.input_ids[:raw_bs] = batch.input_ids
         self.req_pool_indices[:raw_bs] = batch.req_pool_indices

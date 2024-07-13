@@ -154,7 +154,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.0.9",
+            "0.0.8",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
