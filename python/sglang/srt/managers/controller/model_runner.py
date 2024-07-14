@@ -15,6 +15,7 @@ from vllm.distributed import init_distributed_environment, initialize_model_para
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
+from sglang.global_config import global_config
 from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode, InputMetadata, global_server_args_dict
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
@@ -89,6 +90,9 @@ class ModelRunner:
         self.init_memory_pool(total_gpu_memory)
         self.init_cublas()
         self.init_flash_infer()
+
+        # Capture cuda graphs
+        self.init_cuda_graphs()
 
     def load_model(self):
         logger.info(
@@ -182,39 +186,71 @@ class ModelRunner:
         return c
 
     def init_flash_infer(self):
-        if not global_server_args_dict.get("disable_flashinfer", False):
-            from flashinfer import (
-                BatchDecodeWithPagedKVCacheWrapper,
-                BatchPrefillWithPagedKVCacheWrapper,
-                BatchPrefillWithRaggedKVCacheWrapper,
-            )
-            from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
-
-            if not _grouped_size_compiled_for_decode_kernels(
-                self.model_config.num_attention_heads // self.tp_size,
-                self.model_config.get_num_kv_heads(self.tp_size),
-            ):
-                use_tensor_cores = True
-            else:
-                use_tensor_cores = False
-
-            workspace_buffers = torch.empty(
-                2, 96 * 1024 * 1024, dtype=torch.uint8, device="cuda"
-            )
-            self.flashinfer_prefill_wrapper_ragged = (
-                BatchPrefillWithRaggedKVCacheWrapper(workspace_buffers[0], "NHD")
-            )
-            self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffers[1], "NHD"
-            )
-            self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                workspace_buffers[0], "NHD", use_tensor_cores=use_tensor_cores
-            )
-        else:
-            self.flashinfer_prefill_wrapper_ragged = (
-                self.flashinfer_prefill_wrapper_paged
-            ) = None
+        if self.server_args.disable_flashinfer:
+            self.flashinfer_prefill_wrapper_ragged = None
+            self.flashinfer_prefill_wrapper_paged = None
             self.flashinfer_decode_wrapper = None
+            return
+
+        from flashinfer import (
+            BatchDecodeWithPagedKVCacheWrapper,
+            BatchPrefillWithPagedKVCacheWrapper,
+            BatchPrefillWithRaggedKVCacheWrapper,
+        )
+        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
+
+        if not _grouped_size_compiled_for_decode_kernels(
+            self.model_config.num_attention_heads // self.tp_size,
+            self.model_config.get_num_kv_heads(self.tp_size),
+        ):
+            use_tensor_cores = True
+        else:
+            use_tensor_cores = False
+
+        self.flashinfer_workspace_buffers = torch.empty(
+            2, global_config.flashinfer_workspace_size, dtype=torch.uint8, device="cuda"
+        )
+        self.flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+            self.flashinfer_workspace_buffers[0], "NHD"
+        )
+        self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
+            self.flashinfer_workspace_buffers[1], "NHD"
+        )
+        self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+            self.flashinfer_workspace_buffers[0], "NHD", use_tensor_cores=use_tensor_cores
+        )
+
+    def init_cuda_graphs(self):
+        from sglang.srt.managers.controller.cuda_graph_runner import CudaGraphRunner
+
+        if self.server_args.disable_cuda_graph or self.server_args.disable_flashinfer:
+            self.cuda_graph_runner = None
+            return
+
+        logger.info(f"[gpu_id={self.gpu_id}] Capture cuda graph begin.")
+        batch_size_list = [1, 2, 4] + [i * 8 for i in range(1, 16)]
+        self.cuda_graph_runner = CudaGraphRunner(self, max_batch_size_to_capture=max(batch_size_list))
+        self.cuda_graph_runner.capture(batch_size_list)
+
+    @torch.inference_mode()
+    def forward_decode(self, batch: Batch):
+        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(len(batch.reqs)):
+            return self.cuda_graph_runner.replay(batch)
+
+        input_metadata = InputMetadata.create(
+            self,
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=batch.seq_lens,
+            prefix_lens=batch.prefix_lens,
+            position_ids_offsets=batch.position_ids_offsets,
+            out_cache_loc=batch.out_cache_loc,
+            top_logprobs_nums=batch.top_logprobs_nums,
+            return_logprob=batch.return_logprob,
+        )
+        return self.model.forward(
+            batch.input_ids, input_metadata.positions, input_metadata
+        )
 
     @torch.inference_mode()
     def forward_extend(self, batch: Batch):
@@ -234,40 +270,17 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
-    def forward_decode(self, batch: Batch):
-        input_metadata = InputMetadata.create(
-            self,
-            forward_mode=ForwardMode.DECODE,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            prefix_lens=batch.prefix_lens,
-            position_ids_offsets=batch.position_ids_offsets,
-            out_cache_loc=batch.out_cache_loc,
-            out_cache_cont_start=batch.out_cache_cont_start,
-            out_cache_cont_end=batch.out_cache_cont_end,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            return_logprob=batch.return_logprob,
-        )
-        return self.model.forward(
-            batch.input_ids, input_metadata.positions, input_metadata
-        )
-
-    @torch.inference_mode()
     def forward_extend_multi_modal(self, batch: Batch):
         input_metadata = InputMetadata.create(
             self,
             forward_mode=ForwardMode.EXTEND,
-            tp_size=self.tp_size,
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             prefix_lens=batch.prefix_lens,
             position_ids_offsets=batch.position_ids_offsets,
             out_cache_loc=batch.out_cache_loc,
-            top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
-            flashinfer_prefill_wrapper_ragged=self.flashinfer_prefill_wrapper_ragged,
-            flashinfer_prefill_wrapper_paged=self.flashinfer_prefill_wrapper_paged,
-            flashinfer_decode_wrapper=self.flashinfer_decode_wrapper,
+            top_logprobs_nums=batch.top_logprobs_nums,
         )
         return self.model.forward(
             batch.input_ids,
