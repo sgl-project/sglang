@@ -5,12 +5,9 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-
 from vllm.model_executor.layers.activation import SiluAndMul
-
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -31,7 +28,6 @@ from sglang.srt.managers.controller.model_runner import InputMetadata
 
 
 class MiniCPMMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -67,7 +63,6 @@ class MiniCPMMLP(nn.Module):
 
 
 class MiniCPMAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -152,7 +147,6 @@ class MiniCPMAttention(nn.Module):
 
 
 class MiniCPMDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config,
@@ -217,7 +211,6 @@ class MiniCPMDecoderLayer(nn.Module):
 
 
 class MiniCPMModel(nn.Module):
-
     def __init__(
         self,
         config,
@@ -274,7 +267,7 @@ class MiniCPMForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        
+
         self.num_experts = getattr(self.config, "num_experts", 0)
         self.quant_config = quant_config
         self.model = MiniCPMModel(config, quant_config=quant_config)
