@@ -125,7 +125,8 @@ class RadixCache:
             if x.lock_ref > 0:
                 continue
 
-            num_evicted += evict_callback(x.value)
+            evict_callback(x.value)
+            num_evicted += len(x.value)
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0:
