@@ -314,7 +314,9 @@ class ModelTpServer:
         self.forward_queue.append(req)
 
     def get_new_fill_batch(self) -> Optional[Batch]:
-        running_bs = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        running_bs = (
+            len(self.running_batch.reqs) if self.running_batch is not None else 0
+        )
         if running_bs >= self.max_running_requests:
             return
 

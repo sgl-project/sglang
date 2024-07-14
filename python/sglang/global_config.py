@@ -44,4 +44,5 @@ class GlobalConfig:
         # adjust_cache: Adjust the position embedding of KV cache.
         self.concate_and_append_mode = "no_adjust"
 
+
 global_config = GlobalConfig()

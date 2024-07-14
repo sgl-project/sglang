@@ -17,7 +17,8 @@ def run_one_batch_size(bs):
 
     if args.input_len:
         input_ids = [
-            [int(x) for x in np.random.randint(0, high=16384, size=(args.input_len,))] for _ in range(bs)
+            [int(x) for x in np.random.randint(0, high=16384, size=(args.input_len,))]
+            for _ in range(bs)
         ]
     else:
         text = [f"{i, }" for i in range(bs)]
@@ -116,9 +117,11 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--backend", type=str, default="srt")
     parser.add_argument("--input-len", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, nargs='*', default=[1])
+    parser.add_argument("--batch-size", type=int, nargs="*", default=[1])
     parser.add_argument("--max-tokens", type=int, default=256)
-    parser.add_argument("--vllm-model-name", type=str, default="meta-llama/Meta-Llama-3-70B")
+    parser.add_argument(
+        "--vllm-model-name", type=str, default="meta-llama/Meta-Llama-3-70B"
+    )
     args = parser.parse_args()
 
     if args.port is None:
