@@ -315,7 +315,7 @@ class ModelTpServer:
 
     def get_new_fill_batch(self) -> Optional[Batch]:
         running_bs = len(self.running_batch.reqs) if self.running_batch is not None else 0
-        if running_bs > self.max_running_requests:
+        if running_bs >= self.max_running_requests:
             return
 
         # Compute matched prefix length
@@ -393,7 +393,7 @@ class ModelTpServer:
             else:
                 break
 
-            if running_bs + len(can_run_list) > self.max_running_requests:
+            if running_bs + len(can_run_list) >= self.max_running_requests:
                 break
 
         if len(can_run_list) == 0:
