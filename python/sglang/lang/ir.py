@@ -24,9 +24,9 @@ class SglSamplingParams:
     presence_penalty: float = 0.0
     ignore_eos: bool = False
     return_logprob: Optional[bool] = None
-    logprob_start_len: Optional[int] = None,
-    top_logprobs_num: Optional[int] = None,
-    return_text_in_logprobs: Optional[bool] = None,
+    logprob_start_len: Optional[int] = (None,)
+    top_logprobs_num: Optional[int] = (None,)
+    return_text_in_logprobs: Optional[bool] = (None,)
 
     # for constrained generation, not included in to_xxx_kwargs
     dtype: Optional[str] = None

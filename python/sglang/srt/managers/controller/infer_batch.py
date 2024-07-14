@@ -668,7 +668,9 @@ class Batch:
             sampled_index = torch.multinomial(probs_sort, num_samples=1)
         except RuntimeError as e:
             warnings.warn(f"Ignore errors in sampling: {e}")
-            sampled_index = torch.ones(probs_sort.shape[:-1] + (1,), dtype=torch.int64, device=probs.device)
+            sampled_index = torch.ones(
+                probs_sort.shape[:-1] + (1,), dtype=torch.int64, device=probs.device
+            )
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(
             -1
         )
@@ -749,8 +751,14 @@ class InputMetadata:
         skip_flashinfer_init=False,
     ):
         if not skip_flashinfer_init and not model_runner.server_args.disable_flashinfer:
-            init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens, prefix_lens,
-                                 model_runner.flashinfer_decode_wrapper)
+            init_flashinfer_args(
+                forward_mode,
+                model_runner,
+                req_pool_indices,
+                seq_lens,
+                prefix_lens,
+                model_runner.flashinfer_decode_wrapper,
+            )
 
         batch_size = len(req_pool_indices)
 
@@ -807,16 +815,24 @@ class InputMetadata:
         )
 
         if model_runner.server_args.disable_flashinfer:
-            (ret.triton_max_seq_len,
-             ret.triton_max_extend_len,
-             ret.triton_start_loc,
-             ret.triton_prefix_lens) = init_triton_args(forward_mode, seq_lens, prefix_lens)
+            (
+                ret.triton_max_seq_len,
+                ret.triton_max_extend_len,
+                ret.triton_start_loc,
+                ret.triton_prefix_lens,
+            ) = init_triton_args(forward_mode, seq_lens, prefix_lens)
 
         return ret
 
 
-def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens, prefix_lens,
-                         flashinfer_decode_wrapper):
+def init_flashinfer_args(
+    forward_mode,
+    model_runner,
+    req_pool_indices,
+    seq_lens,
+    prefix_lens,
+    flashinfer_decode_wrapper,
+):
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
     num_kv_heads = model_runner.model_config.get_num_kv_heads(model_runner.tp_size)
     head_dim = model_runner.model_config.head_dim
@@ -827,9 +843,7 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
     else:
         paged_kernel_lens = prefix_lens
 
-    kv_indptr = torch.zeros(
-        (batch_size + 1,), dtype=torch.int32, device="cuda"
-    )
+    kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
     kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
     req_pool_indices_cpu = req_pool_indices.cpu().numpy()
     paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
@@ -842,9 +856,7 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
         ],
         dim=0,
     ).contiguous()
-    kv_last_page_len = torch.ones(
-        (batch_size,), dtype=torch.int32, device="cuda"
-    )
+    kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
 
     if forward_mode == ForwardMode.DECODE:
         flashinfer_decode_wrapper.end_forward()
@@ -859,9 +871,7 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
         )
     else:
         # extend part
-        qo_indptr = torch.zeros(
-            (batch_size + 1,), dtype=torch.int32, device="cuda"
-        )
+        qo_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
 
         model_runner.flashinfer_prefill_wrapper_ragged.end_forward()
