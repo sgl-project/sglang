@@ -54,7 +54,7 @@ def launch_tp_servers(gpu_ids, tp_rank_range, server_args,
             gpu_ids[i], i, server_args, model_port_args, model_overide_args
         ))
         proc.start()
-        procs.append(procs)
+        procs.append(proc)
 
     return procs
 
