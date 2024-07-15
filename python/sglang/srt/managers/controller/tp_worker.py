@@ -746,8 +746,8 @@ class ModelTpClient:
             # Init model
             assert len(gpu_ids) == 1
             self.model_server = ModelTpService().exposed_ModelTpServer(
-                0,
                 gpu_ids[0],
+                0,
                 server_args,
                 model_port_args,
                 model_overide_args,
