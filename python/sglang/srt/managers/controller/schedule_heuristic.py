@@ -13,6 +13,10 @@ class ScheduleHeuristic:
         max_total_num_tokens,
         tree_cache,
     ):
+        if tree_cache.disable and schedule_heuristic == "lpm":
+            # LMP is not meaningless when tree cache is disabled.
+            schedule_heuristic = "fcfs"
+
         self.schedule_heuristic = schedule_heuristic
         self.max_running_seqs = max_running_seqs
         self.max_prefill_num_tokens = max_prefill_num_tokens

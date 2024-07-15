@@ -174,9 +174,6 @@ class Req:
 
         return False, ""
 
-    def max_new_tokens(self):
-        return self.sampling_params.max_new_tokens
-
     def check_finished(self):
         if self.finished():
             return
@@ -596,8 +593,7 @@ class Batch:
             "logit_bias",
         ]:
             self_val = getattr(self, item, None)
-            # logit_bias can be None
-            if self_val is not None:
+            if self_val is not None:  # logit_bias can be None
                 setattr(self, item, self_val[new_indices])
 
     def merge(self, other: "Batch"):
