@@ -51,7 +51,7 @@ def broadcast_recv_input(data, rank, dist_group):
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
-            tensor_data = torch.ByteTensor(serialized_data)
+            tensor_data = torch.ByteTensor(list(serialized_data))
             tensor_size = torch.tensor([size], dtype=torch.long)
 
             dist.broadcast(tensor_size, src=0, group=dist_group)

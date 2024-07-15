@@ -206,11 +206,11 @@ class ModelTpServer:
 
     @torch.inference_mode()
     def forward_step(self):
-        new_batch = self.get_new_fill_batch()
+        new_batch = self.get_new_prefill_batch()
 
         if new_batch is not None:
-            # Run a new fill batch
-            self.forward_fill_batch(new_batch)
+            # Run a new prefill batch
+            self.forward_prefill_batch(new_batch)
             self.cache_filled_batch(new_batch)
 
             if not new_batch.is_empty():
@@ -219,7 +219,7 @@ class ModelTpServer:
                 else:
                     self.running_batch.merge(new_batch)
         else:
-            # Run decode batch
+            # Run a decode batch
             if self.running_batch is not None:
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(global_config.num_continue_decode_steps):
@@ -312,7 +312,7 @@ class ModelTpServer:
         )
         self.forward_queue.append(req)
 
-    def get_new_fill_batch(self) -> Optional[Batch]:
+    def get_new_prefill_batch(self) -> Optional[Batch]:
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
@@ -436,7 +436,7 @@ class ModelTpServer:
         self.forward_queue = [x for x in self.forward_queue if x not in can_run_list]
         return new_batch
 
-    def forward_fill_batch(self, batch: Batch):
+    def forward_prefill_batch(self, batch: Batch):
         # Build batch tensors
         batch.prepare_for_extend(
             self.model_config.vocab_size, self.int_token_logit_bias
