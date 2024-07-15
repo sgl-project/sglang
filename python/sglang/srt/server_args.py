@@ -67,10 +67,12 @@ class ServerArgs:
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
         if self.mem_fraction_static is None:
-            if self.tp_size >= 8:
+            if self.tp_size >= 16:
+                self.mem_fraction_static = 0.74
+            elif self.tp_size >= 8:
                 self.mem_fraction_static = 0.78
             elif self.tp_size >= 4:
-                self.mem_fraction_static = 0.80
+                self.mem_fraction_static = 0.82
             elif self.tp_size >= 2:
                 self.mem_fraction_static = 0.85
             else:
