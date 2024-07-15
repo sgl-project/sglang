@@ -27,18 +27,35 @@ def run_tp_server(
     model_overide_args: dict,
 ):
     """Run a tp server."""
-    model_server = ModelTpServer(
-        gpu_id,
-        tp_rank,
-        server_args,
-        model_port_args,
-        model_overide_args,
-    )
-    tp_cpu_group = model_server.model_runner.tp_group.cpu_group
+    try:
+        model_server = ModelTpServer(
+            gpu_id,
+            tp_rank,
+            server_args,
+            model_port_args,
+            model_overide_args,
+        )
+        tp_cpu_group = model_server.model_runner.tp_group.cpu_group
 
-    while True:
-        recv_reqs = broadcast_recv_input(None, tp_rank, tp_cpu_group)
-        model_server.exposed_step(recv_reqs)
+        while True:
+            recv_reqs = broadcast_recv_input(None, tp_rank, tp_cpu_group)
+            model_server.exposed_step(recv_reqs)
+    except Exception:
+        logger.error("Exception in run_tp_server:\n" + get_exception_traceback())
+        raise
+
+def launch_tp_servers(gpu_ids, tp_rank_range, server_args,
+                      model_port_args, model_overide_args):
+    """Launch multiple tp servers."""
+    procs = []
+    for i in tp_rank_range:
+        proc = multiprocessing.Process(target=run_tp_server, args=(
+            gpu_ids[i], i, server_args, model_port_args, model_overide_args
+        ))
+        proc.start()
+        procs.append(procs)
+
+    return procs
 
 
 def broadcast_recv_input(data, rank, dist_group):
@@ -96,8 +113,8 @@ class ControllerSingle:
         # Launch other tp ranks
         if tp_size_local > 1:
             tp_rank_range = range(1, tp_size_local)
-            self.launch_other_ranks(gpu_ids, tp_rank_range, server_args,
-                                    port_args.model_port_args[0], model_overide_args)
+            launch_tp_servers(gpu_ids, tp_rank_range, server_args,
+                              port_args.model_port_args[0], model_overide_args)
 
         # Launch tp rank 0
         self.tp_server = ModelTpServer(
@@ -108,18 +125,6 @@ class ControllerSingle:
             model_overide_args,
         )
         self.tp_cpu_group = self.tp_server.model_runner.tp_group.cpu_group
-
-    def launch_other_ranks(self, gpu_ids, tp_rank_range, server_args,
-                           model_port_args, model_overide_args):
-        procs = []
-        for i in tp_rank_range:
-            proc = multiprocessing.Process(target=run_tp_server, args=(
-                gpu_ids[i], i, server_args, model_port_args, model_overide_args
-            ))
-            proc.start()
-            procs.append(procs)
-
-        self.tp_procs = procs
 
     def loop_for_forward(self):
         while True:
