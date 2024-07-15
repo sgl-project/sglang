@@ -250,7 +250,7 @@ class ModelTpServer:
                         self.running_batch = None
                         break
 
-                    if self.out_pyobjs:
+                    if self.out_pyobjs and self.running_batch.has_stream():
                         break
             else:
                 # Check the available size
