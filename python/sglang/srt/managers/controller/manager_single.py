@@ -76,6 +76,9 @@ class ControllerSingle:
     """A controller that manages a group of tensor parallel workers."""
 
     def __init__(self, server_args: ServerArgs, port_args: PortArgs, model_overide_args: dict):
+        # Parse args
+        self.server_args = server_args
+
         # Init communication
         context = zmq.Context(2)
         self.recv_from_tokenizer = context.socket(zmq.PULL)
@@ -121,7 +124,9 @@ class ControllerSingle:
     def loop_for_forward(self):
         while True:
             recv_reqs = self.recv_requests()
-            broadcast_recv_input(recv_reqs, 0, self.tp_cpu_group)
+
+            if self.server_args.tp_size > 1:
+                broadcast_recv_input(recv_reqs, 0, self.tp_cpu_group)
 
             out_pyobjs = self.tp_server.exposed_step(recv_reqs)
 
