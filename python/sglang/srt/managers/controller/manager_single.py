@@ -44,6 +44,7 @@ def run_tp_server(
         logger.error("Exception in run_tp_server:\n" + get_exception_traceback())
         raise
 
+
 def launch_tp_servers(gpu_ids, tp_rank_range, server_args,
                       model_port_args, model_overide_args):
     """Launch multiple tp servers."""
@@ -113,8 +114,9 @@ class ControllerSingle:
         # Launch other tp ranks
         if tp_size_local > 1:
             tp_rank_range = range(1, tp_size_local)
-            launch_tp_servers(gpu_ids, tp_rank_range, server_args,
-                              port_args.model_port_args[0], model_overide_args)
+            self.tp_procs = launch_tp_servers(
+                gpu_ids, tp_rank_range, server_args,
+                port_args.model_port_args[0], model_overide_args)
 
         # Launch tp rank 0
         self.tp_server = ModelTpServer(
