@@ -352,7 +352,7 @@ class Batch:
         extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
-            self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.dec_refs)
+            self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
             out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
 
             if out_cache_loc is None:
@@ -422,7 +422,7 @@ class Batch:
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 
-        self.tree_cache.evict(bs, self.token_to_kv_pool.dec_refs)
+        self.tree_cache.evict(bs, self.token_to_kv_pool.free)
 
         if self.token_to_kv_pool.available_size() >= bs:
             return True
@@ -453,7 +453,7 @@ class Batch:
             token_indices = self.req_to_token_pool.req_to_token[
                 req_pool_indices_cpu[idx]
             ][last_uncached_pos : seq_lens_cpu[idx]]
-            self.token_to_kv_pool.dec_refs(token_indices)
+            self.token_to_kv_pool.free(token_indices)
 
             # release the last node
             self.tree_cache.dec_lock_ref(req.last_node)
