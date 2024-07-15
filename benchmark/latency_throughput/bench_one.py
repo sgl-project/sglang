@@ -96,8 +96,11 @@ def run_one_batch_size(bs):
         ret = response.json()
     print(ret)
 
+    input_len = args.input_len if args.input_len else 1
+    output_len = max_new_tokens
+
     output_throughput = bs * max_new_tokens / latency
-    overall_throughput = bs * (args.input_len + max_new_tokens) / latency
+    overall_throughput = bs * (input_len + output_len) / latency
     print(f"latency: {latency:.2f} s")
     print(f"decode throughput: {output_throughput:.2f} token/s")
     print(f"overall throughput: {overall_throughput:.2f} token/s")
