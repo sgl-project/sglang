@@ -45,24 +45,31 @@ def broadcast_recv_input(data, rank, dist_group):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
     if rank == 0:
-        serialized_data = pickle.dumps(data)
-        tensor_data = torch.ByteTensor(list(serialized_data))
-        tensor_size = torch.tensor([tensor_data.size(0)], dtype=torch.long)
+        if len(data) == 0:
+            tensor_size = torch.tensor([0], dtype=torch.long)
+            dist.broadcast(tensor_size, src=0, group=dist_group)
+        else:
+            serialized_data = pickle.dumps(data)
+            size = len(serialized_data)
+            tensor_data = torch.ByteTensor(serialized_data)
+            tensor_size = torch.tensor([size], dtype=torch.long)
+
+            dist.broadcast(tensor_size, src=0, group=dist_group)
+            dist.broadcast(tensor_data, src=0, group=dist_group)
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
+        dist.broadcast(tensor_size, src=0, group=dist_group)
+        size = tensor_size.item()
 
-    dist.broadcast(tensor_size, src=0, group=dist_group)
+        if size == 0:
+            return []
 
-    if rank != 0:
-        tensor_data = torch.empty(tensor_size.item(), dtype=torch.uint8)
-    
-    dist.broadcast(tensor_data, src=0, group=dist_group)
+        tensor_data = torch.empty(size, dtype=torch.uint8)
+        dist.broadcast(tensor_data, src=0, group=dist_group)
 
-    if rank != 0:
         serialized_data = bytes(tensor_data.tolist())
         data = pickle.loads(serialized_data)
-
-    return data
+        return data
 
 
 class ControllerSingle:
