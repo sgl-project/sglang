@@ -42,7 +42,7 @@ def run_tp_server(
 
 
 def broadcast_recv_input(data, rank, dist_group):
-    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend"""
+    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
     if rank == 0:
         serialized_data = pickle.dumps(data)
@@ -83,13 +83,13 @@ class ControllerSingle:
         tp_size_local = server_args.tp_size // server_args.nnodes
         gpu_ids = [i for _ in range(server_args.nnodes) for i in range(tp_size_local)]
 
-        # Launch other ranks
+        # Launch other tp ranks
         if tp_size_local > 1:
             tp_rank_range = range(1, tp_size_local)
             self.launch_other_ranks(gpu_ids, tp_rank_range, server_args,
                                     port_args.model_port_args[0], model_overide_args)
 
-        # Launch rank 0
+        # Launch tp rank 0
         self.tp_server = ModelTpServer(
             gpu_ids[0],
             0,
