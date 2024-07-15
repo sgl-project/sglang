@@ -1,25 +1,73 @@
 """A controller that manages a group of tensor parallel workers."""
 
-import asyncio
+import multiprocessing
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import os
+import pickle
 
-import uvloop
+import torch
+import torch.distributed as dist
 import zmq
 import zmq.asyncio
 
-from sglang.global_config import global_config
 from sglang.srt.managers.controller.tp_worker import ModelTpServer
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, ModelPortArgs
 from sglang.srt.utils import kill_parent_process
 from sglang.utils import get_exception_traceback
 
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger("srt.controller")
 
 
+def run_tp_server(
+    gpu_id: int,
+    tp_rank: int,
+    server_args: ServerArgs,
+    model_port_args: ModelPortArgs,
+    model_overide_args: dict,
+):
+    """Run a tp server."""
+    model_server = ModelTpServer(
+        gpu_id,
+        tp_rank,
+        server_args,
+        model_port_args,
+        model_overide_args,
+    )
+    tp_cpu_group = model_server.model_runner.tp_group.cpu_group
+
+    while True:
+        recv_reqs = broadcast_recv_input(None, tp_rank, tp_cpu_group)
+        model_server.exposed_step(recv_reqs)
+
+
+def broadcast_recv_input(data, rank, dist_group):
+    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend"""
+
+    if rank == 0:
+        serialized_data = pickle.dumps(data)
+        tensor_data = torch.ByteTensor(list(serialized_data))
+        tensor_size = torch.tensor([tensor_data.size(0)], dtype=torch.long)
+    else:
+        tensor_size = torch.tensor([0], dtype=torch.long)
+
+    dist.broadcast(tensor_size, src=0, group=dist_group)
+
+    if rank != 0:
+        tensor_data = torch.empty(tensor_size.item(), dtype=torch.uint8)
+    
+    dist.broadcast(tensor_data, src=0, group=dist_group)
+
+    if rank != 0:
+        serialized_data = bytes(tensor_data.tolist())
+        data = pickle.loads(serialized_data)
+
+    return data
+
+
 class ControllerSingle:
+    """A controller that manages a group of tensor parallel workers."""
+
     def __init__(self, server_args: ServerArgs, port_args: PortArgs, model_overide_args: dict):
         # Init communication
         context = zmq.Context(2)
@@ -34,21 +82,41 @@ class ControllerSingle:
         # Init model server
         tp_size_local = server_args.tp_size // server_args.nnodes
         gpu_ids = [i for _ in range(server_args.nnodes) for i in range(tp_size_local)]
-        self.model_server = ModelTpServer(
+
+        # Launch other ranks
+        if tp_size_local > 1:
+            tp_rank_range = range(1, tp_size_local)
+            self.launch_other_ranks(gpu_ids, tp_rank_range, server_args,
+                                    port_args.model_port_args[0], model_overide_args)
+
+        # Launch rank 0
+        self.tp_server = ModelTpServer(
             gpu_ids[0],
             0,
             server_args,
             port_args.model_port_args[0],
             model_overide_args,
         )
+        self.tp_cpu_group = self.tp_server.model_runner.tp_group.cpu_group
 
-        # Init status
-        self.recv_reqs = []
+    def launch_other_ranks(self, gpu_ids, tp_rank_range, server_args,
+                           model_port_args, model_overide_args):
+        procs = []
+        for i in tp_rank_range:
+            proc = multiprocessing.Process(target=run_tp_server, args=(
+                gpu_ids[i], i, server_args, model_port_args, model_overide_args
+            ))
+            proc.start()
+            procs.append(procs)
+
+        self.tp_procs = procs
 
     def loop_for_forward(self):
         while True:
             recv_reqs = self.recv_requests()
-            out_pyobjs = self.model_server.exposed_step(recv_reqs)
+            broadcast_recv_input(recv_reqs, 0, self.tp_cpu_group)
+
+            out_pyobjs = self.tp_server.exposed_step(recv_reqs)
 
             for obj in out_pyobjs:
                 self.send_to_detokenizer.send_pyobj(obj)
@@ -62,6 +130,7 @@ class ControllerSingle:
             except zmq.ZMQError:
                 break
         return recv_reqs
+
 
 def start_controller_process(
     server_args: ServerArgs, port_args: PortArgs, pipe_writer, model_overide_args: dict
@@ -84,4 +153,6 @@ def start_controller_process(
     except Exception:
         logger.error("Exception in ControllerSingle:\n" + get_exception_traceback())
     finally:
+        for t in controller.tp_procs:
+            os.kill(t.pid, 9)
         kill_parent_process()

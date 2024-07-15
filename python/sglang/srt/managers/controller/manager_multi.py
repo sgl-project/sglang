@@ -42,6 +42,8 @@ class LoadBalanceMethod(Enum):
 
 
 class Controller:
+    """A controller that manages multiple data parallel workers."""
+
     def __init__(
         self,
         load_balance_method: str,
@@ -183,9 +185,11 @@ def start_controller_process(
     except Exception:
         pipe_writer.send(get_exception_traceback())
         raise
-
     pipe_writer.send("init ok")
-    loop = asyncio.get_event_loop()
+
+    loop = asyncio.new_event_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=256))
+
     asyncio.set_event_loop(loop)
     loop.create_task(controller.loop_for_recv_requests())
     loop.run_until_complete(controller.loop_for_forward())

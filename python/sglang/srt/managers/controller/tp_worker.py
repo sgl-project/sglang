@@ -53,7 +53,7 @@ class ModelTpServer:
         tp_rank: int,
         server_args: ServerArgs,
         model_port_args: ModelPortArgs,
-        model_overide_args,
+        model_overide_args: dict,
     ):
         server_args, model_port_args = obtain(server_args), obtain(model_port_args)
         suppress_other_loggers()
