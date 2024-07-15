@@ -84,7 +84,7 @@ register_chat_template(
             "system": ("SYSTEM:", "\n"),
             "user": ("USER:", "\n"),
             "assistant": ("ASSISTANT:", "\n"),
-        }
+        },
     )
 )
 
@@ -177,7 +177,7 @@ register_chat_template(
             "assistant": ("", "<|im_end|>\n"),
         },
         style=ChatTemplateStyle.PLAIN,
-        stop_str=("<|im_end|>",)
+        stop_str=("<|im_end|>",),
     )
 )
 

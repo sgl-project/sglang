@@ -12,7 +12,6 @@ from sglang.utils import http_request
 
 
 class RuntimeEndpoint(BaseBackend):
-
     def __init__(
         self,
         base_url: str,
@@ -38,7 +37,8 @@ class RuntimeEndpoint(BaseBackend):
         self.model_info = res.json()
 
         self.chat_template = get_chat_template_by_model_path(
-            self.model_info["model_path"])
+            self.model_info["model_path"]
+        )
 
     def get_model_name(self):
         return self.model_info["model_path"]
@@ -124,7 +124,12 @@ class RuntimeEndpoint(BaseBackend):
         else:
             raise RuntimeError(f"Invalid dtype: {sampling_params.dtype}")
 
-        for item in ["return_logprob", "logprob_start_len", "top_logprobs_num", "return_text_in_logprobs"]:
+        for item in [
+            "return_logprob",
+            "logprob_start_len",
+            "top_logprobs_num",
+            "return_text_in_logprobs",
+        ]:
             value = getattr(sampling_params, item, None)
             if value is not None:
                 data[item] = value
@@ -171,7 +176,12 @@ class RuntimeEndpoint(BaseBackend):
         else:
             raise RuntimeError(f"Invalid dtype: {sampling_params.dtype}")
 
-        for item in ["return_logprob", "logprob_start_len", "top_logprobs_num", "return_text_in_logprobs"]:
+        for item in [
+            "return_logprob",
+            "logprob_start_len",
+            "top_logprobs_num",
+            "return_text_in_logprobs",
+        ]:
             value = getattr(sampling_params, item, None)
             if value is not None:
                 data[item] = value

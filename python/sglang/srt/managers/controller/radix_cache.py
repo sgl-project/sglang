@@ -82,12 +82,12 @@ class RadixCache:
 
         if self.disable:
             if del_in_memory_pool:
-                self.token_to_kv_pool.dec_refs(indices)
+                self.token_to_kv_pool.free(indices)
             else:
                 return torch.tensor([], dtype=torch.int64), self.root_node
 
         # Radix Cache takes one ref in memory pool
-        self.token_to_kv_pool.dec_refs(indices[last_uncached_pos:new_prefix_len])
+        self.token_to_kv_pool.free(indices[last_uncached_pos:new_prefix_len])
 
         if del_in_memory_pool:
             self.req_to_token_pool.free(req_pool_idx)
@@ -125,7 +125,8 @@ class RadixCache:
             if x.lock_ref > 0:
                 continue
 
-            num_evicted += evict_callback(x.value)
+            evict_callback(x.value)
+            num_evicted += len(x.value)
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0:

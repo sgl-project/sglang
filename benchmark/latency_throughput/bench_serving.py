@@ -297,7 +297,8 @@ def main(args: argparse.Namespace):
     benchmark_time = benchmark_end_time - benchmark_start_time
 
     # Compute the statistics.
-    avg_latency = np.mean([latency for _, _, latency in REQUEST_LATENCY])
+    latencies = [latency for _, _, latency in REQUEST_LATENCY]
+    avg_latency = np.mean(latencies)
     avg_per_token_latency = np.mean(
         [
             latency / (prompt_len + output_len)
@@ -310,6 +311,9 @@ def main(args: argparse.Namespace):
     decoding_throughput = (
         np.sum([output_len for _, output_len, _ in REQUEST_LATENCY]) / benchmark_time
     )
+
+    #latencies = [round(latency, 2) for _, _, latency in REQUEST_LATENCY]
+    #print(latencies)
 
     print(f"Total time: {benchmark_time:.2f} s")
     print(f"Request throughput: {args.num_prompts / benchmark_time:.2f} requests/s")

@@ -11,12 +11,17 @@ import torch
 import torch.nn as nn
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
-from vllm.distributed import init_distributed_environment, initialize_model_parallel
+from vllm.distributed import init_distributed_environment, initialize_model_parallel, get_tp_group
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
-from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode, InputMetadata, global_server_args_dict
+from sglang.srt.managers.controller.infer_batch import (
+    Batch,
+    ForwardMode,
+    InputMetadata,
+    global_server_args_dict,
+)
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -70,6 +75,7 @@ class ModelRunner:
             distributed_init_method=nccl_init_method,
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+        self.tp_group = get_tp_group()
         total_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
         )
@@ -83,7 +89,9 @@ class ModelRunner:
 
         # Set some global args
         global_server_args_dict["disable_flashinfer"] = server_args.disable_flashinfer
-        global_server_args_dict["attention_reduce_in_fp32"] = server_args.attention_reduce_in_fp32
+        global_server_args_dict[
+            "attention_reduce_in_fp32"
+        ] = server_args.attention_reduce_in_fp32
 
         # Load the model and create memory pool
         self.load_model()
@@ -217,7 +225,9 @@ class ModelRunner:
             self.flashinfer_workspace_buffers[1], "NHD"
         )
         self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-            self.flashinfer_workspace_buffers[0], "NHD", use_tensor_cores=use_tensor_cores
+            self.flashinfer_workspace_buffers[0],
+            "NHD",
+            use_tensor_cores=use_tensor_cores,
         )
 
     def init_cuda_graphs(self):
@@ -229,7 +239,9 @@ class ModelRunner:
 
         logger.info(f"[gpu_id={self.gpu_id}] Capture cuda graph begin.")
         batch_size_list = [1, 2, 4] + [i * 8 for i in range(1, 16)]
-        self.cuda_graph_runner = CudaGraphRunner(self, max_batch_size_to_capture=max(batch_size_list))
+        self.cuda_graph_runner = CudaGraphRunner(
+            self, max_batch_size_to_capture=max(batch_size_list)
+        )
         self.cuda_graph_runner.capture(batch_size_list)
 
     @torch.inference_mode()
