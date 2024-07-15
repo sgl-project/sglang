@@ -25,7 +25,8 @@ class GlobalConfig:
         # This can improve the speed for large batch sizes during prefill.
         self.layer_sync_threshold = 8192
 
-        # Runtime constants: Flashinfer
+        # Runtime constants: others
+        self.num_continue_decode_steps = 10
         self.flashinfer_workspace_size = 192 * 1024 * 1024
 
         # Output tokenization configs
