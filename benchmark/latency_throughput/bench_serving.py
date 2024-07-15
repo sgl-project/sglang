@@ -297,7 +297,8 @@ def main(args: argparse.Namespace):
     benchmark_time = benchmark_end_time - benchmark_start_time
 
     # Compute the statistics.
-    avg_latency = np.mean([latency for _, _, latency in REQUEST_LATENCY])
+    latencies = [latency for _, _, latency in REQUEST_LATENCY]
+    avg_latency = np.mean(latencies)
     avg_per_token_latency = np.mean(
         [
             latency / (prompt_len + output_len)
