@@ -16,7 +16,9 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv python3-pip \
     && if [ "${PYTHON_VERSION}" != "3" ]; then update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1; fi \
     && python3 --version \
-    && python3 -m pip --version
+    && python3 -m pip --version \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 RUN apt-get update -y \
     && apt-get install -y python3-pip git curl sudo
