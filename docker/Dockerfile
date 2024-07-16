@@ -29,9 +29,10 @@ RUN ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/
 
 WORKDIR /sgl-workspace
 
-RUN pip3 install --upgrade pip
-RUN pip3 install "sglang[all]"
-RUN pip3 uninstall -y triton triton-nightly && pip3 install --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly
-RUN pip3 install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
+RUN pip3 --no-cache-dir install --upgrade pip \
+    && pip3 --no-cache-dir install "sglang[all]" \
+    && pip3 --no-cache-dir uninstall -y triton triton-nightly \
+    && pip3 --no-cache-dir install --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly \
+    && pip3 --no-cache-dir install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 
 ENV DEBIAN_FRONTEND=interactive
