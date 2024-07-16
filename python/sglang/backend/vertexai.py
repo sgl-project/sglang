@@ -14,15 +14,12 @@ try:
         GenerativeModel,
         Image,
     )
-    from vertexai.generative_models._generative_models import SafetySettingsType
 except ImportError as e:
     GenerativeModel = e
 
 
 class VertexAI(BaseBackend):
-    def __init__(
-        self, model_name, safety_settings: Optional[SafetySettingsType] = None
-    ):
+    def __init__(self, model_name, safety_settings=None):
         super().__init__()
 
         if isinstance(GenerativeModel, Exception):
