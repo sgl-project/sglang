@@ -98,6 +98,8 @@ class TokenToKVPool:
         self.can_use_mem_size += len(free_index)
 
     def clear(self):
+        self.prefetch_buffer = torch.empty(0, device="cuda", dtype=torch.int32)
+
         self.mem_state.fill_(True)
         self.can_use_mem_size = self.size
 

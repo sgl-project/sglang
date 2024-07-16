@@ -284,23 +284,26 @@ def main(server_args, bench_args):
     else:
         work_func = latency_test
 
-    workers = []
-    for tp_rank in range(server_args.tp_size):
-        proc = multiprocessing.Process(
-            target=work_func,
-            args=(
-                server_args,
-                bench_args,
-                tp_rank,
-            ),
-        )
-        proc.start()
-        workers.append(proc)
+    if server_args.tp_size == 1:
+        work_func(server_args, bench_args, 0)
+    else:
+        workers = []
+        for tp_rank in range(server_args.tp_size):
+            proc = multiprocessing.Process(
+                target=work_func,
+                args=(
+                    server_args,
+                    bench_args,
+                    tp_rank,
+                ),
+            )
+            proc.start()
+            workers.append(proc)
 
-    for proc in workers:
-        proc.join()
+        for proc in workers:
+            proc.join()
 
-    proc.terminate()
+        proc.terminate()
 
 
 if __name__ == "__main__":

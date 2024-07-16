@@ -96,6 +96,7 @@ class ControllerSingle:
     def __init__(self, server_args: ServerArgs, port_args: PortArgs, model_overide_args: dict):
         # Parse args
         self.server_args = server_args
+        self.tp_procs = []
 
         # Init communication
         context = zmq.Context(2)
