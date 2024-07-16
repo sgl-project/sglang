@@ -58,7 +58,7 @@ docker run --gpus all \
     --env "HUGGING_FACE_HUB_TOKEN=<secret>" \
     --ipc=host \
     lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --host 0.0.0.0 --port 30000
+    python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B --host 0.0.0.0 --port 30000
 ```
 
 ### Common Notes
