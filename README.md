@@ -51,6 +51,16 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 ### Method 3: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags).
 
+```bash
+docker run --gpus all \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HUGGING_FACE_HUB_TOKEN=<secret>" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --host 0.0.0.0 --port 30000
+```
+
 ### Common Notes
 - If you see errors from the Triton compiler, please install the [Triton Nightly](https://triton-lang.org/main/getting-started/installation.html) by
 ```
