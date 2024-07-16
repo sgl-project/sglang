@@ -102,8 +102,8 @@ def run_one_batch_size(bs):
     output_throughput = bs * max_new_tokens / latency
     overall_throughput = bs * (input_len + output_len) / latency
     print(f"latency: {latency:.2f} s")
-    print(f"decode throughput: {output_throughput:.2f} token/s")
-    print(f"overall throughput: {overall_throughput:.2f} token/s")
+    print(f"output throughput: {output_throughput:.2f} token/s")
+    print(f"(input + output) throughput: {overall_throughput:.2f} token/s")
 
     with open("results.jsonl", "a") as fout:
         res = {
