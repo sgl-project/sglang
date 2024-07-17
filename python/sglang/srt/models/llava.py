@@ -95,6 +95,7 @@ class LlavaLlamaForCausalLM(nn.Module):
 
         return image_features
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.LongTensor,

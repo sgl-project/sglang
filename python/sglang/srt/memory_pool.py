@@ -21,7 +21,9 @@ class ReqToTokenPool:
         if need_size > self.can_use_mem_size:
             return None
 
-        select_index = torch.nonzero(self.mem_state).squeeze(1)[:need_size].to(torch.int32)
+        select_index = (
+            torch.nonzero(self.mem_state).squeeze(1)[:need_size].to(torch.int32)
+        )
         self.mem_state[select_index] = False
         self.can_use_mem_size -= need_size
 
@@ -79,7 +81,9 @@ class TokenToKVPool:
 
         addition_size = need_size - buffer_len
         alloc_size = max(addition_size, self.prefetch_chunk_size)
-        select_index = torch.nonzero(self.mem_state).squeeze(1)[:alloc_size].to(torch.int32)
+        select_index = (
+            torch.nonzero(self.mem_state).squeeze(1)[:alloc_size].to(torch.int32)
+        )
 
         if select_index.shape[0] < addition_size:
             return None
@@ -98,6 +102,8 @@ class TokenToKVPool:
         self.can_use_mem_size += len(free_index)
 
     def clear(self):
+        self.prefetch_buffer = torch.empty(0, device="cuda", dtype=torch.int32)
+
         self.mem_state.fill_(True)
         self.can_use_mem_size = self.size
 

@@ -15,23 +15,40 @@ incorrect:
 export OPENAI_API_KEY=sk-******
 python3 openai_chat_speculative.py
 """
+
 import sglang as sgl
-from sglang import function, set_default_backend, OpenAI
+from sglang import OpenAI, function, set_default_backend
 
 
 @function(num_api_spec_tokens=256)
 def gen_character_spec(s):
     s += sgl.system("You are a helpful assistant.")
     s += sgl.user("Construct a character within the following format:")
-    s += sgl.assistant("Name: Steve Jobs.\nBirthday: February 24, 1955.\nJob: Apple CEO.\n")
+    s += sgl.assistant(
+        "Name: Steve Jobs.\nBirthday: February 24, 1955.\nJob: Apple CEO.\n"
+    )
     s += sgl.user("Please generate new Name, Birthday and Job.\n")
-    s += sgl.assistant("Name:" + sgl.gen("name", stop="\n") + "\nBirthday:" + sgl.gen("birthday", stop="\n") + "\nJob:" + sgl.gen("job", stop="\n"))
+    s += sgl.assistant(
+        "Name:"
+        + sgl.gen("name", stop="\n")
+        + "\nBirthday:"
+        + sgl.gen("birthday", stop="\n")
+        + "\nJob:"
+        + sgl.gen("job", stop="\n")
+    )
 
 
 @function(num_api_spec_tokens=256)
 def gen_character_spec_no_few_shot(s):
     s += sgl.user("Construct a character. For each field stop with a newline\n")
-    s += sgl.assistant("Name:" + sgl.gen("name", stop="\n") + "\nAge:" + sgl.gen("age", stop="\n") + "\nJob:" + sgl.gen("job", stop="\n"))
+    s += sgl.assistant(
+        "Name:"
+        + sgl.gen("name", stop="\n")
+        + "\nAge:"
+        + sgl.gen("age", stop="\n")
+        + "\nJob:"
+        + sgl.gen("job", stop="\n")
+    )
 
 
 @function
@@ -45,10 +62,19 @@ def gen_character_normal(s):
 def multi_turn_question(s, question_1, question_2):
     s += sgl.system("You are a helpful assistant.")
     s += sgl.user("Answer questions in the following format:")
-    s += sgl.user("Question 1: What is the capital of France?\nQuestion 2: What is the population of this city?\n")
-    s += sgl.assistant("Answer 1: The capital of France is Paris.\nAnswer 2: The population of Paris in 2024 is estimated to be around 2.1 million for the city proper.\n")
-    s += sgl.user("Question 1: " + question_1+"\nQuestion 2: " + question_2)
-    s += sgl.assistant("Answer 1: " + sgl.gen("answer_1", stop="\n") + "\nAnswer 2: " + sgl.gen("answer_2", stop="\n"))
+    s += sgl.user(
+        "Question 1: What is the capital of France?\nQuestion 2: What is the population of this city?\n"
+    )
+    s += sgl.assistant(
+        "Answer 1: The capital of France is Paris.\nAnswer 2: The population of Paris in 2024 is estimated to be around 2.1 million for the city proper.\n"
+    )
+    s += sgl.user("Question 1: " + question_1 + "\nQuestion 2: " + question_2)
+    s += sgl.assistant(
+        "Answer 1: "
+        + sgl.gen("answer_1", stop="\n")
+        + "\nAnswer 2: "
+        + sgl.gen("answer_2", stop="\n")
+    )
 
 
 def test_spec_single_turn():
@@ -97,7 +123,7 @@ def test_spec_multi_turn_stream():
     state = multi_turn_question.run(
         question_1="What is the capital of the United States?",
         question_2="List two local attractions.",
-        stream=True
+        stream=True,
     )
 
     for out in state.text_iter():

@@ -355,6 +355,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.sampler = Sampler()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -400,9 +401,11 @@ class Qwen2MoeForCausalLM(nn.Module):
             # These are the weights for the experts
             # (param_name, weight_name, expert_id, shard_id)
             (
-                "experts.w13_weight"
-                if weight_name in ["gate_proj", "up_proj"]
-                else "experts.w2_weight",
+                (
+                    "experts.w13_weight"
+                    if weight_name in ["gate_proj", "up_proj"]
+                    else "experts.w2_weight"
+                ),
                 f"experts.{expert_id}.{weight_name}.weight",
                 expert_id,
                 shard_id,
@@ -417,7 +420,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue

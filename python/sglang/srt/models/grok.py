@@ -601,6 +601,7 @@ class Grok1ModelForCausalLM(nn.Module):
         # Monkey patch _prepare_weights to load pre-sharded weights
         setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

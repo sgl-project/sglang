@@ -3,13 +3,18 @@ Usage:
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 python readme_examples.py
 """
+
 import sglang as sgl
 
 
 @sgl.function
 def tool_use(s, question):
     s += "To answer this question: " + question + ". "
-    s += "I need to use a " + sgl.gen("tool", choices=["calculator", "search engine"]) + ". "
+    s += (
+        "I need to use a "
+        + sgl.gen("tool", choices=["calculator", "search engine"])
+        + ". "
+    )
 
     if s["tool"] == "calculator":
         s += "The math expression is" + sgl.gen("expression")
@@ -75,7 +80,7 @@ def driver_batching():
             {"question": "What is the capital of France?"},
             {"question": "What is the capital of Japan?"},
         ],
-        progress_bar=True
+        progress_bar=True,
     )
 
     for s in states:
@@ -85,9 +90,7 @@ def driver_batching():
 
 def driver_stream():
     state = text_qa.run(
-        question="What is the capital of France?",
-        temperature=0.1,
-        stream=True
+        question="What is the capital of France?", temperature=0.1, stream=True
     )
 
     for out in state.text_iter():
@@ -96,7 +99,7 @@ def driver_stream():
 
 
 if __name__ == "__main__":
-    #sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo-instruct"))
+    # sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo-instruct"))
     sgl.set_default_backend(sgl.RuntimeEndpoint("http://localhost:30000"))
 
     driver_tool_use()
