@@ -228,23 +228,7 @@ class ModelTpServer:
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
-                        num_used = self.max_total_num_tokens - (
-                            self.token_to_kv_pool.available_size()
-                            + self.tree_cache.evictable_size()
-                        )
-                        throughput = self.num_generated_tokens / (
-                            time.time() - self.last_stats_tic
-                        )
-                        self.num_generated_tokens = 0
-                        self.last_stats_tic = time.time()
-                        logger.info(
-                            f"[gpu_id={self.gpu_id}] Decode batch. "
-                            f"#running-req: {len(self.running_batch.reqs)}, "
-                            f"#token: {num_used}, "
-                            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                            f"gen throughput (token/s): {throughput:.2f}, "
-                            f"#queue-req: {len(self.forward_queue)}"
-                        )
+                        self.print_stats()
 
                     if self.running_batch.is_empty():
                         self.running_batch = None
@@ -253,17 +237,38 @@ class ModelTpServer:
                     if self.out_pyobjs and self.running_batch.has_stream():
                         break
             else:
-                # Check the available size
-                available_size = (
-                    self.token_to_kv_pool.available_size()
-                    + self.tree_cache.evictable_size()
-                )
-                if available_size != self.max_total_num_tokens:
-                    warnings.warn(
-                        "Warning: "
-                        f"available_size={available_size}, max_total_num_tokens={self.max_total_num_tokens}\n"
-                        "KV cache pool leak detected!"
-                    )
+                self.check_memory()
+
+    def print_stats(self):
+        num_used = self.max_total_num_tokens - (
+            self.token_to_kv_pool.available_size()
+            + self.tree_cache.evictable_size()
+        )
+        throughput = self.num_generated_tokens / (
+            time.time() - self.last_stats_tic
+        )
+        self.num_generated_tokens = 0
+        self.last_stats_tic = time.time()
+        logger.info(
+            f"[gpu_id={self.gpu_id}] Decode batch. "
+            f"#running-req: {len(self.running_batch.reqs)}, "
+            f"#token: {num_used}, "
+            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            f"gen throughput (token/s): {throughput:.2f}, "
+            f"#queue-req: {len(self.forward_queue)}"
+        )
+
+    def check_memory(self):
+        available_size = (
+            self.token_to_kv_pool.available_size()
+            + self.tree_cache.evictable_size()
+        )
+        if available_size != self.max_total_num_tokens:
+            warnings.warn(
+                "Warning: "
+                f"available_size={available_size}, max_total_num_tokens={self.max_total_num_tokens}\n"
+                "KV cache pool leak detected!"
+            )
 
     def handle_generate_request(
         self,
