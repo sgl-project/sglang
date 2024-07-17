@@ -95,9 +95,6 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
     request = CompletionRequest(**request_json)
 
-    if request.n != 1:
-        return create_error_response("n != 1 is not supported")
-
     adapted_request = GenerateReqInput(
         text=request.prompt,
         sampling_params={
@@ -108,6 +105,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
             "regex": request.regex,
+            "n": request.n,
         },
         return_logprob=request.logprobs is not None and request.logprobs > 0,
         top_logprobs_num=request.logprobs if request.logprobs is not None else 0,
@@ -202,46 +200,57 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     except ValueError as e:
         return create_error_response(str(e))
 
-    ret = ret[0] if isinstance(ret, list) else ret
-    prompt_tokens = ret["meta_info"]["prompt_tokens"]
-    completion_tokens = ret["meta_info"]["completion_tokens"]
-    text = ret["text"]
-    if request.echo:
-        text = request.prompt + text
+    if not isinstance(ret, list):
+        ret = [ret]
+    choices = []
 
-    if request.logprobs:
+    for idx, ret_item in enumerate(ret):
+        text = ret_item["text"]
+
         if request.echo:
-            prefill_token_logprobs = ret["meta_info"]["prefill_token_logprobs"]
-            prefill_top_logprobs = ret["meta_info"]["prefill_top_logprobs"]
+            text = request.prompt + text
+
+
+        if request.logprobs:
+            if request.echo:
+                prefill_token_logprobs = ret_item["meta_info"]["prefill_token_logprobs"]
+                prefill_top_logprobs = ret_item["meta_info"]["prefill_top_logprobs"]
+            else:
+                prefill_token_logprobs = None
+                prefill_top_logprobs = None
+
+            logprobs = to_openai_style_logprobs(
+                prefill_token_logprobs=prefill_token_logprobs,
+                prefill_top_logprobs=prefill_top_logprobs,
+                decode_token_logprobs=ret_item["meta_info"]["decode_token_logprobs"],
+                decode_top_logprobs=ret_item["meta_info"]["decode_top_logprobs"],
+            )
         else:
-            prefill_token_logprobs = None
-            prefill_top_logprobs = None
+            logprobs = None
 
-        logprobs = to_openai_style_logprobs(
-            prefill_token_logprobs=prefill_token_logprobs,
-            prefill_top_logprobs=prefill_top_logprobs,
-            decode_token_logprobs=ret["meta_info"]["decode_token_logprobs"],
-            decode_top_logprobs=ret["meta_info"]["decode_top_logprobs"],
+        choice_data = CompletionResponseChoice(
+            index=idx,
+            text=text,
+            logprobs=logprobs,
+            finish_reason=ret_item["meta_info"]["finish_reason"],
         )
-    else:
-        logprobs = None
 
-    choice_data = CompletionResponseChoice(
-        index=0,
-        text=text,
-        logprobs=logprobs,
-        finish_reason=ret["meta_info"]["finish_reason"],
-    )
+        choices.append(choice_data)
+
     response = CompletionResponse(
-        id=ret["meta_info"]["id"],
+        id=ret[0]["meta_info"]["id"],
         model=request.model,
-        choices=[choice_data],
+        choices=choices,
         usage=UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens=ret[0]["meta_info"]["prompt_tokens"],
+            completion_tokens=sum(
+                item["meta_info"]["completion_tokens"] for item in ret
+            ),
+            total_tokens=ret[0]["meta_info"]["prompt_tokens"]
+            + sum(item["meta_info"]["completion_tokens"] for item in ret),
         ),
     )
+
     return response
 
 
@@ -249,8 +258,8 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
     request = ChatCompletionRequest(**request_json)
 
-    if request.n != 1:
-        return create_error_response("n != 1 is not supported")
+    # if request.n != 1:
+    #     return create_error_response("n != 1 is not supported")
 
     # Prep the data needed for the underlying GenerateReqInput:
     #  - prompt: The full prompt string.
@@ -292,6 +301,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
             "regex": request.regex,
+            "n": request.n,
         },
         stream=request.stream,
     )
@@ -354,23 +364,37 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     except ValueError as e:
         return create_error_response(str(e))
 
-    prompt_tokens = ret["meta_info"]["prompt_tokens"]
-    completion_tokens = ret["meta_info"]["completion_tokens"]
-    choice_data = ChatCompletionResponseChoice(
-        index=0,
-        message=ChatMessage(role="assistant", content=ret["text"]),
-        finish_reason=ret["meta_info"]["finish_reason"],
-    )
+    if not isinstance(ret, list):
+        ret = [ret]
+    choices = []
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    for idx, ret_item in enumerate(ret):
+        prompt_tokens = ret_item["meta_info"]["prompt_tokens"]
+        completion_tokens = ret_item["meta_info"]["completion_tokens"]
+
+        choice_data = ChatCompletionResponseChoice(
+            index=idx,
+            message=ChatMessage(role="assistant", content=ret_item["text"]),
+            finish_reason=ret_item["meta_info"]["finish_reason"],
+        )
+
+        choices.append(choice_data)
+        total_prompt_tokens = prompt_tokens
+        total_completion_tokens += completion_tokens
+
     response = ChatCompletionResponse(
-        id=ret["meta_info"]["id"],
+        id=ret[0]["meta_info"]["id"],
         model=request.model,
-        choices=[choice_data],
+        choices=choices,
         usage=UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens=total_prompt_tokens,
+            completion_tokens=total_completion_tokens,
+            total_tokens=total_prompt_tokens + total_completion_tokens,
         ),
     )
+
     return response
 
 

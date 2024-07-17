@@ -20,6 +20,7 @@ class SamplingParams:
         spaces_between_special_tokens: bool = True,
         dtype: Optional[str] = None,
         regex: Optional[str] = None,
+        n: int = 1,
     ) -> None:
         self.temperature = temperature
         self.top_p = top_p
@@ -33,6 +34,7 @@ class SamplingParams:
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self.dtype = dtype
         self.regex = regex
+        self.n = n
 
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:

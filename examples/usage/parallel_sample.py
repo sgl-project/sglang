@@ -27,7 +27,7 @@ def parallel_sample(s, question, n):
 
 
 sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo-instruct"))
-#sgl.set_default_backend(sgl.RuntimeEndpoint("http://localhost:30000"))
+# sgl.set_default_backend(sgl.RuntimeEndpoint("http://localhost:30000"))
 
 state = parallel_sample.run(
     question="Compute 5 + 2 + 4.",

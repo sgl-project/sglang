@@ -206,15 +206,68 @@ class TokenizerManager:
             else:
                 bs = len(obj.input_ids)
 
-            for i in range(bs):
-                rid = obj.rid[i]
+            parallel_sample_num = obj.sampling_params[0].get("n", 1)
+            if parallel_sample_num != 1:
+                bs = parallel_sample_num + 1
+                input_text = obj.text
+                input_ids = self.tokenizer.encode(obj.text)
 
-                if obj.input_ids is None:
-                    input_text = obj.text[i]
-                    input_ids = self.tokenizer.encode(obj.text[i])
+                ## deal with the first prefill
+                rid = obj.rid[0]
+                sampling_params = SamplingParams(**obj.sampling_params[0])
+                sampling_params.max_new_tokens = 0
+                if obj.image_data[0] is None:
+                    pixel_values, image_hash, image_size = None, None, None
                 else:
-                    input_text = None
-                    input_ids = obj.input_ids[i]
+                    pixel_values, image_hash, image_size = await self.get_pixel_values(
+                        obj.image_data[0]
+                    )
+                tokenized_obj = TokenizedGenerateReqInput(
+                    rid=rid,
+                    input_text=input_text,
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    image_hash=image_hash,
+                    image_size=image_size,
+                    sampling_params=sampling_params,
+                    return_logprob=obj.return_logprob[0],
+                    logprob_start_len=obj.logprob_start_len[0],
+                    top_logprobs_num=obj.top_logprobs_num[0],
+                    stream=obj.stream,
+                )
+                self.send_to_router.send_pyobj(tokenized_obj)
+
+                event = asyncio.Event()
+                state = ReqState([], False, event)
+                self.rid_to_state[rid] = state
+
+                state = self.rid_to_state[rid]
+
+                while True:
+                    try:
+                        await asyncio.wait_for(state.event.wait(), timeout=4)
+                        break
+                    except asyncio.TimeoutError:
+                        if request is not None and await request.is_disconnected():
+                            for rid in obj.rid:
+                                self.abort_request(rid)
+                            raise ValueError(f"Abort request {rid}")
+                        continue
+
+                assert state.finished
+                del self.rid_to_state[rid]
+
+            for i in range(bs):
+                if i == 0 and parallel_sample_num != 1:
+                    continue
+                rid = obj.rid[i]
+                if parallel_sample_num == 1:
+                    if obj.input_ids is None:
+                        input_text = obj.text[i]
+                        input_ids = self.tokenizer.encode(obj.text[i])
+                    else:
+                        input_text = None
+                        input_ids = obj.input_ids[i]
 
                 sampling_params = SamplingParams(**obj.sampling_params[i])
                 if sampling_params.max_new_tokens != 0:
@@ -247,6 +300,8 @@ class TokenizerManager:
 
             output_list = []
             for i in range(bs):
+                if i == 0 and parallel_sample_num != 1:
+                    continue
                 rid = obj.rid[i]
                 state = self.rid_to_state[rid]
 
@@ -260,7 +315,6 @@ class TokenizerManager:
                                 self.abort_request(rid)
                             raise ValueError(f"Abort request {rid}")
                         continue
-
                 output_list.append(
                     self.convert_logprob_style(
                         state.out_list[-1],
@@ -335,15 +389,16 @@ class TokenizerManager:
             )
 
             if top_logprobs_num > 0:
-                ret["meta_info"][
-                    "prefill_top_logprobs"
-                ] = self.detokenize_top_logprobs_tokens(
-                    ret["meta_info"]["prefill_top_logprobs"], return_text_in_logprobs
+                ret["meta_info"]["prefill_top_logprobs"] = (
+                    self.detokenize_top_logprobs_tokens(
+                        ret["meta_info"]["prefill_top_logprobs"],
+                        return_text_in_logprobs,
+                    )
                 )
-                ret["meta_info"][
-                    "decode_top_logprobs"
-                ] = self.detokenize_top_logprobs_tokens(
-                    ret["meta_info"]["decode_top_logprobs"], return_text_in_logprobs
+                ret["meta_info"]["decode_top_logprobs"] = (
+                    self.detokenize_top_logprobs_tokens(
+                        ret["meta_info"]["decode_top_logprobs"], return_text_in_logprobs
+                    )
                 )
         return ret
 
