@@ -20,12 +20,7 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
-from sglang.srt.managers.controller.infer_batch import (
-    Batch,
-    ForwardMode,
-    InputMetadata,
-    global_server_args_dict,
-)
+from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode, InputMetadata
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -90,12 +85,6 @@ class ModelRunner:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
                 )
-
-        # Set some global args
-        global_server_args_dict["disable_flashinfer"] = server_args.disable_flashinfer
-        global_server_args_dict["attention_reduce_in_fp32"] = (
-            server_args.attention_reduce_in_fp32
-        )
 
         # Load the model and create memory pool
         self.load_model()

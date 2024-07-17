@@ -7,8 +7,8 @@ from torch import nn
 from sglang.global_config import global_config
 from sglang.srt.layers.extend_attention import extend_attention_fwd
 from sglang.srt.layers.token_attention import token_attention_fwd
-from sglang.srt.managers.controller.infer_batch import global_server_args_dict
 from sglang.srt.managers.controller.model_runner import ForwardMode, InputMetadata
+from sglang.srt.server import global_server_args_dict
 
 
 class RadixAttention(nn.Module):
