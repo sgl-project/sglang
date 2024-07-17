@@ -3,9 +3,10 @@
 import bisect
 
 import torch
+from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.distributed.parallel_state import graph_capture
 
-from sglang.global_config import global_config
 from sglang.srt.layers.logits_processor import LogitProcessorOutput
 from sglang.srt.managers.controller.infer_batch import (
     Batch,
@@ -74,9 +75,6 @@ class CudaGraphRunner:
                 self.flashinfer_handlers[bs] = flashinfer_handler
 
     def capture_one_batch_size(self, bs):
-        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
-        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
-
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
 
