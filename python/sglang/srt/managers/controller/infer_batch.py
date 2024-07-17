@@ -680,7 +680,7 @@ class Batch:
                         req.regex_fsm_state, batch_next_token_ids_cpu[i]
                     )
 
-        return batch_next_token_ids, _
+        return batch_next_token_ids
 
 
 @dataclass
