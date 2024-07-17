@@ -11,7 +11,11 @@ import torch
 import torch.nn as nn
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
-from vllm.distributed import init_distributed_environment, initialize_model_parallel, get_tp_group
+from vllm.distributed import (
+    get_tp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
@@ -89,9 +93,9 @@ class ModelRunner:
 
         # Set some global args
         global_server_args_dict["disable_flashinfer"] = server_args.disable_flashinfer
-        global_server_args_dict[
-            "attention_reduce_in_fp32"
-        ] = server_args.attention_reduce_in_fp32
+        global_server_args_dict["attention_reduce_in_fp32"] = (
+            server_args.attention_reduce_in_fp32
+        )
 
         # Load the model and create memory pool
         self.load_model()

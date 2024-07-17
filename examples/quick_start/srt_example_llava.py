@@ -1,6 +1,7 @@
 """
 Usage: python3 srt_example_llava.py
 """
+
 import sglang as sgl
 
 
@@ -12,9 +13,8 @@ def image_qa(s, image_path, question):
 
 def single():
     state = image_qa.run(
-        image_path="images/cat.jpeg",
-        question="What is this?",
-        max_new_tokens=128)
+        image_path="images/cat.jpeg", question="What is this?", max_new_tokens=128
+    )
     print(state["answer"], "\n")
 
 
@@ -23,7 +23,8 @@ def stream():
         image_path="images/cat.jpeg",
         question="What is this?",
         max_new_tokens=64,
-        stream=True)
+        stream=True,
+    )
 
     for out in state.text_iter("answer"):
         print(out, end="", flush=True)
@@ -33,8 +34,8 @@ def stream():
 def batch():
     states = image_qa.run_batch(
         [
-            {"image_path": "images/cat.jpeg", "question":"What is this?"},
-            {"image_path": "images/dog.jpeg", "question":"What is this?"},
+            {"image_path": "images/cat.jpeg", "question": "What is this?"},
+            {"image_path": "images/dog.jpeg", "question": "What is this?"},
         ],
         max_new_tokens=128,
     )
@@ -43,8 +44,10 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(model_path="liuhaotian/llava-v1.6-vicuna-7b",
-                          tokenizer_path="llava-hf/llava-1.5-7b-hf")
+    runtime = sgl.Runtime(
+        model_path="liuhaotian/llava-v1.6-vicuna-7b",
+        tokenizer_path="llava-hf/llava-1.5-7b-hf",
+    )
     sgl.set_default_backend(runtime)
     print(f"chat template: {runtime.endpoint.chat_template.name}")
 

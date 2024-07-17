@@ -241,12 +241,9 @@ class ModelTpServer:
 
     def print_stats(self):
         num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool.available_size()
-            + self.tree_cache.evictable_size()
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        throughput = self.num_generated_tokens / (
-            time.time() - self.last_stats_tic
-        )
+        throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
         logger.info(
@@ -260,8 +257,7 @@ class ModelTpServer:
 
     def check_memory(self):
         available_size = (
-            self.token_to_kv_pool.available_size()
-            + self.tree_cache.evictable_size()
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
         if available_size != self.max_total_num_tokens:
             warnings.warn(
@@ -348,7 +344,8 @@ class ModelTpServer:
         if self.running_batch:
             available_size -= sum(
                 [
-                    (r.sampling_params.max_new_tokens - len(r.output_ids)) * self.new_token_ratio
+                    (r.sampling_params.max_new_tokens - len(r.output_ids))
+                    * self.new_token_ratio
                     for r in self.running_batch.reqs
                 ]
             )
@@ -370,7 +367,9 @@ class ModelTpServer:
                     req.image_offset += 1
 
             if (
-                req.extend_input_len + req.sampling_params.max_new_tokens + new_batch_total_tokens
+                req.extend_input_len
+                + req.sampling_params.max_new_tokens
+                + new_batch_total_tokens
                 < available_size
                 and (
                     req.extend_input_len + new_batch_input_tokens
@@ -382,7 +381,9 @@ class ModelTpServer:
                 available_size += delta
 
                 if not (
-                    req.extend_input_len + req.sampling_params.max_new_tokens + new_batch_total_tokens
+                    req.extend_input_len
+                    + req.sampling_params.max_new_tokens
+                    + new_batch_total_tokens
                     < available_size
                 ):
                     # Undo locking

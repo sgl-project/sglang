@@ -1,7 +1,7 @@
 """A controller that manages a group of tensor parallel workers."""
 
-import multiprocessing
 import logging
+import multiprocessing
 import os
 import pickle
 
@@ -11,10 +11,9 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.managers.controller.tp_worker import ModelTpServer
-from sglang.srt.server_args import PortArgs, ServerArgs, ModelPortArgs
+from sglang.srt.server_args import ModelPortArgs, PortArgs, ServerArgs
 from sglang.srt.utils import kill_parent_process
 from sglang.utils import get_exception_traceback
-
 
 logger = logging.getLogger("srt.controller")
 
@@ -45,14 +44,16 @@ def run_tp_server(
         raise
 
 
-def launch_tp_servers(gpu_ids, tp_rank_range, server_args,
-                      model_port_args, model_overide_args):
+def launch_tp_servers(
+    gpu_ids, tp_rank_range, server_args, model_port_args, model_overide_args
+):
     """Launch multiple tp servers."""
     procs = []
     for i in tp_rank_range:
-        proc = multiprocessing.Process(target=run_tp_server, args=(
-            gpu_ids[i], i, server_args, model_port_args, model_overide_args
-        ))
+        proc = multiprocessing.Process(
+            target=run_tp_server,
+            args=(gpu_ids[i], i, server_args, model_port_args, model_overide_args),
+        )
         proc.start()
         procs.append(proc)
 
@@ -93,7 +94,9 @@ def broadcast_recv_input(data, rank, dist_group):
 class ControllerSingle:
     """A controller that manages a group of tensor parallel workers."""
 
-    def __init__(self, server_args: ServerArgs, port_args: PortArgs, model_overide_args: dict):
+    def __init__(
+        self, server_args: ServerArgs, port_args: PortArgs, model_overide_args: dict
+    ):
         # Parse args
         self.server_args = server_args
         self.tp_procs = []
@@ -116,8 +119,12 @@ class ControllerSingle:
         if tp_size_local > 1:
             tp_rank_range = range(1, tp_size_local)
             self.tp_procs = launch_tp_servers(
-                gpu_ids, tp_rank_range, server_args,
-                port_args.model_port_args[0], model_overide_args)
+                gpu_ids,
+                tp_rank_range,
+                server_args,
+                port_args.model_port_args[0],
+                model_overide_args,
+            )
 
         # Launch tp rank 0
         self.tp_server = ModelTpServer(

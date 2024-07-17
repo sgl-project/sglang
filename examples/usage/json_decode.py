@@ -3,10 +3,12 @@ Usage:
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 python json_decode.py
 """
+
 from enum import Enum
 
-import sglang as sgl
 from pydantic import BaseModel
+
+import sglang as sgl
 from sglang.srt.constrained import build_regex_from_object
 
 character_regex = (
