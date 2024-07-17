@@ -210,7 +210,6 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
         if request.echo:
             text = request.prompt + text
 
-
         if request.logprobs:
             if request.echo:
                 prefill_token_logprobs = ret_item["meta_info"]["prefill_token_logprobs"]
@@ -257,9 +256,6 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
     request = ChatCompletionRequest(**request_json)
-
-    # if request.n != 1:
-    #     return create_error_response("n != 1 is not supported")
 
     # Prep the data needed for the underlying GenerateReqInput:
     #  - prompt: The full prompt string.
