@@ -16,9 +16,6 @@ from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
-# Store some global server args
-global_server_args_dict = {}
-
 
 class ForwardMode(IntEnum):
     # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.

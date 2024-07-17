@@ -64,6 +64,9 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 app = FastAPI()
 tokenizer_manager = None
 
+# Put some args for easily access
+global_server_args_dict = {}
+
 
 @app.get("/health")
 async def health() -> Response:
@@ -135,6 +138,14 @@ async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
 
 
+def _set_global_server_args(server_args: ServerArgs):
+    global global_server_args_dict
+    global_server_args_dict = {
+        "disable_flashinfer": server_args.disable_flashinfer,
+        "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
+    }
+
+
 def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_args=None):
     global tokenizer_manager
 
@@ -162,6 +173,8 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
     if server_args.chat_template:
         # TODO: replace this with huggingface transformers template
         load_chat_template_for_openai_api(server_args.chat_template)
+
+    _set_global_server_args(server_args)
 
     # Allocate ports
     assert server_args.tp_size % server_args.nnodes == 0
