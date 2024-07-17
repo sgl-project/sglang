@@ -32,8 +32,8 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.controller.manager_multi import (
     start_controller_process as start_controller_process_multi,
 )
+from sglang.srt.managers.controller.manager_single import launch_tp_servers
 from sglang.srt.managers.controller.manager_single import (
-    launch_tp_servers,
     start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
@@ -198,11 +198,22 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 
         if server_args.node_rank != 0:
             tp_size_local = server_args.tp_size // server_args.nnodes
-            gpu_ids = [i for _ in range(server_args.nnodes) for i in range(tp_size_local)]
-            tp_rank_range = list(range(server_args.node_rank * tp_size_local,
-                                  (server_args.node_rank + 1) * tp_size_local))
-            procs = launch_tp_servers(gpu_ids, tp_rank_range, server_args,
-                                      port_args.model_port_args[0], model_overide_args)
+            gpu_ids = [
+                i for _ in range(server_args.nnodes) for i in range(tp_size_local)
+            ]
+            tp_rank_range = list(
+                range(
+                    server_args.node_rank * tp_size_local,
+                    (server_args.node_rank + 1) * tp_size_local,
+                )
+            )
+            procs = launch_tp_servers(
+                gpu_ids,
+                tp_rank_range,
+                server_args,
+                port_args.model_port_args[0],
+                model_overide_args,
+            )
             while True:
                 pass
 

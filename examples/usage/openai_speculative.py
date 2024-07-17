@@ -2,7 +2,8 @@
 Usage:
 python3 openai_speculative.py
 """
-from sglang import function, gen, set_default_backend, OpenAI
+
+from sglang import OpenAI, function, gen, set_default_backend
 
 
 @function(num_api_spec_tokens=64)
@@ -35,7 +36,11 @@ if __name__ == "__main__":
     backend = OpenAI("gpt-3.5-turbo-instruct")
     set_default_backend(backend)
 
-    for function in [gen_character_spec, gen_character_no_spec, gen_character_spec_no_few_shot]:
+    for function in [
+        gen_character_spec,
+        gen_character_no_spec,
+        gen_character_spec_no_few_shot,
+    ]:
         backend.token_usage.reset()
 
         print(f"function: {function.func.__name__}")

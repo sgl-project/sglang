@@ -10,15 +10,14 @@ import os
 
 from transformers import AutoConfig, AutoTokenizer
 
+
 def add_image_token(model_path: str):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    tokenizer.add_tokens(
-        ["<image_placeholder>"],
-        special_tokens=True
-    )
+    tokenizer.add_tokens(["<image_placeholder>"], special_tokens=True)
 
     print(tokenizer)
     tokenizer.save_pretrained(model_path)
+
 
 def edit_model_config(model_path):
     config = AutoConfig.from_pretrained(model_path)
@@ -28,6 +27,7 @@ def edit_model_config(model_path):
 
     print(config)
     config.save_pretrained(model_path)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

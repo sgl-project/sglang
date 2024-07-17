@@ -183,14 +183,18 @@ class CudaGraphRunner:
         else:
             output = LogitProcessorOutput(
                 next_token_logits=output.next_token_logits[:raw_bs],
-                next_token_logprobs=output.next_token_logprobs[:raw_bs]
-                if output.next_token_logprobs is not None
-                else None,
+                next_token_logprobs=(
+                    output.next_token_logprobs[:raw_bs]
+                    if output.next_token_logprobs is not None
+                    else None
+                ),
                 normalized_prompt_logprobs=None,
                 prefill_token_logprobs=None,
                 prefill_top_logprobs=None,
-                decode_top_logprobs=output.decode_top_logprobs[:raw_bs]
-                if output.decode_top_logprobs is not None
-                else None,
+                decode_top_logprobs=(
+                    output.decode_top_logprobs[:raw_bs]
+                    if output.decode_top_logprobs is not None
+                    else None
+                ),
             )
         return output

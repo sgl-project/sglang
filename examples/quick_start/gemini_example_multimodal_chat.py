@@ -3,6 +3,7 @@ Usage:
 export GCP_PROJECT_ID=******
 python3 gemini_example_multimodal_chat.py
 """
+
 import sglang as sgl
 
 
@@ -19,7 +20,7 @@ if __name__ == "__main__":
         image_file1="./images/cat.jpeg",
         image_file2="./images/dog.jpeg",
         question="Describe difference of the two images in one sentence.",
-        stream=True
+        stream=True,
     )
 
     for out in state.text_iter("answer"):
