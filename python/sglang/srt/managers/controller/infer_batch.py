@@ -670,7 +670,7 @@ class Batch:
             )
         except RuntimeError as e:
             warnings.warn(f"Ignore errors in sampling: {e}")
-            # TODO: handle this error
+            batch_next_token_ids = torch.argmax(probs, dim=-1)
 
         if has_regex:
             batch_next_token_ids_cpu = batch_next_token_ids.cpu().numpy()
