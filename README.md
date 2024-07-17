@@ -431,18 +431,8 @@ Instructions for supporting a new model are [here](https://github.com/sgl-projec
 - Synthetic latency and throughput benchmark [scripts](https://github.com/sgl-project/sglang/tree/main/benchmark/latency_throughput).
 
 ## Roadmap
-https://github.com/sgl-project/sglang/issues/157
+[Development Roadmap (2024 Q3)](https://github.com/sgl-project/sglang/issues/634)
 
 ## Citation And Acknowledgment
-```
-@misc{zheng2024sglang,
-      title={SGLang: Efficient Execution of Structured Language Model Programs},
-      author={Lianmin Zheng and Liangsheng Yin and Zhiqiang Xie and Chuyue Sun and Jeff Huang and Cody Hao Yu and Shiyi Cao and Christos Kozyrakis and Ion Stoica and Joseph E. Gonzalez and Clark Barrett and Ying Sheng},
-      year={2024},
-      eprint={2312.07104},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI}
-}
-```
-
-We learned from the design and reused some code of the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), [LMQL](https://github.com/eth-sri/lmql).
+Please cite our paper, [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), if you find the project useful.
+We also learned from the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
