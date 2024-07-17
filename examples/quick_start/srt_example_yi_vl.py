@@ -3,6 +3,7 @@ Usage: python3 srt_example_yi_vl.py
 
 Requirements: transformers==4.38
 """
+
 import sglang as sgl
 
 
@@ -17,7 +18,8 @@ def single():
         image_path="images/cat.jpeg",
         question="What is this?",
         max_new_tokens=64,
-        stop="###")
+        stop="###",
+    )
     print(state["answer"], "\n")
 
 
@@ -27,7 +29,8 @@ def stream():
         question="What is this?",
         max_new_tokens=64,
         stream=True,
-        stop="###")
+        stop="###",
+    )
 
     for out in state.text_iter("answer"):
         print(out, end="", flush=True)
@@ -37,11 +40,11 @@ def stream():
 def batch():
     states = image_qa.run_batch(
         [
-            {"image_path": "images/cat.jpeg", "question":"What is this?"},
-            {"image_path": "images/dog.jpeg", "question":"What is this?"},
+            {"image_path": "images/cat.jpeg", "question": "What is this?"},
+            {"image_path": "images/dog.jpeg", "question": "What is this?"},
         ],
         max_new_tokens=64,
-        stop="###"
+        stop="###",
     )
     for s in states:
         print(s["answer"], "\n")

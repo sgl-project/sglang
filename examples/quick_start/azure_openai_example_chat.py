@@ -3,8 +3,10 @@ Usage:
 export AZURE_OPENAI_API_KEY=sk-******
 python3 openai_example_chat.py
 """
-import sglang as sgl
+
 import os
+
+import sglang as sgl
 
 
 @sgl.function
@@ -32,7 +34,7 @@ def stream():
     state = multi_turn_question.run(
         question_1="What is the capital of the United States?",
         question_2="List two local attractions.",
-        stream=True
+        stream=True,
     )
 
     for out in state.text_iter():
@@ -41,13 +43,18 @@ def stream():
 
 
 def batch():
-    states = multi_turn_question.run_batch([
-        {"question_1": "What is the capital of the United States?",
-         "question_2": "List two local attractions."},
-
-        {"question_1": "What is the capital of France?",
-         "question_2": "What is the population of this city?"},
-    ])
+    states = multi_turn_question.run_batch(
+        [
+            {
+                "question_1": "What is the capital of the United States?",
+                "question_2": "List two local attractions.",
+            },
+            {
+                "question_1": "What is the capital of France?",
+                "question_2": "What is the population of this city?",
+            },
+        ]
+    )
 
     for s in states:
         print(s.messages())

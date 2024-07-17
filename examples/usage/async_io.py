@@ -2,7 +2,9 @@
 Usage:
 python3 async_io.py
 """
+
 import asyncio
+
 from sglang import Runtime
 
 
@@ -14,7 +16,10 @@ async def generate(
     tokenizer = engine.get_tokenizer()
 
     messages = [
-        {"role": "system", "content": "You will be given question answer tasks.",},
+        {
+            "role": "system",
+            "content": "You will be given question answer tasks.",
+        },
         {"role": "user", "content": prompt},
     ]
 
@@ -36,5 +41,5 @@ if __name__ == "__main__":
     prompt = "Who is Alan Turing?"
     sampling_params = {"max_new_tokens": 128}
     asyncio.run(generate(runtime, prompt, sampling_params))
-    
+
     runtime.shutdown()

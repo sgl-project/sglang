@@ -48,9 +48,9 @@ def generate_lines(random_words, num_lines, redirect_ratio):
         )
         for i in redirect_indices:
             target_idx = np.random.choice(min(i * 2 + 100, num_lines))
-            lines[
-                i
-            ] = f"Line {indices[i]}: The REGISTER_CONTENT is the same as Line {indices[target_idx]}."
+            lines[i] = (
+                f"Line {indices[i]}: The REGISTER_CONTENT is the same as Line {indices[target_idx]}."
+            )
             redirects[i] = target_idx
 
     # Build links and find sources
