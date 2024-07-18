@@ -1,6 +1,6 @@
 """Inference-only Mistral model."""
 
-from sglang.srt.models.llama2 import LlamaForCausalLM
+from sglang.srt.models.llama import LlamaForCausalLM
 
 
 class MistralForCausalLM(LlamaForCausalLM):

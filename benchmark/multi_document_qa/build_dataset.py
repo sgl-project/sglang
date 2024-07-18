@@ -3,7 +3,7 @@ import json
 import transformers
 
 content = "\n".join(
-    open("llama2.txt", "r", encoding="utf-8", errors="ignore").readlines()
+    open("llama.txt", "r", encoding="utf-8", errors="ignore").readlines()
 )
 content = content.replace("\n\n", "\n")
 

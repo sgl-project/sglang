@@ -37,7 +37,7 @@ python3 build_dataset.py
 ```python
 import PyPDF2
 
-with open('llama2.pdf', 'rb') as file:
+with open('llama.pdf', 'rb') as file:
     reader = PyPDF2.PdfReader(file)
     text = ''
     for page_num in range(len(reader.pages)):

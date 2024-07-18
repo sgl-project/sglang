@@ -5,7 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 class ChatTemplateStyle(Enum):
     PLAIN = auto()
-    LLAMA2 = auto()
+    LLAMA = auto()
 
 
 @dataclass
@@ -22,7 +22,7 @@ class ChatTemplate:
     ) -> Tuple[str, str]:
         prefix, suffix = self.role_prefix_and_suffix.get(role, ("", ""))
 
-        if self.style == ChatTemplateStyle.LLAMA2:
+        if self.style == ChatTemplateStyle.LLAMA:
             if role == "system" and not hist_messages:
                 user_prefix, _ = self.role_prefix_and_suffix.get("user", ("", ""))
                 system_prefix, system_suffix = self.role_prefix_and_suffix.get(
@@ -190,7 +190,7 @@ register_chat_template(
             "user": ("[INST] ", " [/INST]"),
             "assistant": ("", " </s><s>"),
         },
-        style=ChatTemplateStyle.LLAMA2,
+        style=ChatTemplateStyle.LLAMA,
     )
 )
 

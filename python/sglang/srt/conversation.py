@@ -18,7 +18,7 @@ class SeparatorStyle(IntEnum):
     NO_COLON_SINGLE = auto()
     NO_COLON_TWO = auto()
     ADD_NEW_LINE_SINGLE = auto()
-    LLAMA2 = auto()
+    LLAMA = auto()
     CHATGLM = auto()
     CHATML = auto()
     CHATINTERN = auto()
@@ -122,7 +122,7 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
-        elif self.sep_style == SeparatorStyle.LLAMA2:
+        elif self.sep_style == SeparatorStyle.LLAMA:
             seps = [self.sep, self.sep2]
             if self.system_message:
                 ret = system_prompt
@@ -383,7 +383,7 @@ def generate_chat_conv(
     return conv
 
 
-# llama2 template
+# llama template
 # reference: https://huggingface.co/blog/codellama#conversational-instructions
 # reference: https://github.com/facebookresearch/llama/blob/1a240688810f8036049e8da36b073f63d2ac552c/llama/generation.py#L212
 register_conv_template(
@@ -391,7 +391,7 @@ register_conv_template(
         name="llama-2",
         system_template="[INST] <<SYS>>\n{system_message}\n<</SYS>>\n\n",
         roles=("[INST]", "[/INST]"),
-        sep_style=SeparatorStyle.LLAMA2,
+        sep_style=SeparatorStyle.LLAMA,
         sep=" ",
         sep2=" </s><s>",
         stop_str=["[INST]", "[/INST]", "<<SYS>>", "<</SYS>>"],
