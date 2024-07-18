@@ -7,6 +7,7 @@ from typing import List, Union
 
 import numpy as np
 import torch
+from flashinfer.sampling import top_k_top_p_sampling_from_probs
 
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
@@ -14,9 +15,6 @@ from sglang.srt.managers.controller.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
-
-# Store some global server args
-global_server_args_dict = {}
 
 
 class ForwardMode(IntEnum):
@@ -327,6 +325,11 @@ class Batch:
         seq_lens = []
 
         req_pool_indices = self.req_to_token_pool.alloc(bs)
+
+        if req_pool_indices is None:
+            raise RuntimeError("Out of memory. "
+                               "Please set a smaller number for `--max-running-requests`.")
+
         req_pool_indices_cpu = req_pool_indices.cpu().numpy()
         for i in range(bs):
             flatten_input_ids.extend(input_ids[i])
@@ -398,10 +401,10 @@ class Batch:
         ).view(-1, 1)
         self.top_ps = torch.tensor(
             [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        ).view(-1, 1)
+        )
         self.top_ks = torch.tensor(
             [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
-        ).view(-1, 1)
+        )
         self.frequency_penalties = torch.tensor(
             [r.sampling_params.frequency_penalty for r in reqs],
             dtype=torch.float,
@@ -659,20 +662,17 @@ class Batch:
 
         # TODO(lmzheng): apply penalty
         probs = torch.softmax(logits, dim=-1)
-        probs_sort, probs_idx = _top_p_top_k(probs, self.top_ps, self.top_ks)
         try:
-            sampled_index = torch.multinomial(probs_sort, num_samples=1)
+            max_top_k_round, batch_size = 32, probs.shape[0]
+            uniform_samples = torch.rand(
+                (max_top_k_round, batch_size), device=probs.device
+            )
+            batch_next_token_ids, _ = top_k_top_p_sampling_from_probs(
+                probs, uniform_samples, self.top_ks, self.top_ps
+            )
         except RuntimeError as e:
             warnings.warn(f"Ignore errors in sampling: {e}")
-            sampled_index = torch.ones(
-                probs_sort.shape[:-1] + (1,), dtype=torch.int64, device=probs.device
-            )
-        batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(
-            -1
-        )
-        batch_next_token_probs = torch.gather(
-            probs_sort, dim=1, index=sampled_index
-        ).view(-1)
+            batch_next_token_ids = torch.argmax(probs, dim=-1)
 
         if has_regex:
             batch_next_token_ids_cpu = batch_next_token_ids.cpu().numpy()
@@ -682,18 +682,7 @@ class Batch:
                         req.regex_fsm_state, batch_next_token_ids_cpu[i]
                     )
 
-        return batch_next_token_ids, batch_next_token_probs
-
-
-def _top_p_top_k(probs: torch.Tensor, top_ps: torch.Tensor, top_ks: torch.Tensor):
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[(probs_sum - probs_sort) > top_ps] = 0.0
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1) >= top_ks
-    ] = 0.0
-    probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
-    return probs_sort, probs_idx
+        return batch_next_token_ids
 
 
 @dataclass

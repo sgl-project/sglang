@@ -32,8 +32,8 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.controller.manager_multi import (
     start_controller_process as start_controller_process_multi,
 )
+from sglang.srt.managers.controller.manager_single import launch_tp_servers
 from sglang.srt.managers.controller.manager_single import (
-    launch_tp_servers,
     start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
@@ -63,6 +63,9 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 app = FastAPI()
 tokenizer_manager = None
+
+# Put some args for easily access
+global_server_args_dict = {}
 
 
 @app.get("/health")
@@ -135,6 +138,14 @@ async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
 
 
+def _set_global_server_args(server_args: ServerArgs):
+    global global_server_args_dict
+    global_server_args_dict = {
+        "disable_flashinfer": server_args.disable_flashinfer,
+        "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
+    }
+
+
 def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_args=None):
     global tokenizer_manager
 
@@ -154,7 +165,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.0.8",
+            "0.1.0",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -162,6 +173,8 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
     if server_args.chat_template:
         # TODO: replace this with huggingface transformers template
         load_chat_template_for_openai_api(server_args.chat_template)
+
+    _set_global_server_args(server_args)
 
     # Allocate ports
     assert server_args.tp_size % server_args.nnodes == 0
@@ -198,11 +211,22 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 
         if server_args.node_rank != 0:
             tp_size_local = server_args.tp_size // server_args.nnodes
-            gpu_ids = [i for _ in range(server_args.nnodes) for i in range(tp_size_local)]
-            tp_rank_range = list(range(server_args.node_rank * tp_size_local,
-                                  (server_args.node_rank + 1) * tp_size_local))
-            procs = launch_tp_servers(gpu_ids, tp_rank_range, server_args,
-                                      port_args.model_port_args[0], model_overide_args)
+            gpu_ids = [
+                i for _ in range(server_args.nnodes) for i in range(tp_size_local)
+            ]
+            tp_rank_range = list(
+                range(
+                    server_args.node_rank * tp_size_local,
+                    (server_args.node_rank + 1) * tp_size_local,
+                )
+            )
+            procs = launch_tp_servers(
+                gpu_ids,
+                tp_rank_range,
+                server_args,
+                port_args.model_port_args[0],
+                model_overide_args,
+            )
             while True:
                 pass
 

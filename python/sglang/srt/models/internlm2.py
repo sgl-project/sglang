@@ -1,10 +1,11 @@
-# Adapted from llama.py
-# Modify details for the adaptation of Qwen2 model.
-"""Inference-only Qwen2 model compatible with HuggingFace weights."""
+# -*- coding: utf-8 -*-
+# Adapted from https://raw.githubusercontent.com/vllm-project/vllm/7f62077af5159c625fe3ad1c812e6c1a2b93ba3b/vllm/model_executor/models/internlm2.py
+
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -26,10 +27,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.controller.model_runner import InputMetadata
 
-Qwen2Config = None
 
+class InternLM2MLP(nn.Module):
 
-class Qwen2MLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -39,16 +39,10 @@ class Qwen2MLP(nn.Module):
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
+            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
         )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
+        self.w2 = RowParallelLinear(
+            intermediate_size, hidden_size, bias=False, quant_config=quant_config
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -60,20 +54,21 @@ class Qwen2MLP(nn.Module):
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.w2(x)
         return x
 
 
-class Qwen2Attention(nn.Module):
+class InternLM2Attention(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        layer_id: int = 0,
-        rope_theta: float = 1000000,
+        rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
-        max_position_embeddings: int = 32768,
+        max_position_embeddings: int = 8192,
+        layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -99,15 +94,15 @@ class Qwen2Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = QKVParallelLinear(
+        self.wqkv = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=True,
+            bias=False,
             quant_config=quant_config,
         )
-        self.o_proj = RowParallelLinear(
+        self.wo = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
@@ -122,11 +117,7 @@ class Qwen2Attention(nn.Module):
             rope_scaling=rope_scaling,
         )
         self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
+            self.num_heads, self.head_dim, self.scaling, self.num_kv_heads, layer_id
         )
 
     def forward(
@@ -135,46 +126,45 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.wqkv(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, input_metadata)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.wo(attn_output)
         return output
 
 
-class Qwen2DecoderLayer(nn.Module):
+class InternLMDecoderLayer(nn.Module):
+
     def __init__(
         self,
-        config: Qwen2Config,
+        config: PretrainedConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 1000000)
+        rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
-        self.self_attn = Qwen2Attention(
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        self.attention = InternLM2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
+            layer_id=layer_id,
             quant_config=quant_config,
         )
-        self.mlp = Qwen2MLP(
+        self.feed_forward = InternLM2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.attention_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -186,38 +176,39 @@ class Qwen2DecoderLayer(nn.Module):
         # Self Attention
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.attention_norm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
+            hidden_states, residual = self.attention_norm(hidden_states, residual)
+        hidden_states = self.attention(
             positions=positions,
             hidden_states=hidden_states,
             input_metadata=input_metadata,
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.ffn_norm(hidden_states, residual)
+        hidden_states = self.feed_forward(hidden_states)
         return hidden_states, residual
 
 
-class Qwen2Model(nn.Module):
+class InternLM2Model(nn.Module):
+
     def __init__(
         self,
-        config: Qwen2Config,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
+        self.tok_embeddings = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
         )
         self.layers = nn.ModuleList(
             [
-                Qwen2DecoderLayer(config, i, quant_config=quant_config)
+                InternLMDecoderLayer(config, i, quant_config)
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -231,7 +222,7 @@ class Qwen2Model(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+            hidden_states = self.tok_embeddings(input_ids)
         else:
             hidden_states = input_embeds
         residual = None
@@ -247,18 +238,19 @@ class Qwen2Model(nn.Module):
         return hidden_states
 
 
-class Qwen2ForCausalLM(nn.Module):
+class InternLM2ForCausalLM(nn.Module):
+
     def __init__(
         self,
-        config: Qwen2Config,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: Optional[CacheConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2Model(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.model = InternLM2Model(config, quant_config)
+        self.output = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
@@ -271,25 +263,18 @@ class Qwen2ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+            input_ids, hidden_states, self.output.weight, input_metadata
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+            ("gate_up_proj", "w1", 0),
+            ("gate_up_proj", "w3", 1),
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
+            if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -297,8 +282,6 @@ class Qwen2ForCausalLM(nn.Module):
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name.startswith("model.vision_tower") and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -308,16 +291,27 @@ class Qwen2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                if name.startswith("model.vision_tower") and name not in params_dict:
-                    continue
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                if (
-                    self.config.tie_word_embeddings
-                    and name == "model.embed_tokens.weight"
-                ):
-                    weight_loader(params_dict["lm_head.weight"], loaded_weight)
+                if "wqkv" in name:
+                    config = self.config
+                    kv_groups = config.num_attention_heads // config.num_key_value_heads
+                    head_dim = config.hidden_size // config.num_attention_heads
+                    loaded_weight = loaded_weight.view(
+                        -1, 2 + kv_groups, head_dim, loaded_weight.shape[-1]
+                    )
+                    wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1], dim=1)
+                    wq = wq.reshape(-1, wq.shape[-1])
+                    wk = wk.reshape(-1, wk.shape[-1])
+                    wv = wv.reshape(-1, wv.shape[-1])
+                    weight_loader = param.weight_loader
+                    weight_loader(param, wq, "q")
+                    weight_loader(param, wk, "k")
+                    weight_loader(param, wv, "v")
+                else:
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
 
-EntryClass = Qwen2ForCausalLM
+EntryClass = InternLM2ForCausalLM

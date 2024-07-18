@@ -312,8 +312,8 @@ def main(args: argparse.Namespace):
         np.sum([output_len for _, output_len, _ in REQUEST_LATENCY]) / benchmark_time
     )
 
-    #latencies = [round(latency, 2) for _, _, latency in REQUEST_LATENCY]
-    #print(latencies)
+    # latencies = [round(latency, 2) for _, _, latency in REQUEST_LATENCY]
+    # print(latencies)
 
     print(f"Total time: {benchmark_time:.2f} s")
     print(f"Request throughput: {args.num_prompts / benchmark_time:.2f} requests/s")

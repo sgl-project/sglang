@@ -9,19 +9,24 @@ from typing import Optional, Type
 
 import torch
 import torch.nn as nn
+from flashinfer import (
+    BatchDecodeWithPagedKVCacheWrapper,
+    BatchPrefillWithPagedKVCacheWrapper,
+    BatchPrefillWithRaggedKVCacheWrapper,
+)
+from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
-from vllm.distributed import init_distributed_environment, initialize_model_parallel, get_tp_group
+from vllm.distributed import (
+    get_tp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
-from sglang.srt.managers.controller.infer_batch import (
-    Batch,
-    ForwardMode,
-    InputMetadata,
-    global_server_args_dict,
-)
+from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode, InputMetadata
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -86,12 +91,6 @@ class ModelRunner:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
                 )
-
-        # Set some global args
-        global_server_args_dict["disable_flashinfer"] = server_args.disable_flashinfer
-        global_server_args_dict[
-            "attention_reduce_in_fp32"
-        ] = server_args.attention_reduce_in_fp32
 
         # Load the model and create memory pool
         self.load_model()
@@ -169,7 +168,7 @@ class ModelRunner:
             )
 
         self.req_to_token_pool = ReqToTokenPool(
-            int(self.max_total_num_tokens / self.model_config.context_len * 256),
+            max(int(self.max_total_num_tokens / self.model_config.context_len * 512), 2048),
             self.model_config.context_len + 8,
         )
         self.token_to_kv_pool = TokenToKVPool(
@@ -199,13 +198,6 @@ class ModelRunner:
             self.flashinfer_prefill_wrapper_paged = None
             self.flashinfer_decode_wrapper = None
             return
-
-        from flashinfer import (
-            BatchDecodeWithPagedKVCacheWrapper,
-            BatchPrefillWithPagedKVCacheWrapper,
-            BatchPrefillWithRaggedKVCacheWrapper,
-        )
-        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
         if not _grouped_size_compiled_for_decode_kernels(
             self.model_config.num_attention_heads // self.tp_size,

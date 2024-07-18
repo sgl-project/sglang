@@ -3,9 +3,10 @@
 import bisect
 
 import torch
+from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.distributed.parallel_state import graph_capture
 
-from sglang.global_config import global_config
 from sglang.srt.layers.logits_processor import LogitProcessorOutput
 from sglang.srt.managers.controller.infer_batch import (
     Batch,
@@ -74,9 +75,6 @@ class CudaGraphRunner:
                 self.flashinfer_handlers[bs] = flashinfer_handler
 
     def capture_one_batch_size(self, bs):
-        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
-        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
-
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
 
@@ -183,14 +181,18 @@ class CudaGraphRunner:
         else:
             output = LogitProcessorOutput(
                 next_token_logits=output.next_token_logits[:raw_bs],
-                next_token_logprobs=output.next_token_logprobs[:raw_bs]
-                if output.next_token_logprobs is not None
-                else None,
+                next_token_logprobs=(
+                    output.next_token_logprobs[:raw_bs]
+                    if output.next_token_logprobs is not None
+                    else None
+                ),
                 normalized_prompt_logprobs=None,
                 prefill_token_logprobs=None,
                 prefill_top_logprobs=None,
-                decode_top_logprobs=output.decode_top_logprobs[:raw_bs]
-                if output.decode_top_logprobs is not None
-                else None,
+                decode_top_logprobs=(
+                    output.decode_top_logprobs[:raw_bs]
+                    if output.decode_top_logprobs is not None
+                    else None
+                ),
             )
         return output
