@@ -3,19 +3,17 @@ A controller that manages multiple data parallel workers.
 Each data parallel worker can manage multiple tensor parallel workers.
 """
 
-import asyncio
+import dataclasses
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+import os
 from enum import Enum, auto
-from typing import Dict
 
+import numpy as np
 import zmq
-import zmq.asyncio
 
-from sglang.global_config import global_config
-from sglang.srt.managers.controller.dp_worker import (
-    DataParallelWorkerThread,
-    start_data_parallel_worker,
+from sglang.srt.managers.controller.manager_single import (
+    start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -23,12 +21,14 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import kill_parent_process
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger("srt.controller")
 
 
 class LoadBalanceMethod(Enum):
+    """Load balance method."""
     ROUND_ROBIN = auto()
     SHORTEST_QUEUE = auto()
 
@@ -41,155 +41,155 @@ class LoadBalanceMethod(Enum):
             raise ValueError(f"Invalid load balance method: {method}") from exc
 
 
-class Controller:
+@dataclasses.dataclass
+class WorkerHandle:
+    """Store the handle of a data parallel worker."""
+    proc: multiprocessing.Process
+    queue: multiprocessing.Queue
+
+
+class ControllerMulti:
     """A controller that manages multiple data parallel workers."""
 
     def __init__(
         self,
-        load_balance_method: str,
         server_args: ServerArgs,
         port_args: PortArgs,
         model_overide_args,
     ):
-        self.load_balance_method = LoadBalanceMethod.from_str(load_balance_method)
+        # Parse args
         self.server_args = server_args
         self.port_args = port_args
+        self.model_overide_args = model_overide_args
+        self.load_balance_method = LoadBalanceMethod.from_str(
+            server_args.load_balance_method)
 
-        if self.load_balance_method == LoadBalanceMethod.ROUND_ROBIN:
-            self.round_robin_counter = 0
+        # Init communication
+        context = zmq.Context()
+        self.recv_from_tokenizer = context.socket(zmq.PULL)
+        self.recv_from_tokenizer.bind(f"tcp://127.0.0.1:{port_args.controller_port}")
 
-        self.dispatch_lookup = {
+        # Dispatch method
+        self.round_robin_counter = 0
+        dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
             LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
         }
-        self.dispatching = self.dispatch_lookup[self.load_balance_method]
-
-        # Init communication
-        context = zmq.asyncio.Context()
-        self.recv_from_tokenizer = context.socket(zmq.PULL)
-        self.recv_from_tokenizer.bind(f"tcp://127.0.0.1:{port_args.router_port}")
-
-        # Init status
-        self.recv_reqs = []
+        self.dispatching = dispatch_lookup[self.load_balance_method]
 
         # Start data parallel workers
-        self.workers: Dict[int, DataParallelWorkerThread] = {}
-        tp_size = server_args.tp_size
-
-        def start_dp_worker(i):
-            try:
-                gpu_ids = list(range(i * tp_size, (i + 1) * tp_size))
-                worker_thread = start_data_parallel_worker(
-                    server_args, port_args, model_overide_args, gpu_ids, i
-                )
-                self.workers[i] = worker_thread
-            except Exception:
-                logger.error(
-                    f"Failed to start local worker {i}\n{get_exception_traceback()}"
-                )
-
+        self.workers = []
         for i in range(server_args.dp_size):
-            start_dp_worker(i)
+            self.start_dp_worker(i)
 
-        # Parallel launch is slower, probably due to the disk bandwidth limitations.
-        # with ThreadPoolExecutor(server_args.dp_size) as executor:
-        #     executor.map(start_dp_worker, range(server_args.dp_size))
+    def start_dp_worker(self, dp_worker_id: int):
+        tp_size = self.server_args.tp_size
 
-    def have_any_live_worker(self):
-        return any(worker_thread.liveness for worker_thread in self.workers.values())
+        pipe_controller_reader, pipe_controller_writer = multiprocessing.Pipe(duplex=False)
 
-    def put_req_to_worker(self, worker_id, req):
-        self.workers[worker_id].request_queue.put(req)
+        gpu_ids = list(range(dp_worker_id * tp_size, (dp_worker_id + 1) * tp_size))
+        queue = multiprocessing.Queue()
+        proc = multiprocessing.Process(
+            target=start_controller_process_single,
+            args=(
+                self.server_args,
+                self.port_args,
+                pipe_controller_writer,
+                self.model_overide_args,
+                True,
+                gpu_ids,
+                dp_worker_id,
+                queue,
+            )
+        )
+        proc.start()
 
-    async def round_robin_scheduler(self, input_requests):
-        available_workers = list(self.workers.keys())
+        controller_init_state = pipe_controller_reader.recv()
+        if controller_init_state != "init ok":
+            raise RuntimeError(
+                f"Initialization failed. controller_init_state: {controller_init_state}"
+            )
+        self.workers.append(WorkerHandle(
+            proc=proc,
+            queue=queue,
+        ))
+
+    def round_robin_scheduler(self, input_requests):
         for r in input_requests:
-            self.put_req_to_worker(available_workers[self.round_robin_counter], r)
+            self.workers[self.round_robin_counter].queue.put(r)
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                available_workers
+                self.workers
             )
-        return
 
-    async def shortest_queue_scheduler(self, input_requests):
+    def shortest_queue_scheduler(self, input_requests):
         for r in input_requests:
-            worker = min(
-                self.workers, key=lambda w: self.workers[w].request_queue.qsize()
-            )
-            self.put_req_to_worker(worker, r)
-        return
+            queue_sizes = [worker.queue.qsize() for worker in self.workers]
+            wid = np.argmin(queue_sizes)
+            self.workers[wid].queue.put(r)
 
-    async def remove_dead_workers(self):
-        for i in list(self.workers.keys()):
-            worker_thread = self.workers[i]
-            if not worker_thread.liveness:
-                worker_thread.join()
-                # move unsuccessful requests back to the queue
-                while not worker_thread.request_queue.empty():
-                    self.recv_reqs.append(worker_thread.request_queue.get())
-                del self.workers[i]
-                logger.info(f"Stale worker {i} removed")
-
-    async def loop_for_forward(self):
+    def loop_for_forward(self):
         while True:
-            await self.remove_dead_workers()
+            recv_reqs = self.recv_requests()
+            self.dispatching(recv_reqs)
 
-            if self.have_any_live_worker():
-                next_step_input = list(self.recv_reqs)
-                self.recv_reqs = []
-                if next_step_input:
-                    await self.dispatching(next_step_input)
-            # else:
-            #    logger.error("There is no live worker.")
+    def recv_requests(self):
+        recv_reqs = []
 
-            await asyncio.sleep(global_config.wait_for_new_request_delay)
-
-    async def loop_for_recv_requests(self):
         while True:
-            recv_req = await self.recv_from_tokenizer.recv_pyobj()
+            try:
+                recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+
             if isinstance(recv_req, FlushCacheReq):
                 # TODO(lsyin): apply more specific flushCacheReq
-                for worker_thread in self.workers.values():
-                    worker_thread.request_queue.put(recv_req)
-            elif isinstance(recv_req, TokenizedGenerateReqInput):
-                self.recv_reqs.append(recv_req)
+                for worker in self.workers:
+                    worker.queue.put(recv_req)
             elif isinstance(recv_req, AbortReq):
                 in_queue = False
-                for i, req in enumerate(self.recv_reqs):
+                for i, req in enumerate(recv_reqs):
                     if req.rid == recv_req.rid:
-                        self.recv_reqs[i] = recv_req
+                        recv_reqs[i] = recv_req
                         in_queue = True
                         break
                 if not in_queue:
                     # Send abort req to all TP groups
-                    for worker in list(self.workers.keys()):
-                        self.put_req_to_worker(worker, recv_req)
+                    for worker in self.workers:
+                        worker.queue.put(recv_req)
+            elif isinstance(recv_req, TokenizedGenerateReqInput):
+                recv_reqs.append(recv_req)
             else:
                 logger.error(f"Invalid object: {recv_req}")
+
+        return recv_reqs
 
 
 def start_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer,
-    model_overide_args=None,
+    model_overide_args: dict,
 ):
+    """Start a controller process."""
+
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format="%(message)s",
     )
 
     try:
-        controller = Controller(
-            server_args.load_balance_method, server_args, port_args, model_overide_args
-        )
+        controller = ControllerMulti(server_args, port_args, model_overide_args)
     except Exception:
         pipe_writer.send(get_exception_traceback())
         raise
+
     pipe_writer.send("init ok")
 
-    loop = asyncio.new_event_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=256))
-
-    asyncio.set_event_loop(loop)
-    loop.create_task(controller.loop_for_recv_requests())
-    loop.run_until_complete(controller.loop_for_forward())
+    try:
+        controller.loop_for_forward()
+    except Exception:
+        logger.error("Exception in ControllerMulti:\n" + get_exception_traceback())
+    finally:
+        for w in controller.workers:
+            os.kill(w.proc.pid, 9)
+        kill_parent_process()
