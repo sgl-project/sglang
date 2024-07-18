@@ -327,8 +327,10 @@ class Batch:
         req_pool_indices = self.req_to_token_pool.alloc(bs)
 
         if req_pool_indices is None:
-            raise RuntimeError("Out of memory. "
-                               "Please set a smaller number for `--max-running-requests`.")
+            raise RuntimeError(
+                "Out of memory. "
+                "Please set a smaller number for `--max-running-requests`."
+            )
 
         req_pool_indices_cpu = req_pool_indices.cpu().numpy()
         for i in range(bs):

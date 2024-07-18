@@ -44,7 +44,14 @@ class ReqToTokenPool:
 class TokenToKVPool:
     """A memory pool that maps a token to its kv cache locations"""
 
-    def __init__(self, size: int, dtype: torch.dtype, head_num: int, head_dim: int, layer_num: int):
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+    ):
         self.size = size
 
         # We also add one slot. This slot is used for writing dummy output from padded tokens.
