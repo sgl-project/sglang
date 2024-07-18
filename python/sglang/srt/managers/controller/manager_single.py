@@ -8,7 +8,9 @@ from typing import List
 import zmq
 
 from sglang.srt.managers.controller.tp_worker import (
-    broadcast_recv_input, launch_tp_servers, ModelTpServer
+    ModelTpServer,
+    broadcast_recv_input,
+    launch_tp_servers,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_parent_process
@@ -41,7 +43,9 @@ class ControllerSingle:
 
         if not self.is_dp_worker:
             self.recv_from_tokenizer = context.socket(zmq.PULL)
-            self.recv_from_tokenizer.bind(f"tcp://127.0.0.1:{port_args.controller_port}")
+            self.recv_from_tokenizer.bind(
+                f"tcp://127.0.0.1:{port_args.controller_port}"
+            )
 
         self.send_to_detokenizer = context.socket(zmq.PUSH)
         self.send_to_detokenizer.connect(
@@ -128,9 +132,15 @@ def start_controller_process(
         queue = None
 
     try:
-        controller = ControllerSingle(server_args, port_args, model_overide_args,
-                                      gpu_ids, is_data_parallel_worker,
-                                      dp_worker_id, queue)
+        controller = ControllerSingle(
+            server_args,
+            port_args,
+            model_overide_args,
+            gpu_ids,
+            is_data_parallel_worker,
+            dp_worker_id,
+            queue,
+        )
     except Exception:
         pipe_writer.send(get_exception_traceback())
         raise
