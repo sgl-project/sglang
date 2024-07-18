@@ -186,7 +186,7 @@ def launch_server(server_args: ServerArgs,
     ports = server_args.additional_ports
     port_args = PortArgs(
         tokenizer_port=ports[0],
-        router_port=ports[1],
+        controller_port=ports[1],
         detokenizer_port=ports[2],
         nccl_ports=ports[3:],
     )
@@ -218,18 +218,18 @@ def launch_server(server_args: ServerArgs,
 
     # Launch processes
     tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
-    pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)
+    pipe_controller_reader, pipe_controller_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
     if server_args.dp_size == 1:
         start_process = start_controller_process_single
     else:
         start_process = start_controller_process_multi
-    proc_router = mp.Process(
+    proc_controller = mp.Process(
         target=start_process,
-        args=(server_args, port_args, pipe_router_writer, model_overide_args),
+        args=(server_args, port_args, pipe_controller_writer, model_overide_args),
     )
-    proc_router.start()
+    proc_controller.start()
     proc_detoken = mp.Process(
         target=start_detokenizer_process,
         args=(
@@ -241,21 +241,21 @@ def launch_server(server_args: ServerArgs,
     proc_detoken.start()
 
     # Wait for the model to finish loading
-    router_init_state = pipe_router_reader.recv()
+    controller_init_state = pipe_controller_reader.recv()
     detoken_init_state = pipe_detoken_reader.recv()
 
-    if router_init_state != "init ok" or detoken_init_state != "init ok":
-        proc_router.kill()
+    if controller_init_state != "init ok" or detoken_init_state != "init ok":
+        proc_controller.kill()
         proc_detoken.kill()
         print(
-            f"Initialization failed. router_init_state: {router_init_state}", flush=True
+            f"Initialization failed. controller_init_state: {controller_init_state}", flush=True
         )
         print(
             f"Initialization failed. detoken_init_state: {detoken_init_state}",
             flush=True,
         )
         sys.exit(1)
-    assert proc_router.is_alive() and proc_detoken.is_alive()
+    assert proc_controller.is_alive() and proc_detoken.is_alive()
 
     if server_args.api_key and server_args.api_key != "":
         app.add_middleware(APIKeyValidatorMiddleware, api_key=server_args.api_key)

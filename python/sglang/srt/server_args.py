@@ -340,6 +340,6 @@ class ServerArgs:
 @dataclasses.dataclass
 class PortArgs:
     tokenizer_port: int
-    router_port: int
+    controller_port: int
     detokenizer_port: int
     nccl_ports: List[int]
