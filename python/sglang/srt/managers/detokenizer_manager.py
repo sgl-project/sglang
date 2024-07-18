@@ -1,7 +1,9 @@
 """DetokenizerManager is a process that detokenizes the token ids."""
 
 import asyncio
+import dataclasses
 import inspect
+from typing import List
 
 import uvloop
 import zmq
@@ -14,6 +16,13 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.utils import find_printable_text, get_exception_traceback, graceful_registry
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+
+@dataclasses.dataclass
+class DecodeStatus:
+    decoded_text: str
+    read_ids: List[int]
+    read_offset: int
 
 
 class DetokenizerManager:
@@ -35,19 +44,39 @@ class DetokenizerManager:
             trust_remote_code=server_args.trust_remote_code,
         )
 
+        self.decode_offs = {}
+
     async def handle_loop(self):
         while True:
             recv_obj: BatchTokenIDOut = await self.recv_from_router.recv_pyobj()
             assert isinstance(recv_obj, BatchTokenIDOut)
+            bs = len(recv_obj.rids)
+
+            # Initialize decode status
+            surr_ids = []
+            for i in range(bs):
+                rid = recv_obj.rids[i]
+                if rid not in self.decode_offs:
+                    self.decode_offs[rid] = DecodeStatus(
+                        decoded_text=recv_obj.decoded_texts[i],
+                        read_ids=recv_obj.read_ids[i],
+                        read_offset=recv_obj.read_offsets[i],
+                    )
+                surr_ids.append(recv_obj.read_ids[i][recv_obj.read_offsets[i] :])
+
+            # FIXME: remove this log
+            print(recv_obj.decoded_texts)
+            print(recv_obj.read_ids)
+            print(recv_obj.read_offsets)
 
             # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
             surr_texts = self.tokenizer.batch_decode(
-                recv_obj.surr_output_ids,
+                surr_ids,
                 skip_special_tokens=recv_obj.skip_special_tokens[0],
                 spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
             )
             read_texts = self.tokenizer.batch_decode(
-                recv_obj.read_output_ids,
+                recv_obj.read_ids,
                 skip_special_tokens=recv_obj.skip_special_tokens[0],
                 spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
             )
@@ -55,7 +84,7 @@ class DetokenizerManager:
             # Trim stop str
             # TODO(lmzheng): handle the case where multiple stop strs are hit
             output_strs = []
-            for i in range(len(recv_obj.rids)):
+            for i in range(bs):
                 new_text = read_texts[i][len(surr_texts[i]) :]
                 if recv_obj.finished_reason[i] is None:
                     new_text = find_printable_text(new_text)

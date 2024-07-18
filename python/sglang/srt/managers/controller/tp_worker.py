@@ -590,8 +590,8 @@ class ModelTpServer:
     def handle_finished_requests(self, batch: Batch):
         output_rids = []
         decoded_texts = []
-        surr_output_ids = []
-        read_output_ids = []
+        output_read_ids = []
+        output_read_offsets = []
         output_skip_special_tokens = []
         output_spaces_between_special_tokens = []
         output_meta_info = []
@@ -615,9 +615,9 @@ class ModelTpServer:
             ):
                 output_rids.append(req.rid)
                 decoded_texts.append(req.decoded_text)
-                surr_ids, read_ids, _ = req.init_detokenize_incrementally()
-                surr_output_ids.append(surr_ids)
-                read_output_ids.append(read_ids)
+                read_ids, read_offset = req.init_incremental_detokenize()
+                output_read_ids.append(read_ids)
+                output_read_offsets.append(read_offset)
                 output_skip_special_tokens.append(
                     req.sampling_params.skip_special_tokens
                 )
@@ -654,8 +654,8 @@ class ModelTpServer:
                 BatchTokenIDOut(
                     output_rids,
                     decoded_texts,
-                    surr_output_ids,
-                    read_output_ids,
+                    output_read_ids,
+                    output_read_offsets,
                     output_skip_special_tokens,
                     output_spaces_between_special_tokens,
                     output_meta_info,
