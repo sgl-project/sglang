@@ -19,7 +19,6 @@ PACKAGE_LIST = [
     "pillow",
     "psutil",
     "pydantic",
-    "rpyc",
     "uvicorn",
     "uvloop",
     "zmq",
