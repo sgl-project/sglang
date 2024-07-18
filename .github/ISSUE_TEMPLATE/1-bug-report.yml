@@ -20,7 +20,7 @@ body:
   attributes:
     label: Reproduction
     description: |
-      1. What command or script did you run?
+      What command or script did you run?
     placeholder: |
       A placeholder for the command.
   validations:
@@ -29,7 +29,7 @@ body:
   attributes:
     label: Environment
     description: |
-      Please provide necessary environment information here.
+      Please provide necessary environment information here with `python3 -m sglang.check_env`.
     placeholder: Environment here.
     render: Shell
   validations:
