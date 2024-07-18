@@ -145,9 +145,35 @@ def _set_global_server_args(server_args: ServerArgs):
     }
 
 
-def launch_server(server_args: ServerArgs,
-                  model_overide_args: Optional[dict] = None,
-                  pipe_finish_writer: Optional[mp.connection.Connection] = None):
+def _set_ulimit(target_soft_limit=65535):
+    import resource
+
+    resource_type = resource.RLIMIT_NOFILE
+    current_soft, current_hard = resource.getrlimit(resource_type)
+
+    if current_soft >= target_soft_limit:
+        logger.info(
+            f"Current limits are already sufficient: soft={current_soft}, hard={current_hard}"
+        )
+    else:
+        try:
+            resource.setrlimit(resource_type, (target_soft_limit, current_hard))
+            new_soft, new_hard = resource.getrlimit(resource_type)
+            logger.info(
+                f"Successfully set new limits: soft={new_soft}, hard={new_hard}"
+            )
+        except ValueError as e:
+            logger.warn(f"Failed to set new limits: {e}")
+            logger.info(
+                f"Limits remain unchanged: soft={current_soft}, hard={current_hard}"
+            )
+
+
+def launch_server(
+    server_args: ServerArgs,
+    model_overide_args: Optional[dict] = None,
+    pipe_finish_writer: Optional[mp.connection.Connection] = None,
+):
     """Launch an HTTP server."""
     global tokenizer_manager
 
@@ -160,6 +186,7 @@ def launch_server(server_args: ServerArgs,
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
     os.environ["NCCL_NVLS_ENABLE"] = "0"
+    _set_ulimit()
     if server_args.show_time_cost:
         enable_show_time_cost()
     if server_args.disable_disk_cache:
@@ -248,7 +275,8 @@ def launch_server(server_args: ServerArgs,
         proc_controller.kill()
         proc_detoken.kill()
         print(
-            f"Initialization failed. controller_init_state: {controller_init_state}", flush=True
+            f"Initialization failed. controller_init_state: {controller_init_state}",
+            flush=True,
         )
         print(
             f"Initialization failed. detoken_init_state: {detoken_init_state}",
@@ -261,7 +289,9 @@ def launch_server(server_args: ServerArgs,
         app.add_middleware(APIKeyValidatorMiddleware, api_key=server_args.api_key)
 
     # Send a warmup request
-    t = threading.Thread(target=_wait_and_warmup, args=(server_args, pipe_finish_writer))
+    t = threading.Thread(
+        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
+    )
     t.start()
 
     # Listen for requests
