@@ -341,7 +341,6 @@ class Runtime:
         self.server_args.port, self.server_args.additional_ports = allocate_init_ports(
             self.server_args.port,
             self.server_args.additional_ports,
-            self.server_args.tp_size,
             self.server_args.dp_size,
         )
 
