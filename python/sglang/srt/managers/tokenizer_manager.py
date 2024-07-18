@@ -61,7 +61,7 @@ class TokenizerManager:
         self.recv_from_detokenizer.bind(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
 
         self.send_to_router = context.socket(zmq.PUSH)
-        self.send_to_router.connect(f"tcp://127.0.0.1:{port_args.router_port}")
+        self.send_to_router.connect(f"tcp://127.0.0.1:{port_args.controller_port}")
 
         self.model_path = server_args.model_path
         self.hf_config = get_config(
