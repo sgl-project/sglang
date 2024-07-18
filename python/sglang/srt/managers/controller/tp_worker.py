@@ -273,11 +273,12 @@ class ModelTpServer:
         req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.pixel_values = recv_req.pixel_values
         if req.pixel_values is not None:
+            img_hash = sum(recv_req.image_hash)
             req.pad_value = [
-                (recv_req.image_hash) % self.model_config.vocab_size,
-                (recv_req.image_hash >> 16) % self.model_config.vocab_size,
-                (recv_req.image_hash >> 32) % self.model_config.vocab_size,
-                (recv_req.image_hash >> 64) % self.model_config.vocab_size,
+                (img_hash) % self.model_config.vocab_size,
+                (img_hash >> 16) % self.model_config.vocab_size,
+                (img_hash >> 32) % self.model_config.vocab_size,
+                (img_hash >> 64) % self.model_config.vocab_size,
             ]
             req.image_size = recv_req.image_size
             (
@@ -355,14 +356,21 @@ class ModelTpServer:
                     req.extend_input_len += delta
                     req.prefix_indices = req.prefix_indices[:-delta]
                     if req.image_offset is not None:
-                        req.image_offset += delta
+                        if isinstance(req.image_offse, list):
+                            req.image_offset  = [x + delta for x in req.image_offset]
+                        else:
+                            req.image_offset += delta
+            print(req.extend_input_len)
+            print(req.max_new_tokens())
             if req.extend_input_len == 0 and req.max_new_tokens() > 0:
                 # Need at least one token to compute logits
                 req.extend_input_len = 1
                 req.prefix_indices = req.prefix_indices[:-1]
                 if req.image_offset is not None:
-                    req.image_offset += 1
-
+                    if isinstance(req.image_offset, list):
+                        req.image_offset = [x + 1 for x in req.image_offset]
+                    else:
+                        req.image_offset += 1
             if (
                 req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
                 < available_size

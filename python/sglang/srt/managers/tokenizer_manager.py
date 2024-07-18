@@ -94,8 +94,9 @@ class TokenizerManager:
         self.to_create_loop = True
         self.rid_to_state: Dict[str, ReqState] = {}
 
-    async def get_pixel_values(self, image_data):
-        aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
+    async def get_pixel_values(self, image_data, aspect_ratio=None):
+        if aspect_ratio is None:
+            aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
             self.hf_config.image_grid_pinpoints if aspect_ratio == "anyres" else None
         )
@@ -139,9 +140,26 @@ class TokenizerManager:
                 sampling_params.verify()
 
             if isinstance(obj.image_data, list) and len(obj.image_data) > 0:
-                pixel_values, image_hash, image_size = await self.get_pixel_values(
-                    obj.image_data[0]
-                )
+                # muti image/video (pad): num_frame, 3, 336, 336
+                # single image (anyres): num_patch, 3, 336, 336
+                pixel_values, image_hash, image_size = [], [], []
+                if len(obj.image_data) > 1:
+                    aspect_ratio = "pad" # more than one image --> interleaved image mode or video mode. We do not use anyres
+                    for image_data in obj.image_data:
+                        pixel_v, image_h, image_s = await self.get_pixel_values(
+                            image_data, aspect_ratio
+                        )
+                        pixel_values.append(pixel_v)
+                        image_hash.append(image_h)
+                        image_size.append(image_s)
+                    pixel_values = np.stack(pixel_values, axis=0)
+                else:
+                    pixel_v, image_h, image_s = await self.get_pixel_values(
+                        obj.image_data[0]
+                    )
+                    pixel_values = pixel_v
+                    image_hash.append(image_h)
+                    image_size.append(image_s)
             elif isinstance(obj.image_data, str):
                 pixel_values, image_hash, image_size = await self.get_pixel_values(
                     obj.image_data
