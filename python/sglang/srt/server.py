@@ -146,6 +146,26 @@ def _set_global_server_args(server_args: ServerArgs):
     }
 
 
+def _set_ulimit(target_soft_limit=65535):
+    import resource
+
+    resource_type = resource.RLIMIT_NOFILE
+    current_soft, current_hard = resource.getrlimit(resource_type)
+
+    if current_soft >= target_soft_limit:
+        print(
+            f"Current limits are already sufficient: soft={current_soft}, hard={current_hard}"
+        )
+    else:
+        try:
+            resource.setrlimit(resource_type, (target_soft_limit, current_hard))
+            new_soft, new_hard = resource.getrlimit(resource_type)
+            print(f"Successfully set new limits: soft={new_soft}, hard={new_hard}")
+        except ValueError as e:
+            print(f"Failed to set new limits: {e}")
+            print(f"Limits remain unchanged: soft={current_soft}, hard={current_hard}")
+
+
 def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_args=None):
     global tokenizer_manager
 
@@ -158,6 +178,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
     os.environ["NCCL_NVLS_ENABLE"] = "0"
+    _set_ulimit()
     if server_args.show_time_cost:
         enable_show_time_cost()
     if server_args.disable_disk_cache:
