@@ -338,15 +338,8 @@ class ServerArgs:
 
 
 @dataclasses.dataclass
-class ModelPortArgs:
-    nccl_port: int
-    model_tp_ips: List[str]
-    model_tp_ports: List[int]
-
-
-@dataclasses.dataclass
 class PortArgs:
     tokenizer_port: int
     router_port: int
     detokenizer_port: int
-    model_port_args: List[ModelPortArgs]
+    nccl_ports: List[int]

@@ -1,7 +1,6 @@
 """Launch the inference server for Llava-video model."""
 
 import argparse
-import multiprocessing as mp
 
 from sglang.srt.server import ServerArgs, launch_server
 
@@ -27,6 +26,4 @@ if __name__ == "__main__":
 
     server_args = ServerArgs.from_cli_args(args)
 
-    pipe_reader, pipe_writer = mp.Pipe(duplex=False)
-
-    launch_server(server_args, pipe_writer, model_overide_args)
+    launch_server(server_args, model_overide_args, None)
