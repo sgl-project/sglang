@@ -306,7 +306,7 @@ def test_image_qa():
     assert (
         "taxi" in state.messages()[-1]["content"]
         or "car" in state.messages()[-1]["content"]
-    )
+    ), f"{state.messages()[-1]['content']}"
 
 
 def test_stream():

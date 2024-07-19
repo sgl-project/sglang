@@ -1,8 +1,7 @@
 # Code Structure
 
-- `backend`: Various backends for the language interpreter.
 - `lang`: The frontend language.
-- `srt`: The serving engine for running local models. (SRT = SGLang Runtime).
+- `srt`: The backend engine for running local models. (SRT = SGLang Runtime).
 - `test`: Test utilities.
 - `api.py`: Public API.
 - `bench_latency.py`: Benchmark utilities.
