@@ -61,14 +61,14 @@ class DetokenizerManager:
                 if rid not in self.decode_status:
                     s = DecodeStatus(
                         decoded_text=recv_obj.decoded_texts[i],
-                        decode_ids=recv_obj.read_ids[i],
+                        decode_ids=recv_obj.decode_ids[i],
                         surr_offset=0,
                         read_offset=recv_obj.read_offsets[i],
                     )
                     self.decode_status[rid] = s
                 else:
                     s = self.decode_status[rid]
-                    s.decode_ids = recv_obj.read_ids[i]
+                    s.decode_ids = recv_obj.decode_ids[i]
 
                 read_ids.append(s.decode_ids[s.surr_offset :])
                 surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
