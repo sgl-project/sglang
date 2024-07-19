@@ -74,21 +74,6 @@ async def health() -> Response:
     return Response(status_code=200)
 
 
-def get_model_list():
-    """Available models."""
-    model_names = [tokenizer_manager.model_path]
-    return model_names
-
-
-@app.get("/v1/models")
-def available_models():
-    """Show available models."""
-    model_cards = []
-    for model_name in get_model_list():
-        model_cards.append(ModelCard(id=model_name, root=model_name))
-    return ModelList(data=model_cards)
-
-
 @app.get("/get_model_info")
 async def get_model_info():
     result = {
@@ -152,6 +137,16 @@ async def openai_v1_completions(raw_request: Request):
 @app.post("/v1/chat/completions")
 async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
+
+
+@app.get("/v1/models")
+def available_models():
+    """Show available models."""
+    model_names = [tokenizer_manager.model_path]
+    model_cards = []
+    for model_name in model_names:
+        model_cards.append(ModelCard(id=model_name, root=model_name))
+    return ModelList(data=model_cards)
 
 
 def _set_global_server_args(server_args: ServerArgs):

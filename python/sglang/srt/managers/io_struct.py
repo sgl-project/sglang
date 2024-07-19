@@ -13,25 +13,26 @@ from sglang.srt.sampling_params import SamplingParams
 
 @dataclass
 class GenerateReqInput:
-    # The input prompt
-    text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can either specify text or input_ids
+    # The input prompt. It can be a single prompt or a batch of prompts.
+    text: Union[List[str], str]
+    # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # The image input
+    # The image input. It can be a file name, a url, or base64 encoded string.
+    # See also python/sglang/srt/utils.py:load_image.
     image_data: Optional[Union[List[str], str]] = None
-    # The sampling_params
+    # The sampling_params.
     sampling_params: Union[List[Dict], Dict] = None
-    # The request id
+    # The request id.
     rid: Optional[Union[List[str], str]] = None
-    # Whether to return logprobs
+    # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
-    # The start location of the prompt for return_logprob
+    # The start location of the prompt for return_logprob.
     logprob_start_len: Optional[Union[List[int], int]] = None
-    # The number of top logprobs to return
+    # The number of top logprobs to return.
     top_logprobs_num: Optional[Union[List[int], int]] = None
-    # Whether to detokenize tokens in logprobs
+    # Whether to detokenize tokens in logprobs.
     return_text_in_logprobs: bool = False
-    # Whether to stream output
+    # Whether to stream output.
     stream: bool = False
 
     def post_init(self):
