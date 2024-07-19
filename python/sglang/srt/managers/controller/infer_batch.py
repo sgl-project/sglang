@@ -82,6 +82,14 @@ class Req:
         self.input_ids = None  # input_ids = origin_input_ids + output_ids
 
         # For incremental decoding
+        # ----- | --------- read_ids -------|
+        # ----- |   surr_ids  |
+        # xxxxx | xxxxxxxxxxx | xxxxxxxxxxx |
+        # ----- ^ ----------- ^ ----------- ^
+        # ----- 1 ----------- 2 ----------- 3
+        # 1: surr_offset
+        # 2: read_offset
+        # 3: last token
         self.decoded_text = ""
         self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
         self.read_offset = None
@@ -132,7 +140,7 @@ class Req:
         return self.finished_reason is not None
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
-    def init_detokenize_incrementally(self):
+    def init_incremental_detokenize(self):
         first_iter = self.surr_offset is None or self.read_offset is None
 
         if first_iter:
@@ -142,13 +150,11 @@ class Req:
             )
 
         all_ids = self.origin_input_ids_unpadded + self.output_ids
-        surr_ids = all_ids[self.surr_offset : self.read_offset]
-        read_ids = all_ids[self.surr_offset :]
+        return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
-        return surr_ids, read_ids, len(all_ids)
-
-    def detokenize_incrementally(self, inplace: bool = True):
-        surr_ids, read_ids, num_all_tokens = self.init_detokenize_incrementally()
+    def get_next_inc_detokenization(self):
+        read_ids, read_offset = self.init_incremental_detokenize()
+        surr_ids = read_ids[:read_offset]
 
         surr_text = self.tokenizer.decode(
             surr_ids,
@@ -162,13 +168,7 @@ class Req:
         )
 
         if len(new_text) > len(surr_text) and not new_text.endswith("�"):
-            new_text = new_text[len(surr_text) :]
-            if inplace:
-                self.decoded_text += new_text
-                self.surr_offset = self.read_offset
-                self.read_offset = num_all_tokens
-
-            return True, new_text
+            return True, new_text[len(surr_text) :]
 
         return False, ""
 
@@ -501,7 +501,7 @@ class Batch:
                     cur_output_ids = req.output_ids
 
                     req.output_ids.extend(suffix_ids)
-                    decode_res, new_text = req.detokenize_incrementally(inplace=False)
+                    decode_res, new_text = req.get_next_inc_detokenization()
                     if not decode_res:
                         req.output_ids = cur_output_ids
                         continue

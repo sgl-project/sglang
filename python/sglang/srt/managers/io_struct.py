@@ -111,8 +111,8 @@ class TokenizedGenerateReqInput:
 class BatchTokenIDOut:
     rids: List[str]
     decoded_texts: List[str]
-    surr_output_ids: List[List[int]]
-    read_output_ids: List[List[int]]
+    decode_ids: List[int]
+    read_offsets: List[int]
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
     meta_info: List[Dict]
