@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sglang"
 version = "0.1.21"
-description = "A structured generation langauge for LLMs."
+description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {file = "LICENSE"}
