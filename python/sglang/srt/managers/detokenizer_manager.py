@@ -20,6 +20,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 @dataclasses.dataclass
 class DecodeStatus:
+    vid: int
     decoded_text: str
     decode_ids: List[int]
     surr_offset: int
@@ -53,13 +54,14 @@ class DetokenizerManager:
             assert isinstance(recv_obj, BatchTokenIDOut)
             bs = len(recv_obj.rids)
 
-            # FIXME: incremental detokenize is not compatible with jump forward
             # Initialize decode status
             read_ids, surr_ids = [], []
             for i in range(bs):
                 rid = recv_obj.rids[i]
-                if rid not in self.decode_status:
+                vid = recv_obj.vids[i]
+                if rid not in self.decode_status or self.decode_status[rid].vid != vid:
                     s = DecodeStatus(
+                        vid=vid,
                         decoded_text=recv_obj.decoded_texts[i],
                         decode_ids=recv_obj.decode_ids[i],
                         surr_offset=0,

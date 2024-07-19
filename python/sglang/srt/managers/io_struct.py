@@ -111,6 +111,7 @@ class TokenizedGenerateReqInput:
 @dataclass
 class BatchTokenIDOut:
     rids: List[str]
+    vids: List[int]
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]

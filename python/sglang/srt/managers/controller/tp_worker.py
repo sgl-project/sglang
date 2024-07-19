@@ -589,6 +589,7 @@ class ModelTpServer:
 
     def handle_finished_requests(self, batch: Batch):
         output_rids = []
+        output_vids = []
         decoded_texts = []
         output_read_ids = []
         output_read_offsets = []
@@ -614,6 +615,7 @@ class ModelTpServer:
                 )
             ):
                 output_rids.append(req.rid)
+                output_vids.append(req.vid)
                 decoded_texts.append(req.decoded_text)
                 read_ids, read_offset = req.init_incremental_detokenize()
                 output_read_ids.append(read_ids)
@@ -653,6 +655,7 @@ class ModelTpServer:
             self.out_pyobjs.append(
                 BatchTokenIDOut(
                     output_rids,
+                    output_vids,
                     decoded_texts,
                     output_read_ids,
                     output_read_offsets,
