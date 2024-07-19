@@ -44,6 +44,7 @@ from sglang.srt.openai_api_adapter import (
     v1_chat_completions,
     v1_completions,
 )
+from sglang.srt.openai_protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     API_KEY_HEADER_NAME,
@@ -71,6 +72,21 @@ global_server_args_dict = {}
 async def health() -> Response:
     """Health check."""
     return Response(status_code=200)
+
+
+def get_model_list():
+    """Available models."""
+    model_names = [tokenizer_manager.model_path]
+    return model_names
+
+
+@app.get("/v1/models")
+def available_models():
+    """Show available models."""
+    model_cards = []
+    for model_name in get_model_list():
+        model_cards.append(ModelCard(id=model_name, root=model_name))
+    return ModelList(data=model_cards)
 
 
 @app.get("/get_model_info")
