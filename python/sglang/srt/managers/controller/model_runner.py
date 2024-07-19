@@ -123,7 +123,10 @@ class ModelRunner:
         if self.model_config.model_overide_args is not None:
             vllm_model_config.hf_config.update(self.model_config.model_overide_args)
 
-        if "llama" in self.server_args.model_path.lower() and self.server_args.quantization == "fp8":
+        if (
+            "llama" in self.server_args.model_path.lower()
+            and self.server_args.quantization == "fp8"
+        ):
             from sglang.srt.model_loader.model_loader import get_model
         else:
             from vllm.model_executor.model_loader import get_model

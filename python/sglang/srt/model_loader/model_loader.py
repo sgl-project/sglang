@@ -4,7 +4,6 @@
 import glob
 import os
 import re
-from tqdm import tqdm
 from typing import Any, Dict, Generator, List, Optional, Tuple, Type
 
 import torch

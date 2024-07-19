@@ -27,11 +27,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.controller.model_runner import InputMetadata
 
-
 MergedColumnParallelLinear = None
 QKVParallelLinear = None
 RowParallelLinear = None
- 
+
 
 class LlamaMLP(nn.Module):
     def __init__(
@@ -316,14 +315,19 @@ class LlamaForCausalLM(nn.Module):
         ]
         for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
             if weight_name in name:
-                return name.replace(weight_name, param_name)[:-len(".weight")], num_shard
-        return name[:-len(".weight")], 1
+                return (
+                    name.replace(weight_name, param_name)[: -len(".weight")],
+                    num_shard,
+                )
+        return name[: -len(".weight")], 1
 
     def get_num_params(self):
         params_dict = dict(self.named_parameters())
         return len(params_dict)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None):
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None
+    ):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -333,7 +337,7 @@ class LlamaForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-       
+
         def load_weights_per_param(name, loaded_weight):
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 return
@@ -369,7 +373,7 @@ class LlamaForCausalLM(nn.Module):
         if name is None or loaded_weight is None:
             if get_tensor_model_parallel_rank() == 0:
                 weights = tqdm.tqdm(weights, total=int(len(params_dict) * 1.5))
- 
+
             for name, loaded_weight in weights:
                 load_weights_per_param(name, loaded_weight)
         else:
