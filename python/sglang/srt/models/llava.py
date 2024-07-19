@@ -53,7 +53,7 @@ class LlavaLlamaForCausalLM(nn.Module):
 
     def pad_input_ids(self, input_ids, pad_value, pt_shape=None, image_size=None):
         
-        if len(image_size) > 4:
+        if len(image_size) > 16:
             new_image_feature_len = self.image_feature_len // 4 # video
         else:
             new_image_feature_len = self.image_feature_len # multiimage
@@ -208,7 +208,7 @@ class LlavaLlamaForCausalLM(nn.Module):
                             )
                             image_feature = image_feature.unsqueeze(0)
                         else:
-                            if image_feature.shape[0] > 4:
+                            if image_feature.shape[0] > 16:
                                 # 2x2 pooling
                                 num_of_frames = image_feature.shape[0]
                                 image_feature = image_feature.view(num_of_frames, height, width, -1)
