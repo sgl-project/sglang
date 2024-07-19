@@ -7,7 +7,6 @@ import triton.language as tl
 
 from sglang.srt.server import global_server_args_dict
 
-
 if global_server_args_dict.get("attention_reduce_in_fp32", False):
     REDUCE_TRITON_TYPE = tl.float32
     REDUCE_TORCH_TYPE = torch.float32

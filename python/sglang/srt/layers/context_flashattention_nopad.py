@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
