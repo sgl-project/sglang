@@ -27,7 +27,6 @@ The core features include:
 
 ## Contents
 - [Install](#install)
-- [Quick Start](#quick-start)
 - [Backend: SGLang Runtime (SRT)](#backend-sglang-runtime-srt)
 - [Frontend: Structured Generation Language (SGLang)](#frontend-structured-generation-language-sglang)
 - [Benchmark And Performance](#benchmark-and-performance)
