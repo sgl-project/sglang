@@ -289,6 +289,11 @@ class Batch:
     presence_penalties: torch.Tensor = None
     logit_bias: torch.Tensor = None
 
+    # Sequence Parallel params
+    sp_size: int = None
+    sp_rank: int = None
+    local_token_offsets: List[int] = None
+
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -349,6 +354,14 @@ class Batch:
         # Allocate memory
         seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
         extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
+        if self.sp_size is not None:
+            extend_seq_lens = seq_lens - prefix_lens
+            extend_start_loc = np.concatenate([0], np.cumsum(extend_seq_lens[:-1]))
+            self.local_token_offsets = get_prefill_indices(self.sp_rank,
+                self.sp_size, extend_seq_lens, extend_start_loc)
+            # FIXME: _extend_num_tokens -> extend_num_tokens once kv cache store is ready for SP
+            _extend_num_tokens = len(self.local_token_offsets)
+
         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
             self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
@@ -563,6 +576,13 @@ class Batch:
 
         # Alloc mem
         bs = len(self.reqs)
+        if self.sp_size is not None:
+            seq_lens_cpu = self.seq_lens.cpu().numpy()
+            decode_mask = get_decode_mask(self.sp_rank, self.sp_size, seq_lens_cpu)
+            self.local_token_offsets = np.nonzero(decode_mask)[0].reshape(-1).tolist()
+            # FIXME: _bs -> bs once kv cache store is ready for SP
+            _bs = len(self.local_token_offsets)
+
         self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
         if self.out_cache_loc is None:
@@ -720,6 +740,10 @@ class InputMetadata:
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
 
+    # For Sequence Parallel
+    seq_parallel_rank: int = None
+    seq_parallel_size: int = None
+
     @classmethod
     def create(
         cls,
@@ -796,6 +820,8 @@ class InputMetadata:
             flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
             flashinfer_prefill_wrapper_paged=model_runner.flashinfer_prefill_wrapper_paged,
             flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
+            seq_parallel_rank=model_runner.seq_parallel_rank,
+            seq_parallel_size=model_runner.seq_parallel_size,
         )
 
         if model_runner.server_args.disable_flashinfer:
@@ -896,3 +922,20 @@ def init_triton_args(forward_mode, seq_lens, prefix_lens):
         max_extend_len = int(torch.max(extend_seq_lens))
 
     return max_seq_len, max_extend_len, start_loc, prefix_lens
+
+
+def get_prefill_indices(sp_rank, sp_size, extend_seq_lens, extend_start_loc):
+    # For the first few ranks, they have one more token to compute
+    sp_req_len = extend_seq_lens // sp_size + ((extend_seq_lens % sp_size) > sp_rank).to(torch.long)
+    # the offset of each request in the batch. Only the first few ranks may get 1 more token (for each).
+    # for sp_rank=r, there are r ranks ahread (since 0-based), each may get one token
+    sp_in_req_offset = extend_seq_lens // sp_size * sp_rank + np.clip(extend_seq_lens % sp_size, a_min=None, a_max=sp_rank)
+    sp_req_start = extend_start_loc + sp_in_req_offset
+    sp_indices = np.concatenate([np.arange(s, s + l) for s, l in zip(sp_req_start, sp_req_len)])
+    return sp_indices.numpy().tolist()
+
+
+def get_decode_mask(sp_rank, sp_size, seq_lens):
+    # True means the corresponding token is located on this device. Otherwise False.
+    return (seq_lens % sp_size) == sp_rank
+

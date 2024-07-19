@@ -49,6 +49,8 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        sp_rank: Optional[int] = None,
+        sp_size: Optional[int] = None,
     ):
         # Parse args
         self.model_config = model_config
@@ -56,6 +58,8 @@ class ModelRunner:
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.sp_rank = sp_rank
+        self.sp_size = sp_size
         self.nccl_port = nccl_port
         self.server_args = server_args
         self.is_multimodal_model = is_multimodal_model(self.model_config)
