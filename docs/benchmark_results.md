@@ -1,4 +1,4 @@
-## Benchmark Results
+# Benchmark Results
 
 We tested our system on the following common LLM workloads and reported the achieved throughput:
 - **[MMLU](https://arxiv.org/abs/2009.03300)**: A 5-shot, multi-choice, multi-task benchmark.

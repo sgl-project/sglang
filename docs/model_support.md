@@ -1,4 +1,4 @@
-## How to Support a New Model
+# How to Support a New Model
 
 To support a new model in SGLang, you only need to add a single file under [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models). You can learn from existing model implementations and create new files for the new models. Most models are based on the transformer architecture, making them very similar.
 

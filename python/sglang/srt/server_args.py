@@ -244,13 +244,13 @@ class ServerArgs:
         parser.add_argument(
             "--show-time-cost",
             action="store_true",
-            help="Show time cost of custom marks",
+            help="Show time cost of custom marks.",
         )
         parser.add_argument(
             "--api-key",
             type=str,
             default=ServerArgs.api_key,
-            help="Set API key of the server",
+            help="Set API key of the server.",
         )
 
         # Data parallelism
@@ -286,17 +286,17 @@ class ServerArgs:
         parser.add_argument(
             "--disable-flashinfer",
             action="store_true",
-            help="Disable flashinfer inference kernels",
+            help="Disable flashinfer inference kernels.",
         )
         parser.add_argument(
             "--disable-radix-cache",
             action="store_true",
-            help="Disable RadixAttention",
+            help="Disable RadixAttention for prefix caching.",
         )
         parser.add_argument(
             "--disable-regex-jump-forward",
             action="store_true",
-            help="Disable regex jump-forward",
+            help="Disable regex jump-forward.",
         )
         parser.add_argument(
             "--disable-cuda-graph",

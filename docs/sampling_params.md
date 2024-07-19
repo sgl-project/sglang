@@ -1,4 +1,4 @@
-## Sampling Parameters of SGLang Runtime
+# Sampling Parameters in SGLang Runtime
 This doc describes the sampling parameters of the SGLang Runtime.
 
 The `/generate` endpoint accepts the following arguments in the JSON format.
@@ -6,11 +6,11 @@ The `/generate` endpoint accepts the following arguments in the JSON format.
 ```python
 @dataclass
 class GenerateReqInput:
-    # The input prompt
+    # The input prompt. It can be a single prompt or a batch of prompts.
     text: Union[List[str], str]
     # The token ids for text; one can either specify text or input_ids
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # The image input
+    # The image input. It can be a file name.
     image_data: Optional[Union[List[str], str]] = None
     # The sampling_params
     sampling_params: Union[List[Dict], Dict] = None

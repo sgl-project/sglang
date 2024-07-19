@@ -78,50 +78,12 @@ pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
 
 ## Backend: SGLang Runtime (SRT)
-The SGLang Runtime (SRT) is a serving engine that supports the following models.
+The SGLang Runtime (SRT) is an efficient serving engine.
 
-### Supported Models
-
-<table>
-<tbody>
-<tr align="center" valign="middle">
-<td>
-  <b>LLMs</b>
-</td>
-<td>
-  <b>VLMs</b>
-</td>
-<tr valign="top">
-<td align="left" valign="top">
-<ul>
-  <li> Llama, Llama 2, Llama 3 </li>
-  <li> Mistral, Mixtral </li>
-  <li> Qwen, Qwen 2, Qwen 2 MoE </li>
-  <li> Gemma, Gemma 2 </li>
-  <li> StableLM </li>
-  <li> Command-R </li>
-  <li> DBRX </li>
-  <li> Grok </li>
-  <li> ChatGLM </li>
-  <li> InternLM 2 </li>
-</ul>
-</td>
-<td>
-<ul>
-  <li> LLaVA(1.5,1.6) </li>
-  <li> LLaVA-Next(image, video) </li>
-  <li> Yi-VL </li>
-  <li> MiniCPM </li>
-</ul>
-</td>
-</tr>
-</tbody>
-</table>
-
-### Usage
+### Launching a Server
 Launch a server
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
 ```
 
 Send a request
@@ -139,7 +101,7 @@ curl http://localhost:30000/generate \
 Learn more about the argument format [here](docs/sampling_params.md).
 
 ### OpenAI Compatible API
-In addition, the server supports an experimental OpenAI-compatible API.
+In addition, the server supports OpenAI-compatible APIs.
 
 ```python
 import openai
@@ -168,70 +130,65 @@ response = client.chat.completions.create(
 print(response)
 ```
 
-By default, the server uses the chat template specified in the model tokenizer from Hugging Face. It should just work for most official models such as Llama-2/Llama-3.
+It supports streaming and most features of the Chat/Completions/Models endpoints specified by the [OpenAI API Reference](https://platform.openai.com/docs/api-reference/).
 
-If needed, you can also override the chat template when launching the server:
-
-```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --chat-template llama-2
-```
-
-If the chat template you are looking for is missing, you are welcome to contribute it.
-Meanwhile, you can also temporarily register your chat template as follows:
-
-```json
-{
-  "name": "my_model",
-  "system": "<|im_start|>system",
-  "user": "<|im_start|>user",
-  "assistant": "<|im_start|>assistant",
-  "sep_style": "CHATML",
-  "sep": "<|im_end|>",
-  "stop_str": ["<|im_end|>", "<|im_start|>"]
-}
-```
-
-```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --chat-template ./my_model_template.json
-```
-
-### Additional Arguments
+### Additional Server Arguments
 - Add `--tp 2` to enable tensor parallelism. If it indicates `peer access is not supported between these two devices`, add `--enable-p2p-check` option.
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --tp 2
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --tp 2
 ```
 - Add `--dp 2` to enable data parallelism. It can also be used together with tp. Data parallelism is better for throughput if there is enough memory.
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --dp 2 --tp 2
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --dp 2 --tp 2
 ```
 - If you see out-of-memory errors during serving, please try to reduce the memory usage of the KV cache pool by setting a smaller value of `--mem-fraction-static`. The default value is `0.9`
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --mem-fraction-static 0.7
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --mem-fraction-static 0.7
 ```
 - See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
 - Add `--nnodes 2` to run tensor parallelism on multiple nodes. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-1` be the hostname of the first node and `50000` be an available port.
 ```
 # Node 0
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --tp 4 --nccl-init sgl-dev-1:50000 --nnodes 2 --node-rank 0
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-1:50000 --nnodes 2 --node-rank 0
 
 # Node 1
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --tp 4 --nccl-init sgl-dev-1:50000 --nnodes 2 --node-rank 1
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-1:50000 --nnodes 2 --node-rank 1
 ```
+- If the model does not have a template in the Hugging Face tokenizer, you can specify a [custom chat template](docs/custom_chat_template.md).
 
 ### Supported Models
 
+- Llama / Llama 2 / Llama 3
+- Mistral / Mixtral
+- Gemma / Gemma 2
+- Qwen / Qwen 2 / Qwen 2 MoE
+- LLaVA 1.5 / 1.6
+  - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
+  - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.6-vicuna-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
+  - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.6-34b --tokenizer-path liuhaotian/llava-v1.6-34b-tokenizer --port 3000`
+- LLaVA-NeXT-Video
+  - see [srt_example_llava_v.sh](examples/usage/llava_video/srt_example_llava_v.sh)
+- Yi-VL
+  - see [srt_example_yi_vl.py](examples/quick_start/srt_example_yi_vl.py).
+- StableLM
+- Command-R
+- DBRX
+- Grok
+- ChatGLM
+- InternLM 2
+
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/model_support.md).
 
-
 ## Frontend: Structured Generation Language (SGLang)
+The frontend language can be used with local models or API models.
 
 ### Quick Start
 The example below shows how to use sglang to answer a mulit-turn question.
 
-### Using Local Models
+#### Using Local Models
 First, launch a server with
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
 ```
 
 Then, connect to the server and answer a multi-turn question.
@@ -260,7 +217,7 @@ for m in state.messages():
 print(state["answer_1"])
 ```
 
-### Using OpenAI Models
+#### Using OpenAI Models
 Set the OpenAI API Key
 ```
 export OPENAI_API_KEY=sk-******
@@ -291,13 +248,12 @@ for m in state.messages():
 print(state["answer_1"])
 ```
 
-### More Examples
+#### More Examples
 
 Anthropic and VertexAI (Gemini) models are also supported.
 You can find more examples at [examples/quick_start](examples/quick_start).
 
-
-
+### Language Feature
 To begin with, import sglang.
 ```python
 import sglang as sgl
@@ -310,7 +266,7 @@ The system will manage the state, chat template, parallelism and batching for yo
 
 The complete code for the examples below can be found at [readme_examples.py](examples/usage/readme_examples.py)
 
-### Control Flow
+#### Control Flow
 You can use any Python code within the function body, including control flow, nested function calls, and external libraries.
 
 ```python
@@ -325,7 +281,7 @@ def tool_use(s, question):
         s += "The key word to search is" + sgl.gen("word")
 ```
 
-### Parallelism
+#### Parallelism
 Use `fork` to launch parallel prompts.
 Because `sgl.gen` is non-blocking, the for loop below issues two generation calls in parallel.
 
@@ -347,7 +303,7 @@ def tip_suggestion(s):
     s += "In summary" + sgl.gen("summary")
 ```
 
-### Multi Modality
+#### Multi Modality
 Use `sgl.image` to pass an image as input.
 
 ```python
@@ -359,7 +315,7 @@ def image_qa(s, image_file, question):
 
 See also [srt_example_llava.py](examples/quick_start/srt_example_llava.py).
 
-### Constrained Decoding
+#### Constrained Decoding
 Use `regex` to specify a regular expression as a decoding constraint.
 This is only supported for local models.
 
@@ -374,7 +330,7 @@ def regular_expression_gen(s):
     )
 ```
 
-### JSON Decoding
+#### JSON Decoding
 Use `regex` to specify a JSON schema with a regular expression.
 
 ```python
@@ -403,8 +359,7 @@ def character_gen(s, name):
 
 See also [json_decode.py](examples/usage/json_decode.py) for an additional example on specifying formats with Pydantic models.
 
-
-### Batching
+#### Batching
 Use `run_batch` to run a batch of requests with continuous batching.
 
 ```python
@@ -423,7 +378,7 @@ states = text_qa.run_batch(
 )
 ```
 
-### Streaming
+#### Streaming
 Add `stream=True` to enable streaming.
 
 ```python
@@ -442,7 +397,7 @@ for out in state.text_iter():
     print(out, end="", flush=True)
 ```
 
-### Tips and Implementation Details
+#### Tips and Implementation Details
 - The `choices` argument in `sgl.gen` is implemented by computing the [token-length normalized log probabilities](https://blog.eleuther.ai/multiple-choice-normalization/) of all choices and selecting the one with the highest probability.
 - The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex. It is compatible with `temperature=0` and `temperature != 0`.
 
