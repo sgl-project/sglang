@@ -1,5 +1,6 @@
 import importlib
 import os
+import resource
 import subprocess
 import sys
 from collections import OrderedDict, defaultdict
@@ -10,6 +11,9 @@ import torch
 PACKAGE_LIST = [
     "sglang",
     "flashinfer",
+    "requests",
+    "tqdm",
+    "numpy",
     "aiohttp",
     "fastapi",
     "hf_transfer",
@@ -153,6 +157,9 @@ def check_env():
     gpu_topo = get_gpu_topology()
     if gpu_topo:
         env_info["NVIDIA Topology"] = gpu_topo
+
+    ulimit_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    env_info["ulimit soft"] = ulimit_soft
 
     for k, v in env_info.items():
         print(f"{k}: {v}")
