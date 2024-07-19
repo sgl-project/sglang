@@ -53,7 +53,7 @@ def gen_data(config, tp_size, sp_size, num_tokens):
     extend_start_loc = []
     # req_offset = []
     while len(full_pos) < num_tokens:
-        length = random.randint(sp_size, num_tokens // 4)
+        length = random.randint(sp_size, num_tokens // 2)
         length = min(length, num_tokens - len(full_pos))
         len_offset = random.randint(0, num_tokens)
         
@@ -93,41 +93,38 @@ def get_prefill_indices(sp_rank, sp_size, extend_seq_lens, extend_start_loc):
     sp_indices = torch.concat([torch.arange(s, s + l) for s, l in zip(sp_req_start, sp_req_len)])
     return sp_indices.cpu().numpy()
 
-def sp_rope_forward(self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,):
-    pass
-
 @torch.no_grad()
 def main():
     config = AutoConfig.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
     tp_size = 4
     sp_size = 4
-    num_tokens = 32
-    full_q, full_k, full_pos, extend_seq_lens, extend_start_loc = gen_data(config, tp_size, sp_size, num_tokens)
-    sp_indices = gen_sp_indices(sp_size, extend_seq_lens, extend_start_loc, num_tokens, test=True)
+    num_tokens = 1280
+    (full_q, full_k, full_pos, extend_seq_lens,
+     extend_start_loc) = gen_data(config, tp_size, sp_size, num_tokens)
+    sp_indices = gen_sp_indices(sp_size, extend_seq_lens, extend_start_loc,
+                                num_tokens, test=True)
     # correct result
     rope = gen_rope_model(config)
     full_pos = full_pos.cuda()
     full_q = full_q.cuda().reshape(num_tokens, -1)
     full_k = full_k.cuda().reshape(num_tokens, -1)
 
-    cor_q, cor_k = rope(full_pos, full_q, full_k)
+    cor_q, cor_k = rope(full_pos, torch.clone(full_q),
+                        torch.clone(full_k))
 
     # simulated result
-    test_q = torch.zeros_like(cor_q)
-    test_k = torch.zeros_like(cor_k)
+    test_q = torch.zeros_like(cor_q).squeeze(0)
+    test_k = torch.zeros_like(cor_k).squeeze(0)
     for sp_idx in sp_indices:
-        q, k = rope.forward_native(full_pos[sp_idx], full_q[sp_idx], full_k[sp_idx])
-        torch.testing.assert_close(full_q[sp_idx], q.squeeze(0))
-        exit(-1)
+        q, k = rope(full_pos[sp_idx], torch.clone(full_q[sp_idx]),
+                    torch.clone(full_k[sp_idx]))
         test_q[sp_idx] = q
         test_k[sp_idx] = k
+    test_q = test_q.reshape(cor_q.shape)
+    test_k = test_k.reshape(cor_k.shape)
 
-    torch.testing.assert_close(full_q, test_q)
-    torch.testing.assert_close(full_k, test_k)
+    torch.testing.assert_close(cor_q, test_q)
+    torch.testing.assert_close(cor_k, test_k)
 
 
 main()
