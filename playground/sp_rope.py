@@ -93,6 +93,10 @@ def get_prefill_indices(sp_rank, sp_size, extend_seq_lens, extend_start_loc):
     sp_indices = torch.concat([torch.arange(s, s + l) for s, l in zip(sp_req_start, sp_req_len)])
     return sp_indices.cpu().numpy()
 
+def get_decode_mask(sp_rank, sp_size, seq_lens):
+    # True means the corresponding token is located on this device. Otherwise False.
+    return (seq_lens % sp_size == sp_rank)
+
 @torch.no_grad()
 def main():
     config = AutoConfig.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
