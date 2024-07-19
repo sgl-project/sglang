@@ -4,8 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import wrap_kernel_launcher
-
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
@@ -119,9 +117,6 @@ def _fwd_kernel(
     tl.store(out_ptrs, acc, mask=offs_m[:, None] < cur_batch_seq_len)
 
 
-cached_kernel = None
-
-
 def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
     if CUDA_CAPABILITY[0] >= 8:
         BLOCK = 128
@@ -138,29 +133,6 @@ def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
 
     grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
     num_warps = 4 if Lk <= 64 else 8
-
-    global cached_kernel
-    if cached_kernel:
-        cached_kernel(
-            grid,
-            num_warps,
-            q,
-            k,
-            v,
-            sm_scale,
-            b_start_loc,
-            b_seq_len,
-            o,
-            q.stride(0),
-            q.stride(1),
-            k.stride(0),
-            k.stride(1),
-            v.stride(0),
-            v.stride(1),
-            o.stride(0),
-            o.stride(1),
-        )
-        return
 
     _fwd_kernel[grid](
         q,
@@ -185,4 +157,3 @@ def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
         num_warps=num_warps,
         num_stages=1,
     )
-    cached_kernel = wrap_kernel_launcher(_fwd_kernel)
