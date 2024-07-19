@@ -6,9 +6,9 @@ from functools import partial
 import numpy as np
 import requests
 
-from sglang.backend.openai import OpenAI
-from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.global_config import global_config
+from sglang.lang.backend.openai import OpenAI
+from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import get_exception_traceback
 
 

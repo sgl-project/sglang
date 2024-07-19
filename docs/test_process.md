@@ -1,4 +1,4 @@
-## SRT Unit Tests
+# SRT Unit Tests
 
 ### Latency Alignment
 Make sure your changes do not slow down the following benchmarks

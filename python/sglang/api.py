@@ -4,8 +4,8 @@ import os
 import re
 from typing import Callable, List, Optional, Union
 
-from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config
+from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.ir import (
     SglExpr,
     SglExprList,
