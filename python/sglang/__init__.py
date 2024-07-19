@@ -23,11 +23,11 @@ from sglang.api import (
 )
 
 # SGL Backends
-from sglang.backend.anthropic import Anthropic
-from sglang.backend.litellm import LiteLLM
-from sglang.backend.openai import OpenAI
-from sglang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.backend.vertexai import VertexAI
+from sglang.lang.backend.anthropic import Anthropic
+from sglang.lang.backend.litellm import LiteLLM
+from sglang.lang.backend.openai import OpenAI
+from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.lang.backend.vertexai import VertexAI
 
 # Global Configurations
 from sglang.global_config import global_config

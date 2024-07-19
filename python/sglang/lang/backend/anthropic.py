@@ -2,7 +2,7 @@ from typing import List, Optional, Union
 
 import numpy as np
 
-from sglang.backend.base_backend import BaseBackend
+from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams

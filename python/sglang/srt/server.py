@@ -26,7 +26,7 @@ import uvloop
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from sglang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.constrained import disable_cache
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.controller.manager_multi import (

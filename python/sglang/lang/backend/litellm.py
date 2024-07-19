@@ -1,6 +1,6 @@
 from typing import Mapping, Optional
 
-from sglang.backend.base_backend import BaseBackend
+from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
