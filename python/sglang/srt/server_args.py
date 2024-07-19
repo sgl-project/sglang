@@ -166,7 +166,15 @@ class ServerArgs:
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
-            choices=["awq", "fp8", "gptq", "marlin", "gptq_marlin", "squeezellm", "bitsandbytes"],
+            choices=[
+                "awq",
+                "fp8",
+                "gptq",
+                "marlin",
+                "gptq_marlin",
+                "squeezellm",
+                "bitsandbytes",
+            ],
             help="The quantization method.",
         )
         parser.add_argument(
