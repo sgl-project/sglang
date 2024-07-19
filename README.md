@@ -10,7 +10,7 @@ SGLang is a fast serving framework for large language models and vision language
 It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
 
 The core features include:
-- **Fast Backend Runtime**: Efficient serving with RadixAttention for prefix caching, continuous batching, token attention (paged attention), tensor parallelism, flashinfer kernels, and quantization (AWQ/FP8/GPTQ/Marlin).
+- **Fast Backend Runtime**: Efficient serving with RadixAttention for prefix caching, continuous batching, token attention (paged attention), tensor parallelism, flashinfer kernels, jump-forward constrained decoding, and quantization (AWQ/FP8/GPTQ/Marlin).
 - **Flexible Frontend Language**: Enables easy programming of LLM applications with chained generation calls, advanced prompting, control flow, multiple modalities, parallelism, and external interactions.
 
 ## News
