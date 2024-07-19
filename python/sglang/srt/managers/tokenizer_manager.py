@@ -69,7 +69,10 @@ class TokenizerManager:
             trust_remote_code=server_args.trust_remote_code,
             model_overide_args=model_overide_args,
         )
-        self.context_len = get_context_length(self.hf_config)
+        if server_args.context_length is not None:
+            self.context_len = server_args.context_length
+        else:
+            self.context_len = get_context_length(self.hf_config)
 
         if is_multimodal_model(self.model_path):
             self.processor = get_processor(
