@@ -7,6 +7,23 @@ from pydantic import BaseModel, Field
 from typing_extensions import Literal
 
 
+class ModelCard(BaseModel):
+    """Model cards."""
+
+    id: str
+    object: str = "model"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    owned_by: str = "sglang"
+    root: Optional[str] = None
+
+
+class ModelList(BaseModel):
+    """Model list consists of model cards."""
+
+    object: str = "list"
+    data: List[ModelCard] = []
+
+
 class ErrorResponse(BaseModel):
     object: str = "error"
     message: str
