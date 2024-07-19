@@ -20,7 +20,9 @@ The core features include:
 
 <details>
 <summary>More</summary>
+
 - [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
+
 </details>
 
 ## Contents
