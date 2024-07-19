@@ -33,7 +33,7 @@ class ServerArgs:
 
     # Other runtime options
     tp_size: int = 1
-    stream_interval: int = 8
+    stream_interval: int = 1
     random_seed: Optional[int] = None
 
     # Logging
