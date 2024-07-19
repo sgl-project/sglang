@@ -162,9 +162,9 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - Gemma / Gemma 2
 - Qwen / Qwen 2 / Qwen 2 MoE
 - LLaVA 1.5 / 1.6
-  - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
-  - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.6-vicuna-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
-  - `python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.6-34b --tokenizer-path liuhaotian/llava-v1.6-34b-tokenizer --port 3000`
+  - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
+  - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.6-vicuna-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
+  - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.6-34b --tokenizer-path liuhaotian/llava-v1.6-34b-tokenizer --port 30000`
 - LLaVA-NeXT-Video
   - see [srt_example_llava_v.sh](examples/usage/llava_video/srt_example_llava_v.sh)
 - Yi-VL
@@ -177,6 +177,17 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - InternLM 2
 
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/model_support.md).
+
+### Benchmark Performance
+
+- Benchmark a single static batch. Run the following command without launching a server. The arguments are the same as those for `launch_server.py`.
+  ```
+  python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 32 --input-len 256 --output-len 32
+  ```
+- Benchmark online serving. Launch a server first and run the following command.
+  ```
+  python3 -m sglang.bench_serving --backend sglang --num-prompt 10
+  ```
 
 ## Frontend: Structured Generation Language (SGLang)
 The frontend language can be used with local models or API models.
