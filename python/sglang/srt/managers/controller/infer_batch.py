@@ -90,6 +90,7 @@ class Req:
         # 1: surr_offset
         # 2: read_offset
         # 3: last token
+        self.vid = 0  # version id to sync decode status with in detokenizer_manager
         self.decoded_text = ""
         self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
         self.read_offset = None
@@ -519,6 +520,9 @@ class Batch:
                     ):
                         req.output_ids = cur_output_ids
                         continue
+
+                    # The decode status has diverged from detokenizer_manager
+                    req.vid += 1
 
                     # insert the old request into tree_cache
                     if req_pool_indices_cpu is None:
