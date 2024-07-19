@@ -18,12 +18,10 @@ from safetensors.torch import load_file, safe_open, save_file
 from torch import nn
 from tqdm.auto import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
-
 from vllm.config import LoadConfig, ModelConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from sglang.srt.layers.quantization import get_quantization_config
-
 
 logger = logging.getLogger("srt.model_loader")
 temp_dir = tempfile.gettempdir()
@@ -38,14 +36,15 @@ def set_default_torch_dtype(dtype: torch.dtype):
     torch.set_default_dtype(old_dtype)
 
 
-def get_model_architecture(
-        model_config: ModelConfig) -> Tuple[Type[nn.Module], str]:
+def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], str]:
     architectures = getattr(model_config.hf_config, "architectures", [])
     # Special handling for quantized Mixtral.
     # FIXME(woosuk): This is a temporary hack.
-    if (model_config.quantization is not None
-            and model_config.quantization != "fp8"
-            and "MixtralForCausalLM" in architectures):
+    if (
+        model_config.quantization is not None
+        and model_config.quantization != "fp8"
+        and "MixtralForCausalLM" in architectures
+    ):
         architectures = ["QuantMixtralForCausalLM"]
 
     for arch in architectures:
@@ -54,7 +53,8 @@ def get_model_architecture(
             return (model_cls, arch)
     raise ValueError(
         f"Model architectures {architectures} are not supported for now. "
-        f"Supported architectures: {ModelRegistry.get_supported_archs()}")
+        f"Supported architectures: {ModelRegistry.get_supported_archs()}"
+    )
 
 
 class DisabledTqdm(tqdm):
@@ -71,8 +71,7 @@ def get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
     # add hash to avoid conflict with old users' lock files
     lock_file_name = hash_name + model_name + ".lock"
     # mode 0o666 is required for the filelock to be shared across users
-    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name),
-                             mode=0o666)
+    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
 
 
@@ -161,8 +160,9 @@ def download_safetensors_index_file_from_hf(
 # Passing both of these to the weight loader functionality breaks.
 # So, we use the SAFE_WEIGHTS_INDEX_NAME to
 # look up which safetensors files should be used.
-def filter_duplicate_safetensors_files(hf_weights_files: List[str],
-                                       hf_folder: str) -> List[str]:
+def filter_duplicate_safetensors_files(
+    hf_weights_files: List[str], hf_folder: str
+) -> List[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
     index_file_name = os.path.join(hf_folder, SAFE_WEIGHTS_INDEX_NAME)
@@ -175,17 +175,14 @@ def filter_duplicate_safetensors_files(hf_weights_files: List[str],
         weight_map = json.load(index_file)["weight_map"]
     weight_files_in_index = set()
     for weight_name in weight_map:
-        weight_files_in_index.add(
-            os.path.join(hf_folder, weight_map[weight_name]))
+        weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
     # Filter out any fields that are not found in the index file.
-    hf_weights_files = [
-        f for f in hf_weights_files if f in weight_files_in_index
-    ]
+    hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
 
 
 def safetensors_weights_iterator(
-    hf_weights_files: List[str]
+    hf_weights_files: List[str],
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     for st_file in hf_weights_files:
@@ -195,26 +192,27 @@ def safetensors_weights_iterator(
                 yield name, param
 
 
-def get_quant_config(model_config: ModelConfig,
-                     load_config: LoadConfig) -> QuantizationConfig:
+def get_quant_config(
+    model_config: ModelConfig, load_config: LoadConfig
+) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
     # Read the quantization config from the HF model config, if available.
-    hf_quant_config = getattr(model_config.hf_config, "quantization_config",
-                              None)
+    hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
     if hf_quant_config is None:
         # compressed-tensors uses a compressions_config
-        hf_quant_config = getattr(model_config.hf_config, "compression_config",
-                                  None)
+        hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
         return quant_cls.from_config(hf_quant_config)
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
-        if (not load_config.model_loader_extra_config
-                or "qlora_adapter_name_or_path"
-                not in load_config.model_loader_extra_config):
+        if (
+            not load_config.model_loader_extra_config
+            or "qlora_adapter_name_or_path" not in load_config.model_loader_extra_config
+        ):
             return quant_cls.from_config({"adapter_name_or_path": ""})
         model_name_or_path = load_config.model_loader_extra_config[
-            "qlora_adapter_name_or_path"]
+            "qlora_adapter_name_or_path"
+        ]
 
     else:
         model_name_or_path = model_config.model
@@ -242,16 +240,15 @@ def get_quant_config(model_config: ModelConfig,
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
 
     quant_config_files = [
-        f for f in config_files if any(
-            f.endswith(x) for x in possible_config_filenames)
+        f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
     ]
     if len(quant_config_files) == 0:
-        raise ValueError(
-            f"Cannot find the config file for {model_config.quantization}")
+        raise ValueError(f"Cannot find the config file for {model_config.quantization}")
     if len(quant_config_files) > 1:
         raise ValueError(
             f"Found multiple config files for {model_config.quantization}: "
-            f"{quant_config_files}")
+            f"{quant_config_files}"
+        )
 
     quant_config_file = quant_config_files[0]
     with open(quant_config_file, "r") as f:
