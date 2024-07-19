@@ -7,7 +7,7 @@
 | [**Blog**](https://lmsys.org/blog/2024-01-17-sglang/) | [**Paper**](https://arxiv.org/abs/2312.07104) |
 
 SGLang is a fast serving framework for large language models and vision language models.
-It makes your interaction with models faster and more controllable by co-designing the backend runtime and the frontend language.
+It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
 
 The core features include:
 - **Fast Backend Runtime**: Efficient serving with RadixAttention for prefix caching, continuous batching, token attention (paged attention), tensor parallelism, and flashinfer kernels.
