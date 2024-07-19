@@ -1,3 +1,5 @@
+"""Check environment configurations and dependency versions."""
+
 import importlib
 import os
 import resource
