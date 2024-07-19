@@ -10,7 +10,7 @@ SGLang is a fast serving framework for large language models and vision language
 It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
 
 The core features include:
-- **Fast Backend Runtime**: Efficient serving with RadixAttention for prefix caching, continuous batching, token attention (paged attention), tensor parallelism, flashinfer kernels, jump-forward constrained decoding, and quantization (AWQ/FP8/GPTQ/Marlin).
+- **Fast Backend Runtime**: Efficient serving with RadixAttention for prefix caching, jump-forward constrained decoding, continuous batching, token attention (paged attention), tensor parallelism, flashinfer kernels, and quantization (AWQ/FP8/GPTQ/Marlin).
 - **Flexible Frontend Language**: Enables easy programming of LLM applications with chained generation calls, advanced prompting, control flow, multiple modalities, parallelism, and external interactions.
 
 ## News
@@ -129,7 +129,7 @@ response = client.chat.completions.create(
 print(response)
 ```
 
-It supports streaming and most features of the Chat/Completions/Models endpoints specified by the [OpenAI API Reference](https://platform.openai.com/docs/api-reference/).
+It supports streaming, vision, and most features of the Chat/Completions/Models endpoints specified by the [OpenAI API Reference](https://platform.openai.com/docs/api-reference/).
 
 ### Additional Server Arguments
 - Add `--tp 2` to enable tensor parallelism. If it indicates `peer access is not supported between these two devices`, add `--enable-p2p-check` option.
