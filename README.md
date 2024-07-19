@@ -79,7 +79,7 @@ pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/
 ## Backend: SGLang Runtime (SRT)
 The SGLang Runtime (SRT) is an efficient serving engine.
 
-### Launching a Server
+### Quick Start
 Launch a server
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
