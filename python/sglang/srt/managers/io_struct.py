@@ -66,13 +66,16 @@ class GenerateReqInput:
             if parallel_sample_num != 1:
                 # parallel sampling +1 represents the original prefill stage
                 num = parallel_sample_num + 1
-                if not isinstance(self.text, str):
-                    raise ValueError(
-                        "The text should be a string when using parallel sampling."
-                    )
+                if isinstance(self.text, List):
+                    ## suppot batch operation
+                    self.batch_size = len(self.text)
+                    num = num * len(self.text)
+                else:
+                    self.batch_size = 1
             else:
                 ## support select operation
                 num = len(self.text) if self.text is not None else len(self.input_ids)
+                self.batch_size = num
 
             if self.image_data is None:
                 self.image_data = [None] * num
