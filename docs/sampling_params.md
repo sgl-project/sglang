@@ -121,6 +121,7 @@ Download an image
 curl -o example_image.png -L https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true
 ```
 
+Send a request
 ```python
 import requests
 
