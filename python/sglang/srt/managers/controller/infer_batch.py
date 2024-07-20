@@ -351,9 +351,8 @@ class Batch:
             for sp_rank in range(self.sp_size):
                 ids = input_ids[i]
                 local_slice = _get_local_token_slices(sp_rank, self.sp_size,
-                                                      len(ids[i]))
+                                                      len(ids))
                 flatten_input_ids[sp_rank].extend(ids[local_slice])
-            flatten_input_ids.extend(input_ids[i])
             extend_lens.append(len(input_ids[i]))
 
             if len(prefix_indices[i]) == 0:
@@ -371,7 +370,7 @@ class Batch:
         for flatten_ids in flatten_input_ids:
             if len(flatten_ids) < local_len_padded:
                 flatten_ids.extend([0] * (local_len_padded - len(flatten_ids)))
-        flatten_input_ids = itertools.chain(flatten_input_ids)
+        flatten_input_ids = list(itertools.chain(flatten_input_ids))
 
         position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
 
@@ -769,8 +768,8 @@ class InputMetadata:
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
 
     # For Sequence Parallel
-    seq_parallel_rank: int = None
-    seq_parallel_size: int = None
+    sp_rank: int = None
+    sp_size: int = None
 
     @classmethod
     def create(
@@ -850,8 +849,8 @@ class InputMetadata:
             flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
             flashinfer_prefill_wrapper_paged=model_runner.flashinfer_prefill_wrapper_paged,
             flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
-            seq_parallel_rank=model_runner.seq_parallel_rank,
-            seq_parallel_size=model_runner.seq_parallel_size,
+            sp_rank=model_runner.sp_rank,
+            sp_size=model_runner.sp_size,
         )
 
         if model_runner.server_args.disable_flashinfer:
