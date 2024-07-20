@@ -196,14 +196,14 @@ class TokenizerManager:
         event = asyncio.Event()
         state = ReqState([], False, event)
         self.rid_to_state[rid] = state
-        if is_prefill == False:
+        if is_prefill:
+            await self._wait_for_prefill_response(event, state, obj, request, rid)
+            yield input_ids
+        else:
             async for response in self._wait_for_response(
                 event, state, obj, rid, request
             ):
                 yield response
-        else:
-            await self._wait_for_prefill_response(event, state, obj, request, rid)
-            yield input_ids
 
     async def _handle_batch_request(self, obj, request):
         batch_size = obj.batch_size
