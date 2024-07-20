@@ -1,5 +1,7 @@
 """
-Usage: python3 srt_example_llava.py
+Usage:
+pip install opencv-python-headless
+python3 srt_example_llava.py
 """
 
 import argparse

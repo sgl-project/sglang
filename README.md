@@ -166,7 +166,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
   - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.6-vicuna-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
   - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.6-34b --tokenizer-path liuhaotian/llava-v1.6-34b-tokenizer --port 30000`
 - LLaVA-NeXT-Video
-  - see [srt_example_llava_v.sh](examples/usage/llava_video/srt_example_llava_v.sh)
+  - see [examples/usage/llava_video](examples/usage/llava_video)
 - Yi-VL
   - see [srt_example_yi_vl.py](examples/quick_start/srt_example_yi_vl.py).
 - StableLM
