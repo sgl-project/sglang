@@ -91,6 +91,7 @@ def _initialize_model(
         config=model_config.hf_config,
         cache_config=cache_config,
         quant_config=quant_config,
+        efficient_weight_load=True,
         **_get_model_initialization_kwargs(model_class, lora_config, multimodal_config),
     )
 
