@@ -40,11 +40,13 @@ class GenerateReqInput:
             self.text is not None and self.input_ids is not None
         ):
             raise ValueError("Either text or input_ids should be provided.")
-
-        if self.text is not None:
-            is_single = isinstance(self.text, str)
+        if "n" in self.sampling_params and self.sampling_params["n"] != 1:
+            is_single = False
         else:
-            is_single = isinstance(self.input_ids[0], int)
+            if self.text is not None:
+                is_single = isinstance(self.text, str)
+            else:
+                is_single = isinstance(self.input_ids[0], int)
         self.is_single = is_single
 
         if is_single:
@@ -59,7 +61,22 @@ class GenerateReqInput:
             if self.top_logprobs_num is None:
                 self.top_logprobs_num = 0
         else:
-            num = len(self.text) if self.text is not None else len(self.input_ids)
+
+            parallel_sample_num = self.sampling_params.get("n", 1)
+
+            if parallel_sample_num != 1:
+                # parallel sampling +1 represents the original prefill stage
+                num = parallel_sample_num + 1
+                if isinstance(self.text, List):
+                    ## suppot batch operation
+                    self.batch_size = len(self.text)
+                    num = num * len(self.text)
+                else:
+                    self.batch_size = 1
+            else:
+                ## support select operation
+                num = len(self.text) if self.text is not None else len(self.input_ids)
+                self.batch_size = num
 
             if self.image_data is None:
                 self.image_data = [None] * num
