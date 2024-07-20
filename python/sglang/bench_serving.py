@@ -901,7 +901,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--disable-stream",
         action="store_true",
-        help="Specify to disable tqdm progress bar.",
+        help="Disable streaming mode.",
     )
 
     set_ulimit()
