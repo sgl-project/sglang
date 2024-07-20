@@ -19,6 +19,7 @@ import traceback
 import warnings
 from argparse import ArgumentParser as FlexibleArgumentParser
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import AsyncGenerator, List, Optional, Tuple, Union
 
 import aiohttp
@@ -516,6 +517,7 @@ async def benchmark(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
     disable_tqdm: bool,
+    enable_multi: bool,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -609,6 +611,37 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("=" * 50)
 
+    if enable_multi:
+        if (
+            metrics.median_ttft_ms is not None
+            and metrics.mean_itl_ms is not None
+            and metrics.output_throughput is not None
+        ):
+            result = {
+                "dataset_name": args.dataset_name,
+                "request_rate": request_rate,
+                "median_ttft": metrics.median_ttft_ms,
+                "median_itl": metrics.mean_itl_ms,
+                "output_token_throughput": metrics.output_throughput,
+                "sharegpt_output_len": args.sharegpt_output_len,
+                "random_input_len": args.random_input_len,
+                "random_output_len": args.random_output_len,
+            }
+        else:
+            print(f"Error running benchmark for request rate: {request_rate}")
+            print("-" * 30)
+
+        # Determine output file name
+        if args.output_file:
+            output_file_name = args.output_file
+        else:
+            now = datetime.now().strftime("%m%d%H")
+            output_file_name = f"{args.backend}_{now}.jsonl"
+
+        # Append results to a JSONL file
+        with open(output_file_name, "a") as file:
+            file.write(json.dumps(result) + "\n")
+
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
@@ -637,6 +670,11 @@ async def benchmark(
         "errors": [output.error for output in outputs],
     }
     return result
+
+
+def parse_request_rate_range(request_rate_range):
+    start, stop, step = map(int, request_rate_range.split(","))
+    return list(range(start, stop, step))
 
 
 def fire(args: argparse.Namespace):
@@ -715,17 +753,35 @@ def fire(args: argparse.Namespace):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
-    asyncio.run(
-        benchmark(
-            backend=backend,
-            api_url=api_url,
-            model_id=model_id,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            request_rate=args.request_rate,
-            disable_tqdm=args.disable_tqdm,
+    if args.multi:
+        request_rates = parse_request_rate_range(args.request_rate_range)
+
+        for rate in request_rates:
+            asyncio.run(
+                benchmark(
+                    backend=backend,
+                    api_url=api_url,
+                    model_id=model_id,
+                    tokenizer=tokenizer,
+                    input_requests=input_requests,
+                    request_rate=rate,
+                    disable_tqdm=args.disable_tqdm,
+                    enable_multi=args.multi,
+                )
+            )
+    else:
+        asyncio.run(
+            benchmark(
+                backend=backend,
+                api_url=api_url,
+                model_id=model_id,
+                tokenizer=tokenizer,
+                input_requests=input_requests,
+                request_rate=args.request_rate,
+                disable_tqdm=args.disable_tqdm,
+                enable_multi=args.multi,
+            )
         )
-    )
 
 
 # to avoid relying on SGLang's components
@@ -829,6 +885,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Specify to disable tqdm progress bar.",
     )
+    parser.add_argument(
+        "--multi",
+        action="store_true",
+        help="Use request rate range rather than single value.",
+    )
+    parser.add_argument(
+        "--request-rate-range",
+        type=str,
+        default="2,34,2",
+        help="Range of request rates in the format start,stop,step. Default is 2,34,2",
+    )
+    parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
 
     set_ulimit()
 
