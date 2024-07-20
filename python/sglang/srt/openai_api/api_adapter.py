@@ -105,11 +105,8 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
             "regex": request.regex,
-<<<<<<< Updated upstream:python/sglang/srt/openai_api/api_adapter.py
             "n": request.n,
-=======
             "ignore_eos": request.ignore_eos,
->>>>>>> Stashed changes:python/sglang/srt/openai_api_adapter.py
         },
         return_logprob=request.logprobs is not None and request.logprobs > 0,
         top_logprobs_num=request.logprobs if request.logprobs is not None else 0,
