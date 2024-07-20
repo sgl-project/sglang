@@ -1,4 +1,4 @@
-from sglang.srt.managers.openai_protocol import (
+from sglang.srt.managers.openai_api.protocol import (
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentImageURL,
     ChatCompletionMessageContentTextPart,

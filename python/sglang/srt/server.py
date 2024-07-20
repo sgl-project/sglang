@@ -39,12 +39,12 @@ from sglang.srt.managers.controller.manager_single import (
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.openai_api_adapter import (
+from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_chat_completions,
     v1_completions,
 )
-from sglang.srt.openai_protocol import ModelCard, ModelList
+from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     API_KEY_HEADER_NAME,

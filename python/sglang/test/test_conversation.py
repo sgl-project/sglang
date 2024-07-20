@@ -1,5 +1,5 @@
 from sglang.srt.conversation import generate_chat_conv
-from sglang.srt.managers.openai_protocol import (
+from sglang.srt.managers.openai_api.protocol import (
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentImageURL,
     ChatCompletionMessageContentTextPart,
