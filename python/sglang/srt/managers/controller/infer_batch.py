@@ -665,16 +665,20 @@ class Batch:
 
         # TODO(lmzheng): apply penalty
         probs = torch.softmax(logits, dim=-1)
-        try:
-            max_top_k_round, batch_size = 32, probs.shape[0]
-            uniform_samples = torch.rand(
-                (max_top_k_round, batch_size), device=probs.device
-            )
-            batch_next_token_ids, _ = top_k_top_p_sampling_from_probs(
-                probs, uniform_samples, self.top_ks, self.top_ps
-            )
-        except RuntimeError as e:
-            warnings.warn(f"Ignore errors in sampling: {e}")
+
+        max_top_k_round, batch_size = 32, probs.shape[0]
+        uniform_samples = torch.rand((max_top_k_round, batch_size), device=probs.device)
+        batch_next_token_ids, _ = top_k_top_p_sampling_from_probs(
+            probs, uniform_samples, self.top_ks, self.top_ps
+        )
+
+        # FIXME: this is a temporary fix for the illegal token ids
+        illegal_mask = (
+            batch_next_token_ids < 0 | batch_next_token_ids >= probs.shape[-1]
+        )
+        if illegal_mask.any():
+            warnings.warn("Illegal sampled token ids")
+            probs = probs.masked_fill(torch.isnan(probs), 0.0)
             batch_next_token_ids = torch.argmax(probs, dim=-1)
 
         if has_regex:
