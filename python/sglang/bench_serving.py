@@ -299,6 +299,8 @@ def sample_random_requests(
         )
         input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
 
+    print(f"#Input tokens: {np.sum(input_lens)}")
+    print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
 
 
