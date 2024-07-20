@@ -123,6 +123,15 @@ class ModelRunner:
         if self.model_config.model_overide_args is not None:
             vllm_model_config.hf_config.update(self.model_config.model_overide_args)
 
+        if (
+            self.server_args.efficient_weight_load
+            and "llama" in self.server_args.model_path.lower()
+            and self.server_args.quantization == "fp8"
+        ):
+            from sglang.srt.model_loader.model_loader import get_model
+        else:
+            from vllm.model_executor.model_loader import get_model
+
         self.model = get_model(
             model_config=vllm_model_config,
             device_config=device_config,
@@ -237,7 +246,16 @@ class ModelRunner:
         self.cuda_graph_runner = CudaGraphRunner(
             self, max_batch_size_to_capture=max(batch_size_list)
         )
-        self.cuda_graph_runner.capture(batch_size_list)
+        logger.info(f"Capture for batch sizes {batch_size_list}")
+        try:
+            self.cuda_graph_runner.capture(batch_size_list)
+        except:
+            raise Exception(
+                f"Capture cuda graph failed. Possible solutions:\n"
+                f"1. disable cuda graph by --disable-cuda-graph\n"
+                f"2. set --mem-fraction-static to a smaller value\n"
+                f"Open an issue on GitHub with reproducible scripts if you need help.\n"
+            )
 
     @torch.inference_mode()
     def forward_decode(self, batch: Batch):
