@@ -169,7 +169,6 @@ class ModelRunner:
 
     def init_memory_pool(self, total_gpu_memory):
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-        print("total num tokens", self.max_total_num_tokens)
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
