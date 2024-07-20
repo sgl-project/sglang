@@ -274,8 +274,12 @@ def sample_sharegpt_requests(
 
 
 def sample_random_requests(
-        input_len: int, output_len: int, num_prompts: int, range_ratio: float,
-        tokenizer: PreTrainedTokenizerBase) -> List[Tuple[str, int, int]]:
+    input_len: int,
+    output_len: int,
+    num_prompts: int,
+    range_ratio: float,
+    tokenizer: PreTrainedTokenizerBase,
+) -> List[Tuple[str, int, int]]:
 
     input_lens = np.random.randint(
         int(input_len * range_ratio),
@@ -290,10 +294,10 @@ def sample_random_requests(
     offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
     input_requests = []
     for i in range(num_prompts):
-        prompt = tokenizer.decode([(offsets[i] + i + j) % tokenizer.vocab_size
-                                   for j in range(input_lens[i])])
-        input_requests.append(
-            (prompt, int(input_lens[i]), int(output_lens[i])))
+        prompt = tokenizer.decode(
+            [(offsets[i] + i + j) % tokenizer.vocab_size for j in range(input_lens[i])]
+        )
+        input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
 
     return input_requests
 
@@ -555,7 +559,6 @@ def fire(args: argparse.Namespace):
 
     tokenizer = get_tokenizer(tokenizer_id)
 
-
     if args.dataset_name == "sharegpt":
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
@@ -631,10 +634,9 @@ if __name__ == "__main__":
         choices=["sharegpt", "random"],
         help="Name of the dataset to benchmark on.",
     )
-    parser.add_argument("--dataset-path",
-                        type=str,
-                        default="",
-                        help="Path to the dataset.")
+    parser.add_argument(
+        "--dataset-path", type=str, default="", help="Path to the dataset."
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -661,15 +663,13 @@ if __name__ == "__main__":
         "--random-input-len",
         type=int,
         default=1024,
-        help=
-        "Number of input tokens per request, used only for random dataset.",
+        help="Number of input tokens per request, used only for random dataset.",
     )
     parser.add_argument(
         "--random-output-len",
         type=int,
         default=128,
-        help=
-        "Number of output tokens per request, used only for random dataset.",
+        help="Number of output tokens per request, used only for random dataset.",
     )
     parser.add_argument(
         "--random-range-ratio",
