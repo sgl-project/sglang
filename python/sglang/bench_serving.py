@@ -273,6 +273,37 @@ def sample_sharegpt_requests(
     return filtered_dataset
 
 
+def sample_random_requests(
+    input_len: int,
+    output_len: int,
+    num_prompts: int,
+    range_ratio: float,
+    tokenizer: PreTrainedTokenizerBase,
+) -> List[Tuple[str, int, int]]:
+
+    input_lens = np.random.randint(
+        int(input_len * range_ratio),
+        input_len + 1,
+        size=num_prompts,
+    )
+    output_lens = np.random.randint(
+        int(output_len * range_ratio),
+        output_len + 1,
+        size=num_prompts,
+    )
+    offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
+    input_requests = []
+    for i in range(num_prompts):
+        prompt = tokenizer.decode(
+            [(offsets[i] + i + j) % tokenizer.vocab_size for j in range(input_lens[i])]
+        )
+        input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
+
+    print(f"#Input tokens: {np.sum(input_lens)}")
+    print(f"#Output tokens: {np.sum(output_lens)}")
+    return input_requests
+
+
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
@@ -530,13 +561,23 @@ def fire(args: argparse.Namespace):
 
     tokenizer = get_tokenizer(tokenizer_id)
 
-    assert args.dataset is not None
-    input_requests = sample_sharegpt_requests(
-        dataset_path=args.dataset,
-        num_requests=args.num_prompts,
-        tokenizer=tokenizer,
-        fixed_output_len=args.sharegpt_output_len,
-    )
+    if args.dataset_name == "sharegpt":
+        input_requests = sample_sharegpt_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.sharegpt_output_len,
+        )
+    elif args.dataset_name == "random":
+        input_requests = sample_random_requests(
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            num_prompts=args.num_prompts,
+            range_ratio=args.random_range_ratio,
+            tokenizer=tokenizer,
+        )
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
     asyncio.run(
         benchmark(
@@ -589,7 +630,14 @@ if __name__ == "__main__":
         help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
     )
     parser.add_argument(
-        "--dataset", type=str, default="sharegpt", help="Path to the ShareGPT dataset"
+        "--dataset-name",
+        type=str,
+        default="sharegpt",
+        choices=["sharegpt", "random"],
+        help="Name of the dataset to benchmark on.",
+    )
+    parser.add_argument(
+        "--dataset-path", type=str, default="", help="Path to the dataset."
     )
     parser.add_argument(
         "--model",
@@ -614,9 +662,28 @@ if __name__ == "__main__":
         help="Output length for each request. Overrides the output length from the ShareGPT dataset.",
     )
     parser.add_argument(
+        "--random-input-len",
+        type=int,
+        default=1024,
+        help="Number of input tokens per request, used only for random dataset.",
+    )
+    parser.add_argument(
+        "--random-output-len",
+        type=int,
+        default=128,
+        help="Number of output tokens per request, used only for random dataset.",
+    )
+    parser.add_argument(
+        "--random-range-ratio",
+        type=float,
+        default=1.0,
+        help="Range of sampled ratio of input/output length, "
+        "used only for random dataset.",
+    )
+    parser.add_argument(
         "--request-rate",
         type=float,
-        default=128.0,
+        default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is 128.0.",
     )

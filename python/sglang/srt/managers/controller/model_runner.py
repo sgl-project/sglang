@@ -233,7 +233,7 @@ class ModelRunner:
             return
 
         logger.info(f"[gpu_id={self.gpu_id}] Capture cuda graph begin.")
-        batch_size_list = [1, 2, 4] + [i * 8 for i in range(1, 16)]
+        batch_size_list = [1, 2, 4] + [i * 8 for i in range(1, 17)]
         self.cuda_graph_runner = CudaGraphRunner(
             self, max_batch_size_to_capture=max(batch_size_list)
         )
