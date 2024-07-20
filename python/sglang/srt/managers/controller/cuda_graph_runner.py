@@ -6,6 +6,7 @@ import torch
 from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.distributed.parallel_state import graph_capture
+from vllm.model_executor.custom_op import CustomOp
 
 from sglang.srt.layers.logits_processor import LogitProcessorOutput
 from sglang.srt.managers.controller.infer_batch import (
@@ -16,8 +17,28 @@ from sglang.srt.managers.controller.infer_batch import (
 )
 
 
+def _to_torch(model: torch.nn.Module, reverse=False):
+    for sub in model._modules.values():
+        if isinstance(sub, CustomOp):
+            if reverse:
+                sub._forward_method = sub.forward_cuda
+            else:
+                sub._forward_method = sub.forward_native
+        if isinstance(sub, torch.nn.Module):
+            _to_torch(sub, reverse)
+
+
+def get_forward(model: torch.nn.Module, use_torch: bool):
+    if use_torch:
+        _to_torch(model, reverse=False)
+        return torch.compile(model.forward, mode="max-autotune-no-cudagraphs")
+    else:
+        _to_torch(model, reverse=True)
+        return model.forward
+
+
 class CudaGraphRunner:
-    def __init__(self, model_runner, max_batch_size_to_capture):
+    def __init__(self, model_runner, max_batch_size_to_capture, use_torch_compile):
         self.model_runner = model_runner
         self.graphs = {}
         self.input_buffers = {}
@@ -55,6 +76,8 @@ class CudaGraphRunner:
             (self.max_bs,), dtype=torch.int32, device="cuda"
         )
 
+        self.compile_bs = [1, 2, 4, 8, 16, 24, 32] if use_torch_compile else []
+
     def can_run(self, batch_size):
         return batch_size < self.max_bs
 
@@ -63,18 +86,19 @@ class CudaGraphRunner:
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
             for bs in batch_size_list:
+                forward = get_forward(self.model_runner.model, bs in self.compile_bs)
                 (
                     graph,
                     input_buffers,
                     output_buffers,
                     flashinfer_handler,
-                ) = self.capture_one_batch_size(bs)
+                ) = self.capture_one_batch_size(bs, forward)
                 self.graphs[bs] = graph
                 self.input_buffers[bs] = input_buffers
                 self.output_buffers[bs] = output_buffers
                 self.flashinfer_handlers[bs] = flashinfer_handler
 
-    def capture_one_batch_size(self, bs):
+    def capture_one_batch_size(self, bs, forward):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
 
@@ -127,9 +151,8 @@ class CudaGraphRunner:
                 skip_flashinfer_init=True,
             )
             input_metadata.flashinfer_decode_wrapper = flashinfer_decode_wrapper
-            return self.model_runner.model.forward(
-                input_ids, input_metadata.positions, input_metadata
-            )
+
+            return forward(input_ids, input_metadata.positions, input_metadata)
 
         for _ in range(2):
             run_once()
