@@ -16,7 +16,7 @@ from sglang.srt.conversation import (
     register_conv_template,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.openai_protocol import (
+from sglang.srt.openai_api.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
