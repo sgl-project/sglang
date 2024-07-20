@@ -673,10 +673,11 @@ class Batch:
         )
 
         # FIXME: this is a temporary fix for the illegal token ids
-        illegal_mask = (
-            batch_next_token_ids < 0 | batch_next_token_ids >= probs.shape[-1]
+        illegal_mask = torch.logical_or(
+            batch_next_token_ids < 0,
+            batch_next_token_ids >= probs.shape[-1]
         )
-        if illegal_mask.any():
+        if torch.any(illegal_mask):
             warnings.warn("Illegal sampled token ids")
             probs = probs.masked_fill(torch.isnan(probs), 0.0)
             batch_next_token_ids = torch.argmax(probs, dim=-1)
