@@ -68,7 +68,7 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def load_model(server_args, tp_rank):
+def load_model(server_args, tp_rank, sp_rank: int=0):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
@@ -79,6 +79,8 @@ def load_model(server_args, tp_rank):
         gpu_id=tp_rank,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
+        sp_rank=sp_rank,
+        sp_size=server_args.sp_size,
         nccl_port=28888,
         server_args=server_args,
     )
@@ -153,6 +155,8 @@ def extend(reqs, model_runner):
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool=model_runner.token_to_kv_pool,
         tree_cache=None,
+        sp_size=model_runner.sp_size,
+        sp_rank=model_runner.sp_rank,
     )
     batch.prepare_for_extend(model_runner.model_config.vocab_size, None)
     output = model_runner.forward(batch, ForwardMode.EXTEND)
@@ -289,12 +293,14 @@ def main(server_args, bench_args):
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
+            sp_rank = tp_rank % server_args.sp_size
             proc = multiprocessing.Process(
                 target=work_func,
                 args=(
                     server_args,
                     bench_args,
                     tp_rank,
+                    sp_rank,
                 ),
             )
             proc.start()

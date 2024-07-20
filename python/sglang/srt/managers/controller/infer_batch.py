@@ -295,7 +295,8 @@ class Batch:
     local_token_offsets: List[int] = None
 
     @classmethod
-    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache,
+                 sp_size: int = 1, sp_rank: int = 0):
         return_logprob = any(req.return_logprob for req in reqs)
 
         return cls(
@@ -304,6 +305,8 @@ class Batch:
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
             return_logprob=return_logprob,
+            sp_size=sp_size,
+            sp_rank=sp_rank,
         )
 
     def is_empty(self):

@@ -49,8 +49,8 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
-        sp_rank: Optional[int] = None,
-        sp_size: Optional[int] = None,
+        sp_rank: int = 0,
+        sp_size: int = 1,
     ):
         # Parse args
         self.model_config = model_config

@@ -33,6 +33,7 @@ class ServerArgs:
 
     # Other runtime options
     tp_size: int = 1
+    sp_size: int = 1
     stream_interval: int = 8
     random_seed: Optional[int] = None
 
@@ -210,6 +211,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tp_size,
             help="The tensor parallelism size.",
+        )
+        parser.add_argument(
+            "--sp-size",
+            type=int,
+            default=ServerArgs.sp_size,
+            help="The sequence parallelism size.",
         )
         parser.add_argument(
             "--stream-interval",
