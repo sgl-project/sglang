@@ -57,9 +57,13 @@ class TokenToKVPool:
         # We also add one slot. This slot is used for writing dummy output from padded tokens.
         self.mem_state = torch.ones((self.size + 1,), dtype=torch.bool, device="cuda")
 
-        # [size, key/value, head_num, head_dim] for each layer
-        self.kv_data = [
-            torch.empty((size + 1, 2, head_num, head_dim), dtype=dtype, device="cuda")
+        # [size, head_num, head_dim] for each layer
+        self.k_buffer = [
+            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device="cuda")
+            for _ in range(layer_num)
+        ]
+        self.v_buffer = [
+            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device="cuda")
             for _ in range(layer_num)
         ]
 
@@ -71,10 +75,13 @@ class TokenToKVPool:
         self.clear()
 
     def get_key_buffer(self, layer_id: int):
-        return self.kv_data[layer_id][:, 0]
+        return self.k_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
-        return self.kv_data[layer_id][:, 1]
+        return self.v_buffer[layer_id]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id], self.v_buffer[layer_id]
 
     def available_size(self):
         return self.can_use_mem_size + len(self.prefetch_buffer)
