@@ -335,7 +335,7 @@ def kill_parent_process():
     """Kill the parent process and all children of the parent process."""
     current_process = psutil.Process()
     parent_process = current_process.parent()
-    children = current_process.children(recursive=True)
+    children = parent_process.children(recursive=True)
     for child in children:
         if child.pid != current_process.pid:
             os.kill(child.pid, 9)
