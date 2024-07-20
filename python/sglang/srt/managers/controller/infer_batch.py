@@ -674,8 +674,7 @@ class Batch:
 
         # FIXME: this is a temporary fix for the illegal token ids
         illegal_mask = torch.logical_or(
-            batch_next_token_ids < 0,
-            batch_next_token_ids >= probs.shape[-1]
+            batch_next_token_ids < 0, batch_next_token_ids >= probs.shape[-1]
         )
         if torch.any(illegal_mask):
             warnings.warn("Illegal sampled token ids")
