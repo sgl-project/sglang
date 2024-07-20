@@ -28,10 +28,15 @@ class ScheduleHeuristic:
             # longest prefix match
             forward_queue.sort(key=lambda x: -len(x.prefix_indices))
             return forward_queue
+        elif self.schedule_heuristic == "fcfs":
+            # first come first serve
+            return forward_queue
+        elif self.schedule_heuristic == "lof":
+            # longest output first
+            forward_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
+            return forward_queue
         elif self.schedule_heuristic == "random":
             random.shuffle(forward_queue)
-            return forward_queue
-        elif self.schedule_heuristic == "fcfs":
             return forward_queue
         elif self.schedule_heuristic == "dfs-weight":
             last_node_to_reqs = defaultdict(list)

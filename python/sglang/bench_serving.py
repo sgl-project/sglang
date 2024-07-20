@@ -143,7 +143,7 @@ async def async_request_openai_completions(
             "temperature": 0.0,
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
-            "stream": True,
+            "stream": not args.disable_stream,
             "ignore_eos": True,
         }
         headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
@@ -166,8 +166,9 @@ async def async_request_openai_completions(
                             continue
 
                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        latency = time.perf_counter() - st
                         if chunk == "[DONE]":
-                            latency = time.perf_counter() - st
+                            pass
                         else:
                             data = json.loads(chunk)
 
@@ -897,6 +898,11 @@ if __name__ == "__main__":
         help="Range of request rates in the format start,stop,step. Default is 2,34,2",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
+    parser.add_argument(
+        "--disable-stream",
+        action="store_true",
+        help="Specify to disable tqdm progress bar.",
+    )
 
     set_ulimit()
 
