@@ -308,7 +308,7 @@ class ModelTpServer:
             req.origin_input_ids = req.origin_input_ids[
                 : self.max_total_num_tokens - 128
             ]
-            logger.warn("Req longer than memory pool size, truncated!!!")
+            logger.error("Request longer than memory pool size, truncated!!!")
 
         self.forward_queue.append(req)
 

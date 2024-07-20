@@ -124,7 +124,8 @@ class ModelRunner:
             vllm_model_config.hf_config.update(self.model_config.model_overide_args)
 
         if (
-            "llama" in self.server_args.model_path.lower()
+            self.server_args.efficient_weight_load
+            and "llama" in self.server_args.model_path.lower()
             and self.server_args.quantization == "fp8"
         ):
             from sglang.srt.model_loader.model_loader import get_model

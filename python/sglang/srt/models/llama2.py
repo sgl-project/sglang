@@ -266,12 +266,13 @@ class LlamaForCausalLM(nn.Module):
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: Optional[CacheConfig] = None,
+        efficient_weight_load=False,
     ) -> None:
         global MergedColumnParallelLinear
         global QKVParallelLinear
         global RowParallelLinear
 
-        if quant_config is not None and quant_config.get_name() == "fp8":
+        if efficient_weight_load:
             from sglang.srt.layers.linear import (
                 MergedColumnParallelLinear,
                 QKVParallelLinear,
@@ -357,7 +358,6 @@ class LlamaForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                # print("after load1", param.data, param.data.dtype)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -368,7 +368,6 @@ class LlamaForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                # print("after load", param.data, param.data.dtype)
 
         if name is None or loaded_weight is None:
             if get_tensor_model_parallel_rank() == 0:
