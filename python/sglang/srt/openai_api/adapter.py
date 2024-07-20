@@ -16,7 +16,7 @@ from sglang.srt.conversation import (
     register_conv_template,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.openai_protocol import (
+from sglang.srt.openai_api.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -106,6 +106,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
             "frequency_penalty": request.frequency_penalty,
             "regex": request.regex,
             "n": request.n,
+            "ignore_eos": request.ignore_eos,
         },
         return_logprob=request.logprobs is not None and request.logprobs > 0,
         top_logprobs_num=request.logprobs if request.logprobs is not None else 0,
