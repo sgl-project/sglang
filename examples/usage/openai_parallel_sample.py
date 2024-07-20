@@ -46,6 +46,20 @@ response = client.completions.create(
 print(response)
 
 
+# Text completion
+response = client.completions.create(
+    model="default",
+    prompt=[
+        "The capital of France is",
+        "The capital of Germany is",
+        "The capital of US is",
+    ],
+    n=3,
+    temperature=0.8,
+    max_tokens=32,
+)
+print(response)
+
 # Chat completion
 response = client.chat.completions.create(
     model="default",

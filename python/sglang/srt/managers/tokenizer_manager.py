@@ -132,8 +132,12 @@ class TokenizerManager:
 
     async def _handle_single_request(self, obj, request, index=None, is_prefill=False):
         if is_prefill:
-            rid = obj.rid[0]
-            input_text = obj.text
+            if isinstance(obj.text, list):
+                input_text = obj.text[index]
+                rid = obj.rid[index]
+            else:
+                input_text = obj.text
+                rid = obj.rid[0]
             input_ids = self.tokenizer.encode(input_text)
             sampling_params = SamplingParams(**obj.sampling_params[0])
             sampling_params.max_new_tokens = 0
@@ -171,7 +175,7 @@ class TokenizerManager:
                 obj.top_logprobs_num if index is None else obj.top_logprobs_num[index]
             )
 
-        tokenized_obj = self._create_tokenized_obj(
+        tokenized_obj = TokenizedGenerateReqInput(
             rid,
             input_text,
             input_ids,
@@ -217,35 +221,37 @@ class TokenizerManager:
                 obj.input_ids = input_id_result
             elif input_id_result is not None:
                 obj.input_ids = input_id_result[0]
-
         # First send out all requests
-        for i in range(parallel_sample_num):
-            if i == 0 and parallel_sample_num != 1:
-                continue
-            for j in range(batch_size):
-                index = j + i * batch_size
+        for i in range(batch_size):
+            for j in range(parallel_sample_num):
+                if j == 0 and parallel_sample_num != 1:
+                    continue
+                index = i * parallel_sample_num + j
+                if parallel_sample_num != 1:
+                    # Here when using parallel sampling we shoul consider prefill stage so the index is :  j + i * (parallel_sample_num-1) + batch_size - 1
+                    index += batch_size - 1 - i
                 rid = obj.rid[index]
                 if parallel_sample_num == 1:
                     ## select operation
                     if obj.input_ids is None:
-                        input_text = obj.text[j]
-                        input_ids = self.tokenizer.encode(obj.text[j])
+                        input_text = obj.text[i]
+                        input_ids = self.tokenizer.encode(obj.text[i])
                     else:
                         input_text = None
-                        input_ids = obj.input_ids[j]
+                        input_ids = obj.input_ids[i]
                 else:
                     if batch_size == 1:
                         input_text = obj.text
                         input_ids = obj.input_ids
                     else:
-                        input_text = obj.text[j]
-                        input_ids = obj.input_ids[j]
+                        input_text = obj.text[i]
+                        input_ids = obj.input_ids[i]
                 sampling_params = self._get_sampling_params(obj.sampling_params[index])
                 pixel_values, image_hash, image_size = await self._get_pixel_values(
                     obj.image_data[index]
                 )
 
-                tokenized_obj = self._create_tokenized_obj(
+                tokenized_obj = TokenizedGenerateReqInput(
                     rid,
                     input_text,
                     input_ids,
@@ -266,11 +272,13 @@ class TokenizerManager:
 
         # Then wait for all responses
         output_list = []
-        for i in range(parallel_sample_num):
-            if i == 0 and parallel_sample_num != 1:
-                continue
-            for j in range(batch_size):
-                index = j + i * batch_size
+        for i in range(batch_size):
+            for j in range(parallel_sample_num):
+                if j == 0 and parallel_sample_num != 1:
+                    continue
+                index = i * parallel_sample_num + j
+                if parallel_sample_num != 1:
+                    index += batch_size - 1 - i
                 rid = obj.rid[index]
                 state = self.rid_to_state[rid]
 
@@ -320,34 +328,6 @@ class TokenizerManager:
             return await self.get_pixel_values(image_data)
         else:
             return None, None, None
-
-    def _create_tokenized_obj(
-        self,
-        rid,
-        input_text,
-        input_ids,
-        pixel_values,
-        image_hash,
-        image_size,
-        sampling_params,
-        return_logprob,
-        logprob_start_len,
-        top_logprobs_num,
-        stream,
-    ):
-        return TokenizedGenerateReqInput(
-            rid=rid,
-            input_text=input_text,
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_hash=image_hash,
-            image_size=image_size,
-            sampling_params=sampling_params,
-            return_logprob=return_logprob,
-            logprob_start_len=logprob_start_len,
-            top_logprobs_num=top_logprobs_num,
-            stream=stream,
-        )
 
     async def _wait_for_response(self, event, state, obj, rid, request):
         while True:
