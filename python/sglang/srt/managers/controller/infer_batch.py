@@ -674,6 +674,7 @@ class Batch:
 
         if torch.any(~success):
             warnings.warn("Sampling failed, fallback to top_k=1 strategy")
+            probs = probs.masked_fill(torch.isnan(probs), 0.0)
             argmax_ids = torch.argmax(probs, dim=-1)
             batch_next_token_ids = torch.where(
                 success, batch_next_token_ids, argmax_ids
