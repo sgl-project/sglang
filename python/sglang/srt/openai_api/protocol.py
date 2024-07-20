@@ -68,6 +68,7 @@ class CompletionRequest(BaseModel):
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
+    ignore_eos: Optional[bool] = False
 
 
 class CompletionResponseChoice(BaseModel):
