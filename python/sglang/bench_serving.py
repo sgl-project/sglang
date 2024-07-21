@@ -612,39 +612,42 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("=" * 50)
 
-    if enable_multi:
-        if (
-            metrics.median_ttft_ms is not None
-            and metrics.mean_itl_ms is not None
-            and metrics.output_throughput is not None
-        ):
-            result = {
-                "backend": args.backend,
-                "dataset_name": args.dataset_name,
-                "request_rate": request_rate,
-                "total_input": metrics.total_input,
-                "total_output": metrics.total_output,
-                "median_ttft": metrics.median_ttft_ms,
-                "median_itl": metrics.mean_itl_ms,
-                "output_token_throughput": metrics.output_throughput,
-                "sharegpt_output_len": args.sharegpt_output_len,
-                "random_input_len": args.random_input_len,
-                "random_output_len": args.random_output_len,
-            }
-        else:
-            print(f"Error running benchmark for request rate: {request_rate}")
-            print("-" * 30)
+    if (
+        metrics.median_ttft_ms is not None
+        and metrics.mean_itl_ms is not None
+        and metrics.output_throughput is not None
+    ):
+        result = {
+            "backend": args.backend,
+            "dataset_name": args.dataset_name,
+            "request_rate": request_rate,
+            "total_input": metrics.total_input,
+            "total_output": metrics.total_output,
+            "median_ttft": metrics.median_ttft_ms,
+            "median_itl": metrics.mean_itl_ms,
+            "output_token_throughput": metrics.output_throughput,
+            "sharegpt_output_len": args.sharegpt_output_len,
+            "random_input_len": args.random_input_len,
+            "random_output_len": args.random_output_len,
+            "random_range_ratio": args.random_range_ratio,
+        }
+    else:
+        print(f"Error running benchmark for request rate: {request_rate}")
+        print("-" * 30)
 
-        # Determine output file name
-        if args.output_file:
-            output_file_name = args.output_file
+    # Determine output file name
+    if args.output_file:
+        output_file_name = args.output_file
+    else:
+        now = datetime.now().strftime("%m%d")
+        if args.dataset_name == "random":
+            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
         else:
-            now = datetime.now().strftime("%m%d%H")
-            output_file_name = f"{args.backend}_{now}.jsonl"
+            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
 
-        # Append results to a JSONL file
-        with open(output_file_name, "a") as file:
-            file.write(json.dumps(result) + "\n")
+    # Append results to a JSONL file
+    with open(output_file_name, "a") as file:
+        file.write(json.dumps(result) + "\n")
 
     result = {
         "duration": benchmark_duration,
