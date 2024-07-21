@@ -749,6 +749,7 @@ def fire(args: argparse.Namespace):
     if not check_chat_template(args.model):
         print(
             "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
+            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
 
     print(f"{args}\n")
