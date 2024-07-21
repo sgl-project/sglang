@@ -37,6 +37,7 @@ The core features include:
 
 ### Method 1: With pip
 ```
+pip install --upgrade pip
 pip install "sglang[all]"
 
 # Install FlashInfer CUDA kernels
@@ -48,9 +49,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
-# https://stackoverflow.com/questions/69711606/how-to-install-a-package-using-pip-in-editable-mode-with-pyproject-toml
-python3 -m pip install --upgrade pip
-
+pip install --upgrade pip
 pip install -e "python[all]"
 
 # Install FlashInfer CUDA kernels
