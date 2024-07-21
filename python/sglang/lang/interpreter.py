@@ -288,6 +288,7 @@ class StreamExecutor:
             exes[i].text_ = str(self.text_)
             exes[i].messages_ = list(self.messages_)
             exes[i].cur_role = self.cur_role
+            exes[i].cur_role_begin_pos = self.cur_role_begin_pos
             exes[i].fork_start_text_pos = len(self.text_)
             exes[i].images_ = list(self.images_)
 
