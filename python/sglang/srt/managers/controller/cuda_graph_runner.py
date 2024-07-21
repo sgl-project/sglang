@@ -1,6 +1,7 @@
 """Run the model with cuda graph."""
 
 import bisect
+from contextlib import contextmanager
 
 import torch
 from flashinfer import BatchDecodeWithPagedKVCacheWrapper
@@ -15,9 +16,10 @@ from sglang.srt.managers.controller.infer_batch import (
     InputMetadata,
     init_flashinfer_args,
 )
+from sglang.srt.utils import monkey_patch_vllm_all_gather
 
 
-def _to_torch(model: torch.nn.Module, reverse=False):
+def _to_torch(model: torch.nn.Module, reverse: bool = False):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):
             if reverse:
@@ -28,13 +30,26 @@ def _to_torch(model: torch.nn.Module, reverse=False):
             _to_torch(sub, reverse)
 
 
-def get_forward(model: torch.nn.Module, use_torch: bool):
-    if use_torch:
-        _to_torch(model, reverse=False)
-        return torch.compile(model.forward, mode="max-autotune-no-cudagraphs")
-    else:
-        _to_torch(model, reverse=True)
-        return model.forward
+@contextmanager
+def patch_model(
+    model: torch.nn.Module, use_compile: bool, tp_group: "GroupCoordinator"
+):
+    backup_ca_comm = None
+
+    try:
+        if use_compile:
+            _to_torch(model)
+            monkey_patch_vllm_all_gather()
+            backup_ca_comm = tp_group.ca_comm
+            tp_group.ca_comm = None
+            yield torch.compile(model.forward, mode="max-autotune-no-cudagraphs")
+        else:
+            yield model.forward
+    finally:
+        if use_compile:
+            _to_torch(model, reverse=True)
+            monkey_patch_vllm_all_gather(reverse=True)
+            tp_group.ca_comm = backup_ca_comm
 
 
 class CudaGraphRunner:
@@ -86,17 +101,21 @@ class CudaGraphRunner:
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
             for bs in batch_size_list:
-                forward = get_forward(self.model_runner.model, bs in self.compile_bs)
-                (
-                    graph,
-                    input_buffers,
-                    output_buffers,
-                    flashinfer_handler,
-                ) = self.capture_one_batch_size(bs, forward)
-                self.graphs[bs] = graph
-                self.input_buffers[bs] = input_buffers
-                self.output_buffers[bs] = output_buffers
-                self.flashinfer_handlers[bs] = flashinfer_handler
+                with patch_model(
+                    self.model_runner.model,
+                    bs in self.compile_bs,
+                    self.model_runner.tp_group,
+                ) as forward:
+                    (
+                        graph,
+                        input_buffers,
+                        output_buffers,
+                        flashinfer_handler,
+                    ) = self.capture_one_batch_size(bs, forward)
+                    self.graphs[bs] = graph
+                    self.input_buffers[bs] = input_buffers
+                    self.output_buffers[bs] = output_buffers
+                    self.flashinfer_handlers[bs] = flashinfer_handler
 
     def capture_one_batch_size(self, bs, forward):
         graph = torch.cuda.CUDAGraph()

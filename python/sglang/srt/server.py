@@ -167,7 +167,7 @@ def _set_torch_compile_config():
     torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
 
     # FIXME: tmp workaround
-    torch._dynamo.config.accumulated_cache_size_limit = 128
+    torch._dynamo.config.accumulated_cache_size_limit = 256
 
 
 def launch_server(
