@@ -55,6 +55,7 @@ class ServerArgs:
     disable_regex_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_disk_cache: bool = False
+    enable_torch_compile: bool = False
     attention_reduce_in_fp32: bool = False
     enable_p2p_check: bool = False
     efficient_weight_load: bool = False
@@ -316,6 +317,11 @@ class ServerArgs:
             "--disable-disk-cache",
             action="store_true",
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
+        )
+        parser.add_argument(
+            "--enable-torch-compile",
+            action="store_true",
+            help="Optimize the model with torch.compile, experimental feature.",
         )
         parser.add_argument(
             "--attention-reduce-in-fp32",
