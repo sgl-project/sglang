@@ -178,6 +178,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - Grok
 - ChatGLM
 - InternLM 2
+- Mistral NeMo
 
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/model_support.md).
 
