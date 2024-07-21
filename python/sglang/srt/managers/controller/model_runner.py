@@ -258,6 +258,7 @@ class ModelRunner:
             out_cache_loc=batch.out_cache_loc,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
+            padded_sp_len=batch.padded_sp_len,
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -275,6 +276,7 @@ class ModelRunner:
             out_cache_loc=batch.out_cache_loc,
             top_logprobs_nums=batch.top_logprobs_nums,
             return_logprob=batch.return_logprob,
+            padded_sp_len=batch.padded_sp_len,
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata

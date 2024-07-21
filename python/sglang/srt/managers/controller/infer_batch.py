@@ -380,9 +380,9 @@ class Batch:
         if self.sp_size > 1:
             extend_seq_lens = seq_lens - prefix_lens
             # FIXME(yonghao): _extend_num_tokens -> extend_num_tokens once kv cache store is ready for SP
-            _extend_num_tokens = _get_local_token_nums(self.sp_rank,
-                                                       self.sp_size,
-                                                       extend_seq_lens)
+            local_token_nums = _get_local_token_nums(self.sp_rank, self.sp_size,
+                                                     extend_seq_lens)
+            _extend_num_tokens = int(np.sum(local_token_nums))
 
         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
@@ -601,8 +601,9 @@ class Batch:
         input_ids_sp = [[] for _ in range(self.sp_size)]
         for sp_rank in range(self.sp_size):
             # TODO(yonghao): double check moving the seq lens adds one to above.
+            seq_lens_cpu = (self.seq_lens - self.prefix_lens).cpu().numpy()
             input_ids_sp[sp_rank].append(input_ids[
-                get_decode_indices(sp_rank, self.sp_size, self.seq_lens)
+                get_decode_indices(sp_rank, self.sp_size, seq_lens_cpu)
             ])
         padded_sp_len = max(len(ids) for ids in input_ids_sp)
         for flatten_ids in input_ids_sp:
@@ -617,7 +618,7 @@ class Batch:
         # Alloc mem
         bs = len(self.reqs)
         if self.sp_size > 1:
-            seq_lens_cpu = self.seq_lens.cpu().numpy()
+            seq_lens_cpu = (self.seq_lens - self.prefix_lens).cpu().numpy()
             sp_local_indices = get_decode_indices(self.sp_rank, self.sp_size,
                                                   seq_lens_cpu)
             # FIXME(yonghao): _bs -> bs once SP kv cache store is ready
@@ -862,7 +863,7 @@ class InputMetadata:
         if sp_size > 1:
             # During the runtime, we should use positions[local_token_indices]
             # to get positions for each SP shard.
-            extend_seq_lens_cpu = extend_seq_lens.cpu().numpy()
+            extend_seq_lens_cpu = (seq_lens - prefix_lens).cpu().numpy()
             if forward_mode == ForwardMode.DECODE:
                 local_token_indices = get_decode_indices(sp_rank, sp_size,
                                                          extend_seq_lens_cpu)
@@ -1012,7 +1013,7 @@ def get_prefill_indices(sp_rank, sp_size, extend_seq_lens: np.ndarray,
     This is primarily for the position ids.
     """
     # For the first few ranks, they have one more token to compute
-    sp_req_len = _get_local_token_nums(sp_rank, sp_size, extend_seq_lens)
+    sp_req_lens = _get_local_token_nums(sp_rank, sp_size, extend_seq_lens)
     # the offset of each request in the batch. Only the first few ranks may get
     # 1 more token (for each). For sp_rank=r, therere r peers ahread (0-based),
     # each will get one token
@@ -1022,24 +1023,23 @@ def get_prefill_indices(sp_rank, sp_size, extend_seq_lens: np.ndarray,
     )
     sp_req_start = extend_start_loc + sp_in_req_offset
     sp_indices = np.concatenate([
-        np.arange(s, s + l) for s, l in zip(sp_req_start, sp_req_len)
+        np.arange(s, s + l) for s, l in zip(sp_req_start, sp_req_lens)
     ])
     return sp_indices
 
 
-def _get_local_token_nums(sp_rank, sp_size, extend_seq_lens: Union[int, np.ndarray]):
-    sp_req_len = extend_seq_lens // sp_size + ((extend_seq_lens % sp_size) > sp_rank)
-    if isinstance(sp_req_len, Iterable):
-        sp_req_len = np.sum(sp_req_len)
-    return int(sp_req_len)
+def _get_local_token_nums(sp_rank, sp_size,
+                          extend_seq_lens: Union[int, np.ndarray]):
+    has_remainder = (extend_seq_lens % sp_size) > sp_rank
+    return extend_seq_lens // sp_size + has_remainder
 
 
-def get_decode_indices(sp_rank, sp_size, seq_lens: np.ndarray):
+def get_decode_indices(sp_rank, sp_size, seq_lens: np.ndarray, offset=0):
     """
     From normal layout to the sequence parallel layout(no padding).
     This is primarily for the position ids.
     """
-    return np.nonzero((seq_lens % sp_size) == sp_rank)
+    return np.nonzero((seq_lens % sp_size) == sp_rank) + offset
 
 
 def _get_local_token_slices(sp_rank, sp_size, seq_len: int):
@@ -1069,6 +1069,9 @@ def sp_to_flatten_indices_prefill(sp_size, extend_seq_lens: np.ndarray,
 
 def sp_to_flatten_indices_decode(sp_size, seq_lens_cpu: np.ndarray,
                                  padded_sp_len: int):
+    """
+    Indices from the Sequence Parallel layout to the normal layout.
+    """
     req_sp_rank = seq_lens_cpu % sp_size
     req_sp_offset = req_sp_rank * padded_sp_len
     for sp_rank in range(sp_size):
@@ -1076,3 +1079,19 @@ def sp_to_flatten_indices_decode(sp_size, seq_lens_cpu: np.ndarray,
         req_sp_index = np.cumsum(local_reqs) - 1
         req_sp_offset += req_sp_index * local_reqs  # mask out reqs not here.
     return req_sp_offset
+
+
+def _debug_flatten_to_sp_indices(mode, sp_size, seq_lens, sp_padded_len):
+    """Debug function that translate from flatten layout to the sp layout"""
+    get_indices_fn = (get_decode_indices
+                      if mode == ForwardMode.DECODE else get_prefill_indices)
+    def get_offset(sp_rank):
+        offset = sp_rank * sp_padded_len
+        if mode == ForwardMode.DECODE:
+            return offset
+        return [offset] * len(seq_lens)
+    indices = [
+        get_indices_fn(sp_rank, sp_size, seq_lens, get_offset(sp_rank))
+        for sp_rank in range(sp_size)
+    ]
+    return indices
