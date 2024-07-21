@@ -22,7 +22,6 @@ from vllm.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
@@ -241,7 +240,9 @@ class ModelRunner:
             self.cuda_graph_runner = None
             return
 
-        logger.info(f"[gpu_id={self.gpu_id}] Capture cuda graph begin.")
+        logger.info(
+            f"[gpu_id={self.gpu_id}] Capture cuda graph begin. This can take up to several minutes."
+        )
         batch_size_list = [1, 2, 4] + [i * 8 for i in range(1, 17)]
         self.cuda_graph_runner = CudaGraphRunner(
             self,
@@ -252,7 +253,7 @@ class ModelRunner:
             self.cuda_graph_runner.capture(batch_size_list)
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed {e}. Possible solutions:\n"
+                f"Capture cuda graph failed: {e}. Possible solutions:\n"
                 f"1. disable cuda graph by --disable-cuda-graph\n"
                 f"2. set --mem-fraction-static to a smaller value\n"
                 f"Open an issue on GitHub with reproducible scripts if you need help.\n"
