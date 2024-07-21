@@ -405,7 +405,7 @@ class Batch:
             self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
                 prefix_lens[i] : prefix_lens[i] + extend_len
             ] = out_cache_loc[pt : pt + extend_len]
-            pt += extend_lens[i]
+            pt += extend_len
 
         # Handle logit bias but only allocate when needed
         logit_bias = None
