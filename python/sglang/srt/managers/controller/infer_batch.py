@@ -380,9 +380,10 @@ class Batch:
         if self.sp_size > 1:
             extend_seq_lens = seq_lens - prefix_lens
             # FIXME(yonghao): _extend_num_tokens -> extend_num_tokens once kv cache store is ready for SP
-            local_token_nums = _get_local_token_nums(self.sp_rank, self.sp_size,
-                                                     extend_seq_lens)
-            _extend_num_tokens = int(np.sum(local_token_nums))
+            extend_local_token_nums = _get_local_token_nums(self.sp_rank,
+                                                            self.sp_size,
+                                                            extend_seq_lens)
+            _extend_num_tokens = int(np.sum(extend_local_token_nums))
 
         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
@@ -399,8 +400,7 @@ class Batch:
             extend_len = extend_lens[i]
             if self.sp_size > 1:
                 # FIXME(yonghao): _extend_len > extend_len once SP Attn is ready
-                _extend_len = _get_local_token_nums(self.sp_rank, self.sp_size,
-                                                    extend_len)
+                _extend_len = extend_local_token_nums[i]
             self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
                 prefix_lens[i] : prefix_lens[i] + extend_len
             ] = out_cache_loc[pt : pt + extend_len]
@@ -599,9 +599,9 @@ class Batch:
             ]
         self.seq_lens.add_(1)
         input_ids_sp = [[] for _ in range(self.sp_size)]
+        seq_lens_cpu = (self.seq_lens - self.prefix_lens).cpu().numpy()
         for sp_rank in range(self.sp_size):
             # TODO(yonghao): double check moving the seq lens adds one to above.
-            seq_lens_cpu = (self.seq_lens - self.prefix_lens).cpu().numpy()
             input_ids_sp[sp_rank].append(input_ids[
                 get_decode_indices(sp_rank, self.sp_size, seq_lens_cpu)
             ])
@@ -618,7 +618,6 @@ class Batch:
         # Alloc mem
         bs = len(self.reqs)
         if self.sp_size > 1:
-            seq_lens_cpu = (self.seq_lens - self.prefix_lens).cpu().numpy()
             sp_local_indices = get_decode_indices(self.sp_rank, self.sp_size,
                                                   seq_lens_cpu)
             # FIXME(yonghao): _bs -> bs once SP kv cache store is ready
@@ -796,7 +795,7 @@ class InputMetadata:
     sp_rank: int = None
     sp_size: int = None
     local_token_indices: np.ndarray
-    sp_to_flatten_indices: np.ndarray
+    sp_to_normal_indices: np.ndarray
     sp_local_token_length: int
 
     @classmethod
@@ -867,18 +866,18 @@ class InputMetadata:
             if forward_mode == ForwardMode.DECODE:
                 local_token_indices = get_decode_indices(sp_rank, sp_size,
                                                          extend_seq_lens_cpu)
-                sp_to_flatten_indices = sp_to_flatten_indices_decode(
+                sp_to_normal_indices = sp_to_normal_indices_decode(
                     sp_size, extend_seq_lens_cpu, padded_sp_len
                 )
             else:
                 local_token_indices = get_prefill_indices(sp_rank, sp_size,
                                                           extend_seq_lens_cpu)
-                sp_to_flatten_indices = sp_to_flatten_indices_prefill(
+                sp_to_normal_indices = sp_to_normal_indices_prefill(
                     sp_size, extend_seq_lens_cpu, padded_sp_len
                 )
         else:
             local_token_indices = np.arange(positions.numel())
-            sp_to_flatten_indices = np.arange(extend_seq_lens.numel())
+            sp_to_normal_indices = np.arange(extend_seq_lens.numel())
         sp_local_token_length = len(local_token_indices)
 
         ret = cls(
@@ -902,7 +901,7 @@ class InputMetadata:
             sp_rank=sp_rank,
             sp_size=sp_size,
             local_token_indices=local_token_indices,
-            sp_to_flatten_indices=sp_to_flatten_indices,
+            sp_to_normal_indices=sp_to_normal_indices,
             sp_local_token_length=sp_local_token_length,
         )
 
@@ -1009,8 +1008,8 @@ def init_triton_args(forward_mode, seq_lens, prefix_lens):
 def get_prefill_indices(sp_rank, sp_size, extend_seq_lens: np.ndarray,
                         extend_start_loc):
     """
-    From normal layout to the sequence parallel layout(no padding).
-    This is primarily for the position ids.
+    Get indices from the normal layout to the sequence parallel layout of all
+    requests.
     """
     # For the first few ranks, they have one more token to compute
     sp_req_lens = _get_local_token_nums(sp_rank, sp_size, extend_seq_lens)
@@ -1030,28 +1029,27 @@ def get_prefill_indices(sp_rank, sp_size, extend_seq_lens: np.ndarray,
 
 def _get_local_token_nums(sp_rank, sp_size,
                           extend_seq_lens: Union[int, np.ndarray]):
+    """Get the number of tokens in this SP. Padding is not considered."""
     has_remainder = (extend_seq_lens % sp_size) > sp_rank
     return extend_seq_lens // sp_size + has_remainder
 
 
 def get_decode_indices(sp_rank, sp_size, seq_lens: np.ndarray, offset=0):
-    """
-    From normal layout to the sequence parallel layout(no padding).
-    This is primarily for the position ids.
-    """
+    """Get Indices from the normal layout to the sequence parallel layout."""
     return np.nonzero((seq_lens % sp_size) == sp_rank) + offset
 
 
 def _get_local_token_slices(sp_rank, sp_size, seq_len: int):
+    """Get the SP local slice for a single request's extended input ids."""
     start = seq_len // sp_size * sp_rank + min(seq_len % sp_size, sp_rank)
     length = _get_local_token_nums(sp_rank, sp_size, seq_len)
     return slice(start, start + length)
 
 
-def sp_to_flatten_indices_prefill(sp_size, extend_seq_lens: np.ndarray,
-                                  padded_sp_len: int):
+def sp_to_normal_indices_prefill(sp_size, extend_seq_lens: np.ndarray,
+                                 padded_sp_len: int):
     """
-    Indices from the Sequence Parallel layout to the normal layout.
+    Indices from the Sequence Parallel layout (padded) to the normal layout.
     """
     indices = []
     sp_offset = [padded_sp_len * sp_rank for sp_rank in range(sp_size)]
@@ -1067,10 +1065,10 @@ def sp_to_flatten_indices_prefill(sp_size, extend_seq_lens: np.ndarray,
     return np.asarray(indices)
 
 
-def sp_to_flatten_indices_decode(sp_size, seq_lens_cpu: np.ndarray,
+def sp_to_normal_indices_decode(sp_size, seq_lens_cpu: np.ndarray,
                                  padded_sp_len: int):
     """
-    Indices from the Sequence Parallel layout to the normal layout.
+    Indices from the Sequence Parallel layout (padded) to the normal layout.
     """
     req_sp_rank = seq_lens_cpu % sp_size
     req_sp_offset = req_sp_rank * padded_sp_len
@@ -1081,8 +1079,8 @@ def sp_to_flatten_indices_decode(sp_size, seq_lens_cpu: np.ndarray,
     return req_sp_offset
 
 
-def _debug_flatten_to_sp_indices(mode, sp_size, seq_lens, sp_padded_len):
-    """Debug function that translate from flatten layout to the sp layout"""
+def _debug_normal_to_sp_indices(mode, sp_size, seq_lens, sp_padded_len):
+    """(Debug only) Indices from normal layout to the SP layout (padded)."""
     get_indices_fn = (get_decode_indices
                       if mode == ForwardMode.DECODE else get_prefill_indices)
     def get_offset(sp_rank):
@@ -1095,3 +1093,15 @@ def _debug_flatten_to_sp_indices(mode, sp_size, seq_lens, sp_padded_len):
         for sp_rank in range(sp_size)
     ]
     return indices
+
+
+def _debug_normal_to_sp(indices, output_tensor, tensor):
+    """
+    Use the indices generated above to translate from a normal layout to a
+    SP layout (padded). Due to the padding, `output_tensor`'s shape is different
+    from the input `tensor`'s.
+    """
+    for idxs in indices:
+        output_tensor[idxs] = tensor
+    output_tensor = output_tensor.contiguous()
+    return output_tensor
