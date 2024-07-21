@@ -850,8 +850,8 @@ class InputMetadata:
             # During the runtime, we should use positions[local_token_indices]
             # to get positions for each SP shard.
             if forward_mode == ForwardMode.DECODE:
-                local_token_indices = np.nonzero(
-                    get_decode_mask(sp_rank, sp_size, seq_lens_cpu))
+                local_token_indices = get_decode_indices(sp_rank, sp_size,
+                                                         seq_lens_cpu)
             else:
                 local_token_indices = get_prefill_indices(sp_rank, sp_size,
                                                           extend_seq_lens)
@@ -982,19 +982,24 @@ def init_triton_args(forward_mode, seq_lens, prefix_lens):
 
 
 def get_prefill_indices(sp_rank, sp_size, extend_seq_lens, extend_start_loc):
+    """
+    From normal layout to the sequence parallel layout(no padding).
+    This is primarily for the position ids.
+    """
     # For the first few ranks, they have one more token to compute
     sp_req_len = _get_local_token_nums(sp_rank, sp_size, extend_seq_lens)
-    # the offset of each request in the batch. Only the first few ranks may get 1 more token (for each).
-    # for sp_rank=r, there are r ranks ahread (since 0-based), each may get one token
-    sp_in_req_offset = extend_seq_lens // sp_size * sp_rank + np.clip(extend_seq_lens % sp_size, a_min=None, a_max=sp_rank)
+    # the offset of each request in the batch. Only the first few ranks may get
+    # 1 more token (for each). For sp_rank=r, therere r peers ahread (0-based),
+    # each will get one token
+    sp_in_req_offset = (
+        extend_seq_lens // sp_size * sp_rank +
+        np.clip(extend_seq_lens % sp_size, a_min=None, a_max=sp_rank)
+    )
     sp_req_start = extend_start_loc + sp_in_req_offset
-    sp_indices = np.concatenate([np.arange(s, s + l) for s, l in zip(sp_req_start, sp_req_len)])
+    sp_indices = np.concatenate([
+        np.arange(s, s + l) for s, l in zip(sp_req_start, sp_req_len)
+    ])
     return sp_indices
-
-
-def get_decode_mask(sp_rank, sp_size, seq_lens):
-    # True means the corresponding token is located on this device. Otherwise False.
-    return (seq_lens % sp_size) == sp_rank
 
 
 def _get_local_token_nums(sp_rank, sp_size, extend_seq_lens: Union[int, np.ndarray]):
@@ -1003,7 +1008,40 @@ def _get_local_token_nums(sp_rank, sp_size, extend_seq_lens: Union[int, np.ndarr
         sp_req_len = np.sum(sp_req_len)
     return int(sp_req_len)
 
+
+def get_decode_indices(sp_rank, sp_size, seq_lens):
+    """
+    From normal layout to the sequence parallel layout(no padding).
+    This is primarily for the position ids.
+    """
+    return np.nonzero(get_decode_mask(sp_rank, sp_size, seq_lens))
+
+
+def get_decode_mask(sp_rank, sp_size, seq_lens):
+    # True means the corresponding token is located on this device.
+    return (seq_lens % sp_size) == sp_rank
+
+
 def _get_local_token_slices(sp_rank, sp_size, seq_len: int):
     start = seq_len // sp_size * sp_rank + min(seq_len % sp_size, sp_rank)
     length = _get_local_token_nums(sp_rank, sp_size, seq_len)
     return slice(start, start + length)
+
+
+def sp_to_flatten_indices_prefill(sp_size, extend_seq_lens: np.ndarray,
+                                  padded_sp_len: int):
+    """
+    Indices from the Sequence Parallel layout to the normal layout.
+    """
+    indices = []
+    sp_offset = [padded_sp_len * sp_rank for sp_rank in range(sp_size)]
+    sp_local_token_nums = [
+        _get_local_token_nums(sp_rank, sp_size, extend_seq_lens)
+        for sp_rank in range(sp_size)
+    ]
+    for req_id in range(len(extend_seq_lens)):
+        for sp_rank in range(sp_size):
+            sp_len = sp_local_token_nums[sp_rank][req_id]
+            indices.extend(range(sp_offset[sp_rank], sp_offset + sp_len))
+            sp_offset[sp_rank] += sp_len
+    return np.asarray(indices)

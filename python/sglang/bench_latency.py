@@ -176,6 +176,7 @@ def correctness_test(
     server_args,
     bench_args,
     tp_rank,
+    sp_rank=0,
 ):
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
