@@ -619,8 +619,11 @@ async def benchmark(
             and metrics.output_throughput is not None
         ):
             result = {
+                "backend": args.backend,
                 "dataset_name": args.dataset_name,
                 "request_rate": request_rate,
+                "total_input": metrics.total_input,
+                "total_output": metrics.total_output,
                 "median_ttft": metrics.median_ttft_ms,
                 "median_itl": metrics.mean_itl_ms,
                 "output_token_throughput": metrics.output_throughput,
@@ -674,8 +677,11 @@ async def benchmark(
 
 
 def parse_request_rate_range(request_rate_range):
-    start, stop, step = map(int, request_rate_range.split(","))
-    return list(range(start, stop, step))
+    if len(request_rate_range.split(",")) == 3:
+        start, stop, step = map(int, request_rate_range.split(","))
+        return list(range(start, stop, step))
+    else:
+        return list(map(int, request_rate_range.split(",")))
 
 
 def fire(args: argparse.Namespace):
@@ -895,7 +901,7 @@ if __name__ == "__main__":
         "--request-rate-range",
         type=str,
         default="2,34,2",
-        help="Range of request rates in the format start,stop,step. Default is 2,34,2",
+        help="Range of request rates in the format start,stop,step. Default is 2,34,2. It also supports a list of request rates, requiring the parameters to not equal three.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
