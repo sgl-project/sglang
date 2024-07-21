@@ -4,7 +4,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 import itertools
-from typing import Iterable, List, Union
+from typing import Iterable, List, Optional, Union
 
 import numpy as np
 import torch
@@ -293,7 +293,7 @@ class Batch:
     # Sequence Parallel params
     sp_size: int = None
     sp_rank: int = None
-    sp_local_token_length: int = None
+    padded_sp_len: int = None
 
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache,
@@ -365,12 +365,12 @@ class Batch:
 
             seq_lens.append(prefix_lens[-1] + extend_lens[-1])
         # For sequence parallel, add padding zeros for each rank.
-        tot_extend_len = sum(extend_lens)
-        local_len_padded = int(np.ceil(tot_extend_len / self.sp_size))
+        padded_sp_len = max(len(ids) for ids in flatten_input_ids)
         for flatten_ids in flatten_input_ids:
-            if len(flatten_ids) < local_len_padded:
-                flatten_ids.extend([0] * (local_len_padded - len(flatten_ids)))
+            if len(flatten_ids) < padded_sp_len:
+                flatten_ids.extend([0] * (padded_sp_len - len(flatten_ids)))
         flatten_input_ids = list(itertools.chain(flatten_input_ids))
+        self.padded_sp_len = padded_sp_len
 
         position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
 
@@ -383,7 +383,6 @@ class Batch:
             _extend_num_tokens = _get_local_token_nums(self.sp_rank,
                                                        self.sp_size,
                                                        extend_seq_lens)
-            self.sp_local_token_length = _extend_num_tokens
 
         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
@@ -598,20 +597,31 @@ class Batch:
             input_ids = [
                 r.output_ids[-1] if r.output_ids else r.input_ids[-1] for r in self.reqs
             ]
-        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
+        input_ids_sp = [[] for _ in range(self.sp_size)]
+        for sp_rank in range(self.sp_size):
+            # TODO(yonghao): double check moving the seq lens adds one to above.
+            input_ids_sp[sp_rank].append(input_ids[
+                get_decode_indices(sp_rank, self.sp_size, self.seq_lens)
+            ])
+        padded_sp_len = max(len(ids) for ids in input_ids_sp)
+        for flatten_ids in input_ids_sp:
+            if len(flatten_ids) < padded_sp_len:
+                flatten_ids.extend([0] * (padded_sp_len - len(flatten_ids)))
+        self.padded_sp_len = padded_sp_len
+        
+        input_ids = itertools.chain(input_ids_sp)
+        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.prefix_lens = None
 
         # Alloc mem
         bs = len(self.reqs)
         if self.sp_size > 1:
             seq_lens_cpu = self.seq_lens.cpu().numpy()
-            decode_mask = get_decode_mask(self.sp_rank, self.sp_size,
-                                          seq_lens_cpu)
-            sp_local_indices = np.nonzero(decode_mask)
+            sp_local_indices = get_decode_indices(self.sp_rank, self.sp_size,
+                                                  seq_lens_cpu)
             # FIXME(yonghao): _bs -> bs once SP kv cache store is ready
-            _bs = int(np.sum(decode_mask))
-            self.sp_local_token_length = _bs
+            _bs = len(sp_local_indices)
 
         self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
@@ -785,6 +795,8 @@ class InputMetadata:
     sp_rank: int = None
     sp_size: int = None
     local_token_indices: np.ndarray
+    sp_to_flatten_indices: np.ndarray
+    sp_local_token_length: int
 
     @classmethod
     def create(
@@ -799,6 +811,7 @@ class InputMetadata:
         top_logprobs_nums=None,
         return_logprob=False,
         skip_flashinfer_init=False,
+        padded_sp_len=None,
     ):
         if not skip_flashinfer_init and not model_runner.server_args.disable_flashinfer:
             init_flashinfer_args(
@@ -849,14 +862,23 @@ class InputMetadata:
         if sp_size > 1:
             # During the runtime, we should use positions[local_token_indices]
             # to get positions for each SP shard.
+            extend_seq_lens_cpu = extend_seq_lens.cpu().numpy()
             if forward_mode == ForwardMode.DECODE:
                 local_token_indices = get_decode_indices(sp_rank, sp_size,
-                                                         seq_lens_cpu)
+                                                         extend_seq_lens_cpu)
+                sp_to_flatten_indices = sp_to_flatten_indices_decode(
+                    sp_size, extend_seq_lens_cpu, padded_sp_len
+                )
             else:
                 local_token_indices = get_prefill_indices(sp_rank, sp_size,
-                                                          extend_seq_lens)
+                                                          extend_seq_lens_cpu)
+                sp_to_flatten_indices = sp_to_flatten_indices_prefill(
+                    sp_size, extend_seq_lens_cpu, padded_sp_len
+                )
         else:
             local_token_indices = np.arange(positions.numel())
+            sp_to_flatten_indices = np.arange(extend_seq_lens.numel())
+        sp_local_token_length = len(local_token_indices)
 
         ret = cls(
             forward_mode=forward_mode,
@@ -879,6 +901,8 @@ class InputMetadata:
             sp_rank=sp_rank,
             sp_size=sp_size,
             local_token_indices=local_token_indices,
+            sp_to_flatten_indices=sp_to_flatten_indices,
+            sp_local_token_length=sp_local_token_length,
         )
 
         if model_runner.server_args.disable_flashinfer:
@@ -981,7 +1005,8 @@ def init_triton_args(forward_mode, seq_lens, prefix_lens):
     return max_seq_len, max_extend_len, start_loc, prefix_lens
 
 
-def get_prefill_indices(sp_rank, sp_size, extend_seq_lens, extend_start_loc):
+def get_prefill_indices(sp_rank, sp_size, extend_seq_lens: np.ndarray,
+                        extend_start_loc):
     """
     From normal layout to the sequence parallel layout(no padding).
     This is primarily for the position ids.
@@ -1009,17 +1034,12 @@ def _get_local_token_nums(sp_rank, sp_size, extend_seq_lens: Union[int, np.ndarr
     return int(sp_req_len)
 
 
-def get_decode_indices(sp_rank, sp_size, seq_lens):
+def get_decode_indices(sp_rank, sp_size, seq_lens: np.ndarray):
     """
     From normal layout to the sequence parallel layout(no padding).
     This is primarily for the position ids.
     """
-    return np.nonzero(get_decode_mask(sp_rank, sp_size, seq_lens))
-
-
-def get_decode_mask(sp_rank, sp_size, seq_lens):
-    # True means the corresponding token is located on this device.
-    return (seq_lens % sp_size) == sp_rank
+    return np.nonzero((seq_lens % sp_size) == sp_rank)
 
 
 def _get_local_token_slices(sp_rank, sp_size, seq_len: int):
@@ -1045,3 +1065,14 @@ def sp_to_flatten_indices_prefill(sp_size, extend_seq_lens: np.ndarray,
             indices.extend(range(sp_offset[sp_rank], sp_offset + sp_len))
             sp_offset[sp_rank] += sp_len
     return np.asarray(indices)
+
+
+def sp_to_flatten_indices_decode(sp_size, seq_lens_cpu: np.ndarray,
+                                 padded_sp_len: int):
+    req_sp_rank = seq_lens_cpu % sp_size
+    req_sp_offset = req_sp_rank * padded_sp_len
+    for sp_rank in range(sp_size):
+        local_reqs = req_sp_rank == sp_rank
+        req_sp_index = np.cumsum(local_reqs) - 1
+        req_sp_offset += req_sp_index * local_reqs  # mask out reqs not here.
+    return req_sp_offset
