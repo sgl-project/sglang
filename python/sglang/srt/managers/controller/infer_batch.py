@@ -379,7 +379,7 @@ class Batch:
         extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
         if self.sp_size > 1:
             extend_seq_lens = seq_lens - prefix_lens
-            # FIXME: _extend_num_tokens -> extend_num_tokens once kv cache store is ready for SP
+            # FIXME(yonghao): _extend_num_tokens -> extend_num_tokens once kv cache store is ready for SP
             _extend_num_tokens = _get_local_token_nums(self.sp_rank,
                                                        self.sp_size,
                                                        extend_seq_lens)
@@ -397,8 +397,11 @@ class Batch:
 
         pt = 0
         for i in range(bs):
-            # FIXME: fix this for SP
             extend_len = extend_lens[i]
+            if self.sp_size > 1:
+                # FIXME(yonghao): _extend_len > extend_len once SP Attn is ready
+                _extend_len = _get_local_token_nums(self.sp_rank, self.sp_size,
+                                                    extend_len)
             self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
                 prefix_lens[i] : prefix_lens[i] + extend_len
             ] = out_cache_loc[pt : pt + extend_len]
@@ -605,7 +608,8 @@ class Batch:
             seq_lens_cpu = self.seq_lens.cpu().numpy()
             decode_mask = get_decode_mask(self.sp_rank, self.sp_size,
                                           seq_lens_cpu)
-            # FIXME: _bs -> bs once kv cache store is ready for SP
+            sp_local_indices = np.nonzero(decode_mask)
+            # FIXME(yonghao): _bs -> bs once SP kv cache store is ready
             _bs = int(np.sum(decode_mask))
             self.sp_local_token_length = _bs
 
@@ -616,7 +620,17 @@ class Batch:
             self.tree_cache.pretty_print()
             exit()
 
-        # FIXME: fix this for SP
+        if self.sp_size > 1:
+            return  # FIXME(yonghao): remove it once SP kv cache store is ready
+            local_req_indices = self.req_pool_indices[sp_local_indices]
+            # NOTE(yonghao): here the seqlen is still the total seq len but not
+            # the local lens
+            local_req_seqlens = self.seq_lens[sp_local_indices]
+            # local_req_local_lens = _get_local_token_nums(self.sp_rank, self.sp_size, local_req_seqlens)
+            self.req_to_token_pool.req_to_token[
+                local_req_indices, local_req_seqlens - 1
+            ] = self.out_cache_loc
+            return
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
@@ -770,6 +784,7 @@ class InputMetadata:
     # For Sequence Parallel
     sp_rank: int = None
     sp_size: int = None
+    local_token_indices: np.ndarray
 
     @classmethod
     def create(
@@ -798,7 +813,6 @@ class InputMetadata:
         batch_size = len(req_pool_indices)
 
         if forward_mode == ForwardMode.DECODE:
-            # FIXME: fix this for SP
             positions = ((seq_lens - 1) + position_ids_offsets).to(torch.int64)
             extend_seq_lens = extend_start_loc = extend_no_prefix = None
             if not model_runner.server_args.disable_flashinfer:
@@ -811,7 +825,6 @@ class InputMetadata:
             seq_lens_cpu = seq_lens.cpu().numpy()
             prefix_lens_cpu = prefix_lens.cpu().numpy()
             position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
-            # FIXME: fix this for SP
             positions = torch.tensor(
                 np.concatenate(
                     [
@@ -831,6 +844,20 @@ class InputMetadata:
             extend_no_prefix = torch.all(prefix_lens == 0)
             total_num_tokens = int(torch.sum(seq_lens))
 
+        sp_rank = model_runner.sp_rank
+        sp_size = model_runner.sp_size
+        if sp_size > 1:
+            # During the runtime, we should use positions[local_token_indices]
+            # to get positions for each SP shard.
+            if forward_mode == ForwardMode.DECODE:
+                local_token_indices = np.nonzero(
+                    get_decode_mask(sp_rank, sp_size, seq_lens_cpu))
+            else:
+                local_token_indices = get_prefill_indices(sp_rank, sp_size,
+                                                          extend_seq_lens)
+        else:
+            local_token_indices = np.arange(positions.numel())
+
         ret = cls(
             forward_mode=forward_mode,
             batch_size=batch_size,
@@ -849,8 +876,9 @@ class InputMetadata:
             flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
             flashinfer_prefill_wrapper_paged=model_runner.flashinfer_prefill_wrapper_paged,
             flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
-            sp_rank=model_runner.sp_rank,
-            sp_size=model_runner.sp_size,
+            sp_rank=sp_rank,
+            sp_size=sp_size,
+            local_token_indices=local_token_indices,
         )
 
         if model_runner.server_args.disable_flashinfer:
@@ -955,13 +983,13 @@ def init_triton_args(forward_mode, seq_lens, prefix_lens):
 
 def get_prefill_indices(sp_rank, sp_size, extend_seq_lens, extend_start_loc):
     # For the first few ranks, they have one more token to compute
-    sp_req_len = extend_seq_lens // sp_size + ((extend_seq_lens % sp_size) > sp_rank).to(np.int64)
+    sp_req_len = _get_local_token_nums(sp_rank, sp_size, extend_seq_lens)
     # the offset of each request in the batch. Only the first few ranks may get 1 more token (for each).
     # for sp_rank=r, there are r ranks ahread (since 0-based), each may get one token
     sp_in_req_offset = extend_seq_lens // sp_size * sp_rank + np.clip(extend_seq_lens % sp_size, a_min=None, a_max=sp_rank)
     sp_req_start = extend_start_loc + sp_in_req_offset
     sp_indices = np.concatenate([np.arange(s, s + l) for s, l in zip(sp_req_start, sp_req_len)])
-    return sp_indices.numpy().tolist()
+    return sp_indices
 
 
 def get_decode_mask(sp_rank, sp_size, seq_lens):
