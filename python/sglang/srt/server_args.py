@@ -70,13 +70,13 @@ class ServerArgs:
             self.tokenizer_path = self.model_path
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
-                self.mem_fraction_static = 0.78
+                self.mem_fraction_static = 0.80
             elif self.tp_size >= 8:
-                self.mem_fraction_static = 0.82
+                self.mem_fraction_static = 0.84
             elif self.tp_size >= 4:
-                self.mem_fraction_static = 0.83
-            elif self.tp_size >= 2:
                 self.mem_fraction_static = 0.86
+            elif self.tp_size >= 2:
+                self.mem_fraction_static = 0.88
             else:
                 self.mem_fraction_static = 0.89
         if isinstance(self.additional_ports, int):
