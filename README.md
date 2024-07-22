@@ -37,6 +37,7 @@ The core features include:
 
 ### Method 1: With pip
 ```
+pip install --upgrade pip
 pip install "sglang[all]"
 
 # Install FlashInfer CUDA kernels
@@ -48,6 +49,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
+pip install --upgrade pip
 pip install -e "python[all]"
 
 # Install FlashInfer CUDA kernels
@@ -145,15 +147,16 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --mem-fraction-static 0.7
 ```
 - See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
-- Add `--nnodes 2` to run tensor parallelism on multiple nodes. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-1` be the hostname of the first node and `50000` be an available port.
+- Add `--nnodes 2` to run tensor parallelism on multiple nodes. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port.
 ```
 # Node 0
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-1:50000 --nnodes 2 --node-rank 0
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-0:50000 --nnodes 2 --node-rank 0
 
 # Node 1
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-1:50000 --nnodes 2 --node-rank 1
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-0:50000 --nnodes 2 --node-rank 1
 ```
 - If the model does not have a template in the Hugging Face tokenizer, you can specify a [custom chat template](docs/custom_chat_template.md).
+- To enable fp8 quantization, you can add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 
 ### Supported Models
 
@@ -166,7 +169,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
   - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.6-vicuna-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
   - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.6-34b --tokenizer-path liuhaotian/llava-v1.6-34b-tokenizer --port 30000`
 - LLaVA-NeXT-Video
-  - see [srt_example_llava_v.sh](examples/usage/llava_video/srt_example_llava_v.sh)
+  - see [examples/usage/llava_video](examples/usage/llava_video)
 - Yi-VL
   - see [srt_example_yi_vl.py](examples/quick_start/srt_example_yi_vl.py).
 - StableLM
@@ -175,6 +178,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - Grok
 - ChatGLM
 - InternLM 2
+- Mistral NeMo
 
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/model_support.md).
 

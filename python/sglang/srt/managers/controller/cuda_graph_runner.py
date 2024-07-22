@@ -1,11 +1,13 @@
 """Run the model with cuda graph."""
 
 import bisect
+from contextlib import contextmanager
 
 import torch
 from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.distributed.parallel_state import graph_capture
+from vllm.model_executor.custom_op import CustomOp
 
 from sglang.srt.layers.logits_processor import LogitProcessorOutput
 from sglang.srt.managers.controller.infer_batch import (
@@ -14,10 +16,44 @@ from sglang.srt.managers.controller.infer_batch import (
     InputMetadata,
     init_flashinfer_args,
 )
+from sglang.srt.utils import monkey_patch_vllm_all_gather
+
+
+def _to_torch(model: torch.nn.Module, reverse: bool = False):
+    for sub in model._modules.values():
+        if isinstance(sub, CustomOp):
+            if reverse:
+                sub._forward_method = sub.forward_cuda
+            else:
+                sub._forward_method = sub.forward_native
+        if isinstance(sub, torch.nn.Module):
+            _to_torch(sub, reverse)
+
+
+@contextmanager
+def patch_model(
+    model: torch.nn.Module, use_compile: bool, tp_group: "GroupCoordinator"
+):
+    backup_ca_comm = None
+
+    try:
+        if use_compile:
+            _to_torch(model)
+            monkey_patch_vllm_all_gather()
+            backup_ca_comm = tp_group.ca_comm
+            tp_group.ca_comm = None
+            yield torch.compile(model.forward, mode="max-autotune-no-cudagraphs")
+        else:
+            yield model.forward
+    finally:
+        if use_compile:
+            _to_torch(model, reverse=True)
+            monkey_patch_vllm_all_gather(reverse=True)
+            tp_group.ca_comm = backup_ca_comm
 
 
 class CudaGraphRunner:
-    def __init__(self, model_runner, max_batch_size_to_capture):
+    def __init__(self, model_runner, max_batch_size_to_capture, use_torch_compile):
         self.model_runner = model_runner
         self.graphs = {}
         self.input_buffers = {}
@@ -55,6 +91,8 @@ class CudaGraphRunner:
             (self.max_bs,), dtype=torch.int32, device="cuda"
         )
 
+        self.compile_bs = [1, 2, 4, 8, 16, 24, 32] if use_torch_compile else []
+
     def can_run(self, batch_size):
         return batch_size < self.max_bs
 
@@ -63,18 +101,23 @@ class CudaGraphRunner:
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
             for bs in batch_size_list:
-                (
-                    graph,
-                    input_buffers,
-                    output_buffers,
-                    flashinfer_handler,
-                ) = self.capture_one_batch_size(bs)
-                self.graphs[bs] = graph
-                self.input_buffers[bs] = input_buffers
-                self.output_buffers[bs] = output_buffers
-                self.flashinfer_handlers[bs] = flashinfer_handler
+                with patch_model(
+                    self.model_runner.model,
+                    bs in self.compile_bs,
+                    self.model_runner.tp_group,
+                ) as forward:
+                    (
+                        graph,
+                        input_buffers,
+                        output_buffers,
+                        flashinfer_handler,
+                    ) = self.capture_one_batch_size(bs, forward)
+                    self.graphs[bs] = graph
+                    self.input_buffers[bs] = input_buffers
+                    self.output_buffers[bs] = output_buffers
+                    self.flashinfer_handlers[bs] = flashinfer_handler
 
-    def capture_one_batch_size(self, bs):
+    def capture_one_batch_size(self, bs, forward):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
 
@@ -127,9 +170,8 @@ class CudaGraphRunner:
                 skip_flashinfer_init=True,
             )
             input_metadata.flashinfer_decode_wrapper = flashinfer_decode_wrapper
-            return self.model_runner.model.forward(
-                input_ids, input_metadata.positions, input_metadata
-            )
+
+            return forward(input_ids, input_metadata.positions, input_metadata)
 
         for _ in range(2):
             run_once()
@@ -150,8 +192,8 @@ class CudaGraphRunner:
         index = bisect.bisect_left(self.batch_size_list, raw_bs)
         bs = self.batch_size_list[index]
         if bs != raw_bs:
-            self.seq_lens.zero_()
-            self.position_ids_offsets.fill_(1)
+            self.seq_lens.fill_(1)
+            self.position_ids_offsets.zero_()
             self.out_cache_loc.zero_()
 
         # Common inputs

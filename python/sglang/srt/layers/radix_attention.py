@@ -99,7 +99,7 @@ class RadixAttention(nn.Module):
         else:
             o2, s2 = input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
                 q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-                input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+                input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
                 causal=False,
                 sm_scale=self.scaling,
                 logits_soft_cap=self.logit_cap,
@@ -119,7 +119,7 @@ class RadixAttention(nn.Module):
 
         o = input_metadata.flashinfer_decode_wrapper.forward(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-            input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+            input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
             sm_scale=self.scaling,
             logits_soft_cap=self.logit_cap,
         )
@@ -136,33 +136,7 @@ class RadixAttention(nn.Module):
             return self.decode_forward(q, k, v, input_metadata)
 
     def store_kv_cache(self, cache_k, cache_v, input_metadata: InputMetadata):
-        kv_cache = input_metadata.token_to_kv_pool.kv_data[self.layer_id]
-        _store_kv_cache(cache_k, cache_v, kv_cache, input_metadata.out_cache_loc)
-
-
-try:
-
-    @torch.library.custom_op("mylib::store_kv_cache", mutates_args={"kv_cache"})
-    def _store_kv_cache(
-        k: torch.Tensor,
-        v: torch.Tensor,
-        kv_cache: torch.Tensor,
-        cache_loc: torch.Tensor,
-    ) -> None:
-        kv_cache[cache_loc, 0] = k
-        kv_cache[cache_loc, 1] = v
-
-    @_store_kv_cache.register_fake
-    def _(k, v, kv_cache, cache_loc):
-        pass
-
-except:
-
-    def _store_kv_cache(
-        k: torch.Tensor,
-        v: torch.Tensor,
-        kv_cache: torch.Tensor,
-        cache_loc: torch.Tensor,
-    ) -> None:
-        kv_cache[cache_loc, 0] = k
-        kv_cache[cache_loc, 1] = v
+        k_cache = input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id)
+        v_cache = input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id)
+        k_cache[input_metadata.out_cache_loc] = cache_k
+        v_cache[input_metadata.out_cache_loc] = cache_v

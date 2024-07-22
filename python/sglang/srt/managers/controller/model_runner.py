@@ -22,7 +22,6 @@ from vllm.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
@@ -122,6 +121,15 @@ class ModelRunner:
         self.dtype = vllm_model_config.dtype
         if self.model_config.model_overide_args is not None:
             vllm_model_config.hf_config.update(self.model_config.model_overide_args)
+
+        if (
+            self.server_args.efficient_weight_load
+            and "llama" in self.server_args.model_path.lower()
+            and self.server_args.quantization == "fp8"
+        ):
+            from sglang.srt.model_loader.model_loader import get_model
+        else:
+            from vllm.model_executor.model_loader import get_model
 
         self.model = get_model(
             model_config=vllm_model_config,
@@ -232,12 +240,24 @@ class ModelRunner:
             self.cuda_graph_runner = None
             return
 
-        logger.info(f"[gpu_id={self.gpu_id}] Capture cuda graph begin.")
+        logger.info(
+            f"[gpu_id={self.gpu_id}] Capture cuda graph begin. This can take up to several minutes."
+        )
         batch_size_list = [1, 2, 4] + [i * 8 for i in range(1, 17)]
         self.cuda_graph_runner = CudaGraphRunner(
-            self, max_batch_size_to_capture=max(batch_size_list)
+            self,
+            max_batch_size_to_capture=max(batch_size_list),
+            use_torch_compile=self.server_args.enable_torch_compile,
         )
-        self.cuda_graph_runner.capture(batch_size_list)
+        try:
+            self.cuda_graph_runner.capture(batch_size_list)
+        except RuntimeError as e:
+            raise Exception(
+                f"Capture cuda graph failed: {e}. Possible solutions:\n"
+                f"1. disable cuda graph by --disable-cuda-graph\n"
+                f"2. set --mem-fraction-static to a smaller value\n"
+                f"Open an issue on GitHub with reproducible scripts if you need help.\n"
+            )
 
     @torch.inference_mode()
     def forward_decode(self, batch: Batch):

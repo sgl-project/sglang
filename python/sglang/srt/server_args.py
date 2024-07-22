@@ -56,8 +56,10 @@ class ServerArgs:
     disable_regex_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_disk_cache: bool = False
+    enable_torch_compile: bool = False
     attention_reduce_in_fp32: bool = False
     enable_p2p_check: bool = False
+    efficient_weight_load: bool = False
 
     # Distributed args
     nccl_init_addr: Optional[str] = None
@@ -324,6 +326,11 @@ class ServerArgs:
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
         )
         parser.add_argument(
+            "--enable-torch-compile",
+            action="store_true",
+            help="Optimize the model with torch.compile, experimental feature.",
+        )
+        parser.add_argument(
             "--attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
@@ -333,6 +340,11 @@ class ServerArgs:
             "--enable-p2p-check",
             action="store_true",
             help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
+        )
+        parser.add_argument(
+            "--efficient-weight-load",
+            action="store_true",
+            help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
         )
 
     @classmethod

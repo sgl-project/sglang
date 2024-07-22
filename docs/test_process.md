@@ -92,3 +92,9 @@ python3 run_all.py
 cd test/srt
 python test_openai_server.py
 ```
+
+## Format
+pip3 install pre-commit
+cd sglang
+pre-commit install
+pre-commit run --all-files

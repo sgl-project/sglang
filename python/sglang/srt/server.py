@@ -191,6 +191,19 @@ def _set_global_server_args(server_args: ServerArgs):
     }
 
 
+def _set_torch_compile_config():
+    # The following configurations are for torch compile optimizations
+    import torch._dynamo.config
+    import torch._inductor.config
+
+    torch._inductor.config.coordinate_descent_tuning = True
+    torch._inductor.config.triton.unique_kernel_names = True
+    torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
+
+    # FIXME: tmp workaround
+    torch._dynamo.config.accumulated_cache_size_limit = 256
+
+
 def launch_server(
     server_args: ServerArgs,
     model_overide_args: Optional[dict] = None,
@@ -216,7 +229,7 @@ def launch_server(
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.1.0",
+            "0.1.1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -224,6 +237,9 @@ def launch_server(
     if server_args.chat_template:
         # TODO: replace this with huggingface transformers template
         load_chat_template_for_openai_api(server_args.chat_template)
+
+    if server_args.enable_torch_compile:
+        _set_torch_compile_config()
 
     _set_global_server_args(server_args)
 

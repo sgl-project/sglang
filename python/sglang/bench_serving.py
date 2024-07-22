@@ -19,6 +19,7 @@ import traceback
 import warnings
 from argparse import ArgumentParser as FlexibleArgumentParser
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import AsyncGenerator, List, Optional, Tuple, Union
 
 import aiohttp
@@ -59,6 +60,72 @@ def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
 
 
+# trt llm not support ignore_eos
+# https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
+async def async_request_trt_llm(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+    assert api_url.endswith("generate_stream")
+
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        assert not request_func_input.use_beam_search
+        assert request_func_input.best_of == 1
+        payload = {
+            "accumulate_tokens": True,
+            "text_input": request_func_input.prompt,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "max_tokens": request_func_input.output_len,
+            "stream": True,
+        }
+        output = RequestFuncOutput()
+        output.prompt_len = request_func_input.prompt_len
+
+        ttft = 0.0
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        try:
+            async with session.post(url=api_url, json=payload) as response:
+                if response.status == 200:
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data:")
+
+                        data = json.loads(chunk)
+                        output.generated_text += data["text_output"]
+                        timestamp = time.perf_counter()
+                        # First token
+                        if ttft == 0.0:
+                            ttft = time.perf_counter() - st
+                            output.ttft = ttft
+
+                        # Decoding phase
+                        else:
+                            output.itl.append(timestamp - most_recent_timestamp)
+
+                        most_recent_timestamp = timestamp
+
+                    output.latency = most_recent_timestamp - st
+                    output.success = True
+
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+        if pbar:
+            pbar.update(1)
+        return output
+
+
 # set ignore_eos True by default
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
@@ -76,7 +143,7 @@ async def async_request_openai_completions(
             "temperature": 0.0,
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
-            "stream": True,
+            "stream": not args.disable_stream,
             "ignore_eos": True,
         }
         headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
@@ -99,8 +166,9 @@ async def async_request_openai_completions(
                             continue
 
                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        latency = time.perf_counter() - st
                         if chunk == "[DONE]":
-                            latency = time.perf_counter() - st
+                            pass
                         else:
                             data = json.loads(chunk)
 
@@ -167,6 +235,7 @@ ASYNC_REQUEST_FUNCS = {
     "sglang": async_request_openai_completions,
     "vllm": async_request_openai_completions,
     "lmdeploy": async_request_openai_completions,
+    "trt": async_request_trt_llm,
 }
 
 
@@ -192,6 +261,36 @@ class BenchmarkMetrics:
     p99_itl_ms: float
 
 
+default_sharegpt_path = "ShareGPT_V3_unfiltered_cleaned_split.json"
+
+
+def download_sharegpt_dataset(path):
+    url = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+
+    print(f"Downloading dataset from {url}")
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+
+        total_size = int(response.headers.get("content-length", 0))
+        block_size = 8192
+
+        with open(path, "wb") as f, tqdm(
+            desc="Downloading",
+            total=total_size,
+            unit="iB",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as progress_bar:
+            for data in response.iter_content(block_size):
+                size = f.write(data)
+                progress_bar.update(size)
+
+        print(f"Dataset downloaded and saved to {path}")
+    except requests.RequestException as e:
+        raise Exception(f"Failed to download dataset: {e}")
+
+
 def sample_sharegpt_requests(
     dataset_path: str,
     num_requests: int,
@@ -201,36 +300,13 @@ def sample_sharegpt_requests(
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
 
-    default_dataset_path = "ShareGPT_V3_unfiltered_cleaned_split.json"
-    url = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-
-    if not os.path.isfile(dataset_path) and not os.path.isfile(default_dataset_path):
-        print(f"Downloading dataset from {url}")
-        try:
-            response = requests.get(url, stream=True)
-            response.raise_for_status()
-
-            total_size = int(response.headers.get("content-length", 0))
-            block_size = 8192
-
-            with open(default_dataset_path, "wb") as f, tqdm(
-                desc="Downloading",
-                total=total_size,
-                unit="iB",
-                unit_scale=True,
-                unit_divisor=1024,
-            ) as progress_bar:
-                for data in response.iter_content(block_size):
-                    size = f.write(data)
-                    progress_bar.update(size)
-
-            print(f"Dataset downloaded and saved to {default_dataset_path}")
-            dataset_path = default_dataset_path
-        except requests.RequestException as e:
-            raise Exception(f"Failed to download dataset: {e}")
+    # Download sharegpt if necessary
+    if not os.path.isfile(dataset_path) and not os.path.isfile(default_sharegpt_path):
+        download_sharegpt_dataset(default_sharegpt_path)
+        dataset_path = default_sharegpt_path
     else:
         dataset_path = (
-            dataset_path if os.path.isfile(dataset_path) else default_dataset_path
+            dataset_path if os.path.isfile(dataset_path) else default_sharegpt_path
         )
 
     # Load the dataset.
@@ -279,6 +355,7 @@ def sample_random_requests(
     num_prompts: int,
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
+    dataset_path: str,
 ) -> List[Tuple[str, int, int]]:
 
     input_lens = np.random.randint(
@@ -291,13 +368,62 @@ def sample_random_requests(
         output_len + 1,
         size=num_prompts,
     )
-    offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
-    input_requests = []
-    for i in range(num_prompts):
-        prompt = tokenizer.decode(
-            [(offsets[i] + i + j) % tokenizer.vocab_size for j in range(input_lens[i])]
-        )
-        input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
+
+    if True:
+        # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
+
+        # Download sharegpt if necessary
+        if not os.path.isfile(dataset_path) and not os.path.isfile(
+            default_sharegpt_path
+        ):
+            download_sharegpt_dataset(default_sharegpt_path)
+            dataset_path = default_sharegpt_path
+        else:
+            dataset_path = (
+                dataset_path if os.path.isfile(dataset_path) else default_sharegpt_path
+            )
+
+        # Load the dataset.
+        with open(dataset_path) as f:
+            dataset = json.load(f)
+        # Filter out the conversations with less than 2 turns.
+        dataset = [data for data in dataset if len(data["conversations"]) >= 2]
+        # Only keep the first two turns of each conversation.
+        dataset = [
+            (data["conversations"][0]["value"], data["conversations"][1]["value"])
+            for data in dataset
+        ]
+
+        # Shuffle the dataset.
+        random.shuffle(dataset)
+
+        # Filter out sequences that are too long or too short
+        input_requests: List[Tuple[str, int, int]] = []
+        for i in range(num_prompts):
+            # Tokenize the prompts and completions.
+            prompt = dataset[i][0]
+            prompt_token_ids = tokenizer(prompt).input_ids
+            prompt_len = len(prompt_token_ids)
+
+            if prompt_len <= input_lens[i]:
+                input_ids = prompt_token_ids[: input_lens[i]]
+            else:
+                ratio = (input_lens[i] + prompt_len - 1) // prompt_len
+                input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
+            prompt = tokenizer.decode(input_ids)
+            input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
+    else:
+        # Sample token ids from random integers. This can cause some NaN issues.
+        offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
+        input_requests = []
+        for i in range(num_prompts):
+            prompt = tokenizer.decode(
+                [
+                    (offsets[i] + i + j) % tokenizer.vocab_size
+                    for j in range(input_lens[i])
+                ]
+            )
+            input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
 
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
@@ -392,6 +518,7 @@ async def benchmark(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
     disable_tqdm: bool,
+    enable_multi: bool,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -485,6 +612,44 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("=" * 50)
 
+    if (
+        metrics.median_ttft_ms is not None
+        and metrics.mean_itl_ms is not None
+        and metrics.output_throughput is not None
+    ):
+        result = {
+            "backend": args.backend,
+            "dataset_name": args.dataset_name,
+            "request_rate": request_rate,
+            "total_input": metrics.total_input,
+            "total_output": metrics.total_output,
+            "median_ttft": metrics.median_ttft_ms,
+            "median_itl": metrics.mean_itl_ms,
+            "output_token_throughput": metrics.output_throughput,
+            "sharegpt_output_len": args.sharegpt_output_len,
+            "random_input_len": args.random_input_len,
+            "random_output_len": args.random_output_len,
+            "random_range_ratio": args.random_range_ratio,
+            "benchmark_duration": benchmark_duration,
+        }
+    else:
+        print(f"Error running benchmark for request rate: {request_rate}")
+        print("-" * 30)
+
+    # Determine output file name
+    if args.output_file:
+        output_file_name = args.output_file
+    else:
+        now = datetime.now().strftime("%m%d")
+        if args.dataset_name == "random":
+            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
+        else:
+            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
+
+    # Append results to a JSONL file
+    with open(output_file_name, "a") as file:
+        file.write(json.dumps(result) + "\n")
+
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
@@ -515,6 +680,23 @@ async def benchmark(
     return result
 
 
+def parse_request_rate_range(request_rate_range):
+    if len(request_rate_range.split(",")) == 3:
+        start, stop, step = map(int, request_rate_range.split(","))
+        return list(range(start, stop, step))
+    else:
+        return list(map(int, request_rate_range.split(",")))
+
+
+def check_chat_template(model_path):
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        return "chat_template" in tokenizer.init_kwargs
+    except Exception as e:
+        print(f"Fail to load tokenizer config with error={e}")
+        return False
+
+
 def fire(args: argparse.Namespace):
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -524,6 +706,7 @@ def fire(args: argparse.Namespace):
             "sglang": 30000,
             "lmdeploy": 23333,
             "vllm": 8000,
+            "trt": 8000,
         }.get(args.backend, 30000)
 
     api_url = (
@@ -536,6 +719,16 @@ def fire(args: argparse.Namespace):
         if args.base_url
         else f"http://{args.host}:{args.port}/v1/models"
     )
+
+    if args.backend == "trt":
+        api_url = (
+            f"{args.base_url}/v2/models/ensemble/generate_stream"
+            if args.base_url
+            else f"http://{args.host}:{args.port}/v2/models/ensemble/generate_stream"
+        )
+        if args.model is None:
+            print("Please provide a model using `--model` when using `trt` backend.")
+            sys.exit(1)
 
     if args.model is None:
         try:
@@ -552,6 +745,12 @@ def fire(args: argparse.Namespace):
     if args.model is None:
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
+
+    if not check_chat_template(args.model):
+        print(
+            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
+            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
+        )
 
     print(f"{args}\n")
 
@@ -575,21 +774,40 @@ def fire(args: argparse.Namespace):
             num_prompts=args.num_prompts,
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
+            dataset_path=args.dataset_path,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
-    asyncio.run(
-        benchmark(
-            backend=backend,
-            api_url=api_url,
-            model_id=model_id,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            request_rate=args.request_rate,
-            disable_tqdm=args.disable_tqdm,
+    if args.multi:
+        request_rates = parse_request_rate_range(args.request_rate_range)
+
+        for rate in request_rates:
+            asyncio.run(
+                benchmark(
+                    backend=backend,
+                    api_url=api_url,
+                    model_id=model_id,
+                    tokenizer=tokenizer,
+                    input_requests=input_requests,
+                    request_rate=rate,
+                    disable_tqdm=args.disable_tqdm,
+                    enable_multi=args.multi,
+                )
+            )
+    else:
+        asyncio.run(
+            benchmark(
+                backend=backend,
+                api_url=api_url,
+                model_id=model_id,
+                tokenizer=tokenizer,
+                input_requests=input_requests,
+                request_rate=args.request_rate,
+                disable_tqdm=args.disable_tqdm,
+                enable_multi=args.multi,
+            )
         )
-    )
 
 
 # to avoid relying on SGLang's components
@@ -692,6 +910,23 @@ if __name__ == "__main__":
         "--disable-tqdm",
         action="store_true",
         help="Specify to disable tqdm progress bar.",
+    )
+    parser.add_argument(
+        "--multi",
+        action="store_true",
+        help="Use request rate range rather than single value.",
+    )
+    parser.add_argument(
+        "--request-rate-range",
+        type=str,
+        default="2,34,2",
+        help="Range of request rates in the format start,stop,step. Default is 2,34,2. It also supports a list of request rates, requiring the parameters to not equal three.",
+    )
+    parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
+    parser.add_argument(
+        "--disable-stream",
+        action="store_true",
+        help="Disable streaming mode.",
     )
 
     set_ulimit()

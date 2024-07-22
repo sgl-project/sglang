@@ -34,12 +34,11 @@ class LogitProcessorOutput:
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode
-    extend_seq_lens: torch.Tensor
-    extend_start_loc: torch.Tensor
-
-    # For logprobs
     return_logprob: bool
-    top_logprobs_nums: List[int]
+
+    extend_seq_lens: torch.Tensor = None
+    extend_start_loc: torch.Tensor = None
+    top_logprobs_nums: List[int] = None
 
     @classmethod
     def from_input_metadata(cls, input_metadata: InputMetadata):
