@@ -1,8 +1,9 @@
-from openai import OpenAI
-import openai
-import time
 import json
 import os
+import time
+
+import openai
+from openai import OpenAI
 
 
 class OpenAIBatchProcessor:
