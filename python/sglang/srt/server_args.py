@@ -29,7 +29,7 @@ class ServerArgs:
     max_prefill_tokens: Optional[int] = None
     max_running_requests: Optional[int] = None
     schedule_heuristic: str = "lpm"
-    schedule_conservativeness: float = 0.8
+    schedule_conservativeness: float = 0.9
 
     # Other runtime options
     tp_size: int = 1
@@ -72,13 +72,13 @@ class ServerArgs:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.78
             elif self.tp_size >= 8:
-                self.mem_fraction_static = 0.81
-            elif self.tp_size >= 4:
                 self.mem_fraction_static = 0.82
+            elif self.tp_size >= 4:
+                self.mem_fraction_static = 0.83
             elif self.tp_size >= 2:
-                self.mem_fraction_static = 0.85
+                self.mem_fraction_static = 0.86
             else:
-                self.mem_fraction_static = 0.88
+                self.mem_fraction_static = 0.89
         if isinstance(self.additional_ports, int):
             self.additional_ports = [self.additional_ports]
         elif self.additional_ports is None:
