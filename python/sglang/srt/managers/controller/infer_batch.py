@@ -631,8 +631,8 @@ class Batch:
             self.tree_cache.pretty_print()
             exit()
 
-        if self.sp_size > 1:
-            return  # FIXME(yonghao): remove it once SP kv cache store is ready
+        if self.sp_size > 1 and False:
+            # FIXME(yonghao): enable remove it once SP kv cache store is ready
             local_req_indices = self.req_pool_indices[sp_local_indices]
             # NOTE(yonghao): here the seqlen is still the total seq len but not
             # the local lens
