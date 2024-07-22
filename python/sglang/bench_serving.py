@@ -483,6 +483,7 @@ def calculate_metrics(
             completed += 1
         else:
             output_lens.append(0)
+            retokenized_output_lens.append(0)
 
     if completed == 0:
         warnings.warn(
