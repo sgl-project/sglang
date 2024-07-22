@@ -68,7 +68,7 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def load_model(server_args, tp_rank, sp_rank: int=0):
+def load_model(server_args, tp_rank, sp_rank: int = 0):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
