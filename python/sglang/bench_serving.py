@@ -640,7 +640,7 @@ async def benchmark(
             "total_output": metrics.total_output,
             "total_output_retokenized": metrics.total_output_retokenized,
             "median_ttft": metrics.median_ttft_ms,
-            "median_itl": metrics.mean_itl_ms,
+            "median_itl": metrics.median_itl_ms,
             "output_token_throughput": metrics.output_throughput,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
