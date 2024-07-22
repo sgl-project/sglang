@@ -55,6 +55,8 @@ class TokenizerManager:
         model_overide_args: dict = None,
     ):
         self.server_args = server_args
+        print('tokenizer port:', port_args.tokenizer_port)
+        print('controller port:', port_args.controller_port)
 
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = context.socket(zmq.PULL)
@@ -122,6 +124,8 @@ class TokenizerManager:
 
         obj.post_init()
         is_single = obj.is_single
+        print('is_single:', is_single)
+        print('obj:', obj)
 
         if is_single:
             async for response in self._handle_single_request(obj, request):
@@ -151,32 +155,35 @@ class TokenizerManager:
             logprob_start_len = obj.logprob_start_len[0]
             top_logprobs_num = obj.top_logprobs_num[0]
         else:
-            rid = obj.rid if index is None else obj.rid[index]
-            input_text = obj.text if index is None else obj.text[index]
+            use_index = index is not None
+            rid = obj.rid if not use_index else obj.rid[index]
+            input_text = obj.text if not use_index else obj.text[index]
             input_ids = (
                 self.tokenizer.encode(input_text)
                 if obj.input_ids is None
                 else obj.input_ids
             )
-            if index is not None and obj.input_ids:
+            if use_index and obj.input_ids:
                 input_ids = obj.input_ids[index]
 
             self._validate_input_length(input_ids)
+
             sampling_params = self._get_sampling_params(
-                obj.sampling_params if index is None else obj.sampling_params[index]
+                obj.sampling_params if not use_index else obj.sampling_params[index]
             )
             pixel_values, image_hash, image_size = await self._get_pixel_values(
-                obj.image_data if index is None else obj.image_data[index]
+                obj.image_data if not use_index else obj.image_data[index]
             )
             return_logprob = (
-                obj.return_logprob if index is None else obj.return_logprob[index]
+                obj.return_logprob if not use_index else obj.return_logprob[index]
             )
             logprob_start_len = (
-                obj.logprob_start_len if index is None else obj.logprob_start_len[index]
+                obj.logprob_start_len if not use_index else obj.logprob_start_len[index]
             )
             top_logprobs_num = (
-                obj.top_logprobs_num if index is None else obj.top_logprobs_num[index]
+                obj.top_logprobs_num if not use_index else obj.top_logprobs_num[index]
             )
+
 
         tokenized_obj = TokenizedGenerateReqInput(
             rid,
@@ -191,6 +198,7 @@ class TokenizerManager:
             top_logprobs_num,
             obj.stream,
         )
+        print('tokenized_obj:', tokenized_obj)
         self.send_to_router.send_pyobj(tokenized_obj)
 
         event = asyncio.Event()
@@ -231,7 +239,7 @@ class TokenizerManager:
                     continue
                 index = i * parallel_sample_num + j
                 if parallel_sample_num != 1:
-                    # Here when using parallel sampling we shoul consider prefill stage so the index is :  j + i * (parallel_sample_num-1) + batch_size - 1
+                    # Here when using parallel sampling we should consider prefill stage so the index is :  j + i * (parallel_sample_num-1) + batch_size - 1
                     index += batch_size - 1 - i
                 rid = obj.rid[index]
                 if parallel_sample_num == 1:
@@ -335,6 +343,7 @@ class TokenizerManager:
     async def _wait_for_response(self, event, state, obj, rid, request):
         while True:
             try:
+                print('wait for response:')
                 await asyncio.wait_for(event.wait(), timeout=4)
             except asyncio.TimeoutError:
                 if request is not None and await request.is_disconnected():
@@ -348,6 +357,7 @@ class TokenizerManager:
                 obj.top_logprobs_num,
                 obj.return_text_in_logprobs,
             )
+            print('out in wait for response:', out)
 
             if self.server_args.log_requests and state.finished:
                 logger.info(f"in={obj.text}, out={out}")

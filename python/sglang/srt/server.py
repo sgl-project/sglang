@@ -43,6 +43,11 @@ from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_chat_completions,
     v1_completions,
+    v1_files_create,
+    v1_batches, 
+    v1_retrieve_batch,
+    v1_retrieve_file,
+    v1_retrieve_file_content
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -55,6 +60,7 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
+from fastapi import FastAPI, Request, Form, UploadFile, File
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +143,32 @@ async def openai_v1_completions(raw_request: Request):
 @app.post("/v1/chat/completions")
 async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
+
+@app.post("/v1/files")
+async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
+    print("openai_v1_files")
+    return await v1_files_create(file, purpose)
+
+## support /v1/batches
+@app.post("/v1/batches")
+async def openai_v1_batches(raw_request: Request):
+    return await v1_batches(tokenizer_manager,raw_request)
+
+@app.get("/v1/batches/{batch_id}")
+async def retrieve_batch(batch_id: str):
+    return await v1_retrieve_batch(batch_id)
+
+@app.get("/v1/files/{file_id}")
+async def retrieve_file(file_id: str):
+    print("openai_v1_files retrieve")
+    # https://platform.openai.com/docs/api-reference/files/retrieve
+    return await v1_retrieve_file(file_id)
+
+## for  "GET /v1/files/backend_result_file-29c7b5de-8ca6-4e91-9142-ce157a967475/content
+@app.get("/v1/files/{file_id}/content")
+async def retrieve_file_content(file_id: str):
+    # https://platform.openai.com/docs/api-reference/files/retrieve-contents
+    return await v1_retrieve_file_content(file_id)
 
 
 @app.get("/v1/models")
