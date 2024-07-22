@@ -44,6 +44,7 @@ class ServerArgs:
 
     # Other
     api_key: str = ""
+    file_storage_pth: str = "SGlang_storage"
 
     # Data parallelism
     dp_size: int = 1
@@ -259,6 +260,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.api_key,
             help="Set API key of the server.",
+        )
+        parser.add_argument(
+            "--file-storage-pth",
+            type=str,
+            default=ServerArgs.file_storage_pth,
+            help="The path of the file storage in backend.",
         )
 
         # Data parallelism

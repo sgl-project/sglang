@@ -48,7 +48,10 @@ class UsageInfo(BaseModel):
 class FileRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/files/create
     file: bytes  # The File object (not file name) to be uploaded
-    purpose: str = "batch"  # The intended purpose of the uploaded file, default is "batch"
+    purpose: str = (
+        "batch"  # The intended purpose of the uploaded file, default is "batch"
+    )
+
 
 class FileResponse(BaseModel):
     id: str
@@ -60,10 +63,13 @@ class FileResponse(BaseModel):
 
 
 class BatchRequest(BaseModel):
-    input_file_id: str  # The ID of an uploaded file that contains requests for the new batch
+    input_file_id: (
+        str  # The ID of an uploaded file that contains requests for the new batch
+    )
     endpoint: str  # The endpoint to be used for all requests in the batch
     completion_window: str  # The time frame within which the batch should be processed
     metadata: Optional[dict] = None  # Optional custom metadata for the batch
+
 
 class BatchResponse(BaseModel):
     id: str
@@ -84,12 +90,9 @@ class BatchResponse(BaseModel):
     expired_at: Optional[int] = None
     cancelling_at: Optional[int] = None
     cancelled_at: Optional[int] = None
-    request_counts: dict = {
-        "total": 0,
-        "completed": 0,
-        "failed": 0
-    }
+    request_counts: dict = {"total": 0, "completed": 0, "failed": 0}
     metadata: Optional[dict] = None
+
 
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation

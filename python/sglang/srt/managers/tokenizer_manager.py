@@ -55,8 +55,6 @@ class TokenizerManager:
         model_overide_args: dict = None,
     ):
         self.server_args = server_args
-        print('tokenizer port:', port_args.tokenizer_port)
-        print('controller port:', port_args.controller_port)
 
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = context.socket(zmq.PULL)
@@ -71,6 +69,7 @@ class TokenizerManager:
             trust_remote_code=server_args.trust_remote_code,
             model_overide_args=model_overide_args,
         )
+
         if server_args.context_length is not None:
             self.context_len = server_args.context_length
         else:
@@ -124,8 +123,6 @@ class TokenizerManager:
 
         obj.post_init()
         is_single = obj.is_single
-        print('is_single:', is_single)
-        print('obj:', obj)
 
         if is_single:
             async for response in self._handle_single_request(obj, request):
@@ -184,7 +181,6 @@ class TokenizerManager:
                 obj.top_logprobs_num if not use_index else obj.top_logprobs_num[index]
             )
 
-
         tokenized_obj = TokenizedGenerateReqInput(
             rid,
             input_text,
@@ -198,7 +194,6 @@ class TokenizerManager:
             top_logprobs_num,
             obj.stream,
         )
-        print('tokenized_obj:', tokenized_obj)
         self.send_to_router.send_pyobj(tokenized_obj)
 
         event = asyncio.Event()
@@ -343,7 +338,6 @@ class TokenizerManager:
     async def _wait_for_response(self, event, state, obj, rid, request):
         while True:
             try:
-                print('wait for response:')
                 await asyncio.wait_for(event.wait(), timeout=4)
             except asyncio.TimeoutError:
                 if request is not None and await request.is_disconnected():
@@ -357,7 +351,6 @@ class TokenizerManager:
                 obj.top_logprobs_num,
                 obj.return_text_in_logprobs,
             )
-            print('out in wait for response:', out)
 
             if self.server_args.log_requests and state.finished:
                 logger.info(f"in={obj.text}, out={out}")
