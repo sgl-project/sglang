@@ -599,11 +599,11 @@ class Batch:
             ]
         self.seq_lens.add_(1)
         input_ids_sp = [[] for _ in range(self.sp_size)]
-        prefix_lens = self.prefix_lens or 0
+        prefix_lens = 0 if self.prefix_lens is None else self.prefix_lens
         seq_lens_cpu = (self.seq_lens - prefix_lens).cpu().numpy()
         for sp_rank in range(self.sp_size):
             # TODO(yonghao): double check moving the seq lens adds one to above.
-            input_ids_sp[sp_rank].append(input_ids[
+            input_ids_sp[sp_rank].extend(input_ids[
                 get_decode_indices(sp_rank, self.sp_size, seq_lens_cpu)
             ])
         padded_sp_len = max(len(ids) for ids in input_ids_sp)
@@ -612,8 +612,8 @@ class Batch:
                 flatten_ids.extend([0] * (padded_sp_len - len(flatten_ids)))
         self.padded_sp_len = padded_sp_len
 
-        input_ids = list(itertools.chain(*input_ids_sp))
-        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
+        flatten_input_ids = list(itertools.chain(*input_ids_sp))
+        self.input_ids = torch.tensor(flatten_input_ids, dtype=torch.int32, device="cuda")
         self.prefix_lens = None
 
         # Alloc mem

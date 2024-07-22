@@ -141,11 +141,24 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
+        if input_metadata.sp_size > 1:
+            ori_hidden_states = hidden_states
+            hidden_states = hidden_states[
+                input_metadata.sp_to_normal_indices
+            ].contiguous()
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
+        if input_metadata.sp_size > 1:
+            output_sp = torch.zeros_like(ori_hidden_states).reshape(
+                input_metadata.sp_size, -1, *ori_hidden_states.shape[1:]
+            )
+            for sp_rank, idxs in enumerate(input_metadata._debug_normal_to_sp_metadata):
+                sp_real_vals = output[idxs]
+                output_sp[sp_rank][:sp_real_vals.shape[0]] = sp_real_vals
+            output = output_sp.reshape(ori_hidden_states.shape).contiguous()
         return output
 
 
@@ -284,6 +297,13 @@ class LlamaForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
+        if input_metadata.sp_size > 1:
+            hidden_states = hidden_states[
+                input_metadata.sp_to_normal_indices
+            ].contiguous()
+            input_ids = input_ids[
+                input_metadata.sp_to_normal_indices
+            ].contiguous()
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
