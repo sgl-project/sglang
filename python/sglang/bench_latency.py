@@ -181,7 +181,7 @@ def correctness_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, tp_rank, sp_rank)
 
     # Prepare inputs
     input_ids, reqs = prepare_inputs(bench_args, tokenizer)

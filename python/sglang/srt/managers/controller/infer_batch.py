@@ -864,6 +864,7 @@ class InputMetadata:
         if sp_size > 1:
             # During the runtime, we should use positions[local_token_indices]
             # to get positions for each SP shard.
+            prefix_lens = prefix_lens if prefix_lens is not None else 0
             extend_seq_lens_cpu = (seq_lens - prefix_lens).cpu().numpy()
             if forward_mode == ForwardMode.DECODE:
                 local_token_indices = get_decode_indices(sp_rank, sp_size,
@@ -872,8 +873,10 @@ class InputMetadata:
                     sp_size, extend_seq_lens_cpu, padded_sp_len
                 )
             else:
+                extend_start_loc_cpu = extend_start_loc.cpu().numpy()
                 local_token_indices = get_prefill_indices(sp_rank, sp_size,
-                                                          extend_seq_lens_cpu)
+                                                          extend_seq_lens_cpu,
+                                                          extend_start_loc_cpu)
                 sp_to_normal_indices = sp_to_normal_indices_prefill(
                     sp_size, extend_seq_lens_cpu, padded_sp_len
                 )
@@ -1066,14 +1069,15 @@ def sp_to_normal_indices_prefill(sp_size, extend_seq_lens: np.ndarray,
     ]
     for req_id in range(len(extend_seq_lens)):
         for sp_rank in range(sp_size):
-            sp_len = sp_local_token_nums[sp_rank][req_id]
-            indices.extend(range(sp_offset[sp_rank], sp_offset + sp_len))
+            sp_len = int(sp_local_token_nums[sp_rank][req_id])
+            sp_my_offset = sp_offset[sp_rank]
+            indices.extend(range(sp_my_offset, sp_my_offset + sp_len))
             sp_offset[sp_rank] += sp_len
     return np.asarray(indices)
 
 
 def sp_to_normal_indices_decode(sp_size, seq_lens_cpu: np.ndarray,
-                                 padded_sp_len: int):
+                                padded_sp_len: int):
     """
     Indices from the Sequence Parallel layout (padded) to the normal layout.
     """
