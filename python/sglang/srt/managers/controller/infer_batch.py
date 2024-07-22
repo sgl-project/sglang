@@ -599,7 +599,8 @@ class Batch:
             ]
         self.seq_lens.add_(1)
         input_ids_sp = [[] for _ in range(self.sp_size)]
-        seq_lens_cpu = (self.seq_lens - self.prefix_lens).cpu().numpy()
+        prefix_lens = self.prefix_lens if self.prefix_lens is not None else 0
+        seq_lens_cpu = (self.seq_lens - prefix_lens).cpu().numpy()
         for sp_rank in range(self.sp_size):
             # TODO(yonghao): double check moving the seq lens adds one to above.
             input_ids_sp[sp_rank].append(input_ids[
@@ -611,7 +612,7 @@ class Batch:
                 flatten_ids.extend([0] * (padded_sp_len - len(flatten_ids)))
         self.padded_sp_len = padded_sp_len
         
-        input_ids = itertools.chain(input_ids_sp)
+        input_ids = list(itertools.chain(input_ids_sp))
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.prefix_lens = None
 
@@ -794,9 +795,10 @@ class InputMetadata:
     # For Sequence Parallel
     sp_rank: int = None
     sp_size: int = None
-    local_token_indices: np.ndarray
-    sp_to_normal_indices: np.ndarray
-    sp_local_token_length: int
+    local_token_indices: np.ndarray = None
+    sp_to_normal_indices: np.ndarray = None
+    sp_local_token_length: int = None
+    _debug_normal_to_sp_metadata: Optional[List[np.ndarray]] = None
 
     @classmethod
     def create(
@@ -875,9 +877,13 @@ class InputMetadata:
                 sp_to_normal_indices = sp_to_normal_indices_prefill(
                     sp_size, extend_seq_lens_cpu, padded_sp_len
                 )
+            _debug_normal_to_sp_metadata = _debug_normal_to_sp_indices(
+                forward_mode, sp_size, extend_seq_lens_cpu, padded_sp_len
+            )
         else:
             local_token_indices = np.arange(positions.numel())
-            sp_to_normal_indices = np.arange(extend_seq_lens.numel())
+            sp_to_normal_indices = np.arange(positions.numel())
+            _debug_normal_to_sp_metadata = None
         sp_local_token_length = len(local_token_indices)
 
         ret = cls(
@@ -903,6 +909,7 @@ class InputMetadata:
             local_token_indices=local_token_indices,
             sp_to_normal_indices=sp_to_normal_indices,
             sp_local_token_length=sp_local_token_length,
+            _debug_normal_to_sp_metadata=_debug_normal_to_sp_metadata
         )
 
         if model_runner.server_args.disable_flashinfer:
@@ -1036,7 +1043,7 @@ def _get_local_token_nums(sp_rank, sp_size,
 
 def get_decode_indices(sp_rank, sp_size, seq_lens: np.ndarray, offset=0):
     """Get Indices from the normal layout to the sequence parallel layout."""
-    return np.nonzero((seq_lens % sp_size) == sp_rank) + offset
+    return np.nonzero((seq_lens % sp_size) == sp_rank)[0] + offset
 
 
 def _get_local_token_slices(sp_rank, sp_size, seq_len: int):
