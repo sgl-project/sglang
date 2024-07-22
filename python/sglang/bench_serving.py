@@ -70,12 +70,10 @@ async def async_request_trt_llm(
     assert api_url.endswith("generate_stream")
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        assert not request_func_input.use_beam_search
-        assert request_func_input.best_of == 1
         payload = {
             "accumulate_tokens": True,
             "text_input": request_func_input.prompt,
-            "temperature": 0.0,
+            "temperature": 0.000001,
             "top_p": 1.0,
             "max_tokens": request_func_input.output_len,
             "stream": True,
