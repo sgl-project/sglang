@@ -5,12 +5,10 @@
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
-import tqdm
 from torch import nn
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
 from vllm.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -375,9 +373,6 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
         if name is None or loaded_weight is None:
-            if get_tensor_model_parallel_rank() == 0:
-                weights = tqdm.tqdm(weights, total=int(len(params_dict) * 1.5))
-
             for name, loaded_weight in weights:
                 load_weights_per_param(name, loaded_weight)
         else:

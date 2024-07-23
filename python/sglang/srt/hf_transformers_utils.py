@@ -73,6 +73,8 @@ def get_context_length(config):
     rope_scaling = getattr(config, "rope_scaling", None)
     if rope_scaling:
         rope_scaling_factor = config.rope_scaling["factor"]
+        if config.rope_scaling["rope_type"] == "llama3":
+            rope_scaling_factor = 1
     else:
         rope_scaling_factor = 1
 
