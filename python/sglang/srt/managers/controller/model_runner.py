@@ -175,6 +175,7 @@ class ModelRunner:
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
 
+        print("max_total_num_tokens", self.max_total_num_tokens)
         self.req_to_token_pool = ReqToTokenPool(
             max(
                 int(self.max_total_num_tokens / self.model_config.context_len * 512),
@@ -259,7 +260,7 @@ class ModelRunner:
                 f"Open an issue on GitHub with reproducible scripts if you need help.\n"
             )
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward_decode(self, batch: Batch):
         if self.cuda_graph_runner and self.cuda_graph_runner.can_run(len(batch.reqs)):
             return self.cuda_graph_runner.replay(batch)
@@ -279,7 +280,7 @@ class ModelRunner:
             batch.input_ids, input_metadata.positions, input_metadata
         )
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward_extend(self, batch: Batch):
         input_metadata = InputMetadata.create(
             self,
@@ -296,7 +297,7 @@ class ModelRunner:
             batch.input_ids, input_metadata.positions, input_metadata
         )
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward_extend_multi_modal(self, batch: Batch):
         input_metadata = InputMetadata.create(
             self,

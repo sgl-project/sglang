@@ -197,7 +197,7 @@ class ModelTpServer:
         self.out_pyobjs = []
         return ret
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward_step(self):
         new_batch = self.get_new_prefill_batch()
 

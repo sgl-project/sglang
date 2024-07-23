@@ -68,8 +68,12 @@ def get_context_length(config):
 
     for key in CONTEXT_LENGTH_KEYS:
         val = getattr(config, key, None)
+        config_dict = config.to_dict()
+        use_new_rope = (int(config_dict["rope_scaling"]["factor"]) == 10000 and
+                        config_dict["rope_scaling"]["type"] == "dynamic" and
+                        "LlamaForCausalLM" in config.architectures)
         if val is not None:
-            return int(rope_scaling_factor * val)
+            return int(rope_scaling_factor * val) if not use_new_rope else val
     return 2048
 
 

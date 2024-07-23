@@ -16,7 +16,6 @@ from vllm.distributed import (
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -30,6 +29,7 @@ from sglang.srt.managers.controller.model_runner import InputMetadata
 MergedColumnParallelLinear = None
 QKVParallelLinear = None
 RowParallelLinear = None
+get_rope = None
 
 
 class LlamaMLP(nn.Module):
@@ -276,6 +276,16 @@ class LlamaForCausalLM(nn.Module):
         global MergedColumnParallelLinear
         global QKVParallelLinear
         global RowParallelLinear
+        global get_rope
+
+        config_dict = config.to_dict()
+        use_new_rope = (int(config_dict["rope_scaling"]["factor"]) == 10000 and
+                        config_dict["rope_scaling"]["type"] == "dynamic")
+
+        if use_new_rope:
+            from sglang.srt.layers.rotary_embedding import get_rope
+        else:
+            from vllm.model_executor.layers.rotary_embedding import get_rope
 
         if efficient_weight_load:
             from sglang.srt.layers.linear import (

@@ -167,7 +167,7 @@ def decode(input_token_ids, batch, model_runner):
     return next_token_ids, output.next_token_logits
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def correctness_test(
     server_args,
     bench_args,
@@ -225,7 +225,7 @@ def latency_test(
         model_runner.req_to_token_pool.clear()
         model_runner.token_to_kv_pool.clear()
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def run_once(output_len):
         # Prefill
         torch.cuda.synchronize()
