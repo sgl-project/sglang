@@ -8,9 +8,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
-from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
-)
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
