@@ -85,9 +85,9 @@ class RadixAttention(nn.Module):
         return o
 
     def extend_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
-        self.store_kv_cache(k, v, input_metadata)
+        if not input_metadata.use_ragged:
+            self.store_kv_cache(k, v, input_metadata)
 
-        if input_metadata.total_num_tokens <= 4096:
             o = input_metadata.flashinfer_prefill_wrapper_paged.forward(
                 q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
                 input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
@@ -121,6 +121,8 @@ class RadixAttention(nn.Module):
                 )
 
                 o, _ = merge_state(o1, s1, o2, s2)
+
+            self.store_kv_cache(k, v, input_metadata)
 
             if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
                 torch.cuda.synchronize()
