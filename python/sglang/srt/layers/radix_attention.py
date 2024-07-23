@@ -96,24 +96,28 @@ class RadixAttention(nn.Module):
                 logits_soft_cap=self.logit_cap,
             )
         else:
-            o1, s1 = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
-                q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-                k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
-                v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
-                causal=True,
-                sm_scale=self.scaling,
-                logits_soft_cap=self.logit_cap,
+            o1, s1 = (
+                input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
+                    q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+                    k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
+                    v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
+                    causal=True,
+                    sm_scale=self.scaling,
+                    logits_soft_cap=self.logit_cap,
+                )
             )
 
             if input_metadata.extend_no_prefix:
                 o = o1
             else:
-                o2, s2 = input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
-                    q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-                    input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
-                    causal=False,
-                    sm_scale=self.scaling,
-                    logits_soft_cap=self.logit_cap,
+                o2, s2 = (
+                    input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
+                        q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+                        input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
+                        causal=False,
+                        sm_scale=self.scaling,
+                        logits_soft_cap=self.logit_cap,
+                    )
                 )
 
                 o, _ = merge_state(o1, s1, o2, s2)
