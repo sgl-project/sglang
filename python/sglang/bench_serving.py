@@ -484,10 +484,7 @@ def calculate_metrics(
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
 
-            e2e_latency = outputs[i].ttft + (output_len - 1) * (
-                sum(outputs[i].itl) / len(outputs[i].itl)
-            )
-            e2e_latencies.append(e2e_latency)
+            e2e_latencies.append(outputs[i].latency)
 
             completed += 1
         else:
