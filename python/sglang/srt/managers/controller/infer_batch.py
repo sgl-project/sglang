@@ -726,7 +726,7 @@ class InputMetadata:
     flashinfer_prefill_wrapper_ragged: "BatchPrefillWithRaggedKVCacheWrapper" = None
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
-    use_ragged = False
+    use_ragged: bool = False
 
     @classmethod
     def create(
@@ -742,8 +742,9 @@ class InputMetadata:
         return_logprob=False,
         skip_flashinfer_init=False,
     ):
+        use_ragged = False
         if not skip_flashinfer_init and not model_runner.server_args.disable_flashinfer:
-            if forward_mode != ForwardMode.DECODE and total_num_tokens > 4096:
+            if forward_mode != ForwardMode.DECODE and int(torch.sum(seq_lens)) > 4096:
                 use_ragged = True
             init_flashinfer_args(
                 forward_mode,
