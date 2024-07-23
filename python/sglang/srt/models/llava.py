@@ -2,6 +2,7 @@
 
 from typing import Iterable, List, Optional, Tuple
 
+import re, math
 import numpy as np
 import torch
 from torch import nn
@@ -52,18 +53,18 @@ class LlavaLlamaForCausalLM(nn.Module):
             )
 
     def pad_input_ids(self, input_ids, pad_value, pt_shape=None, image_size=None):
-        
+
         if len(image_size) > 16:
-            new_image_feature_len = self.image_feature_len // 4 # video
+            new_image_feature_len = self.image_feature_len // 4  # video
         else:
-            new_image_feature_len = self.image_feature_len # multiimage
-            
+            new_image_feature_len = self.image_feature_len  # multiimage
+
         # hardcode for spatial_unpad + anyres
         image_aspect_ratio = "anyres" if len(image_size) == 1 else "pad"
         offset_list = []
-        for  image_s in  image_size:
+        for image_s in image_size:
             height = width = self.num_patches_per_side
-            if image_aspect_ratio == "anyres":
+            if "anyres" in image_aspect_ratio:
                 num_patch_width, num_patch_height = get_anyres_image_grid_shape(
                     image_s,
                     self.image_grid_pinpoints,
@@ -73,7 +74,6 @@ class LlavaLlamaForCausalLM(nn.Module):
                 w = num_patch_width * width
                 new_h, new_w = unpad_image_shape(h, w, image_s)
                 new_image_feature_len += new_h * (new_w + 1)
-
 
             pad_ids = pad_value * (
                 (new_image_feature_len + len(pad_value)) // len(pad_value)
@@ -159,24 +159,54 @@ class LlavaLlamaForCausalLM(nn.Module):
                     new_image_features = []
                     height = width = self.num_patches_per_side
                     for image_idx, image_feature in enumerate(image_features):
-                        image_aspect_ratio = "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
-                        if image_feature.shape[0] > 1 and image_aspect_ratio == "anyres":
+                        if len(image_sizes[image_idx]) == 1:
+                            image_aspect_ratio = (
+                                self.config.image_aspect_ratio
+                            )  # single image
+                        else:
+                            image_aspect_ratio = "pad"  # multi image
+                        # image_aspect_ratio = (
+                        #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
+                        # )
+                        if (
+                            image_feature.shape[0] > 1
+                            and "anyres" in image_aspect_ratio
+                        ):
                             base_image_feature = image_feature[0]
                             image_feature = image_feature[1:]
                             assert height * width == base_image_feature.shape[0]
-                            (
-                                num_patch_width,
-                                num_patch_height,
-                            ) = get_anyres_image_grid_shape(
-                                image_sizes[image_idx][0],
-                                self.image_grid_pinpoints,
-                                self.vision_tower.config.image_size,
-                            )
-                            image_feature = image_feature.view(
-                                num_patch_height, num_patch_width, height, width, -1
-                            )
+                            
+                            if "anyres_max" in image_aspect_ratio:
+                                matched_anyres_max_num_patches = re.match(r"anyres_max_(\d+)", image_aspect_ratio)
+                                if matched_anyres_max_num_patches:
+                                    max_num_patches = int(matched_anyres_max_num_patches.group(1))
 
-                            if "unpad" in self.mm_patch_merge_type:
+                            if image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
+                                vision_tower_image_size = self.image_size
+                                try:
+                                    num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx][0], self.config.image_grid_pinpoints, vision_tower_image_size)
+                                except Exception as e:
+                                    print(f"Error: {e}")
+                                    num_patch_width, num_patch_height = 2, 2
+                                image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
+                            else:
+                                image_feature = image_feature.view(2, 2, height, width, -1)
+                            
+                            # (
+                            #     num_patch_width,
+                            #     num_patch_height,
+                            # ) = get_anyres_image_grid_shape(
+                            #     image_sizes[image_idx][0],
+                            #     self.image_grid_pinpoints,
+                            #     self.vision_tower.config.image_size,
+                            # )
+                            
+                            # image_feature = image_feature.view(
+                            #     num_patch_height, num_patch_width, height, width, -1
+                            # )
+
+                            if "unpad" in self.mm_patch_merge_type and "anyres_max" in image_aspect_ratio and matched_anyres_max_num_patches:
+                                unit = image_feature.shape[2]
                                 image_feature = image_feature.permute(
                                     4, 0, 2, 1, 3
                                 ).contiguous()
@@ -186,6 +216,12 @@ class LlavaLlamaForCausalLM(nn.Module):
                                 image_feature = unpad_image(
                                     image_feature, image_sizes[image_idx][0]
                                 )
+                                c, h, w = image_feature.shape
+                                times = math.sqrt(h * w / (max_num_patches * unit**2))
+                                if times > 1.1:
+                                    image_feature = image_feature[None]
+                                    image_feature = nn.functional.interpolate(image_feature, [int(h // times), int(w // times)], mode="bilinear")[0]
+
                                 image_feature = torch.cat(
                                     (
                                         image_feature,
@@ -195,25 +231,30 @@ class LlavaLlamaForCausalLM(nn.Module):
                                     ),
                                     dim=-1,
                                 )
-                                image_feature = image_feature.flatten(1, 2).transpose(
-                                    0, 1
-                                )
+                                image_feature = image_feature.flatten(1, 2).transpose(0, 1)
                             else:
-                                image_feature = image_feature.permute(
-                                    0, 2, 1, 3, 4
-                                ).contiguous()
+                                image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
                                 image_feature = image_feature.flatten(0, 3)
                             image_feature = torch.cat(
                                 (base_image_feature, image_feature), dim=0
                             )
                             image_feature = image_feature.unsqueeze(0)
                         else:
-                            if image_feature.shape[0] > 16:
+                            if image_feature.shape[0] > 16:  # video
                                 # 2x2 pooling
                                 num_of_frames = image_feature.shape[0]
-                                image_feature = image_feature.view(num_of_frames, height, width, -1)
-                                image_feature = image_feature.permute(0, 3, 1, 2).contiguous() # N, C, H, W
-                                image_feature = self.resampler(image_feature).flatten(2).transpose(1, 2).contiguous() # N, C, H*W
+                                image_feature = image_feature.view(
+                                    num_of_frames, height, width, -1
+                                )
+                                image_feature = image_feature.permute(
+                                    0, 3, 1, 2
+                                ).contiguous()  # N, C, H, W
+                                image_feature = (
+                                    self.resampler(image_feature)
+                                    .flatten(2)
+                                    .transpose(1, 2)
+                                    .contiguous()
+                                )  # N, C, H*W
 
                         new_image_features.append(image_feature)
                     image_features = new_image_features
@@ -235,10 +276,7 @@ class LlavaLlamaForCausalLM(nn.Module):
                         for j, image_off in enumerate(image_offsets[i]):
                             pad_len = image_features[pt][j].shape[0]
                             input_embeds[
-                                start_idx
-                                + image_off : start_idx
-                                + image_off
-                                + pad_len
+                                start_idx + image_off : start_idx + image_off + pad_len
                             ] = image_features[pt][j]
                     except RuntimeError as e:
                         print(f"RuntimeError in llava image encoding: {e}")
@@ -278,7 +316,10 @@ class LlavaLlamaForCausalLM(nn.Module):
         self.image_grid_pinpoints = getattr(self.config, "image_grid_pinpoints", None)
 
         self.image_feature_len = int((self.image_size // self.patch_size) ** 2)
-        if self.vision_feature_select_strategy == "patch" or self.vision_feature_select_strategy == "full":
+        if (
+            self.vision_feature_select_strategy == "patch"
+            or self.vision_feature_select_strategy == "full"
+        ):
             pass
         elif self.vision_feature_select_strategy == "cls_patch":
             self.image_feature_len += 1

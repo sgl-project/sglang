@@ -133,11 +133,21 @@ register_chat_template(
     )
 )
 
+# conv_qwen = Conversation(
+#     system="""<|im_start|>system
+# You are a helpful assistant.""",
+#     roles=("<|im_start|>user", "<|im_start|>assistant"),
+#     version="qwen",
+#     messages=[],
+#     offset=0,
+#     sep_style=SeparatorStyle.CHATML,
+#     sep="<|im_end|>",
+# )
 
 register_chat_template(
     ChatTemplate(
         name="chatml-llava",
-        default_system_prompt="Answer the questions.",
+        default_system_prompt="You are a helpful assistant.",
         role_prefix_and_suffix={
             "system": ("<|im_start|>system\n", "<|im_end|>\n"),
             "user": ("<|im_start|>user\n", "<|im_end|>\n"),
@@ -145,7 +155,7 @@ register_chat_template(
         },
         style=ChatTemplateStyle.PLAIN,
         stop_str=("<|im_end|>",),
-        image_token=" <image>\n",
+        image_token="<image>\n",
     )
 )
 
@@ -322,12 +332,13 @@ def match_chat_ml(model_path: str):
     if "tinyllama" in model_path:
         return get_chat_template("chatml")
     # Now the suffix for qwen2 chat model is "instruct"
-    if "qwen" in model_path and ("chat" in model_path or "instruct" in model_path):
+    if "qwen" in model_path and ("chat" in model_path or "instruct" in model_path) and ("llava" not in model_path):
         return get_chat_template("qwen")
     if (
         "llava-v1.6-34b" in model_path
         or "llava-v1.6-yi-34b" in model_path
         or "llava-next-video-34b" in model_path
+        or "llavanext-google_siglip-so400m-patch14-384-Qwen_Qwen2-7B-Instruct-mid_to_final_next_2p4m_am9_continual_ov" in model_path
     ):
         return get_chat_template("chatml-llava")
 

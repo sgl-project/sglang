@@ -18,7 +18,7 @@ def image_qa(s, image, question):
 def single():
     image_url = "https://farm4.staticflickr.com/3175/2653711032_804ff86d81_z.jpg"
     pil_image, _ = load_image(image_url)
-    state = image_qa.run(image=pil_image, question="What is this?", max_new_tokens=512)
+    state = image_qa.run(image=pil_image, question="<image>\nWhat is this?", max_new_tokens=512)
     print(state["answer"], "\n")
 
 
@@ -57,11 +57,15 @@ if __name__ == "__main__":
 
     mp.set_start_method("spawn", force=True)
     runtime = sgl.Runtime(
-        model_path="lmms-lab/llama3-llava-next-8b",
-        tokenizer_path="lmms-lab/llama3-llava-next-8b-tokenizer",
+        model_path="/mnt/bn/vl-research/checkpoints/onevision/llavanext-google_siglip-so400m-patch14-384-Qwen_Qwen2-7B-Instruct-mid_to_final_next_2p4m_am9_continual_ov",
+        tokenizer_path="lmms-lab/llavanext-qwen-siglip-tokenizer",
+        host="127.0.0.1",
+        tp_size=1,
+        port=8000,
+        chat_template="chatml-llava",
+        disable_flashinfer=True,
         # port=8000, Optional: specify the port number for the HTTP server if meets rpc issue or connection reset by peer issue.
     )
-    runtime.endpoint.chat_template = get_chat_template("llama-3-instruct")
     # runtime = sgl.Runtime(
     #     model_path="lmms-lab/llava-next-72b",
     #     tokenizer_path="lmms-lab/llavanext-qwen-tokenizer",

@@ -175,6 +175,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
 
     ports = server_args.additional_ports
     model_port_args = []
+    
     for i in range(server_args.dp_size):
         model_port_args.append(
             ModelPortArgs(
@@ -364,7 +365,8 @@ class Runtime:
                 "Initialization failed. Please see the error messages above."
             )
 
-        self.endpoint = RuntimeEndpoint(self.url)
+        server_args_dict = dataclasses.asdict(self.server_args)
+        self.endpoint = RuntimeEndpoint(self.url, **server_args_dict)
 
     def shutdown(self):
         if self.pid is not None:

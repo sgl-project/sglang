@@ -5,7 +5,7 @@ import numpy as np
 
 from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config
-from sglang.lang.chat_template import get_chat_template_by_model_path
+from sglang.lang.chat_template import get_chat_template_by_model_path, get_chat_template
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
 from sglang.utils import http_request
@@ -19,6 +19,7 @@ class RuntimeEndpoint(BaseBackend):
         auth_token: Optional[str] = None,
         api_key: Optional[str] = None,
         verify: Optional[str] = None,
+        **kwargs
     ):
         super().__init__()
         self.support_concate_and_append = True
@@ -37,8 +38,7 @@ class RuntimeEndpoint(BaseBackend):
         self._assert_success(res)
         self.model_info = res.json()
 
-        self.chat_template = get_chat_template_by_model_path(
-            self.model_info["model_path"])
+        self.chat_template = get_chat_template_by_model_path(self.model_info["model_path"]) if "chat_template" not in kwargs else get_chat_template(kwargs["chat_template"])
 
     def get_model_name(self):
         return self.model_info["model_path"]

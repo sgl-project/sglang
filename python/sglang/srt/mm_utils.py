@@ -25,19 +25,15 @@ def select_best_resolution(original_size, possible_resolutions):
     min_wasted_resolution = float("inf")
 
     for width, height in possible_resolutions:
+        # Calculate the downscaled size to keep the aspect ratio
         scale = min(width / original_width, height / original_height)
-        downscaled_width, downscaled_height = int(original_width * scale), int(
-            original_height * scale
-        )
-        effective_resolution = min(
-            downscaled_width * downscaled_height, original_width * original_height
-        )
+        downscaled_width, downscaled_height = int(original_width * scale), int(original_height * scale)
+
+        # Calculate effective and wasted resolutions
+        effective_resolution = min(downscaled_width * downscaled_height, original_width * original_height)
         wasted_resolution = (width * height) - effective_resolution
 
-        if effective_resolution > max_effective_resolution or (
-            effective_resolution == max_effective_resolution
-            and wasted_resolution < min_wasted_resolution
-        ):
+        if effective_resolution > max_effective_resolution or (effective_resolution == max_effective_resolution and wasted_resolution < min_wasted_resolution):
             max_effective_resolution = effective_resolution
             min_wasted_resolution = wasted_resolution
             best_fit = (width, height)
@@ -114,6 +110,16 @@ def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size):
     Returns:
         tuple: The shape of the image patch grid in the format (width, height).
     """
+    if isinstance(grid_pinpoints, str) and "x" in grid_pinpoints:
+        assert patch_size in [224, 336, 384, 448, 512], "patch_size should be in [224, 336, 384, 448, 512]"
+        # Use regex to extract the range from the input string
+        matches = re.findall(r"\((\d+)x(\d+)\)", grid_pinpoints)
+        range_start = tuple(map(int, matches[0]))
+        range_end = tuple(map(int, matches[-1]))
+        # Generate a matrix of tuples from (range_start[0], range_start[1]) to (range_end[0], range_end[1])
+        grid_pinpoints = [(i, j) for i in range(range_start[0], range_end[0] + 1) for j in range(range_start[1], range_end[1] + 1)]
+        # Multiply all elements by patch_size
+        grid_pinpoints = [[dim * patch_size for dim in pair] for pair in grid_pinpoints]
     if type(grid_pinpoints) is list:
         possible_resolutions = grid_pinpoints
     else:
@@ -134,6 +140,21 @@ def process_anyres_image(image, processor, grid_pinpoints):
     Returns:
         np.array: An np array containing the processed image patches.
     """
+    if isinstance(grid_pinpoints, str) and "x" in grid_pinpoints:
+        try:
+            patch_size = processor.size[0]
+        except Exception as e:
+            patch_size = processor.size["shortest_edge"]
+        assert patch_size in [224, 336, 384, 448, 512], "patch_size should be in [224, 336, 384, 448, 512]"
+        # Use regex to extract the range from the input string
+        matches = re.findall(r"\((\d+)x(\d+)\)", grid_pinpoints)
+        range_start = tuple(map(int, matches[0]))
+        range_end = tuple(map(int, matches[-1]))
+        # Generate a matrix of tuples from (range_start[0], range_start[1]) to (range_end[0], range_end[1])
+        grid_pinpoints = [(i, j) for i in range(range_start[0], range_end[0] + 1) for j in range(range_start[1], range_end[1] + 1)]
+        # Multiply all elements by patch_size
+        grid_pinpoints = [[dim * patch_size for dim in pair] for pair in grid_pinpoints]
+
     if type(grid_pinpoints) is list:
         possible_resolutions = grid_pinpoints
     else:
@@ -243,7 +264,7 @@ def process_images(images, image_processor, model_cfg):
             )
             image = image_processor.preprocess(image)["pixel_values"][0]
             new_images.append(image)
-    elif image_aspect_ratio == "anyres":
+    elif "anyres" in image_aspect_ratio:
         for image in images:
             image = process_anyres_image(
                 image, image_processor, model_cfg.image_grid_pinpoints

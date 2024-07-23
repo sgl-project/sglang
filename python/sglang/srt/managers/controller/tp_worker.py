@@ -273,7 +273,7 @@ class ModelTpServer:
         req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.pixel_values = recv_req.pixel_values
         if req.pixel_values is not None:
-            img_hash = sum(recv_req.image_hash)
+            img_hash = sum(recv_req.image_hash) if type(recv_req.image_hash) is list else recv_req.image_hash
             req.pad_value = [
                 (img_hash) % self.model_config.vocab_size,
                 (img_hash >> 16) % self.model_config.vocab_size,

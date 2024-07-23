@@ -98,7 +98,7 @@ class TokenizerManager:
         if aspect_ratio is None:
             aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
-            self.hf_config.image_grid_pinpoints if aspect_ratio == "anyres" else None
+            self.hf_config.image_grid_pinpoints if "anyres_max" in aspect_ratio else None
         )
         if self.executor is not None:
             loop = asyncio.get_event_loop()
@@ -140,11 +140,11 @@ class TokenizerManager:
                 sampling_params.verify()
 
             if isinstance(obj.image_data, list) and len(obj.image_data) > 0:
-                # muti image/video (pad): num_frame, 3, 336, 336
-                # single image (anyres): num_patch, 3, 336, 336
+                # muti image/video (pad): num_frame, 3, 336 or 384, 336 or 384
+                # single image (anyres): num_patch, 3, 336 or 384, 336 or 384
                 pixel_values, image_hash, image_size = [], [], []
                 if len(obj.image_data) > 1:
-                    aspect_ratio = "pad" # more than one image --> interleaved image mode or video mode. We do not use anyres
+                    aspect_ratio = "pad" # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
                     for image_data in obj.image_data:
                         pixel_v, image_h, image_s = await self.get_pixel_values(
                             image_data, aspect_ratio
@@ -415,9 +415,9 @@ def get_pixel_values(
                 image = expand2square(
                     image,
                     tuple(int(x * 255) for x in processor.image_processor.image_mean),
-                )
+                ).convert("RGB")
                 pixel_values = processor.image_processor(image)["pixel_values"][0]
-            elif image_aspect_ratio == "anyres":
+            elif image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
                 pixel_values = process_anyres_image(
                     image, processor.image_processor, image_grid_pinpoints
                 )
