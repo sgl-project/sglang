@@ -222,6 +222,7 @@ def launch_server(
         detokenizer_port=ports[2],
         nccl_ports=ports[3:],
     )
+    logger.info(f"{server_args=}")
 
     # Handle multi-node tensor parallelism
     if server_args.nnodes > 1:
