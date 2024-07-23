@@ -829,8 +829,9 @@ def init_flashinfer_args(
     num_kv_heads = model_runner.model_config.get_num_kv_heads(model_runner.tp_size)
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
+    total_num_tokens = int(torch.sum(seq_lens))
 
-    if forward_mode == ForwardMode.DECODE:
+    if forward_mode == ForwardMode.DECODE or total_num_tokens <= 4096:
         paged_kernel_lens = seq_lens
     else:
         paged_kernel_lens = prefix_lens

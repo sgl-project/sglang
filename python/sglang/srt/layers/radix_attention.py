@@ -85,32 +85,45 @@ class RadixAttention(nn.Module):
         return o
 
     def extend_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
-        o1, s1 = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
-            q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-            k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
-            v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
-            causal=True,
-            sm_scale=self.scaling,
-            logits_soft_cap=self.logit_cap,
-        )
+        self.store_kv_cache(k, v, input_metadata)
 
-        if input_metadata.extend_no_prefix:
-            o = o1
-        else:
-            o2, s2 = input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
+        if input_metadata.total_num_tokens <= 4096:
+            o = input_metadata.flashinfer_prefill_wrapper_paged.forward(
                 q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
                 input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
-                causal=False,
+                causal=True,
                 sm_scale=self.scaling,
                 logits_soft_cap=self.logit_cap,
             )
+        else:
+            o1, s1 = (
+                input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
+                    q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+                    k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
+                    v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
+                    causal=True,
+                    sm_scale=self.scaling,
+                    logits_soft_cap=self.logit_cap,
+                )
+            )
 
-            o, _ = merge_state(o1, s1, o2, s2)
+            if input_metadata.extend_no_prefix:
+                o = o1
+            else:
+                o2, s2 = (
+                    input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
+                        q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+                        input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
+                        causal=False,
+                        sm_scale=self.scaling,
+                        logits_soft_cap=self.logit_cap,
+                    )
+                )
 
-        self.store_kv_cache(k, v, input_metadata)
+                o, _ = merge_state(o1, s1, o2, s2)
 
-        if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
-            torch.cuda.synchronize()
+            if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
+                torch.cuda.synchronize()
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
