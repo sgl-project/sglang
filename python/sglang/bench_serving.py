@@ -264,6 +264,8 @@ class BenchmarkMetrics:
     median_itl_ms: float
     std_itl_ms: float
     p99_itl_ms: float
+    mean_e2e_latency_ms: float
+    median_e2e_latency_ms: float
 
 
 default_sharegpt_path = "ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -467,6 +469,7 @@ def calculate_metrics(
     itls: List[float] = []
     tpots: List[float] = []
     ttfts: List[float] = []
+    e2e_latencies: List[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_len
@@ -480,6 +483,9 @@ def calculate_metrics(
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
+
+            e2e_latencies.append(outputs[i].latency)
+
             completed += 1
         else:
             output_lens.append(0)
@@ -513,6 +519,8 @@ def calculate_metrics(
         median_itl_ms=np.median(itls or 0) * 1000,
         std_itl_ms=np.std(itls or 0) * 1000,
         p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
+        mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
+        median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
     )
 
     return metrics, output_lens
@@ -611,6 +619,15 @@ async def benchmark(
             "Output token throughput (tok/s):", metrics.output_throughput
         )
     )
+    print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
+    print(
+        "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
+        )
+    )
     print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
@@ -639,6 +656,8 @@ async def benchmark(
             "total_input": metrics.total_input,
             "total_output": metrics.total_output,
             "total_output_retokenized": metrics.total_output_retokenized,
+            "mean_e2e_latency": metrics.mean_e2e_latency_ms,
+            "median_e2e_latency": metrics.median_e2e_latency_ms,
             "median_ttft": metrics.median_ttft_ms,
             "median_itl": metrics.median_itl_ms,
             "output_token_throughput": metrics.output_throughput,
@@ -693,6 +712,8 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
+        "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
     }
     return result
 
