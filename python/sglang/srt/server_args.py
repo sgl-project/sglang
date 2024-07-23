@@ -29,7 +29,7 @@ class ServerArgs:
     max_prefill_tokens: Optional[int] = None
     max_running_requests: Optional[int] = None
     schedule_heuristic: str = "lpm"
-    schedule_conservativeness: float = 0.8
+    schedule_conservativeness: float = 1.0
 
     # Other runtime options
     tp_size: int = 1

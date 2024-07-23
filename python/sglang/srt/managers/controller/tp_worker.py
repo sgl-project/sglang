@@ -161,15 +161,12 @@ class ModelTpServer:
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
-        self.new_token_ratio = min(
-            global_config.base_new_token_ratio * server_args.schedule_conservativeness,
-            1.0,
-        )
         self.min_new_token_ratio = min(
             global_config.base_min_new_token_ratio
             * server_args.schedule_conservativeness,
             1.0,
         )
+        self.new_token_ratio = self.min_new_token_ratio
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.new_token_ratio_recovery = global_config.new_token_ratio_recovery
 
