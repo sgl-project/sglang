@@ -228,6 +228,7 @@ class ModelTpServer:
                         break
             else:
                 self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
 
     def print_stats(self):
         num_used = self.max_total_num_tokens - (
