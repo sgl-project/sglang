@@ -103,6 +103,10 @@ class ModelTpServer:
             if server_args.max_running_requests is None
             else server_args.max_running_requests
         )
+        self.max_running_requests = min(
+            self.max_running_requests,
+            self.model_runner.req_to_token_pool.size - 1
+        )
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
         )
