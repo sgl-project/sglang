@@ -11,6 +11,7 @@ class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     def __init__(self, size: int, max_context_len: int):
+        self.size = size
         self.mem_state = torch.ones((size,), dtype=torch.bool, device="cuda")
         self.req_to_token = torch.empty(
             (size, max_context_len), dtype=torch.int32, device="cuda"
