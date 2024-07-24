@@ -14,9 +14,10 @@ pip install -e "python[all]"
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 ```
 
-### Set up HF_TOKEN
+### Set up ulimit and HF_TOKEN
 
 ```bash
+ulimit -n 65535
 # Change the token to a real and usable one, with access permissions for the Llama 3 models.
 export HF_TOKEN=hf_token
 ```
