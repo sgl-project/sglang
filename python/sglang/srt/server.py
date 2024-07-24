@@ -187,6 +187,7 @@ def launch_server(
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
     os.environ["NCCL_NVLS_ENABLE"] = "0"
+    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     set_ulimit()
     if server_args.show_time_cost:
         enable_show_time_cost()
