@@ -228,6 +228,7 @@ class ModelTpServer:
                         break
             else:
                 self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
 
     def print_stats(self):
         num_used = self.max_total_num_tokens - (
@@ -536,9 +537,10 @@ class ModelTpServer:
         # Check if decode out of memory
         if not batch.check_decode_mem():
             old_ratio = self.new_token_ratio
-            self.new_token_ratio = min(old_ratio + self.new_token_ratio_recovery, 1.0)
 
-            retracted_reqs = batch.retract_decode()
+            retracted_reqs, new_token_ratio = batch.retract_decode()
+            self.new_token_ratio = new_token_ratio
+
             logger.info(
                 "decode out of memory happened, "
                 f"#retracted_reqs: {len(retracted_reqs)}, "

@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from flashinfer.sampling import top_k_top_p_sampling_from_probs
 
+from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.managers.controller.radix_cache import RadixCache
@@ -431,7 +432,8 @@ class Batch:
 
     def retract_decode(self):
         sorted_indices = [i for i in range(len(self.reqs))]
-        # TODO(lsyin): improve the priority of retraction
+
+        # TODO(lsyin): improve retraction policy for radix cache
         sorted_indices.sort(
             key=lambda i: (
                 len(self.reqs[i].output_ids),
@@ -443,7 +445,17 @@ class Batch:
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
-        while self.token_to_kv_pool.available_size() < len(self.reqs):
+        while (
+            self.token_to_kv_pool.available_size()
+            < len(sorted_indices) * global_config.retract_decode_steps
+        ):
+            if len(sorted_indices) == 1:
+                # Corner case: only one request left
+                assert (
+                    self.token_to_kv_pool.available_size() > 0
+                ), "No space left for only one request"
+                break
+
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
@@ -468,7 +480,16 @@ class Batch:
 
         self.filter_batch(sorted_indices)
 
-        return retracted_reqs
+        # Reqs in batch are filtered
+        total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
+        total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
+
+        new_estimate_ratio = (
+            total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
+        ) / total_max_new_tokens
+        new_estimate_ratio = min(1.0, new_estimate_ratio)
+
+        return retracted_reqs, new_estimate_ratio
 
     def check_for_jump_forward(self, model_runner):
         jump_forward_reqs = []
