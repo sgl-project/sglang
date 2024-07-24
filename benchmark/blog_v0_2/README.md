@@ -29,6 +29,9 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruc
 
 # Meta-Llama-3.1-70B-Instruct
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-70B-Instruct --disable-radix-cache --tp 8
+
+# Meta-Llama-3-70B-Instruct-FP8
+python -m sglang.launch_server --model-path neuralmagic/Meta-Llama-3-70B-Instruct-FP8 --disable-radix-cache --tp 8
 ```
 
 ## Benchmark
@@ -59,19 +62,19 @@ cat sglang_offline_benchmark.jsonl | cut -d':' -f12 | cut -d',' -f1
 #### Online benchmark
 
 ```bash
-# Random dataset, Input [1024, 4096], Output [256, 1024], request rate 1, num prompts 300
+# Random dataset, Input [512, 4096], Output [128, 1024], request rate 1, num prompts 300
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 300 --request-rate 1 --output-file sglang_online_benchmark.jsonl
 
-# Random dataset, Input [1024, 4096], Output [256, 1024], request rate 2, num prompts 600
+# Random dataset, Input [512, 4096], Output [128, 1024], request rate 2, num prompts 600
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 600 --request-rate 2 --output-file sglang_online_benchmark.jsonl
 
-# Random dataset, Input [1024, 4096], Output [256, 1024], request rate 4, num prompts 1200
+# Random dataset, Input [512, 4096], Output [128, 1024], request rate 4, num prompts 1200
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 1200 --request-rate 4 --output-file sglang_online_benchmark.jsonl
 
-# Random dataset, Input [1024, 4096], Output [256, 1024], request rate 8, num prompts 2400
+# Random dataset, Input [512, 4096], Output [128, 1024], request rate 8, num prompts 2400
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 2400 --request-rate 8 --output-file sglang_online_benchmark.jsonl
 
-# Random dataset, Input [1024, 4096], Output [256, 1024], request rate 16, num prompts 3200
+# Random dataset, Input [512, 4096], Output [128, 1024], request rate 16, num prompts 3200
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 3200 --request-rate 16 --output-file sglang_online_benchmark.jsonl
 
 # get median e2e latency
