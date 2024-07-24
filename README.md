@@ -37,7 +37,7 @@ The core features include:
 
 ### Method 1: With pip
 ```
-pip install --upgrade pip
+pip install --upgrade pip setuptools wheel
 pip install "sglang[all]"
 
 # Install FlashInfer CUDA kernels
