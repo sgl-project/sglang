@@ -160,7 +160,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 
 ### Supported Models
 
-- Llama / Llama 2 / Llama 3
+- Llama / Llama 2 / Llama 3 / Llama 3.1
 - Mistral / Mixtral
 - Gemma / Gemma 2
 - Qwen / Qwen 2 / Qwen 2 MoE
