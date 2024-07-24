@@ -312,6 +312,9 @@ def suppress_other_loggers():
     logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
         logging.WARN
     )
+    logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(
+        logging.WARN
+    )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
     logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
