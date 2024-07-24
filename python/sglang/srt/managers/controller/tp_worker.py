@@ -537,7 +537,6 @@ class ModelTpServer:
         # Check if decode out of memory
         if not batch.check_decode_mem():
             old_ratio = self.new_token_ratio
-            # self.new_token_ratio = min(old_ratio + self.new_token_ratio_recovery, 1.0)
 
             retracted_reqs, new_token_ratio = batch.retract_decode()
             self.new_token_ratio = new_token_ratio
