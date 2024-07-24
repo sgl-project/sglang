@@ -173,7 +173,7 @@ def process_anyres_image(image, processor, grid_pinpoints):
 
     image_patches = [image_original_resize] + patches
     image_patches = [
-        processor.preprocess(image_patch)["pixel_values"][0]
+        processor.preprocess(image_patch.convert("RGB"))["pixel_values"][0]
         for image_patch in image_patches
     ]
     return np.stack(image_patches, axis=0)
