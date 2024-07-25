@@ -33,7 +33,6 @@ WORKDIR /sgl-workspace
 
 RUN pip3 --no-cache-dir install --upgrade pip \
     && pip3 --no-cache-dir install "sglang[all]" \
-    && pip3 --no-cache-dir uninstall -y triton triton-nightly \
     && pip3 --no-cache-dir install --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly \
     && pip3 --no-cache-dir install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 
