@@ -27,6 +27,7 @@ The core features include:
 </details>
 
 ![8b_throughput](https://lmsys.org/images/blog/sglang_llama3/8b_throughput.svg)
+![70b_fp8_throughput](https://lmsys.org/images/blog/sglang_llama3/70b_fp8_throughput.svg)
 
 ## Contents
 - [Install](#install)
