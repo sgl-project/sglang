@@ -1,5 +1,3 @@
-__version__ = "0.1.24"
-
 # SGL API Components
 from sglang.api import (
     Runtime,
@@ -31,6 +29,8 @@ from sglang.lang.backend.litellm import LiteLLM
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.lang.backend.vertexai import VertexAI
+
+from .version import __version__
 
 # public APIs management
 __all__ = [
