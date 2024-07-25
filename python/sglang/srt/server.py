@@ -202,15 +202,12 @@ def launch_server(
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
-
-    if server_args.tp_size // server_args.dp_size > 1:
+    if server_args.tp_size * server_args.dp_size > 1:
         # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
         maybe_set_triton_cache_manager()
-
     if server_args.chat_template:
         # TODO: replace this with huggingface transformers template
         load_chat_template_for_openai_api(server_args.chat_template)
-
     if server_args.enable_torch_compile:
         _set_torch_compile_config()
 
