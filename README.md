@@ -26,12 +26,12 @@ The core features include:
 
 </details>
 
+![8b_throughput](https://lmsys.org/images/blog/sglang_llama3/8b_throughput.svg)
 
 ## Contents
 - [Install](#install)
 - [Backend: SGLang Runtime (SRT)](#backend-sglang-runtime-srt)
 - [Frontend: Structured Generation Language (SGLang)](#frontend-structured-generation-language-sglang)
-- [Benchmark And Performance](#benchmark-and-performance)
 - [Roadmap](#roadmap)
 - [Citation And Acknowledgment](#citation-and-acknowledgment)
 
