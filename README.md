@@ -26,14 +26,12 @@ The core features include:
 
 </details>
 
-![8b_throughput](https://lmsys.org/images/blog/sglang_llama3/8b_throughput.svg)
-![70b_fp8_throughput](https://lmsys.org/images/blog/sglang_llama3/70b_fp8_throughput.svg)
-
 ## Contents
 - [Install](#install)
 - [Backend: SGLang Runtime (SRT)](#backend-sglang-runtime-srt)
 - [Frontend: Structured Generation Language (SGLang)](#frontend-structured-generation-language-sglang)
 - [Roadmap](#roadmap)
+- [Benchmark And Performance](#benchmark-and-performance)
 - [Citation And Acknowledgment](#citation-and-acknowledgment)
 
 ## Install
@@ -413,6 +411,13 @@ for out in state.text_iter():
 #### Tips and Implementation Details
 - The `choices` argument in `sgl.gen` is implemented by computing the [token-length normalized log probabilities](https://blog.eleuther.ai/multiple-choice-normalization/) of all choices and selecting the one with the highest probability.
 - The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex. It is compatible with `temperature=0` and `temperature != 0`.
+
+
+## Benchmark And Performance
+![8b_throughput](https://lmsys.org/images/blog/sglang_llama3/8b_throughput.svg)
+![70b_fp8_throughput](https://lmsys.org/images/blog/sglang_llama3/70b_fp8_throughput.svg)
+
+Learn more at this [blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/).
 
 ## Roadmap
 [Development Roadmap (2024 Q3)](https://github.com/sgl-project/sglang/issues/634)
