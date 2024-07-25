@@ -9,13 +9,13 @@ from typing import Optional, Type
 
 import torch
 import torch.nn as nn
-from torch.nn.parameter import Parameter        
 from flashinfer import (
     BatchDecodeWithPagedKVCacheWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
 )
 from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
+from torch.nn.parameter import Parameter
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
 from vllm.distributed import (
@@ -41,11 +41,12 @@ logger = logging.getLogger("srt.model_runner")
 
 
 def is_llama3_405b_fp8(model_config):
-    if (model_config.hf_config.architectures[0] == "LlamaForCausalLM" and
-        model_config.hf_config.hidden_size == 16384 and
-        model_config.hf_config.intermediate_size == 53248 and
-        model_config.hf_config.num_hidden_layers == 126 and
-        model_config.hf_config.quantization_config["quant_method"] == "fbgemm_fp8"
+    if (
+        model_config.hf_config.architectures[0] == "LlamaForCausalLM"
+        and model_config.hf_config.hidden_size == 16384
+        and model_config.hf_config.intermediate_size == 53248
+        and model_config.hf_config.num_hidden_layers == 126
+        and model_config.hf_config.quantization_config["quant_method"] == "fbgemm_fp8"
     ):
         return True
     return False
@@ -390,8 +391,10 @@ def get_original_weight(loaded_weight, head_dim):
     n_kv_head = loaded_weight.shape[0] // (2 * head_dim)
     dim = loaded_weight.shape[1]
     for i in range(n_kv_head):
-        loaded_weight[i * head_dim: (i + 1) * head_dim, :] = loaded_weight[2 * i * head_dim: (2 * i + 1) * head_dim, :]
-    original_kv_weight = loaded_weight[:n_kv_head * head_dim, :]
+        loaded_weight[i * head_dim : (i + 1) * head_dim, :] = loaded_weight[
+            2 * i * head_dim : (2 * i + 1) * head_dim, :
+        ]
+    original_kv_weight = loaded_weight[: n_kv_head * head_dim, :]
     assert original_kv_weight.shape == (n_kv_head * head_dim, dim)
     return original_kv_weight
 
@@ -401,9 +404,12 @@ def get_weight_loader_srt(weight_loader):
         self,
         param: Parameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: Optional[str] = None
+        loaded_shard_id: Optional[str] = None,
     ):
-        if loaded_shard_id in ["k", "v"] and loaded_weight.shape[0] == self.head_size * self.total_num_kv_heads * 2:
+        if (
+            loaded_shard_id in ["k", "v"]
+            and loaded_weight.shape[0] == self.head_size * self.total_num_kv_heads * 2
+        ):
             loaded_weight = get_original_weight(loaded_weight, self.head_size)
 
         weight_loader(self, param, loaded_weight, loaded_shard_id)
@@ -414,4 +420,6 @@ def get_weight_loader_srt(weight_loader):
 # Monkey patch model loader
 setattr(ModelRegistry, "load_model_cls", load_model_cls_srt)
 original_weight_loader = QKVParallelLinear.weight_loader
-setattr(QKVParallelLinear, "weight_loader", get_weight_loader_srt(original_weight_loader))
+setattr(
+    QKVParallelLinear, "weight_loader", get_weight_loader_srt(original_weight_loader)
+)
