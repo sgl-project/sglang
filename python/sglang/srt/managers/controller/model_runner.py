@@ -30,9 +30,11 @@ from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    is_llama3_405b_fp8,
     is_multimodal_model,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
+    monkey_patch_vllm_qvk_linear_loader,
 )
 
 logger = logging.getLogger("srt.model_runner")
@@ -118,6 +120,13 @@ class ModelRunner:
             seed=42,
             skip_tokenizer_init=True,
         )
+
+        if is_llama3_405b_fp8(self.model_config):
+            # A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints
+            self.model_config.hf_config.num_key_value_heads = 8
+            vllm_model_config.hf_config.num_key_value_heads = 8
+            monkey_patch_vllm_qvk_linear_loader()
+
         self.dtype = vllm_model_config.dtype
         if self.model_config.model_overide_args is not None:
             vllm_model_config.hf_config.update(self.model_config.model_overide_args)
