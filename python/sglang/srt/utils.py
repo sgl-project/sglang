@@ -660,6 +660,6 @@ def monkey_patch_vllm_qvk_linear_loader():
         ):
             loaded_weight = get_original_weight(loaded_weight, self.head_size)
 
-        origin_weight_loader(param, loaded_weight, loaded_shard_id)
+        origin_weight_loader(self, param, loaded_weight, loaded_shard_id)
 
     setattr(QKVParallelLinear, "weight_loader", weight_loader_srt)
