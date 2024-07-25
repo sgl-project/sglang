@@ -14,8 +14,9 @@ The core features include:
 - **Flexible Frontend Language**: Enables easy programming of LLM applications with chained generation calls, advanced prompting, control flow, multiple modalities, parallelism, and external interactions.
 
 ## News
-- [2024/04] 🔥 SGLang is used by the official **LLaVA-NeXT (video)** release ([blog](https://llava-vl.github.io/blog/2024-04-30-llava-next-video/)).
-- [2024/02] 🔥 SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
+- [2024/07] 🔥 Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM). ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
+- [2024/04] SGLang is used by the official **LLaVA-NeXT (video)** release ([blog](https://llava-vl.github.io/blog/2024-04-30-llava-next-video/)).
+- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
 - [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
 
 <details>
@@ -24,6 +25,7 @@ The core features include:
 - [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
 
 </details>
+
 
 ## Contents
 - [Install](#install)
@@ -410,16 +412,6 @@ for out in state.text_iter():
 #### Tips and Implementation Details
 - The `choices` argument in `sgl.gen` is implemented by computing the [token-length normalized log probabilities](https://blog.eleuther.ai/multiple-choice-normalization/) of all choices and selecting the one with the highest probability.
 - The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex. It is compatible with `temperature=0` and `temperature != 0`.
-
-## Benchmark And Performance
-- Llama-7B on NVIDIA A10G, FP16, Tensor Parallelism=1
-![llama_7b](assets/llama_7b.jpg)
-
-- Mixtral-8x7B on NVIDIA A10G, FP16, Tensor Parallelism=8
-![mixtral_8x7b](assets/mixtral_8x7b.jpg)
-
-- Learn more about the above [results](docs/benchmark_results.md).
-- Synthetic latency and throughput benchmark [scripts](https://github.com/sgl-project/sglang/tree/main/benchmark/latency_throughput).
 
 ## Roadmap
 [Development Roadmap (2024 Q3)](https://github.com/sgl-project/sglang/issues/634)
