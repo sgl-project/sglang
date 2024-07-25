@@ -18,10 +18,15 @@ import psutil
 import requests
 import torch
 import torch.distributed as dist
-import triton
 from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
 from starlette.middleware.base import BaseHTTPMiddleware
+from triton.runtime.cache import (
+    FileCacheManager,
+    default_cache_dir,
+    default_dump_dir,
+    default_override_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +463,44 @@ def monkey_patch_vllm_all_gather(reverse: bool = False):
         setattr(GroupCoordinator, "all_gather", vllm_all_gather_backup)
     else:
         setattr(GroupCoordinator, "all_gather", all_gather)
+
+
+def maybe_set_triton_cache_manager() -> None:
+    """Set environment variable to tell Triton to use a
+    custom cache manager"""
+    cache_manger = os.environ.get("TRITON_CACHE_MANAGER", None)
+    if cache_manger is None:
+        manager = "sglang.srt.utils:CustomCacheManager"
+        logger.info("Setting Triton cache manager to: %s", manager)
+        os.environ["TRITON_CACHE_MANAGER"] = manager
+
+
+class CustomCacheManager(FileCacheManager):
+    # Adapted from: https://github.com/tdoublep/vllm/blob/3307522289fdfefe323b6c00d0db696651989a2f/vllm/triton_utils/custom_cache_manager.py
+    def __init__(self, key, override=False, dump=False):
+
+        self.key = key
+        self.lock_path = None
+        if dump:
+            self.cache_dir = default_dump_dir()
+            self.cache_dir = os.path.join(self.cache_dir, self.key)
+            self.lock_path = os.path.join(self.cache_dir, "lock")
+            os.makedirs(self.cache_dir, exist_ok=True)
+        elif override:
+            self.cache_dir = default_override_dir()
+            self.cache_dir = os.path.join(self.cache_dir, self.key)
+        else:
+            # create cache directory if it doesn't exist
+            self.cache_dir = (
+                os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
+            )
+            if self.cache_dir:
+                self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
+                self.cache_dir = os.path.join(self.cache_dir, self.key)
+                self.lock_path = os.path.join(self.cache_dir, "lock")
+                os.makedirs(self.cache_dir, exist_ok=True)
+            else:
+                raise RuntimeError("Could not create or locate cache dir")
 
 
 API_KEY_HEADER_NAME = "X-API-Key"
