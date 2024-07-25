@@ -635,6 +635,7 @@ def is_llama3_405b_fp8(model_config):
 def monkey_patch_vllm_qvk_linear_loader():
     """A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints."""
     from vllm.model_executor.layers.linear import QKVParallelLinear
+    origin_weight_loader = QKVParallelLinear.weight_loader
 
     def get_original_weight(loaded_weight, head_dim):
         n_kv_head = loaded_weight.shape[0] // (2 * head_dim)
@@ -659,6 +660,6 @@ def monkey_patch_vllm_qvk_linear_loader():
         ):
             loaded_weight = get_original_weight(loaded_weight, self.head_size)
 
-        self.weight_loader(param, loaded_weight, loaded_shard_id)
+        origin_weight_loader(param, loaded_weight, loaded_shard_id)
 
     setattr(QKVParallelLinear, "weight_loader", weight_loader_srt)
