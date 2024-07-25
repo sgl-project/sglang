@@ -23,17 +23,10 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
 RUN apt-get update -y \
     && apt-get install -y python3-pip git curl sudo
 
-# Workaround for https://github.com/openai/triton/issues/2507 and
-# https://github.com/pytorch/pytorch/issues/107960 -- hopefully
-# this won't be needed for future versions of this docker image
-# or future versions of triton.
-RUN ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/
-
 WORKDIR /sgl-workspace
 
 RUN pip3 --no-cache-dir install --upgrade pip \
     && pip3 --no-cache-dir install "sglang[all]" \
-    && pip3 --no-cache-dir install --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly \
     && pip3 --no-cache-dir install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 
 ENV DEBIAN_FRONTEND=interactive
