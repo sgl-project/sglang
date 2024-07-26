@@ -33,6 +33,7 @@ class ServerArgs:
     context_length: Optional[int] = None
     quantization: Optional[str] = None
     chat_template: Optional[str] = None
+    served_model_name: Optional[Union[str, List[str]]] = None
 
     # Port
     host: str = "127.0.0.1"
@@ -90,6 +91,10 @@ class ServerArgs:
     def __post_init__(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+        if not self.served_model_name:
+            self.served_model_name = self.model_path
+        elif isinstance(self.served_model_name, list):
+            self.served_model_name = self.served_model_name[0]
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.79
