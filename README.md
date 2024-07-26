@@ -156,6 +156,21 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - To enable fp8 quantization, you can add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable experimental torch.compile support, you can add `--enable-torch-compile`. It accelerates small models on small batch sizes.
 
+### Run Llama 3.1 405B
+
+```bash
+# 2 nodes run 405B fp16
+# replace the `172.16.4.52:20000` with your own first node ip address and port, disable CUDA Grpah temporarily
+# on the first node
+GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 0 --disable-cuda-graph --mem-frac 0.75
+
+# on the second
+GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 1 --disable-cuda-graph --mem-frac 0.75
+
+# single node run 405B fp8
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct-FP8 --tp 8
+```
+
 ### Supported Models
 
 - Llama / Llama 2 / Llama 3 / Llama 3.1
