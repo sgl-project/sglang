@@ -94,9 +94,14 @@ def load_chat_template_for_openai_api(chat_template_arg):
 async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
     request = CompletionRequest(**request_json)
+    prompt = request.prompt
+    if isinstance(prompt, str) or isinstance(prompt[0], str):
+        prompt_kwargs = {"text": prompt}
+    else:
+        prompt_kwargs = {"input_ids": prompt}
 
     adapted_request = GenerateReqInput(
-        text=request.prompt,
+        **prompt_kwargs,
         sampling_params={
             "temperature": request.temperature,
             "max_new_tokens": request.max_tokens,
