@@ -1,10 +1,10 @@
 <div align="center">
-<img src="assets/logo.png" alt="logo" width="400"></img>
+<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400"></img>
 </div>
 
 --------------------------------------------------------------------------------
 
-| [**Blog**](https://lmsys.org/blog/2024-01-17-sglang/) | [**Paper**](https://arxiv.org/abs/2312.07104) |
+| [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/) | [**Paper**](https://arxiv.org/abs/2312.07104) |
 
 SGLang is a fast serving framework for large language models and vision language models.
 It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
@@ -14,13 +14,14 @@ The core features include:
 - **Flexible Frontend Language**: Enables easy programming of LLM applications with chained generation calls, advanced prompting, control flow, multiple modalities, parallelism, and external interactions.
 
 ## News
-- [2024/04] 🔥 SGLang is used by the official **LLaVA-NeXT (video)** release ([blog](https://llava-vl.github.io/blog/2024-04-30-llava-next-video/)).
-- [2024/02] 🔥 SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
+- [2024/07] 🔥 Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
+- [2024/04] SGLang is used by the official **LLaVA-NeXT (video)** release ([blog](https://llava-vl.github.io/blog/2024-04-30-llava-next-video/)).
+- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
 
 <details>
 <summary>More</summary>
 
+- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
 - [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
 
 </details>
@@ -37,6 +38,7 @@ The core features include:
 
 ### Method 1: With pip
 ```
+pip install --upgrade pip
 pip install "sglang[all]"
 
 # Install FlashInfer CUDA kernels
@@ -48,6 +50,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
+pip install --upgrade pip
 pip install -e "python[all]"
 
 # Install FlashInfer CUDA kernels
@@ -55,24 +58,20 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 ```
 
 ### Method 3: Using docker
-The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags).
+The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](docker).
+Repalce `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash
 docker run --gpus all \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
-    --env "HUGGING_FACE_HUB_TOKEN=<secret>" \
+    --env "HF_TOKEN=<secret>" \
     --ipc=host \
     lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B --host 0.0.0.0 --port 30000
+    python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --host 0.0.0.0 --port 30000
 ```
 
 ### Common Notes
-- If you see errors from the Triton compiler, please install the [Triton Nightly](https://triton-lang.org/main/getting-started/installation.html) by
-```
-pip uninstall -y triton triton-nightly
-pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly
-```
 - If you cannot install FlashInfer, check out its [installation](https://docs.flashinfer.ai/installation.html#) page. If you still cannot install it, you can use the slower Triton kernels by adding `--disable-flashinfer` when launching the server.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
 
@@ -145,20 +144,36 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --mem-fraction-static 0.7
 ```
 - See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
-- Add `--nnodes 2` to run tensor parallelism on multiple nodes. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-1` be the hostname of the first node and `50000` be an available port.
+- Add `--nnodes 2` to run tensor parallelism on multiple nodes. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port.
 ```
 # Node 0
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-1:50000 --nnodes 2 --node-rank 0
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-0:50000 --nnodes 2 --node-rank 0
 
 # Node 1
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-1:50000 --nnodes 2 --node-rank 1
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-0:50000 --nnodes 2 --node-rank 1
 ```
 - If the model does not have a template in the Hugging Face tokenizer, you can specify a [custom chat template](docs/custom_chat_template.md).
 - To enable fp8 quantization, you can add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
+- To enable experimental torch.compile support, you can add `--enable-torch-compile`. It accelerates small models on small batch sizes.
+
+### Run Llama 3.1 405B
+
+```bash
+# 2 nodes run 405B fp16
+# replace the `172.16.4.52:20000` with your own first node ip address and port, disable CUDA Graph temporarily
+# on the first node
+GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 0 --disable-cuda-graph --mem-frac 0.75
+
+# on the second
+GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 1 --disable-cuda-graph --mem-frac 0.75
+
+# single node run 405B fp8
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct-FP8 --tp 8
+```
 
 ### Supported Models
 
-- Llama / Llama 2 / Llama 3
+- Llama / Llama 2 / Llama 3 / Llama 3.1
 - Mistral / Mixtral
 - Gemma / Gemma 2
 - Qwen / Qwen 2 / Qwen 2 MoE
@@ -176,6 +191,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - Grok
 - ChatGLM
 - InternLM 2
+- Mistral NeMo
 
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/model_support.md).
 
@@ -412,15 +428,12 @@ for out in state.text_iter():
 - The `choices` argument in `sgl.gen` is implemented by computing the [token-length normalized log probabilities](https://blog.eleuther.ai/multiple-choice-normalization/) of all choices and selecting the one with the highest probability.
 - The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex. It is compatible with `temperature=0` and `temperature != 0`.
 
+
 ## Benchmark And Performance
-- Llama-7B on NVIDIA A10G, FP16, Tensor Parallelism=1
-![llama_7b](assets/llama_7b.jpg)
+![8b_throughput](https://lmsys.org/images/blog/sglang_llama3/8b_throughput.svg)
+![70b_fp8_throughput](https://lmsys.org/images/blog/sglang_llama3/70b_fp8_throughput.svg)
 
-- Mixtral-8x7B on NVIDIA A10G, FP16, Tensor Parallelism=8
-![mixtral_8x7b](assets/mixtral_8x7b.jpg)
-
-- Learn more about the above [results](docs/benchmark_results.md).
-- Synthetic latency and throughput benchmark [scripts](https://github.com/sgl-project/sglang/tree/main/benchmark/latency_throughput).
+Learn more at this [blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/).
 
 ## Roadmap
 [Development Roadmap (2024 Q3)](https://github.com/sgl-project/sglang/issues/634)

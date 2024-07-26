@@ -14,7 +14,7 @@ class ScheduleHeuristic:
         tree_cache,
     ):
         if tree_cache.disable and schedule_heuristic == "lpm":
-            # LMP is not meaningless when tree cache is disabled.
+            # LMP is meaningless when the tree cache is disabled.
             schedule_heuristic = "fcfs"
 
         self.schedule_heuristic = schedule_heuristic

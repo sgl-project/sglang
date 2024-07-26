@@ -103,6 +103,9 @@ class ModelTpServer:
             if server_args.max_running_requests is None
             else server_args.max_running_requests
         )
+        self.max_running_requests = min(
+            self.max_running_requests, self.model_runner.req_to_token_pool.size - 1
+        )
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
         )
@@ -113,13 +116,9 @@ class ModelTpServer:
             f"[gpu_id={self.gpu_id}] "
             f"max_total_num_tokens={self.max_total_num_tokens}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
+            f"max_running_requests={self.max_running_requests}, "
             f"context_len={self.model_config.context_len}"
         )
-        if self.tp_rank == 0:
-            logger.info(
-                f"[gpu_id={self.gpu_id}] "
-                f"server_args: {server_args.print_mode_args()}"
-            )
 
         # Init cache
         self.tree_cache = RadixCache(
@@ -161,15 +160,12 @@ class ModelTpServer:
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
-        self.new_token_ratio = min(
-            global_config.base_new_token_ratio * server_args.schedule_conservativeness,
-            1.0,
-        )
         self.min_new_token_ratio = min(
             global_config.base_min_new_token_ratio
             * server_args.schedule_conservativeness,
             1.0,
         )
+        self.new_token_ratio = self.min_new_token_ratio
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.new_token_ratio_recovery = global_config.new_token_ratio_recovery
 
@@ -231,6 +227,7 @@ class ModelTpServer:
                         break
             else:
                 self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
 
     def print_stats(self):
         num_used = self.max_total_num_tokens - (
@@ -539,9 +536,10 @@ class ModelTpServer:
         # Check if decode out of memory
         if not batch.check_decode_mem():
             old_ratio = self.new_token_ratio
-            self.new_token_ratio = min(old_ratio + self.new_token_ratio_recovery, 1.0)
 
-            retracted_reqs = batch.retract_decode()
+            retracted_reqs, new_token_ratio = batch.retract_decode()
+            self.new_token_ratio = new_token_ratio
+
             logger.info(
                 "decode out of memory happened, "
                 f"#retracted_reqs: {len(retracted_reqs)}, "

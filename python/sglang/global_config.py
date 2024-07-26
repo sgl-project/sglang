@@ -16,9 +16,9 @@ class GlobalConfig:
         self.wait_for_new_request_delay = 0.0006
 
         # Runtime constants: New generation token ratio estimation
-        self.base_new_token_ratio = 0.4
-        self.base_min_new_token_ratio = 0.2
-        self.new_token_ratio_decay = 0.0001
+        self.init_new_token_ratio = 0.7
+        self.base_min_new_token_ratio = 0.1
+        self.new_token_ratio_decay = 0.001
         self.new_token_ratio_recovery = 0.05
 
         # Runtime constants: The threshold (number of tokens) to trigger layer-wise cuda sync.
@@ -27,6 +27,7 @@ class GlobalConfig:
 
         # Runtime constants: others
         self.num_continue_decode_steps = 10
+        self.retract_decode_steps = 20
         self.flashinfer_workspace_size = 192 * 1024 * 1024
 
         # Output tokenization configs
