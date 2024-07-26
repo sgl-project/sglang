@@ -20,12 +20,14 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && apt-get clean
 
 RUN apt-get update -y \
-    && apt-get install -y python3-pip git curl sudo
+    && apt-get install -y git curl sudo
 
 WORKDIR /sgl-workspace
 
 RUN pip3 --no-cache-dir install --upgrade pip \
-    && pip3 --no-cache-dir install "sglang[all]" \
+    && git clone --depth=1 https://github.com/sgl-project/sglang.git \
+    && cd sglang \
+    && pip3 --no-cache-dir install -e "python[all]" \
     && pip3 --no-cache-dir install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 
 ENV DEBIAN_FRONTEND=interactive
