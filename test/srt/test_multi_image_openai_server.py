@@ -1,4 +1,6 @@
 import openai
+import base64
+
 client = openai.Client(api_key="EMPTY", base_url="http://127.0.0.1:30000/v1")
 # request_1 = client.chat.completions.create(
 #     model="default",
@@ -28,6 +30,13 @@ client = openai.Client(api_key="EMPTY", base_url="http://127.0.0.1:30000/v1")
 #     max_tokens=512,
 #     stream=True,
 # )
+
+def encode_image(image_path):
+  with open(image_path, "rb") as image_file:
+    return base64.b64encode(image_file.read()).decode('utf-8')
+
+image_path = "/mnt/bn/vl-research/workspace/boli01/projects/demos/sglang_codebase/test/srt/example_image.png"
+
 request_2 = client.chat.completions.create(
     model="default",
     messages=[
@@ -38,7 +47,7 @@ request_2 = client.chat.completions.create(
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/mixtral_8x7b.jpg"
+                        "url": f"data:image/jpeg;base64,{encode_image(image_path)}"
                     },
                 },
             ],
