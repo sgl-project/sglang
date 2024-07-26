@@ -178,6 +178,7 @@ class Conversation:
                     ret += role + "\n" + message + self.sep + "\n"
                 else:
                     ret += role + "\n"
+            print(ret)
             return ret
         elif self.sep_style == SeparatorStyle.CHATGLM3:
             ret = ""
@@ -379,12 +380,23 @@ def generate_chat_conv(
                 conv.append_message(conv.roles[0], message.content)
             else:
                 real_content = ""
+                # calculate number of image_url
+                num_image_url = 0
+                for content in message.content:
+                    if content.type == "image_url":
+                        num_image_url += 1
+                if num_image_url > 1:
+                    image_token = "<image>"
+                else:
+                    image_token = "<image>\n"
                 for content in message.content:
                     if content.type == "text":
+                        if num_image_url > 16:
+                            real_content += "\n" # for video
                         real_content += content.text
                     elif content.type == "image_url":
                         # NOTE: Only works for llava
-                        real_content += "<image>\n"
+                        real_content += image_token
                         conv.append_image(content.image_url.url)
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":

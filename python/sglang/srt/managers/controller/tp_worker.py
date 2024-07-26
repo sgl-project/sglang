@@ -360,8 +360,6 @@ class ModelTpServer:
                             req.image_offset  = [x + delta for x in req.image_offset]
                         else:
                             req.image_offset += delta
-            print(req.extend_input_len)
-            print(req.max_new_tokens())
             if req.extend_input_len == 0 and req.max_new_tokens() > 0:
                 # Need at least one token to compute logits
                 req.extend_input_len = 1
