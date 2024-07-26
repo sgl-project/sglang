@@ -6,7 +6,7 @@
 
 
 /home/peiyuan_zhang_ntu_edu_sg/miniconda3/envs/sglang/bin/python -m sglang.launch_server \
---model-path lmms-lab/llava-OV-Qwen2-7B-AM9-ContinualOV \
+--model-path lmms-lab/llava-onevision-qwen2-7b-ov \
 --tokenizer-path lmms-lab/llavanext-qwen-siglip-tokenizer \
 --port=30000 \
 --host=127.0.0.1 \

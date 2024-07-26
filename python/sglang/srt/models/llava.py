@@ -60,7 +60,8 @@ class LlavaLlamaForCausalLM(nn.Module):
         offset_list = []
         for image_s in image_size:
             if len(image_size) > 16:
-                new_image_feature_len = self.image_feature_len // 4  # video
+                # 2x2 pooling with stride 2
+                new_image_feature_len = ((self.image_size // self.patch_size) // 2) ** 2
             else:
                 new_image_feature_len = self.image_feature_len  # multiimage
             
