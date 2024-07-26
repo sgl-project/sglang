@@ -98,7 +98,7 @@ class TokenizerManager:
         if aspect_ratio is None:
             aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
-            self.hf_config.image_grid_pinpoints if "anyres_max" in aspect_ratio else None
+            self.hf_config.image_grid_pinpoints if "anyres" in aspect_ratio else None
         )
         if self.executor is not None:
             loop = asyncio.get_event_loop()

@@ -3,7 +3,7 @@ import ast
 import base64
 import math
 from io import BytesIO
-
+import re
 import numpy as np
 from PIL import Image
 
@@ -154,7 +154,7 @@ def process_anyres_image(image, processor, grid_pinpoints):
         grid_pinpoints = [(i, j) for i in range(range_start[0], range_end[0] + 1) for j in range(range_start[1], range_end[1] + 1)]
         # Multiply all elements by patch_size
         grid_pinpoints = [[dim * patch_size for dim in pair] for pair in grid_pinpoints]
-
+        
     if type(grid_pinpoints) is list:
         possible_resolutions = grid_pinpoints
     else:

@@ -54,15 +54,16 @@ class LlavaLlamaForCausalLM(nn.Module):
 
     def pad_input_ids(self, input_ids, pad_value, pt_shape=None, image_size=None):
 
-        if len(image_size) > 16:
-            new_image_feature_len = self.image_feature_len // 4  # video
-        else:
-            new_image_feature_len = self.image_feature_len  # multiimage
 
         # hardcode for spatial_unpad + anyres
         image_aspect_ratio = "anyres" if len(image_size) == 1 else "pad"
         offset_list = []
         for image_s in image_size:
+            if len(image_size) > 16:
+                new_image_feature_len = self.image_feature_len // 4  # video
+            else:
+                new_image_feature_len = self.image_feature_len  # multiimage
+            
             height = width = self.num_patches_per_side
             if "anyres" in image_aspect_ratio:
                 num_patch_width, num_patch_height = get_anyres_image_grid_shape(
@@ -73,11 +74,22 @@ class LlavaLlamaForCausalLM(nn.Module):
                 h = num_patch_height * height
                 w = num_patch_width * width
                 new_h, new_w = unpad_image_shape(h, w, image_s)
+                
+                if "anyres_max" in self.config.image_aspect_ratio:
+                    matched_anyres_max_num_patches = re.match(r"anyres_max_(\d+)", self.config.image_aspect_ratio)
+                    if matched_anyres_max_num_patches:
+                        max_num_patches = int(matched_anyres_max_num_patches.group(1))
+                    # times = math.sqrt(h * w / (max_num_patches * unit**2))
+                    times = math.sqrt(new_h * new_w / (max_num_patches * self.image_feature_len))
+                    if times > 1.1:
+                        new_h = int(new_h // times)
+                        new_w = int(new_w // times)
                 new_image_feature_len += new_h * (new_w + 1)
 
             pad_ids = pad_value * (
                 (new_image_feature_len + len(pad_value)) // len(pad_value)
             )
+            print("calculated new_image_feature_len: ", new_image_feature_len)
             offset = input_ids.index(self.config.image_token_index)
             # old_len + pad_len - 1, because we need to remove image_token_id
             input_ids = (
@@ -221,7 +233,6 @@ class LlavaLlamaForCausalLM(nn.Module):
                                 if times > 1.1:
                                     image_feature = image_feature[None]
                                     image_feature = nn.functional.interpolate(image_feature, [int(h // times), int(w // times)], mode="bilinear")[0]
-
                                 image_feature = torch.cat(
                                     (
                                         image_feature,
@@ -274,6 +285,7 @@ class LlavaLlamaForCausalLM(nn.Module):
                     # Fill in the placeholder for the image
                     try:
                         for j, image_off in enumerate(image_offsets[i]):
+                            print("actual image_features length: ", image_features[pt][j].shape[0])
                             pad_len = image_features[pt][j].shape[0]
                             input_embeds[
                                 start_idx + image_off : start_idx + image_off + pad_len

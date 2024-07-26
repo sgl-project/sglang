@@ -1,6 +1,6 @@
 import openai
-client = openai.Client(api_key="EMPTY", base_url="http://127.0.0.1:30000/v1")
-# request_1 = client.chat.completions.create(
+client = openai.Client(api_key="EMPTY", base_url="http://127.0.0.1:10061/v1")
+# request_2 = client.chat.completions.create(
 #     model="default",
 #     messages=[
 #         {
