@@ -30,7 +30,7 @@ from sglang.srt.mm_utils import (
 from sglang.srt.models.llama2 import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-
+import math
 
 class LlavaLlamaForCausalLM(nn.Module):
     def __init__(
@@ -45,7 +45,6 @@ class LlavaLlamaForCausalLM(nn.Module):
         self.config.vision_config.hidden_size = config.mm_hidden_size
         self.config.text_config.hidden_size = config.hidden_size
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.resampler = nn.AvgPool2d(kernel_size=2, stride=2)
         self.language_model = LlamaForCausalLM(config, quant_config=quant_config)
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
@@ -61,7 +60,7 @@ class LlavaLlamaForCausalLM(nn.Module):
         for image_s in image_size:
             if len(image_size) > 16:
                 # 2x2 pooling with stride 2
-                new_image_feature_len = ((self.image_size // self.patch_size) // 2) ** 2
+                new_image_feature_len = math.ceil(self.image_size / self.patch_size / 2) ** 2
             else:
                 new_image_feature_len = self.image_feature_len  # multiimage
             
@@ -261,12 +260,10 @@ class LlavaLlamaForCausalLM(nn.Module):
                                 image_feature = image_feature.permute(
                                     0, 3, 1, 2
                                 ).contiguous()  # N, C, H, W
-                                image_feature = (
-                                    self.resampler(image_feature)
-                                    .flatten(2)
-                                    .transpose(1, 2)
-                                    .contiguous()
-                                )  # N, C, H*W
+                                height, weight = image_feature.shape[2:]
+                                scaled_shape = [math.ceil(height / 2), math.ceil(weight / 2)]
+                                image_feature = nn.functional.interpolate(image_feature, size=scaled_shape, mode='bilinear')
+                                image_feature = image_feature.flatten(2).transpose(1, 2).contiguous() # N, C, H*W
 
                         new_image_features.append(image_feature)
                     image_features = new_image_features

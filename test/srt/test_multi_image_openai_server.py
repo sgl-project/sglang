@@ -1,5 +1,5 @@
 import openai
-client = openai.Client(api_key="EMPTY", base_url="http://127.0.0.1:10071/v1")
+client = openai.Client(api_key="EMPTY", base_url="http://127.0.0.1:10073/v1")
 import sys
 
 
