@@ -369,7 +369,7 @@ def sample_random_requests(
 ) -> List[Tuple[str, int, int]]:
 
     input_lens = np.random.randint(
-        int(input_len * range_ratio),
+        max(int(input_len * range_ratio), 1),
         input_len + 1,
         size=num_prompts,
     )
@@ -415,7 +415,7 @@ def sample_random_requests(
             prompt_token_ids = tokenizer(prompt).input_ids
             prompt_len = len(prompt_token_ids)
 
-            if prompt_len <= input_lens[i]:
+            if prompt_len > input_lens[i]:
                 input_ids = prompt_token_ids[: input_lens[i]]
             else:
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
@@ -935,7 +935,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--random-range-ratio",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random dataset.",
     )

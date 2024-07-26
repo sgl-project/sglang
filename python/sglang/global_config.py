@@ -17,7 +17,7 @@ class GlobalConfig:
 
         # Runtime constants: New generation token ratio estimation
         self.init_new_token_ratio = 0.7
-        self.base_min_new_token_ratio = 0.2
+        self.base_min_new_token_ratio = 0.1
         self.new_token_ratio_decay = 0.001
         self.new_token_ratio_recovery = 0.05
 
