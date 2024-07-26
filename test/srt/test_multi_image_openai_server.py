@@ -53,7 +53,7 @@ request_2 = client.chat.completions.create(
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/mixtral_8x7b.jpg"
+                        "url": f"data:image/jpeg;base64,{encode_image(image_path)}"
                     },
                 },
                 {"type": "text", "text": "Now , describe image 1 and image 2."},
