@@ -40,7 +40,10 @@ class GenerateReqInput:
             self.text is not None and self.input_ids is not None
         ):
             raise ValueError("Either text or input_ids should be provided.")
-        if isinstance(self.sampling_params, dict) and self.sampling_params.get("n", 1) != 1:
+        if (
+            isinstance(self.sampling_params, dict)
+            and self.sampling_params.get("n", 1) != 1
+        ):
             is_single = False
         else:
             if self.text is not None:
