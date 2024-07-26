@@ -160,7 +160,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 
 ```bash
 # 2 nodes run 405B fp16
-# replace the `172.16.4.52:20000` with your own first node ip address and port, disable CUDA Grpah temporarily
+# replace the `172.16.4.52:20000` with your own first node ip address and port, disable CUDA Graph temporarily
 # on the first node
 GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 0 --disable-cuda-graph --mem-frac 0.75
 
