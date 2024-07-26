@@ -626,6 +626,7 @@ def is_llama3_405b_fp8(model_config):
         and model_config.hf_config.intermediate_size == 53248
         and model_config.hf_config.num_hidden_layers == 126
         and model_config.hf_config.num_key_value_heads == 16
+        and hasattr(model_config.hf_config, "quantization_config")
         and model_config.hf_config.quantization_config["quant_method"] == "fbgemm_fp8"
     ):
         return True
