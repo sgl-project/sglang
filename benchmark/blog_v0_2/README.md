@@ -48,45 +48,24 @@ Please ensure you have the appropriate hardware before running the benchmarks.
 #### Offline benchmark
 
 ```bash
-# Random dataset, Input [512, 1024], Output [512, 1024], num prompts 3k
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5 --output-file sglang_offline_benchmark.jsonl
-		
-# Random dataset, Input [2048, 4096], Output [512, 1024], num prompts 3k      							
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 4096 --random-output 1024 --random-range-ratio 0.5 --output-file sglang_offline_benchmark.jsonl
-
-# Random dataset, Input [512, 1024], Output [256, 512], num prompts 3k							
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 512 --random-range-ratio 0.5 --output-file sglang_offline_benchmark.jsonl
-
-# Random dataset, Input [2048, 4096], Output [256, 512], num prompts 3k
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 4096 --random-output 512 --random-range-ratio 0.5 --output-file sglang_offline_benchmark.jsonl
-
-# ShareGPT dataset, num prompts 3k
-python3 -m sglang.bench_serving --backend sglang --num-prompts 3000 --output-file sglang_offline_benchmark.jsonl
-
-# get output token throughput
-cat sglang_offline_benchmark.jsonl | cut -d':' -f12 | cut -d',' -f1
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 4000 --random-input 1024 --random-output 1024 --output-file offline.jsonl
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 5000 --random-input 1024 --random-output 512 --output-file offline.jsonl
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 1000 --random-input 4096 --random-output 2048 --output-file offline.jsonl
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 2000 --random-input 4096 --random-output 1024 --output-file offline.jsonl
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 6000 --random-input 256 --random-output 512 --output-file offline.jsonl
+python3 -m sglang.bench_serving --backend sglang --dataset-name sharegpt --num-prompts 3000 --output-file offline.jsonl
+cat offline.jsonl | cut -d':' -f12 | cut -d',' -f1
 ```
 
 #### Online benchmark
 
 ```bash
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 1, num prompts 300
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 300 --request-rate 1 --output-file sglang_online_benchmark.jsonl
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 2, num prompts 600
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 600 --request-rate 2 --output-file sglang_online_benchmark.jsonl
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 4, num prompts 1200
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 1200 --request-rate 4 --output-file sglang_online_benchmark.jsonl
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 8, num prompts 2400
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 2400 --request-rate 8 --output-file sglang_online_benchmark.jsonl
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 16, num prompts 3200
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 3200 --request-rate 16 --output-file sglang_online_benchmark.jsonl
-
-# get median e2e latency
-cat sglang_online_benchmark.jsonl | cut -d':' -f9 | cut -d',' -f1
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 300 --request-rate 1 --output-file online.jsonl
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 600 --request-rate 2 --output-file online.jsonl
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 1200 --request-rate 4 --output-file online.jsonl
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 2400 --request-rate 8 --output-file online.jsonl
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 3200 --request-rate 16 --output-file online.jsonl
+cat online.jsonl | cut -d':' -f9 | cut -d',' -f1
 ```
 
 ## Other
@@ -98,6 +77,7 @@ Preparation for TensorRT LLM can refer to https://github.com/sgl-project/tensorr
 ```bash
 # vLLM
 pip install vllm==0.5.2
+pip install jsonschema==4.21.1
 
 # Meta-Llama-3-8B-Instruct
 python -m vllm.entrypoints.openai.api_server --model meta-llama/Meta-Llama-3-8B-Instruct --disable-log-requests
@@ -116,131 +96,68 @@ wget https://raw.githubusercontent.com/sgl-project/sglang/main/python/sglang/ben
 ```bash
 # vLLM Offline
 
-# Random dataset, Input [512, 1024], Output [512, 1024], num prompts 3k
-python3 bench_serving.py --backend vllm --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5 --output-file vllm_offline_benchmark.jsonl
-
-# Random dataset, Input [2048, 4096], Output [512, 1024], num prompts 3k
-python3 bench_serving.py --backend vllm --dataset-name random --num-prompts 3000 --random-input 4096 --random-output 1024 --random-range-ratio 0.5 --output-file vllm_offline_benchmark.jsonl
-
-# Random dataset, Input [512, 1024], Output [256, 512], num prompts 3k
-python3 bench_serving.py --backend vllm --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 512 --random-range-ratio 0.5 --output-file vllm_offline_benchmark.jsonl
-
-# Random dataset, Input [2048, 4096], Output [256, 512], num prompts 3k
-python3 bench_serving.py --backend vllm --dataset-name random --num-prompts 3000 --random-input 4096 --random-output 512 --random-range-ratio 0.5 --output-file vllm_offline_benchmark.jsonl
-
-# ShareGPT dataset, num prompts 3k
-python3 bench_serving.py --backend vllm --num-prompts 3000 --output-file vllm_offline_benchmark.jsonl
-
-# get output token throughput
-cat vllm_offline_benchmark.jsonl | cut -d':' -f12 | cut -d',' -f1
+python3 bench_serving.py --backend vllm --dataset-name random --num-prompts 4000 --random-input 1024 --random-output 1024 --output-file offline_vllm.jsonl
+python3 bench_serving.py --backend vllm --dataset-name random --num-prompts 5000 --random-input 1024 --random-output 512 --output-file offline_vllm.jsonl
+python3 bench_serving.py --backend vllm --dataset-name random --num-prompts 1000 --random-input 4096 --random-output 2048 --output-file offline_vllm.jsonl
+python3 bench_serving.py --backend vllm --dataset-name random --num-prompts 2000 --random-input 4096 --random-output 1024 --output-file offline_vllm.jsonl
+python3 bench_serving.py --backend vllm --dataset-name random --num-prompts 6000 --random-input 256 --random-output 512 --output-file offline_vllm.jsonl
+python3 bench_serving.py --backend vllm --dataset-name sharegpt --num-prompts 3000 --output-file offline_vllm.jsonl
+cat offline_vllm.jsonl | cut -d':' -f12 | cut -d',' -f1
 ```
 
 ```bash
 # vLLM Online
 
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 1, num prompts 300
-python3 bench_serving.py --backend vllm --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 300 --request-rate 1 --output-file vllm_online_benchmark.jsonl
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 2, num prompts 600
-python3 bench_serving.py --backend vllm --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 600 --request-rate 2 --output-file vllm_online_benchmark.jsonl
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 4, num prompts 1200
-python3 bench_serving.py --backend vllm --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 1200 --request-rate 4 --output-file vllm_online_benchmark.jsonl
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 8, num prompts 2400
-python3 bench_serving.py --backend vllm --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 2400 --request-rate 8 --output-file vllm_online_benchmark.jsonl
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 16, num prompts 3200
-python3 bench_serving.py --backend vllm --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 3200 --request-rate 16 --output-file vllm_online_benchmark.jsonl
-
-# get median e2e latency
-cat vllm_online_benchmark.jsonl | cut -d':' -f9 | cut -d',' -f1
+python3 bench_serving.py --backend vllm --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 300 --request-rate 1 --output-file online_vllm.jsonl
+python3 bench_serving.py --backend vllm --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 600 --request-rate 2 --output-file online_vllm.jsonl
+python3 bench_serving.py --backend vllm --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 1200 --request-rate 4 --output-file online_vllm.jsonl
+python3 bench_serving.py --backend vllm --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 2400 --request-rate 8 --output-file online_vllm.jsonl
+python3 bench_serving.py --backend vllm --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 3200 --request-rate 16 --output-file online_vllm.jsonl
+cat online_vllm.jsonl | cut -d':' -f9 | cut -d',' -f1
 ```
 
 ```bash
 # TensorRT LLM Offline 8B
 
-# Random dataset, Input [512, 1024], Output [512, 1024], num prompts 3k
-python3 bench_serving.py --backend trt --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5 --output-file trt_offline_benchmark_8b.jsonl --model meta-llama/Meta-Llama-3-8B-Instruct
-
-# Random dataset, Input [2048, 4096], Output [512, 1024], num prompts 3k
-python3 bench_serving.py --backend trt --dataset-name random --num-prompts 3000 --random-input 4096 --random-output 1024 --random-range-ratio 0.5 --output-file trt_offline_benchmark_8b.jsonl --model meta-llama/Meta-Llama-3-8B-Instruct
-
-# Random dataset, Input [512, 1024], Output [256, 512], num prompts 3k
-python3 bench_serving.py --backend trt --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 512 --random-range-ratio 0.5 --output-file trt_offline_benchmark_8b.jsonl --model meta-llama/Meta-Llama-3-8B-Instruct
-
-# Random dataset, Input [2048, 4096], Output [256, 512], num prompts 3k
-python3 bench_serving.py --backend trt --dataset-name random --num-prompts 3000 --random-input 4096 --random-output 512 --random-range-ratio 0.5 --output-file trt_offline_benchmark_8b.jsonl --model meta-llama/Meta-Llama-3-8B-Instruct
-
-# ShareGPT dataset, num prompts 3k
-python3 bench_serving.py --backend trt --num-prompts 3000 --output-file trt_offline_benchmark_8b.jsonl --model meta-llama/Meta-Llama-3-8B-Instruct
-
-# get output token throughput
-cat trt_offline_benchmark_8b.jsonl | cut -d':' -f12 | cut -d',' -f1
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-8B-Instruct --dataset-name random --num-prompts 4000 --random-input 1024 --random-output 1024 --output-file offline_trt_8b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-8B-Instruct --dataset-name random --num-prompts 5000 --random-input 1024 --random-output 512 --output-file offline_trt_8b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-8B-Instruct --dataset-name random --num-prompts 1000 --random-input 4096 --random-output 2048 --output-file offline_trt_8b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-8B-Instruct --dataset-name random --num-prompts 2000 --random-input 4096 --random-output 1024 --output-file offline_trt_8b.jsonl
+python3 bench_serving.py --backend trt --dataset-name random --num-prompts 6000 --random-input 256 --random-output 512 --output-file offline_trt_8b.jsonl --model meta-llama/Meta-Llama-3-8B-Instruct
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-8B-Instruct --dataset-name sharegpt --num-prompts 3000 --output-file offline_trt_8b.jsonl
+cat offline_trt_8b.jsonl | cut -d':' -f12 | cut -d',' -f1
 ```
 
 ```bash
 # TensorRT LLM Online 8B
 
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 1, num prompts 300
-python3 bench_serving.py --backend trt --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 300 --request-rate 1 --output-file trt_online_benchmark_8b.jsonl --model meta-llama/Meta-Llama-3-8B-Instruct
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 2, num prompts 600
-python3 bench_serving.py --backend trt --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 600 --request-rate 2 --output-file trt_online_benchmark_8b.jsonl --model meta-llama/Meta-Llama-3-8B-Instruct
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 4, num prompts 1200
-python3 bench_serving.py --backend trt --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 1200 --request-rate 4 --output-file trt_online_benchmark_8b.jsonl --model meta-llama/Meta-Llama-3-8B-Instruct
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 8, num prompts 2400
-python3 bench_serving.py --backend trt --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 2400 --request-rate 8 --output-file trt_online_benchmark_8b.jsonl --model meta-llama/Meta-Llama-3-8B-Instruct
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 16, num prompts 3200
-python3 bench_serving.py --backend trt --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 3200 --request-rate 16 --output-file trt_online_benchmark_8b.jsonl --model meta-llama/Meta-Llama-3-8B-Instruct
-
-# get median e2e latency
-cat trt_online_benchmark_8b.jsonl | cut -d':' -f9 | cut -d',' -f1
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 300 --request-rate 1 --output-file online_trt_8b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 600 --request-rate 2 --output-file online_trt_8b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 1200 --request-rate 4 --output-file online_trt_8b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 2400 --request-rate 8 --output-file online_trt_8b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 3200 --request-rate 16 --output-file online_trt_8b.jsonl
+cat online_trt_8b.jsonl | cut -d':' -f9 | cut -d',' -f1
 ```
 
 ```bash
 # TensorRT LLM Offline 70B
 
-# Random dataset, Input [512, 1024], Output [512, 1024], num prompts 3k
-python3 bench_serving.py --backend trt --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5 --output-file trt_offline_benchmark_70b.jsonl --model meta-llama/Meta-Llama-3-70B-Instruct
-
-# Random dataset, Input [2048, 4096], Output [512, 1024], num prompts 3k
-python3 bench_serving.py --backend trt --dataset-name random --num-prompts 3000 --random-input 4096 --random-output 1024 --random-range-ratio 0.5 --output-file trt_offline_benchmark_70b.jsonl --model meta-llama/Meta-Llama-3-70B-Instruct
-
-# Random dataset, Input [512, 1024], Output [256, 512], num prompts 3k
-python3 bench_serving.py --backend trt --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 512 --random-range-ratio 0.5 --output-file trt_offline_benchmark_70b.jsonl --model meta-llama/Meta-Llama-3-70B-Instruct
-
-# Random dataset, Input [2048, 4096], Output [256, 512], num prompts 3k
-python3 bench_serving.py --backend trt --dataset-name random --num-prompts 3000 --random-input 4096 --random-output 512 --random-range-ratio 0.5 --output-file trt_offline_benchmark_70b.jsonl --model meta-llama/Meta-Llama-3-70B-Instruct
-
-# ShareGPT dataset, num prompts 3k
-python3 bench_serving.py --backend trt --num-prompts 3000 --output-file trt_offline_benchmark_70b.jsonl --model meta-llama/Meta-Llama-3-70B-Instruct
-
-# get output token throughput
-cat trt_offline_benchmark_70b.jsonl | cut -d':' -f12 | cut -d',' -f1
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-70B-Instruct --dataset-name random --num-prompts 4000 --random-input 1024 --random-output 1024 --output-file offline_trt_70b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-70B-Instruct --dataset-name random --num-prompts 5000 --random-input 1024 --random-output 512 --output-file offline_trt_70b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-70B-Instruct --dataset-name random --num-prompts 1000 --random-input 4096 --random-output 2048 --output-file offline_trt_70b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-70B-Instruct --dataset-name random --num-prompts 2000 --random-input 4096 --random-output 1024 --output-file offline_trt_70b.jsonl
+python3 bench_serving.py --backend trt --dataset-name random --num-prompts 6000 --random-input 256 --random-output 512 --output-file offline_trt_70b.jsonl --model meta-llama/Meta-Llama-3-70B-Instruct
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-70B-Instruct --dataset-name sharegpt --num-prompts 3000 --output-file offline_trt_70b.jsonl
+cat offline_trt_70b.jsonl | cut -d':' -f12 | cut -d',' -f1
 ```
 
 ```bash
 # TensorRT LLM Online 70B
 
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 1, num prompts 300
-python3 bench_serving.py --backend trt --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 300 --request-rate 1 --output-file trt_online_benchmark_70b.jsonl --model meta-llama/Meta-Llama-3-70B-Instruct
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 2, num prompts 600
-python3 bench_serving.py --backend trt --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 600 --request-rate 2 --output-file trt_online_benchmark_70b.jsonl --model meta-llama/Meta-Llama-3-70B-Instruct
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 4, num prompts 1200
-python3 bench_serving.py --backend trt --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 1200 --request-rate 4 --output-file trt_online_benchmark_70b.jsonl --model meta-llama/Meta-Llama-3-70B-Instruct
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 8, num prompts 2400
-python3 bench_serving.py --backend trt --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 2400 --request-rate 8 --output-file trt_online_benchmark_70b.jsonl --model meta-llama/Meta-Llama-3-70B-Instruct
-
-# Random dataset, Input [512, 4096], Output [128, 1024], request rate 16, num prompts 3200
-python3 bench_serving.py --backend trt --dataset-name random --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --num-prompts 3200 --request-rate 16 --output-file trt_online_benchmark_70b.jsonl --model meta-llama/Meta-Llama-3-70B-Instruct
-
-# get median e2e latency
-cat trt_online_benchmark_70b.jsonl | cut -d':' -f9 | cut -d',' -f1
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-70B-Instruct --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 300 --request-rate 1 --output-file online_trt_70b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-70B-Instruct --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 600 --request-rate 2 --output-file online_trt_70b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-70B-Instruct --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 1200 --request-rate 4 --output-file online_trt_70b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-70B-Instruct --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 2400 --request-rate 8 --output-file online_trt_70b.jsonl
+python3 bench_serving.py --backend trt --model meta-llama/Meta-Llama-3-70B-Instruct --dataset-name random --random-input 1024 --random-output 1024 --num-prompts 3200 --request-rate 16 --output-file online_trt_70b.jsonl
+cat online_trt_70b.jsonl | cut -d':' -f9 | cut -d',' -f1
 ```
