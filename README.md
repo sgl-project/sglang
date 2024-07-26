@@ -65,7 +65,7 @@ Repalce `<secret>` below with your huggingface hub [token](https://huggingface.c
 docker run --gpus all \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
-    --env "HUGGING_FACE_HUB_TOKEN=<secret>" \
+    --env "HF_TOKEN=<secret>" \
     --ipc=host \
     lmsysorg/sglang:latest \
     python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --host 0.0.0.0 --port 30000
