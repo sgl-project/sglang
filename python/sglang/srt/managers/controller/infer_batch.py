@@ -376,7 +376,7 @@ class Batch:
                     logit_bias = torch.zeros(
                         (bs, vocab_size), dtype=torch.float32, device=device
                     )
-                logit_bias[i] = int_token_logit_bias
+                logit_bias[i][:len(int_token_logit_bias)] = int_token_logit_bias
 
         # Set fields
         self.input_ids = torch.tensor(
