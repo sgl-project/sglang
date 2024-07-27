@@ -65,10 +65,11 @@ class SamplingParams:
             raise ValueError(
                 "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
             )
-        if self.max_new_tokens < 0:
-            raise ValueError(
-                f"max_new_tokens must be at least 0, got {self.max_new_tokens}."
-            )
+        if self.max_new_tokens is not None:
+            if self.max_new_tokens < 0:
+                raise ValueError(
+                    f"max_new_tokens must be at least 0, got {self.max_new_tokens}."
+                )
 
     def normalize(self, tokenizer):
         # Process stop strings
