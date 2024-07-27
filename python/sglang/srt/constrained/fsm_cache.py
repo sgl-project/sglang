@@ -21,7 +21,27 @@ class FSMCache(BaseCache):
             tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_path, **tokenizer_args_dict
             )
-            self.outlines_tokenizer = TransformerTokenizer(tokenizer)
+            try:
+                self.outlines_tokenizer = TransformerTokenizer(tokenizer)
+            except AttributeError:
+                # FIXME: tmp fix for chatglm2 & chatglm3 (pad_token_id=0)
+                origin_pad_token_id = tokenizer.pad_token_id
+
+                def fset(self, value):
+                    self._value = value
+
+                type(tokenizer).pad_token_id = property(
+                    fget=type(tokenizer).pad_token_id.fget, fset=fset
+                )
+                self.outlines_tokenizer = TransformerTokenizer(tokenizer)
+                self.outlines_tokenizer.tokenizer.pad_token_id = origin_pad_token_id
+                self.outlines_tokenizer.pad_token_id = origin_pad_token_id
+                self.outlines_tokenizer.pad_token = (
+                    self.outlines_tokenizer.tokenizer.pad_token
+                )
+                self.outlines_tokenizer.vocabulary = (
+                    self.outlines_tokenizer.tokenizer.get_vocab()
+                )
         else:
             self.outlines_tokenizer = TransformerTokenizer(
                 tokenizer_path, **tokenizer_args_dict
