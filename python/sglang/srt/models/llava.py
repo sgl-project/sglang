@@ -283,7 +283,7 @@ class LlavaLlamaForCausalLM(nn.Module):
                     # Fill in the placeholder for the image
                     try:
                         for j, image_off in enumerate(image_offsets[i]):
-                            print("actual image_features length: ", image_features[pt][j].shape[0])
+                            # print("actual image_features length: ", image_features[pt][j].shape[0])
                             pad_len = image_features[pt][j].shape[0]
                             input_embeds[
                                 start_idx + image_off : start_idx + image_off + pad_len
