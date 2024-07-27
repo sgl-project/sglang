@@ -91,10 +91,12 @@ class ServerArgs:
     def __post_init__(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
-        if not self.served_model_name:
-            self.served_model_name = self.model_path
-        elif isinstance(self.served_model_name, list):
+        if isinstance(self.served_model_name, str):
+            pass
+        elif isinstance(self.served_model_name, list) and self.served_model_name:
             self.served_model_name = self.served_model_name[0]
+        else:
+            self.served_model_name = self.model_path
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.79
