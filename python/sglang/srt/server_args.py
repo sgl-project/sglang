@@ -28,6 +28,7 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_prefill_tokens: Optional[int] = None
     max_running_requests: Optional[int] = None
+    max_num_reqs: Optional[int] = None
     schedule_heuristic: str = "lpm"
     schedule_conservativeness: float = 1.0
 
@@ -202,6 +203,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_running_requests,
             help="The maximum number of running requests.",
+        )
+        parser.add_argument(
+            "--max-num-reqs",
+            type=int,
+            default=None,
+            help="The maximum number of requests to serve in the memory pool. If the model have a large context length, you may need to decrease this value to avoid out-of-memory errors.",
         )
         parser.add_argument(
             "--schedule-heuristic",

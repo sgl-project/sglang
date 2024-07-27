@@ -95,7 +95,7 @@ class ModelRunner:
 
         # Load the model and create memory pool
         self.load_model()
-        self.init_memory_pool(total_gpu_memory)
+        self.init_memory_pool(total_gpu_memory, server_args.max_num_reqs)
         self.init_cublas()
         self.init_flash_infer()
 
@@ -176,7 +176,7 @@ class ModelRunner:
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
-    def init_memory_pool(self, total_gpu_memory):
+    def init_memory_pool(self, total_gpu_memory, max_num_reqs=None):
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if self.max_total_num_tokens <= 0:
@@ -184,11 +184,14 @@ class ModelRunner:
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
 
-        self.req_to_token_pool = ReqToTokenPool(
-            max(
+        if max_num_reqs is None:
+            max_num_reqs = max(
                 int(self.max_total_num_tokens / self.model_config.context_len * 512),
                 2048,
-            ),
+            )
+
+        self.req_to_token_pool = ReqToTokenPool(
+            max_num_reqs,
             self.model_config.context_len + 8,
         )
         self.token_to_kv_pool = TokenToKVPool(
