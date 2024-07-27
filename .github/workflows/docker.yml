@@ -9,6 +9,7 @@ on:
 
 jobs:
   publish:
+    if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     environment: 'prod'
     strategy:
