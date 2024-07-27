@@ -299,14 +299,14 @@ class ModelTpServer:
                 )
 
         # Truncate prompts that are too long
-        if len(req.origin_input_ids) > self.max_req_input_len:
+        if len(req.origin_input_ids) >= self.max_req_input_len:
             logger.warn(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated!!!"
             )
             req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
         req.sampling_params.max_new_tokens = min(
-            req.sampling_params.max_new_tokens or 1 << 30, self.max_req_input_len - 1
+            req.sampling_params.max_new_tokens or 1 << 30, self.max_req_input_len - 1 - len(req.origin_input_ids)
         )
         self.forward_queue.append(req)
 
