@@ -118,7 +118,11 @@ def test_decode_json_regex():
             s += "}"
 
     ret = decode_json.run()
-    js_obj = json.loads(ret["json_output"])
+    try:
+        js_obj = json.loads(ret["json_output"])
+    except json.decoder.JSONDecodeError:
+        print(ret["json_output"])
+        raise
     assert isinstance(js_obj["name"], str)
     assert isinstance(js_obj["population"], int)
 
