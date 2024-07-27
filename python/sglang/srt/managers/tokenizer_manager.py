@@ -133,7 +133,9 @@ class TokenizerManager:
             async for response in self._handle_batch_request(obj, request):
                 yield response
 
-    async def _handle_single_request(self, obj, request, index=None, is_cache_for_prefill=False):
+    async def _handle_single_request(
+        self, obj, request, index=None, is_cache_for_prefill=False
+    ):
         if not is_cache_for_prefill:
             rid = obj.rid if index is None else obj.rid[index]
             input_text = obj.text if index is None else obj.text[index]
@@ -331,7 +333,14 @@ class TokenizerManager:
         else:
             return None, None, None
 
-    async def _wait_for_response(self, event: asyncio.Event, state: ReqState, obj: GenerateReqInput, rid: str, request):
+    async def _wait_for_response(
+        self,
+        event: asyncio.Event,
+        state: ReqState,
+        obj: GenerateReqInput,
+        rid: str,
+        request,
+    ):
         while True:
             try:
                 await asyncio.wait_for(event.wait(), timeout=4)
@@ -360,7 +369,14 @@ class TokenizerManager:
             event.clear()
             yield out
 
-    async def _wait_for_cache_prefill_response(self, event: asyncio.Event, state: ReqState, obj: GenerateReqInput, rid: str, request):
+    async def _wait_for_cache_prefill_response(
+        self,
+        event: asyncio.Event,
+        state: ReqState,
+        obj: GenerateReqInput,
+        rid: str,
+        request,
+    ):
         while True:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
@@ -425,7 +441,11 @@ class TokenizerManager:
                 state.event.set()
 
     def convert_logprob_style(
-        self, ret: dict, return_logprob: bool, top_logprobs_num: int, return_text_in_logprobs: bool
+        self,
+        ret: dict,
+        return_logprob: bool,
+        top_logprobs_num: int,
+        return_text_in_logprobs: bool,
     ):
         if return_logprob:
             ret["meta_info"]["prefill_token_logprobs"] = self.detokenize_logprob_tokens(
