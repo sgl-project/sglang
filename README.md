@@ -177,6 +177,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instr
 - Mistral / Mixtral
 - Gemma / Gemma 2
 - Qwen / Qwen 2 / Qwen 2 MoE
+- DeepSeek / DeepSeek 2
 - LLaVA 1.5 / 1.6
   - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
   - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.6-vicuna-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
