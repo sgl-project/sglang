@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   close-inactive-issues:
+    if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     steps:
       - name: Check and close inactive issues
