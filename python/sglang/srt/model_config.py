@@ -36,6 +36,11 @@ class ModelConfig:
             "head_dim",
             self.hf_config.hidden_size // self.hf_config.num_attention_heads,
         )
+
+        # FIXME: temporary special judge for deepseek v2 MLA architecture
+        if "DeepseekV2ForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 256
+
         self.num_attention_heads = self.hf_config.num_attention_heads
         self.num_key_value_heads = getattr(self.hf_config, "num_key_value_heads", None)
 
