@@ -152,33 +152,33 @@ class TokenizerManager:
             logprob_start_len = obj.logprob_start_len[0]
             top_logprobs_num = obj.top_logprobs_num[0]
         else:
-            use_index = index is not None
-            rid = obj.rid if not use_index else obj.rid[index]
-            input_text = obj.text if not use_index else obj.text[index]
+            not_use_index = not (index is not None)
+            rid = obj.rid if not_use_index else obj.rid[index]
+            input_text = obj.text if not_use_index else obj.text[index]
             input_ids = (
                 self.tokenizer.encode(input_text)
                 if obj.input_ids is None
                 else obj.input_ids
             )
-            if use_index and obj.input_ids:
+            if not not_use_index and obj.input_ids:
                 input_ids = obj.input_ids[index]
 
             self._validate_input_length(input_ids)
 
             sampling_params = self._get_sampling_params(
-                obj.sampling_params if not use_index else obj.sampling_params[index]
+                obj.sampling_params if not_use_index else obj.sampling_params[index]
             )
             pixel_values, image_hash, image_size = await self._get_pixel_values(
-                obj.image_data if not use_index else obj.image_data[index]
+                obj.image_data if not_use_index else obj.image_data[index]
             )
             return_logprob = (
-                obj.return_logprob if not use_index else obj.return_logprob[index]
+                obj.return_logprob if not_use_index else obj.return_logprob[index]
             )
             logprob_start_len = (
-                obj.logprob_start_len if not use_index else obj.logprob_start_len[index]
+                obj.logprob_start_len if not_use_index else obj.logprob_start_len[index]
             )
             top_logprobs_num = (
-                obj.top_logprobs_num if not use_index else obj.top_logprobs_num[index]
+                obj.top_logprobs_num if not_use_index else obj.top_logprobs_num[index]
             )
 
         tokenized_obj = TokenizedGenerateReqInput(
@@ -210,7 +210,7 @@ class TokenizerManager:
 
     async def _handle_batch_request(self, obj, request):
         batch_size = obj.batch_size
-        parallel_sample_num = obj.sampling_params[0].get("n", 1)
+        parallel_sample_num = obj.parallel_sample_num
 
         if parallel_sample_num != 1:
             ## send prefill requests

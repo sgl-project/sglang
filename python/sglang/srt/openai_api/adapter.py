@@ -6,7 +6,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -203,49 +203,51 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
 
         all_ret = []
         end_point = batch_storage[batch_id].endpoint
+        file_request_list = []
+        all_requests = []
         for line in lines:
             request_data = json.loads(line)
+            file_request_list.append(request_data)
+            body = request_data["body"]
             if end_point == "/v1/chat/completions":
-                adapted_request, request = v1_chat_generate_request(
-                    request_data, tokenizer_manager, from_file=True
-                )
+                all_requests.append(ChatCompletionRequest(**body))
             elif end_point == "/v1/completions":
-                adapted_request, request = v1_generate_request(
-                    request_data, from_file=True
-                )
+                all_requests.append(CompletionRequest(**body))
+        if end_point == "/v1/chat/completions":
+            adapted_request, request = v1_chat_generate_request(
+                all_requests, tokenizer_manager
+            )
+        elif end_point == "/v1/completions":
+            adapted_request, request = v1_generate_request(all_requests)
+        try:
+            ret = await tokenizer_manager.generate_request(adapted_request).__anext__()
+            if not isinstance(ret, list):
+                ret = [ret]
+            if end_point == "/v1/chat/completions":
+                responses = v1_chat_generate_response(request, ret, to_file=True)
+            else:
+                responses = v1_generate_response(request, ret, to_file=True)
 
-            try:
-                ret = await tokenizer_manager.generate_request(
-                    adapted_request
-                ).__anext__()
+        except Exception as e:
+            error_json = {
+                "id": f"batch_req_{uuid.uuid4()}",
+                "custom_id": request_data.get("custom_id"),
+                "response": None,
+                "error": {"message": str(e)},
+            }
+            all_ret.append(error_json)
+            failed_requests += len(file_request_list)
 
-                if not isinstance(ret, list):
-                    ret = [ret]
-                if end_point == "/v1/chat/completions":
-                    response = v1_chat_generate_response(request, ret, to_file=True)
-                else:
-                    response = v1_generate_response(request, ret, to_file=True)
-
-                response_json = {
-                    "id": f"batch_req_{uuid.uuid4()}",
-                    "custom_id": request_data.get("custom_id"),
-                    "response": response,
-                    "error": None,
-                }
-                all_ret.append(response_json)
-
-                completed_requests += 1
-            except Exception as e:
-                error_json = {
-                    "id": f"batch_req_{uuid.uuid4()}",
-                    "custom_id": request_data.get("custom_id"),
-                    "response": None,
-                    "error": {"message": str(e)},
-                }
-                all_ret.append(error_json)
-                failed_requests += 1
-                continue
-
+        for idx, response in enumerate(responses):
+            ## the batch_req here can be changed to be named within a batch granularity
+            response_json = {
+                "id": f"batch_req_{uuid.uuid4()}",
+                "custom_id": file_request_list[idx].get("custom_id"),
+                "response": response,
+                "error": None,
+            }
+            all_ret.append(response_json)
+            completed_requests += 1
         # Write results to a new file
         output_file_id = f"backend_result_file-{uuid.uuid4()}"
         global storage_dir
@@ -305,32 +307,49 @@ async def v1_retrieve_file_content(file_id: str):
     return StreamingResponse(iter_file(), media_type="application/octet-stream")
 
 
-def v1_generate_request(request_json, from_file=False):
-    if from_file:
-        body = request_json["body"]
-        request = CompletionRequest(**body)
-    else:
-        request = CompletionRequest(**request_json)
+def v1_generate_request(all_requests):
+
+    texts = []
+    sampling_params_list = []
+
+    for request in all_requests:
+        texts.append(request.prompt)
+        sampling_params_list.append(
+            {
+                "temperature": request.temperature,
+                "max_new_tokens": request.max_tokens,
+                "stop": request.stop,
+                "top_p": request.top_p,
+                "presence_penalty": request.presence_penalty,
+                "frequency_penalty": request.frequency_penalty,
+                "regex": request.regex,
+                "n": request.n,
+                "ignore_eos": request.ignore_eos,
+            }
+        )
+        if len(all_requests) > 1 and request.n > 1:
+            raise ValueError(
+                "Batch operation is not supported for completions from files"
+            )
+
+    if len(all_requests) == 1:
+        texts = texts[0]
+        sampling_params_list = sampling_params_list[0]
 
     adapted_request = GenerateReqInput(
-        text=request.prompt,
-        sampling_params={
-            "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
-            "stop": request.stop,
-            "top_p": request.top_p,
-            "presence_penalty": request.presence_penalty,
-            "frequency_penalty": request.frequency_penalty,
-            "regex": request.regex,
-            "n": request.n,
-            "ignore_eos": request.ignore_eos,
-        },
-        return_logprob=request.logprobs is not None and request.logprobs > 0,
-        top_logprobs_num=request.logprobs if request.logprobs is not None else 0,
+        text=texts,
+        sampling_params=sampling_params_list,
+        return_logprob=all_requests[0].logprobs is not None
+        and all_requests[0].logprobs > 0,
+        top_logprobs_num=(
+            all_requests[0].logprobs if all_requests[0].logprobs is not None else 0
+        ),
         return_text_in_logprobs=True,
-        stream=request.stream,
+        stream=all_requests[0].stream,
     )
-    return adapted_request, request
+    if len(all_requests) == 1:
+        return adapted_request, all_requests[0]
+    return adapted_request, all_requests
 
 
 def v1_generate_response(request, ret, to_file=False):
@@ -338,12 +357,22 @@ def v1_generate_response(request, ret, to_file=False):
 
     for idx, ret_item in enumerate(ret):
         text = ret_item["text"]
+        echo = False
+        if isinstance(request, List) and request[idx].echo:
+            echo = True
+            text = request[idx].prompt + text
 
-        if request.echo:
+        elif (not isinstance(request, List)) and request.echo:
+            echo = True
             text = request.prompt + text
 
-        if request.logprobs:
-            if request.echo:
+        logprobs = False
+        if isinstance(request, List) and request[idx].logprobs:
+            logprobs = True
+        elif (not isinstance(request, List)) and request.logprobs:
+            logprobs = True
+        if logprobs:
+            if echo:
                 prefill_token_logprobs = ret_item["meta_info"]["prefill_token_logprobs"]
                 prefill_top_logprobs = ret_item["meta_info"]["prefill_top_logprobs"]
             else:
@@ -362,7 +391,7 @@ def v1_generate_response(request, ret, to_file=False):
         if to_file:
             ## to make the choise data json serializable
             choice_data = {
-                "index": idx,
+                "index": 0,
                 "text": text,
                 "logprobs": logprobs,
                 "finish_reason": ret_item["meta_info"]["finish_reason"],
@@ -378,27 +407,29 @@ def v1_generate_response(request, ret, to_file=False):
         choices.append(choice_data)
 
     if to_file:
-        response = {
-            "status_code": 200,
-            "request_id": ret[0]["meta_info"]["id"],
-            "body": {
-                ## remain the same but if needed we can change that
-                "id": ret[0]["meta_info"]["id"],
-                "object": "text_completion",
-                "created": int(time.time()),
-                "model": request.model,
-                "choices": choices,
-                "usage": {
-                    "prompt_tokens": ret[0]["meta_info"]["prompt_tokens"],
-                    "completion_tokens": sum(
-                        item["meta_info"]["completion_tokens"] for item in ret
-                    ),
-                    "total_tokens": ret[0]["meta_info"]["prompt_tokens"]
-                    + sum(item["meta_info"]["completion_tokens"] for item in ret),
+        responses = []
+        for i, choice in enumerate(choices):
+            response = {
+                "status_code": 200,
+                "request_id": ret[i]["meta_info"]["id"],
+                "body": {
+                    ## remain the same but if needed we can change that
+                    "id": ret[i]["meta_info"]["id"],
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": request[i].model,
+                    "choices": choice,
+                    "usage": {
+                        "prompt_tokens": ret[i]["meta_info"]["prompt_tokens"],
+                        "completion_tokens": ret[i]["meta_info"]["completion_tokens"],
+                        "total_tokens": ret[i]["meta_info"]["prompt_tokens"]
+                        + ret[i]["meta_info"]["completion_tokens"],
+                    },
+                    "system_fingerprint": None,
                 },
-                "system_fingerprint": None,
-            },
-        }
+            }
+            responses.append(response)
+        return responses
     else:
         response = CompletionResponse(
             id=ret[0]["meta_info"]["id"],
@@ -418,7 +449,8 @@ def v1_generate_response(request, ret, to_file=False):
 
 async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
-    adapted_request, request = v1_generate_request(request_json, from_file=False)
+    all_requests = [CompletionRequest(**request_json)]
+    adapted_request, request = v1_generate_request(all_requests)
 
     if adapted_request.stream:
 
@@ -514,58 +546,67 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     return response
 
 
-def v1_chat_generate_request(request_json, tokenizer_manager, from_file=False):
-    if from_file:
-        body = request_json["body"]
-        request = ChatCompletionRequest(**body)
-    else:
-        request = ChatCompletionRequest(**request_json)
+def v1_chat_generate_request(all_requests, tokenizer_manager):
 
-    # Prep the data needed for the underlying GenerateReqInput:
-    #  - prompt: The full prompt string.
-    #  - stop: Custom stop tokens.
-    #  - image_data: None or a list of image strings (URLs or base64 strings).
-    #    None skips any image processing in GenerateReqInput.
-    if not isinstance(request.messages, str):
-        # Apply chat template and its stop strings.
-        if chat_template_name is None:
-            prompt = tokenizer_manager.tokenizer.apply_chat_template(
-                request.messages, tokenize=False, add_generation_prompt=True
-            )
+    texts = []
+    sampling_params_list = []
+    image_data_list = []
+    for request in all_requests:
+        # Prep the data needed for the underlying GenerateReqInput:
+        #  - prompt: The full prompt string.
+        #  - stop: Custom stop tokens.
+        #  - image_data: None or a list of image strings (URLs or base64 strings).
+        #    None skips any image processing in GenerateReqInput.
+        if not isinstance(request.messages, str):
+            # Apply chat template and its stop strings.
+            if chat_template_name is None:
+                prompt = tokenizer_manager.tokenizer.apply_chat_template(
+                    request.messages, tokenize=False, add_generation_prompt=True
+                )
+                stop = request.stop
+                image_data = None
+            else:
+                conv = generate_chat_conv(request, chat_template_name)
+                prompt = conv.get_prompt()
+                image_data = conv.image_data
+                stop = conv.stop_str or []
+                if request.stop:
+                    if isinstance(request.stop, str):
+                        stop.append(request.stop)
+                    else:
+                        stop.extend(request.stop)
+        else:
+            # Use the raw prompt and stop strings if the messages is already a string.
+            prompt = request.messages
             stop = request.stop
             image_data = None
-        else:
-            conv = generate_chat_conv(request, chat_template_name)
-            prompt = conv.get_prompt()
-            image_data = conv.image_data
-            stop = conv.stop_str or []
-            if request.stop:
-                if isinstance(request.stop, str):
-                    stop.append(request.stop)
-                else:
-                    stop.extend(request.stop)
-    else:
-        # Use the raw prompt and stop strings if the messages is already a string.
-        prompt = request.messages
-        stop = request.stop
-        image_data = None
-
+        texts.append(prompt)
+        sampling_params_list.append(
+            {
+                "temperature": request.temperature,
+                "max_new_tokens": request.max_tokens,
+                "stop": stop,
+                "top_p": request.top_p,
+                "presence_penalty": request.presence_penalty,
+                "frequency_penalty": request.frequency_penalty,
+                "regex": request.regex,
+                "n": request.n,
+            }
+        )
+        image_data_list.append(image_data)
+    if len(all_requests) == 1:
+        texts = texts[0]
+        sampling_params_list = sampling_params_list[0]
+        image_data = image_data_list[0]
     adapted_request = GenerateReqInput(
-        text=prompt,
+        text=texts,
         image_data=image_data,
-        sampling_params={
-            "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
-            "stop": stop,
-            "top_p": request.top_p,
-            "presence_penalty": request.presence_penalty,
-            "frequency_penalty": request.frequency_penalty,
-            "regex": request.regex,
-            "n": request.n,
-        },
+        sampling_params=sampling_params_list,
         stream=request.stream,
     )
-    return adapted_request, request
+    if len(all_requests) == 1:
+        return adapted_request, all_requests[0]
+    return adapted_request, all_requests
 
 
 def v1_chat_generate_response(request, ret, to_file=False):
@@ -578,9 +619,9 @@ def v1_chat_generate_response(request, ret, to_file=False):
         completion_tokens = ret_item["meta_info"]["completion_tokens"]
 
         if to_file:
-            ## to make the choise data json serializable
+            ## to make the choice data json serializable
             choice_data = {
-                "index": idx,
+                "index": 0,
                 "message": {"role": "assistant", "content": ret_item["text"]},
                 "logprobs": None,
                 "finish_reason": ret_item["meta_info"]["finish_reason"],
@@ -595,25 +636,31 @@ def v1_chat_generate_response(request, ret, to_file=False):
         choices.append(choice_data)
         total_prompt_tokens = prompt_tokens
         total_completion_tokens += completion_tokens
-
     if to_file:
-        response = {
-            "status_code": 200,
-            "request_id": ret[0]["meta_info"]["id"],
-            "body": {
-                "id": ret[0]["meta_info"]["id"],
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": request.model,
-                "choices": choices,
-                "usage": {
-                    "prompt_tokens": total_prompt_tokens,
-                    "completion_tokens": total_completion_tokens,
-                    "total_tokens": total_prompt_tokens + total_completion_tokens,
+        responses = []
+
+        for i, choice in enumerate(choices):
+            response = {
+                "status_code": 200,
+                "request_id": ret[i]["meta_info"]["id"],
+                "body": {
+                    ## remain the same but if needed we can change that
+                    "id": ret[i]["meta_info"]["id"],
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": request[i].model,
+                    "choices": choice,
+                    "usage": {
+                        "prompt_tokens": ret[i]["meta_info"]["prompt_tokens"],
+                        "completion_tokens": ret[i]["meta_info"]["completion_tokens"],
+                        "total_tokens": ret[i]["meta_info"]["prompt_tokens"]
+                        + ret[i]["meta_info"]["completion_tokens"],
+                    },
+                    "system_fingerprint": None,
                 },
-                "system_fingerprint": None,
-            },
-        }
+            }
+            responses.append(response)
+        return responses
     else:
         response = ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
@@ -625,15 +672,13 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 total_tokens=total_prompt_tokens + total_completion_tokens,
             ),
         )
-    return response
+        return response
 
 
 async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
-
-    adapted_request, request = v1_chat_generate_request(
-        request_json, tokenizer_manager, from_file=False
-    )
+    all_requests = [ChatCompletionRequest(**request_json)]
+    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
 
     if adapted_request.stream:
 
