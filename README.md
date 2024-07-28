@@ -96,7 +96,7 @@ curl http://localhost:30000/generate \
     }
   }'
 ```
-Learn more about the argument format [here](docs/sampling_params.md).
+Learn more about the argument format [here](docs/en/sampling_params.md).
 
 ### OpenAI Compatible API
 In addition, the server supports OpenAI-compatible APIs.
@@ -143,7 +143,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --mem-fraction-static 0.7
 ```
-- See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
+- See [hyperparameter_tuning.md](docs/en/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
 - Add `--nnodes 2` to run tensor parallelism on multiple nodes. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port.
 ```
 # Node 0
@@ -152,7 +152,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 # Node 1
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-0:50000 --nnodes 2 --node-rank 1
 ```
-- If the model does not have a template in the Hugging Face tokenizer, you can specify a [custom chat template](docs/custom_chat_template.md).
+- If the model does not have a template in the Hugging Face tokenizer, you can specify a [custom chat template](docs/en/custom_chat_template.md).
 - To enable fp8 quantization, you can add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable experimental torch.compile support, you can add `--enable-torch-compile`. It accelerates small models on small batch sizes.
 
@@ -195,7 +195,7 @@ GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/
 - InternLM 2
 - Mistral NeMo
 
-Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/model_support.md).
+Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/en/model_support.md).
 
 ### Benchmark Performance
 

@@ -1,0 +1,12 @@
+markdown>=3.4.0
+myst-parser
+sphinx
+sphinx-book-theme
+sphinx-copybutton
+sphinx-tabs
+sphinxcontrib-mermaid
+pillow
+pydantic
+torch
+transformers
+urllib3<2.0.0
