@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """Conversion between OpenAI APIs and native SRT APIs"""
 
 import asyncio
@@ -473,29 +488,29 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     if request.logprobs:
                         # The first chunk and echo is enabled.
                         if not stream_buffer and request.echo:
-                            prefill_token_logprobs = content["meta_info"][
-                                "prefill_token_logprobs"
+                            input_token_logprobs = content["meta_info"][
+                                "input_token_logprobs"
                             ]
-                            prefill_top_logprobs = content["meta_info"][
-                                "prefill_top_logprobs"
+                            input_top_logprobs = content["meta_info"][
+                                "input_top_logprobs"
                             ]
                         else:
-                            prefill_token_logprobs = None
-                            prefill_top_logprobs = None
+                            input_token_logprobs = None
+                            input_top_logprobs = None
 
                         logprobs = to_openai_style_logprobs(
-                            prefill_token_logprobs=prefill_token_logprobs,
-                            prefill_top_logprobs=prefill_top_logprobs,
-                            decode_token_logprobs=content["meta_info"][
-                                "decode_token_logprobs"
+                            input_token_logprobs=input_token_logprobs,
+                            input_top_logprobs=input_top_logprobs,
+                            output_token_logprobs=content["meta_info"][
+                                "output_token_logprobs"
                             ][n_prev_token:],
-                            decode_top_logprobs=content["meta_info"][
-                                "decode_top_logprobs"
+                            output_top_logprobs=content["meta_info"][
+                                "output_top_logprobs"
                             ][n_prev_token:],
                         )
 
                         n_prev_token = len(
-                            content["meta_info"]["decode_token_logprobs"]
+                            content["meta_info"]["output_token_logprobs"]
                         )
                     else:
                         logprobs = None
@@ -747,10 +762,10 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
 
 def to_openai_style_logprobs(
-    prefill_token_logprobs=None,
-    decode_token_logprobs=None,
-    prefill_top_logprobs=None,
-    decode_top_logprobs=None,
+    input_token_logprobs=None,
+    output_token_logprobs=None,
+    input_top_logprobs=None,
+    output_top_logprobs=None,
 ):
     ret_logprobs = LogProbs()
 
@@ -771,13 +786,13 @@ def to_openai_style_logprobs(
             else:
                 ret_logprobs.top_logprobs.append(None)
 
-    if prefill_token_logprobs is not None:
-        append_token_logprobs(prefill_token_logprobs)
-    if decode_token_logprobs is not None:
-        append_token_logprobs(decode_token_logprobs)
-    if prefill_top_logprobs is not None:
-        append_top_logprobs(prefill_top_logprobs)
-    if decode_top_logprobs is not None:
-        append_top_logprobs(decode_top_logprobs)
+    if input_token_logprobs is not None:
+        append_token_logprobs(input_token_logprobs)
+    if output_token_logprobs is not None:
+        append_token_logprobs(output_token_logprobs)
+    if input_top_logprobs is not None:
+        append_top_logprobs(input_top_logprobs)
+    if output_top_logprobs is not None:
+        append_top_logprobs(output_top_logprobs)
 
     return ret_logprobs

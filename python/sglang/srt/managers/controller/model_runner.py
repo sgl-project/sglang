@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """ModelRunner runs the forward passes of the models."""
 
 import importlib
@@ -25,14 +40,21 @@ from vllm.distributed import (
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
-from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode, InputMetadata
+from sglang.srt.managers.controller.infer_batch import (
+    Batch,
+    ForwardMode,
+    InputMetadata,
+    global_server_args_dict,
+)
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    is_llama3_405b_fp8,
     is_multimodal_model,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
+    monkey_patch_vllm_qvk_linear_loader,
 )
 
 logger = logging.getLogger("srt.model_runner")
@@ -58,7 +80,13 @@ class ModelRunner:
         self.nccl_port = nccl_port
         self.server_args = server_args
         self.is_multimodal_model = is_multimodal_model(self.model_config)
-        monkey_patch_vllm_dummy_weight_loader()
+        global_server_args_dict.update(
+            {
+                "disable_flashinfer": server_args.disable_flashinfer,
+                "disable_flashinfer_sampling": server_args.disable_flashinfer_sampling,
+                "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
+            }
+        )
 
         # Init torch distributed
         torch.cuda.set_device(self.gpu_id)
@@ -93,7 +121,7 @@ class ModelRunner:
 
         # Load the model and create memory pool
         self.load_model()
-        self.init_memory_pool(total_gpu_memory)
+        self.init_memory_pool(total_gpu_memory, server_args.max_num_reqs)
         self.init_cublas()
         self.init_flash_infer()
 
@@ -106,6 +134,7 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
+        monkey_patch_vllm_dummy_weight_loader()
         device_config = DeviceConfig()
         load_config = LoadConfig(load_format=self.server_args.load_format)
         vllm_model_config = VllmModelConfig(
@@ -118,6 +147,13 @@ class ModelRunner:
             seed=42,
             skip_tokenizer_init=True,
         )
+
+        if is_llama3_405b_fp8(self.model_config) and self.tp_size <= 8:
+            # A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints
+            self.model_config.hf_config.num_key_value_heads = 8
+            vllm_model_config.hf_config.num_key_value_heads = 8
+            monkey_patch_vllm_qvk_linear_loader()
+
         self.dtype = vllm_model_config.dtype
         if self.model_config.model_overide_args is not None:
             vllm_model_config.hf_config.update(self.model_config.model_overide_args)
@@ -167,7 +203,7 @@ class ModelRunner:
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
-    def init_memory_pool(self, total_gpu_memory):
+    def init_memory_pool(self, total_gpu_memory, max_num_reqs=None):
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if self.max_total_num_tokens <= 0:
@@ -175,11 +211,14 @@ class ModelRunner:
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
 
-        self.req_to_token_pool = ReqToTokenPool(
-            max(
+        if max_num_reqs is None:
+            max_num_reqs = max(
                 int(self.max_total_num_tokens / self.model_config.context_len * 512),
                 2048,
-            ),
+            )
+
+        self.req_to_token_pool = ReqToTokenPool(
+            max_num_reqs,
             self.model_config.context_len + 8,
         )
         self.token_to_kv_pool = TokenToKVPool(

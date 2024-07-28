@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
@@ -5,14 +20,10 @@
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
-import tqdm
 from torch import nn
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -39,6 +50,7 @@ class LlamaMLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -46,12 +58,14 @@ class LlamaMLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -80,6 +94,7 @@ class LlamaAttention(nn.Module):
         rope_is_neox_style: bool = True,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -114,12 +129,14 @@ class LlamaAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
         )
 
         self.rotary_emb = get_rope(
@@ -158,6 +175,7 @@ class LlamaDecoderLayer(nn.Module):
         config: LlamaConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -182,12 +200,14 @@ class LlamaDecoderLayer(nn.Module):
             rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -235,7 +255,9 @@ class LlamaModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                LlamaDecoderLayer(config, i, quant_config=quant_config)
+                LlamaDecoderLayer(
+                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -375,9 +397,6 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
         if name is None or loaded_weight is None:
-            if get_tensor_model_parallel_rank() == 0:
-                weights = tqdm.tqdm(weights, total=int(len(params_dict) * 1.5))
-
             for name, loaded_weight in weights:
                 load_weights_per_param(name, loaded_weight)
         else:

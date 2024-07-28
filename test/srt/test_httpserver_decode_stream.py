@@ -40,14 +40,14 @@ def test_decode_stream(url, return_logprob, top_logprobs_num):
             data = json.loads(chunk[5:].strip("\n"))
 
             if return_logprob:
-                assert data["meta_info"]["prefill_token_logprobs"] is not None
-                assert data["meta_info"]["decode_token_logprobs"] is not None
+                assert data["meta_info"]["input_token_logprobs"] is not None
+                assert data["meta_info"]["output_token_logprobs"] is not None
                 assert data["meta_info"]["normalized_prompt_logprob"] is not None
                 for logprob, token_id, token_text in data["meta_info"][
-                    "decode_token_logprobs"
+                    "output_token_logprobs"
                 ][prev:]:
                     print(f"{token_text:12s}\t{logprob}\t{token_id}", flush=True)
-                prev = len(data["meta_info"]["decode_token_logprobs"])
+                prev = len(data["meta_info"]["output_token_logprobs"])
             else:
                 output = data["text"].strip()
                 print(output[prev:], end="", flush=True)

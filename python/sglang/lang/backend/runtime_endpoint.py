@@ -253,14 +253,14 @@ class RuntimeEndpoint(BaseBackend):
             r["meta_info"]["normalized_prompt_logprob"] for r in obj
         ]
         decision = choices[np.argmax(normalized_prompt_logprobs)]
-        prefill_token_logprobs = [r["meta_info"]["prefill_token_logprobs"] for r in obj]
-        decode_token_logprobs = [r["meta_info"]["decode_token_logprobs"] for r in obj]
+        input_token_logprobs = [r["meta_info"]["input_token_logprobs"] for r in obj]
+        output_token_logprobs = [r["meta_info"]["output_token_logprobs"] for r in obj]
 
         return (
             decision,
             normalized_prompt_logprobs,
-            prefill_token_logprobs,
-            decode_token_logprobs,
+            input_token_logprobs,
+            output_token_logprobs,
         )
 
     def concatenate_and_append(self, src_rids: List[str], dst_rid: str):

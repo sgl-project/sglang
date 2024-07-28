@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """A tensor parallel worker."""
 
 import logging
@@ -98,13 +113,20 @@ class ModelTpServer:
             if server_args.max_prefill_tokens is None
             else server_args.max_prefill_tokens
         )
-        self.max_running_requests = (
-            self.max_total_num_tokens // 2
-            if server_args.max_running_requests is None
-            else server_args.max_running_requests
+        self.max_running_requests = min(
+            (
+                self.max_total_num_tokens // 2
+                if server_args.max_running_requests is None
+                else server_args.max_running_requests
+            ),
+            self.model_runner.req_to_token_pool.size - 1,
         )
         self.int_token_logit_bias = torch.tensor(
             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
+        )
+        self.max_req_input_len = min(
+            self.model_config.context_len - 1,
+            self.max_total_num_tokens - 1,
         )
         set_random_seed(server_args.random_seed)
 
@@ -113,13 +135,9 @@ class ModelTpServer:
             f"[gpu_id={self.gpu_id}] "
             f"max_total_num_tokens={self.max_total_num_tokens}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
+            f"max_running_requests={self.max_running_requests}, "
             f"context_len={self.model_config.context_len}"
         )
-        if self.tp_rank == 0:
-            logger.info(
-                f"[gpu_id={self.gpu_id}] "
-                f"server_args: {server_args.print_mode_args()}"
-            )
 
         # Init cache
         self.tree_cache = RadixCache(
@@ -161,15 +179,12 @@ class ModelTpServer:
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
-        self.new_token_ratio = min(
-            global_config.base_new_token_ratio * server_args.schedule_conservativeness,
-            1.0,
-        )
         self.min_new_token_ratio = min(
             global_config.base_min_new_token_ratio
             * server_args.schedule_conservativeness,
             1.0,
         )
+        self.new_token_ratio = self.min_new_token_ratio
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.new_token_ratio_recovery = global_config.new_token_ratio_recovery
 
@@ -231,6 +246,7 @@ class ModelTpServer:
                         break
             else:
                 self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
 
     def print_stats(self):
         num_used = self.max_total_num_tokens - (
@@ -298,18 +314,20 @@ class ModelTpServer:
                 )
 
         # Truncate prompts that are too long
-        req.origin_input_ids = req.origin_input_ids[: self.model_config.context_len - 1]
+        if len(req.origin_input_ids) >= self.max_req_input_len:
+            logger.warn(
+                "Request length is longer than the KV cache pool size or "
+                "the max context length. Truncated!!!"
+            )
+            req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
         req.sampling_params.max_new_tokens = min(
-            req.sampling_params.max_new_tokens,
-            self.model_config.context_len - 1 - len(req.origin_input_ids),
-            self.max_total_num_tokens - 128 - len(req.origin_input_ids),
+            (
+                req.sampling_params.max_new_tokens
+                if req.sampling_params.max_new_tokens is not None
+                else 1 << 30
+            ),
+            self.max_req_input_len - 1 - len(req.origin_input_ids),
         )
-        if req.sampling_params.max_new_tokens < 0:
-            req.origin_input_ids = req.origin_input_ids[
-                : self.max_total_num_tokens - 128
-            ]
-            logger.error("Request longer than memory pool size, truncated!!!")
-
         self.forward_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[Batch]:
@@ -452,7 +470,7 @@ class ModelTpServer:
                     torch.arange(len(next_token_ids), device=next_token_ids.device),
                     next_token_ids,
                 ].tolist()
-                output.prefill_token_logprobs = output.prefill_token_logprobs.tolist()
+                output.input_token_logprobs = output.input_token_logprobs.tolist()
                 output.normalized_prompt_logprobs = (
                     output.normalized_prompt_logprobs.tolist()
                 )
@@ -478,24 +496,24 @@ class ModelTpServer:
         if req.normalized_prompt_logprob is None:
             req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
 
-        if req.prefill_token_logprobs is None:
+        if req.input_token_logprobs is None:
             # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
-            req.prefill_token_logprobs = list(
+            req.input_token_logprobs = list(
                 zip(
-                    output.prefill_token_logprobs[pt : pt + req.extend_input_len - 1],
+                    output.input_token_logprobs[pt : pt + req.extend_input_len - 1],
                     req.input_ids[-req.extend_input_len + 1 :],
                 )
             )
             if req.logprob_start_len == 0:
-                req.prefill_token_logprobs = [
+                req.input_token_logprobs = [
                     (None, req.input_ids[0])
-                ] + req.prefill_token_logprobs
+                ] + req.input_token_logprobs
 
         if req.last_update_decode_tokens != 0:
-            req.decode_token_logprobs.extend(
+            req.output_token_logprobs.extend(
                 list(
                     zip(
-                        output.prefill_token_logprobs[
+                        output.input_token_logprobs[
                             pt
                             + req.extend_input_len
                             - req.last_update_decode_tokens : pt
@@ -507,21 +525,21 @@ class ModelTpServer:
                 )
             )
 
-        req.decode_token_logprobs.append(
+        req.output_token_logprobs.append(
             (output.next_token_logprobs[i], next_token_ids[i])
         )
 
         if req.top_logprobs_num > 0:
-            if req.prefill_top_logprobs is None:
-                req.prefill_top_logprobs = output.prefill_top_logprobs[i]
+            if req.input_top_logprobs is None:
+                req.input_top_logprobs = output.input_top_logprobs[i]
                 if req.logprob_start_len == 0:
-                    req.prefill_top_logprobs = [None] + req.prefill_top_logprobs
+                    req.input_top_logprobs = [None] + req.input_top_logprobs
 
             if req.last_update_decode_tokens != 0:
-                req.decode_top_logprobs.extend(
-                    output.prefill_top_logprobs[i][-req.last_update_decode_tokens + 1 :]
+                req.output_top_logprobs.extend(
+                    output.input_top_logprobs[i][-req.last_update_decode_tokens + 1 :]
                 )
-            req.decode_top_logprobs.append(output.decode_top_logprobs[i])
+            req.output_top_logprobs.append(output.output_top_logprobs[i])
 
     def cache_filled_batch(self, batch: Batch):
         req_pool_indices_cpu = batch.req_pool_indices.cpu().numpy()
@@ -539,9 +557,10 @@ class ModelTpServer:
         # Check if decode out of memory
         if not batch.check_decode_mem():
             old_ratio = self.new_token_ratio
-            self.new_token_ratio = min(old_ratio + self.new_token_ratio_recovery, 1.0)
 
-            retracted_reqs = batch.retract_decode()
+            retracted_reqs, new_token_ratio = batch.retract_decode()
+            self.new_token_ratio = new_token_ratio
+
             logger.info(
                 "decode out of memory happened, "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
@@ -585,11 +604,11 @@ class ModelTpServer:
             req.check_finished()
 
             if req.return_logprob:
-                req.decode_token_logprobs.append(
+                req.output_token_logprobs.append(
                     (next_token_logprobs[i], next_token_id)
                 )
                 if req.top_logprobs_num > 0:
-                    req.decode_top_logprobs.append(output.decode_top_logprobs[i])
+                    req.output_top_logprobs.append(output.output_top_logprobs[i])
 
         self.handle_finished_requests(batch)
 
@@ -641,16 +660,16 @@ class ModelTpServer:
                 }
                 if req.return_logprob:
                     (
-                        meta_info["prefill_token_logprobs"],
-                        meta_info["decode_token_logprobs"],
-                        meta_info["prefill_top_logprobs"],
-                        meta_info["decode_top_logprobs"],
+                        meta_info["input_token_logprobs"],
+                        meta_info["output_token_logprobs"],
+                        meta_info["input_top_logprobs"],
+                        meta_info["output_top_logprobs"],
                         meta_info["normalized_prompt_logprob"],
                     ) = (
-                        req.prefill_token_logprobs,
-                        req.decode_token_logprobs,
-                        req.prefill_top_logprobs,
-                        req.decode_top_logprobs,
+                        req.input_token_logprobs,
+                        req.output_token_logprobs,
+                        req.input_top_logprobs,
+                        req.output_top_logprobs,
                         req.normalized_prompt_logprob,
                     )
                 output_meta_info.append(meta_info)

@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """The arguments of the server."""
 
 import argparse
@@ -28,8 +43,9 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_prefill_tokens: Optional[int] = None
     max_running_requests: Optional[int] = None
+    max_num_reqs: Optional[int] = None
     schedule_heuristic: str = "lpm"
-    schedule_conservativeness: float = 0.8
+    schedule_conservativeness: float = 1.0
 
     # Other runtime options
     tp_size: int = 1
@@ -52,13 +68,14 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_flashinfer: bool = False
+    disable_flashinfer_sampling: bool = False
     disable_radix_cache: bool = False
     disable_regex_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_disk_cache: bool = False
     enable_torch_compile: bool = False
-    attention_reduce_in_fp32: bool = False
     enable_p2p_check: bool = False
+    attention_reduce_in_fp32: bool = False
     efficient_weight_load: bool = False
 
     # Distributed args
@@ -71,15 +88,15 @@ class ServerArgs:
             self.tokenizer_path = self.model_path
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
-                self.mem_fraction_static = 0.74
+                self.mem_fraction_static = 0.80
             elif self.tp_size >= 8:
-                self.mem_fraction_static = 0.78
+                self.mem_fraction_static = 0.84
             elif self.tp_size >= 4:
-                self.mem_fraction_static = 0.82
+                self.mem_fraction_static = 0.86
             elif self.tp_size >= 2:
-                self.mem_fraction_static = 0.85
-            else:
                 self.mem_fraction_static = 0.88
+            else:
+                self.mem_fraction_static = 0.89
         if isinstance(self.additional_ports, int):
             self.additional_ports = [self.additional_ports]
         elif self.additional_ports is None:
@@ -205,6 +222,12 @@ class ServerArgs:
             help="The maximum number of running requests.",
         )
         parser.add_argument(
+            "--max-num-reqs",
+            type=int,
+            default=None,
+            help="The maximum number of requests to serve in the memory pool. If the model have a large context length, you may need to decrease this value to avoid out-of-memory errors.",
+        )
+        parser.add_argument(
             "--schedule-heuristic",
             type=str,
             default=ServerArgs.schedule_heuristic,
@@ -303,7 +326,12 @@ class ServerArgs:
         parser.add_argument(
             "--disable-flashinfer",
             action="store_true",
-            help="Disable flashinfer inference kernels.",
+            help="Disable flashinfer attention kernels.",
+        )
+        parser.add_argument(
+            "--disable-flashinfer-sampling",
+            action="store_true",
+            help="Disable flashinfer sampling kernels.",
         )
         parser.add_argument(
             "--disable-radix-cache",
@@ -331,15 +359,15 @@ class ServerArgs:
             help="Optimize the model with torch.compile, experimental feature.",
         )
         parser.add_argument(
+            "--enable-p2p-check",
+            action="store_true",
+            help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
+        )
+        parser.add_argument(
             "--attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels",
-        )
-        parser.add_argument(
-            "--enable-p2p-check",
-            action="store_true",
-            help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
         )
         parser.add_argument(
             "--efficient-weight-load",
@@ -363,6 +391,14 @@ class ServerArgs:
             f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
             f"disable_disk_cache={self.disable_disk_cache}, "
         )
+
+    def check_server_args(self):
+        assert (
+            self.tp_size % self.nnodes == 0
+        ), "tp_size must be divisible by number of nodes"
+        assert not (
+            self.dp_size > 1 and self.node_rank is not None
+        ), "multi-node data parallel is not supported"
 
 
 @dataclasses.dataclass

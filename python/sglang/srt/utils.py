@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """Common utilities."""
 
 import base64
@@ -18,10 +33,16 @@ import psutil
 import requests
 import torch
 import torch.distributed as dist
-import triton
 from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
 from starlette.middleware.base import BaseHTTPMiddleware
+from torch.nn.parameter import Parameter
+from triton.runtime.cache import (
+    FileCacheManager,
+    default_cache_dir,
+    default_dump_dir,
+    default_override_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +333,9 @@ def suppress_other_loggers():
     logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
         logging.WARN
     )
+    logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(
+        logging.WARN
+    )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
     logging.getLogger("vllm.utils").setLevel(logging.WARN)
 
@@ -457,6 +481,44 @@ def monkey_patch_vllm_all_gather(reverse: bool = False):
         setattr(GroupCoordinator, "all_gather", all_gather)
 
 
+def maybe_set_triton_cache_manager() -> None:
+    """Set environment variable to tell Triton to use a
+    custom cache manager"""
+    cache_manger = os.environ.get("TRITON_CACHE_MANAGER", None)
+    if cache_manger is None:
+        manager = "sglang.srt.utils:CustomCacheManager"
+        logger.debug("Setting Triton cache manager to: %s", manager)
+        os.environ["TRITON_CACHE_MANAGER"] = manager
+
+
+class CustomCacheManager(FileCacheManager):
+    # Adapted from: https://github.com/tdoublep/vllm/blob/3307522289fdfefe323b6c00d0db696651989a2f/vllm/triton_utils/custom_cache_manager.py
+    def __init__(self, key, override=False, dump=False):
+
+        self.key = key
+        self.lock_path = None
+        if dump:
+            self.cache_dir = default_dump_dir()
+            self.cache_dir = os.path.join(self.cache_dir, self.key)
+            self.lock_path = os.path.join(self.cache_dir, "lock")
+            os.makedirs(self.cache_dir, exist_ok=True)
+        elif override:
+            self.cache_dir = default_override_dir()
+            self.cache_dir = os.path.join(self.cache_dir, self.key)
+        else:
+            # create cache directory if it doesn't exist
+            self.cache_dir = (
+                os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
+            )
+            if self.cache_dir:
+                self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
+                self.cache_dir = os.path.join(self.cache_dir, self.key)
+                self.lock_path = os.path.join(self.cache_dir, "lock")
+                os.makedirs(self.cache_dir, exist_ok=True)
+            else:
+                raise RuntimeError("Could not create or locate cache dir")
+
+
 API_KEY_HEADER_NAME = "X-API-Key"
 
 
@@ -569,3 +631,52 @@ def set_ulimit(target_soft_limit=65535):
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
             logger.warn(f"Fail to set RLIMIT_NOFILE: {e}")
+
+
+def is_llama3_405b_fp8(model_config):
+    """Return whether the model is meta-llama/Meta-Llama-3.1-405B-FP8 with 16 kv heads."""
+    if (
+        model_config.hf_config.architectures[0] == "LlamaForCausalLM"
+        and model_config.hf_config.hidden_size == 16384
+        and model_config.hf_config.intermediate_size == 53248
+        and model_config.hf_config.num_hidden_layers == 126
+        and model_config.hf_config.num_key_value_heads == 16
+        and hasattr(model_config.hf_config, "quantization_config")
+        and model_config.hf_config.quantization_config["quant_method"] == "fbgemm_fp8"
+    ):
+        return True
+    return False
+
+
+def monkey_patch_vllm_qvk_linear_loader():
+    """A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints."""
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+
+    origin_weight_loader = QKVParallelLinear.weight_loader
+
+    def get_original_weight(loaded_weight, head_dim):
+        n_kv_head = loaded_weight.shape[0] // (2 * head_dim)
+        dim = loaded_weight.shape[1]
+        for i in range(n_kv_head):
+            loaded_weight[i * head_dim : (i + 1) * head_dim, :] = loaded_weight[
+                2 * i * head_dim : (2 * i + 1) * head_dim, :
+            ]
+        original_kv_weight = loaded_weight[: n_kv_head * head_dim, :]
+        assert original_kv_weight.shape == (n_kv_head * head_dim, dim)
+        return original_kv_weight
+
+    def weight_loader_srt(
+        self,
+        param: Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: Optional[str] = None,
+    ):
+        if (
+            loaded_shard_id in ["k", "v"]
+            and loaded_weight.shape[0] == self.head_size * self.total_num_kv_heads * 2
+        ):
+            loaded_weight = get_original_weight(loaded_weight, self.head_size)
+
+        origin_weight_loader(self, param, loaded_weight, loaded_shard_id)
+
+    setattr(QKVParallelLinear, "weight_loader", weight_loader_srt)

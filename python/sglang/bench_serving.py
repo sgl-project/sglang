@@ -5,6 +5,9 @@ Benchmark online serving.
 
 Usage:
 python3 -m sglang.bench_serving --backend sglang --num-prompt 10
+
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
+python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate-range 1,2,4,8,16,32 --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --multi
 """
 
 import argparse
@@ -54,6 +57,7 @@ class RequestFuncOutput:
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
     prompt_len: int = 0
     error: str = ""
+    output_len: int = 0
 
 
 def remove_prefix(text: str, prefix: str) -> str:
@@ -70,15 +74,15 @@ async def async_request_trt_llm(
     assert api_url.endswith("generate_stream")
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        assert not request_func_input.use_beam_search
-        assert request_func_input.best_of == 1
         payload = {
             "accumulate_tokens": True,
             "text_input": request_func_input.prompt,
-            "temperature": 0.0,
+            "temperature": 0.000001,
             "top_p": 1.0,
             "max_tokens": request_func_input.output_len,
             "stream": True,
+            "min_length": request_func_input.output_len,
+            "end_id": 1048576,
         }
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
@@ -112,6 +116,7 @@ async def async_request_trt_llm(
 
                     output.latency = most_recent_timestamp - st
                     output.success = True
+                    output.output_len = request_func_input.output_len
 
                 else:
                     output.error = response.reason or ""
@@ -191,6 +196,7 @@ async def async_request_openai_completions(
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
+                    output.output_len = request_func_input.output_len
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -244,9 +250,11 @@ class BenchmarkMetrics:
     completed: int
     total_input: int
     total_output: int
+    total_output_retokenized: int
     request_throughput: float
     input_throughput: float
     output_throughput: float
+    output_throughput_retokenized: float
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
@@ -259,6 +267,8 @@ class BenchmarkMetrics:
     median_itl_ms: float
     std_itl_ms: float
     p99_itl_ms: float
+    mean_e2e_latency_ms: float
+    median_e2e_latency_ms: float
 
 
 default_sharegpt_path = "ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -359,7 +369,7 @@ def sample_random_requests(
 ) -> List[Tuple[str, int, int]]:
 
     input_lens = np.random.randint(
-        int(input_len * range_ratio),
+        max(int(input_len * range_ratio), 1),
         input_len + 1,
         size=num_prompts,
     )
@@ -405,7 +415,7 @@ def sample_random_requests(
             prompt_token_ids = tokenizer(prompt).input_ids
             prompt_len = len(prompt_token_ids)
 
-            if prompt_len <= input_lens[i]:
+            if prompt_len > input_lens[i]:
                 input_ids = prompt_token_ids[: input_lens[i]]
             else:
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
@@ -453,31 +463,36 @@ def calculate_metrics(
     outputs: List[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
+    backend: str,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
-    actual_output_lens: List[int] = []
+    output_lens: List[int] = []
+    retokenized_output_lens: List[int] = []
     total_input = 0
     completed = 0
     itls: List[float] = []
     tpots: List[float] = []
     ttfts: List[float] = []
+    e2e_latencies: List[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
-            # We use the tokenizer to count the number of output tokens for all
-            # serving backends instead of looking at len(outputs[i].itl) since
-            # multiple output tokens may be bundled together
-            # Note : this may inflate the output token count slightly
-            output_len = len(
+            output_len = outputs[i].output_len
+            output_lens.append(output_len)
+            retokenized_output_len = len(
                 tokenizer(outputs[i].generated_text, add_special_tokens=False).input_ids
             )
-            actual_output_lens.append(output_len)
+            retokenized_output_lens.append(retokenized_output_len)
             total_input += input_requests[i][1]
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
+
+            e2e_latencies.append(outputs[i].latency)
+
             completed += 1
         else:
-            actual_output_lens.append(0)
+            output_lens.append(0)
+            retokenized_output_lens.append(0)
 
     if completed == 0:
         warnings.warn(
@@ -488,10 +503,12 @@ def calculate_metrics(
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
-        total_output=sum(actual_output_lens),
+        total_output=sum(output_lens),
+        total_output_retokenized=sum(retokenized_output_lens),
         request_throughput=completed / dur_s,
         input_throughput=total_input / dur_s,
-        output_throughput=sum(actual_output_lens) / dur_s,
+        output_throughput=sum(output_lens) / dur_s,
+        output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
@@ -505,9 +522,11 @@ def calculate_metrics(
         median_itl_ms=np.median(itls or 0) * 1000,
         std_itl_ms=np.std(itls or 0) * 1000,
         p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
+        mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
+        median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
     )
 
-    return metrics, actual_output_lens
+    return metrics, output_lens
 
 
 async def benchmark(
@@ -568,19 +587,26 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    metrics, actual_output_lens = calculate_metrics(
+    metrics, output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
+        backend=backend,
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
+    print("{:<40} {:<10}".format("Backend:", backend))
     print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+    print(
+        "{:<40} {:<10}".format(
+            "Total generated tokens (retokenized):", metrics.total_output_retokenized
+        )
+    )
     print(
         "{:<40} {:<10.2f}".format(
             "Request throughput (req/s):", metrics.request_throughput
@@ -594,6 +620,15 @@ async def benchmark(
     print(
         "{:<40} {:<10.2f}".format(
             "Output token throughput (tok/s):", metrics.output_throughput
+        )
+    )
+    print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
+    print(
+        "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
         )
     )
     print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
@@ -623,8 +658,11 @@ async def benchmark(
             "request_rate": request_rate,
             "total_input": metrics.total_input,
             "total_output": metrics.total_output,
+            "total_output_retokenized": metrics.total_output_retokenized,
+            "mean_e2e_latency": metrics.mean_e2e_latency_ms,
+            "median_e2e_latency": metrics.median_e2e_latency_ms,
             "median_ttft": metrics.median_ttft_ms,
-            "median_itl": metrics.mean_itl_ms,
+            "median_itl": metrics.median_itl_ms,
             "output_token_throughput": metrics.output_throughput,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
@@ -655,6 +693,7 @@ async def benchmark(
         "completed": metrics.completed,
         "total_input_tokens": metrics.total_input,
         "total_output_tokens": metrics.total_output,
+        "total_output_tokens_retokenized": metrics.total_output_retokenized,
         "request_throughput": metrics.request_throughput,
         "input_throughput": metrics.input_throughput,
         "output_throughput": metrics.output_throughput,
@@ -671,11 +710,13 @@ async def benchmark(
         "std_itl_ms": metrics.std_itl_ms,
         "p99_itl_ms": metrics.p99_itl_ms,
         "input_lens": [output.prompt_len for output in outputs],
-        "output_lens": actual_output_lens,
+        "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
+        "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
     }
     return result
 
@@ -894,7 +935,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--random-range-ratio",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random dataset.",
     )

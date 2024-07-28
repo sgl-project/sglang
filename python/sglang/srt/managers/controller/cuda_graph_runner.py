@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """Run the model with cuda graph."""
 
 import bisect
@@ -9,7 +24,11 @@ from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
-from sglang.srt.layers.logits_processor import LogitProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitProcessorOutput,
+    LogitsMetadata,
+    LogitsProcessor,
+)
 from sglang.srt.managers.controller.infer_batch import (
     Batch,
     ForwardMode,
@@ -185,7 +204,6 @@ class CudaGraphRunner:
 
     def replay(self, batch: Batch):
         assert batch.out_cache_loc is not None
-        assert not batch.return_logprob
         raw_bs = len(batch.reqs)
 
         # Pad
@@ -218,23 +236,29 @@ class CudaGraphRunner:
         output = self.output_buffers[bs]
 
         # Unpad
-        if bs == raw_bs:
-            return output
-        else:
+        if bs != raw_bs:
             output = LogitProcessorOutput(
                 next_token_logits=output.next_token_logits[:raw_bs],
-                next_token_logprobs=(
-                    output.next_token_logprobs[:raw_bs]
-                    if output.next_token_logprobs is not None
-                    else None
-                ),
+                next_token_logprobs=None,
                 normalized_prompt_logprobs=None,
-                prefill_token_logprobs=None,
-                prefill_top_logprobs=None,
-                decode_top_logprobs=(
-                    output.decode_top_logprobs[:raw_bs]
-                    if output.decode_top_logprobs is not None
-                    else None
-                ),
+                input_token_logprobs=None,
+                input_top_logprobs=None,
+                output_top_logprobs=None,
             )
+
+        # Extract logprobs
+        if batch.return_logprob:
+            output.next_token_logprobs = torch.nn.functional.log_softmax(
+                output.next_token_logits, dim=-1
+            )
+            return_top_logprob = any(x > 0 for x in batch.top_logprobs_nums)
+            if return_top_logprob:
+                logits_metadata = LogitsMetadata(
+                    forward_mode=ForwardMode.DECODE,
+                    top_logprobs_nums=batch.top_logprobs_nums,
+                )
+                output.output_top_logprobs = LogitsProcessor.get_top_logprobs(
+                    output.next_token_logprobs, logits_metadata
+                )[1]
+
         return output

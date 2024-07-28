@@ -541,16 +541,16 @@ class StreamExecutor:
         (
             decision,
             normalized_prompt_logprobs,
-            prefill_token_logprobs,
-            decode_token_logprobs,
+            input_token_logprobs,
+            output_token_logprobs,
         ) = self.backend.select(self, expr.choices, expr.temperature)
         if expr.name is not None:
             name = expr.name
             self.variables[name] = decision
             self.meta_info[name] = {
                 "normalized_prompt_logprobs": normalized_prompt_logprobs,
-                "prefill_token_logprobs": prefill_token_logprobs,
-                "decode_token_logprobs": decode_token_logprobs,
+                "input_token_logprobs": input_token_logprobs,
+                "output_token_logprobs": output_token_logprobs,
             }
             self.variable_event[name].set()
         self.text_ += decision

@@ -1,21 +1,43 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """Utilities for Huggingface Transformers."""
 
 import functools
 import json
 import os
 import warnings
-from typing import AbstractSet, Collection, Literal, Optional, Union
+from typing import AbstractSet, Collection, Dict, Literal, Optional, Type, Union
 
 from huggingface_hub import snapshot_download
 from transformers import (
     AutoConfig,
     AutoProcessor,
     AutoTokenizer,
+    PretrainedConfig,
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
+from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
 
 from sglang.srt.utils import is_multimodal_model
+
+_CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
+    ChatGLMConfig.model_type: ChatGLMConfig,
+    DbrxConfig.model_type: DbrxConfig,
+}
 
 
 def download_from_hf(model_path: str):
@@ -40,6 +62,9 @@ def get_config(
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision
     )
+    if config.model_type in _CONFIG_REGISTRY:
+        config_class = _CONFIG_REGISTRY[config.model_type]
+        config = config_class.from_pretrained(model, revision=revision)
     if model_overide_args:
         config.update(model_overide_args)
     return config
@@ -63,6 +88,10 @@ def get_context_length(config):
     rope_scaling = getattr(config, "rope_scaling", None)
     if rope_scaling:
         rope_scaling_factor = config.rope_scaling["factor"]
+        if "original_max_position_embeddings" in rope_scaling:
+            rope_scaling_factor = 1
+        if config.rope_scaling.get("rope_type", None) == "llama3":
+            rope_scaling_factor = 1
     else:
         rope_scaling_factor = 1
 

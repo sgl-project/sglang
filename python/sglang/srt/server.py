@@ -1,4 +1,19 @@
 """
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+"""
 The entry point of inference server.
 SRT = SGLang Runtime.
 """
@@ -57,6 +72,7 @@ from sglang.srt.utils import (
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
+    maybe_set_triton_cache_manager,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
@@ -68,9 +84,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 app = FastAPI()
 tokenizer_manager = None
-
-# Put some args for easily access
-global_server_args_dict = {}
 
 
 @app.get("/health")
@@ -183,14 +196,6 @@ def available_models():
     return ModelList(data=model_cards)
 
 
-def _set_global_server_args(server_args: ServerArgs):
-    global global_server_args_dict
-    global_server_args_dict = {
-        "disable_flashinfer": server_args.disable_flashinfer,
-        "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
-    }
-
-
 def _set_torch_compile_config():
     # The following configurations are for torch compile optimizations
     import torch._dynamo.config
@@ -209,6 +214,8 @@ def launch_server(
     model_overide_args: Optional[dict] = None,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
+    server_args.check_server_args()
+
     """Launch an HTTP server."""
     global tokenizer_manager
 
@@ -221,6 +228,7 @@ def launch_server(
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
     os.environ["NCCL_NVLS_ENABLE"] = "0"
+    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     set_ulimit()
     if server_args.show_time_cost:
         enable_show_time_cost()
@@ -234,14 +242,14 @@ def launch_server(
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
+    if server_args.tp_size * server_args.dp_size > 1:
+        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
+        maybe_set_triton_cache_manager()
     if server_args.chat_template:
         # TODO: replace this with huggingface transformers template
         load_chat_template_for_openai_api(server_args.chat_template)
-
     if server_args.enable_torch_compile:
         _set_torch_compile_config()
-
-    _set_global_server_args(server_args)
 
     # Allocate ports
     server_args.port, server_args.additional_ports = allocate_init_ports(
@@ -256,11 +264,10 @@ def launch_server(
         detokenizer_port=ports[2],
         nccl_ports=ports[3:],
     )
+    logger.info(f"{server_args=}")
 
     # Handle multi-node tensor parallelism
     if server_args.nnodes > 1:
-        assert server_args.dp_size == 1, "Multi-node dp is not supported."
-
         if server_args.node_rank != 0:
             tp_size_local = server_args.tp_size // server_args.nnodes
             gpu_ids = [

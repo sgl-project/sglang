@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """Meta data for requests and batches"""
 
 import warnings
@@ -9,12 +24,20 @@ import numpy as np
 import torch
 from flashinfer.sampling import top_k_top_p_sampling_from_probs
 
+from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.managers.controller.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
+
+# Put some global args for easy access
+global_server_args_dict = {
+    "disable_flashinfer": False,
+    "disable_flashinfer_sampling": False,
+    "attention_reduce_in_fp32": False,
+}
 
 
 class ForwardMode(IntEnum):
@@ -123,10 +146,10 @@ class Req:
         self.logprob_start_len = 0
         self.top_logprobs_num = 0
         self.normalized_prompt_logprob = None
-        self.prefill_token_logprobs = None
-        self.prefill_top_logprobs = None
-        self.decode_token_logprobs = []
-        self.decode_top_logprobs = []
+        self.input_token_logprobs = None
+        self.input_top_logprobs = None
+        self.output_token_logprobs = []
+        self.output_top_logprobs = []
         # The tokens is prefilled but need to be considered as decode tokens
         # and should be updated for the decode logprobs
         self.last_update_decode_tokens = 0
@@ -243,8 +266,8 @@ class Req:
                     k = k + 1
                 else:
                     break
-            self.decode_token_logprobs = self.decode_token_logprobs[:k]
-            self.decode_top_logprobs = self.decode_top_logprobs[:k]
+            self.output_token_logprobs = self.output_token_logprobs[:k]
+            self.output_top_logprobs = self.output_top_logprobs[:k]
             self.logprob_start_len = prompt_tokens + k
             self.last_update_decode_tokens = len(self.output_ids) - k
 
@@ -375,7 +398,7 @@ class Batch:
                     logit_bias = torch.zeros(
                         (bs, vocab_size), dtype=torch.float32, device=device
                     )
-                logit_bias[i] = int_token_logit_bias
+                logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
 
         # Set fields
         self.input_ids = torch.tensor(
@@ -431,7 +454,8 @@ class Batch:
 
     def retract_decode(self):
         sorted_indices = [i for i in range(len(self.reqs))]
-        # TODO(lsyin): improve the priority of retraction
+
+        # TODO(lsyin): improve retraction policy for radix cache
         sorted_indices.sort(
             key=lambda i: (
                 len(self.reqs[i].output_ids),
@@ -443,7 +467,17 @@ class Batch:
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
-        while self.token_to_kv_pool.available_size() < len(self.reqs):
+        while (
+            self.token_to_kv_pool.available_size()
+            < len(sorted_indices) * global_config.retract_decode_steps
+        ):
+            if len(sorted_indices) == 1:
+                # Corner case: only one request left
+                assert (
+                    self.token_to_kv_pool.available_size() > 0
+                ), "No space left for only one request"
+                break
+
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
@@ -468,7 +502,16 @@ class Batch:
 
         self.filter_batch(sorted_indices)
 
-        return retracted_reqs
+        # Reqs in batch are filtered
+        total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
+        total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
+
+        new_estimate_ratio = (
+            total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
+        ) / total_max_new_tokens
+        new_estimate_ratio = min(1.0, new_estimate_ratio)
+
+        return retracted_reqs, new_estimate_ratio
 
     def check_for_jump_forward(self, model_runner):
         jump_forward_reqs = []
@@ -666,13 +709,21 @@ class Batch:
         # TODO(lmzheng): apply penalty
         probs = torch.softmax(logits, dim=-1)
 
-        max_top_k_round, batch_size = 32, probs.shape[0]
-        uniform_samples = torch.rand((max_top_k_round, batch_size), device=probs.device)
-        batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
-            probs, uniform_samples, self.top_ks, self.top_ps
-        )
+        if not global_server_args_dict["disable_flashinfer_sampling"]:
+            max_top_k_round, batch_size = 32, probs.shape[0]
+            uniform_samples = torch.rand(
+                (max_top_k_round, batch_size), device=probs.device
+            )
+            batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
+                probs, uniform_samples, self.top_ks, self.top_ps
+            )
+        else:
+            # Here we provide a slower fallback implementation.
+            batch_next_token_ids, success = top_k_top_p_sampling_from_probs_torch(
+                probs, self.top_ks, self.top_ps
+            )
 
-        if torch.any(~success):
+        if not torch.all(success):
             warnings.warn("Sampling failed, fallback to top_k=1 strategy")
             probs = probs.masked_fill(torch.isnan(probs), 0.0)
             argmax_ids = torch.argmax(probs, dim=-1)
@@ -726,6 +777,7 @@ class InputMetadata:
     flashinfer_prefill_wrapper_ragged: "BatchPrefillWithRaggedKVCacheWrapper" = None
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
+    use_ragged: bool = False
 
     @classmethod
     def create(
@@ -741,7 +793,10 @@ class InputMetadata:
         return_logprob=False,
         skip_flashinfer_init=False,
     ):
+        use_ragged = False
         if not skip_flashinfer_init and not model_runner.server_args.disable_flashinfer:
+            if forward_mode != ForwardMode.DECODE and int(torch.sum(seq_lens)) > 4096:
+                use_ragged = True
             init_flashinfer_args(
                 forward_mode,
                 model_runner,
@@ -749,6 +804,7 @@ class InputMetadata:
                 seq_lens,
                 prefix_lens,
                 model_runner.flashinfer_decode_wrapper,
+                use_ragged,
             )
 
         batch_size = len(req_pool_indices)
@@ -803,6 +859,7 @@ class InputMetadata:
             flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
             flashinfer_prefill_wrapper_paged=model_runner.flashinfer_prefill_wrapper_paged,
             flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
+            use_ragged=use_ragged,
         )
 
         if model_runner.server_args.disable_flashinfer:
@@ -823,17 +880,19 @@ def init_flashinfer_args(
     seq_lens,
     prefix_lens,
     flashinfer_decode_wrapper,
+    use_ragged=False,
 ):
     """Init auxiliary variables for FlashInfer attention backend."""
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
     num_kv_heads = model_runner.model_config.get_num_kv_heads(model_runner.tp_size)
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
+    total_num_tokens = int(torch.sum(seq_lens))
 
-    if forward_mode == ForwardMode.DECODE:
-        paged_kernel_lens = seq_lens
-    else:
+    if use_ragged:
         paged_kernel_lens = prefix_lens
+    else:
+        paged_kernel_lens = seq_lens
 
     kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
     kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -866,14 +925,15 @@ def init_flashinfer_args(
         qo_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
 
-        model_runner.flashinfer_prefill_wrapper_ragged.end_forward()
-        model_runner.flashinfer_prefill_wrapper_ragged.begin_forward(
-            qo_indptr,
-            qo_indptr,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-        )
+        if use_ragged:
+            model_runner.flashinfer_prefill_wrapper_ragged.end_forward()
+            model_runner.flashinfer_prefill_wrapper_ragged.begin_forward(
+                qo_indptr,
+                qo_indptr,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+            )
 
         # cached part
         model_runner.flashinfer_prefill_wrapper_paged.end_forward()
@@ -903,3 +963,29 @@ def init_triton_args(forward_mode, seq_lens, prefix_lens):
         max_extend_len = int(torch.max(extend_seq_lens))
 
     return max_seq_len, max_extend_len, start_loc, prefix_lens
+
+
+def top_k_top_p_sampling_from_probs_torch(
+    probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor
+):
+    """A top-k and top-k sampling implementation with native pytorch operations."""
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    probs_sort[
+        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+        >= top_ks.view(-1, 1)
+    ] = 0.0
+    probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
+    try:
+        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+    except RuntimeError:
+        batch_next_token_ids = torch.zeros(
+            (probs_sort.shape[0],), dtype=torch.int64, device=probs.device
+        )
+        success = torch.zeros(probs.shape[0], dtype=torch.bool, device=probs.device)
+        return batch_next_token_ids, success
+
+    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
+    success = torch.ones(probs.shape[0], dtype=torch.bool, device=probs.device)
+    return batch_next_token_ids, success
