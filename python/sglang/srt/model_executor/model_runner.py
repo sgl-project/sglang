@@ -47,7 +47,12 @@ from sglang.srt.managers.schedule_batch import (
     InputMetadata,
     global_server_args_dict,
 )
+<<<<<<< 001b0bdd089a626ada2ee217fdc59b4212f0b461:python/sglang/srt/model_executor/model_runner.py
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
+=======
+from sglang.srt.memory_pool import MHATokenToKVPool, MLATokenToKVPool, ReqToTokenPool
+from sglang.srt.model_config import AttentionArch
+>>>>>>> support MLA kv pool:python/sglang/srt/managers/controller/model_runner.py
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -193,15 +198,20 @@ class ModelRunner:
         available_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
         )
-        head_dim = self.model_config.head_dim
-        head_num = self.model_config.get_num_kv_heads(self.tp_size)
-        cell_size = (
-            head_num
-            * head_dim
-            * self.model_config.num_hidden_layers
-            * 2
-            * torch._utils._element_size(self.dtype)
-        )
+        if self.model_config.attention_arch == AttentionArch.MLA:
+            cell_size = (
+                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
+                * self.model_config.num_hidden_layers
+                * torch._utils._element_size(self.dtype)
+            )
+        else:
+            cell_size = (
+                self.model_config.get_num_kv_heads(self.tp_size)
+                * self.model_config.head_dim
+                * self.model_config.num_hidden_layers
+                * 2
+                * torch._utils._element_size(self.dtype)
+            )
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
@@ -241,13 +251,22 @@ class ModelRunner:
             max_num_reqs,
             self.model_config.context_len + 8,
         )
-        self.token_to_kv_pool = TokenToKVPool(
-            self.max_total_num_tokens,
-            dtype=self.dtype,
-            head_num=self.model_config.get_num_kv_heads(self.tp_size),
-            head_dim=self.model_config.head_dim,
-            layer_num=self.model_config.num_hidden_layers,
-        )
+        if self.model_config.attention_arch == AttentionArch.MLA:
+            self.token_to_kv_pool = MLATokenToKVPool(
+                self.max_total_num_tokens,
+                dtype=self.dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+            )
+        else:
+            self.token_to_kv_pool = MHATokenToKVPool(
+                self.max_total_num_tokens,
+                dtype=self.dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+            )
         logger.info(
             f"[gpu={self.gpu_id}] Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
