@@ -75,7 +75,7 @@ def gen(
     choices: Optional[List[str]] = None,
     regex: Optional[str] = None,
 ):
-    """Call the model to generate. See the meaning of the arguments in docs/sampling_params.md"""
+    """Call the model to generate. See the meaning of the arguments in docs/en/sampling_params.md"""
 
     if choices:
         return SglSelect(name, choices, 0.0 if temperature is None else temperature)
