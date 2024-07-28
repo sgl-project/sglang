@@ -306,7 +306,11 @@ class ModelTpServer:
             )
             req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
         req.sampling_params.max_new_tokens = min(
-            req.sampling_params.max_new_tokens or 1 << 30,
+            (
+                req.sampling_params.max_new_tokens
+                if req.sampling_params.max_new_tokens is not None
+                else 1 << 30
+            ),
             self.max_req_input_len - 1 - len(req.origin_input_ids),
         )
         self.forward_queue.append(req)
