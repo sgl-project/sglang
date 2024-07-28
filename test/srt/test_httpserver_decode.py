@@ -13,14 +13,15 @@ import json
 import requests
 
 
-def test_decode(url, return_logprob, top_logprobs_num, return_text):
+def test_decode(url, return_logprob=False, top_logprobs_num=0, return_text=False, n=1):
     response = requests.post(
         url + "/generate",
         json={
             "text": "The capital of France is",
             "sampling_params": {
-                "temperature": 0,
+                "temperature": 0 if n == 1 else 0.5,
                 "max_new_tokens": 32,
+                "n": n,
             },
             "stream": False,
             "return_logprob": return_logprob,
@@ -41,8 +42,9 @@ if __name__ == "__main__":
 
     url = f"{args.host}:{args.port}"
 
-    test_decode(url, False, 0, False)
-    test_decode(url, True, 0, False)
-    test_decode(url, True, 0, True)
-    test_decode(url, True, 3, False)
-    test_decode(url, True, 3, True)
+    test_decode(url)
+    test_decode(url, n=3)
+
+    for top_logprobs_num in [0, 3]:
+        for return_text in [True, False]:
+            test_decode(url, return_logprob=True, top_logprobs_num=top_logprobs_num, return_text=return_text)
