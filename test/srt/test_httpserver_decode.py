@@ -47,4 +47,9 @@ if __name__ == "__main__":
 
     for top_logprobs_num in [0, 3]:
         for return_text in [True, False]:
-            test_decode(url, return_logprob=True, top_logprobs_num=top_logprobs_num, return_text=return_text)
+            test_decode(
+                url,
+                return_logprob=True,
+                top_logprobs_num=top_logprobs_num,
+                return_text=return_text,
+            )
