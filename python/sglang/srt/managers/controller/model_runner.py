@@ -25,7 +25,12 @@ from vllm.distributed import (
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
-from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode, InputMetadata
+from sglang.srt.managers.controller.infer_batch import (
+    Batch,
+    ForwardMode,
+    InputMetadata,
+    global_server_args_dict,
+)
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -60,7 +65,13 @@ class ModelRunner:
         self.nccl_port = nccl_port
         self.server_args = server_args
         self.is_multimodal_model = is_multimodal_model(self.model_config)
-        monkey_patch_vllm_dummy_weight_loader()
+        global_server_args_dict.update(
+            {
+                "disable_flashinfer": server_args.disable_flashinfer,
+                "disable_flashinfer_sampling": server_args.disable_flashinfer_sampling,
+                "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
+            }
+        )
 
         # Init torch distributed
         torch.cuda.set_device(self.gpu_id)
@@ -108,6 +119,7 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
+        monkey_patch_vllm_dummy_weight_loader()
         device_config = DeviceConfig()
         load_config = LoadConfig(load_format=self.server_args.load_format)
         vllm_model_config = VllmModelConfig(
