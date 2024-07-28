@@ -6,7 +6,7 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import transformers
@@ -469,7 +469,9 @@ class TokenizerManager:
                 )
         return ret
 
-    def detokenize_logprob_tokens(self, token_logprobs, decode_to_text: bool):
+    def detokenize_logprob_tokens(
+        self, token_logprobs: List[Tuple[float, int]], decode_to_text: bool
+    ):
         if not decode_to_text:
             return [(logprob, token_id, None) for logprob, token_id in token_logprobs]
 
@@ -481,9 +483,13 @@ class TokenizerManager:
         ]
 
     def detokenize_top_logprobs_tokens(self, top_logprobs, decode_to_text: bool):
-        for i, t in enumerate(top_logprobs):
-            if t:
-                top_logprobs[i] = self.detokenize_logprob_tokens(t, decode_to_text)
+        # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
+        # We should batch all top-k tokens in all positions.
+        for i, token_log_probs in enumerate(top_logprobs):
+            if token_log_probs:
+                top_logprobs[i] = self.detokenize_logprob_tokens(
+                    token_log_probs, decode_to_text
+                )
         return top_logprobs
 
 
