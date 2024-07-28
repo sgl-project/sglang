@@ -176,6 +176,8 @@ def launch_server(
     model_overide_args: Optional[dict] = None,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
+    server_args.check_server_args()
+
     """Launch an HTTP server."""
     global tokenizer_manager
 
@@ -230,8 +232,6 @@ def launch_server(
 
     # Handle multi-node tensor parallelism
     if server_args.nnodes > 1:
-        assert server_args.dp_size == 1, "Multi-node dp is not supported."
-
         if server_args.node_rank != 0:
             tp_size_local = server_args.tp_size // server_args.nnodes
             gpu_ids = [

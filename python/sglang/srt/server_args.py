@@ -364,6 +364,14 @@ class ServerArgs:
             f"disable_disk_cache={self.disable_disk_cache}, "
         )
 
+    def check_server_args(self):
+        assert (
+            self.tp_size % self.nnodes == 0
+        ), "tp_size must be divisible by number of nodes"
+        assert not (
+            self.dp_size > 1 and self.node_rank is not None
+        ), "multi-node data parallel is not supported"
+
 
 @dataclasses.dataclass
 class PortArgs:
