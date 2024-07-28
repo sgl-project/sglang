@@ -22,7 +22,7 @@ PACKAGE_LIST = [
     "huggingface_hub",
     "interegular",
     "packaging",
-    "pillow",
+    "PIL",
     "psutil",
     "pydantic",
     "uvicorn",
