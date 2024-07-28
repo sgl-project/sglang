@@ -8,6 +8,7 @@ import numpy as np
 
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import ChatTemplate, get_chat_template_by_model_path
+from sglang.lang.choices import ChoicesDecision, ChoicesSamplingMethod
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
 
@@ -296,11 +297,16 @@ class OpenAI(BaseBackend):
         s: StreamExecutor,
         choices: List[str],
         temperature: float,
-    ):
+        choices_method: Optional[ChoicesSamplingMethod],
+    ) -> ChoicesDecision:
         if self.is_chat_model:
             raise NotImplementedError(
                 "select/choices is not supported for chat models. "
                 "Please try to use a non-chat model such as gpt-3.5-turbo-instruct"
+            )
+        if choices_method:
+            raise NotImplementedError(
+                "choices_method is not supported for OpenAI backend. Leave as None."
             )
 
         n_choices = len(choices)
@@ -354,8 +360,10 @@ class OpenAI(BaseBackend):
 
             prompt_tokens.append(ret_token)
 
-        decision = choices[np.argmax(scores)]
-        return decision, scores, None, None
+        return ChoicesDecision(
+            decision=choices[np.argmax(scores)],
+            meta_info={"scores": scores},
+        )
 
 
 def openai_completion(

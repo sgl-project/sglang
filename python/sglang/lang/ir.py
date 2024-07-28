@@ -6,6 +6,7 @@ import warnings
 from typing import List, Optional, Union
 
 from sglang.global_config import global_config
+from sglang.lang.choices import ChoicesSamplingMethod
 
 REGEX_INT = r"[-+]?[0-9]+"
 REGEX_FLOAT = r"[-+]?[0-9]*\.?[0-9]+"
@@ -461,14 +462,22 @@ class SglRoleEnd(SglExpr):
 
 
 class SglSelect(SglExpr):
-    def __init__(self, name: str, choices: List[str], temperature: float):
+
+    def __init__(
+        self,
+        name: str,
+        choices: List[str],
+        temperature: float,
+        choices_method: Optional[ChoicesSamplingMethod],
+    ):
         super().__init__()
         self.name = name
         self.choices = choices
         self.temperature = temperature
+        self.choices_method = choices_method
 
     def __repr__(self):
-        return f"Select({self.name}, choices={self.choices})"
+        return f"Select({self.name}, choices={self.choices}, choices_method={self.choices_method})"
 
 
 class SglFork(SglExpr):
