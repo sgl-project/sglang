@@ -9,7 +9,11 @@ from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
-from sglang.srt.layers.logits_processor import LogitProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitProcessorOutput,
+    LogitsMetadata,
+    LogitsProcessor,
+)
 from sglang.srt.managers.controller.infer_batch import (
     Batch,
     ForwardMode,
@@ -185,7 +189,6 @@ class CudaGraphRunner:
 
     def replay(self, batch: Batch):
         assert batch.out_cache_loc is not None
-        assert not batch.return_logprob
         raw_bs = len(batch.reqs)
 
         # Pad
@@ -218,23 +221,29 @@ class CudaGraphRunner:
         output = self.output_buffers[bs]
 
         # Unpad
-        if bs == raw_bs:
-            return output
-        else:
+        if bs != raw_bs:
             output = LogitProcessorOutput(
                 next_token_logits=output.next_token_logits[:raw_bs],
-                next_token_logprobs=(
-                    output.next_token_logprobs[:raw_bs]
-                    if output.next_token_logprobs is not None
-                    else None
-                ),
+                next_token_logprobs=None,
                 normalized_prompt_logprobs=None,
                 prefill_token_logprobs=None,
                 prefill_top_logprobs=None,
-                decode_top_logprobs=(
-                    output.decode_top_logprobs[:raw_bs]
-                    if output.decode_top_logprobs is not None
-                    else None
-                ),
+                decode_top_logprobs=None,
             )
+
+        # Extract logprobs
+        if batch.return_logprob:
+            output.next_token_logprobs = torch.nn.functional.log_softmax(
+                output.next_token_logits, dim=-1
+            )
+            return_top_logprob = any(x > 0 for x in batch.top_logprobs_nums)
+            if return_top_logprob:
+                logits_metadata = LogitsMetadata(
+                    forward_mode=ForwardMode.DECODE,
+                    top_logprobs_nums=batch.top_logprobs_nums,
+                )
+                output.decode_top_logprobs = LogitsProcessor.get_top_logprobs(
+                    output.next_token_logprobs, logits_metadata
+                )[1]
+
         return output
