@@ -448,23 +448,23 @@ class TokenizerManager:
         return_text_in_logprobs: bool,
     ):
         if return_logprob:
-            ret["meta_info"]["prefill_token_logprobs"] = self.detokenize_logprob_tokens(
-                ret["meta_info"]["prefill_token_logprobs"], return_text_in_logprobs
+            ret["meta_info"]["input_token_logprobs"] = self.detokenize_logprob_tokens(
+                ret["meta_info"]["input_token_logprobs"], return_text_in_logprobs
             )
-            ret["meta_info"]["decode_token_logprobs"] = self.detokenize_logprob_tokens(
-                ret["meta_info"]["decode_token_logprobs"], return_text_in_logprobs
+            ret["meta_info"]["output_token_logprobs"] = self.detokenize_logprob_tokens(
+                ret["meta_info"]["output_token_logprobs"], return_text_in_logprobs
             )
 
             if top_logprobs_num > 0:
-                ret["meta_info"]["prefill_top_logprobs"] = (
+                ret["meta_info"]["input_top_logprobs"] = (
                     self.detokenize_top_logprobs_tokens(
-                        ret["meta_info"]["prefill_top_logprobs"],
+                        ret["meta_info"]["input_top_logprobs"],
                         return_text_in_logprobs,
                     )
                 )
-                ret["meta_info"]["decode_top_logprobs"] = (
+                ret["meta_info"]["output_top_logprobs"] = (
                     self.detokenize_top_logprobs_tokens(
-                        ret["meta_info"]["decode_top_logprobs"], return_text_in_logprobs
+                        ret["meta_info"]["output_top_logprobs"], return_text_in_logprobs
                     )
                 )
         return ret

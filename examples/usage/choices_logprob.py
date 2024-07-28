@@ -20,8 +20,8 @@ def main():
     print("questions:", question)
     print("choice:", state["tool"])
     meta_info = state.get_meta_info("tool")
-    print("logprobs of choice 1", meta_info["prefill_token_logprobs"][0])
-    print("logprobs of choice 2", meta_info["prefill_token_logprobs"][1])
+    print("logprobs of choice 1", meta_info["input_token_logprobs"][0])
+    print("logprobs of choice 2", meta_info["input_token_logprobs"][1])
     print("-" * 50)
 
     # Run a batch
@@ -34,8 +34,8 @@ def main():
         print("questions:", question)
         print("choice:", state["tool"])
         meta_info = state.get_meta_info("tool")
-        print("logprobs of choice 1", meta_info["prefill_token_logprobs"][0])
-        print("logprobs of choice 2", meta_info["prefill_token_logprobs"][1])
+        print("logprobs of choice 1", meta_info["input_token_logprobs"][0])
+        print("logprobs of choice 2", meta_info["input_token_logprobs"][1])
         print("-" * 50)
 
 
