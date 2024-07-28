@@ -57,8 +57,8 @@ class ServerArgs:
     disable_cuda_graph: bool = False
     disable_disk_cache: bool = False
     enable_torch_compile: bool = False
-    attention_reduce_in_fp32: bool = False
     enable_p2p_check: bool = False
+    attention_reduce_in_fp32: bool = False
     efficient_weight_load: bool = False
 
     # Distributed args
@@ -303,7 +303,12 @@ class ServerArgs:
         parser.add_argument(
             "--disable-flashinfer",
             action="store_true",
-            help="Disable flashinfer inference kernels.",
+            help="Disable flashinfer attention kernels.",
+        )
+        parser.add_argument(
+            "--disable-flashinfer-sampling",
+            action="store_true",
+            help="Disable flashinfer sampling kernels.",
         )
         parser.add_argument(
             "--disable-radix-cache",
@@ -331,15 +336,15 @@ class ServerArgs:
             help="Optimize the model with torch.compile, experimental feature.",
         )
         parser.add_argument(
+            "--enable-p2p-check",
+            action="store_true",
+            help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
+        )
+        parser.add_argument(
             "--attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels",
-        )
-        parser.add_argument(
-            "--enable-p2p-check",
-            action="store_true",
-            help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
         )
         parser.add_argument(
             "--efficient-weight-load",

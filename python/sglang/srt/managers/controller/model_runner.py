@@ -60,7 +60,11 @@ class ModelRunner:
         self.nccl_port = nccl_port
         self.server_args = server_args
         self.is_multimodal_model = is_multimodal_model(self.model_config)
-        monkey_patch_vllm_dummy_weight_loader()
+        global_server_args_dict.update({
+            "disable_flashinfer": server_args.disable_flashinfer,
+            "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
+            "disable_flashinfer_sampling": server_args.disable_flashinfer_sampling,
+        })
 
         # Init torch distributed
         torch.cuda.set_device(self.gpu_id)
@@ -108,6 +112,7 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
+        monkey_patch_vllm_dummy_weight_loader()
         device_config = DeviceConfig()
         load_config = LoadConfig(load_format=self.server_args.load_format)
         vllm_model_config = VllmModelConfig(

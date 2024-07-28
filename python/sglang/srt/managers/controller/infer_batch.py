@@ -18,6 +18,10 @@ from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
+# Put some args for easy access
+global_server_args_dict = {}
+
+
 class ForwardMode(IntEnum):
     # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
     PREFILL = auto()
@@ -687,7 +691,7 @@ class Batch:
         # TODO(lmzheng): apply penalty
         probs = torch.softmax(logits, dim=-1)
 
-        if True:
+        if not global_server_args_dict["disable_flashinfer_sampling"]:
             max_top_k_round, batch_size = 32, probs.shape[0]
             uniform_samples = torch.rand(
                 (max_top_k_round, batch_size), device=probs.device
