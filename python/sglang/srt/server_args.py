@@ -17,8 +17,11 @@ limitations under the License.
 
 import argparse
 import dataclasses
+import logging
 import random
 from typing import List, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -440,12 +443,26 @@ class ServerArgs:
         )
 
     def check_server_args(self):
+        logging.basicConfig(
+            level=getattr(logging, self.log_level.upper()),
+            format="%(message)s",
+        )
+
         assert (
             self.tp_size % self.nnodes == 0
         ), "tp_size must be divisible by number of nodes"
         assert not (
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
+        if "gemma-2" in self.model_path.lower():
+            logger.info(
+                f"When using sliding window in gemma-2, disable radix_cache, regex_jump_forward, and turn on flashinfer."
+            )
+            self.disable_radix_cache = True
+            self.disable_regex_jump_forward = True
+            self.disable_flashinfer = False
+            self.disable_cuda_graph = True
+            self.chunked_prefill_size = -1
 
 
 @dataclasses.dataclass
