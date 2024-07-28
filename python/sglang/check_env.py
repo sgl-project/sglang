@@ -22,7 +22,6 @@ PACKAGE_LIST = [
     "huggingface_hub",
     "interegular",
     "packaging",
-    "pillow",
     "psutil",
     "pydantic",
     "uvicorn",
