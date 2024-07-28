@@ -226,9 +226,9 @@ class CudaGraphRunner:
                 next_token_logits=output.next_token_logits[:raw_bs],
                 next_token_logprobs=None,
                 normalized_prompt_logprobs=None,
-                prefill_token_logprobs=None,
-                prefill_top_logprobs=None,
-                decode_top_logprobs=None,
+                input_token_logprobs=None,
+                input_top_logprobs=None,
+                output_top_logprobs=None,
             )
 
         # Extract logprobs
@@ -242,7 +242,7 @@ class CudaGraphRunner:
                     forward_mode=ForwardMode.DECODE,
                     top_logprobs_nums=batch.top_logprobs_nums,
                 )
-                output.decode_top_logprobs = LogitsProcessor.get_top_logprobs(
+                output.output_top_logprobs = LogitsProcessor.get_top_logprobs(
                     output.next_token_logprobs, logits_metadata
                 )[1]
 

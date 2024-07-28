@@ -54,9 +54,9 @@ class LlamaForClassification(nn.Module):
             next_token_logits=scores,
             next_token_logprobs=scores,
             normalized_prompt_logprobs=scores,
-            prefill_token_logprobs=torch.ones_like(input_ids),
-            prefill_top_logprobs=None,
-            decode_top_logprobs=None,
+            input_token_logprobs=torch.ones_like(input_ids),
+            input_top_logprobs=None,
+            output_top_logprobs=None,
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

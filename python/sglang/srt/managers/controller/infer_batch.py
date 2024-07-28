@@ -124,10 +124,10 @@ class Req:
         self.logprob_start_len = 0
         self.top_logprobs_num = 0
         self.normalized_prompt_logprob = None
-        self.prefill_token_logprobs = None
-        self.prefill_top_logprobs = None
-        self.decode_token_logprobs = []
-        self.decode_top_logprobs = []
+        self.input_token_logprobs = None
+        self.input_top_logprobs = None
+        self.output_token_logprobs = []
+        self.output_top_logprobs = []
         # The tokens is prefilled but need to be considered as decode tokens
         # and should be updated for the decode logprobs
         self.last_update_decode_tokens = 0
@@ -244,8 +244,8 @@ class Req:
                     k = k + 1
                 else:
                     break
-            self.decode_token_logprobs = self.decode_token_logprobs[:k]
-            self.decode_top_logprobs = self.decode_top_logprobs[:k]
+            self.output_token_logprobs = self.output_token_logprobs[:k]
+            self.output_top_logprobs = self.output_top_logprobs[:k]
             self.logprob_start_len = prompt_tokens + k
             self.last_update_decode_tokens = len(self.output_ids) - k
 
