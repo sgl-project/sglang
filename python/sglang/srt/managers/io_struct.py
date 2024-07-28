@@ -20,7 +20,7 @@ class GenerateReqInput:
     # The image input. It can be a file name, a url, or base64 encoded string.
     # See also python/sglang/srt/utils.py:load_image.
     image_data: Optional[Union[List[str], str]] = None
-    # The sampling_params.
+    # The sampling_params. See descriptions below.
     sampling_params: Union[List[Dict], Dict] = None
     # The request id.
     rid: Optional[Union[List[str], str]] = None
@@ -30,7 +30,7 @@ class GenerateReqInput:
     logprob_start_len: Optional[Union[List[int], int]] = None
     # The number of top logprobs to return.
     top_logprobs_num: Optional[Union[List[int], int]] = None
-    # Whether to detokenize tokens in logprobs.
+    # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Whether to stream output.
     stream: bool = False
