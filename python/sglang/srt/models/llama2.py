@@ -158,8 +158,8 @@ class LlamaAttention(nn.Module):
                 input_metadata.sp_size, -1, *ori_hidden_states.shape[1:]
             )
             for sp_rank, idxs in enumerate(input_metadata._debug_normal_to_sp_metadata):
-                sp_real_vals = output[idxs]
-                output_sp[sp_rank][: sp_real_vals.shape[0]] = sp_real_vals
+                tgt_idx, src_idx = idxs
+                output_sp[sp_rank][tgt_idx] = output[src_idx]
             output = output_sp.reshape(ori_hidden_states.shape).contiguous()
         return output
 
