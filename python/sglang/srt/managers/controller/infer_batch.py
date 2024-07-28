@@ -24,6 +24,7 @@ global_server_args_dict = {
     "attention_reduce_in_fp32": False,
 }
 
+
 class ForwardMode(IntEnum):
     # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
     PREFILL = auto()
