@@ -58,8 +58,7 @@ Documentation
 
    sampling_params.md
 
-Indices and tables
+Search Bar
 ==================
 
-* :ref:`genindex`
 * :ref:`search`
