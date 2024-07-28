@@ -485,10 +485,10 @@ class TokenizerManager:
     def detokenize_top_logprobs_tokens(self, top_logprobs, decode_to_text: bool):
         # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
         # We should batch all top-k tokens in all positions.
-        for i, token_log_probs in enumerate(top_logprobs):
-            if token_log_probs:
+        for i, token_top_logprobs in enumerate(top_logprobs):
+            if token_top_logprobs:
                 top_logprobs[i] = self.detokenize_logprob_tokens(
-                    token_log_probs, decode_to_text
+                    token_top_logprobs, decode_to_text
                 )
         return top_logprobs
 
