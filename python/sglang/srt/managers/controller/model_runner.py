@@ -68,8 +68,8 @@ class ModelRunner:
         global_server_args_dict.update(
             {
                 "disable_flashinfer": server_args.disable_flashinfer,
-                "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
                 "disable_flashinfer_sampling": server_args.disable_flashinfer_sampling,
+                "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
             }
         )
 

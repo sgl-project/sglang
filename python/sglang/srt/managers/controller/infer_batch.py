@@ -17,10 +17,12 @@ from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
-
-# Put some args for easy access
-global_server_args_dict = {}
-
+# Put some global args for easy access
+global_server_args_dict = {
+    "disable_flashinfer": False,
+    "disable_flashinfer_sampling": False,
+    "attention_reduce_in_fp32": False,
+}
 
 class ForwardMode(IntEnum):
     # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
