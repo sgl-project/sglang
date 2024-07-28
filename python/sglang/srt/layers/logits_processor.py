@@ -22,12 +22,12 @@ class LogitProcessorOutput:
 
     # The normlaized logprobs of prompts.  shape: [#seq]
     normalized_prompt_logprobs: torch.Tensor
-    # The logprobs of prefill tokens.      shape: [#token, vocab_size]
+    # The logprobs of input tokens.      shape: [#token, vocab_size]
     input_token_logprobs: torch.Tensor
 
-    # The logprob and id of the top-k tokens in prefill positions.  shape [#seq, #token, k] of Tuple(logprob, token_id)
+    # The logprob and id of the top-k tokens in input positions.  shape [#seq, #token, k] of Tuple(logprob, token_id)
     input_top_logprobs: List
-    # The logprob and id of the top-k tokens in decode positions.   shape [#seq, #token, k] of Tuple(logprob, token_id)
+    # The logprob and id of the top-k tokens in output positions. shape [#seq, #token, k] of Tuple(logprob, token_id)
     output_top_logprobs: List
 
 
