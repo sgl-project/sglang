@@ -157,7 +157,7 @@ class ModelTpServer:
         self.token_to_kv_pool = self.model_runner.token_to_kv_pool
 
         # Init running status
-        self.forward_queue: List[Req] = []
+        self.waiting_queue: List[Req] = []
         self.running_batch: Batch = None
         self.out_pyobjs = []
         self.decode_forward_ct = 0
@@ -261,7 +261,7 @@ class ModelTpServer:
             f"#token: {num_used}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             f"gen throughput (token/s): {throughput:.2f}, "
-            f"#queue-req: {len(self.forward_queue)}"
+            f"#queue-req: {len(self.waiting_queue)}"
         )
 
     def check_memory(self):
@@ -328,7 +328,7 @@ class ModelTpServer:
             ),
             self.max_req_input_len - 1 - len(req.origin_input_ids),
         )
-        self.forward_queue.append(req)
+        self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[Batch]:
         running_bs = (
@@ -338,7 +338,7 @@ class ModelTpServer:
             return
 
         # Compute matched prefix length
-        for req in self.forward_queue:
+        for req in self.waiting_queue:
             req.input_ids = req.origin_input_ids + req.output_ids
             prefix_indices, last_node = self.tree_cache.match_prefix(req.input_ids)
             if req.return_logprob:
@@ -348,7 +348,7 @@ class ModelTpServer:
             req.last_node = last_node
 
         # Get priority queue
-        self.forward_queue = self.scheduler.get_priority_queue(self.forward_queue)
+        self.waiting_queue = self.scheduler.get_priority_queue(self.waiting_queue)
 
         # Add requests if there is available space
         can_run_list = []
@@ -367,7 +367,7 @@ class ModelTpServer:
                 ]
             )
 
-        for req in self.forward_queue:
+        for req in self.waiting_queue:
             if req.return_logprob and req.normalized_prompt_logprob is None:
                 # Need at least two tokens to compute normalized logprob
                 if req.extend_input_len < 2:
@@ -440,7 +440,7 @@ class ModelTpServer:
                 f"#cached-token: {hit_tokens}, "
                 f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
                 f"#running-req: {running_bs}, "
-                f"#queue-req: {len(self.forward_queue) - len(can_run_list)}"
+                f"#queue-req: {len(self.waiting_queue) - len(can_run_list)}"
             )
 
         # Return the new batch
@@ -450,7 +450,7 @@ class ModelTpServer:
             self.token_to_kv_pool,
             self.tree_cache,
         )
-        self.forward_queue = [x for x in self.forward_queue if x not in can_run_list]
+        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
         return new_batch
 
     def forward_prefill_batch(self, batch: Batch):
@@ -566,7 +566,7 @@ class ModelTpServer:
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
-            self.forward_queue.extend(retracted_reqs)
+            self.waiting_queue.extend(retracted_reqs)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -576,7 +576,7 @@ class ModelTpServer:
         if not self.disable_regex_jump_forward:
             # Check for jump-forward
             jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
-            self.forward_queue.extend(jump_forward_reqs)
+            self.waiting_queue.extend(jump_forward_reqs)
             if batch.is_empty():
                 return
 
@@ -712,7 +712,7 @@ class ModelTpServer:
                 batch.reqs = []
 
     def flush_cache(self):
-        if len(self.forward_queue) == 0 and (
+        if len(self.waiting_queue) == 0 and (
             self.running_batch is None or len(self.running_batch.reqs) == 0
         ):
             self.tree_cache.reset()
@@ -725,20 +725,20 @@ class ModelTpServer:
         else:
             warnings.warn(
                 f"Cache not flushed because there are pending requests. "
-                f"#queue-req: {len(self.forward_queue)}, "
+                f"#queue-req: {len(self.waiting_queue)}, "
                 f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
             )
 
     def abort_request(self, recv_req):
         # Delete requests in the waiting queue
         to_del = None
-        for i, req in enumerate(self.forward_queue):
+        for i, req in enumerate(self.waiting_queue):
             if req.rid == recv_req.rid:
                 to_del = i
                 break
 
         if to_del is not None:
-            del self.forward_queue[to_del]
+            del self.waiting_queue[to_del]
 
         # Delete requests in the running batch
         if self.running_batch:

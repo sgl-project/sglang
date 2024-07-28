@@ -38,24 +38,24 @@ class ScheduleHeuristic:
         self.max_total_num_tokens = max_total_num_tokens
         self.tree_cache = tree_cache
 
-    def get_priority_queue(self, forward_queue):
+    def get_priority_queue(self, waiting_queue):
         if self.schedule_heuristic == "lpm":
             # longest prefix match
-            forward_queue.sort(key=lambda x: -len(x.prefix_indices))
-            return forward_queue
+            waiting_queue.sort(key=lambda x: -len(x.prefix_indices))
+            return waiting_queue
         elif self.schedule_heuristic == "fcfs":
             # first come first serve
-            return forward_queue
+            return waiting_queue
         elif self.schedule_heuristic == "lof":
             # longest output first
-            forward_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
-            return forward_queue
+            waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
+            return waiting_queue
         elif self.schedule_heuristic == "random":
-            random.shuffle(forward_queue)
-            return forward_queue
+            random.shuffle(waiting_queue)
+            return waiting_queue
         elif self.schedule_heuristic == "dfs-weight":
             last_node_to_reqs = defaultdict(list)
-            for req in forward_queue:
+            for req in waiting_queue:
                 last_node_to_reqs[req.last_node].append(req)
 
             node_to_weight = defaultdict(int)
@@ -67,7 +67,7 @@ class ScheduleHeuristic:
             self.get_dfs_priority(
                 self.tree_cache.root_node, node_to_weight, last_node_to_reqs, q
             )
-            assert len(q) == len(forward_queue)
+            assert len(q) == len(waiting_queue)
             return q
         else:
             raise ValueError(f"Unknown schedule_heuristic: {self.schedule_heuristic}")
