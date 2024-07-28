@@ -13,7 +13,7 @@ class GenerateReqInput:
     # The image input. It can be a file name, a url, or base64 encoded string.
     # See also python/sglang/srt/utils.py:load_image.
     image_data: Optional[Union[List[str], str]] = None
-    # The sampling_params.
+    # The sampling_params. See descriptions below.
     sampling_params: Union[List[Dict], Dict] = None
     # The request id.
     rid: Optional[Union[List[str], str]] = None
@@ -23,7 +23,7 @@ class GenerateReqInput:
     logprob_start_len: Optional[Union[List[int], int]] = None
     # The number of top logprobs to return.
     top_logprobs_num: Optional[Union[List[int], int]] = None
-    # Whether to detokenize tokens in logprobs.
+    # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Whether to stream output.
     stream: bool = False
@@ -32,26 +32,27 @@ class GenerateReqInput:
 The `sampling_params` follows this format
 
 ```python
-class SamplingParams:
-    def __init__(
-        self,
-        max_new_tokens: int = 16,
-        stop: Optional[Union[str, List[str]]] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = -1,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        ignore_eos: bool = False,
-        skip_special_tokens: bool = True,
-        dtype: Optional[str] = None,
-        regex: Optional[str] = None,
-    ) -> None:
+# The maximum number of output tokens
+max_new_tokens: int = 16,
+# Stop when hitting any of the strings in this list.
+stop: Optional[Union[str, List[str]]] = None,
+# Sampling temperature
+temperature: float = 1.0,
+# Top-p sampling
+top_p: float = 1.0,
+# Top-k sampling
+top_k: int = -1,
+# Whether to ignore EOS token.
+ignore_eos: bool = False,
+# Whether to skip the special tokens during detokenization.
+skip_special_tokens: bool = True,
+# Whether to add spaces between special tokens during detokenization.
+spaces_between_special_tokens: bool = True,
+# Constrains the output to follow a given regular expression.
+regex: Optional[str] = None,
+# Do parallel sampling and return `n` outputs.
+n: int = 1,
 ```
-
-- `max_new_tokens`, `stop`, `temperature`, `top_p`, `top_k` are common sampling parameters.
-- `ignore_eos` means ignoring the EOS token and continue decoding, which is helpful for benchmarking purposes.
-- `regex` constrains the output to follow a given regular expression.
 
 ## Examples
 
