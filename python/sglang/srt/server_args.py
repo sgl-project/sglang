@@ -52,6 +52,7 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_flashinfer: bool = False
+    disable_flashinfer_sampling: bool = False
     disable_radix_cache: bool = False
     disable_regex_jump_forward: bool = False
     disable_cuda_graph: bool = False
