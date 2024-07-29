@@ -1,6 +1,7 @@
 """Common utilities."""
 
 import base64
+import importlib
 import json
 import logging
 import signal
@@ -261,3 +262,24 @@ def graceful_registry(sub_module_name):
             logger.info(f"{sub_module_name} recive sigterm")
 
     signal.signal(signal.SIGTERM, graceful_shutdown)
+
+
+class LazyImport:
+    def __init__(self, module_name, class_name):
+        self.module_name = module_name
+        self.class_name = class_name
+        self._module = None
+
+    def _load(self):
+        if self._module is None:
+            module = importlib.import_module(self.module_name)
+            self._module = getattr(module, self.class_name)
+        return self._module
+
+    def __getattr__(self, name):
+        module = self._load()
+        return getattr(module, name)
+
+    def __call__(self, *args, **kwargs):
+        module = self._load()
+        return module(*args, **kwargs)
