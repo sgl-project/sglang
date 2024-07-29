@@ -336,6 +336,7 @@ class ModelTpServer:
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[Batch]:
+        # TODO(lsyin): organize this function
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
@@ -769,6 +770,7 @@ class ModelTpServer:
                 batch.reqs = []
 
     def filter_out_inflight(self, batch: Batch):
+        # TODO(lsyin): reduce the overhead, make a special version for this
         if self.current_inflight_req is None:
             return
 
