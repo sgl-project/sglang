@@ -59,9 +59,16 @@ from sglang.srt.openai_api.protocol import (
 
 chat_template_name = None
 
+
+class FileMetadata:
+    def __init__(self, filename: str, purpose: str):
+        self.filename = filename
+        self.purpose = purpose
+
+
 # In-memory storage for batch jobs and files
 batch_storage: Dict[str, BatchResponse] = {}
-file_id_request: Dict[str, FileRequest] = {}
+file_id_request: Dict[str, FileMetadata] = {}
 file_id_response: Dict[str, FileResponse] = {}
 ## map file id to file path in SGlang backend
 file_id_storage: Dict[str, str] = {}
@@ -146,7 +153,7 @@ async def v1_files_create(file: UploadFile, purpose: str, file_storage_pth: str 
             f.write(request_body.file)
 
         # add info to global file map
-        file_id_request[file_id] = request_body
+        file_id_request[file_id] = FileMetadata(filename=file.filename, purpose=purpose)
         file_id_storage[file_id] = file_path
 
         # Return the response in the required format
