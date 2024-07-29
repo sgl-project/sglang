@@ -778,8 +778,8 @@ class ModelTpServer:
         if self.current_inflight_req is None:
             return
 
-        unfinished_indices = list(range(len(batch.reqs)))
-        unfinished_indices.remove(batch.reqs.index(self.current_inflight_req))
+        to_remove = batch.reqs.index(self.current_inflight_req)
+        unfinished_indices = [i for i in range(len(batch.reqs)) if i != to_remove]
 
         batch.filter_batch(unfinished_indices)
 
