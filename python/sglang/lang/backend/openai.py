@@ -51,6 +51,14 @@ class TokenUsage:
     def reset(self):
         self.prompt_tokens = self.completion_tokens = 0
 
+    def increment_prompt_tokens(self, new_tokens: int):
+        self.prompt_tokens += new_tokens
+
+    def increment_completion_tokens(self, new_tokens: int):
+        self.completion_tokens += new_tokens
+
+    def get_total_tokens(self):
+        return self.prompt_tokens + self.completion_tokens
 
 class OpenAI(BaseBackend):
     def __init__(
