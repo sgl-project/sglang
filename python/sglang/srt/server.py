@@ -175,39 +175,6 @@ def _set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 256
 
 
-def set_envs_and_config(server_args: ServerArgs):
-    # Set global environments
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    os.environ["NCCL_NVLS_ENABLE"] = "0"
-    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
-
-    # Set ulimit
-    set_ulimit()
-
-    # Enable show time cost for debugging
-    if server_args.show_time_cost:
-        enable_show_time_cost()
-
-    # Disable disk cache
-    if server_args.disable_disk_cache:
-        disable_cache()
-
-    # Fix triton bugs
-    if server_args.tp_size * server_args.dp_size > 1:
-        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
-        maybe_set_triton_cache_manager()
-
-    # Set torch compile config
-    if server_args.enable_torch_compile:
-        _set_torch_compile_config()
-
-    # Set global chat template
-    if server_args.chat_template:
-        # TODO: replace this with huggingface transformers template
-        load_chat_template_for_openai_api(server_args.chat_template)
-
-
 def launch_server(
     server_args: ServerArgs,
     model_overide_args: Optional[dict] = None,
@@ -223,6 +190,16 @@ def launch_server(
         format="%(message)s",
     )
 
+    # Set global environments
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+    set_ulimit()
+    if server_args.show_time_cost:
+        enable_show_time_cost()
+    if server_args.disable_disk_cache:
+        disable_cache()
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
@@ -231,8 +208,14 @@ def launch_server(
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
-
-    set_envs_and_config(server_args)
+    if server_args.tp_size * server_args.dp_size > 1:
+        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
+        maybe_set_triton_cache_manager()
+    if server_args.chat_template:
+        # TODO: replace this with huggingface transformers template
+        load_chat_template_for_openai_api(server_args.chat_template)
+    if server_args.enable_torch_compile:
+        _set_torch_compile_config()
 
     # Allocate ports
     server_args.port, server_args.additional_ports = allocate_init_ports(
