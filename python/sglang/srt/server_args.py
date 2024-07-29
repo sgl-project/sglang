@@ -87,7 +87,7 @@ class ServerArgs:
 
     def __post_init__(self):
         if self.chunked_prefill_size is None:
-            self.chunked_prefill_size = int(10**9)
+            self.chunked_prefill_size = 1 << 30
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
         if self.mem_fraction_static is None:
@@ -407,7 +407,7 @@ class ServerArgs:
         ), "multi-node data parallel is not supported"
 
         assert not (
-            self.chunked_prefill_size is not None and self.disable_radix_cache
+            self.chunked_prefill_size < (1 << 30) and self.disable_radix_cache
         ), "chunked prefill is not supported with radix cache disabled currently"
 
 
