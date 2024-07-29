@@ -611,6 +611,10 @@ class ModelTpServer:
             )
             req.prefix_indices, req.last_node = new_prefix_indices, new_last_node
 
+            if req is self.current_inflight_req:
+                # inflight request would get a new req idx
+                self.req_to_token_pool.free(int(req_pool_indices_cpu[i]))
+
     def forward_decode_batch(self, batch: Batch):
         # Check if decode out of memory
         if not batch.check_decode_mem():
