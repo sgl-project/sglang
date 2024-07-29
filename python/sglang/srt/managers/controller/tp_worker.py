@@ -443,6 +443,9 @@ class ModelTpServer:
                     if (
                         new_batch_input_tokens + req.extend_input_len
                         <= self.chunked_prefill_size
+                        or (
+                            req.return_logprob and req.normalized_prompt_logprob is None
+                        )
                     ):
                         can_run_list.append(req)
                         new_batch_total_tokens += (
