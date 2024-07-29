@@ -441,6 +441,7 @@ Use `sgl.system`， `sgl.user` and `sgl.assistant` to set roles when using Chat 
 @sgl.function
 def chat_example(s):
     s += sgl.system("You are a helpful assistant.")
+    # Same as: s += s.system("You are a helpful assistant.")
 
     with s.user():
         s += "Question: What is the capital of France?"
