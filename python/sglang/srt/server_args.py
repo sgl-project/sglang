@@ -66,7 +66,7 @@ class ServerArgs:
     load_balance_method: str = "round_robin"
 
     # Chunked Prefill
-    chunked_prefill_size: int = 0
+    chunked_prefill_size: int = None
 
     # Optimization/debug options
     disable_flashinfer: bool = False
@@ -322,7 +322,7 @@ class ServerArgs:
         parser.add_argument(
             "--chunked-prefill-size",
             type=int,
-            default=0,
+            default=None,
             help="The size of the chunked prefill.",
         )
 
@@ -405,11 +405,11 @@ class ServerArgs:
         ), "multi-node data parallel is not supported"
 
         assert not (
-            self.chunked_prefill_size > 0 and self.disable_radix_cache
+            self.chunked_prefill_size is not None and self.disable_radix_cache
         ), "chunked prefill is not supported with radix cache disabled currently"
 
     def post_server_args(self):
-        if self.chunked_prefill_size == 0:
+        if self.chunked_prefill_size is None:
             self.chunked_prefill_size = int(10**9)
 
 
