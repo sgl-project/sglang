@@ -15,6 +15,7 @@ limitations under the License.
 
 """Meta data for requests and batches"""
 
+import logging
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -38,6 +39,9 @@ global_server_args_dict = {
     "disable_flashinfer_sampling": False,
     "attention_reduce_in_fp32": False,
 }
+
+
+logger = logging.getLogger(__name__)
 
 
 class ForwardMode(IntEnum):
@@ -379,7 +383,7 @@ class Batch:
             out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
 
             if out_cache_loc is None:
-                print("Prefill out of memory. This should never happen.")
+                logger.error("Prefill out of memory. This should never happen.")
                 self.tree_cache.pretty_print()
                 exit()
 
@@ -613,7 +617,7 @@ class Batch:
         self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
         if self.out_cache_loc is None:
-            print("Decode out of memory. This should never happen.")
+            logger.error("Decode out of memory. This should never happen.")
             self.tree_cache.pretty_print()
             exit()
 
