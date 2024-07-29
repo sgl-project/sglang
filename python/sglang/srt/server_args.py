@@ -65,6 +65,9 @@ class ServerArgs:
     dp_size: int = 1
     load_balance_method: str = "round_robin"
 
+    # Chunked Prefill
+    chunked_prefill_size: int = 0
+
     # Optimization/debug options
     disable_flashinfer: bool = False
     disable_flashinfer_sampling: bool = False
@@ -315,6 +318,14 @@ class ServerArgs:
         )
         parser.add_argument("--node-rank", type=int, help="The node rank.")
 
+        # Chunked prefill
+        parser.add_argument(
+            "--chunked-prefill-size",
+            type=int,
+            default=0,
+            help="The size of the chunked prefill.",
+        )
+
         # Optimization/debug options
         parser.add_argument(
             "--disable-flashinfer",
@@ -392,6 +403,10 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
+
+    def post_server_args(self):
+        if self.chunked_prefill_size == 0:
+            self.chunked_prefill_size = int(10**9)
 
 
 @dataclasses.dataclass
