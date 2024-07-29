@@ -214,7 +214,6 @@ def launch_server(
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
     server_args.check_server_args()
-    server_args.post_server_args()
 
     """Launch an HTTP server."""
     global tokenizer_manager
