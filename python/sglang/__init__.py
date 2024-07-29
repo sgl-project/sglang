@@ -61,5 +61,5 @@ __all__ = [
     "assistant_begin",
     "assistant_end",
     "system_begin",
-    "system_end"
+    "system_end",
 ]
