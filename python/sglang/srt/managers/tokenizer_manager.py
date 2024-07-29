@@ -84,6 +84,7 @@ class TokenizerManager:
             trust_remote_code=server_args.trust_remote_code,
             model_overide_args=model_overide_args,
         )
+
         if server_args.context_length is not None:
             self.context_len = server_args.context_length
         else:
@@ -152,31 +153,33 @@ class TokenizerManager:
         self, obj, request, index=None, is_cache_for_prefill=False
     ):
         if not is_cache_for_prefill:
-            rid = obj.rid if index is None else obj.rid[index]
-            input_text = obj.text if index is None else obj.text[index]
+            not_use_index = not (index is not None)
+            rid = obj.rid if not_use_index else obj.rid[index]
+            input_text = obj.text if not_use_index else obj.text[index]
             input_ids = (
                 self.tokenizer.encode(input_text)
                 if obj.input_ids is None
                 else obj.input_ids
             )
-            if index is not None and obj.input_ids:
+            if not not_use_index and obj.input_ids:
                 input_ids = obj.input_ids[index]
 
             self._validate_input_length(input_ids)
+
             sampling_params = self._get_sampling_params(
-                obj.sampling_params if index is None else obj.sampling_params[index]
+                obj.sampling_params if not_use_index else obj.sampling_params[index]
             )
             pixel_values, image_hash, image_size = await self._get_pixel_values(
-                obj.image_data if index is None else obj.image_data[index]
+                obj.image_data if not_use_index else obj.image_data[index]
             )
             return_logprob = (
-                obj.return_logprob if index is None else obj.return_logprob[index]
+                obj.return_logprob if not_use_index else obj.return_logprob[index]
             )
             logprob_start_len = (
-                obj.logprob_start_len if index is None else obj.logprob_start_len[index]
+                obj.logprob_start_len if not_use_index else obj.logprob_start_len[index]
             )
             top_logprobs_num = (
-                obj.top_logprobs_num if index is None else obj.top_logprobs_num[index]
+                obj.top_logprobs_num if not_use_index else obj.top_logprobs_num[index]
             )
         else:
             if isinstance(obj.text, list):
@@ -224,7 +227,7 @@ class TokenizerManager:
 
     async def _handle_batch_request(self, obj: GenerateReqInput, request):
         batch_size = obj.batch_size
-        parallel_sample_num = obj.sampling_params[0].get("n", 1)
+        parallel_sample_num = obj.parallel_sample_num
 
         if parallel_sample_num != 1:
             # Send prefill requests to cache the common input
@@ -241,7 +244,6 @@ class TokenizerManager:
                 obj.input_ids = input_id_result
             elif input_id_result is not None:
                 obj.input_ids = input_id_result[0]
-
         # First send out all requests
         for i in range(batch_size):
             for j in range(parallel_sample_num):
@@ -249,7 +251,7 @@ class TokenizerManager:
                     continue
                 index = i * parallel_sample_num + j
                 if parallel_sample_num != 1:
-                    # Here when using parallel sampling we shoul consider prefill stage so the index is :  j + i * (parallel_sample_num-1) + batch_size - 1
+                    # Here when using parallel sampling we should consider prefill stage so the index is :  j + i * (parallel_sample_num-1) + batch_size - 1
                     index += batch_size - 1 - i
                 rid = obj.rid[index]
                 if parallel_sample_num == 1:
