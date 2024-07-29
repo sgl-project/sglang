@@ -45,7 +45,7 @@ class ReqToTokenPool:
 
         return select_index
 
-    def free(self, free_index: int):
+    def free(self, free_index):
         self.mem_state[free_index] = True
         if isinstance(free_index, (int,)):
             self.can_use_mem_size += 1
