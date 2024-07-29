@@ -33,12 +33,12 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.managers.controller.infer_batch import ForwardMode
-from sglang.srt.managers.controller.model_runner import InputMetadata
 from sglang.srt.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
     unpad_image_shape,
 )
+from sglang.srt.model_executor.model_runner import InputMetadata
 from sglang.srt.models.llama2 import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
