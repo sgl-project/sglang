@@ -65,6 +65,9 @@ class ServerArgs:
     dp_size: int = 1
     load_balance_method: str = "round_robin"
 
+    # Chunked Prefill
+    chunked_prefill_size: Optional[int] = None
+
     # Optimization/debug options
     disable_flashinfer: bool = False
     disable_flashinfer_sampling: bool = False
@@ -83,6 +86,8 @@ class ServerArgs:
     node_rank: Optional[int] = None
 
     def __post_init__(self):
+        if self.chunked_prefill_size is None:
+            self.chunked_prefill_size = int(10**9)
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
         if self.mem_fraction_static is None:
@@ -223,7 +228,7 @@ class ServerArgs:
         parser.add_argument(
             "--max-num-reqs",
             type=int,
-            default=None,
+            default=ServerArgs.max_num_reqs,
             help="The maximum number of requests to serve in the memory pool. If the model have a large context length, you may need to decrease this value to avoid out-of-memory errors.",
         )
         parser.add_argument(
@@ -311,9 +316,17 @@ class ServerArgs:
             help="The nccl init address of multi-node server.",
         )
         parser.add_argument(
-            "--nnodes", type=int, default=1, help="The number of nodes."
+            "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
         )
         parser.add_argument("--node-rank", type=int, help="The node rank.")
+
+        # Chunked prefill
+        parser.add_argument(
+            "--chunked-prefill-size",
+            type=int,
+            default=ServerArgs.chunked_prefill_size,
+            help="The size of the chunked prefill.",
+        )
 
         # Optimization/debug options
         parser.add_argument(
@@ -392,6 +405,10 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
+
+        assert not (
+            self.chunked_prefill_size is not None and self.disable_radix_cache
+        ), "chunked prefill is not supported with radix cache disabled currently"
 
 
 @dataclasses.dataclass
