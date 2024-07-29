@@ -18,7 +18,7 @@ except ImportError as e:
     openai = tiktoken = e
 
 
-logger = logging.getLogger("openai")
+logger = logging.getLogger(__name__)
 
 
 def create_logit_bias_int(tokenizer):

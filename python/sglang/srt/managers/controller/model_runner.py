@@ -57,7 +57,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_qvk_linear_loader,
 )
 
-logger = logging.getLogger("srt.model_runner")
+logger = logging.getLogger(__name__)
 
 
 class ModelRunner:
@@ -90,7 +90,7 @@ class ModelRunner:
 
         # Init torch distributed
         torch.cuda.set_device(self.gpu_id)
-        logger.info(f"[gpu_id={self.gpu_id}] Init nccl begin.")
+        logger.info(f"[gpu={self.gpu_id}] Init nccl begin.")
 
         if not server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
@@ -130,7 +130,7 @@ class ModelRunner:
 
     def load_model(self):
         logger.info(
-            f"[gpu_id={self.gpu_id}] Load weight begin. "
+            f"[gpu={self.gpu_id}] Load weight begin. "
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
@@ -178,7 +178,7 @@ class ModelRunner:
             cache_config=None,
         )
         logger.info(
-            f"[gpu_id={self.gpu_id}] Load weight end. "
+            f"[gpu={self.gpu_id}] Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
@@ -229,7 +229,7 @@ class ModelRunner:
             layer_num=self.model_config.num_hidden_layers,
         )
         logger.info(
-            f"[gpu_id={self.gpu_id}] Memory pool end. "
+            f"[gpu={self.gpu_id}] Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
@@ -280,7 +280,7 @@ class ModelRunner:
             return
 
         logger.info(
-            f"[gpu_id={self.gpu_id}] Capture cuda graph begin. This can take up to several minutes."
+            f"[gpu={self.gpu_id}] Capture cuda graph begin. This can take up to several minutes."
         )
         batch_size_list = [1, 2, 4] + [i * 8 for i in range(1, 17)]
         self.cuda_graph_runner = CudaGraphRunner(

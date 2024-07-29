@@ -38,7 +38,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 
 from sglang.srt.layers.quantization import get_quantization_config
 
-logger = logging.getLogger("srt.model_loader")
+logger = logging.getLogger(__name__)
 temp_dir = tempfile.gettempdir()
 
 
