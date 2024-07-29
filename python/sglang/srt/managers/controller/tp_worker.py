@@ -373,7 +373,9 @@ class ModelTpServer:
             )
 
         # Handle the current inflight request
+        take_inflight = 0
         if self.current_inflight_req:
+            take_inflight = 1
             r = self.current_inflight_req
             r.input_ids = r.origin_input_ids + r.output_ids
             truncated = (
@@ -491,7 +493,7 @@ class ModelTpServer:
                 f"#cached-token: {hit_tokens}, "
                 f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
                 f"#running-req: {running_bs}, "
-                f"#queue-req: {len(self.waiting_queue) - len(can_run_list)}"
+                f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + take_inflight}"
             )
 
         # Return the new batch
