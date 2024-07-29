@@ -38,7 +38,7 @@ import psutil
 import requests
 import uvicorn
 import uvloop
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
@@ -56,8 +56,13 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
+    v1_batches,
     v1_chat_completions,
     v1_completions,
+    v1_files_create,
+    v1_retrieve_batch,
+    v1_retrieve_file,
+    v1_retrieve_file_content,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -150,6 +155,35 @@ async def openai_v1_completions(raw_request: Request):
 @app.post("/v1/chat/completions")
 async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
+
+
+@app.post("/v1/files")
+async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
+    return await v1_files_create(
+        file, purpose, tokenizer_manager.server_args.file_storage_pth
+    )
+
+
+@app.post("/v1/batches")
+async def openai_v1_batches(raw_request: Request):
+    return await v1_batches(tokenizer_manager, raw_request)
+
+
+@app.get("/v1/batches/{batch_id}")
+async def retrieve_batch(batch_id: str):
+    return await v1_retrieve_batch(batch_id)
+
+
+@app.get("/v1/files/{file_id}")
+async def retrieve_file(file_id: str):
+    # https://platform.openai.com/docs/api-reference/files/retrieve
+    return await v1_retrieve_file(file_id)
+
+
+@app.get("/v1/files/{file_id}/content")
+async def retrieve_file_content(file_id: str):
+    # https://platform.openai.com/docs/api-reference/files/retrieve-contents
+    return await v1_retrieve_file_content(file_id)
 
 
 @app.get("/v1/models")
