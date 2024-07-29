@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
-from sglang.srt.managers.infer_batch import BaseFinishReason
+from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling_params import SamplingParams
 
 

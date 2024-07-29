@@ -29,7 +29,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
 )
-from sglang.srt.managers.infer_batch import (
+from sglang.srt.managers.schedule_batch import (
     Batch,
     ForwardMode,
     InputMetadata,

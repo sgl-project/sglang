@@ -20,7 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.managers.infer_batch import global_server_args_dict
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 if global_server_args_dict.get("attention_reduce_in_fp32", False):
     REDUCE_TRITON_TYPE = tl.float32

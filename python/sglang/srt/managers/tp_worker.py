@@ -29,18 +29,18 @@ from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.infer_batch import (
-    FINISH_ABORT,
-    BaseFinishReason,
-    Batch,
-    ForwardMode,
-    Req,
-)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenIDOut,
     FlushCacheReq,
     TokenizedGenerateReqInput,
+)
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    BaseFinishReason,
+    Batch,
+    ForwardMode,
+    Req,
 )
 from sglang.srt.managers.schedule_heuristic import ScheduleHeuristic
 from sglang.srt.mem_cache.radix_cache import RadixCache
