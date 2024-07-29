@@ -55,7 +55,7 @@ from sglang.srt.utils import (
 )
 from sglang.utils import get_exception_traceback
 
-logger = logging.getLogger("srt.tp_worker")
+logger = logging.getLogger(__name__)
 
 
 class ModelTpServer:
@@ -132,7 +132,7 @@ class ModelTpServer:
 
         # Print info
         logger.info(
-            f"[gpu_id={self.gpu_id}] "
+            f"[gpu={self.gpu_id}] "
             f"max_total_num_tokens={self.max_total_num_tokens}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
             f"max_running_requests={self.max_running_requests}, "
@@ -256,7 +256,7 @@ class ModelTpServer:
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
         logger.info(
-            f"[gpu_id={self.gpu_id}] Decode batch. "
+            f"[gpu={self.gpu_id}] Decode batch. "
             f"#running-req: {len(self.running_batch.reqs)}, "
             f"#token: {num_used}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -434,7 +434,7 @@ class ModelTpServer:
                 self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
             )
             logger.info(
-                f"[gpu_id={self.gpu_id}] Prefill batch. "
+                f"[gpu={self.gpu_id}] Prefill batch. "
                 f"#new-seq: {len(can_run_list)}, "
                 f"#new-token: {new_batch_input_tokens}, "
                 f"#cached-token: {hit_tokens}, "

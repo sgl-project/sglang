@@ -39,7 +39,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_parent_process
 from sglang.utils import get_exception_traceback
 
-logger = logging.getLogger("srt.controller")
+logger = logging.getLogger(__name__)
 
 
 class LoadBalanceMethod(Enum):

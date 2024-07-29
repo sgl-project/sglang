@@ -24,13 +24,15 @@ from sglang.api import (
 from sglang.global_config import global_config
 
 # SGL Backends
-from sglang.lang.backend.anthropic import Anthropic
-from sglang.lang.backend.litellm import LiteLLM
-from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.lang.backend.vertexai import VertexAI
+from sglang.utils import LazyImport
+from sglang.version import __version__
 
-from .version import __version__
+Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
+LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
+OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
+VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
+
 
 # public APIs management
 __all__ = [

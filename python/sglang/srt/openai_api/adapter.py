@@ -369,17 +369,23 @@ def v1_generate_request(all_requests):
 
 def v1_generate_response(request, ret, to_file=False):
     choices = []
+    echo = False
+
+    if (not isinstance(request, List)) and request.echo:
+        # TODO: handle the case propmt is token ids
+        if isinstance(request.prompt, list):
+            prompts = request.prompt
+        else:
+            prompts = [request.prompt]
+        echo = True
 
     for idx, ret_item in enumerate(ret):
         text = ret_item["text"]
-        echo = False
         if isinstance(request, List) and request[idx].echo:
             echo = True
             text = request[idx].prompt + text
-
-        elif (not isinstance(request, List)) and request.echo:
-            echo = True
-            text = request.prompt + text
+        if (not isinstance(request, List)) and echo:
+            text = prompts[idx] + text
 
         logprobs = False
         if isinstance(request, List) and request[idx].logprobs:
@@ -446,17 +452,15 @@ def v1_generate_response(request, ret, to_file=False):
             responses.append(response)
         return responses
     else:
+        completion_tokens = sum(item["meta_info"]["completion_tokens"] for item in ret)
         response = CompletionResponse(
             id=ret[0]["meta_info"]["id"],
             model=request.model,
             choices=choices,
             usage=UsageInfo(
                 prompt_tokens=ret[0]["meta_info"]["prompt_tokens"],
-                completion_tokens=sum(
-                    item["meta_info"]["completion_tokens"] for item in ret
-                ),
-                total_tokens=ret[0]["meta_info"]["prompt_tokens"]
-                + sum(item["meta_info"]["completion_tokens"] for item in ret),
+                completion_tokens=completion_tokens,
+                total_tokens=ret[0]["meta_info"]["prompt_tokens"] + completion_tokens,
             ),
         )
     return response
