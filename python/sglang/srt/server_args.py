@@ -44,7 +44,7 @@ class ServerArgs:
     max_prefill_tokens: Optional[int] = None
     max_running_requests: Optional[int] = None
     max_num_reqs: Optional[int] = None
-    schedule_heuristic: str = "lpm"
+    schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
 
     # Other runtime options
@@ -233,11 +233,11 @@ class ServerArgs:
             help="The maximum number of requests to serve in the memory pool. If the model have a large context length, you may need to decrease this value to avoid out-of-memory errors.",
         )
         parser.add_argument(
-            "--schedule-heuristic",
+            "--schedule-policy",
             type=str,
-            default=ServerArgs.schedule_heuristic,
+            default=ServerArgs.schedule_policy,
             choices=["lpm", "random", "fcfs", "dfs-weight"],
-            help="The scheduling heuristic.",
+            help="The scheduling policy of the requests.",
         )
         parser.add_argument(
             "--schedule-conservativeness",

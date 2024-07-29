@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.policy_scheduler import PolicyScheduler
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     BaseFinishReason,
@@ -42,7 +43,6 @@ from sglang.srt.managers.schedule_batch import (
     ForwardMode,
     Req,
 )
-from sglang.srt.managers.schedule_heuristic import ScheduleHeuristic
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -74,7 +74,7 @@ class ModelTpServer:
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
-        self.schedule_heuristic = server_args.schedule_heuristic
+        self.schedule_policy = server_args.schedule_policy
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
 
         # Chunked prefill
@@ -150,8 +150,8 @@ class ModelTpServer:
             disable=server_args.disable_radix_cache,
         )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
-        self.scheduler = ScheduleHeuristic(
-            self.schedule_heuristic,
+        self.scheduler = PolicyScheduler(
+            self.schedule_policy,
             self.max_running_requests,
             self.max_prefill_tokens,
             self.max_total_num_tokens,
