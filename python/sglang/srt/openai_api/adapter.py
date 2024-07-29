@@ -331,11 +331,15 @@ async def v1_retrieve_file_content(file_id: str):
 
 def v1_generate_request(all_requests):
 
-    texts = []
+    prompts = []
     sampling_params_list = []
-
+    first_prompt_type = type(all_requests[0].prompt)
     for request in all_requests:
-        texts.append(request.prompt)
+        prompt = request.prompt
+        assert (
+            type(prompt) == first_prompt_type
+        ), "All prompts must be of the same type in file input settings"
+        prompts.append(prompt)
         sampling_params_list.append(
             {
                 "temperature": request.temperature,
@@ -355,11 +359,20 @@ def v1_generate_request(all_requests):
             )
 
     if len(all_requests) == 1:
-        texts = texts[0]
+        prompt = prompts[0]
         sampling_params_list = sampling_params_list[0]
+        if isinstance(prompts, str) or isinstance(prompts[0], str):
+            prompt_kwargs = {"text": prompt}
+        else:
+            prompt_kwargs = {"input_ids": prompt}
+    else:
+        if isinstance(prompts[0], str):
+            prompt_kwargs = {"text": prompts}
+        else:
+            prompt_kwargs = {"input_ids": prompts}
 
     adapted_request = GenerateReqInput(
-        text=texts,
+        **prompt_kwargs,
         sampling_params=sampling_params_list,
         return_logprob=all_requests[0].logprobs is not None
         and all_requests[0].logprobs > 0,
@@ -401,17 +414,17 @@ def v1_generate_response(request, ret, to_file=False):
             logprobs = True
         if logprobs:
             if echo:
-                prefill_token_logprobs = ret_item["meta_info"]["prefill_token_logprobs"]
-                prefill_top_logprobs = ret_item["meta_info"]["prefill_top_logprobs"]
+                input_token_logprobs = ret_item["meta_info"]["input_token_logprobs"]
+                input_top_logprobs = ret_item["meta_info"]["input_top_logprobs"]
             else:
-                prefill_token_logprobs = None
-                prefill_top_logprobs = None
+                input_token_logprobs = None
+                input_top_logprobs = None
 
             logprobs = to_openai_style_logprobs(
-                prefill_token_logprobs=prefill_token_logprobs,
-                prefill_top_logprobs=prefill_top_logprobs,
-                decode_token_logprobs=ret_item["meta_info"]["decode_token_logprobs"],
-                decode_top_logprobs=ret_item["meta_info"]["decode_top_logprobs"],
+                input_token_logprobs=input_token_logprobs,
+                input_top_logprobs=input_top_logprobs,
+                output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
+                output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
             )
         else:
             logprobs = None
