@@ -77,6 +77,10 @@ class ModelTpServer:
         self.schedule_heuristic = server_args.schedule_heuristic
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
 
+        # Chunked prefill
+        self.chunked_prefill_size = server_args.chunked_prefill_size
+        self.current_inflight_req = None
+
         # Init model and tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,
@@ -220,6 +224,7 @@ class ModelTpServer:
             # Run a new prefill batch
             self.forward_prefill_batch(new_batch)
             self.cache_filled_batch(new_batch)
+            self.filter_out_inflight(new_batch)
 
             if not new_batch.is_empty():
                 if self.running_batch is None:
@@ -367,6 +372,30 @@ class ModelTpServer:
                 ]
             )
 
+        # Handle the current inflight request
+        if self.current_inflight_req:
+            r = self.current_inflight_req
+            r.input_ids = r.origin_input_ids + r.output_ids
+            truncated = (
+                len(r.input_ids) - len(r.prefix_indices) > self.chunked_prefill_size
+            )
+            r.extend_input_len = min(
+                len(r.input_ids) - len(r.prefix_indices), self.chunked_prefill_size
+            )
+            r.input_ids = r.input_ids[: len(r.prefix_indices) + r.extend_input_len]
+            can_run_list.append(r)
+
+            if not truncated:
+                # Finish inflight
+                self.current_inflight_req = None
+                new_batch_total_tokens += (
+                    r.extend_input_len + r.sampling_params.max_new_tokens
+                )
+                new_batch_input_tokens += r.extend_input_len
+            else:
+                new_batch_total_tokens += r.extend_input_len
+                new_batch_input_tokens += r.extend_input_len
+
         for req in self.waiting_queue:
             if req.return_logprob and req.normalized_prompt_logprob is None:
                 # Need at least two tokens to compute normalized logprob
@@ -409,11 +438,33 @@ class ModelTpServer:
                     break
                 else:
                     # Add this request to the running batch
-                    can_run_list.append(req)
-                    new_batch_total_tokens += (
-                        req.extend_input_len + req.sampling_params.max_new_tokens
-                    )
-                    new_batch_input_tokens += req.extend_input_len
+                    if (
+                        new_batch_input_tokens + req.extend_input_len
+                        <= self.chunked_prefill_size
+                    ):
+                        can_run_list.append(req)
+                        new_batch_total_tokens += (
+                            req.extend_input_len + req.sampling_params.max_new_tokens
+                        )
+                        new_batch_input_tokens += req.extend_input_len
+                    else:
+                        trunc_len = self.chunked_prefill_size - new_batch_input_tokens
+
+                        if trunc_len <= 0:
+                            # Undo locking
+                            delta = self.tree_cache.dec_lock_ref(req.last_node)
+                            available_size += delta
+                            break
+
+                        req.extend_input_len = trunc_len
+                        req.input_ids = req.input_ids[
+                            : len(req.prefix_indices) + req.extend_input_len
+                        ]
+                        can_run_list.append(req)
+                        self.current_inflight_req = req
+                        new_batch_input_tokens += req.extend_input_len
+                        new_batch_total_tokens += req.extend_input_len
+                        break
             else:
                 break
 
@@ -482,9 +533,10 @@ class ModelTpServer:
         # Check finish conditions
         pt = 0
         for i, req in enumerate(batch.reqs):
-            req.completion_tokens_wo_jump_forward += 1
-            req.output_ids.append(next_token_ids[i])
-            req.check_finished()
+            if req is not self.current_inflight_req:
+                req.completion_tokens_wo_jump_forward += 1
+                req.output_ids.append(next_token_ids[i])
+                req.check_finished()
 
             if req.return_logprob:
                 self.add_logprob_return_values(i, req, pt, next_token_ids, output)
@@ -545,7 +597,7 @@ class ModelTpServer:
         req_pool_indices_cpu = batch.req_pool_indices.cpu().numpy()
         for i, req in enumerate(batch.reqs):
             new_prefix_indices, new_last_node = self.tree_cache.cache_req(
-                token_ids=tuple(req.origin_input_ids + req.output_ids)[:-1],
+                token_ids=tuple(req.input_ids),
                 last_uncached_pos=len(req.prefix_indices),
                 req_pool_idx=req_pool_indices_cpu[i],
                 del_in_memory_pool=False,
@@ -710,6 +762,15 @@ class ModelTpServer:
                 batch.filter_batch(unfinished_indices)
             else:
                 batch.reqs = []
+
+    def filter_out_inflight(self, batch: Batch):
+        unfinished_indices = list(range(len(batch.reqs)))
+        for i, req in enumerate(batch.reqs):
+            if req is self.current_inflight_req:
+                unfinished_indices.remove(i)
+                break
+
+        batch.filter_batch(unfinished_indices)
 
     def flush_cache(self):
         if len(self.waiting_queue) == 0 and (
