@@ -436,3 +436,14 @@ register_conv_template(
         sep2="</s>",
     )
 )
+
+# Reference: https://github.com/InternLM/lmdeploy/blob/387bf54b4f124e72aab30ae9755f562e435d3d01/lmdeploy/model.py#L425-L442
+register_conv_template(
+    Conversation(
+        name="internlm2-chat",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="\n",
+        stop_str=["<|im_end|>", "<|action_end|>"],
+    )
+)
