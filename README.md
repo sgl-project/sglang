@@ -433,6 +433,24 @@ for out in state.text_iter():
     print(out, end="", flush=True)
 ```
 
+#### Roles
+
+Use `sgl.system`， `sgl.user` and `sgl.assistant` to set roles when using Chat models. You can also define more complex role prompts using begin and end tokens.
+
+```python
+@sgl.function
+def chat_example(s):
+    s += sgl.system("You are a helpful assistant.")
+    # Same as: s += s.system("You are a helpful assistant.")
+
+    with s.user():
+        s += "Question: What is the capital of France?"
+
+    s += sgl.assistant_begin()
+    s += "Answer: " + sgl.gen(max_tokens=100, stop="\n")
+    s += sgl.assistant_end()
+```
+
 #### Tips and Implementation Details
 - The `choices` argument in `sgl.gen` is implemented by computing the [token-length normalized log probabilities](https://blog.eleuther.ai/multiple-choice-normalization/) of all choices and selecting the one with the highest probability.
 - The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex. It is compatible with `temperature=0` and `temperature != 0`.

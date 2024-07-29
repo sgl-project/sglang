@@ -210,6 +210,14 @@ def assistant(expr: Optional[SglExpr] = None):
     return _role_common("assistant", expr)
 
 
+def system_begin():
+    return SglRoleBegin("system")
+
+
+def system_end():
+    return SglRoleEnd("system")
+
+
 def user_begin():
     return SglRoleBegin("user")
 

@@ -705,9 +705,9 @@ class ProgramState:
 
     def _role_common(self, name: str, expr: Optional[SglExpr] = None):
         if expr is not None:
-            self.stream_executor.submit(
-                SglExprList([SglRoleBegin(name), expr, SglRoleEnd(name)])
-            )
+            role_expr = SglExprList([SglRoleBegin(name), expr, SglRoleEnd(name)])
+            self.stream_executor.submit(role_expr)
+            return role_expr
         else:
 
             @contextmanager
