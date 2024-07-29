@@ -46,7 +46,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.controller.infer_batch import InputMetadata
+from sglang.srt.managers.infer_batch import InputMetadata
 
 
 class DeepseekMLP(nn.Module):

@@ -40,7 +40,7 @@ from vllm.distributed import (
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
-from sglang.srt.managers.controller.infer_batch import (
+from sglang.srt.managers.infer_batch import (
     Batch,
     ForwardMode,
     InputMetadata,

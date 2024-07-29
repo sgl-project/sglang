@@ -27,7 +27,7 @@ from enum import Enum, auto
 import numpy as np
 import zmq
 
-from sglang.srt.managers.controller.controller_single import (
+from sglang.srt.managers.controller_single import (
     start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.io_struct import (

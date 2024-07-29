@@ -22,7 +22,7 @@ from typing import List
 
 import zmq
 
-from sglang.srt.managers.controller.tp_worker import (
+from sglang.srt.managers.tp_worker import (
     ModelTpServer,
     broadcast_recv_input,
     launch_tp_servers,
