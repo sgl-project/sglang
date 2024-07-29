@@ -404,6 +404,10 @@ class ServerArgs:
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
 
+        assert not (
+            self.chunked_prefill_size > 0 and self.disable_radix_cache
+        ), "chunked prefill is not supported with radix cache disabled currently"
+
     def post_server_args(self):
         if self.chunked_prefill_size == 0:
             self.chunked_prefill_size = int(10**9)
