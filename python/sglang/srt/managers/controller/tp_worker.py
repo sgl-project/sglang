@@ -769,6 +769,9 @@ class ModelTpServer:
                 batch.reqs = []
 
     def filter_out_inflight(self, batch: Batch):
+        if self.current_inflight_req is None:
+            return
+
         unfinished_indices = list(range(len(batch.reqs)))
         for i, req in enumerate(batch.reqs):
             if req is self.current_inflight_req:
