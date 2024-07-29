@@ -66,7 +66,7 @@ class ServerArgs:
     load_balance_method: str = "round_robin"
 
     # Chunked Prefill
-    chunked_prefill_size: int = None
+    chunked_prefill_size: Optional[int] = None
 
     # Optimization/debug options
     disable_flashinfer: bool = False
@@ -228,7 +228,7 @@ class ServerArgs:
         parser.add_argument(
             "--max-num-reqs",
             type=int,
-            default=None,
+            default=ServerArgs.max_num_reqs,
             help="The maximum number of requests to serve in the memory pool. If the model have a large context length, you may need to decrease this value to avoid out-of-memory errors.",
         )
         parser.add_argument(
@@ -316,7 +316,7 @@ class ServerArgs:
             help="The nccl init address of multi-node server.",
         )
         parser.add_argument(
-            "--nnodes", type=int, default=1, help="The number of nodes."
+            "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
         )
         parser.add_argument("--node-rank", type=int, help="The node rank.")
 
@@ -324,7 +324,7 @@ class ServerArgs:
         parser.add_argument(
             "--chunked-prefill-size",
             type=int,
-            default=None,
+            default=ServerArgs.chunked_prefill_size,
             help="The size of the chunked prefill.",
         )
 
