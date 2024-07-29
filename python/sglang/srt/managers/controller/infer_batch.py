@@ -28,8 +28,8 @@ from flashinfer.sampling import top_k_top_p_sampling_from_probs
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
-from sglang.srt.managers.controller.radix_cache import RadixCache
-from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.mem_cache.radix_cache import RadixCache
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 

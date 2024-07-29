@@ -46,7 +46,7 @@ from sglang.srt.managers.controller.infer_batch import (
     InputMetadata,
     global_server_args_dict,
 )
-from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,

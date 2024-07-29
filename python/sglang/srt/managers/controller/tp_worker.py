@@ -36,7 +36,6 @@ from sglang.srt.managers.controller.infer_batch import (
     ForwardMode,
     Req,
 )
-from sglang.srt.managers.controller.radix_cache import RadixCache
 from sglang.srt.managers.controller.schedule_heuristic import ScheduleHeuristic
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -44,6 +43,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
