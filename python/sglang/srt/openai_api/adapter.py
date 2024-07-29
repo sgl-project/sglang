@@ -223,13 +223,19 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
     if not isinstance(ret, list):
         ret = [ret]
+    if request.echo:
+        # TODO: handle the case propmt is token ids
+        if isinstance(request.prompt, list):
+            prompts = request.prompt
+        else:
+            prompts = [request.prompt]
     choices = []
 
     for idx, ret_item in enumerate(ret):
         text = ret_item["text"]
 
         if request.echo:
-            text = request.prompt + text
+            text = prompts[idx] + text
 
         if request.logprobs:
             if request.echo:
@@ -257,17 +263,15 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
         choices.append(choice_data)
 
+    completion_tokens = sum(item["meta_info"]["completion_tokens"] for item in ret)
     response = CompletionResponse(
         id=ret[0]["meta_info"]["id"],
         model=request.model,
         choices=choices,
         usage=UsageInfo(
             prompt_tokens=ret[0]["meta_info"]["prompt_tokens"],
-            completion_tokens=sum(
-                item["meta_info"]["completion_tokens"] for item in ret
-            ),
-            total_tokens=ret[0]["meta_info"]["prompt_tokens"]
-            + sum(item["meta_info"]["completion_tokens"] for item in ret),
+            completion_tokens=completion_tokens,
+            total_tokens=ret[0]["meta_info"]["prompt_tokens"] + completion_tokens,
         ),
     )
 
