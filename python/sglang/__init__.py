@@ -14,6 +14,8 @@ from sglang.api import (
     select,
     set_default_backend,
     system,
+    system_begin,
+    system_end,
     user,
     user_begin,
     user_end,
@@ -58,4 +60,6 @@ __all__ = [
     "user_end",
     "assistant_begin",
     "assistant_end",
+    "system_begin",
+    "system_end"
 ]
