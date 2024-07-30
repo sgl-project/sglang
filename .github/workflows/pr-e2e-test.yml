@@ -1,6 +1,10 @@
 name: PR E2E Test
 
 on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/sglang/*"
   pull_request:
     branches: [ main ]
     paths:
