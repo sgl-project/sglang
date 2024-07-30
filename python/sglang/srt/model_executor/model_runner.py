@@ -40,13 +40,13 @@ from vllm.distributed import (
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
-from sglang.srt.managers.controller.infer_batch import (
+from sglang.srt.managers.schedule_batch import (
     Batch,
     ForwardMode,
     InputMetadata,
     global_server_args_dict,
 )
-from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -273,7 +273,7 @@ class ModelRunner:
         )
 
     def init_cuda_graphs(self):
-        from sglang.srt.managers.controller.cuda_graph_runner import CudaGraphRunner
+        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
         if self.server_args.disable_cuda_graph or self.server_args.disable_flashinfer:
             self.cuda_graph_runner = None

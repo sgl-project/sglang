@@ -553,6 +553,7 @@ class StreamExecutor:
                 "output_token_logprobs": output_token_logprobs,
             }
             self.variable_event[name].set()
+            self.stream_var_event[name].set()
         self.text_ += decision
 
     def _execute_variable(self, expr: SglVariable):
@@ -778,7 +779,14 @@ class ProgramState:
                     if self.stream_executor.is_finished:
                         break
             else:
-                event = self.stream_executor.stream_var_event[var_name]
+                event = None
+                while not event:
+                    if var_name in self.stream_executor.stream_var_event:
+                        event = self.stream_executor.stream_var_event[var_name]
+                    if self.stream_executor.is_finished:
+                        yield ""
+                        return
+
                 while True:
                     event.wait()
                     event.clear()
@@ -813,7 +821,14 @@ class ProgramState:
                     if self.stream_executor.is_finished:
                         break
             else:
-                event = self.stream_executor.stream_var_event[var_name]
+                event = None
+                while not event:
+                    if var_name in self.stream_executor.stream_var_event:
+                        event = self.stream_executor.stream_var_event[var_name]
+                    if self.stream_executor.is_finished:
+                        yield ""
+                        return
+
                 while True:
                     await loop.run_in_executor(None, event.wait)
                     event.clear()
