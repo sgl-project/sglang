@@ -1,3 +1,14 @@
+"""
+Usage:
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python openai_batch_complete.py
+Note: Before running this script,
+you should create the input.jsonl file with the following content:
+{"custom_id": "request-1", "method": "POST", "url": "/v1/completions", "body": {"model": "gpt-3.5-turbo-instruct", "prompt": "List 3 names of famous soccer player: ", "max_tokens": 200}}
+{"custom_id": "request-2", "method": "POST", "url": "/v1/completions", "body": {"model": "gpt-3.5-turbo-instruct", "prompt": "List 6 names of famous basketball player:  ", "max_tokens": 400}}
+{"custom_id": "request-3", "method": "POST", "url": "/v1/completions", "body": {"model": "gpt-3.5-turbo-instruct", "prompt": "List 6 names of famous basketball player:  ", "max_tokens": 400}}
+"""
+
 import json
 import os
 import time
