@@ -46,6 +46,7 @@ from sglang.srt.model_loader.utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
+    filter_files_not_needed_for_inference,
     get_quant_config,
     safetensors_weights_iterator,
 )
