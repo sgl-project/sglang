@@ -12,19 +12,36 @@ jobs:
     runs-on: self-hosted
     env:
       CUDA_VISIBLE_DEVICES: 6
+
     steps:
-    - uses: actions/checkout@v2
-    - name: Check GPU
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Install dependencies
       run: |
-        if ! command -v nvidia-smi &> /dev/null; then
-          echo "nvidia-smi not found. Is CUDA installed?"
-          exit 1
-        fi
-        nvidia-smi || exit 1
-    - name: Environment Info
+        pip install --upgrade pip
+        pip install -e "python[all]"
+        pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/ --force-reinstall
+        pip install --upgrade transformers
+
+    - name: Launch server and run benchmark
       run: |
-        echo "Working directory: $(pwd)"
-        echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
-    - name: Run Tests
-      run: |
-        echo "Running tests..."
+        python3 -m sglang.launch_server --model /home/lmzheng/zhyncs/Meta-Llama-3.1-8B-Instruct --port 8413 &
+
+        echo "Waiting for server to start..."
+        for i in {1..60}; do
+          if curl -s http://127.0.0.1:8413/health; then
+            echo "Server is up!"
+            break
+          fi
+          if [ $i -eq 60 ]; then
+            echo "Server failed to start within 60 seconds"
+            exit 1
+          fi
+          sleep 1
+        done
+
+        python3 -m sglang.bench_serving --backend sglang
+
+        echo "Stopping server..."
+        kill -9 $(ps aux | grep sglang | grep Meta-Llama-3.1-8B-Instruct | grep -v grep | awk '{print $2}')
