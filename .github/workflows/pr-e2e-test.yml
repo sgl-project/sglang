@@ -41,7 +41,7 @@ jobs:
           sleep 1
         done
 
-        python3 -m sglang.bench_serving --backend sglang
+        python3 -m sglang.bench_serving --backend sglang --port 8413
 
         echo "Stopping server..."
         kill -9 $(ps aux | grep sglang | grep Meta-Llama-3.1-8B-Instruct | grep -v grep | awk '{print $2}')
