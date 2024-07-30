@@ -2,10 +2,10 @@
 Benchmark the latency of a given model. It accepts arguments similar to those of launch_server.py.
 
 # Usage (latency test):
-python -m sglang.benchmarks.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct --load-format dummy
+python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct --load-format dummy
 
 # Usage (correctness test):
-python -m sglang.benchmarks.bench_latency --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
+python -m sglang.bench_latency --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
 
 ### Reference output:
 prefill logits (first half) tensor([[-10.0312,  -9.5000,   0.8936,  ...,  -4.9414,  -3.2402,  -3.3633],
