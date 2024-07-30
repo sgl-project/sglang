@@ -361,7 +361,7 @@ def v1_generate_request(all_requests):
     if len(all_requests) == 1:
         prompt = prompts[0]
         sampling_params_list = sampling_params_list[0]
-        if isinstance(prompts, str) or isinstance(prompts[0], str):
+        if isinstance(prompt, str) or isinstance(prompt[0], str):
             prompt_kwargs = {"text": prompt}
         else:
             prompt_kwargs = {"input_ids": prompt}
