@@ -442,8 +442,11 @@ class ModelTpServer:
                 else:
                     # Add this request to the running batch
                     if (
-                        new_batch_input_tokens + req.extend_input_len
-                        <= self.chunked_prefill_size
+                        self.chunked_prefill_size is None
+                        or (
+                            new_batch_input_tokens + req.extend_input_len
+                            <= self.chunked_prefill_size
+                        )
                         or (
                             req.return_logprob and req.normalized_prompt_logprob is None
                         )
