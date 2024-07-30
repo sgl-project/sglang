@@ -103,7 +103,7 @@ class RadixAttention(nn.Module):
         return o
 
     def extend_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
-        if not input_metadata.use_ragged:
+        if not input_metadata.flashinfer_use_ragged:
             self.store_kv_cache(k, v, input_metadata)
 
             o = input_metadata.flashinfer_prefill_wrapper_paged.forward(

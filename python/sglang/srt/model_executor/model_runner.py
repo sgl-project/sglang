@@ -212,9 +212,14 @@ class ModelRunner:
             )
 
         if max_num_reqs is None:
-            max_num_reqs = max(
-                int(self.max_total_num_tokens / self.model_config.context_len * 512),
-                2048,
+            max_num_reqs = min(
+                max(
+                    int(
+                        self.max_total_num_tokens / self.model_config.context_len * 512
+                    ),
+                    2048,
+                ),
+                5120,
             )
 
         self.req_to_token_pool = ReqToTokenPool(
