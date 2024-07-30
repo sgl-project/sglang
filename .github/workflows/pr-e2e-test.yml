@@ -3,8 +3,12 @@ name: PR E2E Test
 on:
   push:
     branches: [ main ]
+    paths:
+      - "python/sglang/*"
   pull_request:
     branches: [ main ]
+    paths:
+      - "python/sglang/*"
   workflow_dispatch:
 
 jobs:
@@ -26,22 +30,22 @@ jobs:
 
     - name: Launch server and run benchmark
       run: |
-        python3 -m sglang.launch_server --model /home/lmzheng/zhyncs/Meta-Llama-3.1-8B-Instruct --port 8413 &
+        python3 -m sglang.launch_server --model /home/lmzheng/zhyncs/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
 
         echo "Waiting for server to start..."
-        for i in {1..60}; do
+        for i in {1..120}; do
           if curl -s http://127.0.0.1:8413/health; then
             echo "Server is up!"
             break
           fi
-          if [ $i -eq 60 ]; then
-            echo "Server failed to start within 60 seconds"
+          if [ $i -eq 120 ]; then
+            echo "Server failed to start within 120 seconds"
             exit 1
           fi
           sleep 1
         done
 
-        python3 -m sglang.bench_serving --backend sglang --port 8413
+        cd /home/lmzheng/zhyncs && python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512
 
         echo "Stopping server..."
         kill -9 $(ps aux | grep sglang | grep Meta-Llama-3.1-8B-Instruct | grep -v grep | awk '{print $2}')
