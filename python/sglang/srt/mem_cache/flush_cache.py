@@ -17,7 +17,7 @@ limitations under the License.
 Flush the KV cache.
 
 Usage:
-python3 -m sglang.srt.flush_cache --url http://localhost:30000
+python3 -m sglang.srt.mem_cache.flush_cache --url http://localhost:30000
 """
 
 import argparse

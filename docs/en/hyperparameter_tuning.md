@@ -29,7 +29,7 @@ If OOM happens during prefill, try to decrease `--max-prefill-tokens`.
 If OOM happens during decoding, try to decrease `--max-running-requests`.  
 You can also try to decrease `--mem-fraction-static`, which reduces the memory usage of the KV cache memory pool and helps both prefill and decoding.
 
-### (Minor) Tune `--schedule-heuristic`
-If you have many shared prefixes, use the default `--schedule-heuristic lpm`. `lpm` stands for longest prefix match.
+### (Minor) Tune `--schedule-policy`
+If you have many shared prefixes, use the default `--schedule-policy lpm`. `lpm` stands for longest prefix match.
 When you have no shared prefixes at all or you always send the requests with the shared prefixes together,
-you can try `--schedule-heuristic fcfs`. `fcfs` stands for first come first serve.
+you can try `--schedule-policy fcfs`. `fcfs` stands for first come first serve.

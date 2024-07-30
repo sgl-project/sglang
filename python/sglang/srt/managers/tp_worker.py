@@ -29,23 +29,23 @@ from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.controller.infer_batch import (
-    FINISH_ABORT,
-    BaseFinishReason,
-    Batch,
-    ForwardMode,
-    Req,
-)
-from sglang.srt.managers.controller.model_runner import ModelRunner
-from sglang.srt.managers.controller.radix_cache import RadixCache
-from sglang.srt.managers.controller.schedule_heuristic import ScheduleHeuristic
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenIDOut,
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.policy_scheduler import PolicyScheduler
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    BaseFinishReason,
+    Batch,
+    ForwardMode,
+    Req,
+)
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_int_token_logit_bias,
@@ -74,7 +74,7 @@ class ModelTpServer:
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
-        self.schedule_heuristic = server_args.schedule_heuristic
+        self.schedule_policy = server_args.schedule_policy
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
 
         # Chunked prefill
@@ -150,8 +150,8 @@ class ModelTpServer:
             disable=server_args.disable_radix_cache,
         )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
-        self.scheduler = ScheduleHeuristic(
-            self.schedule_heuristic,
+        self.scheduler = PolicyScheduler(
+            self.schedule_policy,
             self.max_running_requests,
             self.max_prefill_tokens,
             self.max_total_num_tokens,

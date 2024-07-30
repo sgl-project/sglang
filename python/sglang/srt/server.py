@@ -44,11 +44,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.constrained import disable_cache
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.managers.controller.manager_multi import (
+from sglang.srt.managers.controller_multi import (
     start_controller_process as start_controller_process_multi,
 )
-from sglang.srt.managers.controller.manager_single import launch_tp_servers
-from sglang.srt.managers.controller.manager_single import (
+from sglang.srt.managers.controller_single import launch_tp_servers
+from sglang.srt.managers.controller_single import (
     start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process

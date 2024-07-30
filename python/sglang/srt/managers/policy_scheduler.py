@@ -13,47 +13,47 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Request scheduler heuristic."""
+"""Request policy scheduler"""
 
 import random
 from collections import defaultdict
 
 
-class ScheduleHeuristic:
+class PolicyScheduler:
     def __init__(
         self,
-        schedule_heuristic,
+        policy,
         max_running_seqs,
         max_prefill_num_tokens,
         max_total_num_tokens,
         tree_cache,
     ):
-        if tree_cache.disable and schedule_heuristic == "lpm":
+        if tree_cache.disable and policy == "lpm":
             # LMP is meaningless when the tree cache is disabled.
-            schedule_heuristic = "fcfs"
+            policy = "fcfs"
 
-        self.schedule_heuristic = schedule_heuristic
+        self.policy = policy
         self.max_running_seqs = max_running_seqs
         self.max_prefill_num_tokens = max_prefill_num_tokens
         self.max_total_num_tokens = max_total_num_tokens
         self.tree_cache = tree_cache
 
     def get_priority_queue(self, waiting_queue):
-        if self.schedule_heuristic == "lpm":
+        if self.policy == "lpm":
             # longest prefix match
             waiting_queue.sort(key=lambda x: -len(x.prefix_indices))
             return waiting_queue
-        elif self.schedule_heuristic == "fcfs":
+        elif self.policy == "fcfs":
             # first come first serve
             return waiting_queue
-        elif self.schedule_heuristic == "lof":
+        elif self.policy == "lof":
             # longest output first
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
             return waiting_queue
-        elif self.schedule_heuristic == "random":
+        elif self.policy == "random":
             random.shuffle(waiting_queue)
             return waiting_queue
-        elif self.schedule_heuristic == "dfs-weight":
+        elif self.policy == "dfs-weight":
             last_node_to_reqs = defaultdict(list)
             for req in waiting_queue:
                 last_node_to_reqs[req.last_node].append(req)
@@ -70,7 +70,7 @@ class ScheduleHeuristic:
             assert len(q) == len(waiting_queue)
             return q
         else:
-            raise ValueError(f"Unknown schedule_heuristic: {self.schedule_heuristic}")
+            raise ValueError(f"Unknown schedule_policy: {self.policy}")
 
     def calc_weight(self, cur_node, node_to_weight):
         for child in cur_node.children.values():
