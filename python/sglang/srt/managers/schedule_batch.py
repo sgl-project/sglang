@@ -494,6 +494,7 @@ class Batch:
             self.token_to_kv_pool.free(token_indices)
 
             # release the last node
+            # FIXME(lsyin): we should use the newly evictable memory instantly.
             self.tree_cache.dec_lock_ref(req.last_node)
 
             req.prefix_indices = None
@@ -575,6 +576,7 @@ class Batch:
                     if req_pool_indices_cpu is None:
                         req_pool_indices_cpu = self.req_pool_indices.tolist()
                     self.tree_cache.cache_req(
+                        rid=req.rid,
                         token_ids=cur_all_ids,
                         last_uncached_pos=len(req.prefix_indices),
                         req_pool_idx=req_pool_indices_cpu[i],

@@ -64,7 +64,7 @@ class RadixCache(BaseCache):
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
 
-    def match_prefix(self, key):
+    def match_prefix(self, key, **kwargs):
         if self.disable:
             return [], self.root_node
 
@@ -92,6 +92,7 @@ class RadixCache(BaseCache):
         req_pool_idx,
         del_in_memory_pool=True,
         old_last_node=None,
+        **kwargs,
     ):
         # Insert the request into radix cache
         indices = self.req_to_token_pool.req_to_token[req_pool_idx, : len(token_ids)]

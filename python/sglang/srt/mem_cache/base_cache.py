@@ -2,31 +2,22 @@ from abc import ABC, abstractmethod
 
 
 class BaseCache(ABC):
+    """Cache can be indexed by either rid or key."""
+
     @abstractmethod
     def reset(self):
         pass
 
     @abstractmethod
-    def match_prefix(self, key):
+    def match_prefix(self, **kwargs):
         pass
 
     @abstractmethod
-    def insert(self, key, value=None):
+    def insert(self, **kwargs):
         pass
 
     @abstractmethod
-    def cache_req(
-        self,
-        token_ids,
-        last_uncached_pos,
-        req_pool_idx,
-        del_in_memory_pool=True,
-        old_last_node=None,
-    ):
-        pass
-
-    @abstractmethod
-    def total_size(self):
+    def cache_req(self, **kwargs):
         pass
 
     @abstractmethod
@@ -44,6 +35,9 @@ class BaseCache(ABC):
     @abstractmethod
     def evictable_size(self):
         pass
+
+    def total_size(self):
+        raise NotImplementedError
 
     def pretty_print(self):
         raise NotImplementedError
