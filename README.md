@@ -54,7 +54,8 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 
 ### Method 2: From source
 ```
-git clone https://github.com/sgl-project/sglang.git
+# Use the stable rel branch
+git clone -b rel https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
