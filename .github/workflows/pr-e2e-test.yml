@@ -1,0 +1,30 @@
+name: PR E2E Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  gpu-job:
+    runs-on: self-hosted
+    env:
+      CUDA_VISIBLE_DEVICES: 6
+    steps:
+    - uses: actions/checkout@v2
+    - name: Check GPU
+      run: |
+        if ! command -v nvidia-smi &> /dev/null; then
+          echo "nvidia-smi not found. Is CUDA installed?"
+          exit 1
+        fi
+        nvidia-smi || exit 1
+    - name: Environment Info
+      run: |
+        echo "Working directory: $(pwd)"
+        echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+    - name: Run Tests
+      run: |
+        echo "Running tests..."
