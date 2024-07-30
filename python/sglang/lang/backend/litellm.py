@@ -61,7 +61,7 @@ class LiteLLM(BaseBackend):
             model=self.model_name,
             messages=messages,
             **self.client_params,
-            **sampling_params.to_anthropic_kwargs(),
+            **sampling_params.to_litellm_kwargs(),
         )
         comp = ret.choices[0].message.content
 
