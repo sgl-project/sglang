@@ -1,3 +1,13 @@
+"""
+Usage:
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python openai_batch_chat.py
+Note: Before running this script,
+you should create the input.jsonl file with the following content:
+{"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo-0125", "messages": [{"role": "system", "content": "You are a helpful assistant."},{"role": "user", "content": "Hello world!  List 3 NBA players and tell a story"}],"max_tokens": 300}}
+{"custom_id": "request-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo-0125", "messages": [{"role": "system", "content": "You are an assistant. "},{"role": "user", "content": "Hello world! List three capital and tell a story"}],"max_tokens": 500}}
+"""
+
 import json
 import os
 import time
