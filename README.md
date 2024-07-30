@@ -208,11 +208,11 @@ Instructions for supporting a new model are [here](https://github.com/sgl-projec
 
 - Benchmark a single static batch by running the following command without launching a server. The arguments are the same as those for `launch_server.py`. This is not a dynamic batching server, so it may run out of memory for a batch size that can run successfully with a real server. This is because a real server will truncate the prefill into several batches/chunks, while this unit test does not do this.
   ```
-  python -m sglang.benchmarks.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 32 --input-len 256 --output-len 32
+  python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 32 --input-len 256 --output-len 32
   ```
 - Benchmark online serving. Launch a server first and run the following command.
   ```
-  python3 -m sglang.benchmarks.bench_serving --backend sglang --num-prompt 10
+  python3 -m sglang.bench_serving --backend sglang --num-prompt 10
   ```
 
 ## Frontend: Structured Generation Language (SGLang)
