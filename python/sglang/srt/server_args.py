@@ -195,6 +195,7 @@ class ServerArgs:
                 "gptq",
                 "marlin",
                 "gptq_marlin",
+                "awq_marlin",
                 "squeezellm",
                 "bitsandbytes",
             ],
