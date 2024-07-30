@@ -84,6 +84,9 @@ async def async_request_trt_llm(
             "min_length": request_func_input.output_len,
             "end_id": 1048576,
         }
+        if args.disable_ignore_eos:
+            del payload["min_length"]
+            del payload["end_id"]
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
 
@@ -149,7 +152,7 @@ async def async_request_openai_completions(
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
-            "ignore_eos": True,
+            "ignore_eos": not args.disable_ignore_eos,
         }
         headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
 
@@ -968,6 +971,11 @@ if __name__ == "__main__":
         "--disable-stream",
         action="store_true",
         help="Disable streaming mode.",
+    )
+    parser.add_argument(
+        "--disable-ignore-eos",
+        action="store_true",
+        help="Disable ignoring EOS.",
     )
 
     set_ulimit()
