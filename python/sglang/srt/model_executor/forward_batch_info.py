@@ -75,20 +75,6 @@ class InputMetadata:
         return_logprob=False,
         skip_flashinfer_init=False,
     ):
-        flashinfer_use_ragged = False
-        if not skip_flashinfer_init and not model_runner.server_args.disable_flashinfer:
-            if forward_mode != ForwardMode.DECODE and int(torch.sum(seq_lens)) > 4096:
-                flashinfer_use_ragged = True
-            init_flashinfer_args(
-                forward_mode,
-                model_runner,
-                req_pool_indices,
-                seq_lens,
-                prefix_lens,
-                model_runner.flashinfer_decode_wrapper,
-                flashinfer_use_ragged,
-            )
-
         batch_size = len(req_pool_indices)
 
         if forward_mode == ForwardMode.DECODE:
@@ -138,14 +124,16 @@ class InputMetadata:
             extend_no_prefix=extend_no_prefix,
             return_logprob=return_logprob,
             top_logprobs_nums=top_logprobs_nums,
-            flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
-            flashinfer_prefill_wrapper_paged=model_runner.flashinfer_prefill_wrapper_paged,
-            flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
-            flashinfer_use_ragged=flashinfer_use_ragged,
         )
 
         if model_runner.server_args.disable_flashinfer:
             ret.init_triton_args(prefix_lens)
+
+        if not skip_flashinfer_init and not model_runner.server_args.disable_flashinfer:
+            flashinfer_use_ragged = False
+            if forward_mode != ForwardMode.DECODE and int(torch.sum(seq_lens)) > 4096:
+                flashinfer_use_ragged = True
+            ret.init_flashinfer_args(model_runner, prefix_lens, flashinfer_use_ragged)
 
         return ret
 
@@ -165,8 +153,31 @@ class InputMetadata:
             extend_seq_lens = self.seq_lens - prefix_lens
             self.triton_max_extend_len = int(torch.max(extend_seq_lens))
 
+    def init_flashinfer_args(self, model_runner, prefix_lens, flashinfer_use_ragged):
+        update_flashinfer_indices(
+            self.forward_mode,
+            model_runner,
+            self.req_pool_indices,
+            self.seq_lens,
+            prefix_lens,
+            model_runner.flashinfer_decode_wrapper,
+            flashinfer_use_ragged,
+        )
 
-def init_flashinfer_args(
+        (
+            self.flashinfer_decode_wrapper,
+            self.flashinfer_prefill_wrapper_ragged,
+            self.flashinfer_prefill_wrapper_paged,
+            self.flashinfer_use_ragged,
+        ) = (
+            model_runner.flashinfer_decode_wrapper,
+            model_runner.flashinfer_prefill_wrapper_ragged,
+            model_runner.flashinfer_prefill_wrapper_paged,
+            flashinfer_use_ragged,
+        )
+
+
+def update_flashinfer_indices(
     forward_mode,
     model_runner,
     req_pool_indices,

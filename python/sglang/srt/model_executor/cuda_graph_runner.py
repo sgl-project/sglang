@@ -33,7 +33,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     InputMetadata,
-    init_flashinfer_args,
+    update_flashinfer_indices,
 )
 from sglang.srt.utils import monkey_patch_vllm_all_gather
 
@@ -165,7 +165,7 @@ class CudaGraphRunner:
             paged_kv_indices_buffer=self.flashinfer_kv_indices,
             paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[:bs],
         )
-        init_flashinfer_args(
+        update_flashinfer_indices(
             ForwardMode.DECODE,
             self.model_runner,
             req_pool_indices,
@@ -222,7 +222,7 @@ class CudaGraphRunner:
         self.out_cache_loc[:raw_bs] = batch.out_cache_loc
 
         # FlashInfer inputs
-        init_flashinfer_args(
+        update_flashinfer_indices(
             ForwardMode.DECODE,
             self.model_runner,
             self.req_pool_indices[:bs],
