@@ -223,6 +223,13 @@ def is_multimodal_model(model):
     raise ValueError("unrecognized type")
 
 
+def is_embedding_model(model_path):
+    # FIXME incomplete list
+    if "e5-mistral-7b-instruct" in model_path.lower():
+        return True
+    return False
+
+
 def decode_video_base64(video_base64):
     from PIL import Image
 
