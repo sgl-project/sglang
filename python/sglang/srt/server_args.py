@@ -44,6 +44,7 @@ class ServerArgs:
     max_prefill_tokens: Optional[int] = None
     max_running_requests: Optional[int] = None
     max_num_reqs: Optional[int] = None
+    max_total_tokens: Optional[int] = None
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
 
@@ -230,6 +231,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_num_reqs,
             help="The maximum number of requests to serve in the memory pool. If the model have a large context length, you may need to decrease this value to avoid out-of-memory errors.",
+        )
+        parser.add_argument(
+            "--max-total-tokens",
+            type=int,
+            default=ServerArgs.max_total_tokens,
+            help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. This option is typically used for development and debugging purposes.",
         )
         parser.add_argument(
             "--schedule-policy",
