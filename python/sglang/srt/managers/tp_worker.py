@@ -44,7 +44,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
-from sglang.srt.model_executor.forward_batch import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (

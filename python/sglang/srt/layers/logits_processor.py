@@ -25,7 +25,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 
-from sglang.srt.model_executor.forward_batch import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import InputMetadata
 
 

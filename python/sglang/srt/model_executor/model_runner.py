@@ -47,7 +47,7 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
-from sglang.srt.model_executor.forward_batch import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,

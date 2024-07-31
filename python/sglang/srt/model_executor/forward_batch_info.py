@@ -12,7 +12,7 @@ class ForwardMode(IntEnum):
 
 
 @dataclass
-class ForwardBatch:
+class ForwardBatchInfo:
     """Model forward information for a batch."""
 
     pass

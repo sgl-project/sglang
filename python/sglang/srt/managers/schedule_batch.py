@@ -29,7 +29,7 @@ from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
