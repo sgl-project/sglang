@@ -280,6 +280,14 @@ class ModelTpServer:
                 "KV cache pool leak detected!"
             )
 
+        if self.req_to_token_pool.can_use_mem_size != self.req_to_token_pool.size:
+            warnings.warn(
+                "Warning: "
+                f"available req slots={self.req_to_token_pool.can_use_mem_size}, "
+                f"total slots={self.req_to_token_pool.size}\n"
+                "Memory pool leak detected!"
+            )
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
