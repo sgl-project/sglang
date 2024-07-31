@@ -493,6 +493,7 @@ class Batch:
                     req_pool_indices_cpu[idx]
                 ][: seq_lens_cpu[idx]]
                 self.token_to_kv_pool.free(token_indices)
+                self.req_to_token_pool.free(int(req_pool_indices_cpu[idx]))
                 del self.tree_cache.entries[req.rid]
             else:
                 # TODO: apply more fine-grained retraction
@@ -501,6 +502,7 @@ class Batch:
                     req_pool_indices_cpu[idx]
                 ][last_uncached_pos : seq_lens_cpu[idx]]
                 self.token_to_kv_pool.free(token_indices)
+                self.req_to_token_pool.free(int(req_pool_indices_cpu[idx]))
 
                 # release the last node
                 # FIXME(lsyin): we should use the newly evictable memory instantly.
