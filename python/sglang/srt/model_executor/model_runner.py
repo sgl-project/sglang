@@ -125,7 +125,7 @@ class ModelRunner:
             server_args.max_total_tokens,
         )
         self.init_cublas()
-        self.init_flash_infer()
+        self.init_flashinfer()
 
         # Capture cuda graphs
         self.init_cuda_graphs()
@@ -259,7 +259,7 @@ class ModelRunner:
         c = a @ b
         return c
 
-    def init_flash_infer(self):
+    def init_flashinfer(self):
         if self.server_args.disable_flashinfer:
             self.flashinfer_prefill_wrapper_ragged = None
             self.flashinfer_prefill_wrapper_paged = None
