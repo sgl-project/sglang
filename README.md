@@ -67,7 +67,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 
 ### Method 3: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](docker).
-Repalce `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
+Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash
 docker run --gpus all \
