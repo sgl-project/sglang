@@ -505,8 +505,15 @@ class Batch:
                 self.req_to_token_pool.free(int(req_pool_indices_cpu[idx]))
 
                 # release the last node
-                # FIXME(lsyin): we should use the newly evictable memory instantly.
                 self.tree_cache.dec_lock_ref(req.last_node)
+
+                # NOTE(lsyin): we should use the newly evictable memory instantly.
+                residual_size = (
+                    len(sorted_indices) * global_config.retract_decode_steps
+                    - self.token_to_kv_pool.available_size()
+                )
+                residual_size = max(0, residual_size)
+                self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
 
             req.prefix_indices = None
             req.last_node = None
