@@ -43,7 +43,9 @@ from sglang.srt.openai_api.protocol import (
     ChatCompletionResponseChoice,
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
+    ChatCompletionTokenLogprob,
     ChatMessage,
+    ChoiceLogprobs,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
@@ -55,8 +57,6 @@ from sglang.srt.openai_api.protocol import (
     FileResponse,
     LogProbs,
     TopLogprob,
-    ChatCompletionTokenLogprob,
-    ChoiceLogprobs,
     UsageInfo,
 )
 
@@ -346,7 +346,9 @@ def v1_generate_request(all_requests):
         ), "All prompts must be of the same type in file input settings"
         prompts.append(prompt)
         return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
-        top_logprobs_nums.append(request.logprobs if request.logprobs is not None else 0)
+        top_logprobs_nums.append(
+            request.logprobs if request.logprobs is not None else 0
+        )
         sampling_params_list.append(
             {
                 "temperature": request.temperature,
@@ -680,13 +682,26 @@ def v1_chat_generate_response(request, ret, to_file=False):
             )
             token_logprobs = []
             for token, logprob in zip(logprobs.tokens, logprobs.token_logprobs):
-                token_bytes = list(token.encode('utf-8'))
+                token_bytes = list(token.encode("utf-8"))
                 top_logprobs = []
                 if logprobs.top_logprobs:
                     for top_token, top_logprob in logprobs.top_logprobs[0].items():
-                        top_token_bytes = list(top_token.encode('utf-8'))
-                        top_logprobs.append(TopLogprob(token=top_token, bytes=top_token_bytes, logprob=top_logprob))
-                token_logprobs.append(ChatCompletionTokenLogprob(token=token, bytes=token_bytes, logprob=logprob, top_logprobs=top_logprobs))
+                        top_token_bytes = list(top_token.encode("utf-8"))
+                        top_logprobs.append(
+                            TopLogprob(
+                                token=top_token,
+                                bytes=top_token_bytes,
+                                logprob=top_logprob,
+                            )
+                        )
+                token_logprobs.append(
+                    ChatCompletionTokenLogprob(
+                        token=token,
+                        bytes=token_bytes,
+                        logprob=logprob,
+                        top_logprobs=top_logprobs,
+                    )
+                )
 
             choice_logprobs = ChoiceLogprobs(content=token_logprobs)
         else:

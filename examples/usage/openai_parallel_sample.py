@@ -121,7 +121,7 @@ response = client.chat.completions.create(
     ],
     temperature=0.8,
     max_tokens=1,
-    n=1
+    n=1,
 )
 print(response)
 
@@ -151,4 +151,3 @@ response = client.chat.completions.create(
     n=4,
 )
 print(response)
-
