@@ -11,6 +11,7 @@ suites = {
         "test_chunked_prefill.py",
         "test_torch_compile.py",
         "models/test_causal_models.py",
+        "models/test_embedding_models.py",
         "sampling/penaltylib",
     ],
     "sampling/penaltylib": glob.glob(

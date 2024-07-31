@@ -161,6 +161,10 @@ class ModelRunner:
             vllm_model_config.hf_config.num_key_value_heads = 8
             monkey_patch_vllm_qvk_linear_loader()
 
+        if "e5-mistral" in self.server_args.model_path.lower():
+            self.model_config.hf_config.architectures = ["LlamaEmbeddingModel"]
+            vllm_model_config.hf_config.architectures = ["LlamaEmbeddingModel"]
+
         self.dtype = vllm_model_config.dtype
         if self.model_config.model_overide_args is not None:
             vllm_model_config.hf_config.update(self.model_config.model_overide_args)

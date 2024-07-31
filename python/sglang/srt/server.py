@@ -52,7 +52,7 @@ from sglang.srt.managers.controller_single import (
     start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
@@ -72,6 +72,7 @@ from sglang.srt.utils import (
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
+    is_embedding_model,
     kill_child_process,
     maybe_set_triton_cache_manager,
     set_torch_compile_config,
@@ -98,6 +99,7 @@ async def health() -> Response:
 async def get_model_info():
     result = {
         "model_path": tokenizer_manager.model_path,
+        "is_embedding": is_embedding_model(tokenizer_manager.model_path),
     }
     return result
 
@@ -149,6 +151,21 @@ app.post("/generate")(generate_request)
 app.put("/generate")(generate_request)
 
 
+async def encode_request(obj: EmbeddingReqInput, request: Request):
+    """Handle an embedding request."""
+    try:
+        ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+        return ret
+    except ValueError as e:
+        return JSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
+app.post("/encode")(encode_request)
+app.put("/encode")(encode_request)
+
+
 @app.post("/v1/completions")
 async def openai_v1_completions(raw_request: Request):
     return await v1_completions(tokenizer_manager, raw_request)
@@ -167,6 +184,11 @@ def available_models():
     for served_model_name in served_model_names:
         model_cards.append(ModelCard(id=served_model_name, root=served_model_name))
     return ModelList(data=model_cards)
+
+
+@app.post("/v1/embeddings")
+async def openai_v1_embeddings(raw_request: Request):
+    return await v1_embeddings(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/files")
@@ -385,6 +407,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         except (AssertionError, requests.exceptions.RequestException) as e:
             last_traceback = get_exception_traceback()
             pass
+    model_info = res.json()
 
     if not success:
         if pipe_finish_writer is not None:
@@ -393,15 +416,17 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         sys.exit(1)
 
     # Send a warmup request
+    request_name = "/encode" if model_info["is_embedding"] else "/generate"
+    max_new_tokens = 0 if model_info["is_embedding"] else 8
     try:
         for _ in range(server_args.dp_size):
             res = requests.post(
-                url + "/generate",
+                url + request_name,
                 json={
                     "text": "The capital city of France is",
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 8,
+                        "max_new_tokens": max_new_tokens,
                     },
                 },
                 headers=headers,
@@ -530,6 +555,19 @@ class Runtime:
         }
         response = requests.post(
             self.url + "/generate",
+            json=json_data,
+        )
+        return json.dumps(response.json())
+
+    def encode(
+        self,
+        prompt: str,
+    ):
+        json_data = {
+            "text": prompt,
+        }
+        response = requests.post(
+            self.url + "/encode",
             json=json_data,
         )
         return json.dumps(response.json())
