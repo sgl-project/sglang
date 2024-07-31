@@ -18,7 +18,6 @@ limitations under the License.
 import logging
 import warnings
 from dataclasses import dataclass
-from enum import IntEnum, auto
 from typing import List, Union
 
 import numpy as np
@@ -30,6 +29,7 @@ from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.model_executor.forward_batch import ForwardMode
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -42,15 +42,6 @@ global_server_args_dict = {
 
 
 logger = logging.getLogger(__name__)
-
-
-class ForwardMode(IntEnum):
-    # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
-    PREFILL = auto()
-    # Extend a sequence. The KV cache of the first part of the sequence is already computed (e.g., system prompt).
-    EXTEND = auto()
-    # Decode one token.
-    DECODE = auto()
 
 
 class BaseFinishReason:
@@ -283,7 +274,7 @@ class Req:
 
 @dataclass
 class ScheduleBatch:
-    """Store all inforamtion of a batch."""
+    """All schedule information for a batch."""
 
     # Request, memory pool, and cache
     reqs: List[Req]

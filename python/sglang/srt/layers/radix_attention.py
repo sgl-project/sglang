@@ -22,8 +22,8 @@ from torch import nn
 from sglang.global_config import global_config
 from sglang.srt.layers.extend_attention import extend_attention_fwd
 from sglang.srt.layers.token_attention import token_attention_fwd
+from sglang.srt.model_executor.forward_batch import ForwardMode
 from sglang.srt.model_executor.model_runner import (
-    ForwardMode,
     InputMetadata,
     global_server_args_dict,
 )

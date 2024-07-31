@@ -39,12 +39,12 @@ from sglang.srt.managers.policy_scheduler import PolicyScheduler
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     BaseFinishReason,
-    ForwardMode,
     Req,
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
+from sglang.srt.model_executor.forward_batch import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (

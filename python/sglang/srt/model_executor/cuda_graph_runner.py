@@ -30,11 +30,11 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
 )
 from sglang.srt.managers.schedule_batch import (
-    ForwardMode,
     InputMetadata,
     ScheduleBatch,
     init_flashinfer_args,
 )
+from sglang.srt.model_executor.forward_batch import ForwardMode
 from sglang.srt.utils import monkey_patch_vllm_all_gather
 
 

@@ -42,17 +42,18 @@ from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
 from sglang.srt.managers.schedule_batch import (
-    ForwardMode,
     InputMetadata,
     ScheduleBatch,
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.model_executor.forward_batch import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_llama3_405b_fp8,
     is_multimodal_model,
+    monkey_patch_vllm_all_gather,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
     monkey_patch_vllm_qvk_linear_loader,
