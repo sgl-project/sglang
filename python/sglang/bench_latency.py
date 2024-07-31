@@ -198,12 +198,13 @@ def correctness_test(
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
     rank_print("prefill logits (final)", next_token_logits)
 
+    # FIXME (yifan): enable decode later.
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
-    for _ in range(bench_args.output_len):
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-        for i in range(len(reqs)):
-            output_ids[i].append(next_token_ids[i])
+    # for _ in range(bench_args.output_len):
+    #     next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+    #     for i in range(len(reqs)):
+    #         output_ids[i].append(next_token_ids[i])
 
     # Print
     for i in range(len(reqs)):
@@ -214,11 +215,12 @@ def latency_test(
     server_args,
     bench_args,
     tp_rank,
+    sp_rank=0,
 ):
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, tp_rank, sp_rank)
     rank_print(
         f"max_batch_size={model_runner.max_total_num_tokens // (bench_args.input_len + bench_args.output_len)}"
     )
@@ -290,7 +292,7 @@ def main(server_args, bench_args):
         work_func = latency_test
 
     if server_args.tp_size == 1:
-        work_func(server_args, bench_args, 0)
+        work_func(server_args, bench_args, 0, 0)
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):

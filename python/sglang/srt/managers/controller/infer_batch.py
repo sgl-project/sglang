@@ -4,7 +4,7 @@ import itertools
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import Iterable, List, Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -393,11 +393,10 @@ class Batch:
         extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
         if self.sp_size > 1:
             extend_seq_lens = seq_lens - prefix_lens
-            # FIXME(yonghao): _extend_num_tokens -> extend_num_tokens once kv cache store is ready for SP
             extend_local_token_nums = _get_local_token_nums_new(
                 self.sp_rank, self.sp_size, extend_seq_lens
             )
-            _extend_num_tokens = int(np.sum(extend_local_token_nums))
+            extend_num_tokens = int(np.sum(extend_local_token_nums))
 
         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
@@ -413,8 +412,7 @@ class Batch:
         for i in range(bs):
             extend_len = extend_lens[i]
             if self.sp_size > 1:
-                # FIXME(yonghao): _extend_len > extend_len once SP Attn is ready
-                _extend_len = extend_local_token_nums[i]
+                extend_len = extend_local_token_nums[i]
             self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
                 prefix_lens[i] : prefix_lens[i] + extend_len
             ] = out_cache_loc[pt : pt + extend_len]
@@ -808,6 +806,10 @@ class InputMetadata:
     flashinfer_prefill_wrapper_ragged: "BatchPrefillWithRaggedKVCacheWrapper" = None
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
+    # NOTE: for sequence parallel, we need dedicated kernels for cross-shard attn.
+    # Especially, we need custom masks for the last SP shard which may contain padding tokens.
+    flashinfer_prefill_wrapper_sp_full: "BatchPrefillWithRaggedKVCacheWrapper" = None
+    flashinfer_prefill_wrapper_sp_causal: "BatchPrefillWithRaggedKVCacheWrapper" = None
 
     # For Sequence Parallel
     sp_rank: int = None
@@ -878,7 +880,6 @@ class InputMetadata:
         sp_rank = model_runner.sp_rank
         sp_size = model_runner.sp_size
         if sp_size > 1:
-            # FIXME: haven't supported cuda graph yet.
             # During the runtime, we should use positions[local_token_indices]
             # to get positions for each SP shard.
             prefix_lens = prefix_lens if prefix_lens is not None else 0
@@ -903,6 +904,16 @@ class InputMetadata:
                 sp_local_token_length = _get_local_token_nums_new(
                     sp_rank, sp_size, extend_seq_lens_cpu
                 )
+                # Convert positions to SP layout and add padding zeros.
+                normal_to_sp_indices = np.argsort(sp_to_normal_indices)
+                positions = positions[normal_to_sp_indices]
+                positions = _add_padding_zeros(positions, extend_seq_lens_cpu, sp_size)
+                # Add padding zeros to out_cache_loc and write KV of padded tokens that may
+                # exist in the last SP shard to slot 0 (reserved for dummy output).
+                if sp_rank == sp_size - 1:
+                    out_cache_loc = _add_padding_zeros(
+                        out_cache_loc, extend_seq_lens_cpu, sp_size, True
+                    )
         else:
             sp_to_normal_indices = np.arange(positions.numel())
             _debug_normal_to_sp_metadata = None
@@ -926,6 +937,8 @@ class InputMetadata:
             flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
             flashinfer_prefill_wrapper_paged=model_runner.flashinfer_prefill_wrapper_paged,
             flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
+            flashinfer_prefill_wrapper_sp_full=model_runner.flashinfer_prefill_wrapper_sp_full,
+            flashinfer_prefill_wrapper_sp_causal=model_runner.flashinfer_prefill_wrapper_sp_causal,
             sp_rank=sp_rank,
             sp_size=sp_size,
             sp_to_normal_indices=sp_to_normal_indices,
@@ -954,9 +967,17 @@ def init_flashinfer_args(
 ):
     """Init auxiliary variables for FlashInfer attention backend."""
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
-    num_kv_heads = model_runner.model_config.get_num_kv_heads(model_runner.tp_size)
+    # NOTE (yifan): we partitioned K and V along both TP and SP dimensions.
+    # And here tp_size represents KV-TP size * SP size.
+    num_kv_heads = model_runner.model_config.get_num_kv_heads(
+        model_runner.tp_size // model_runner.sp_size
+    )
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
+    prefix_lens = prefix_lens if prefix_lens is not None else torch.zeros_like(seq_lens)
+    extend_lens = seq_lens - prefix_lens
+    seq_lens = torch.ceil(seq_lens / model_runner.sp_size).to(torch.int32)
+    prefix_lens = torch.ceil(prefix_lens / model_runner.sp_size).to(torch.int32)
 
     if forward_mode == ForwardMode.DECODE:
         paged_kernel_lens = seq_lens
@@ -1014,6 +1035,60 @@ def init_flashinfer_args(
             num_kv_heads,
             head_dim,
             1,
+        )
+
+    if (
+        model_runner.sp_size > 1 and forward_mode != ForwardMode.DECODE
+    ):  # Sequence parallel enabled.
+        # NOTE (yifan): here we assume that when sequence parallel is enabled,
+        # prefix_lens are always 0s, and we will use flashinfer paged attn kernel
+        # for cross-SP-shard attn computation. If later prefix_lens can be non-0s, (
+        # e.g., extend phases with SP), we will need a dedicate paged attn kernel
+        # wrapper for cross-SP-shard attn.
+        if torch.sum(prefix_lens) != 0:
+            raise ValueError(
+                "Prefix caching with sequence parallelism is not supported."
+            )
+
+        # Prepare masks.
+        sp_size = model_runner.sp_size
+        extend_lens_cpu = extend_lens.cpu().numpy()
+        padded_extend_lens = _get_local_token_nums_new(0, sp_size, extend_lens_cpu)
+        last_extend_lens = _get_local_token_nums_new(
+            sp_size - 1, sp_size, extend_lens_cpu
+        )
+        qo_len = (seq_lens - prefix_lens).cpu().tolist()
+        full_mask_arr = []
+        causal_mask_arr = []
+        for i in range(batch_size):
+            full_mask_i = torch.full((qo_len[i], qo_len[i]), False, device="cuda")
+            full_mask_i[: last_extend_lens[i], : padded_extend_lens[i]] = True
+            full_mask_arr.append(full_mask_i.flatten())
+            causal_mask_i = torch.tril(full_mask_i, diagonal=0)
+            causal_mask_arr.append(causal_mask_i.flatten())
+        full_mask = torch.cat(full_mask_arr, dim=0)
+        causal_mask = torch.cat(causal_mask_arr, dim=0)
+
+        # Cross-SP-shard extend part -- masked for the last SP shard which may have
+        # padding tokens. For the othe shards, we can simply use the ragged kernel.
+        model_runner.flashinfer_prefill_wrapper_sp_causal.end_forward()
+        model_runner.flashinfer_prefill_wrapper_sp_causal.begin_forward(
+            qo_indptr,
+            qo_indptr,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            custom_mask=causal_mask,
+        )
+
+        model_runner.flashinfer_prefill_wrapper_sp_full.end_forward()
+        model_runner.flashinfer_prefill_wrapper_sp_full.begin_forward(
+            qo_indptr,
+            qo_indptr,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            custom_mask=full_mask,
         )
 
 
@@ -1145,3 +1220,42 @@ def _debug_normal_to_sp(indices, output_tensor, tensor):
         output_tensor[idxs] = tensor
     output_tensor = output_tensor.contiguous()
     return output_tensor
+
+
+def _add_padding_zeros(
+    indices: torch.Tensor, seq_lens, sp_size: int, only_last_shard: bool = False
+):
+    """
+    Add padding zeros to SP-layout indices (must be a 1D tensor) so that the last
+    SP shard will have its sequences padded after each sequence and all SP shards
+    can have the same length.
+
+    This function is used to (1) adjust the positions tensor to align input_ids with
+    their positions during positional encoding and (2) adjust the output cache location
+    to write KV cache of padded tokens to slot 0 (reserved for dummy output).
+    """
+    sp_seq_lens = np.ceil(seq_lens / sp_size).astype(np.int32)
+    last_sp_seq_lens = seq_lens - sp_seq_lens * (sp_size - 1)
+    padded_num_tokens = np.sum(sp_seq_lens).astype(np.int32)
+    if only_last_shard:
+        padded_indices = torch.zeros(
+            padded_num_tokens, dtype=indices.dtype, device=indices.device
+        )
+        padded_stt = stt = 0
+    else:
+        padded_indices = torch.zeros(
+            sp_size * padded_num_tokens, dtype=indices.dtype, device=indices.device
+        )
+        # All non-last shards do not need padding and hence can be copied.
+        padded_stt = padded_num_tokens * (sp_size - 1)
+        stt = padded_stt
+        padded_indices[:padded_stt] = indices[:stt]
+
+    bs = seq_lens.size
+    for i in range(bs):
+        padded_end = padded_stt + sp_seq_lens[i]
+        end = stt + last_sp_seq_lens[i]
+        padded_indices[padded_stt : padded_stt + last_sp_seq_lens[i]] = indices[stt:end]
+        padded_stt = padded_end
+        stt = end
+    return padded_indices

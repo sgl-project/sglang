@@ -17,15 +17,12 @@ from flashinfer import (
 from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
-from vllm.distributed import (
-    get_tp_group,
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from vllm.distributed import get_tp_group, init_distributed_environment
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
+from sglang.srt.layers.parallel_utils import initialize_model_parallel
 from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode, InputMetadata
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
@@ -83,7 +80,10 @@ class ModelRunner:
             local_rank=self.gpu_id,
             distributed_init_method=nccl_init_method,
         )
-        initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+        initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            sequence_parallel_size=self.sp_size,
+        )
         self.tp_group = get_tp_group()
         total_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
@@ -148,8 +148,10 @@ class ModelRunner:
         available_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
         )
+        # Attention uses both TP and SP -- (KV-TP size, SP size)
+        kv_tp_size = self.tp_size // self.sp_size
         head_dim = self.model_config.head_dim
-        head_num = self.model_config.get_num_kv_heads(self.tp_size)
+        head_num = self.model_config.get_num_kv_heads(kv_tp_size)
         cell_size = (
             head_num
             * head_dim
@@ -164,6 +166,12 @@ class ModelRunner:
         return max_num_token
 
     def init_memory_pool(self, total_gpu_memory):
+        if self.tp_size % self.sp_size != 0:
+            raise ValueError(
+                f"Invalid sequence parallel configuration. tp_size={self.tp_size} "
+                f"must be divisible by sp_size={self.sp_size}"
+            )
+
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if self.max_total_num_tokens <= 0:
@@ -178,10 +186,13 @@ class ModelRunner:
             ),
             self.model_config.context_len + 8,
         )
+
+        # Attention uses both TP and SP -- (KV-TP size, SP size)
+        kv_tp_size = self.tp_size // self.sp_size
         self.token_to_kv_pool = TokenToKVPool(
             self.max_total_num_tokens,
             dtype=self.dtype,
-            head_num=self.model_config.get_num_kv_heads(self.tp_size),
+            head_num=self.model_config.get_num_kv_heads(kv_tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
         )
@@ -204,6 +215,9 @@ class ModelRunner:
             self.flashinfer_prefill_wrapper_ragged = None
             self.flashinfer_prefill_wrapper_paged = None
             self.flashinfer_decode_wrapper = None
+            # NOTE: for sequence parallel, we need to use a dedicated kernel for cross-shard attn.
+            self.flashinfer_prefill_wrapper_sp_full = None
+            self.flashinfer_prefill_wrapper_sp_causal = None
             return
 
         if not _grouped_size_compiled_for_decode_kernels(
@@ -214,8 +228,12 @@ class ModelRunner:
         else:
             use_tensor_cores = False
 
+        num_buffers = 2 + (self.sp_size > 1) * 2
         self.flashinfer_workspace_buffers = torch.empty(
-            2, global_config.flashinfer_workspace_size, dtype=torch.uint8, device="cuda"
+            num_buffers,
+            global_config.flashinfer_workspace_size,
+            dtype=torch.uint8,
+            device="cuda",
         )
         self.flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.flashinfer_workspace_buffers[0], "NHD"
@@ -228,6 +246,20 @@ class ModelRunner:
             "NHD",
             use_tensor_cores=use_tensor_cores,
         )
+        if self.sp_size > 1:  # Sequence parallel enabled.
+            self.flashinfer_prefill_wrapper_sp_full = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.flashinfer_workspace_buffers[2], "NHD"
+                )
+            )
+            self.flashinfer_prefill_wrapper_sp_causal = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.flashinfer_workspace_buffers[3], "NHD"
+                )
+            )
+        else:
+            self.flashinfer_prefill_wrapper_sp_full = None
+            self.flashinfer_prefill_wrapper_sp_causal = None
 
     def init_cuda_graphs(self):
         from sglang.srt.managers.controller.cuda_graph_runner import CudaGraphRunner
