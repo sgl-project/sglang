@@ -783,7 +783,7 @@ class InputMetadata:
     flashinfer_prefill_wrapper_ragged: "BatchPrefillWithRaggedKVCacheWrapper" = None
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
-    use_ragged: bool = False
+    flashinfer_use_ragged: bool = False
 
     @classmethod
     def create(
@@ -799,10 +799,10 @@ class InputMetadata:
         return_logprob=False,
         skip_flashinfer_init=False,
     ):
-        use_ragged = False
+        flashinfer_use_ragged = False
         if not skip_flashinfer_init and not model_runner.server_args.disable_flashinfer:
             if forward_mode != ForwardMode.DECODE and int(torch.sum(seq_lens)) > 4096:
-                use_ragged = True
+                flashinfer_use_ragged = True
             init_flashinfer_args(
                 forward_mode,
                 model_runner,
@@ -810,7 +810,7 @@ class InputMetadata:
                 seq_lens,
                 prefix_lens,
                 model_runner.flashinfer_decode_wrapper,
-                use_ragged,
+                flashinfer_use_ragged,
             )
 
         batch_size = len(req_pool_indices)
@@ -865,7 +865,7 @@ class InputMetadata:
             flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
             flashinfer_prefill_wrapper_paged=model_runner.flashinfer_prefill_wrapper_paged,
             flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
-            use_ragged=use_ragged,
+            flashinfer_use_ragged=flashinfer_use_ragged,
         )
 
         if model_runner.server_args.disable_flashinfer:
@@ -886,7 +886,7 @@ def init_flashinfer_args(
     seq_lens,
     prefix_lens,
     flashinfer_decode_wrapper,
-    use_ragged=False,
+    flashinfer_use_ragged=False,
 ):
     """Init auxiliary variables for FlashInfer attention backend."""
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -895,7 +895,7 @@ def init_flashinfer_args(
     batch_size = len(req_pool_indices)
     total_num_tokens = int(torch.sum(seq_lens))
 
-    if use_ragged:
+    if flashinfer_use_ragged:
         paged_kernel_lens = prefix_lens
     else:
         paged_kernel_lens = seq_lens
@@ -931,7 +931,7 @@ def init_flashinfer_args(
         qo_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
 
-        if use_ragged:
+        if flashinfer_use_ragged:
             model_runner.flashinfer_prefill_wrapper_ragged.end_forward()
             model_runner.flashinfer_prefill_wrapper_ragged.begin_forward(
                 qo_indptr,

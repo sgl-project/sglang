@@ -44,6 +44,7 @@ class ServerArgs:
     max_prefill_tokens: Optional[int] = None
     max_running_requests: Optional[int] = None
     max_num_reqs: Optional[int] = None
+    max_total_tokens: Optional[int] = None
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
 
@@ -91,15 +92,15 @@ class ServerArgs:
             self.tokenizer_path = self.model_path
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
-                self.mem_fraction_static = 0.80
+                self.mem_fraction_static = 0.79
             elif self.tp_size >= 8:
-                self.mem_fraction_static = 0.84
+                self.mem_fraction_static = 0.83
             elif self.tp_size >= 4:
-                self.mem_fraction_static = 0.86
+                self.mem_fraction_static = 0.85
             elif self.tp_size >= 2:
-                self.mem_fraction_static = 0.88
+                self.mem_fraction_static = 0.87
             else:
-                self.mem_fraction_static = 0.89
+                self.mem_fraction_static = 0.88
         if isinstance(self.additional_ports, int):
             self.additional_ports = [self.additional_ports]
         elif self.additional_ports is None:
@@ -195,6 +196,7 @@ class ServerArgs:
                 "gptq",
                 "marlin",
                 "gptq_marlin",
+                "awq_marlin",
                 "squeezellm",
                 "bitsandbytes",
             ],
@@ -229,6 +231,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_num_reqs,
             help="The maximum number of requests to serve in the memory pool. If the model have a large context length, you may need to decrease this value to avoid out-of-memory errors.",
+        )
+        parser.add_argument(
+            "--max-total-tokens",
+            type=int,
+            default=ServerArgs.max_total_tokens,
+            help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. This option is typically used for development and debugging purposes.",
         )
         parser.add_argument(
             "--schedule-policy",
