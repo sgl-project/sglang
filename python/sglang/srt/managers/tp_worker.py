@@ -39,9 +39,9 @@ from sglang.srt.managers.policy_scheduler import PolicyScheduler
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     BaseFinishReason,
-    Batch,
     ForwardMode,
     Req,
+    ScheduleBatch,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
@@ -162,7 +162,7 @@ class ModelTpServer:
 
         # Init running status
         self.waiting_queue: List[Req] = []
-        self.running_batch: Batch = None
+        self.running_batch: ScheduleBatch = None
         self.out_pyobjs = []
         self.decode_forward_ct = 0
         self.stream_interval = server_args.stream_interval
@@ -343,7 +343,7 @@ class ModelTpServer:
         )
         self.waiting_queue.append(req)
 
-    def get_new_prefill_batch(self) -> Optional[Batch]:
+    def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
         # TODO(lsyin): organize this function
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
@@ -512,7 +512,7 @@ class ModelTpServer:
             )
 
         # Return the new batch
-        new_batch = Batch.init_new(
+        new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
             self.token_to_kv_pool,
@@ -521,7 +521,7 @@ class ModelTpServer:
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
         return new_batch
 
-    def forward_prefill_batch(self, batch: Batch):
+    def forward_prefill_batch(self, batch: ScheduleBatch):
         # Build batch tensors
         batch.prepare_for_extend(
             self.model_config.vocab_size, self.int_token_logit_bias
@@ -610,7 +610,7 @@ class ModelTpServer:
                 )
             req.output_top_logprobs.append(output.output_top_logprobs[i])
 
-    def cache_filled_batch(self, batch: Batch):
+    def cache_filled_batch(self, batch: ScheduleBatch):
         req_pool_indices_cpu = batch.req_pool_indices.cpu().numpy()
         for i, req in enumerate(batch.reqs):
             new_prefix_indices, new_last_node = self.tree_cache.cache_req(
@@ -626,7 +626,7 @@ class ModelTpServer:
                 # inflight request would get a new req idx
                 self.req_to_token_pool.free(int(req_pool_indices_cpu[i]))
 
-    def forward_decode_batch(self, batch: Batch):
+    def forward_decode_batch(self, batch: ScheduleBatch):
         # Check if decode out of memory
         if not batch.check_decode_mem():
             old_ratio = self.new_token_ratio
@@ -685,7 +685,7 @@ class ModelTpServer:
 
         self.handle_finished_requests(batch)
 
-    def handle_finished_requests(self, batch: Batch):
+    def handle_finished_requests(self, batch: ScheduleBatch):
         output_rids = []
         output_vids = []
         decoded_texts = []
@@ -784,7 +784,7 @@ class ModelTpServer:
             else:
                 batch.reqs = []
 
-    def filter_out_inflight(self, batch: Batch):
+    def filter_out_inflight(self, batch: ScheduleBatch):
         # TODO(lsyin): reduce the overhead, make a special version for this
         if self.current_inflight_req is None:
             return
