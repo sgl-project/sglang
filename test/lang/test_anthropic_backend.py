@@ -27,5 +27,5 @@ if __name__ == "__main__":
 
     # global_config.verbosity = 2
     # t = TestAnthropicBackend()
-    # t.setUp()
+    # t.setUpClass()
     # t.test_mt_bench()
