@@ -1,5 +1,7 @@
 """
-python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+Usage:
+python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
+python3 test_srt_backend.py
 """
 
 import json

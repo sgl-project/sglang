@@ -32,7 +32,13 @@ jobs:
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/ --force-reinstall
         pip install --upgrade transformers
 
-    - name: Launch server and run benchmark
+    - name: Test OpenAI Backend
+      run: |
+        export OPENAI_API_KEY=secrets.OPENAI_API_KEY
+        cd sglang/test/lang
+        python3 test_openai_backend.py
+
+    - name: Benchmark Serving
       run: |
         python3 -m sglang.launch_server --model /home/lmzheng/zhyncs/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
 
