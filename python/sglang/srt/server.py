@@ -73,6 +73,7 @@ from sglang.srt.utils import (
     assert_pkg_version,
     enable_show_time_cost,
     maybe_set_triton_cache_manager,
+    kill_child_process,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
@@ -467,16 +468,7 @@ class Runtime:
 
     def shutdown(self):
         if self.pid is not None:
-            try:
-                parent = psutil.Process(self.pid)
-            except psutil.NoSuchProcess:
-                return
-            children = parent.children(recursive=True)
-            for child in children:
-                child.kill()
-            psutil.wait_procs(children, timeout=5)
-            parent.kill()
-            parent.wait(timeout=5)
+            kill_child_process(self.pid)
             self.pid = None
 
     def cache_prefix(self, prefix: str):
