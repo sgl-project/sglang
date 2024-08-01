@@ -14,9 +14,10 @@ add `/lib/systemd/system/runner.service`
 [Unit]
 StartLimitIntervalSec=0
 [Service]
+Environment="CUDA_VISIBLE_DEVICES=7"
 Restart=always
 RestartSec=1
-ExecStart=/home/lmzheng/zhyncs/actions-runner/run.sh
+ExecStart=/data/zhyncs/actions-runner/run.sh
 [Install]
 WantedBy=multi-user.target
 ```
