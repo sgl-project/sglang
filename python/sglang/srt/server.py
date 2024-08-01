@@ -72,8 +72,8 @@ from sglang.srt.utils import (
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
-    maybe_set_triton_cache_manager,
     kill_child_process,
+    maybe_set_triton_cache_manager,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
