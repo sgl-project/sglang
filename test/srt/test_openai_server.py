@@ -86,7 +86,6 @@ class TestOpenAIServer(unittest.TestCase):
         first = True
         for response in generator:
             if logprobs:
-                print(response.choices[0].logprobs)
                 assert response.choices[0].logprobs
                 assert isinstance(response.choices[0].logprobs.tokens[0], str)
                 if not (first and echo):
