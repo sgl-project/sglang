@@ -366,6 +366,26 @@ def kill_parent_process():
     os.kill(parent_process.pid, 9)
 
 
+def kill_child_process(pid, including_parent=True):
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+
+    children = parent.children(recursive=True)
+    for child in children:
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+    if including_parent:
+        try:
+            parent.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
 def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     """
     Monkey patch the slow p2p access check in vllm.

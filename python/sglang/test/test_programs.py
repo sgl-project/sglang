@@ -105,15 +105,14 @@ def test_decode_json_regex():
     def decode_json(s):
         from sglang.lang.ir import REGEX_FLOAT, REGEX_INT, REGEX_STRING
 
-        s += "Generate a JSON object to describe the basic information of a city.\n"
+        s += "Generate a JSON object to describe the basic city information of Paris.\n"
 
         with s.var_scope("json_output"):
             s += "{\n"
             s += '  "name": ' + sgl.gen(regex=REGEX_STRING + ",") + "\n"
             s += '  "population": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
             s += '  "area": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
-            s += '  "latitude": ' + sgl.gen(regex=REGEX_FLOAT + ",") + "\n"
-            s += '  "country": ' + sgl.gen(regex=REGEX_STRING) + "\n"
+            s += '  "latitude": ' + sgl.gen(regex=REGEX_FLOAT) + "\n"
             s += "}"
 
     ret = decode_json.run(temperature=0.0)
@@ -129,7 +128,7 @@ def test_decode_json_regex():
 def test_decode_json():
     @sgl.function
     def decode_json(s):
-        s += "Generate a JSON object to describe the basic information of a city.\n"
+        s += "Generate a JSON object to describe the basic city information of Paris.\n"
 
         with s.var_scope("json_output"):
             s += "{\n"
@@ -264,6 +263,7 @@ def test_parallel_decoding():
         s += "\nIn summary," + sgl.gen("summary", max_tokens=512)
 
     ret = parallel_decoding.run(topic="writing a good blog post", temperature=0.3)
+    assert isinstance(ret["summary"], str)
 
 
 def test_parallel_encoding(check_answer=True):

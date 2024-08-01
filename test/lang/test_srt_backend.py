@@ -21,7 +21,7 @@ class TestSRTBackend(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.backend = sgl.Runtime(model_path="meta-llama/Meta-Llama-3-8B-Instruct")
+        cls.backend = sgl.Runtime(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
         sgl.set_default_backend(cls.backend)
 
     @classmethod
