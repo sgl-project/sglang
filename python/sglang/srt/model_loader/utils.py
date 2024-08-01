@@ -205,6 +205,8 @@ def safetensors_weights_iterator(
             for name in f.keys():  # noqa: SIM118
                 param = f.get_tensor(name)
                 yield name, param
+                
+                
 def get_quant_config(
     model_config: ModelConfig, load_config: LoadConfig
 ) -> QuantizationConfig:
