@@ -43,6 +43,7 @@ from sglang.srt.managers.schedule_batch import (
     ForwardMode,
     Req,
 )
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -144,11 +145,20 @@ class ModelTpServer:
         )
 
         # Init cache
-        self.tree_cache = RadixCache(
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            disable=server_args.disable_radix_cache,
-        )
+        if (
+            server_args.chunked_prefill_size is not None
+            and server_args.disable_radix_cache
+        ):
+            self.tree_cache = ChunkCache(
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            )
+        else:
+            self.tree_cache = RadixCache(
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool=self.model_runner.token_to_kv_pool,
+                disable=server_args.disable_radix_cache,
+            )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.scheduler = PolicyScheduler(
             self.schedule_policy,
@@ -354,7 +364,10 @@ class ModelTpServer:
         # Compute matched prefix length
         for req in self.waiting_queue:
             req.input_ids = req.origin_input_ids + req.output_ids
-            prefix_indices, last_node = self.tree_cache.match_prefix(req.input_ids)
+            prefix_indices, last_node = self.tree_cache.match_prefix(
+                rid=req.rid,
+                key=req.input_ids,
+            )
             if req.return_logprob:
                 prefix_indices = prefix_indices[: req.logprob_start_len]
             req.extend_input_len = len(req.input_ids) - len(prefix_indices)
@@ -614,6 +627,7 @@ class ModelTpServer:
         req_pool_indices_cpu = batch.req_pool_indices.cpu().numpy()
         for i, req in enumerate(batch.reqs):
             new_prefix_indices, new_last_node = self.tree_cache.cache_req(
+                rid=req.rid,
                 token_ids=tuple(req.input_ids),
                 last_uncached_pos=len(req.prefix_indices),
                 req_pool_idx=req_pool_indices_cpu[i],
@@ -771,6 +785,7 @@ class ModelTpServer:
             for i in finished_indices:
                 req = batch.reqs[i]
                 self.tree_cache.cache_req(
+                    rid=req.rid,
                     token_ids=tuple(req.origin_input_ids + req.output_ids)[:-1],
                     last_uncached_pos=len(req.prefix_indices),
                     req_pool_idx=req_pool_indices_cpu[i],
