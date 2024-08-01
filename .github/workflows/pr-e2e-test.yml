@@ -20,6 +20,8 @@ jobs:
     runs-on: self-hosted
     env:
       CUDA_VISIBLE_DEVICES: 6
+      HF_HOME: ${{ secrets.HF_HOME }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     steps:
     - name: Checkout code
@@ -27,7 +29,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        cd /data/zhyncs/venv && source ./bin/activate && cd -
+        cd $HF_HOME/venv && source ./bin/activate && cd -
         pip cache purge
         pip install --upgrade pip
         pip install -e "python[all]"
@@ -36,8 +38,8 @@ jobs:
 
     - name: Benchmark Serving
       run: |
-        cd /data/zhyncs/venv && source ./bin/activate && cd -
-        python3 -m sglang.launch_server --model /data/zhyncs/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
+        cd $HF_HOME/venv && source ./bin/activate && cd -
+        python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
 
         echo "Waiting for server to start..."
         for i in {1..120}; do
@@ -52,7 +54,7 @@ jobs:
           sleep 1
         done
 
-        cd /data/zhyncs && python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512
+        cd $HF_HOME && python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512
 
         echo "Stopping server..."
         kill -9 $(ps aux | grep sglang | grep Meta-Llama-3.1-8B-Instruct | grep -v grep | awk '{print $2}')
