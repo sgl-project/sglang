@@ -16,10 +16,10 @@ limitations under the License.
 """Cache for the compressed finite state machine."""
 
 from sglang.srt.constrained import RegexGuide, TransformerTokenizer
-from sglang.srt.constrained.base_cache import BaseCache
+from sglang.srt.constrained.base_tool_cache import BaseToolCache
 
 
-class FSMCache(BaseCache):
+class FSMCache(BaseToolCache):
     def __init__(self, tokenizer_path, tokenizer_args_dict, enable=True):
         super().__init__(enable=enable)
 

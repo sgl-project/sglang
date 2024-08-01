@@ -419,10 +419,6 @@ class ServerArgs:
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
 
-        assert not (
-            self.chunked_prefill_size is not None and self.disable_radix_cache
-        ), "chunked prefill is not supported with radix cache disabled currently"
-
 
 @dataclasses.dataclass
 class PortArgs:
