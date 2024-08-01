@@ -15,6 +15,7 @@ add `/lib/systemd/system/runner.service`
 StartLimitIntervalSec=0
 [Service]
 Environment="CUDA_VISIBLE_DEVICES=7"
+Environment="XGD_CACHE_HOME=/data/.cache"
 Restart=always
 RestartSec=1
 ExecStart=/data/zhyncs/actions-runner/run.sh
