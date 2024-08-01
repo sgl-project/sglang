@@ -480,7 +480,7 @@ class Runtime:
             self.pid = None
 
     def cache_prefix(self, prefix: str):
-        self.endpoint.cache_pprefix(prefix)
+        self.endpoint.cache_prefix(prefix)
 
     def get_tokenizer(self):
         return get_tokenizer(
