@@ -17,13 +17,11 @@ class TestVertexAIBackend(unittest.TestCase):
     chat_backend = None
     chat_vision_backend = None
 
-    def setUp(self):
-        cls = type(self)
-
-        if cls.backend is None:
-            cls.backend = VertexAI("gemini-pro")
-            cls.chat_backend = VertexAI("gemini-pro")
-            cls.chat_vision_backend = VertexAI("gemini-pro-vision")
+    @classmethod
+    def setUpClass(cls):
+        cls.backend = VertexAI("gemini-pro")
+        cls.chat_backend = VertexAI("gemini-pro")
+        cls.chat_vision_backend = VertexAI("gemini-pro-vision")
 
     def test_few_shot_qa(self):
         set_default_backend(self.backend)
@@ -61,5 +59,5 @@ if __name__ == "__main__":
 
     # global_config.verbosity = 2
     # t = TestVertexAIBackend()
-    # t.setUp()
+    # t.setUpClass()
     # t.test_stream()

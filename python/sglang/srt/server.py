@@ -479,6 +479,9 @@ class Runtime:
             parent.wait(timeout=5)
             self.pid = None
 
+    def cache_prefix(self, prefix: str):
+        self.endpoint.cache_prefix(prefix)
+
     def get_tokenizer(self):
         return get_tokenizer(
             self.server_args.tokenizer_path,
