@@ -150,6 +150,7 @@ class ModelLoader:
                 self.load_config.download_dir,
                 allow_patterns,
                 revision,
+                ignore_patterns=self.load_config.ignore_patterns,
             )
         else:
             hf_folder = model_name_or_path
