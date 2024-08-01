@@ -16,7 +16,7 @@ StartLimitIntervalSec=0
 [Service]
 Restart=always
 RestartSec=1
-ExecStart=/home/lmzheng/zhyncs/actions-runner/run.sh
+ExecStart=/data/zhyncs/actions-runner/run.sh
 [Install]
 WantedBy=multi-user.target
 ```
