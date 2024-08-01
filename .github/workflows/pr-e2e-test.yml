@@ -11,6 +11,10 @@ on:
       - "python/sglang/**"
   workflow_dispatch:
 
+concurrency:
+  group: pr-e2e-test-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   gpu-job:
     runs-on: self-hosted
