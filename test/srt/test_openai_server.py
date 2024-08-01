@@ -57,6 +57,9 @@ class TestOpenAIServer(unittest.TestCase):
             assert text.startswith(prompt)
         if logprobs:
             assert response.choices[0].logprobs
+            assert isinstance(response.choices[0].logprobs.tokens[0], str)
+            assert isinstance(response.choices[0].logprobs.top_logprobs[1], dict)
+            assert len(response.choices[0].logprobs.top_logprobs[1]) == logprobs
             if echo:
                 assert response.choices[0].logprobs.token_logprobs[0] == None
             else:
@@ -67,19 +70,55 @@ class TestOpenAIServer(unittest.TestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
+    def run_completion_stream(self, echo, logprobs):
+        client = openai.Client(api_key="EMPTY", base_url=self.base_url)
+        prompt = "The capital of France is"
+        generator = client.completions.create(
+            model=self.model,
+            prompt=prompt,
+            temperature=0.1,
+            max_tokens=32,
+            echo=echo,
+            logprobs=logprobs,
+            stream=True,
+        )
+
+        first = True
+        for response in generator:
+            if logprobs:
+                print(response.choices[0].logprobs)
+                assert response.choices[0].logprobs
+                assert isinstance(response.choices[0].logprobs.tokens[0], str)
+                if not (first and echo):
+                    assert isinstance(response.choices[0].logprobs.top_logprobs[0], dict)
+                    assert len(response.choices[0].logprobs.top_logprobs[0]) == logprobs
+
+            if first:
+                if echo:
+                    assert response.choices[0].text.startswith(prompt)
+                first = False
+
+            assert response.id
+            assert response.created
+            assert response.usage.prompt_tokens > 0
+            assert response.usage.completion_tokens > 0
+            assert response.usage.total_tokens > 0
+
     def test_completion(self):
-        for echo in [True, False]:
+        for echo in [False, True]:
             for logprobs in [None, 5]:
                 self.run_completion(echo, logprobs)
 
+    def test_completion_stream(self):
+        for echo in [True]:
+            for logprobs in [5]:
+                self.run_completion_stream(echo, logprobs)
+
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
+    # unittest.main(warnings="ignore")
 
-    # from sglang.global_config import global_config
-
-    # global_config.verbosity = 2
-    # t = TestSRTBackend()
-    # t.setUpClass()
-    # t.test_few_shot_qa()
-    # t.tearDownClass()
+    t = TestOpenAIServer()
+    t.setUpClass()
+    t.test_completion_stream()
+    t.tearDownClass()
