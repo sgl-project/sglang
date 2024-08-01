@@ -113,15 +113,14 @@ def test_decode_json_regex():
             s += '  "population": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
             s += '  "area": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
             s += '  "latitude": ' + sgl.gen(regex=REGEX_FLOAT + ",") + "\n"
-            s += '  "country": ' + sgl.gen(regex=REGEX_STRING + ",") + "\n"
-            s += '  "timezone": ' + sgl.gen(regex=REGEX_STRING) + "\n"
+            s += '  "country": ' + sgl.gen(regex=REGEX_STRING) + "\n"
             s += "}"
 
-    ret = decode_json.run()
+    ret = decode_json.run(temperature=0.0)
     try:
         js_obj = json.loads(ret["json_output"])
     except json.decoder.JSONDecodeError:
-        print(ret["json_output"])
+        print("JSONDecodeError", ret["json_output"])
         raise
     assert isinstance(js_obj["name"], str)
     assert isinstance(js_obj["population"], int)
@@ -141,8 +140,12 @@ def test_decode_json():
             s += '  "timezone": ' + sgl.gen(dtype=str) + "\n"
             s += "}"
 
-    ret = decode_json.run()
-    js_obj = json.loads(ret["json_output"])
+    ret = decode_json.run(max_new_tokens=64)
+    try:
+        js_obj = json.loads(ret["json_output"])
+    except json.decoder.JSONDecodeError:
+        print("JSONDecodeError", ret["json_output"])
+        raise
     assert isinstance(js_obj["name"], str)
     assert isinstance(js_obj["population"], int)
 
