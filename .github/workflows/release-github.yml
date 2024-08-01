@@ -1,10 +1,5 @@
 name: release tag
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "python/sglang/version.py"
   workflow_dispatch:
 jobs:
   publish:

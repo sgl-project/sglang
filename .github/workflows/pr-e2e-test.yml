@@ -4,38 +4,16 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "python/sglang/*"
-      - "python/sglang/lang/*"
-      - "python/sglang/lang/backend/*"
-      - "python/sglang/srt/*"
-      - "python/sglang/srt/constrained/*"
-      - "python/sglang/srt/layers/*"
-      - "python/sglang/srt/layers/quantization/*"
-      - "python/sglang/srt/managers/*"
-      - "python/sglang/srt/mem_cache/*"
-      - "python/sglang/srt/model_executor/*"
-      - "python/sglang/srt/model_loader/*"
-      - "python/sglang/srt/models/*"
-      - "python/sglang/srt/openai_api/*"
-      - "python/sglang/test/*"
+      - "python/sglang/**"
   pull_request:
     branches: [ main ]
     paths:
-      - "python/sglang/*"
-      - "python/sglang/lang/*"
-      - "python/sglang/lang/backend/*"
-      - "python/sglang/srt/*"
-      - "python/sglang/srt/constrained/*"
-      - "python/sglang/srt/layers/*"
-      - "python/sglang/srt/layers/quantization/*"
-      - "python/sglang/srt/managers/*"
-      - "python/sglang/srt/mem_cache/*"
-      - "python/sglang/srt/model_executor/*"
-      - "python/sglang/srt/model_loader/*"
-      - "python/sglang/srt/models/*"
-      - "python/sglang/srt/openai_api/*"
-      - "python/sglang/test/*"
+      - "python/sglang/**"
   workflow_dispatch:
+
+concurrency:
+  group: pr-e2e-test-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   gpu-job:

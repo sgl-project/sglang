@@ -54,6 +54,24 @@ class LogProbs(BaseModel):
     top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
 
+class TopLogprob(BaseModel):
+    token: str
+    bytes: List[int]
+    logprob: float
+
+
+class ChatCompletionTokenLogprob(BaseModel):
+    token: str
+    bytes: List[int]
+    logprob: float
+    top_logprobs: List[TopLogprob]
+
+
+class ChoiceLogprobs(BaseModel):
+    # build for v1/chat/completions response
+    content: List[ChatCompletionTokenLogprob]
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
@@ -239,8 +257,8 @@ class ChatMessage(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
-    logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[str] = None
+    logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
+    finish_reason: str
 
 
 class ChatCompletionResponse(BaseModel):

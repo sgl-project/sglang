@@ -13,12 +13,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Base cache class."""
+"""Base tool cache for constrained decoding tools."""
 
 import time
 
 
-class BaseCache:
+class BaseToolCache:
     def __init__(self, enable=True):
         self.enable = enable
         self.reset()

@@ -260,7 +260,7 @@ def launch_server(
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.1.2",
+            "0.1.3",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",

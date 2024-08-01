@@ -30,7 +30,7 @@ from sglang.srt.constrained import (
     make_byte_level_fsm,
     make_deterministic_fsm,
 )
-from sglang.srt.constrained.base_cache import BaseCache
+from sglang.srt.constrained.base_tool_cache import BaseToolCache
 
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
 
@@ -151,7 +151,7 @@ class JumpForwardMap:
         )
 
 
-class JumpForwardCache(BaseCache):
+class JumpForwardCache(BaseToolCache):
     def __init__(self):
         super().__init__()
 
