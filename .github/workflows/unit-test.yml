@@ -1,0 +1,42 @@
+name: Unit Test
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+  workflow_dispatch:
+
+concurrency:
+  group: unit-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-test:
+    runs-on: self-hosted
+    env:
+      CUDA_VISIBLE_DEVICES: 6
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        cd /data/zhyncs/venv && source ./bin/activate && cd -
+        pip cache purge
+        pip install --upgrade pip
+        pip install -e "python[all]"
+        pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/ --force-reinstall
+        pip install --upgrade transformers
+
+    - name: Test OpenAI Backend
+      run: |
+        cd /data/zhyncs/venv && source ./bin/activate && cd -
+        cd test/lang
+        export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+        python3 test_openai_backend.py
