@@ -34,8 +34,8 @@ jobs:
 
     - name: Test OpenAI Backend
       run: |
-        export OPENAI_API_KEY=secrets.OPENAI_API_KEY
-        cd sglang/test/lang
+        export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+        cd test/lang
         python3 test_openai_backend.py
 
     - name: Benchmark Serving
