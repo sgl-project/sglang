@@ -68,7 +68,7 @@ class ChatCompletionTokenLogprob(BaseModel):
 
 
 class ChoiceLogprobs(BaseModel):
-    ## build for v1/chat/completions response
+    # build for v1/chat/completions response
     content: List[ChatCompletionTokenLogprob]
 
 

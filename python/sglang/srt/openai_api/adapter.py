@@ -73,7 +73,7 @@ class FileMetadata:
 batch_storage: Dict[str, BatchResponse] = {}
 file_id_request: Dict[str, FileMetadata] = {}
 file_id_response: Dict[str, FileResponse] = {}
-## map file id to file path in SGlang backend
+# map file id to file path in SGlang backend
 file_id_storage: Dict[str, str] = {}
 
 
@@ -264,7 +264,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
             failed_requests += len(file_request_list)
 
         for idx, response in enumerate(responses):
-            ## the batch_req here can be changed to be named within a batch granularity
+            # the batch_req here can be changed to be named within a batch granularity
             response_json = {
                 "id": f"batch_req_{uuid.uuid4()}",
                 "custom_id": file_request_list[idx].get("custom_id"),
@@ -437,7 +437,7 @@ def v1_generate_response(request, ret, to_file=False):
             logprobs = None
 
         if to_file:
-            ## to make the choise data json serializable
+            # to make the choise data json serializable
             choice_data = {
                 "index": 0,
                 "text": text,
@@ -461,7 +461,7 @@ def v1_generate_response(request, ret, to_file=False):
                 "status_code": 200,
                 "request_id": ret[i]["meta_info"]["id"],
                 "body": {
-                    ## remain the same but if needed we can change that
+                    # remain the same but if needed we can change that
                     "id": ret[i]["meta_info"]["id"],
                     "object": "text_completion",
                     "created": int(time.time()),
@@ -710,7 +710,7 @@ def v1_chat_generate_response(request, ret, to_file=False):
         completion_tokens = ret_item["meta_info"]["completion_tokens"]
 
         if to_file:
-            ## to make the choice data json serializable
+            # to make the choice data json serializable
             choice_data = {
                 "index": 0,
                 "message": {"role": "assistant", "content": ret_item["text"]},
@@ -736,7 +736,7 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 "status_code": 200,
                 "request_id": ret[i]["meta_info"]["id"],
                 "body": {
-                    ## remain the same but if needed we can change that
+                    # remain the same but if needed we can change that
                     "id": ret[i]["meta_info"]["id"],
                     "object": "chat.completion",
                     "created": int(time.time()),
