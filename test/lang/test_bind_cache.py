@@ -1,3 +1,9 @@
+"""
+Usage:
+python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
+python3 test_bind_cache.py
+"""
+
 import unittest
 
 import sglang as sgl
