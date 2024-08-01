@@ -106,12 +106,11 @@ response = client.chat.completions.create(
         {"role": "user", "content": "List 3 countries and their capitals."},
     ],
     temperature=0.8,
-    max_tokens=64,
+    max_tokens=1,
     logprobs=True,
-    n=1,
+    top_logprobs=3,
 )
 print(response)
-
 
 # Chat completion
 response = client.chat.completions.create(
@@ -121,8 +120,34 @@ response = client.chat.completions.create(
         {"role": "user", "content": "List 3 countries and their capitals."},
     ],
     temperature=0.8,
-    max_tokens=64,
+    max_tokens=1,
+    n=1,
+)
+print(response)
+
+# Chat completion
+response = client.chat.completions.create(
+    model="default",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "List 3 countries and their capitals."},
+    ],
+    temperature=0.8,
+    max_tokens=1,
     logprobs=True,
+    top_logprobs=3,
+)
+print(response)
+
+# Chat completion
+response = client.chat.completions.create(
+    model="default",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "List 3 countries and their capitals."},
+    ],
+    temperature=0.8,
+    max_tokens=1,
     n=4,
 )
 print(response)
