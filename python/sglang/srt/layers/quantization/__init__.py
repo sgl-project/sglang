@@ -23,7 +23,7 @@ from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
-    CompressedTensorsConfig, 
+    CompressedTensorsConfig,
 )
 from vllm.model_executor.layers.quantization.deepspeedfp import DeepSpeedFPConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig

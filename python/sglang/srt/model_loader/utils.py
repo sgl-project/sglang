@@ -195,25 +195,6 @@ def filter_duplicate_safetensors_files(
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
 
-def filter_files_not_needed_for_inference(
-        hf_weights_files: List[str]) -> List[str]:
-    """
-    Exclude files that are not needed for inference.
-
-    See https://github.com/huggingface/transformers/blob/v4.34.0/src/transformers/trainer.py#L227-L233
-    """
-    blacklist = [
-        "training_args.bin",
-        "optimizer.bin",
-        "optimizer.pt",
-        "scheduler.pt",
-        "scaler.pt",
-    ]
-    hf_weights_files = [
-        f for f in hf_weights_files
-        if not any(f.endswith(x) for x in blacklist)
-    ]
-    return hf_weights_files
 
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
