@@ -21,7 +21,7 @@ jobs:
   unit-test:
     runs-on: self-hosted
     env:
-      CUDA_VISIBLE_DEVICES: 6
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
     steps:
     - name: Checkout code
@@ -30,6 +30,7 @@ jobs:
     - name: Install dependencies
       run: |
         cd /data/zhyncs/venv && source ./bin/activate && cd -
+
         pip cache purge
         pip install --upgrade pip
         pip install -e "python[all]"
@@ -39,6 +40,13 @@ jobs:
     - name: Test OpenAI Backend
       run: |
         cd /data/zhyncs/venv && source ./bin/activate && cd -
+
         cd test/lang
-        export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
         python3 test_openai_backend.py
+
+    - name: Test SRT Backend
+      run: |
+        cd /data/zhyncs/venv && source ./bin/activate && cd -
+
+        cd test/lang
+        python3 test_srt_backend.py
