@@ -1,6 +1,6 @@
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-from sglang.srt.mem_cache.base_cache import BaseCache
+from sglang.srt.mem_cache.base_cache import BasePrefixCache
 
 
 class ChunkCacheEntry:
@@ -9,7 +9,7 @@ class ChunkCacheEntry:
         self.value = value
 
 
-class ChunkCache(BaseCache):
+class ChunkCache(BasePrefixCache):
     def __init__(self, req_to_token_pool, token_to_kv_pool):
         self.disable = True
         self.req_to_token_pool = req_to_token_pool

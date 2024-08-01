@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 
 
-class BaseCache(ABC):
+class BasePrefixCache(ABC):
     """Cache can be indexed by either rid or key."""
 
     @abstractmethod
