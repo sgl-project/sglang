@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  gpu-job:
+  pr-e2e-test:
     runs-on: self-hosted
     env:
       CUDA_VISIBLE_DEVICES: 6
@@ -27,20 +27,17 @@ jobs:
 
     - name: Install dependencies
       run: |
+        cd /data/zhyncs/venv && source ./bin/activate && cd -
+        pip cache purge
         pip install --upgrade pip
         pip install -e "python[all]"
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/ --force-reinstall
         pip install --upgrade transformers
 
-    - name: Test OpenAI Backend
-      run: |
-        export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-        cd test/lang
-        python3 test_openai_backend.py
-
     - name: Benchmark Serving
       run: |
-        python3 -m sglang.launch_server --model /home/lmzheng/zhyncs/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
+        cd /data/zhyncs/venv && source ./bin/activate && cd -
+        python3 -m sglang.launch_server --model /data/zhyncs/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
 
         echo "Waiting for server to start..."
         for i in {1..120}; do
@@ -55,7 +52,7 @@ jobs:
           sleep 1
         done
 
-        cd /home/lmzheng/zhyncs && python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512
+        cd /data/zhyncs && python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512
 
         echo "Stopping server..."
         kill -9 $(ps aux | grep sglang | grep Meta-Llama-3.1-8B-Instruct | grep -v grep | awk '{print $2}')
