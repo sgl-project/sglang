@@ -7,7 +7,6 @@ import unittest
 
 from sglang.utils import run_with_timeout
 
-
 suites = {
     "minimal": ["test_openai_backend.py", "test_srt_backend.py"],
 }
