@@ -1,4 +1,4 @@
-name: fake tag
+name: Release Fake Tag
 on:
   push:
     branches:
