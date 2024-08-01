@@ -141,7 +141,11 @@ def test_decode_json():
             s += "}"
 
     ret = decode_json.run(max_new_tokens=64)
-    js_obj = json.loads(ret["json_output"])
+    try:
+        js_obj = json.loads(ret["json_output"])
+    except json.decoder.JSONDecodeError:
+        print("JSONDecodeError", ret["json_output"])
+        raise
     assert isinstance(js_obj["name"], str)
     assert isinstance(js_obj["population"], int)
 
