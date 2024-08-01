@@ -20,8 +20,6 @@ concurrency:
 jobs:
   unit-test:
     runs-on: self-hosted
-    env:
-      CUDA_VISIBLE_DEVICES: 6
 
     steps:
     - name: Checkout code
