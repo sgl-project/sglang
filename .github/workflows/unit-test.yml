@@ -5,10 +5,12 @@ on:
     branches: [ main ]
     paths:
       - "python/sglang/**"
+      - "test/**"
   pull_request:
     branches: [ main ]
     paths:
       - "python/sglang/**"
+      - "test/**"
   workflow_dispatch:
 
 concurrency:
