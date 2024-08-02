@@ -312,10 +312,12 @@ class ModelRunner:
             self.cuda_graph_runner.capture(batch_size_list)
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}. Possible solutions:\n"
-                f"1. disable cuda graph by --disable-cuda-graph\n"
-                f"2. set --mem-fraction-static to a smaller value\n"
-                f"Open an issue on GitHub with reproducible scripts if you need help.\n"
+                f"Capture cuda graph failed: {e}\n"
+                "Possible solutions:\n"
+                "1. disable torch compile by not using --enable-torch-compile\n"
+                "2. disable cuda graph by --disable-cuda-graph\n"
+                "3. set --mem-fraction-static to a smaller value\n"
+                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
     @torch.inference_mode()
