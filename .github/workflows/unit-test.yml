@@ -21,6 +21,9 @@ jobs:
   unit-test:
     runs-on: self-hosted
 
+    env:
+      HF_TOKEN : ${{ secrets.HF_TOKEN }}
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -49,3 +52,10 @@ jobs:
 
         cd test/lang
         python3 test_srt_backend.py
+
+    - name: Test OpenAI API Server
+      run: |
+        cd /data/zhyncs/venv && source ./bin/activate && cd -
+
+        cd test/srt
+        python3 test_openai_server.py
