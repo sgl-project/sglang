@@ -30,6 +30,7 @@ PACKAGE_LIST = [
     "zmq",
     "vllm",
     "outlines",
+    "multipart",
     "openai",
     "tiktoken",
     "anthropic",
