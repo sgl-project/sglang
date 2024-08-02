@@ -16,6 +16,9 @@ StartLimitIntervalSec=0
 [Service]
 Environment="CUDA_VISIBLE_DEVICES=7"
 Environment="XDG_CACHE_HOME=/data/.cache"
+Environment="HF_TOKEN=hf_**"
+Environment="OPENAI_API_KEY=sk-**"
+Environment="HOME=/data/zhyncs"
 Restart=always
 RestartSec=1
 ExecStart=/data/zhyncs/actions-runner/run.sh
