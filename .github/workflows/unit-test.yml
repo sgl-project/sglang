@@ -21,16 +21,20 @@ jobs:
   unit-test:
     runs-on: self-hosted
 
-    env:
-      HF_TOKEN : ${{ secrets.HF_TOKEN }}
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
 
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
     - name: Install dependencies
       run: |
-        cd /data/zhyncs/venv && source ./bin/activate && cd -
+        python -m venv .venv
+        source .venv/bin/activate
+        echo "${{ github.workspace }}/.venv/bin" >> $GITHUB_PATH
 
         pip cache purge
         pip install --upgrade pip
@@ -40,29 +44,20 @@ jobs:
 
     - name: Test Frontend Language with OpenAI Backend
       run: |
-        cd /data/zhyncs/venv && source ./bin/activate && cd -
-        export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-
         cd test/lang
         python3 test_openai_backend.py
 
     - name: Test Frontend Language with SRT Backend
       run: |
-        cd /data/zhyncs/venv && source ./bin/activate && cd -
-
         cd test/lang
         python3 test_srt_backend.py
 
     - name: Test OpenAI API Server
       run: |
-        cd /data/zhyncs/venv && source ./bin/activate && cd -
-
         cd test/srt
         python3 test_openai_server.py
 
     - name: Test Accuracy
       run: |
-        cd /data/zhyncs/venv && source ./bin/activate && cd -
-
         cd test/srt
         python3 test_eval_accuracy.py
