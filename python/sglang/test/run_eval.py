@@ -1,0 +1,80 @@
+import argparse
+import os
+import time
+import json
+
+from sglang.test.simple_eval_mmlu import MMLUEval
+from sglang.test.simple_eval_common import ChatCompletionSampler, set_ulimit, make_report
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="Server or API base url if not using http host and port.",
+    )
+    parser.add_argument(
+        "--host", type=str, default="0.0.0.0", help="Default host is 0.0.0.0."
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
+    )
+    parser.add_argument("--eval-name", type=str, default="mmlu")
+    parser.add_argument("--num-examples", type=int)
+    parser.add_argument("--num-threads", type=int, default=64)
+    set_ulimit()
+    args = parser.parse_args()
+
+    base_url = (
+        f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
+    )
+
+    if args.eval_name == "mmlu":
+        dataset_path = "mmlu.csv"
+
+        if not os.path.exists(dataset_path):
+            download_dataset(
+                dataset_path,
+                "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv",
+            )
+        eval_obj = MMLUEval(dataset_path, args.num_examples, args.num_threads)
+    else:
+        raise ValueError(f"Invalid eval name: {args.eval_name}")
+
+    sampler = ChatCompletionSampler(
+        model=args.model,
+        max_tokens=2048,
+        base_url=base_url,
+    )
+
+    # Run eval
+    tic = time.time()
+    result = eval_obj(sampler)
+    latency = time.time() - tic
+
+    # Dump reports
+    metrics = result.metrics | {"score": result.score}
+    file_stem = f"mmlu_{sampler.model.replace('/', '_')}"
+    report_filename = f"/tmp/{file_stem}.html"
+    print(f"Writing report to {report_filename}")
+    with open(report_filename, "w") as fh:
+        fh.write(make_report(result))
+    metrics = result.metrics | {"score": result.score}
+    print(metrics)
+    result_filename = f"/tmp/{file_stem}.json"
+    with open(result_filename, "w") as f:
+        f.write(json.dumps(metrics, indent=2))
+    print(f"Writing results to {result_filename}")
+
+    # Print results
+    print(f"Total latency: {latency:.3f} s")
+    print(f"Score: {metrics['score']:.3f}")

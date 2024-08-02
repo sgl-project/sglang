@@ -1,8 +1,27 @@
 # Adapted from https://github.com/openai/simple-evals/
 
+import base64
+import os
 import resource
+import time
+from collections import defaultdict
 from dataclasses import dataclass, field
+from multiprocessing.pool import ThreadPool
 from typing import Any
+
+import jinja2
+import numpy as np
+import openai
+import requests
+from openai import OpenAI
+from tqdm import tqdm
+
+OPENAI_SYSTEM_MESSAGE_API = "You are a helpful assistant."
+OPENAI_SYSTEM_MESSAGE_CHATGPT = (
+    "You are ChatGPT, a large language model trained by OpenAI, based on the GPT-4 architecture."
+    + "\nKnowledge cutoff: 2023-12\nCurrent date: 2024-04-01"
+)
+
 
 Message = dict[str, Any]  # keys role, content
 MessageList = list[Message]
@@ -49,20 +68,6 @@ class Eval:
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         raise NotImplementedError()
-
-
-import base64
-import time
-from typing import Any
-
-import openai
-from openai import OpenAI
-
-OPENAI_SYSTEM_MESSAGE_API = "You are a helpful assistant."
-OPENAI_SYSTEM_MESSAGE_CHATGPT = (
-    "You are ChatGPT, a large language model trained by OpenAI, based on the GPT-4 architecture."
-    + "\nKnowledge cutoff: 2023-12\nCurrent date: 2024-04-01"
-)
 
 
 class ChatCompletionSampler(SamplerBase):
@@ -139,15 +144,6 @@ class ChatCompletionSampler(SamplerBase):
                 trial += 1
             # unknown error shall throw exception
 
-
-import os
-from collections import defaultdict
-from multiprocessing.pool import ThreadPool
-from typing import Any
-
-import jinja2
-import numpy as np
-from tqdm import tqdm
 
 QUERY_TEMPLATE_MULTICHOICE = """
 Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.
@@ -295,7 +291,7 @@ def aggregate_results(
     )
 
 
-def map_with_progress(f: callable, xs: list[Any], num_threads: int = 50):
+def map_with_progress(f: callable, xs: list[Any], num_threads: int):
     """
     Apply f to each element of xs, using a ThreadPool, and show progress.
     """
@@ -422,10 +418,6 @@ def make_report_from_example_htmls(htmls: list[str]):
     return jinja_env.from_string(_report_template).render(
         score=None, metrics={}, htmls=htmls
     )
-
-
-import requests
-from tqdm import tqdm
 
 
 def download_dataset(path, url):
