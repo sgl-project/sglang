@@ -1,10 +1,14 @@
+"""
+Usage:
+python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
+"""
 import argparse
 import os
 import time
 import json
 
 from sglang.test.simple_eval_mmlu import MMLUEval
-from sglang.test.simple_eval_common import ChatCompletionSampler, set_ulimit, make_report
+from sglang.test.simple_eval_common import ChatCompletionSampler, set_ulimit, make_report, download_dataset
 
 
 if __name__ == "__main__":
