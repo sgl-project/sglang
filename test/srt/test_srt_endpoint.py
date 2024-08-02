@@ -1,10 +1,11 @@
 import json
 import unittest
+
 import requests
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import popen_launch_server, MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import MODEL_NAME_FOR_TEST, popen_launch_server
 
 
 class TestSRTEndpoint(unittest.TestCase):
@@ -21,7 +22,9 @@ class TestSRTEndpoint(unittest.TestCase):
     def tearDownClass(cls):
         kill_child_process(cls.process.pid)
 
-    def run_decode(self, return_logprob=False, top_logprobs_num=0, return_text=False, n=1):
+    def run_decode(
+        self, return_logprob=False, top_logprobs_num=0, return_text=False, n=1
+    ):
         response = requests.post(
             self.base_url + "/generate",
             json={
