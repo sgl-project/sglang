@@ -38,7 +38,7 @@ jobs:
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/ --force-reinstall
         pip install --upgrade transformers
 
-    - name: Test OpenAI Backend
+    - name: Test Frontend Language with OpenAI Backend
       run: |
         cd /data/zhyncs/venv && source ./bin/activate && cd -
         export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
@@ -46,7 +46,7 @@ jobs:
         cd test/lang
         python3 test_openai_backend.py
 
-    - name: Test SRT Backend
+    - name: Test Frontend Language with SRT Backend
       run: |
         cd /data/zhyncs/venv && source ./bin/activate && cd -
 
