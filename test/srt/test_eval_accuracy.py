@@ -3,8 +3,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_child_process
-from sglang.test.test_utils import popen_launch_server
 from sglang.test.run_eval import run_eval
+from sglang.test.test_utils import popen_launch_server
 
 
 class TestAccuracy(unittest.TestCase):

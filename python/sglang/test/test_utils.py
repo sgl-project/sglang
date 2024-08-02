@@ -394,7 +394,7 @@ def popen_launch_server(model, port, timeout, *args):
         "localhost",
         "--port",
         str(port),
-        *args
+        *args,
     ]
     process = subprocess.Popen(command, stdout=None, stderr=None)
     base_url = f"http://localhost:{port}/v1"
