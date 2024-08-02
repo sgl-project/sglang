@@ -19,6 +19,9 @@ jobs:
   pr-e2e-test:
     runs-on: self-hosted
 
+    env:
+      HF_TOKEN : ${{ secrets.HF_TOKEN }}
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
