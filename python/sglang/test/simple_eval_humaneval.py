@@ -18,9 +18,14 @@ from typing import Any, Tuple
 
 import blobfile as bf
 import tqdm
-from human_eval.data import HUMAN_EVAL, read_problems
-from human_eval.evaluation import estimate_pass_at_k
-from human_eval.execution import check_correctness  # , unsafe_execute
+
+try:
+    from human_eval.data import HUMAN_EVAL, read_problems
+    from human_eval.evaluation import estimate_pass_at_k
+    from human_eval.execution import check_correctness  # , unsafe_execute
+except (ImportError, ModuleNotFoundError):
+    print("\nPlease install human-eval at https://github.com/openai/human-eval.\n")
+    raise
 
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
