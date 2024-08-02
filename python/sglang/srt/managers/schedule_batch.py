@@ -357,78 +357,9 @@ class ScheduleBatch:
 
         return out_cache_loc
 
-    def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+    def batch_sampling_params(self, vocab_size, int_token_logit_bias):
         device = "cuda"
-        bs = self.batch_size()
-        reqs = self.reqs
-        input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(r.input_ids) - len(r.prefix_indices) for r in reqs)
-        prefix_indices = [r.prefix_indices for r in reqs]
-
-        # Handle prefix
-        flatten_input_ids = []
-        extend_lens = []
-        prefix_lens = []
-        seq_lens = []
-
-        # Allocate memory
-        req_pool_indices = self.alloc_req_slots(bs)
-        out_cache_loc = self.alloc_token_slots(extend_num_tokens)
-
-        req_pool_indices_cpu = req_pool_indices.tolist()
-
-        # Set req_pool_idx in Req
-        for i in range(bs):
-            reqs[i].req_pool_idx = req_pool_indices_cpu[i]
-
-        for i in range(bs):
-            flatten_input_ids.extend(input_ids[i])
-            extend_lens.append(len(input_ids[i]))
-
-            prefix_lens.append(len(prefix_indices[i]))
-            if len(prefix_indices[i]) > 0:
-                self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
-                    : len(prefix_indices[i])
-                ] = prefix_indices[i]
-
-            seq_lens.append(prefix_lens[-1] + extend_lens[-1])
-
-        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
-
-        pt = 0
-        for i in range(bs):
-            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
-                prefix_lens[i] : prefix_lens[i] + extend_lens[i]
-            ] = out_cache_loc[pt : pt + extend_lens[i]]
-            pt += extend_lens[i]
-
-        # Handle logit bias but only allocate when needed
-        logit_bias = None
-        for i in range(bs):
-            if reqs[i].sampling_params.dtype == "int":
-                if logit_bias is None:
-                    logit_bias = torch.zeros(
-                        (bs, vocab_size), dtype=torch.float32, device=device
-                    )
-                logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
-
-        # Set fields
-        self.input_ids = torch.tensor(
-            flatten_input_ids, dtype=torch.int32, device=device
-        )
-        self.pixel_values = [r.pixel_values for r in reqs]
-        self.image_sizes = [r.image_size for r in reqs]
-        self.image_offsets = [
-            r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
-        ]
-        self.req_pool_indices = req_pool_indices
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-        self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
-        self.position_ids_offsets = position_ids_offsets
-        self.extend_num_tokens = extend_num_tokens
-        self.out_cache_loc = out_cache_loc
-        self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
-
+        bs, reqs = self.batch_size(), self.reqs
         self.temperatures = torch.tensor(
             [r.sampling_params.temperature for r in reqs],
             dtype=torch.float,
@@ -450,7 +381,69 @@ class ScheduleBatch:
             dtype=torch.float,
             device=device,
         )
-        self.logit_bias = logit_bias
+
+        # Handle logit bias but only allocate when needed
+        self.logit_bias = None
+        for i in range(bs):
+            if reqs[i].sampling_params.dtype == "int":
+                if self.logit_bias is None:
+                    self.logit_bias = torch.zeros(
+                        (bs, vocab_size), dtype=torch.float32, device=device
+                    )
+                self.logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
+
+    def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+        device = "cuda"
+        bs = self.batch_size()
+        reqs = self.reqs
+        seq_lens = [len(r.input_ids) for r in reqs]
+        input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
+        extend_num_tokens = sum(len(r.input_ids) - len(r.prefix_indices) for r in reqs)
+        prefix_indices = [r.prefix_indices for r in reqs]
+
+        # Handle prefix
+        extend_lens = []
+        prefix_lens = []
+
+        # Allocate memory
+        req_pool_indices = self.alloc_req_slots(bs)
+        out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+
+        req_pool_indices_cpu = req_pool_indices.tolist()
+
+        pt = 0
+        for i in range(bs):
+            extend_lens.append(len(input_ids[i]))
+            prefix_lens.append(len(prefix_indices[i]))
+
+            reqs[i].req_pool_idx = req_pool_indices_cpu[i]
+            if len(prefix_indices[i]) > 0:
+                self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
+                    : len(prefix_indices[i])
+                ] = prefix_indices[i]
+            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
+                prefix_lens[i] : prefix_lens[i] + extend_lens[i]
+            ] = out_cache_loc[pt : pt + extend_lens[i]]
+            pt += extend_lens[i]
+
+        # Set fields
+        self.input_ids = torch.tensor(
+            sum(input_ids, []), dtype=torch.int32, device=device
+        )
+        self.pixel_values = [r.pixel_values for r in reqs]
+        self.image_sizes = [r.image_size for r in reqs]
+        self.image_offsets = [
+            r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
+        ]
+        self.req_pool_indices = req_pool_indices
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
+        self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
+        self.extend_num_tokens = extend_num_tokens
+        self.out_cache_loc = out_cache_loc
+        self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+
+        self.batch_sampling_params(vocab_size, int_token_logit_bias)
 
     def check_decode_mem(self):
         bs = len(self.reqs)
