@@ -317,7 +317,7 @@ class ModelRunner:
                 "1. disable torch compile by not using --enable-torch-compile\n"
                 "2. disable cuda graph by --disable-cuda-graph\n"
                 "3. set --mem-fraction-static to a smaller value\n"
-                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose with reproducible scripts if you need help.\n"
+                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
     @torch.inference_mode()
