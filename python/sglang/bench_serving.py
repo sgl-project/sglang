@@ -21,7 +21,7 @@ import sys
 import time
 import traceback
 import warnings
-from argparse import ArgumentParser as FlexibleArgumentParser
+from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import AsyncGenerator, List, Optional, Tuple, Union
@@ -868,14 +868,12 @@ def set_ulimit(target_soft_limit=65535):
 
 
 if __name__ == "__main__":
-    parser = FlexibleArgumentParser(
-        description="Benchmark the online serving throughput."
-    )
+    parser = ArgumentParser(description="Benchmark the online serving throughput.")
     parser.add_argument(
         "--backend",
         type=str,
-        required=True,
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
+        default="sglang",
         help="Must specify a backend, depending on the LLM Inference Engine.",
     )
     parser.add_argument(
