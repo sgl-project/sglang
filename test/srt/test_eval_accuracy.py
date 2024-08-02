@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import popen_launch_server
+from sglang.test.test_utils import MODEL_NAME_FOR_TEST, popen_launch_server
 
 
 class TestAccuracy(unittest.TestCase):
@@ -13,7 +13,7 @@ class TestAccuracy(unittest.TestCase):
     def setUpClass(cls):
         port = 30000
 
-        cls.model = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        cls.model = MODEL_NAME_FOR_TEST
         cls.base_url = f"http://localhost:{port}"
         cls.process = popen_launch_server(cls.model, port, timeout=300)
 

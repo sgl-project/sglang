@@ -18,6 +18,9 @@ from sglang.test.simple_eval_mmlu import MMLUEval
 
 
 def run_eval(args):
+    if "OPENAI_API_KEY" not in os.environ:
+        os.environ["OPENAI_API_KEY"] = "EMPTY"
+
     base_url = (
         f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
     )
