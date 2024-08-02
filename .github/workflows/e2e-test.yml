@@ -30,6 +30,12 @@ jobs:
 
     - name: Install dependencies
       run: |
+        whoami
+        whoami
+        whoami
+        whoami
+        whoami
+
         cd /data/zhyncs/venv && source ./bin/activate && cd -
 
         pip cache purge
