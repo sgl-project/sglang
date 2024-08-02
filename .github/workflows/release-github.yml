@@ -1,4 +1,4 @@
-name: release tag
+name: Release GitHub
 on:
   workflow_dispatch:
 jobs:

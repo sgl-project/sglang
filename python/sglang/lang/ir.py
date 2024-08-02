@@ -99,7 +99,6 @@ class SglSamplingParams:
             "stop": self.stop or None,
             "temperature": self.temperature,
             "top_p": self.top_p,
-            "top_k": self.top_k,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
         }

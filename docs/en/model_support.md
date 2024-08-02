@@ -11,6 +11,6 @@ To port a model from vLLM to SGLang, you can compare these two files [SGLang LLa
   - Change `forward()` functions, and add `input_metadata`.
   - Add `EntryClass` at the end.
   - Test correctness by comparing the final logits and outputs of the two following commands:
-    - `python3 playground/reference_hf.py --model [new model]`
+    - `python3 scripts/playground/reference_hf.py --model [new model]`
     - `python3 -m sglang.bench_latency --model [new model] --correct --output-len 16 --trust-remote-code`
   - Update [Supported Models](https://github.com/sgl-project/sglang/tree/main?tab=readme-ov-file#supported-models) at [README](../README.md).
