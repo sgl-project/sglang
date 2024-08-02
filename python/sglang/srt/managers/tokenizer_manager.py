@@ -79,6 +79,7 @@ class TokenizerManager:
         self.send_to_router.connect(f"tcp://127.0.0.1:{port_args.controller_port}")
 
         self.model_path = server_args.model_path
+        self.served_model_name = server_args.served_model_name
         self.hf_config = get_config(
             self.model_path,
             trust_remote_code=server_args.trust_remote_code,

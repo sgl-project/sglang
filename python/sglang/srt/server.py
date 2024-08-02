@@ -190,10 +190,10 @@ async def retrieve_file_content(file_id: str):
 @app.get("/v1/models")
 def available_models():
     """Show available models."""
-    model_names = [tokenizer_manager.model_path]
+    served_model_names = [tokenizer_manager.served_model_name]
     model_cards = []
-    for model_name in model_names:
-        model_cards.append(ModelCard(id=model_name, root=model_name))
+    for served_model_name in served_model_names:
+        model_cards.append(ModelCard(id=served_model_name, root=served_model_name))
     return ModelList(data=model_cards)
 
 
