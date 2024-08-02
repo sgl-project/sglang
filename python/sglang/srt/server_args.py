@@ -32,6 +32,7 @@ class ServerArgs:
     trust_remote_code: bool = True
     context_length: Optional[int] = None
     quantization: Optional[str] = None
+    served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
 
     # Port
@@ -90,6 +91,10 @@ class ServerArgs:
     def __post_init__(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+
+        if self.served_model_name is None:
+            self.served_model_name = self.model_path
+
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.79
@@ -201,6 +206,12 @@ class ServerArgs:
                 "bitsandbytes",
             ],
             help="The quantization method.",
+        )
+        parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=ServerArgs.served_model_name,
+            help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
         )
         parser.add_argument(
             "--chat-template",
