@@ -35,6 +35,10 @@ jobs:
         whoami
         whoami
         whoami
+        
+        groups
+        
+        groups $(whoami)
 
         cd /data/zhyncs/venv && source ./bin/activate && cd -
 
