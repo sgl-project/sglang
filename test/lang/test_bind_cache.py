@@ -1,6 +1,7 @@
 import unittest
 
 import sglang as sgl
+from sglang.test.test_utils import MODEL_NAME_FOR_TEST
 
 
 class TestBind(unittest.TestCase):
@@ -8,7 +9,7 @@ class TestBind(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.backend = sgl.Runtime(model_path="meta-llama/Meta-Llama-3-8B-Instruct")
+        cls.backend = sgl.Runtime(model_path=MODEL_NAME_FOR_TEST)
         sgl.set_default_backend(cls.backend)
 
     @classmethod
