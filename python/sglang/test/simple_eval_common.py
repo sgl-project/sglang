@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
 from typing import Any
 
+import httpx
 import jinja2
 import numpy as np
 import openai
@@ -70,6 +71,16 @@ class Eval:
         raise NotImplementedError()
 
 
+class LargerHttpxClient(httpx.Client):
+    def __init__(self):
+        timeout_config = httpx.Timeout(3600)
+        limits = httpx.Limits(
+            max_keepalive_connections=3600,
+            max_connections=3600,
+        )
+        super().__init__(timeout=timeout_config, limits=limits)
+
+
 class ChatCompletionSampler(SamplerBase):
     """
     Sample from OpenAI's chat completion API
@@ -83,7 +94,7 @@ class ChatCompletionSampler(SamplerBase):
         temperature: float = 0.0,
         max_tokens: int = 2048,
     ):
-        self.client = OpenAI(base_url=base_url)
+        self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
 
         if model is None:
             model = self.client.models.list().data[0].id
