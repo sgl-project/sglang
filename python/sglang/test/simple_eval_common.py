@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
 from typing import Any
 
+import httpx
 import jinja2
 import numpy as np
 import openai
@@ -70,7 +71,6 @@ class Eval:
         raise NotImplementedError()
 
 
-import httpx
 class LargerHttpxClient(httpx.Client):
     def __init__(self):
         timeout_config = httpx.Timeout(3600)
