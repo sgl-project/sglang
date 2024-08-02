@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  pr-e2e-test:
+  e2e-test:
     runs-on: self-hosted
 
     env:
@@ -38,7 +38,7 @@ jobs:
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/ --force-reinstall
         pip install --upgrade transformers
 
-    - name: Benchmark Serving
+    - name: Benchmark Serving Throughput
       run: |
         cd /data/zhyncs/venv && source ./bin/activate && cd -
         python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &

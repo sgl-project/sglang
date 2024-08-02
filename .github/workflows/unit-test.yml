@@ -59,3 +59,10 @@ jobs:
 
         cd test/srt
         python3 test_openai_server.py
+
+    - name: Test Accuracy
+      run: |
+        cd /data/zhyncs/venv && source ./bin/activate && cd -
+
+        cd test/srt
+        python3 test_eval_accuracy.py
