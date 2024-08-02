@@ -14,7 +14,6 @@ from sglang.test.simple_eval_common import (
     make_report,
     set_ulimit,
 )
-from sglang.test.simple_eval_mmlu import MMLUEval
 
 
 def run_eval(args):
@@ -26,6 +25,8 @@ def run_eval(args):
     )
 
     if args.eval_name == "mmlu":
+        from sglang.test.simple_eval_mmlu import MMLUEval
+
         dataset_path = "mmlu.csv"
 
         if not os.path.exists(dataset_path):
@@ -34,6 +35,10 @@ def run_eval(args):
                 "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv",
             )
         eval_obj = MMLUEval(dataset_path, args.num_examples, args.num_threads)
+    elif args.eval_name == "humaneval":
+        from sglang.test.simple_eval_humaneval import HumanEval
+
+        eval_obj = HumanEval(args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
@@ -50,7 +55,7 @@ def run_eval(args):
 
     # Dump reports
     metrics = result.metrics | {"score": result.score}
-    file_stem = f"mmlu_{sampler.model.replace('/', '_')}"
+    file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
     report_filename = f"/tmp/{file_stem}.html"
     print(f"Writing report to {report_filename}")
     with open(report_filename, "w") as fh:
