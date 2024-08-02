@@ -409,11 +409,9 @@ class ScheduleBatch:
         req_pool_indices = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
-        req_pool_indices_cpu = req_pool_indices.tolist()
-
         pt = 0
         for i, req in enumerate(reqs):
-            reqs[i].req_pool_idx = req_pool_indices_cpu[i]
+            reqs[i].req_pool_idx = req_pool_indices[i]
 
             extend_lens.append(len(input_ids[i]))
             prefix_lens.append(len(prefix_indices[i]))
@@ -426,22 +424,24 @@ class ScheduleBatch:
             ] = out_cache_loc[pt : pt + extend_lens[i]]
             pt += extend_lens[i]
 
-        # Set fields
-        self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int32, device=device
-        )
+        # Image auxiliary
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
         self.image_offsets = [
             r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
         ]
-        self.req_pool_indices = req_pool_indices
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-        self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
-        self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
+
         self.extend_num_tokens = extend_num_tokens
-        self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+
+        with torch.device(device):
+            # Batched tensors
+            self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
+            self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32)
+            self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+            self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32)
+            self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int32)
+            self.out_cache_loc = out_cache_loc
 
         self.batch_sampling_params(vocab_size, int_token_logit_bias)
 
