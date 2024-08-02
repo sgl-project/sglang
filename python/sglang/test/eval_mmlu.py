@@ -14,7 +14,21 @@ import time
 
 import pandas
 
-from sglang.test.eval_common import (ANSWER_PATTERN_MULTICHOICE, HTML_JINJA, format_multichoice_question, Eval, EvalResult, SamplerBase, SingleEvalResult, download_dataset, ChatCompletionSampler, map_with_progress, jinja_env, aggregate_results, set_ulimit)
+from sglang.test.eval_common import (
+    ANSWER_PATTERN_MULTICHOICE,
+    HTML_JINJA,
+    ChatCompletionSampler,
+    Eval,
+    EvalResult,
+    SamplerBase,
+    SingleEvalResult,
+    aggregate_results,
+    download_dataset,
+    format_multichoice_question,
+    jinja_env,
+    map_with_progress,
+    set_ulimit,
+)
 
 subject2category = {
     "abstract_algebra": "stem",
@@ -88,7 +102,9 @@ class MMLUEval(Eval):
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(row: dict):
             prompt_messages = [
-                sampler._pack_message(content=format_multichoice_question(row), role="user")
+                sampler._pack_message(
+                    content=format_multichoice_question(row), role="user"
+                )
             ]
             response_text = sampler(prompt_messages)
             match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
@@ -103,7 +119,9 @@ class MMLUEval(Eval):
             )
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
             category = subject2category.get(row["Subject"], "other")
-            return SingleEvalResult(html=html, score=score, metrics={category: score}, convo=convo)
+            return SingleEvalResult(
+                html=html, score=score, metrics={category: score}, convo=convo
+            )
 
         results = map_with_progress(fn, self.examples)
         return aggregate_results(results)
@@ -133,18 +151,19 @@ if __name__ == "__main__":
         type=str,
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
     )
-    parser.add_argument(
-        "--num-examples",
-        type=int,
-        help="The number of examples."
-    )
+    parser.add_argument("--num-examples", type=int, help="The number of examples.")
     set_ulimit()
     args = parser.parse_args()
 
-    base_url = f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
+    base_url = (
+        f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
+    )
 
     if not os.path.exists(args.dataset_path):
-        download_dataset(args.dataset_path, "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv")
+        download_dataset(
+            args.dataset_path,
+            "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv",
+        )
     eval_obj = MMLUEval(args.dataset_path, num_examples=args.num_examples)
     sampler = ChatCompletionSampler(
         model=args.model,

@@ -868,13 +868,10 @@ def set_ulimit(target_soft_limit=65535):
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(
-        description="Benchmark the online serving throughput."
-    )
+    parser = ArgumentParser(description="Benchmark the online serving throughput.")
     parser.add_argument(
         "--backend",
         type=str,
-        required=True,
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
         default="sglang",
         help="Must specify a backend, depending on the LLM Inference Engine.",
