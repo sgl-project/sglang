@@ -1,6 +1,8 @@
 """Common utilities for testing and benchmarking"""
 
 import asyncio
+import subprocess
+import time
 from functools import partial
 
 import numpy as np
@@ -379,3 +381,31 @@ def get_call_select(args):
             raise
 
     return func
+
+
+def popen_launch_server(model, port, timeout, *args):
+    command = [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        model,
+        "--host",
+        "localhost",
+        "--port",
+        str(port),
+        *args
+    ]
+    process = subprocess.Popen(command, stdout=None, stderr=None)
+    base_url = f"http://localhost:{port}/v1"
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(f"{base_url}/models")
+            if response.status_code == 200:
+                return process
+        except requests.RequestException:
+            pass
+        time.sleep(10)
+    raise TimeoutError("Server failed to start within the timeout period.")

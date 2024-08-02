@@ -16,33 +16,8 @@ from sglang.test.simple_eval_common import (
 )
 from sglang.test.simple_eval_mmlu import MMLUEval
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--base-url",
-        type=str,
-        default=None,
-        help="Server or API base url if not using http host and port.",
-    )
-    parser.add_argument(
-        "--host", type=str, default="0.0.0.0", help="Default host is 0.0.0.0."
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
-    )
-    parser.add_argument("--eval-name", type=str, default="mmlu")
-    parser.add_argument("--num-examples", type=int)
-    parser.add_argument("--num-threads", type=int, default=64)
-    set_ulimit()
-    args = parser.parse_args()
 
+def run_eval(args):
     base_url = (
         f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
     )
@@ -87,3 +62,35 @@ if __name__ == "__main__":
     # Print results
     print(f"Total latency: {latency:.3f} s")
     print(f"Score: {metrics['score']:.3f}")
+
+    return metrics
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="Server or API base url if not using http host and port.",
+    )
+    parser.add_argument(
+        "--host", type=str, default="0.0.0.0", help="Default host is 0.0.0.0."
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
+    )
+    parser.add_argument("--eval-name", type=str, default="mmlu")
+    parser.add_argument("--num-examples", type=int)
+    parser.add_argument("--num-threads", type=int, default=64)
+    set_ulimit()
+    args = parser.parse_args()
+
+    run_eval(args)

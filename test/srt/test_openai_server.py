@@ -1,47 +1,21 @@
 import json
-import subprocess
-import time
 import unittest
 
 import openai
-import requests
 
 from sglang.srt.utils import kill_child_process
+from sglang.test.test_utils import popen_launch_server
 
 
 class TestOpenAIServer(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        model = "meta-llama/Meta-Llama-3.1-8B-Instruct"
         port = 30000
-        timeout = 300
 
-        command = [
-            "python3",
-            "-m",
-            "sglang.launch_server",
-            "--model-path",
-            model,
-            "--host",
-            "localhost",
-            "--port",
-            str(port),
-        ]
-        cls.process = subprocess.Popen(command, stdout=None, stderr=None)
+        cls.model = "meta-llama/Meta-Llama-3.1-8B-Instruct"
         cls.base_url = f"http://localhost:{port}/v1"
-        cls.model = model
-
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(f"{cls.base_url}/models")
-                if response.status_code == 200:
-                    return
-            except requests.RequestException:
-                pass
-            time.sleep(10)
-        raise TimeoutError("Server failed to start within the timeout period.")
+        cls.process = popen_launch_server(cls.model, port, timeout=300)
 
     @classmethod
     def tearDownClass(cls):
@@ -178,8 +152,6 @@ class TestOpenAIServer(unittest.TestCase):
 
         is_first = True
         for response in generator:
-            print(response)
-
             data = response.choices[0].delta
             if is_first:
                 data.role == "assistant"
