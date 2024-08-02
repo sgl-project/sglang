@@ -19,6 +19,9 @@ jobs:
   pr-e2e-test:
     runs-on: self-hosted
 
+    env:
+      HF_TOKEN : ${{ secrets.HF_TOKEN }}
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -35,7 +38,7 @@ jobs:
     - name: Benchmark Serving
       run: |
         cd /data/zhyncs/venv && source ./bin/activate && cd -
-        python3 -m sglang.launch_server --model /data/zhyncs/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
+        python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
 
         echo "Waiting for server to start..."
         for i in {1..120}; do
