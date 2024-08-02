@@ -624,13 +624,12 @@ class ModelTpServer:
             req.output_top_logprobs.append(output.output_top_logprobs[i])
 
     def cache_filled_batch(self, batch: ScheduleBatch):
-        req_pool_indices_cpu = batch.req_pool_indices.cpu().numpy()
-        for i, req in enumerate(batch.reqs):
+        for req in batch.reqs:
             new_prefix_indices, new_last_node = self.tree_cache.cache_req(
                 rid=req.rid,
                 token_ids=tuple(req.input_ids),
                 last_uncached_pos=len(req.prefix_indices),
-                req_pool_idx=req_pool_indices_cpu[i],
+                req_pool_idx=req.req_pool_idx,
                 del_in_memory_pool=False,
                 old_last_node=req.last_node,
             )
@@ -638,7 +637,7 @@ class ModelTpServer:
 
             if req is self.current_inflight_req:
                 # inflight request would get a new req idx
-                self.req_to_token_pool.free(int(req_pool_indices_cpu[i]))
+                self.req_to_token_pool.free(req.req_pool_idx)
 
     def forward_decode_batch(self, batch: ScheduleBatch):
         # Check if decode out of memory
@@ -781,14 +780,13 @@ class ModelTpServer:
         # Remove finished reqs
         if finished_indices:
             # Update radix cache
-            req_pool_indices_cpu = batch.req_pool_indices.tolist()
             for i in finished_indices:
                 req = batch.reqs[i]
                 self.tree_cache.cache_req(
                     rid=req.rid,
                     token_ids=tuple(req.origin_input_ids + req.output_ids)[:-1],
                     last_uncached_pos=len(req.prefix_indices),
-                    req_pool_idx=req_pool_indices_cpu[i],
+                    req_pool_idx=req.req_pool_idx,
                 )
 
                 self.tree_cache.dec_lock_ref(req.last_node)
