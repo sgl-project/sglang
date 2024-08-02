@@ -25,16 +25,10 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v3
 
-    - name: Setup Python 3.10
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
-
     - name: Install dependencies
       run: |
-        python -m venv .venv
-        source .venv/bin/activate
-        echo "${{ github.workspace }}/.venv/bin" >> $GITHUB_PATH
+        source $HOME/venv/bin/activate
+        echo "$HOME/venv/bin" >> $GITHUB_PATH
 
         pip cache purge
         pip install --upgrade pip
