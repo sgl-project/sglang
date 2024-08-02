@@ -1,15 +1,6 @@
-name: fake tag
+name: Release GitHub
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "python/sglang/version.py"
   workflow_dispatch:
-
-permissions:
-  contents: write
-
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
@@ -18,18 +9,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
-
+      
       - name: Get version
         id: get_version
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           echo "TAG=v$version" >> $GITHUB_OUTPUT
 
-      - name: Create and push fake tag
+      - name: Release
+        uses: softprops/action-gh-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.REPO_TOKEN }}
-        run: |
-          git config user.name zhyncs
-          git config user.email me@zhyncs.com
-          git checkout -b ${{ steps.get_version.outputs.TAG }}
-          git push --set-upstream origin ${{ steps.get_version.outputs.TAG }}
+        with:
+          name: Release ${{ steps.get_version.outputs.TAG }}
+          tag_name: ${{ steps.get_version.outputs.TAG }}

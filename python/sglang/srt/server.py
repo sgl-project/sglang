@@ -72,6 +72,7 @@ from sglang.srt.utils import (
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
+    kill_child_process,
     maybe_set_triton_cache_manager,
     set_ulimit,
 )
@@ -189,10 +190,10 @@ async def retrieve_file_content(file_id: str):
 @app.get("/v1/models")
 def available_models():
     """Show available models."""
-    model_names = [tokenizer_manager.model_path]
+    served_model_names = [tokenizer_manager.served_model_name]
     model_cards = []
-    for model_name in model_names:
-        model_cards.append(ModelCard(id=model_name, root=model_name))
+    for served_model_name in served_model_names:
+        model_cards.append(ModelCard(id=served_model_name, root=served_model_name))
     return ModelList(data=model_cards)
 
 
@@ -260,7 +261,7 @@ def launch_server(
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.1.2",
+            "0.1.3",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -467,17 +468,11 @@ class Runtime:
 
     def shutdown(self):
         if self.pid is not None:
-            try:
-                parent = psutil.Process(self.pid)
-            except psutil.NoSuchProcess:
-                return
-            children = parent.children(recursive=True)
-            for child in children:
-                child.kill()
-            psutil.wait_procs(children, timeout=5)
-            parent.kill()
-            parent.wait(timeout=5)
+            kill_child_process(self.pid)
             self.pid = None
+
+    def cache_prefix(self, prefix: str):
+        self.endpoint.cache_prefix(prefix)
 
     def get_tokenizer(self):
         return get_tokenizer(

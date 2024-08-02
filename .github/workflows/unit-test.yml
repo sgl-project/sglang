@@ -1,0 +1,57 @@
+name: Unit Test
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+  workflow_dispatch:
+
+concurrency:
+  group: unit-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-test:
+    runs-on: self-hosted
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        source $HOME/venv/bin/activate
+        echo "$HOME/venv/bin" >> $GITHUB_PATH
+
+        pip cache purge
+        pip install --upgrade pip
+        pip install -e "python[all]"
+        pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/ --force-reinstall
+        pip install --upgrade transformers
+
+    - name: Test Frontend Language with OpenAI Backend
+      run: |
+        cd test/lang
+        python3 test_openai_backend.py
+
+    - name: Test Frontend Language with SRT Backend
+      run: |
+        cd test/lang
+        python3 test_srt_backend.py
+
+    - name: Test OpenAI API Server
+      run: |
+        cd test/srt
+        python3 test_openai_server.py
+
+    - name: Test Accuracy
+      run: |
+        cd test/srt
+        python3 test_eval_accuracy.py

@@ -32,6 +32,7 @@ class ServerArgs:
     trust_remote_code: bool = True
     context_length: Optional[int] = None
     quantization: Optional[str] = None
+    served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
 
     # Port
@@ -90,6 +91,10 @@ class ServerArgs:
     def __post_init__(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+
+        if self.served_model_name is None:
+            self.served_model_name = self.model_path
+
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.79
@@ -201,6 +206,12 @@ class ServerArgs:
                 "bitsandbytes",
             ],
             help="The quantization method.",
+        )
+        parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=ServerArgs.served_model_name,
+            help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
         )
         parser.add_argument(
             "--chat-template",
@@ -418,10 +429,6 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
-
-        assert not (
-            self.chunked_prefill_size is not None and self.disable_radix_cache
-        ), "chunked prefill is not supported with radix cache disabled currently"
 
 
 @dataclasses.dataclass

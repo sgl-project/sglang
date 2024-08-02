@@ -7,6 +7,10 @@ import unittest
 
 from sglang.utils import run_with_timeout
 
+suites = {
+    "minimal": ["test_openai_backend.py", "test_srt_backend.py"],
+}
+
 
 def run_unittest_files(files, args):
     for filename in files:
@@ -45,9 +49,19 @@ if __name__ == "__main__":
         default=1000,
         help="The time limit for running one file in seconds.",
     )
+    arg_parser.add_argument(
+        "--suite",
+        type=str,
+        default=list(suites.keys())[0],
+        choices=list(suites.keys()) + ["all"],
+        help="The suite to run",
+    )
     args = arg_parser.parse_args()
 
-    files = glob.glob("**/test_*.py", recursive=True)
+    if args.suite == "all":
+        files = glob.glob("**/test_*.py", recursive=True)
+    else:
+        files = suites[args.suite]
 
     tic = time.time()
     success = run_unittest_files(files, args)

@@ -553,7 +553,8 @@ class StreamExecutor:
                 "output_token_logprobs": output_token_logprobs,
             }
             self.variable_event[name].set()
-            self.stream_var_event[name].set()
+            if self.stream_var_event:
+                self.stream_var_event[name].set()
         self.text_ += decision
 
     def _execute_variable(self, expr: SglVariable):

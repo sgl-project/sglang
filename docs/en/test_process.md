@@ -93,8 +93,10 @@ cd test/srt
 python test_openai_server.py
 ```
 
-## Format
+## Code Formatting
+```
 pip3 install pre-commit
 cd sglang
 pre-commit install
 pre-commit run --all-files
+```
