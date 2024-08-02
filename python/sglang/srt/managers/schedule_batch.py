@@ -100,6 +100,9 @@ class Req:
         self.output_ids = []  # Each decode stage's output ids
         self.input_ids = None  # input_ids = origin_input_ids + output_ids
 
+        # Memory info
+        self.req_pool_idx = None
+
         # For incremental decoding
         # ----- | --------- read_ids -------|
         # ----- |   surr_ids  |
@@ -321,6 +324,9 @@ class ScheduleBatch:
             return_logprob=return_logprob,
         )
 
+    def batch_size(self):
+        return len(self.reqs) if self.reqs is not None else 0
+
     def is_empty(self):
         return len(self.reqs) == 0
 
@@ -328,11 +334,35 @@ class ScheduleBatch:
         # Return whether batch has at least 1 streaming request
         return any(r.stream for r in self.reqs)
 
+    def alloc_req_slots(self, num_reqs):
+        req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
+        if req_pool_indices is None:
+            raise RuntimeError(
+                "Out of memory. "
+                "Please set a smaller number for `--max-running-requests`."
+            )
+        return req_pool_indices
+
+    def alloc_token_slots(self, num_tokens: int):
+        out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
+
+        if out_cache_loc is None:
+            self.tree_cache.evict(num_tokens, self.token_to_kv_pool.free)
+            out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
+
+            if out_cache_loc is None:
+                logger.error("Prefill out of memory. This should never happen.")
+                self.tree_cache.pretty_print()
+                exit()
+
+        return out_cache_loc
+
     def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
         device = "cuda"
-        bs = len(self.reqs)
+        bs = self.batch_size()
         reqs = self.reqs
         input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
+        extend_num_tokens = sum(len(r.input_ids) - len(r.prefix_indices) for r in reqs)
         prefix_indices = [r.prefix_indices for r in reqs]
 
         # Handle prefix
@@ -341,23 +371,22 @@ class ScheduleBatch:
         prefix_lens = []
         seq_lens = []
 
-        req_pool_indices = self.req_to_token_pool.alloc(bs)
+        # Allocate memory
+        req_pool_indices = self.alloc_req_slots(bs)
+        out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
-        if req_pool_indices is None:
-            raise RuntimeError(
-                "Out of memory. "
-                "Please set a smaller number for `--max-running-requests`."
-            )
+        req_pool_indices_cpu = req_pool_indices.tolist()
 
-        req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+        # Set req_pool_idx in Req
+        for i in range(bs):
+            reqs[i].req_pool_idx = req_pool_indices_cpu[i]
+
         for i in range(bs):
             flatten_input_ids.extend(input_ids[i])
             extend_lens.append(len(input_ids[i]))
 
-            if len(prefix_indices[i]) == 0:
-                prefix_lens.append(0)
-            else:
-                prefix_lens.append(len(prefix_indices[i]))
+            prefix_lens.append(len(prefix_indices[i]))
+            if len(prefix_indices[i]) > 0:
                 self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
                     : len(prefix_indices[i])
                 ] = prefix_indices[i]
@@ -365,19 +394,6 @@ class ScheduleBatch:
             seq_lens.append(prefix_lens[-1] + extend_lens[-1])
 
         position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
-
-        # Allocate memory
-        seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
-        extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
-        out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
-        if out_cache_loc is None:
-            self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
-            out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
-
-            if out_cache_loc is None:
-                logger.error("Prefill out of memory. This should never happen.")
-                self.tree_cache.pretty_print()
-                exit()
 
         pt = 0
         for i in range(bs):
@@ -624,8 +640,8 @@ class ScheduleBatch:
         self.prefix_lens = None
 
         # Alloc mem
-        bs = len(self.reqs)
-        self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
+        bs = self.batch_size()
+        self.out_cache_loc = self.alloc_token_slots(bs)
 
         if self.out_cache_loc is None:
             logger.error("Decode out of memory. This should never happen.")
