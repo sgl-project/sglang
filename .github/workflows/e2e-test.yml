@@ -39,6 +39,8 @@ jobs:
         groups
         
         groups $(whoami)
+        
+        ls -lah /data/.cache | grep pip
 
         cd /data/zhyncs/venv && source ./bin/activate && cd -
 
