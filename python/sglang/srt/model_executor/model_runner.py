@@ -47,12 +47,12 @@ from sglang.srt.managers.schedule_batch import (
     InputMetadata,
     global_server_args_dict,
 )
-<<<<<<< 001b0bdd089a626ada2ee217fdc59b4212f0b461:python/sglang/srt/model_executor/model_runner.py
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
-=======
-from sglang.srt.memory_pool import MHATokenToKVPool, MLATokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    ReqToTokenPool,
+)
 from sglang.srt.model_config import AttentionArch
->>>>>>> support MLA kv pool:python/sglang/srt/managers/controller/model_runner.py
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,

@@ -28,14 +28,9 @@ from flashinfer.sampling import top_k_top_p_sampling_from_probs
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
-<<<<<<< 001b0bdd089a626ada2ee217fdc59b4212f0b461:python/sglang/srt/managers/schedule_batch.py
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
-=======
-from sglang.srt.managers.controller.radix_cache import RadixCache
-from sglang.srt.memory_pool import BaseTokenToKVPool, ReqToTokenPool
->>>>>>> support MLA kv pool:python/sglang/srt/managers/controller/infer_batch.py
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
