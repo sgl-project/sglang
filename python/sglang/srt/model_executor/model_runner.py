@@ -259,6 +259,8 @@ class ModelRunner:
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
             )
+            # FIXME: temporarily only Triton MLA is supported
+            self.server_args.disable_flashinfer = True
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,

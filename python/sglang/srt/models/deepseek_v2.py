@@ -312,6 +312,164 @@ class DeepseekV2Attention(nn.Module):
         return output
 
 
+class DeepseekV2AttentionMLA(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        hidden_size: int,
+        num_heads: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        layer_id=None,
+    ) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.hidden_size = hidden_size
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.num_heads = num_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        assert num_heads % tp_size == 0
+        self.num_local_heads = num_heads // tp_size
+        self.scaling = self.qk_head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        if self.q_lora_rank is not None:
+            self.q_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.q_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+            )
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_b_proj = ColumnParallelLinear(
+                q_lora_rank,
+                self.num_heads * self.qk_head_dim,
+                bias=False,
+                quant_config=quant_config,
+            )
+        else:
+            self.q_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads * self.qk_head_dim,
+                bias=False,
+                quant_config=quant_config,
+            )
+
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            self.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            quant_config=quant_config,
+        )
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            quant_config=quant_config,
+        )
+        # O projection.
+        self.o_proj = RowParallelLinear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+        )
+        rope_scaling["type"] = "deepseek_yarn"
+        self.rotary_emb = get_rope(
+            qk_rope_head_dim,
+            rotary_dim=qk_rope_head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=False,
+        )
+
+        if rope_scaling:
+            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+            scaling_factor = rope_scaling["factor"]
+            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+            self.scaling = self.scaling * mscale * mscale
+
+        self.attn = RadixAttention(
+            self.num_local_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            self.scaling,
+            num_kv_heads=1,
+            layer_id=layer_id,
+            v_head_dim=self.kv_lora_rank,
+        )
+
+        kv_b_proj = self.kv_b_proj
+        w_kc, w_vc = kv_b_proj.weight.unflatten(
+            0, (-1, qk_nope_head_dim + v_head_dim)
+        ).split([qk_nope_head_dim, v_head_dim], dim=1)
+        self.w_kc = w_kc
+        self.w_vc = w_vc
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+        q_len = hidden_states.shape[0]
+        q_input = hidden_states.new_empty(
+            q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
+        )
+        if self.q_lora_rank is not None:
+            q = self.q_a_proj(hidden_states)[0]
+            q = self.q_a_layernorm(q)
+            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        else:
+            q = self.q_proj(hidden_states)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_nope_out = q_input[..., : self.kv_lora_rank]
+        torch.bmm(q_nope.transpose(0, 1), self.w_kc, out=q_nope_out.transpose(0, 1))
+
+        k_input = self.kv_a_proj_with_mqa(hidden_states)[0].unsqueeze(1)
+        k_pe = k_input[..., self.kv_lora_rank :]
+        v_input = k_input[..., : self.kv_lora_rank]
+        v_input = self.kv_a_layernorm(v_input.contiguous())
+        k_input[..., : self.kv_lora_rank] = v_input
+
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q_input[..., self.kv_lora_rank :] = q_pe
+        k_input[..., self.kv_lora_rank :] = k_pe
+
+        attn_output = self.attn(q_input, k_input, v_input, input_metadata)
+        attn_bmm_output = attn_output.new_empty(
+            q_len, self.num_local_heads, self.v_head_dim
+        )
+        torch.bmm(
+            attn_output.transpose(0, 1),
+            self.w_vc.transpose(1, 2).contiguous(),
+            out=attn_bmm_output.transpose(0, 1),
+        )
+
+        attn_output = attn_bmm_output.flatten(1, 2)
+        output, _ = self.o_proj(attn_output)
+
+        return output
+
+
 class DeepseekV2DecoderLayer(nn.Module):
 
     def __init__(
@@ -326,7 +484,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = DeepseekV2Attention(
+        self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
