@@ -20,7 +20,6 @@ import warnings
 from dataclasses import dataclass
 from typing import List, Union
 
-import numpy as np
 import torch
 from flashinfer.sampling import top_k_top_p_sampling_from_probs
 
@@ -30,7 +29,6 @@ from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -124,7 +122,7 @@ class Req:
         # For vision input
         self.pixel_values = None
         self.image_size = None
-        self.image_offset = 0
+        self.image_offset = None
         self.pad_value = None
 
         # Prefix info
@@ -161,6 +159,26 @@ class Req:
     # whether request reached finished condition
     def finished(self) -> bool:
         return self.finished_reason is not None
+
+    def adjust_input_len(self):
+        if self.return_logprob:
+            self.prefix_indices = self.prefix_indices[: self.logprob_start_len]
+            self.extend_input_len = len(self.input_ids) - len(self.prefix_indices)
+
+            if self.normalized_prompt_logprob is None and self.extend_input_len < 2:
+                # Need at least two tokens to compute normalized logprob
+                delta = 2 - self.extend_input_len
+                self.extend_input_len += delta
+                self.prefix_indices = self.prefix_indices[:-delta]
+                if self.image_offset is not None:
+                    self.image_offset += delta
+
+        if self.extend_input_len == 0 and self.sampling_params.max_new_tokens > 0:
+            # Need at least one token to compute logits
+            self.extend_input_len = 1
+            self.prefix_indices = self.prefix_indices[:-1]
+            if self.image_offset is not None:
+                self.image_offset += 1
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -433,7 +451,8 @@ class ScheduleBatch:
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
         self.image_offsets = [
-            r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
+            (r.image_offset - p_len) if r.image_offset is not None else 0
+            for r, p_len in zip(reqs, prefix_lens)
         ]
 
         self.extend_num_tokens = extend_num_tokens

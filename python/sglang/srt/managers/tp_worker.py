@@ -364,15 +364,12 @@ class ModelTpServer:
         # Compute matched prefix length
         for req in self.waiting_queue:
             req.input_ids = req.origin_input_ids + req.output_ids
-            prefix_indices, last_node = self.tree_cache.match_prefix(
+            req.prefix_indices, req.last_node = self.tree_cache.match_prefix(
                 rid=req.rid,
                 key=req.input_ids,
             )
-            if req.return_logprob:
-                prefix_indices = prefix_indices[: req.logprob_start_len]
-            req.extend_input_len = len(req.input_ids) - len(prefix_indices)
-            req.prefix_indices = prefix_indices
-            req.last_node = last_node
+            req.extend_input_len = len(req.input_ids) - len(req.prefix_indices)
+            req.adjust_input_len()
 
         # Get priority queue
         self.waiting_queue = self.scheduler.get_priority_queue(self.waiting_queue)
@@ -421,21 +418,6 @@ class ModelTpServer:
                 new_batch_input_tokens += r.extend_input_len
 
         for req in self.waiting_queue:
-            if req.return_logprob and req.normalized_prompt_logprob is None:
-                # Need at least two tokens to compute normalized logprob
-                if req.extend_input_len < 2:
-                    delta = 2 - req.extend_input_len
-                    req.extend_input_len += delta
-                    req.prefix_indices = req.prefix_indices[:-delta]
-                    if req.image_offset is not None:
-                        req.image_offset += delta
-            if req.extend_input_len == 0 and req.sampling_params.max_new_tokens > 0:
-                # Need at least one token to compute logits
-                req.extend_input_len = 1
-                req.prefix_indices = req.prefix_indices[:-1]
-                if req.image_offset is not None:
-                    req.image_offset += 1
-
             if (
                 req.extend_input_len
                 + req.sampling_params.max_new_tokens
