@@ -393,7 +393,6 @@ class ScheduleBatch:
                 self.logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
 
     def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
-        device = "cuda"
         bs = self.batch_size()
         reqs = self.reqs
         seq_lens = [len(r.input_ids) for r in reqs]
@@ -406,12 +405,16 @@ class ScheduleBatch:
         prefix_lens = []
 
         # Allocate memory
-        req_pool_indices = self.alloc_req_slots(bs)
+        req_pool_indices = self.alloc_req_slots(
+            sum(r.req_pool_idx is None for r in reqs)
+        )
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
+        # Resolve index mapping
         pt = 0
         for i, req in enumerate(reqs):
-            reqs[i].req_pool_idx = req_pool_indices[i]
+            if req.req_pool_idx is None:
+                req.req_pool_idx = req_pool_indices.pop(0)
 
             extend_lens.append(len(input_ids[i]))
             prefix_lens.append(len(prefix_indices[i]))
@@ -424,6 +427,8 @@ class ScheduleBatch:
             ] = out_cache_loc[pt : pt + extend_lens[i]]
             pt += extend_lens[i]
 
+        assert req_pool_indices == [], "req_pool_indices not fully used"
+
         # Image auxiliary
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
@@ -434,10 +439,12 @@ class ScheduleBatch:
         self.extend_num_tokens = extend_num_tokens
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
 
-        with torch.device(device):
+        with torch.device("cuda"):
             # Batched tensors
             self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
-            self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32)
+            self.req_pool_indices = torch.tensor(
+                [r.req_pool_idx for r in reqs], dtype=torch.int32
+            )
             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
             self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32)
             self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int32)
