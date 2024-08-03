@@ -639,9 +639,10 @@ class Batch:
         self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
         if self.out_cache_loc is None:
-            logger.error("Decode out of memory. This should never happen.")
-            self.tree_cache.pretty_print()
-            exit()
+            logger.error("Decode out of memory. Try to lower your batch size.")
+            if self.tree_cache is not None:
+                self.tree_cache.pretty_print()
+            exit(1)
 
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
