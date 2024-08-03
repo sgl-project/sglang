@@ -647,18 +647,32 @@ class ScheduleBatch:
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
 
-    def filter_batch(self, unfinished_indices: List[int]):
-        self.reqs = [self.reqs[i] for i in unfinished_indices]
-        new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cuda")
-        self.seq_lens = self.seq_lens[new_indices]
-        self.input_ids = None
-        self.req_pool_indices = self.req_pool_indices[new_indices]
+    def prune_batch(self):
+        """Clear the infos which are 1) exclusive for extend, or 2) update every step"""
+        # Exclusive for extend
         self.prefix_lens = None
-        self.position_ids_offsets = self.position_ids_offsets[new_indices]
+        self.extend_num_tokens = None
+        self.pixel_values = None
+        self.image_offsets = None
+        self.image_offsets = None
+
+        # Update every step
+        self.input_ids = None
         self.out_cache_loc = None
+
+    def filter_batch(self, unfinished_indices: List[int]):
+        """Filter out finished requests in the batch and ready for decode"""
+        self.prune_batch()
+
+        new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cuda")
+
+        # Filter useful infos for decode
+        self.reqs = [self.reqs[i] for i in unfinished_indices]
+        self.seq_lens = self.seq_lens[new_indices]
+        self.req_pool_indices = self.req_pool_indices[new_indices]
+        self.position_ids_offsets = self.position_ids_offsets[new_indices]
         self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
-
         for item in [
             "temperatures",
             "top_ps",
@@ -672,17 +686,19 @@ class ScheduleBatch:
                 setattr(self, item, self_val[new_indices])
 
     def merge(self, other: "ScheduleBatch"):
-        self.reqs.extend(other.reqs)
+        """Merge two batches together and ready for decode"""
+        self.prune_batch()
+        other.prune_batch()
 
+        # Merge useful infos
+        self.reqs.extend(other.reqs)
+        self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
         self.req_pool_indices = torch.concat(
             [self.req_pool_indices, other.req_pool_indices]
         )
-        self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
-        self.prefix_lens = None
         self.position_ids_offsets = torch.concat(
             [self.position_ids_offsets, other.position_ids_offsets]
         )
-        self.out_cache_loc = None
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
@@ -715,6 +731,7 @@ class ScheduleBatch:
             self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
 
     def sample(self, logits: torch.Tensor):
+        # TODO(lsyin): move this into a part of layer and run with CUDA Graph
         # Post process logits
         logits = logits.contiguous()
         logits.div_(self.temperatures)
