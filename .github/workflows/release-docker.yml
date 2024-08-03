@@ -16,6 +16,9 @@ jobs:
       matrix:
         cuda_version: ['12.1.1', '12.4.1']
     steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
       - name: Checkout repository
         uses: actions/checkout@v3
       
