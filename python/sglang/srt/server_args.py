@@ -307,7 +307,7 @@ class ServerArgs:
             "--api-key",
             type=str,
             default=ServerArgs.api_key,
-            help="Set API key of the server.",
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
         )
         parser.add_argument(
             "--file-storage-pth",
