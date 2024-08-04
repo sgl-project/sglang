@@ -13,6 +13,7 @@ import torch
 PACKAGE_LIST = [
     "sglang",
     "flashinfer",
+    "triton",
     "requests",
     "tqdm",
     "numpy",
