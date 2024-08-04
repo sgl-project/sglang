@@ -107,6 +107,11 @@ class GenerateReqInput:
                     ## suppot batch operation
                     self.batch_size = len(self.text)
                     num = num * len(self.text)
+                elif isinstance(self.input_ids, List) and isinstance(
+                    self.input_ids[0], List
+                ):
+                    self.batch_size = len(self.input_ids)
+                    num = num * len(self.input_ids)
                 else:
                     self.batch_size = 1
             else:
