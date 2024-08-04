@@ -380,13 +380,15 @@ class Batch:
         extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
-            self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
-            out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+            if self.tree_cache is not None:
+                self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
+                out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
 
             if out_cache_loc is None:
-                logger.error("Prefill out of memory. This should never happen.")
-                self.tree_cache.pretty_print()
-                exit()
+                logger.error("Prefill out of memory. Try to lower your batch size.")
+                if self.tree_cache is not None:
+                    self.tree_cache.pretty_print()
+                exit(1)
 
         pt = 0
         for i in range(bs):
@@ -637,9 +639,10 @@ class Batch:
         self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
         if self.out_cache_loc is None:
-            logger.error("Decode out of memory. This should never happen.")
-            self.tree_cache.pretty_print()
-            exit()
+            logger.error("Decode out of memory. Try to lower your batch size.")
+            if self.tree_cache is not None:
+                self.tree_cache.pretty_print()
+            exit(1)
 
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1

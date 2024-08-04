@@ -37,11 +37,6 @@ jobs:
         pip install --upgrade transformers
         pip install accelerate
 
-    - name: Test Frontend Language with OpenAI Backend
-      run: |
-        cd test/lang
-        python3 test_openai_backend.py
-
     - name: Test Frontend Language with SRT Backend
       run: |
         cd test/lang
@@ -57,3 +52,8 @@ jobs:
         cd test/srt
         python3 test_eval_accuracy.py
         python3 models/test_causal_models.py
+
+    - name: Test Frontend Language with OpenAI Backend
+      run: |
+        cd test/lang
+        python3 test_openai_backend.py
