@@ -1,9 +1,14 @@
 """Common utilities for testing and benchmarking"""
 
+import argparse
 import asyncio
 import subprocess
+import multiprocessing
+import threading
 import time
+import unittest
 from functools import partial
+from typing import Callable, Optional
 
 import numpy as np
 import requests
@@ -247,7 +252,7 @@ async def call_select_lmql(context, choices, temperature=0, max_len=4096, model=
     return choices.index(answer)
 
 
-def add_common_other_args_and_parse(parser):
+def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
@@ -286,7 +291,7 @@ def add_common_other_args_and_parse(parser):
     return args
 
 
-def add_common_sglang_args_and_parse(parser):
+def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
@@ -296,7 +301,7 @@ def add_common_sglang_args_and_parse(parser):
     return args
 
 
-def select_sglang_backend(args):
+def select_sglang_backend(args: argparse.Namespace):
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
             global_config.enable_parallel_decoding = False
@@ -309,7 +314,7 @@ def select_sglang_backend(args):
     return backend
 
 
-def _get_call_generate(args):
+def _get_call_generate(args: argparse.Namespace):
     if args.backend == "lightllm":
         return partial(call_generate_lightllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "vllm":
@@ -336,7 +341,7 @@ def _get_call_generate(args):
         raise ValueError(f"Invalid backend: {args.backend}")
 
 
-def _get_call_select(args):
+def _get_call_select(args: argparse.Namespace):
     if args.backend == "lightllm":
         return partial(call_select_lightllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "vllm":
@@ -359,7 +364,7 @@ def _get_call_select(args):
         raise ValueError(f"Invalid backend: {args.backend}")
 
 
-def get_call_generate(args):
+def get_call_generate(args: argparse.Namespace):
     call_generate = _get_call_generate(args)
 
     def func(*args, **kwargs):
@@ -372,7 +377,7 @@ def get_call_generate(args):
     return func
 
 
-def get_call_select(args):
+def get_call_select(args: argparse.Namespace):
     call_select = _get_call_select(args)
 
     def func(*args, **kwargs):
@@ -385,7 +390,7 @@ def get_call_select(args):
     return func
 
 
-def popen_launch_server(model, port, timeout, *args):
+def popen_launch_server(model: str, port: int, timeout: float, *args):
     command = [
         "python3",
         "-m",
@@ -411,3 +416,58 @@ def popen_launch_server(model, port, timeout, *args):
             pass
         time.sleep(10)
     raise TimeoutError("Server failed to start within the timeout period.")
+
+
+def run_with_timeout(func: Callable, args: tuple = (), kwargs: Optional[dict] = None,
+                     timeout: float = None):
+    """Run a function with timeout."""
+    ret_value = []
+
+    def _target_func():
+        ret_value.append(func(*args, **(kwargs or {})))
+
+    t = threading.Thread(target=_target_func)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        raise TimeoutError()
+
+    if not ret_value:
+        raise RuntimeError()
+
+    return ret_value[0]
+
+
+def run_unittest_files(files: list[str], timeout_per_file: float):
+    tic = time.time()
+    success = True
+
+    for filename in files:
+
+        def func():
+            print(f"Run {filename}")
+            ret = unittest.main(module=None, argv=["", "-vb"] + [filename])
+
+        p = multiprocessing.Process(target=func)
+
+        def run_one_file():
+            p.start()
+            p.join()
+
+        try:
+            run_with_timeout(run_one_file, timeout=timeout_per_file)
+            if p.exitcode != 0:
+                success = False
+                break
+        except TimeoutError:
+            p.terminate()
+            time.sleep(5)
+            print("\nTimeout after {timeout_per_file} seconds when running {filename}\n")
+            return False
+
+    if success:
+        print(f"Success. Time elapsed: {time.time() - tic:.2f}s")
+    else:
+        print(f"Fail. Time elapsed: {time.time() - tic:.2f}s")
+
+    return 0 if success else -1
