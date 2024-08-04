@@ -61,7 +61,7 @@ class ServerArgs:
     show_time_cost: bool = False
 
     # Other
-    api_key: str = ""
+    api_key: Optional[str] = None
     file_storage_pth: str = "SGlang_storage"
 
     # Data parallelism
@@ -307,7 +307,7 @@ class ServerArgs:
             "--api-key",
             type=str,
             default=ServerArgs.api_key,
-            help="Set API key of the server.",
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
         )
         parser.add_argument(
             "--file-storage-pth",
