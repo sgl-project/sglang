@@ -35,11 +35,7 @@ jobs:
         pip install -e "python[all]"
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/ --force-reinstall
         pip install --upgrade transformers
-
-    - name: Test Frontend Language with OpenAI Backend
-      run: |
-        cd test/lang
-        python3 test_openai_backend.py
+        pip install accelerate
 
     - name: Test Frontend Language with SRT Backend
       run: |
@@ -55,3 +51,9 @@ jobs:
       run: |
         cd test/srt
         python3 test_eval_accuracy.py
+        python3 models/test_causal_models.py
+
+    - name: Test Frontend Language with OpenAI Backend
+      run: |
+        cd test/lang
+        python3 test_openai_backend.py
