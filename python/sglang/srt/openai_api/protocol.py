@@ -278,7 +278,7 @@ class DeltaMessage(BaseModel):
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
-    logprobs: Optional[LogProbs] = None
+    logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[str] = None
 
 
