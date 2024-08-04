@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import requests
