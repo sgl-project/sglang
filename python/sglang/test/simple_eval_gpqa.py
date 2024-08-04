@@ -13,8 +13,14 @@ import pandas
 
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
-    ANSWER_PATTERN_MULTICHOICE, HTML_JINJA, format_multichoice_question,
-    Eval, EvalResult, MessageList, SamplerBase, SingleEvalResult,
+    ANSWER_PATTERN_MULTICHOICE,
+    HTML_JINJA,
+    Eval,
+    EvalResult,
+    MessageList,
+    SamplerBase,
+    SingleEvalResult,
+    format_multichoice_question,
 )
 
 
@@ -33,7 +39,9 @@ class GPQAEval(Eval):
             assert n_repeats == 1, "n_repeats only supported for num_examples"
             examples = rng.sample(examples, num_examples)
         examples = examples * n_repeats
-        examples = [example | {"permutation": rng.sample(range(4), 4)} for example in examples]
+        examples = [
+            example | {"permutation": rng.sample(range(4), 4)} for example in examples
+        ]
         self.examples = examples
         self.n_repeats = n_repeats
         self.num_threads = num_threads
@@ -50,7 +58,11 @@ class GPQAEval(Eval):
             correct_index = choices.index(row["Correct Answer"])
             correct_answer = "ABCD"[correct_index]
             choices_dict = dict(
-                A=choices[0], B=choices[1], C=choices[2], D=choices[3], Question=row["Question"]
+                A=choices[0],
+                B=choices[1],
+                C=choices[2],
+                D=choices[3],
+                Question=row["Question"],
             )
             prompt_messages = [
                 sampler._pack_message(
@@ -70,7 +82,10 @@ class GPQAEval(Eval):
             )
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
             return SingleEvalResult(
-                html=html, score=score, convo=convo, metrics={"chars": len(response_text)}
+                html=html,
+                score=score,
+                convo=convo,
+                metrics={"chars": len(response_text)},
             )
 
         results = common.map_with_progress(fn, self.examples, self.num_threads)

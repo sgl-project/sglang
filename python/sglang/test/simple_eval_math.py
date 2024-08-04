@@ -13,8 +13,13 @@ import pandas
 
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
-    ANSWER_PATTERN, HTML_JINJA, check_equality,
-    Eval, EvalResult, SamplerBase, SingleEvalResult
+    ANSWER_PATTERN,
+    HTML_JINJA,
+    Eval,
+    EvalResult,
+    SamplerBase,
+    SingleEvalResult,
+    check_equality,
 )
 
 QUERY_TEMPLATE = """
@@ -27,11 +32,13 @@ Remember to put your answer on its own line after "Answer:", and you do not need
 
 
 class MathEval(Eval):
-    def __init__(self,
-                 filename: str,
-                 equality_checker: SamplerBase,
-                 num_examples: int | None,
-                 num_threads: int):
+    def __init__(
+        self,
+        filename: str,
+        equality_checker: SamplerBase,
+        num_examples: int | None,
+        num_threads: int,
+    ):
         df = pandas.read_csv(filename)
         examples = [row.to_dict() for _, row in df.iterrows()]
         if num_examples:
@@ -48,7 +55,9 @@ class MathEval(Eval):
             response_text = sampler(prompt_messages)
             match = re.search(ANSWER_PATTERN, response_text)
             extracted_answer = match.group(1) if match else None
-            score = float(check_equality(self.equality_checker, row["Answer"], extracted_answer))
+            score = float(
+                check_equality(self.equality_checker, row["Answer"], extracted_answer)
+            )
             html = common.jinja_env.from_string(HTML_JINJA).render(
                 prompt_messages=prompt_messages,
                 next_message=dict(content=response_text, role="assistant"),
