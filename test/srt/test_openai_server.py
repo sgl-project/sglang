@@ -45,7 +45,8 @@ class TestOpenAIServer(unittest.TestCase):
             num_choices = 1
 
         if parallel_sample_num:
-            # FIXME: This is wrong.
+            # FIXME: This is wrong. We should not count the prompt tokens multiple times for
+            # parallel sampling.
             num_prompt_tokens *= parallel_sample_num
 
         response = client.completions.create(
@@ -69,7 +70,8 @@ class TestOpenAIServer(unittest.TestCase):
             assert isinstance(response.choices[0].logprobs.tokens[0], str)
             assert isinstance(response.choices[0].logprobs.top_logprobs[1], dict)
             ret_num_top_logprobs = len(response.choices[0].logprobs.top_logprobs[1])
-            # FIXME: Fix this bug. Sometimes, some top_logprobs are missing in the return value. The reason is that some out_put id maps to the same output token and duplicate in the map
+            # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some out_put id maps to the same output token and duplicate in the map
+            # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
             assert ret_num_top_logprobs > 0
             if echo:
                 assert response.choices[0].logprobs.token_logprobs[0] == None
@@ -78,7 +80,9 @@ class TestOpenAIServer(unittest.TestCase):
 
         assert response.id
         assert response.created
-        assert response.usage.prompt_tokens == num_prompt_tokens, f"{response.usage.prompt_tokens} vs {num_prompt_tokens}"
+        assert (
+            response.usage.prompt_tokens == num_prompt_tokens
+        ), f"{response.usage.prompt_tokens} vs {num_prompt_tokens}"
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
@@ -111,7 +115,8 @@ class TestOpenAIServer(unittest.TestCase):
                     ret_num_top_logprobs = len(
                         response.choices[0].logprobs.top_logprobs[0]
                     )
-                    # FIXME: Fix this bug. Sometimes, some top_logprobs are missing in the return value. The reason is that some out_put id maps to the same output token and duplicate in the map
+                    # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some out_put id maps to the same output token and duplicate in the map
+                    # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
                     assert ret_num_top_logprobs > 0
 
             if first:
@@ -192,6 +197,12 @@ class TestOpenAIServer(unittest.TestCase):
                 assert isinstance(
                     response.choices[0].logprobs.content[0].top_logprobs, list
                 )
+                ret_num_top_logprobs = len(
+                    response.choices[0].logprobs.content[0].top_logprobs
+                )
+                assert (
+                    ret_num_top_logprobs == logprobs
+                ), f"{ret_num_top_logprobs} vs {logprobs}"
 
             assert isinstance(data.content, str)
             assert response.id

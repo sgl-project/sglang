@@ -403,7 +403,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
     choices = []
     echo = False
 
-    if (not isinstance(request, List)) and request.echo:
+    if (not isinstance(request, list)) and request.echo:
         # TODO: handle the case propmt is token ids
         if isinstance(request.prompt, list) and isinstance(request.prompt[0], str):
             # for the case of multiple str prompts
@@ -428,17 +428,17 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
 
     for idx, ret_item in enumerate(ret):
         text = ret_item["text"]
-        if isinstance(request, List) and request[idx].echo:
+        if isinstance(request, list) and request[idx].echo:
             echo = True
             text = request[idx].prompt + text
-        if (not isinstance(request, List)) and echo:
+        if (not isinstance(request, list)) and echo:
             prompt_index = idx // request.n
             text = prompts[prompt_index] + text
 
         logprobs = False
-        if isinstance(request, List) and request[idx].logprobs:
+        if isinstance(request, list) and request[idx].logprobs:
             logprobs = True
-        elif (not isinstance(request, List)) and request.logprobs:
+        elif (not isinstance(request, list)) and request.logprobs:
             logprobs = True
         if logprobs:
             if echo:
@@ -712,9 +712,9 @@ def v1_chat_generate_response(request, ret, to_file=False):
 
     for idx, ret_item in enumerate(ret):
         logprobs = False
-        if isinstance(request, List) and request[idx].logprobs:
+        if isinstance(request, list) and request[idx].logprobs:
             logprobs = True
-        elif (not isinstance(request, List)) and request.logprobs:
+        elif (not isinstance(request, list)) and request.logprobs:
             logprobs = True
         if logprobs:
             logprobs = to_openai_style_logprobs(
