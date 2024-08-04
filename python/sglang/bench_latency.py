@@ -28,13 +28,12 @@ I'm going to the park
 
 import argparse
 import dataclasses
-import json
 import logging
 import multiprocessing
-import os
 import time
 from typing import Tuple
 
+import jsonlines
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -309,15 +308,10 @@ def latency_test(
     result_list = []
     result_list.append(run_once(bench_args.output_len))
 
-    # Write results in jsonl
+    # Write results in jsonlines format.
     if bench_args.result_filename:
-        open_mode = "w"
-        if os.path.isfile(bench_args.result_filename):
-            open_mode = "a"
-        with open(bench_args.result_filename, open_mode) as f:
-            for ret in result_list:
-                json.dump(ret, f)
-                f.write("\n")
+        with jsonlines.open(bench_args.result_filename, "a") as f:
+            f.write_all(result_list)
 
 
 def main(server_args, bench_args):
