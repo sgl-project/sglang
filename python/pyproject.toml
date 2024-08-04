@@ -21,7 +21,8 @@ dependencies = [
 
 [project.optional-dependencies]
 srt = ["aiohttp", "fastapi", "hf_transfer", "huggingface_hub", "interegular", "jsonlines",
-       "packaging", "pillow", "psutil", "pydantic", "python-multipart",
+       "matplotlib",
+       "packaging", "pandas", "pillow", "psutil", "pydantic", "python-multipart",
        "torch", "uvicorn", "uvloop", "zmq",
        "vllm==0.5.3.post1", "outlines>=0.0.44"]
 openai = ["openai>=1.0", "tiktoken"]

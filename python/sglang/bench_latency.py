@@ -28,6 +28,7 @@ I'm going to the park
 
 import argparse
 import dataclasses
+import itertools
 import logging
 import multiprocessing
 import time
@@ -49,26 +50,42 @@ from sglang.srt.utils import suppress_other_loggers
 
 @dataclasses.dataclass
 class BenchArgs:
+    run_name: str = "before"
     batch_size: Tuple[int] = (1,)
-    input_len: int = 1024
-    output_len: int = 4
+    input_len: Tuple[int] = (1024,)
+    output_len: Tuple[int] = (4,)
     result_filename: str = ""
     correctness_test: bool = False
     # This is only used for correctness test
     cut_len: int = 4
+    # Plotting args
+    graph_sql: str = (
+        "select run_name, batch_size, prefill_throughput from results where run_name='before'"
+    )
+    graph_filename: str = "out.png"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
         parser.add_argument(
             "--batch-size", type=int, nargs="+", default=BenchArgs.batch_size
         )
-        parser.add_argument("--input-len", type=int, default=BenchArgs.input_len)
-        parser.add_argument("--output-len", type=int, default=BenchArgs.output_len)
+        parser.add_argument(
+            "--input-len", type=int, nargs="+", default=BenchArgs.input_len
+        )
+        parser.add_argument(
+            "--output-len", type=int, nargs="+", default=BenchArgs.output_len
+        )
         parser.add_argument(
             "--result-filename", type=str, default=BenchArgs.result_filename
         )
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
+        # graphing
+        parser.add_argument("--graph-sql", type=str, default=BenchArgs.graph_sql)
+        parser.add_argument(
+            "--graph-filename", type=str, default=BenchArgs.graph_filename
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -222,7 +239,7 @@ def correctness_test(
 
 @torch.inference_mode()
 def latency_test_run_once(
-    model_runner, rank_print, reqs, batch_size, input_len, output_len
+    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len
 ):
 
     # Clear the pools.
@@ -230,7 +247,7 @@ def latency_test_run_once(
     model_runner.token_to_kv_pool.clear()
 
     measurement_results = {
-        "run_name": "before",
+        "run_name": run_name,
         "batch_size": batch_size,
         "input_len": input_len,
         "output_len": output_len,
@@ -292,34 +309,37 @@ def latency_test(
     # Load the model
     model_runner, tokenizer = load_model(server_args, tp_rank)
     rank_print(
-        f"max_batch_size={model_runner.max_total_num_tokens // (bench_args.input_len + bench_args.output_len)}"
+        # TODO: better print of max batch size when sweeping.
+        f"max_batch_size={model_runner.max_total_num_tokens // (bench_args.input_len[-1] + bench_args.output_len[-1])}"
     )
 
-    # To make this PR easier to review, for now, only do the first element in batch_size tuple.
-    bench_args.batch_size = bench_args.batch_size[0]
-
-    # Prepare inputs
+    # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size, bench_args.input_len
+        bench_args.batch_size[0], bench_args.input_len[0]
     )
 
     # Warm up
     latency_test_run_once(
-        model_runner, rank_print, reqs, bench_args.batch_size, bench_args.input_len, 4
+        bench_args.run_name,
+        model_runner,
+        rank_print,
+        reqs,
+        bench_args.batch_size[0],
+        bench_args.input_len[0],
+        4,  # shorter decoding to speed up the warmup
     )
 
-    # Run again
+    # Run the sweep
     result_list = []
-    result_list.append(
-        latency_test_run_once(
-            model_runner,
-            rank_print,
-            reqs,
-            bench_args.batch_size,
-            bench_args.input_len,
-            bench_args.output_len,
+    for bs, il, ol in itertools.product(
+        bench_args.batch_size, bench_args.input_len, bench_args.output_len
+    ):
+        req = prepare_synthetic_inputs_for_latency_test(bs, il)
+        result_list.append(
+            latency_test_run_once(
+                bench_args.run_name, model_runner, rank_print, reqs, bs, il, ol
+            )
         )
-    )
 
     # Write results in jsonlines format.
     if bench_args.result_filename:
