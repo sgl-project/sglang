@@ -13,7 +13,7 @@ class TestAccuracy(unittest.TestCase):
         cls.model = MODEL_NAME_FOR_TEST
         cls.base_url = f"http://localhost:30000"
         cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=300, other_args=["--torch-compile"]
+            cls.model, cls.base_url, timeout=300, other_args=["--enable-torch-compile"]
         )
 
     @classmethod

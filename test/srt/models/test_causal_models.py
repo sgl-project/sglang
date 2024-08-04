@@ -18,6 +18,7 @@ import torch
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 
 MODELS = [
+    # (model_name, tp_size)
     ("meta-llama/Meta-Llama-3.1-8B-Instruct", 1),
     # ("meta-llama/Meta-Llama-3.1-8B-Instruct", 2),
 ]

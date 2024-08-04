@@ -453,7 +453,7 @@ def run_unittest_files(files: list[str], timeout_per_file: float):
     for filename in files:
 
         def func():
-            print(f"Run {filename}")
+            print(f"\n\nRun {filename}\n\n")
             ret = unittest.main(module=None, argv=["", "-vb"] + [filename])
 
         p = multiprocessing.Process(target=func)
