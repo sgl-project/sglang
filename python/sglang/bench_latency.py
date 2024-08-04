@@ -415,7 +415,9 @@ def plot_latency_test(
 
     # if in kitty, just dump it to the terminal
     if os.environ["TERM"] == "xterm-kitty":
-        os.system("kitty icat --use-window-size 1,1,600,600 out.png")
+        os.system(
+            f"kitty icat --use-window-size 1,1,600,600 {bench_args.graph_filename}"
+        )
 
 
 def main(server_args, bench_args):
