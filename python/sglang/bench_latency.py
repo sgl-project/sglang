@@ -44,8 +44,6 @@ import sqlite3
 import time
 from typing import Tuple
 
-import jsonlines
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -357,6 +355,8 @@ def latency_test(
 
     # Write results in jsonlines format on rank 0.
     if tp_rank == 0 and bench_args.result_filename:
+        import jsonlines
+
         with jsonlines.open(bench_args.result_filename, "a") as f:
             f.write_all(result_list)
 
@@ -401,6 +401,8 @@ def plot_latency_test(
     conn.close()
 
     # plot it and save to a file
+    import matplotlib.pyplot as plt
+
     assert (
         len(df.columns) == 3
     ), f"The sql should have fetched <series, x, y> columns, not {df.columns}"
