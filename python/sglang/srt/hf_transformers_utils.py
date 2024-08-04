@@ -19,7 +19,7 @@ import functools
 import json
 import os
 import warnings
-from typing import AbstractSet, Collection, Dict, Literal, Optional, Type, Union
+from typing import AbstractSet, Collection, Dict, List, Literal, Optional, Type, Union
 
 from huggingface_hub import snapshot_download
 from transformers import (
@@ -259,7 +259,7 @@ class TiktokenTokenizer:
                 Literal["all"], AbstractSet[str]
             ] = set(),  # noqa: B006
             disallowed_special: Union[Literal["all"], Collection[str]] = "all",
-        ) -> list[int]:
+        ) -> List[int]:
             if isinstance(allowed_special, set):
                 allowed_special |= self._default_allowed_special
             return tiktoken.Encoding.encode(

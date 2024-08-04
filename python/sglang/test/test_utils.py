@@ -457,7 +457,7 @@ def run_with_timeout(
     return ret_value[0]
 
 
-def run_unittest_files(files: list[str], timeout_per_file: float):
+def run_unittest_files(files: List[str], timeout_per_file: float):
     tic = time.time()
     success = True
 
