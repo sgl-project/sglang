@@ -10,7 +10,6 @@ import time
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
-    download_dataset,
     make_report,
     set_ulimit,
 )
@@ -26,18 +25,10 @@ def run_eval(args):
 
     if args.eval_name == "mmlu":
         from sglang.test.simple_eval_mmlu import MMLUEval
-
-        dataset_path = "mmlu.csv"
-
-        if not os.path.exists(dataset_path):
-            download_dataset(
-                dataset_path,
-                "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv",
-            )
-        eval_obj = MMLUEval(dataset_path, args.num_examples, args.num_threads)
+        filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        eval_obj = MMLUEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
-
         eval_obj = HumanEval(args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
