@@ -539,26 +539,6 @@ class CustomCacheManager(FileCacheManager):
                 raise RuntimeError("Could not create or locate cache dir")
 
 
-API_KEY_HEADER_NAME = "X-API-Key"
-
-
-class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, api_key: str):
-        super().__init__(app)
-        self.api_key = api_key
-
-    async def dispatch(self, request, call_next):
-        # extract API key from the request headers
-        api_key_header = request.headers.get(API_KEY_HEADER_NAME)
-        if not api_key_header or api_key_header != self.api_key:
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "Invalid API Key"},
-            )
-        response = await call_next(request)
-        return response
-
-
 def get_ip_address(ifname):
     """
     Get the IP address of a network interface.
@@ -642,6 +622,19 @@ def receive_addrs(model_port_args, server_args):
     dist.destroy_process_group()
 
 
+def set_torch_compile_config():
+    # The following configurations are for torch compile optimizations
+    import torch._dynamo.config
+    import torch._inductor.config
+
+    torch._inductor.config.coordinate_descent_tuning = True
+    torch._inductor.config.triton.unique_kernel_names = True
+    torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
+
+    # FIXME: tmp workaround
+    torch._dynamo.config.accumulated_cache_size_limit = 256
+
+
 def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
@@ -700,3 +693,15 @@ def monkey_patch_vllm_qvk_linear_loader():
         origin_weight_loader(self, param, loaded_weight, loaded_shard_id)
 
     setattr(QKVParallelLinear, "weight_loader", weight_loader_srt)
+
+
+def add_api_key_middleware(app, api_key):
+    @app.middleware("http")
+    async def authentication(request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        if request.url.path.startswith("/health"):
+            return await call_next(request)
+        if request.headers.get("Authorization") != "Bearer " + api_key:
+            return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+        return await call_next(request)
