@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   unit-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: self-hosted
 
     steps:
