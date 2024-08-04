@@ -4,10 +4,9 @@ import unittest
 import openai
 from transformers import AutoTokenizer
 
+from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import MODEL_NAME_FOR_TEST, popen_launch_server
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_FOR_TEST)
 
 
 class TestOpenAIServer(unittest.TestCase):
@@ -19,27 +18,35 @@ class TestOpenAIServer(unittest.TestCase):
         cls.model = MODEL_NAME_FOR_TEST
         cls.base_url = f"http://localhost:{port}/v1"
         cls.process = popen_launch_server(cls.model, port, timeout=300)
+        cls.tokenizer = get_tokenizer(MODEL_NAME_FOR_TEST)
 
     @classmethod
     def tearDownClass(cls):
         kill_child_process(cls.process.pid)
 
     def run_completion(
-        self, echo, logprobs, use_list_input, parrallel_sample_num, token_input
+        self, echo, logprobs, use_list_input, parallel_sample_num, token_input
     ):
         client = openai.Client(api_key="EMPTY", base_url=self.base_url)
         prompt = "The capital of France is"
         if token_input:
-            prompt_input = tokenizer.encode(prompt, add_special_tokens=False)
+            prompt_input = self.tokenizer.encode(prompt)
+            num_prompt_tokens = len(prompt_input)
         else:
             prompt_input = prompt
+            num_prompt_tokens = len(self.tokenizer.encode(prompt))
 
         if use_list_input:
             prompt_arg = [prompt_input, prompt_input]
             num_choices = len(prompt_arg)
+            num_prompt_tokens *= 2
         else:
             prompt_arg = prompt_input
             num_choices = 1
+
+        if parallel_sample_num:
+            # FIXME: This is wrong.
+            num_prompt_tokens *= parallel_sample_num
 
         response = client.completions.create(
             model=self.model,
@@ -48,10 +55,10 @@ class TestOpenAIServer(unittest.TestCase):
             max_tokens=32,
             echo=echo,
             logprobs=logprobs,
-            n=parrallel_sample_num,
+            n=parallel_sample_num,
         )
 
-        assert len(response.choices) == num_choices * parrallel_sample_num
+        assert len(response.choices) == num_choices * parallel_sample_num
 
         if echo:
             text = response.choices[0].text
@@ -68,9 +75,10 @@ class TestOpenAIServer(unittest.TestCase):
                 assert response.choices[0].logprobs.token_logprobs[0] == None
             else:
                 assert response.choices[0].logprobs.token_logprobs[0] != None
+
         assert response.id
         assert response.created
-        assert response.usage.prompt_tokens > 0
+        assert response.usage.prompt_tokens == num_prompt_tokens, f"{response.usage.prompt_tokens} vs {num_prompt_tokens}"
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
@@ -78,7 +86,7 @@ class TestOpenAIServer(unittest.TestCase):
         client = openai.Client(api_key="EMPTY", base_url=self.base_url)
         prompt = "The capital of France is"
         if token_input:
-            prompt_arg = tokenizer.encode(prompt, add_special_tokens=False)
+            prompt_arg = self.tokenizer.encode(prompt)
         else:
             prompt_arg = prompt
         generator = client.completions.create(
@@ -255,5 +263,5 @@ if __name__ == "__main__":
 
     # t = TestOpenAIServer()
     # t.setUpClass()
-    # t.test_chat_completion_stream()
+    # t.test_completion()
     # t.tearDownClass()

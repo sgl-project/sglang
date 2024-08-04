@@ -153,8 +153,9 @@ class TokenizerManager:
     async def _handle_single_request(
         self, obj, request, index=None, is_cache_for_prefill=False
     ):
-        not_use_index = not (index is not None)
-        if not is_cache_for_prefill:
+        if not is_cache_for_prefill:  # The normal case with a single prompt
+            not_use_index = index is None
+
             rid = obj.rid if not_use_index else obj.rid[index]
             input_text = obj.text if not_use_index else obj.text[index]
             input_ids = (
@@ -182,7 +183,7 @@ class TokenizerManager:
             top_logprobs_num = (
                 obj.top_logprobs_num if not_use_index else obj.top_logprobs_num[index]
             )
-        else:
+        else:  # A prefill request to cache the common prompt for parallel sampling
             if obj.text is not None:
                 if isinstance(obj.text, list):
                     input_text = obj.text[index]
@@ -196,12 +197,13 @@ class TokenizerManager:
                 if isinstance(obj.input_ids, list) and isinstance(
                     obj.input_ids[0], list
                 ):
-                    # when obj["input_ids"] is list[list[int]]
+                    # when obj["input_ids"] is List[List[int]]
                     input_ids = obj.input_ids[index]
                     rid = obj.rid[index]
                 else:
                     input_ids = obj.input_ids
                     rid = obj.rid[0]
+
             sampling_params = SamplingParams(**obj.sampling_params[0])
             sampling_params.max_new_tokens = 0
             pixel_values, image_hash, image_size = await self._get_pixel_values(
@@ -252,11 +254,11 @@ class TokenizerManager:
                 ):
                     if input_id_result is not None:
                         input_id_result.append(input_id)
-                    pass
             if input_id_result is not None and len(input_id_result) > 1:
                 obj.input_ids = input_id_result
             elif input_id_result is not None:
                 obj.input_ids = input_id_result[0]
+
         # First send out all requests
         for i in range(batch_size):
             for j in range(parallel_sample_num):

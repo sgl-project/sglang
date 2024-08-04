@@ -341,6 +341,7 @@ def v1_generate_request(all_requests):
     return_logprobs = []
     top_logprobs_nums = []
     first_prompt_type = type(all_requests[0].prompt)
+
     for request in all_requests:
         prompt = request.prompt
         assert (
@@ -366,7 +367,7 @@ def v1_generate_request(all_requests):
         )
         if len(all_requests) > 1 and request.n > 1:
             raise ValueError(
-                "Batch operation is not supported for completions from files"
+                "Parallel sampling is not supported for completions from files"
             )
 
     if len(all_requests) == 1:
@@ -379,10 +380,11 @@ def v1_generate_request(all_requests):
         else:
             prompt_kwargs = {"input_ids": prompt}
     else:
-        if isinstance(prompts[0], str):
+        if isinstance(prompts[0], str) or isinstance(propmt[0][0], str):
             prompt_kwargs = {"text": prompts}
         else:
             prompt_kwargs = {"input_ids": prompts}
+
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
         sampling_params=sampling_params_list,
@@ -391,6 +393,7 @@ def v1_generate_request(all_requests):
         return_text_in_logprobs=True,
         stream=all_requests[0].stream,
     )
+
     if len(all_requests) == 1:
         return adapted_request, all_requests[0]
     return adapted_request, all_requests
@@ -497,15 +500,16 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
             responses.append(response)
         return responses
     else:
+        prompt_tokens = sum(item["meta_info"]["prompt_tokens"] for item in ret)
         completion_tokens = sum(item["meta_info"]["completion_tokens"] for item in ret)
         response = CompletionResponse(
             id=ret[0]["meta_info"]["id"],
             model=request.model,
             choices=choices,
             usage=UsageInfo(
-                prompt_tokens=ret[0]["meta_info"]["prompt_tokens"],
+                prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                total_tokens=ret[0]["meta_info"]["prompt_tokens"] + completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
             ),
         )
     return response
