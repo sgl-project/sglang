@@ -129,7 +129,6 @@ class PrefillAdder:
     def _prefill_one_req(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
-        # If trunc is True, there is no output in this round.
         self.rem_total_tokens -= extend_input_len + max_new_tokens
         self.rem_input_tokens -= extend_input_len
         if self.rem_chunk_tokens is not None:
@@ -185,6 +184,7 @@ class PrefillAdder:
                 or input_tokens <= self.rem_chunk_tokens
                 or (req.return_logprob and req.normalized_prompt_logprob is None)
             ):
+                # Non-chunked prefill
                 self.can_run_list.append(req)
                 self.tree_cache.inc_lock_ref(req.last_node)
                 self._prefill_one_req(

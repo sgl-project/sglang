@@ -200,7 +200,6 @@ class ModelTpServer:
         )
         self.new_token_ratio = self.min_new_token_ratio
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
-        self.new_token_ratio_recovery = global_config.new_token_ratio_recovery
 
     def exposed_step(self, recv_reqs):
         try:
@@ -354,12 +353,11 @@ class ModelTpServer:
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
-        # TODO(lsyin): organize this function
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
         if running_bs >= self.max_running_requests:
-            return
+            return None
 
         # Compute matched prefix length
         for req in self.waiting_queue:
@@ -384,7 +382,7 @@ class ModelTpServer:
         if self.running_batch is not None:
             adder.remove_running_tokens(self.running_batch, self.new_token_ratio)
 
-        take_inflight = self.current_inflight_req is not None
+        has_inflight = self.current_inflight_req is not None
         if self.current_inflight_req is not None:
             self.current_inflight_req = adder.add_inflight_req(
                 self.current_inflight_req
@@ -418,7 +416,7 @@ class ModelTpServer:
                 f"#cached-token: {adder.log_hit_tokens}, "
                 f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
                 f"#running-req: {running_bs}, "
-                f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + take_inflight}"
+                f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
             )
 
         # Return the new batch
