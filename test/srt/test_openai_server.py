@@ -19,6 +19,7 @@ class TestOpenAIServer(unittest.TestCase):
             cls.model, cls.base_url, timeout=300, api_key=cls.api_key
         )
         cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(MODEL_NAME_FOR_TEST)
 
     @classmethod
     def tearDownClass(cls):
