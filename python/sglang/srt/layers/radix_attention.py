@@ -33,7 +33,7 @@ class RadixAttention(nn.Module):
     def __init__(
         self,
         num_heads: int,
-        qk_head_dim: int,
+        head_dim: int,
         scaling: float,
         num_kv_heads: int,
         layer_id: int,
@@ -44,14 +44,15 @@ class RadixAttention(nn.Module):
         self.tp_q_head_num = num_heads
         self.tp_k_head_num = num_kv_heads
         self.tp_v_head_num = num_kv_heads
-        self.qk_head_dim = qk_head_dim
-        self.v_head_dim = v_head_dim if v_head_dim != -1 else qk_head_dim
+        self.head_dim = head_dim
+        self.qk_head_dim = head_dim
+        self.v_head_dim = v_head_dim if v_head_dim != -1 else head_dim
         self.scaling = scaling
         self.layer_id = layer_id
 
         if (
             not global_server_args_dict.get("disable_flashinfer", False)
-            and qk_head_dim == v_head_dim
+            and self.qk_head_dim == self.v_head_dim
         ):
             self.extend_forward = self.extend_forward_flashinfer
             self.decode_forward = self.decode_forward_flashinfer
