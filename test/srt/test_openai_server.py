@@ -2,7 +2,6 @@ import json
 import unittest
 
 import openai
-from transformers import AutoTokenizer
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_child_process
