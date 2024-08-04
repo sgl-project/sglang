@@ -398,6 +398,10 @@ class ModelTpServer:
                 break
 
         can_run_list = adder.can_run_list
+        if adder.new_inflight_req is not None:
+            assert self.current_inflight_req is None
+            self.current_inflight_req = adder.new_inflight_req
+
         if len(can_run_list) == 0:
             return None
 
