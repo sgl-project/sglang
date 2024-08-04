@@ -306,16 +306,18 @@ def latency_test(
     clear()
 
     # Run again
-    ret = []
-    ret.append(run_once(bench_args.output_len))
+    result_list = []
+    result_list.append(run_once(bench_args.output_len))
 
-    # Write results
+    # Write results in jsonl
     if bench_args.result_filename:
-        data = []
+        open_mode = "w"
         if os.path.isfile(bench_args.result_filename):
-            data = json.loads(open(bench_args.result_filename, "r").read())
-        data += ret
-        open(bench_args.result_filename, "w").write(json.dumps(data, indent=2))
+            open_mode = "a"
+        with open(bench_args.result_filename, open_mode) as f:
+            for ret in result_list:
+                json.dump(ret, f)
+                f.write("\n")
 
 
 def main(server_args, bench_args):
