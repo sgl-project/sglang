@@ -7,7 +7,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
-from typing import Any
+from typing import Any, Dict, List, Tuple
 
 import httpx
 import jinja2
@@ -24,8 +24,8 @@ OPENAI_SYSTEM_MESSAGE_CHATGPT = (
 )
 
 
-Message = dict[str, Any]  # keys role, content
-MessageList = list[Message]
+Message = Dict[str, Any]  # keys role, content
+MessageList = List[Message]
 
 
 class SamplerBase:
@@ -45,9 +45,9 @@ class EvalResult:
     """
 
     score: float | None  # top-line metric
-    metrics: dict[str, float] | None  # other metrics
-    htmls: list[str]  # strings of valid HTML
-    convos: list[MessageList]  # sampled conversations
+    metrics: Dict[str, float] | None  # other metrics
+    htmls: List[str]  # strings of valid HTML
+    convos: List[MessageList]  # sampled conversations
 
 
 @dataclass
@@ -57,7 +57,7 @@ class SingleEvalResult:
     """
 
     score: float | None
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: Dict[str, float] = field(default_factory=dict)
     html: str | None = None
     convo: MessageList | None = None  # sampled conversation
 
@@ -270,9 +270,9 @@ def _compute_stat(values: list, stat: str):
 
 
 def aggregate_results(
-    single_eval_results: list[SingleEvalResult],
-    default_stats: tuple[str] = ("mean", "std"),
-    name2stats: dict[str, tuple[str]] | None = None,
+    single_eval_results: List[SingleEvalResult],
+    default_stats: Tuple[str] = ("mean", "std"),
+    name2stats: Dict[str, Tuple[str]] | None = None,
 ) -> EvalResult:
     """
     Aggregate results from multiple evaluations into a single EvalResult.
@@ -302,7 +302,7 @@ def aggregate_results(
     )
 
 
-def map_with_progress(f: callable, xs: list[Any], num_threads: int):
+def map_with_progress(f: callable, xs: List[Any], num_threads: int):
     """
     Apply f to each element of xs, using a ThreadPool, and show progress.
     """
@@ -422,7 +422,7 @@ def make_report(eval_result: EvalResult) -> str:
     )
 
 
-def make_report_from_example_htmls(htmls: list[str]):
+def make_report_from_example_htmls(htmls: List[str]):
     """
     Create a standalone HTML report from a list of example htmls
     """
