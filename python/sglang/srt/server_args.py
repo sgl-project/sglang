@@ -80,6 +80,7 @@ class ServerArgs:
     disable_disk_cache: bool = False
     enable_torch_compile: bool = False
     enable_p2p_check: bool = False
+    enable_mla: bool = False
     attention_reduce_in_fp32: bool = False
     efficient_weight_load: bool = False
 
@@ -392,6 +393,11 @@ class ServerArgs:
             "--enable-p2p-check",
             action="store_true",
             help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
+        )
+        parser.add_argument(
+            "--enable-mla",
+            action="store_true",
+            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2",
         )
         parser.add_argument(
             "--attention-reduce-in-fp32",
