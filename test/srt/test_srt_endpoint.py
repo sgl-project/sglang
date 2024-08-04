@@ -12,11 +12,9 @@ class TestSRTEndpoint(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        port = 30000
-
         cls.model = MODEL_NAME_FOR_TEST
-        cls.base_url = f"http://localhost:{port}"
-        cls.process = popen_launch_server(cls.model, port, timeout=300)
+        cls.base_url = f"http://localhost:{8157}"
+        cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300)
 
     @classmethod
     def tearDownClass(cls):

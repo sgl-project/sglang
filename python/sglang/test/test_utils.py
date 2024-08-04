@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import requests
@@ -457,7 +457,7 @@ def run_with_timeout(
     return ret_value[0]
 
 
-def run_unittest_files(files: list[str], timeout_per_file: float):
+def run_unittest_files(files: List[str], timeout_per_file: float):
     tic = time.time()
     success = True
 

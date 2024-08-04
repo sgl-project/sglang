@@ -12,7 +12,7 @@ class TestOpenAIServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = MODEL_NAME_FOR_TEST
-        cls.base_url = f"http://localhost:30000"
+        cls.base_url = f"http://localhost:8157"
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model, cls.base_url, timeout=300, api_key=cls.api_key
