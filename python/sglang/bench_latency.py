@@ -253,6 +253,12 @@ def correctness_test(
 def latency_test_run_once(
     run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len
 ):
+    max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
+    if batch_size > max_batch_size:
+        rank_print(
+            f"skipping ({batch_size}, {input_len}, {output_len}) due to max batch size limit"
+        )
+        return
 
     # Clear the pools.
     model_runner.req_to_token_pool.clear()
@@ -320,10 +326,6 @@ def latency_test(
 
     # Load the model
     model_runner, tokenizer = load_model(server_args, tp_rank)
-    rank_print(
-        # TODO: better print of max batch size when sweeping.
-        f"max_batch_size={model_runner.max_total_num_tokens // (bench_args.input_len[-1] + bench_args.output_len[-1])}"
-    )
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
@@ -347,11 +349,11 @@ def latency_test(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
         req = prepare_synthetic_inputs_for_latency_test(bs, il)
-        result_list.append(
-            latency_test_run_once(
-                bench_args.run_name, model_runner, rank_print, reqs, bs, il, ol
-            )
+        ret = latency_test_run_once(
+            bench_args.run_name, model_runner, rank_print, reqs, bs, il, ol
         )
+        if ret is not None:
+            result_list.append(ret)
 
     # Write results in jsonlines format on rank 0.
     if tp_rank == 0 and bench_args.result_filename:
