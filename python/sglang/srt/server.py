@@ -67,13 +67,13 @@ from sglang.srt.openai_api.adapter import (
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    add_api_key_middleware,
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
     kill_child_process,
     maybe_set_triton_cache_manager,
-	add_api_key_middleware,
-	set_torch_compile_config,
+    set_torch_compile_config,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
