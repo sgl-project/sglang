@@ -12,7 +12,12 @@ class TestAccuracy(unittest.TestCase):
     def setUpClass(cls):
         cls.model = MODEL_NAME_FOR_TEST
         cls.base_url = f"http://localhost:30000"
-        cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300)
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=300,
+            other_args=["--chunked-prefill-size", "32"],
+        )
 
     @classmethod
     def tearDownClass(cls):
