@@ -422,7 +422,7 @@ def popen_launch_server(
         try:
             headers = {
                 "Content-Type": "application/json; charset=utf-8",
-                "Authorization": f"Bearer {api_key}"
+                "Authorization": f"Bearer {api_key}",
             }
             response = requests.get(f"{base_url}/v1/models", headers=headers)
             if response.status_code == 200:
