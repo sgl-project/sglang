@@ -456,6 +456,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_input[..., self.kv_lora_rank :] = k_pe
 
         attn_output = self.attn(q_input, k_input, v_input, input_metadata)
+        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         attn_bmm_output = attn_output.new_empty(
             q_len, self.num_local_heads, self.v_head_dim
         )

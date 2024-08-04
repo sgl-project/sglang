@@ -63,13 +63,17 @@ class RadixAttention(nn.Module):
         self.logit_cap = logit_cap if logit_cap is not None and logit_cap > 0 else 0
 
     def extend_forward_triton(self, q, k, v, input_metadata: InputMetadata):
-        o = q.new_empty((q.shape[0], self.tp_q_head_num, self.v_head_dim))
+        if self.qk_head_dim != self.v_head_dim:
+            o = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+        else:
+            o = torch.empty_like(q)
+
         self.store_kv_cache(k, v, input_metadata)
         extend_attention_fwd(
             q.view(-1, self.tp_q_head_num, self.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
-            o,
+            o.view(-1, self.tp_q_head_num, self.v_head_dim),
             input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id),
             input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id),
             input_metadata.req_to_token_pool.req_to_token,
@@ -88,14 +92,17 @@ class RadixAttention(nn.Module):
         return o
 
     def decode_forward_triton(self, q, k, v, input_metadata: InputMetadata):
-        o = q.new_empty((q.shape[0], self.tp_q_head_num, self.v_head_dim))
+        if self.qk_head_dim != self.v_head_dim:
+            o = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+        else:
+            o = torch.empty_like(q)
         self.store_kv_cache(k, v, input_metadata)
 
         token_attention_fwd(
             q.view(-1, self.tp_q_head_num, self.qk_head_dim),
             input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id),
             input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id),
-            o,
+            o.view(-1, self.tp_q_head_num, self.v_head_dim),
             input_metadata.req_to_token_pool.req_to_token,
             input_metadata.req_pool_indices,
             input_metadata.triton_start_loc,
