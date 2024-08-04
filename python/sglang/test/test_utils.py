@@ -390,7 +390,12 @@ def get_call_select(args: argparse.Namespace):
     return func
 
 
-def popen_launch_server(model: str, port: int, timeout: float, *args):
+def popen_launch_server(
+    model: str, base_url: str, timeout: float, other_args: tuple = ()
+):
+    _, host, port = base_url.split(":")
+    host = host[2:]
+
     command = [
         "python3",
         "-m",
@@ -398,18 +403,17 @@ def popen_launch_server(model: str, port: int, timeout: float, *args):
         "--model-path",
         model,
         "--host",
-        "localhost",
+        host,
         "--port",
-        str(port),
-        *args,
+        port,
+        *other_args,
     ]
     process = subprocess.Popen(command, stdout=None, stderr=None)
-    base_url = f"http://localhost:{port}/v1"
 
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            response = requests.get(f"{base_url}/models")
+            response = requests.get(f"{base_url}/v1/models")
             if response.status_code == 200:
                 return process
         except requests.RequestException:
