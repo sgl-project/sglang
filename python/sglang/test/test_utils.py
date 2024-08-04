@@ -2,8 +2,8 @@
 
 import argparse
 import asyncio
-import subprocess
 import multiprocessing
+import subprocess
 import threading
 import time
 import unittest
@@ -418,8 +418,12 @@ def popen_launch_server(model: str, port: int, timeout: float, *args):
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
-def run_with_timeout(func: Callable, args: tuple = (), kwargs: Optional[dict] = None,
-                     timeout: float = None):
+def run_with_timeout(
+    func: Callable,
+    args: tuple = (),
+    kwargs: Optional[dict] = None,
+    timeout: float = None,
+):
     """Run a function with timeout."""
     ret_value = []
 
@@ -462,7 +466,9 @@ def run_unittest_files(files: list[str], timeout_per_file: float):
         except TimeoutError:
             p.terminate()
             time.sleep(5)
-            print("\nTimeout after {timeout_per_file} seconds when running {filename}\n")
+            print(
+                "\nTimeout after {timeout_per_file} seconds when running {filename}\n"
+            )
             return False
 
     if success:
