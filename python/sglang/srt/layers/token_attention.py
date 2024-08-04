@@ -54,6 +54,7 @@ def _fwd_kernel_stage1(
     att_stride_h,
     kv_group_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     logit_cap: tl.constexpr,
 ):
@@ -72,6 +73,10 @@ def _fwd_kernel_stage1(
     cur_batch_end_index = cur_batch_seq_len
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        off_qpe = cur_batch * stride_qbs + cur_head * stride_qh + offs_dpe
 
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
@@ -97,6 +102,19 @@ def _fwd_kernel_stage1(
             other=0.0,
         ).to(REDUCE_TRITON_TYPE)
         att_value = tl.sum(q[None, :] * k, 1)
+        if BLOCK_DPE > 0:
+            qpe = tl.load(Q + off_qpe + start_mark).to(REDUCE_TRITON_TYPE)
+            offs_buf_kpe = (
+                k_loc[:, None] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_dpe[None, :]
+            )
+            kpe = tl.load(
+                K_Buffer + offs_buf_kpe,
+                mask=offs_n_new[:, None] < cur_batch_end_index,
+                other=0.0,
+            ).to(REDUCE_TRITON_TYPE)
+            att_value += tl.sum(qpe[None, :] * kpe, 1)
         att_value *= sm_scale
 
         if logit_cap > 0:
@@ -192,7 +210,14 @@ def _token_att_m_fwd(
     # shape constraints
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
     assert Lq == Lk
-    assert Lk in {16, 32, 64, 128, 256}
+    assert Lk in {16, 32, 64, 128, 256, 576}
+
+    if Lk == 576:
+        BLOCK_DMODEL = 512
+        BLOCK_DPE = 64
+    else:
+        BLOCK_DMODEL = Lk
+        BLOCK_DPE = 0
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
 
@@ -220,7 +245,8 @@ def _token_att_m_fwd(
         k_buffer.stride(1),
         att_out.stride(0),
         kv_group_num=kv_group_num,
-        BLOCK_DMODEL=Lk,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DPE=BLOCK_DPE,
         BLOCK_N=BLOCK,
         logit_cap=logit_cap,
         num_warps=num_warps,
