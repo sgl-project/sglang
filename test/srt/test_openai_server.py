@@ -13,12 +13,13 @@ class TestOpenAIServer(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        port = 30000
-
         cls.model = MODEL_NAME_FOR_TEST
-        cls.base_url = f"http://localhost:{port}/v1"
-        cls.process = popen_launch_server(cls.model, port, timeout=300)
-        cls.tokenizer = get_tokenizer(MODEL_NAME_FOR_TEST)
+        cls.base_url = f"http://localhost:8157"
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model, cls.base_url, timeout=300, api_key=cls.api_key
+        )
+        cls.base_url += "/v1"
 
     @classmethod
     def tearDownClass(cls):
@@ -27,7 +28,7 @@ class TestOpenAIServer(unittest.TestCase):
     def run_completion(
         self, echo, logprobs, use_list_input, parallel_sample_num, token_input
     ):
-        client = openai.Client(api_key="EMPTY", base_url=self.base_url)
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
         if token_input:
             prompt_input = self.tokenizer.encode(prompt)
@@ -87,7 +88,7 @@ class TestOpenAIServer(unittest.TestCase):
         assert response.usage.total_tokens > 0
 
     def run_completion_stream(self, echo, logprobs, token_input):
-        client = openai.Client(api_key="EMPTY", base_url=self.base_url)
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
         if token_input:
             prompt_arg = self.tokenizer.encode(prompt)
@@ -133,7 +134,7 @@ class TestOpenAIServer(unittest.TestCase):
             assert response.usage.total_tokens > 0
 
     def run_chat_completion(self, logprobs, parallel_sample_num):
-        client = openai.Client(api_key="EMPTY", base_url=self.base_url)
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response = client.chat.completions.create(
             model=self.model,
             messages=[
@@ -167,7 +168,7 @@ class TestOpenAIServer(unittest.TestCase):
         assert response.usage.total_tokens > 0
 
     def run_chat_completion_stream(self, logprobs):
-        client = openai.Client(api_key="EMPTY", base_url=self.base_url)
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         generator = client.chat.completions.create(
             model=self.model,
             messages=[
@@ -239,7 +240,7 @@ class TestOpenAIServer(unittest.TestCase):
             self.run_chat_completion_stream(logprobs)
 
     def test_regex(self):
-        client = openai.Client(api_key="EMPTY", base_url=self.base_url)
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         regex = (
             r"""\{\n"""

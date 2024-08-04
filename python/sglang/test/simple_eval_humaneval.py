@@ -14,7 +14,7 @@ import re
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
-from typing import Any, Tuple
+from typing import Any, Dict, List, Tuple
 
 import blobfile as bf
 import tqdm
@@ -38,8 +38,8 @@ from sglang.test.simple_eval_common import (
 
 
 def evaluate_functional_correctness(
-    sample: dict[str, str],
-    completions: list[str],
+    sample: Dict[str, str],
+    completions: List[str],
     n_workers: int = 4,
     timeout: float = 3.0,
 ):
@@ -70,7 +70,7 @@ class HumanEval(Eval):
         num_examples: int | None,
         num_threads: int,
         num_samples_per_task: int = 5,
-        ks_passes: list[int] = [1, 2, 5],
+        ks_passes: List[int] = [1, 2, 5],
         timeout: int = 120,
     ):
         self.seed = 0
@@ -97,7 +97,7 @@ class HumanEval(Eval):
             ]  # remove signature
             return extracted_answer
 
-        def fn(sample: dict[str, str]):
+        def fn(sample: Dict[str, str]):
             prompt_messages = [
                 sampler._pack_message(
                     role="user", content=instruction + sample["prompt"]

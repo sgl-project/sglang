@@ -13,11 +13,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from enum import IntEnum, auto
 from typing import Optional
 
 from transformers import PretrainedConfig
 
 from sglang.srt.hf_transformers_utils import get_config, get_context_length
+
+
+class AttentionArch(IntEnum):
+    MLA = auto()
+    MHA = auto()
 
 
 class ModelConfig:
@@ -55,6 +61,11 @@ class ModelConfig:
         # FIXME: temporary special judge for deepseek v2 MLA architecture
         if "DeepseekV2ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 256
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+        else:
+            self.attention_arch = AttentionArch.MHA
 
         self.num_attention_heads = self.hf_config.num_attention_heads
         self.num_key_value_heads = getattr(self.hf_config, "num_key_value_heads", None)

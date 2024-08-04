@@ -10,7 +10,7 @@ When the server is running at full load, look for the following in the log:
 
 ### Tune Your Request Submission Speed
 `#queue-req` indicates the number of requests in the queue. If you frequently see `#queue-req == 0`, it suggests you are bottlenecked by the request submission speed.
-A healthy range for `#queue-req` is `100 - 3000`.
+A healthy range for `#queue-req` is `100 - 1000`.
 
 ### Tune `--schedule-conservativeness`
 `token usage` indicates the KV cache memory utilization of the server. `token usage > 0.9` means good utilization.
