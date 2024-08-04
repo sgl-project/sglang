@@ -420,7 +420,11 @@ def popen_launch_server(
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            response = requests.get(f"{base_url}/v1/models")
+            headers = {
+                "Content-Type": "application/json; charset=utf-8",
+                "Authorization": f"Bearer {api_key}"
+            }
+            response = requests.get(f"{base_url}/v1/models", headers=headers)
             if response.status_code == 200:
                 return process
         except requests.RequestException:
