@@ -616,15 +616,7 @@ class ScheduleBatch:
                     req.vid += 1
 
                     # insert the old request into tree_cache
-                    self.tree_cache.cache_req(
-                        rid=req.rid,
-                        token_ids=cur_all_ids,
-                        last_uncached_pos=len(req.prefix_indices),
-                        req_pool_idx=req.req_pool_idx,
-                    )
-
-                    # unlock the last node
-                    self.tree_cache.dec_lock_ref(req.last_node)
+                    self.tree_cache.cache_finished_req(req, token_ids=cur_all_ids)
 
                     # re-applying image padding
                     if req.pixel_values is not None:
