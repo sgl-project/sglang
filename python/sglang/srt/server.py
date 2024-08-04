@@ -294,7 +294,7 @@ def launch_server(
     assert proc_controller.is_alive() and proc_detoken.is_alive()
 
     # Add api key authorization
-    if server_args.api_key and server_args.api_key != "":
+    if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)
 
     # Send a warmup request

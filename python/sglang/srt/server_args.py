@@ -61,7 +61,7 @@ class ServerArgs:
     show_time_cost: bool = False
 
     # Other
-    api_key: str = ""
+    api_key: Optional[str] = None
     file_storage_pth: str = "SGlang_storage"
 
     # Data parallelism

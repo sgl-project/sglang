@@ -391,7 +391,9 @@ def get_call_select(args: argparse.Namespace):
 
 
 def popen_launch_server(
-    model: str, base_url: str, timeout: float, other_args: tuple = ()
+        model: str, base_url: str, timeout: float,
+        api_key: Optional[str] = None,
+        other_args: tuple = ()
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -408,6 +410,9 @@ def popen_launch_server(
         port,
         *other_args,
     ]
+    if api_key:
+        command += ["--api-key", api_key]
+
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
     start_time = time.time()
