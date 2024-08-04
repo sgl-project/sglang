@@ -425,17 +425,13 @@ class ScheduleBatch:
         prefix_lens = []
 
         # Allocate memory
-        req_pool_indices = self.alloc_req_slots(
-            sum(r.req_pool_idx is None for r in reqs)
-        )
+        req_pool_indices = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
         # Resolve index mapping
         pt = 0
         for i, req in enumerate(reqs):
-            if req.req_pool_idx is None:
-                req.req_pool_idx = req_pool_indices.pop(0)
-
+            req.req_pool_idx = req_pool_indices[i]
             extend_lens.append(len(input_ids[i]))
             prefix_lens.append(len(prefix_indices[i]))
             if len(prefix_indices[i]) > 0:
@@ -446,8 +442,6 @@ class ScheduleBatch:
                 prefix_lens[i] : prefix_lens[i] + extend_lens[i]
             ] = out_cache_loc[pt : pt + extend_lens[i]]
             pt += extend_lens[i]
-
-        assert req_pool_indices == [], "req_pool_indices not fully used"
 
         # Image auxiliary
         self.pixel_values = [r.pixel_values for r in reqs]
