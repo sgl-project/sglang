@@ -10,7 +10,6 @@ import time
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
-    download_dataset,
     make_report,
     set_ulimit,
 )
@@ -27,14 +26,26 @@ def run_eval(args):
     if args.eval_name == "mmlu":
         from sglang.test.simple_eval_mmlu import MMLUEval
 
-        dataset_path = "mmlu.csv"
+        filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        eval_obj = MMLUEval(filename, args.num_examples, args.num_threads)
+    elif args.eval_name == "math":
+        from sglang.test.simple_eval_math import MathEval
 
-        if not os.path.exists(dataset_path):
-            download_dataset(
-                dataset_path,
-                "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv",
-            )
-        eval_obj = MMLUEval(dataset_path, args.num_examples, args.num_threads)
+        equality_checker = ChatCompletionSampler(model="gpt-4-turbo")
+
+        filename = (
+            "https://openaipublic.blob.core.windows.net/simple-evals/math_test.csv"
+        )
+        eval_obj = MathEval(
+            filename, equality_checker, args.num_examples, args.num_threads
+        )
+    elif args.eval_name == "gpqa":
+        from sglang.test.simple_eval_gpqa import GPQAEval
+
+        filename = (
+            "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
+        )
+        eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
 
@@ -97,7 +108,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--eval-name", type=str, default="mmlu")
     parser.add_argument("--num-examples", type=int)
-    parser.add_argument("--num-threads", type=int, default=64)
+    parser.add_argument("--num-threads", type=int, default=512)
     set_ulimit()
     args = parser.parse_args()
 

@@ -61,7 +61,7 @@ class ServerArgs:
     show_time_cost: bool = False
 
     # Other
-    api_key: str = ""
+    api_key: Optional[str] = None
     file_storage_pth: str = "SGlang_storage"
 
     # Data parallelism
@@ -80,6 +80,7 @@ class ServerArgs:
     disable_disk_cache: bool = False
     enable_torch_compile: bool = False
     enable_p2p_check: bool = False
+    enable_mla: bool = False
     attention_reduce_in_fp32: bool = False
     efficient_weight_load: bool = False
 
@@ -306,7 +307,7 @@ class ServerArgs:
             "--api-key",
             type=str,
             default=ServerArgs.api_key,
-            help="Set API key of the server.",
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
         )
         parser.add_argument(
             "--file-storage-pth",
@@ -392,6 +393,11 @@ class ServerArgs:
             "--enable-p2p-check",
             action="store_true",
             help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
+        )
+        parser.add_argument(
+            "--enable-mla",
+            action="store_true",
+            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2",
         )
         parser.add_argument(
             "--attention-reduce-in-fp32",

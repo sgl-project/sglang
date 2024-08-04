@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   unit-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: self-hosted
 
     steps:
@@ -37,23 +38,12 @@ jobs:
         pip install --upgrade transformers
         pip install accelerate
 
-    - name: Test Frontend Language with SRT Backend
+    - name: Test Frontend Language
       run: |
         cd test/lang
-        python3 test_srt_backend.py
+        python3 run_suite.py --suite minimal
 
-    - name: Test OpenAI API Server
+    - name: Test Backend Runtime
       run: |
         cd test/srt
-        python3 test_openai_server.py
-
-    - name: Test Accuracy
-      run: |
-        cd test/srt
-        python3 test_eval_accuracy.py
-        python3 models/test_causal_models.py
-
-    - name: Test Frontend Language with OpenAI Backend
-      run: |
-        cd test/lang
-        python3 test_openai_backend.py
+        python3 run_suite.py --suite minimal

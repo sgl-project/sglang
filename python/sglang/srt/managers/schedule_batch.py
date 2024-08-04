@@ -27,7 +27,7 @@ from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -37,6 +37,7 @@ global_server_args_dict = {
     "disable_flashinfer": False,
     "disable_flashinfer_sampling": False,
     "attention_reduce_in_fp32": False,
+    "enable_mla": False,
 }
 
 
@@ -301,7 +302,7 @@ class ScheduleBatch:
     # Request, memory pool, and cache
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool
-    token_to_kv_pool: TokenToKVPool
+    token_to_kv_pool: BaseTokenToKVPool
     tree_cache: RadixCache
 
     # Batched arguments to model runner

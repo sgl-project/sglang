@@ -52,31 +52,17 @@ class ReqToTokenPool:
         self.free_slots = list(range(self.size))
 
 
-class TokenToKVPool:
+class BaseTokenToKVPool:
     """A memory pool that maps a token to its kv cache locations"""
 
     def __init__(
         self,
         size: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
-        layer_num: int,
     ):
         self.size = size
 
         # We also add one slot. This slot is used for writing dummy output from padded tokens.
         self.mem_state = torch.ones((self.size + 1,), dtype=torch.bool, device="cuda")
-
-        # [size, head_num, head_dim] for each layer
-        self.k_buffer = [
-            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device="cuda")
-            for _ in range(layer_num)
-        ]
-        self.v_buffer = [
-            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device="cuda")
-            for _ in range(layer_num)
-        ]
 
         # Prefetch buffer
         self.prefetch_buffer = torch.empty(0, device="cuda", dtype=torch.int32)
@@ -84,15 +70,6 @@ class TokenToKVPool:
 
         self.can_use_mem_size = self.size
         self.clear()
-
-    def get_key_buffer(self, layer_id: int):
-        return self.k_buffer[layer_id]
-
-    def get_value_buffer(self, layer_id: int):
-        return self.v_buffer[layer_id]
-
-    def get_kv_buffer(self, layer_id: int):
-        return self.k_buffer[layer_id], self.v_buffer[layer_id]
 
     def available_size(self):
         return self.can_use_mem_size + len(self.prefetch_buffer)
@@ -134,3 +111,67 @@ class TokenToKVPool:
 
         # We also add one slot. This slot is used for writing dummy output from padded tokens.
         self.mem_state[0] = False
+
+
+class MHATokenToKVPool(BaseTokenToKVPool):
+
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+    ):
+        super().__init__(size)
+
+        # [size, head_num, head_dim] for each layer
+        self.k_buffer = [
+            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device="cuda")
+            for _ in range(layer_num)
+        ]
+        self.v_buffer = [
+            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device="cuda")
+            for _ in range(layer_num)
+        ]
+
+    def get_key_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id]
+
+    def get_value_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id], self.v_buffer[layer_id]
+
+
+class MLATokenToKVPool(BaseTokenToKVPool):
+
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+    ):
+        super().__init__(size)
+
+        self.kv_lora_rank = kv_lora_rank
+        self.kv_buffer = [
+            torch.empty(
+                (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
+                dtype=dtype,
+                device="cuda",
+            )
+            for _ in range(layer_num)
+        ]
+
+    def get_key_buffer(self, layer_id: int):
+        return self.kv_buffer[layer_id]
+
+    def get_value_buffer(self, layer_id: int):
+        return self.kv_buffer[layer_id][..., : self.kv_lora_rank]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)

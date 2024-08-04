@@ -5,7 +5,7 @@ from typing import List
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 
 
 class ForwardMode(IntEnum):
@@ -35,7 +35,7 @@ class InputMetadata:
     seq_lens: torch.Tensor
     positions: torch.Tensor
     req_to_token_pool: ReqToTokenPool
-    token_to_kv_pool: TokenToKVPool
+    token_to_kv_pool: BaseTokenToKVPool
 
     # For extend
     extend_seq_lens: torch.Tensor
