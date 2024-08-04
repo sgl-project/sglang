@@ -15,7 +15,6 @@ class RuntimeEndpoint(BaseBackend):
     def __init__(
         self,
         base_url: str,
-        auth_token: Optional[str] = None,
         api_key: Optional[str] = None,
         verify: Optional[str] = None,
     ):
@@ -23,13 +22,11 @@ class RuntimeEndpoint(BaseBackend):
         self.support_concate_and_append = True
 
         self.base_url = base_url
-        self.auth_token = auth_token
         self.api_key = api_key
         self.verify = verify
 
         res = http_request(
             self.base_url + "/get_model_info",
-            auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -67,7 +64,6 @@ class RuntimeEndpoint(BaseBackend):
         res = http_request(
             self.base_url + "/generate",
             json={"text": prefix_str, "sampling_params": {"max_new_tokens": 0}},
-            auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -79,7 +75,6 @@ class RuntimeEndpoint(BaseBackend):
         res = http_request(
             self.base_url + "/generate",
             json=data,
-            auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -91,7 +86,6 @@ class RuntimeEndpoint(BaseBackend):
         res = http_request(
             self.base_url + "/generate",
             json=data,
-            auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -139,7 +133,6 @@ class RuntimeEndpoint(BaseBackend):
         res = http_request(
             self.base_url + "/generate",
             json=data,
-            auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -193,7 +186,6 @@ class RuntimeEndpoint(BaseBackend):
             self.base_url + "/generate",
             json=data,
             stream=True,
-            auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -225,7 +217,6 @@ class RuntimeEndpoint(BaseBackend):
         res = http_request(
             self.base_url + "/generate",
             json=data,
-            auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -243,7 +234,6 @@ class RuntimeEndpoint(BaseBackend):
         res = http_request(
             self.base_url + "/generate",
             json=data,
-            auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -267,7 +257,6 @@ class RuntimeEndpoint(BaseBackend):
         res = http_request(
             self.base_url + "/concate_and_append_request",
             json={"src_rids": src_rids, "dst_rid": dst_rid},
-            auth_token=self.auth_token,
             api_key=self.api_key,
             verify=self.verify,
         )

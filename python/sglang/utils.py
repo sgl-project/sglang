@@ -76,19 +76,13 @@ class HttpResponse:
         return self.resp.status
 
 
-def http_request(
-    url, json=None, stream=False, auth_token=None, api_key=None, verify=None
-):
+def http_request(url, json=None, stream=False, api_key=None, verify=None):
     """A faster version of requests.post with low-level urllib API."""
     headers = {"Content-Type": "application/json; charset=utf-8"}
 
-    # add the Authorization header if an auth token is provided
-    if auth_token is not None:
-        headers["Authorization"] = f"Bearer {auth_token}"
-
-    # add the API Key header if an API key is provided
+    # add the Authorization header if an api key is provided
     if api_key is not None:
-        headers["X-API-Key"] = api_key
+        headers["Authorization"] = f"Bearer {api_key}"
 
     if stream:
         return requests.post(url, json=json, stream=True, headers=headers)
