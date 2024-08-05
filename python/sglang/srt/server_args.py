@@ -268,7 +268,7 @@ class ServerArgs:
             "--tp-size",
             type=int,
             default=ServerArgs.tp_size,
-            help="Number of tensor parallel replicas.",
+            help="The tensor parallelism size.",
         )
         parser.add_argument(
             "--stream-interval",
