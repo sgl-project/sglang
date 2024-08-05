@@ -147,6 +147,7 @@ class TestOpenAIServer(unittest.TestCase):
             top_logprobs=logprobs,
             n=parallel_sample_num,
         )
+
         if logprobs:
             assert isinstance(
                 response.choices[0].logprobs.content[0].top_logprobs[0].token, str
@@ -158,6 +159,7 @@ class TestOpenAIServer(unittest.TestCase):
             assert (
                 ret_num_top_logprobs == logprobs
             ), f"{ret_num_top_logprobs} vs {logprobs}"
+
         assert len(response.choices) == parallel_sample_num
         assert response.choices[0].message.role == "assistant"
         assert isinstance(response.choices[0].message.content, str)
