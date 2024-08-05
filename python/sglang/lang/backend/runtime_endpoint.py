@@ -43,7 +43,7 @@ class RuntimeEndpoint(BaseBackend):
     def flush_cache(self):
         res = http_request(
             self.base_url + "/flush_cache",
-            auth_token=self.auth_token,
+            api_key=self.api_key,
             verify=self.verify,
         )
         self._assert_success(res)
@@ -51,7 +51,7 @@ class RuntimeEndpoint(BaseBackend):
     def get_server_args(self):
         res = http_request(
             self.base_url + "/get_server_args",
-            auth_token=self.auth_token,
+            api_key=self.api_key,
             verify=self.verify,
         )
         self._assert_success(res)
