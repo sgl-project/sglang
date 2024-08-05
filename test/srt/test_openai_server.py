@@ -5,21 +5,21 @@ import openai
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_child_process
-from sglang.test.test_utils import MODEL_NAME_FOR_TEST, popen_launch_server
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, popen_launch_server
 
 
 class TestOpenAIServer(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = f"http://localhost:8157"
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model, cls.base_url, timeout=300, api_key=cls.api_key
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(MODEL_NAME_FOR_TEST)
+        cls.tokenizer = get_tokenizer(DEFAULT_MODEL_NAME_FOR_TEST)
 
     @classmethod
     def tearDownClass(cls):
@@ -147,6 +147,7 @@ class TestOpenAIServer(unittest.TestCase):
             top_logprobs=logprobs,
             n=parallel_sample_num,
         )
+
         if logprobs:
             assert isinstance(
                 response.choices[0].logprobs.content[0].top_logprobs[0].token, str
@@ -158,6 +159,7 @@ class TestOpenAIServer(unittest.TestCase):
             assert (
                 ret_num_top_logprobs == logprobs
             ), f"{ret_num_top_logprobs} vs {logprobs}"
+
         assert len(response.choices) == parallel_sample_num
         assert response.choices[0].message.role == "assistant"
         assert isinstance(response.choices[0].message.content, str)

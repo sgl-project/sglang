@@ -390,8 +390,13 @@ class TokenizerManager:
                 obj.return_text_in_logprobs,
             )
 
+            # Log requests
             if self.server_args.log_requests and state.finished:
-                logger.info(f"in={obj.text}, out={out}")
+                if obj.text is None:
+                    in_obj = {"text": self.tokenizer.decode(obj.input_ids)}
+                else:
+                    in_obj = {"text": obj.text}
+                logger.info(f"in={in_obj}, out={out}")
 
             state.out_list = []
             if state.finished:
