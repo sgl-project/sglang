@@ -8,7 +8,7 @@ import numpy as np
 @dataclass
 class ChoicesDecision:
     decision: str
-    meta_info: Dict[str, Any] | None = None
+    meta_info: Optional[Dict[str, Any]] = None
 
 
 class ChoicesSamplingMethod(ABC):
