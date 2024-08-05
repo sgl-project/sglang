@@ -20,14 +20,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-srt = ["aiohttp", "fastapi", "hf_transfer", "huggingface_hub", "interegular", "jsonlines",
+srt = ["aiohttp", "fastapi", "hf_transfer", "huggingface_hub", "interegular",
        "packaging", "pillow", "psutil", "pydantic", "python-multipart",
        "torch", "uvicorn", "uvloop", "zmq",
        "vllm==0.5.3.post1", "outlines>=0.0.44"]
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
+test = ["jsonlines", "matplotlib", "pandas"]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+dev = ["sglang[all]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
