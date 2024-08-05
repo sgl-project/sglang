@@ -139,7 +139,10 @@ class TestOpenAIServer(unittest.TestCase):
             model=self.model,
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant"},
-                {"role": "user", "content": "What is the capital of France? Answer in a few words."},
+                {
+                    "role": "user",
+                    "content": "What is the capital of France? Answer in a few words.",
+                },
             ],
             temperature=0,
             logprobs=logprobs is not None and logprobs > 0,

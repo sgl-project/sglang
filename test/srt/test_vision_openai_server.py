@@ -49,7 +49,10 @@ class TestOpenAIVisionServer(unittest.TestCase):
                                 "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
                             },
                         },
-                        {"type": "text", "text": "Describe this image in a very short sentence."},
+                        {
+                            "type": "text",
+                            "text": "Describe this image in a very short sentence.",
+                        },
                     ],
                 },
             ],
@@ -88,7 +91,10 @@ class TestOpenAIVisionServer(unittest.TestCase):
                                 "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
                             },
                         },
-                        {"type": "text", "text": "Describe this image in the JSON format."},
+                        {
+                            "type": "text",
+                            "text": "Describe this image in the JSON format.",
+                        },
                     ],
                 },
             ],
