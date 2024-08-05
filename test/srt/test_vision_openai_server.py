@@ -16,10 +16,15 @@ class TestOpenAIVisionServer(unittest.TestCase):
         cls.base_url = "http://localhost:8157"
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=300, api_key=cls.api_key,
+            cls.model,
+            cls.base_url,
+            timeout=300,
+            api_key=cls.api_key,
             other_args=[
-                "--chat-template", "vicuna_v1.1",
-                "--tokenizer-path", "llava-hf/llava-1.5-7b-hf",
+                "--chat-template",
+                "vicuna_v1.1",
+                "--tokenizer-path",
+                "llava-hf/llava-1.5-7b-hf",
                 "--log-requests",
             ],
         )
