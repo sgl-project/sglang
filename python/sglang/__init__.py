@@ -22,6 +22,11 @@ from sglang.api import (
     user_end,
     video,
 )
+from sglang.lang.choices import (
+    greedy_token_selection,
+    token_length_normalized,
+    unconditional_likelihood_normalized,
+)
 
 # SGLang DSL APIs
 __all__ = [
@@ -45,6 +50,9 @@ __all__ = [
     "user_begin",
     "user_end",
     "video",
+    "greedy_token_selection",
+    "token_length_normalized",
+    "unconditional_likelihood_normalized",
 ]
 
 # Global Configurations
