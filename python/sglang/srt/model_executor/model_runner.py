@@ -370,9 +370,9 @@ class ModelRunner:
             batch.input_ids,
             input_metadata.positions,
             input_metadata,
-            batch.pixel_values,
-            batch.image_sizes,
-            batch.image_offsets,
+            input_metadata.pixel_values,
+            input_metadata.image_sizes,
+            input_metadata.image_offsets,
         )
 
     def forward(self, batch: ScheduleBatch, forward_mode: ForwardMode):

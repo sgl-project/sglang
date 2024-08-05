@@ -46,6 +46,11 @@ class InputMetadata:
     extend_start_loc: torch.Tensor = None
     extend_no_prefix: bool = None
 
+    # For multimodal
+    pixel_values: List[torch.Tensor] = None
+    image_sizes: List[List[int]] = None
+    image_offsets: List[int] = None
+
     # Output options
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
@@ -61,6 +66,15 @@ class InputMetadata:
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
     flashinfer_use_ragged: bool = False
+
+    def init_multimodal_infos(self, batch: ScheduleBatch):
+        reqs = batch.reqs
+        self.pixel_values = [r.pixel_values for r in reqs]
+        self.image_sizes = [r.image_size for r in reqs]
+        self.image_offsets = [
+            (r.image_offset - p_len) if r.image_offset is not None else 0
+            for r, p_len in zip(reqs, batch.prefix_lens_cpu)
+        ]
 
     def compute_positions(self, batch: ScheduleBatch):
         bs = self.batch_size
@@ -96,7 +110,6 @@ class InputMetadata:
 
     @classmethod
     def from_batch(cls, model_runner, batch: ScheduleBatch, forward_mode: ForwardMode):
-
         ret = cls(
             forward_mode=forward_mode,
             batch_size=batch.batch_size(),
@@ -113,6 +126,7 @@ class InputMetadata:
         ret.compute_positions(batch)
 
         if forward_mode != ForwardMode.DECODE:
+            ret.init_multimodal_infos(batch)
             ret.compute_extend_infos(batch)
 
         prefix_lens = (

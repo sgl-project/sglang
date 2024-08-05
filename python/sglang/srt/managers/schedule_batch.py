@@ -320,11 +320,6 @@ class ScheduleBatch:
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
 
-    # For multimodal
-    pixel_values: List[torch.Tensor] = None
-    image_sizes: List[List[int]] = None
-    image_offsets: List[int] = None
-
     # Batched sampling params
     temperatures: torch.Tensor = None
     top_ps: torch.Tensor = None
@@ -447,19 +442,12 @@ class ScheduleBatch:
             ] = out_cache_loc[pt : pt + extend_lens_cpu[i]]
             pt += extend_lens_cpu[i]
 
-        # Image auxiliary
-        self.pixel_values = [r.pixel_values for r in reqs]
-        self.image_sizes = [r.image_size for r in reqs]
-        self.image_offsets = [
-            (r.image_offset - p_len) if r.image_offset is not None else 0
-            for r, p_len in zip(reqs, prefix_lens_cpu)
-        ]
-
         self.extend_num_tokens = extend_num_tokens
         self.total_num_tokens = total_num_tokens
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
         self.prefix_lens_cpu = prefix_lens_cpu
         self.extend_lens_cpu = extend_lens_cpu
+        self.out_cache_loc = out_cache_loc
 
         with torch.device("cuda"):
             # Batched tensors
@@ -469,7 +457,6 @@ class ScheduleBatch:
             )
             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
             self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int32)
-            self.out_cache_loc = out_cache_loc
 
         self.batch_sampling_params(vocab_size, int_token_logit_bias)
 
