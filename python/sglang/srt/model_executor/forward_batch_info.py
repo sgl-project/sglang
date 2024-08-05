@@ -34,17 +34,17 @@ class InputMetadata:
     total_num_tokens: int
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
-    positions: torch.Tensor
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: BaseTokenToKVPool
+    out_cache_loc: torch.Tensor
+
+    # Input positions
+    positions: torch.Tensor = None
 
     # For extend
-    extend_seq_lens: torch.Tensor
-    extend_start_loc: torch.Tensor
-    extend_no_prefix: bool
-
-    # Output location of the KV cache
-    out_cache_loc: torch.Tensor = None
+    extend_seq_lens: torch.Tensor = None
+    extend_start_loc: torch.Tensor = None
+    extend_no_prefix: bool = None
 
     # Output options
     return_logprob: bool = False
@@ -62,60 +62,56 @@ class InputMetadata:
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
     flashinfer_use_ragged: bool = False
 
-    @classmethod
-    def from_batch(cls, model_runner, batch: ScheduleBatch, forward_mode: ForwardMode):
-        batch_size = batch.batch_size()
-
-        if forward_mode == ForwardMode.DECODE:
-            positions = ((batch.seq_lens - 1) + batch.position_ids_offsets).to(
+    def compute_positions(self, batch: ScheduleBatch):
+        bs = self.batch_size
+        if self.forward_mode == ForwardMode.DECODE:
+            self.positions = ((batch.seq_lens - 1) + batch.position_ids_offsets).to(
                 torch.int64
             )
-            extend_seq_lens = extend_start_loc = extend_no_prefix = None
-            if not model_runner.server_args.disable_flashinfer:
-                # This variable is not needed in this case,
-                # we do not compute it to make it compatbile with cuda graph.
-                total_num_tokens = None
-            else:
-                total_num_tokens = int(torch.sum(batch.seq_lens))
         else:
             seq_lens_cpu = batch.seq_lens.cpu().numpy()
             prefix_lens_cpu = batch.prefix_lens.cpu().numpy()
             position_ids_offsets_cpu = batch.position_ids_offsets.cpu().numpy()
-            positions = torch.tensor(
+            self.positions = torch.tensor(
                 np.concatenate(
                     [
                         np.arange(
                             prefix_lens_cpu[i] + position_ids_offsets_cpu[i],
                             seq_lens_cpu[i] + position_ids_offsets_cpu[i],
                         )
-                        for i in range(batch_size)
+                        for i in range(bs)
                     ],
                     axis=0,
                 ),
                 device="cuda",
             )
-            extend_seq_lens = batch.seq_lens - batch.prefix_lens
-            extend_start_loc = torch.zeros_like(batch.seq_lens)
-            extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-            extend_no_prefix = torch.all(batch.prefix_lens == 0)
-            total_num_tokens = int(torch.sum(batch.seq_lens))
+
+    def compute_extend_infos(self, batch: ScheduleBatch):
+        self.extend_seq_lens = batch.seq_lens - batch.prefix_lens
+        self.extend_start_loc = torch.zeros_like(batch.seq_lens)
+        self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+        self.extend_no_prefix = torch.all(batch.prefix_lens == 0)
+
+    @classmethod
+    def from_batch(cls, model_runner, batch: ScheduleBatch, forward_mode: ForwardMode):
 
         ret = cls(
             forward_mode=forward_mode,
-            batch_size=batch_size,
-            total_num_tokens=total_num_tokens,
+            batch_size=batch.batch_size(),
+            total_num_tokens=batch.total_num_tokens,
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
-            positions=positions,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             out_cache_loc=batch.out_cache_loc,
-            extend_seq_lens=extend_seq_lens,
-            extend_start_loc=extend_start_loc,
-            extend_no_prefix=extend_no_prefix,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
         )
+
+        ret.compute_positions(batch)
+
+        if forward_mode != ForwardMode.DECODE:
+            ret.compute_extend_infos(batch)
 
         if model_runner.server_args.disable_flashinfer:
             ret.init_triton_args(batch.prefix_lens)

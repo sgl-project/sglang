@@ -313,6 +313,7 @@ class ScheduleBatch:
     position_ids_offsets: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
     extend_num_tokens: int = None
+    total_num_tokens: int = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -419,6 +420,7 @@ class ScheduleBatch:
         seq_lens = [len(r.input_ids) for r in reqs]
         input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(r.input_ids) - len(r.prefix_indices) for r in reqs)
+        total_num_tokens = sum(len(r.input_ids) for r in reqs)
         prefix_indices = [r.prefix_indices for r in reqs]
 
         # Handle prefix
@@ -453,6 +455,7 @@ class ScheduleBatch:
         ]
 
         self.extend_num_tokens = extend_num_tokens
+        self.total_num_tokens = total_num_tokens
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
 
         with torch.device("cuda"):
@@ -640,6 +643,7 @@ class ScheduleBatch:
             ]
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
+        self.total_num_tokens += self.batch_size()
         self.prefix_lens = None
 
         # Alloc mem
