@@ -468,7 +468,7 @@ class SglSelect(SglExpr):
         name: str,
         choices: List[str],
         temperature: float,
-        choices_method: Optional[ChoicesSamplingMethod],
+        choices_method: ChoicesSamplingMethod,
     ):
         super().__init__()
         self.name = name

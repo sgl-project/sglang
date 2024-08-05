@@ -1,7 +1,7 @@
 # Choices Methods in SGLang
 This doc describes the choices methods supported by SGLang.
 
-The optional `choices_method` arg determines how options supplied to SGLang's `choices` primitive are selected.
+The optional `choices_method` arg determines how options supplied to SGLang's `choices` primitive are selected. Only the `RuntimeEndpoint` backend supports the `choices_method` arg. Other backends, such as `OpenAI`, have bespoke selection implementations due to API limitations.
 
 ## Methods
 

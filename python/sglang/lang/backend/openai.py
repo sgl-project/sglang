@@ -297,16 +297,13 @@ class OpenAI(BaseBackend):
         s: StreamExecutor,
         choices: List[str],
         temperature: float,
-        choices_method: Optional[ChoicesSamplingMethod],
+        choices_method: ChoicesSamplingMethod,
     ) -> ChoicesDecision:
+        """Note: `choices_method` is not used by the OpenAI backend."""
         if self.is_chat_model:
             raise NotImplementedError(
                 "select/choices is not supported for chat models. "
                 "Please try to use a non-chat model such as gpt-3.5-turbo-instruct"
-            )
-        if choices_method:
-            raise NotImplementedError(
-                "choices_method is not supported for OpenAI backend. Leave as None."
             )
 
         n_choices = len(choices)

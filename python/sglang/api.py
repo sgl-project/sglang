@@ -6,7 +6,7 @@ from typing import Callable, List, Optional, Union
 
 from sglang.global_config import global_config
 from sglang.lang.backend.base_backend import BaseBackend
-from sglang.lang.choices import ChoicesSamplingMethod
+from sglang.lang.choices import ChoicesSamplingMethod, token_length_normalized
 from sglang.lang.ir import (
     SglExpr,
     SglExprList,
@@ -81,7 +81,10 @@ def gen(
 
     if choices:
         return SglSelect(
-            name, choices, 0.0 if temperature is None else temperature, choices_method
+            name,
+            choices,
+            0.0 if temperature is None else temperature,
+            token_length_normalized if choices_method is None else choices_method,
         )
 
     # check regex is valid
@@ -190,7 +193,7 @@ def select(
     name: Optional[str] = None,
     choices: Optional[List[str]] = None,
     temperature: float = 0.0,
-    choices_method: Optional[ChoicesSamplingMethod] = None,
+    choices_method: ChoicesSamplingMethod = token_length_normalized,
 ):
     assert choices is not None
     return SglSelect(name, choices, temperature, choices_method)

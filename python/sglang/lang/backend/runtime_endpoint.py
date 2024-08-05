@@ -212,10 +212,9 @@ class RuntimeEndpoint(BaseBackend):
         s: StreamExecutor,
         choices: List[str],
         temperature: float,
-        choices_method: Optional[ChoicesSamplingMethod],
+        choices_method: ChoicesSamplingMethod,
     ) -> ChoicesDecision:
         assert temperature <= 1e-5
-        choices_method = choices_method or token_length_normalized
 
         # Cache common prefix
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
