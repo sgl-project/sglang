@@ -402,7 +402,7 @@ def v1_generate_request(all_requests):
         else:
             prompt_kwargs = {"input_ids": prompt}
     else:
-        if isinstance(prompts[0], str) or isinstance(propmt[0][0], str):
+        if isinstance(prompts[0], str):
             prompt_kwargs = {"text": prompts}
         else:
             prompt_kwargs = {"input_ids": prompts}
