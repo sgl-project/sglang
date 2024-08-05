@@ -19,13 +19,6 @@ class ForwardMode(IntEnum):
 
 
 @dataclass
-class ForwardBatchInfo:
-    """Model forward information for a batch."""
-
-    pass
-
-
-@dataclass
 class InputMetadata:
     """Store all inforamtion of a forward pass."""
 

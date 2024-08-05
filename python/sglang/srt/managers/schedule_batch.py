@@ -299,6 +299,11 @@ class Req:
 class ScheduleBatch:
     """All schedule information for a batch."""
 
+    # This class shold only stores GPU infos which are
+    # 1) related to memory allocation: out_cache_loc, ...
+    # 2) updated with each step: seq_len, ...
+    # 3) can be filtered with just indices: position_ids_offsets, ...
+
     # Request, memory pool, and cache
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool
@@ -311,6 +316,8 @@ class ScheduleBatch:
     seq_lens: torch.Tensor = None
     position_ids_offsets: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
+
+    # CPU data
     extend_lens_cpu: List[int] = None
     prefix_lens_cpu: List[int] = None
     extend_num_tokens: int = None
