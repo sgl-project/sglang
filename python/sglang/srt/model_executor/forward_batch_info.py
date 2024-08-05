@@ -70,7 +70,7 @@ class InputMetadata:
             )
         else:
             seq_lens_cpu = batch.seq_lens.cpu().numpy()
-            prefix_lens_cpu = batch.prefix_lens.cpu().numpy()
+            prefix_lens_cpu = batch.prefix_lens_cpu
             position_ids_offsets_cpu = batch.position_ids_offsets.cpu().numpy()
             self.positions = torch.tensor(
                 np.concatenate(
@@ -87,10 +87,12 @@ class InputMetadata:
             )
 
     def compute_extend_infos(self, batch: ScheduleBatch):
-        self.extend_seq_lens = batch.seq_lens - batch.prefix_lens
+        self.extend_seq_lens = torch.tensor(
+            batch.extend_lens_cpu, device="cuda", dtype=torch.int32
+        )
         self.extend_start_loc = torch.zeros_like(batch.seq_lens)
         self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
-        self.extend_no_prefix = torch.all(batch.prefix_lens == 0)
+        self.extend_no_prefix = all(l == 0 for l in batch.prefix_lens_cpu)
 
     @classmethod
     def from_batch(cls, model_runner, batch: ScheduleBatch, forward_mode: ForwardMode):
@@ -113,19 +115,22 @@ class InputMetadata:
         if forward_mode != ForwardMode.DECODE:
             ret.compute_extend_infos(batch)
 
-        if model_runner.server_args.disable_flashinfer:
-            ret.init_triton_args(batch.prefix_lens)
+        prefix_lens = (
+            torch.tensor(batch.prefix_lens_cpu, device="cuda", dtype=torch.int32)
+            if forward_mode != ForwardMode.DECODE
+            else None
+        )
 
-        if not model_runner.server_args.disable_flashinfer:
+        if model_runner.server_args.disable_flashinfer:
+            ret.init_triton_args(prefix_lens)
+        else:
             flashinfer_use_ragged = False
             if (
                 forward_mode != ForwardMode.DECODE
                 and int(torch.sum(batch.seq_lens)) > 4096
             ):
                 flashinfer_use_ragged = True
-            ret.init_flashinfer_args(
-                model_runner, batch.prefix_lens, flashinfer_use_ragged
-            )
+            ret.init_flashinfer_args(model_runner, prefix_lens, flashinfer_use_ragged)
 
         return ret
 

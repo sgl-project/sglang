@@ -309,9 +309,10 @@ class ScheduleBatch:
     input_ids: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
-    prefix_lens: torch.Tensor = None
     position_ids_offsets: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
+    extend_lens_cpu: List[int] = None
+    prefix_lens_cpu: List[int] = None
     extend_num_tokens: int = None
     total_num_tokens: int = None
 
@@ -424,8 +425,8 @@ class ScheduleBatch:
         prefix_indices = [r.prefix_indices for r in reqs]
 
         # Handle prefix
-        extend_lens = []
-        prefix_lens = []
+        extend_lens_cpu = []
+        prefix_lens_cpu = []
 
         # Allocate memory
         req_pool_indices = self.alloc_req_slots(bs)
@@ -435,28 +436,30 @@ class ScheduleBatch:
         pt = 0
         for i, req in enumerate(reqs):
             req.req_pool_idx = req_pool_indices[i]
-            extend_lens.append(len(input_ids[i]))
-            prefix_lens.append(len(prefix_indices[i]))
+            extend_lens_cpu.append(len(input_ids[i]))
+            prefix_lens_cpu.append(len(prefix_indices[i]))
             if len(prefix_indices[i]) > 0:
                 self.req_to_token_pool.req_to_token[req.req_pool_idx][
                     : len(prefix_indices[i])
                 ] = prefix_indices[i]
             self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                prefix_lens[i] : prefix_lens[i] + extend_lens[i]
-            ] = out_cache_loc[pt : pt + extend_lens[i]]
-            pt += extend_lens[i]
+                prefix_lens_cpu[i] : prefix_lens_cpu[i] + extend_lens_cpu[i]
+            ] = out_cache_loc[pt : pt + extend_lens_cpu[i]]
+            pt += extend_lens_cpu[i]
 
         # Image auxiliary
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
         self.image_offsets = [
             (r.image_offset - p_len) if r.image_offset is not None else 0
-            for r, p_len in zip(reqs, prefix_lens)
+            for r, p_len in zip(reqs, prefix_lens_cpu)
         ]
 
         self.extend_num_tokens = extend_num_tokens
         self.total_num_tokens = total_num_tokens
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+        self.prefix_lens_cpu = prefix_lens_cpu
+        self.extend_lens_cpu = extend_lens_cpu
 
         with torch.device("cuda"):
             # Batched tensors
@@ -465,7 +468,6 @@ class ScheduleBatch:
                 [r.req_pool_idx for r in reqs], dtype=torch.int32
             )
             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
-            self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32)
             self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int32)
             self.out_cache_loc = out_cache_loc
 
@@ -644,7 +646,7 @@ class ScheduleBatch:
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
         self.total_num_tokens += self.batch_size()
-        self.prefix_lens = None
+        self.prefix_lens_cpu = None
 
         # Alloc mem
         bs = self.batch_size()
@@ -663,7 +665,7 @@ class ScheduleBatch:
     def prune_batch(self):
         """Clear the infos which are 1) exclusive for extend, or 2) update every step"""
         # Exclusive for extend
-        self.prefix_lens = None
+        self.prefix_lens_cpu = None
         self.extend_num_tokens = None
         self.pixel_values = None
         self.image_offsets = None
