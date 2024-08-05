@@ -367,13 +367,23 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
     # Wait until the server is launched
+    success = False
     for _ in range(120):
         time.sleep(1)
         try:
-            requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            assert res.status_code == 200, f"{res}"
+            success = True
             break
-        except requests.exceptions.RequestException:
+        except (AssertionError, requests.exceptions.RequestException) as e:
+            last_traceback = get_exception_traceback()
             pass
+
+    if not success:
+        if pipe_finish_writer is not None:
+            pipe_finish_writer.send(last_traceback)
+        print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
+        sys.exit(1)
 
     # Send a warmup request
     try:
@@ -390,12 +400,13 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
                 headers=headers,
                 timeout=600,
             )
-            assert res.status_code == 200
+            assert res.status_code == 200, f"{res}"
     except Exception as e:
+        last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
-            pipe_finish_writer.send(get_exception_traceback())
-        print(f"Initialization failed. warmup error: {e}", flush=True)
-        raise e
+            pipe_finish_writer.send(last_traceback)
+        print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
+        sys.exit(1)
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
