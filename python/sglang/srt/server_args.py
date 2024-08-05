@@ -264,10 +264,11 @@ class ServerArgs:
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
         parser.add_argument(
+            "--tensor-parallel-size",
             "--tp-size",
             type=int,
             default=ServerArgs.tp_size,
-            help="The tensor parallelism size.",
+            help="Number of tensor parallel replicas.",
         )
         parser.add_argument(
             "--stream-interval",
@@ -318,6 +319,7 @@ class ServerArgs:
 
         # Data parallelism
         parser.add_argument(
+            "--data-parallel-size",
             "--dp-size",
             type=int,
             default=ServerArgs.dp_size,
@@ -413,6 +415,8 @@ class ServerArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
+        args.tp_size = args.tensor_parallel_size
+        args.dp_size = args.data_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
