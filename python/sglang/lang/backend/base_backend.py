@@ -1,6 +1,7 @@
 from typing import Callable, List, Optional, Union
 
 from sglang.lang.chat_template import get_chat_template
+from sglang.lang.choices import ChoicesDecision, ChoicesSamplingMethod
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
 
@@ -64,7 +65,8 @@ class BaseBackend:
         s: StreamExecutor,
         choices: List[str],
         temperature: float,
-    ):
+        choices_method: Optional[ChoicesSamplingMethod] = None,
+    ) -> ChoicesDecision:
         raise NotImplementedError()
 
     def concatenate_and_append(self, src_rids: List[str], dst_rid: str):
