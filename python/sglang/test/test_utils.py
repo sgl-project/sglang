@@ -18,7 +18,9 @@ from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import get_exception_traceback
 
-MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+DEFAULT_VISION_MODEL_NAME_FOR_TEST = "liuhaotian/llava-v1.6-vicuna-7b"
+DEFAULT_VISION_TOKENIZER_NAME_FOR_TEST = "llava-hf/llava-1.5-7b-hf"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):

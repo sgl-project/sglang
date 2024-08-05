@@ -14,7 +14,7 @@ from sglang.test.test_programs import (
     test_stream,
     test_tool_use,
 )
-from sglang.test.test_utils import MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
 
 class TestSRTBackend(unittest.TestCase):
@@ -22,7 +22,7 @@ class TestSRTBackend(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.backend = sgl.Runtime(model_path=MODEL_NAME_FOR_TEST)
+        cls.backend = sgl.Runtime(model_path=DEFAULT_MODEL_NAME_FOR_TEST)
         sgl.set_default_backend(cls.backend)
 
     @classmethod

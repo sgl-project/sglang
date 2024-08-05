@@ -5,14 +5,14 @@ import requests
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import MODEL_NAME_FOR_TEST, popen_launch_server
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, popen_launch_server
 
 
 class TestSRTEndpoint(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = f"http://localhost:{8157}"
         cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300)
 
