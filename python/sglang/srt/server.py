@@ -59,6 +59,7 @@ from sglang.srt.openai_api.adapter import (
     v1_batches,
     v1_chat_completions,
     v1_completions,
+    v1_delete_file,
     v1_files_create,
     v1_retrieve_batch,
     v1_retrieve_file,
@@ -173,6 +174,12 @@ async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("bat
     return await v1_files_create(
         file, purpose, tokenizer_manager.server_args.file_storage_pth
     )
+
+
+@app.delete("/v1/files/{file_id}")
+async def delete_file(file_id: str):
+    # https://platform.openai.com/docs/api-reference/files/delete
+    return await v1_delete_file(file_id)
 
 
 @app.post("/v1/batches")

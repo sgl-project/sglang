@@ -23,7 +23,7 @@ _SAMPLING_EPS = 1e-6
 class SamplingParams:
     def __init__(
         self,
-        max_new_tokens: int = 16,
+        max_new_tokens: Optional[int] = None,
         stop: Optional[Union[str, List[str]]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
@@ -37,13 +37,13 @@ class SamplingParams:
         regex: Optional[str] = None,
         n: int = 1,
     ) -> None:
+        self.max_new_tokens = 16 if max_new_tokens is None else max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
         self.frequency_penalty = frequency_penalty
         self.presence_penalty = presence_penalty
         self.stop_strs = stop
-        self.max_new_tokens = max_new_tokens
         self.ignore_eos = ignore_eos
         self.skip_special_tokens = skip_special_tokens
         self.spaces_between_special_tokens = spaces_between_special_tokens

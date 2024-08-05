@@ -95,6 +95,12 @@ class FileResponse(BaseModel):
     purpose: str
 
 
+class FileDeleteResponse(BaseModel):
+    id: str
+    object: str = "file"
+    deleted: bool
+
+
 class BatchRequest(BaseModel):
     input_file_id: (
         str  # The ID of an uploaded file that contains requests for the new batch
