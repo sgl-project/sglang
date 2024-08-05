@@ -45,11 +45,6 @@ class TestOpenAIServer(unittest.TestCase):
             prompt_arg = prompt_input
             num_choices = 1
 
-        if parallel_sample_num:
-            # FIXME: This is wrong. We should not count the prompt tokens multiple times for
-            # parallel sampling.
-            num_prompt_tokens *= parallel_sample_num
-
         response = client.completions.create(
             model=self.model,
             prompt=prompt_arg,
