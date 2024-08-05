@@ -1,101 +1,103 @@
 import json
-import subprocess
-import time
 import unittest
 
 import openai
-import requests
 
+from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_child_process
+from sglang.test.test_utils import MODEL_NAME_FOR_TEST, popen_launch_server
 
 
 class TestOpenAIServer(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        model = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-        port = 30000
-        timeout = 300
-
-        command = [
-            "python3",
-            "-m",
-            "sglang.launch_server",
-            "--model-path",
-            model,
-            "--host",
-            "localhost",
-            "--port",
-            str(port),
-        ]
-        cls.process = subprocess.Popen(command, stdout=None, stderr=None)
-        cls.base_url = f"http://localhost:{port}/v1"
-        cls.model = model
-
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(f"{cls.base_url}/models")
-                if response.status_code == 200:
-                    return
-            except requests.RequestException:
-                pass
-            time.sleep(10)
-        raise TimeoutError("Server failed to start within the timeout period.")
+        cls.model = MODEL_NAME_FOR_TEST
+        cls.base_url = f"http://localhost:8157"
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model, cls.base_url, timeout=300, api_key=cls.api_key
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(MODEL_NAME_FOR_TEST)
 
     @classmethod
     def tearDownClass(cls):
         kill_child_process(cls.process.pid)
 
-    def run_completion(self, echo, logprobs, use_list_input):
-        client = openai.Client(api_key="EMPTY", base_url=self.base_url)
+    def run_completion(
+        self, echo, logprobs, use_list_input, parallel_sample_num, token_input
+    ):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
+        if token_input:
+            prompt_input = self.tokenizer.encode(prompt)
+            num_prompt_tokens = len(prompt_input)
+        else:
+            prompt_input = prompt
+            num_prompt_tokens = len(self.tokenizer.encode(prompt))
 
         if use_list_input:
-            prompt_arg = [prompt, prompt]
+            prompt_arg = [prompt_input, prompt_input]
             num_choices = len(prompt_arg)
+            num_prompt_tokens *= 2
         else:
-            prompt_arg = prompt
+            prompt_arg = prompt_input
             num_choices = 1
+
+        if parallel_sample_num:
+            # FIXME: This is wrong. We should not count the prompt tokens multiple times for
+            # parallel sampling.
+            num_prompt_tokens *= parallel_sample_num
 
         response = client.completions.create(
             model=self.model,
             prompt=prompt_arg,
-            temperature=0.1,
+            temperature=0,
             max_tokens=32,
             echo=echo,
             logprobs=logprobs,
+            n=parallel_sample_num,
         )
 
-        assert len(response.choices) == num_choices
+        assert len(response.choices) == num_choices * parallel_sample_num
 
         if echo:
             text = response.choices[0].text
             assert text.startswith(prompt)
+
         if logprobs:
             assert response.choices[0].logprobs
             assert isinstance(response.choices[0].logprobs.tokens[0], str)
             assert isinstance(response.choices[0].logprobs.top_logprobs[1], dict)
             ret_num_top_logprobs = len(response.choices[0].logprobs.top_logprobs[1])
-            # FIXME: Fix this bug. Sometimes, some top_logprobs are missing in the return value.
+            # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some out_put id maps to the same output token and duplicate in the map
             # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
+            assert ret_num_top_logprobs > 0
             if echo:
                 assert response.choices[0].logprobs.token_logprobs[0] == None
             else:
                 assert response.choices[0].logprobs.token_logprobs[0] != None
+
         assert response.id
         assert response.created
-        assert response.usage.prompt_tokens > 0
+        assert (
+            response.usage.prompt_tokens == num_prompt_tokens
+        ), f"{response.usage.prompt_tokens} vs {num_prompt_tokens}"
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
-    def run_completion_stream(self, echo, logprobs):
-        client = openai.Client(api_key="EMPTY", base_url=self.base_url)
+    def run_completion_stream(self, echo, logprobs, token_input):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
+        if token_input:
+            prompt_arg = self.tokenizer.encode(prompt)
+        else:
+            prompt_arg = prompt
         generator = client.completions.create(
             model=self.model,
-            prompt=prompt,
-            temperature=0.1,
+            prompt=prompt_arg,
+            temperature=0,
             max_tokens=32,
             echo=echo,
             logprobs=logprobs,
@@ -114,12 +116,15 @@ class TestOpenAIServer(unittest.TestCase):
                     ret_num_top_logprobs = len(
                         response.choices[0].logprobs.top_logprobs[0]
                     )
-                    # FIXME: Fix this bug. Sometimes, some top_logprobs are missing in the return value.
+                    # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some out_put id maps to the same output token and duplicate in the map
                     # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
+                    assert ret_num_top_logprobs > 0
 
             if first:
                 if echo:
-                    assert response.choices[0].text.startswith(prompt)
+                    assert response.choices[0].text.startswith(
+                        prompt
+                    ), f"{response.choices[0].text} and all args {echo} {logprobs} {token_input} {first}"
                 first = False
 
             assert response.id
@@ -128,8 +133,8 @@ class TestOpenAIServer(unittest.TestCase):
             assert response.usage.completion_tokens > 0
             assert response.usage.total_tokens > 0
 
-    def run_chat_completion(self, logprobs):
-        client = openai.Client(api_key="EMPTY", base_url=self.base_url)
+    def run_chat_completion(self, logprobs, parallel_sample_num):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response = client.chat.completions.create(
             model=self.model,
             messages=[
@@ -140,6 +145,7 @@ class TestOpenAIServer(unittest.TestCase):
             max_tokens=32,
             logprobs=logprobs is not None and logprobs > 0,
             top_logprobs=logprobs,
+            n=parallel_sample_num,
         )
         if logprobs:
             assert isinstance(
@@ -152,7 +158,7 @@ class TestOpenAIServer(unittest.TestCase):
             assert (
                 ret_num_top_logprobs == logprobs
             ), f"{ret_num_top_logprobs} vs {logprobs}"
-
+        assert len(response.choices) == parallel_sample_num
         assert response.choices[0].message.role == "assistant"
         assert isinstance(response.choices[0].message.content, str)
         assert response.id
@@ -162,7 +168,7 @@ class TestOpenAIServer(unittest.TestCase):
         assert response.usage.total_tokens > 0
 
     def run_chat_completion_stream(self, logprobs):
-        client = openai.Client(api_key="EMPTY", base_url=self.base_url)
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         generator = client.chat.completions.create(
             model=self.model,
             messages=[
@@ -178,8 +184,6 @@ class TestOpenAIServer(unittest.TestCase):
 
         is_first = True
         for response in generator:
-            print(response)
-
             data = response.choices[0].delta
             if is_first:
                 data.role == "assistant"
@@ -187,11 +191,21 @@ class TestOpenAIServer(unittest.TestCase):
                 continue
 
             if logprobs:
-                # FIXME: Fix this bug. Return top_logprobs in the streaming mode.
-                pass
+                assert response.choices[0].logprobs
+                assert isinstance(
+                    response.choices[0].logprobs.content[0].top_logprobs[0].token, str
+                )
+                assert isinstance(
+                    response.choices[0].logprobs.content[0].top_logprobs, list
+                )
+                ret_num_top_logprobs = len(
+                    response.choices[0].logprobs.content[0].top_logprobs
+                )
+                assert (
+                    ret_num_top_logprobs == logprobs
+                ), f"{ret_num_top_logprobs} vs {logprobs}"
 
             assert isinstance(data.content, str)
-
             assert response.id
             assert response.created
 
@@ -199,23 +213,34 @@ class TestOpenAIServer(unittest.TestCase):
         for echo in [False, True]:
             for logprobs in [None, 5]:
                 for use_list_input in [True, False]:
-                    self.run_completion(echo, logprobs, use_list_input)
+                    for parallel_sample_num in [1, 2]:
+                        for token_input in [False, True]:
+                            self.run_completion(
+                                echo,
+                                logprobs,
+                                use_list_input,
+                                parallel_sample_num,
+                                token_input,
+                            )
 
     def test_completion_stream(self):
+        # parallel sampling adn list input are not supported in streaming mode
         for echo in [False, True]:
             for logprobs in [None, 5]:
-                self.run_completion_stream(echo, logprobs)
+                for token_input in [False, True]:
+                    self.run_completion_stream(echo, logprobs, token_input)
 
     def test_chat_completion(self):
         for logprobs in [None, 5]:
-            self.run_chat_completion(logprobs)
+            for parallel_sample_num in [1, 2]:
+                self.run_chat_completion(logprobs, parallel_sample_num)
 
     def test_chat_completion_stream(self):
         for logprobs in [None, 5]:
             self.run_chat_completion_stream(logprobs)
 
     def test_regex(self):
-        client = openai.Client(api_key="EMPTY", base_url=self.base_url)
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         regex = (
             r"""\{\n"""
@@ -250,5 +275,5 @@ if __name__ == "__main__":
 
     # t = TestOpenAIServer()
     # t.setUpClass()
-    # t.test_chat_completion_stream()
+    # t.test_completion()
     # t.tearDownClass()

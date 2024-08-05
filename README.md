@@ -54,8 +54,8 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
 
 ### Method 2: From source
 ```
-# Use the stable v0.2.8 branch
-git clone -b v0.2.8 https://github.com/sgl-project/sglang.git
+# Use the last release branch
+git clone -b v0.2.10 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -207,7 +207,7 @@ Instructions for supporting a new model are [here](https://github.com/sgl-projec
 
 ### Benchmark Performance
 
-- Benchmark a single static batch by running the following command without launching a server. The arguments are the same as those for `launch_server.py`. This is not a dynamic batching server, so it may run out of memory for a batch size that can run successfully with a real server. This is because a real server will truncate the prefill into several batches/chunks, while this unit test does not do this.
+- Benchmark a single static batch by running the following command without launching a server. The arguments are the same as for `launch_server.py`. Note that this is not a dynamic batching server, so it may run out of memory for a batch size that a real server can handle. A real server truncates the prefill into several batches, while this unit test does not. For accurate large batch testing, consider using `sglang.bench_serving`.
   ```
   python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 32 --input-len 256 --output-len 32
   ```

@@ -29,7 +29,7 @@ from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -39,6 +39,7 @@ global_server_args_dict = {
     "disable_flashinfer": False,
     "disable_flashinfer_sampling": False,
     "attention_reduce_in_fp32": False,
+    "enable_mla": False,
 }
 
 
@@ -289,7 +290,7 @@ class Batch:
     # Request, memory pool, and cache
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool
-    token_to_kv_pool: TokenToKVPool
+    token_to_kv_pool: BaseTokenToKVPool
     tree_cache: RadixCache
 
     # Batched arguments to model runner
@@ -380,13 +381,15 @@ class Batch:
         extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
-            self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
-            out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+            if self.tree_cache is not None:
+                self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
+                out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
 
             if out_cache_loc is None:
-                logger.error("Prefill out of memory. This should never happen.")
-                self.tree_cache.pretty_print()
-                exit()
+                logger.error("Prefill out of memory. Try to lower your batch size.")
+                if self.tree_cache is not None:
+                    self.tree_cache.pretty_print()
+                exit(1)
 
         pt = 0
         for i in range(bs):
@@ -637,9 +640,10 @@ class Batch:
         self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
         if self.out_cache_loc is None:
-            logger.error("Decode out of memory. This should never happen.")
-            self.tree_cache.pretty_print()
-            exit()
+            logger.error("Decode out of memory. Try to lower your batch size.")
+            if self.tree_cache is not None:
+                self.tree_cache.pretty_print()
+            exit(1)
 
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
@@ -777,7 +781,7 @@ class InputMetadata:
     seq_lens: torch.Tensor
     positions: torch.Tensor
     req_to_token_pool: ReqToTokenPool
-    token_to_kv_pool: TokenToKVPool
+    token_to_kv_pool: BaseTokenToKVPool
 
     # For extend
     extend_seq_lens: torch.Tensor

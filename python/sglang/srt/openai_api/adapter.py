@@ -251,7 +251,9 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
             if end_point == "/v1/chat/completions":
                 responses = v1_chat_generate_response(request, ret, to_file=True)
             else:
-                responses = v1_generate_response(request, ret, to_file=True)
+                responses = v1_generate_response(
+                    request, ret, tokenizer_manager, to_file=True
+                )
 
         except Exception as e:
             error_json = {
@@ -339,6 +341,7 @@ def v1_generate_request(all_requests):
     return_logprobs = []
     top_logprobs_nums = []
     first_prompt_type = type(all_requests[0].prompt)
+
     for request in all_requests:
         prompt = request.prompt
         assert (
@@ -364,7 +367,7 @@ def v1_generate_request(all_requests):
         )
         if len(all_requests) > 1 and request.n > 1:
             raise ValueError(
-                "Batch operation is not supported for completions from files"
+                "Parallel sampling is not supported for completions from files"
             )
 
     if len(all_requests) == 1:
@@ -377,10 +380,11 @@ def v1_generate_request(all_requests):
         else:
             prompt_kwargs = {"input_ids": prompt}
     else:
-        if isinstance(prompts[0], str):
+        if isinstance(prompts[0], str) or isinstance(propmt[0][0], str):
             prompt_kwargs = {"text": prompts}
         else:
             prompt_kwargs = {"input_ids": prompts}
+
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
         sampling_params=sampling_params_list,
@@ -389,35 +393,52 @@ def v1_generate_request(all_requests):
         return_text_in_logprobs=True,
         stream=all_requests[0].stream,
     )
+
     if len(all_requests) == 1:
         return adapted_request, all_requests[0]
     return adapted_request, all_requests
 
 
-def v1_generate_response(request, ret, to_file=False):
+def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
     choices = []
     echo = False
 
-    if (not isinstance(request, List)) and request.echo:
+    if (not isinstance(request, list)) and request.echo:
         # TODO: handle the case propmt is token ids
-        if isinstance(request.prompt, list):
+        if isinstance(request.prompt, list) and isinstance(request.prompt[0], str):
+            # for the case of multiple str prompts
             prompts = request.prompt
+        elif isinstance(request.prompt, list) and isinstance(request.prompt[0], list):
+            # for the case of multiple token ids prompts
+            prompts = [
+                tokenizer_manager.tokenizer.decode(prompt, skip_special_tokens=True)
+                for prompt in request.prompt
+            ]
+        elif isinstance(request.prompt, list) and isinstance(request.prompt[0], int):
+            # for the case of single token ids prompt
+            prompts = [
+                tokenizer_manager.tokenizer.decode(
+                    request.prompt, skip_special_tokens=True
+                )
+            ]
         else:
+            # for the case of single str prompt
             prompts = [request.prompt]
         echo = True
 
     for idx, ret_item in enumerate(ret):
         text = ret_item["text"]
-        if isinstance(request, List) and request[idx].echo:
+        if isinstance(request, list) and request[idx].echo:
             echo = True
             text = request[idx].prompt + text
-        if (not isinstance(request, List)) and echo:
-            text = prompts[idx] + text
+        if (not isinstance(request, list)) and echo:
+            prompt_index = idx // request.n
+            text = prompts[prompt_index] + text
 
         logprobs = False
-        if isinstance(request, List) and request[idx].logprobs:
+        if isinstance(request, list) and request[idx].logprobs:
             logprobs = True
-        elif (not isinstance(request, List)) and request.logprobs:
+        elif (not isinstance(request, list)) and request.logprobs:
             logprobs = True
         if logprobs:
             if echo:
@@ -479,15 +500,16 @@ def v1_generate_response(request, ret, to_file=False):
             responses.append(response)
         return responses
     else:
+        prompt_tokens = sum(item["meta_info"]["prompt_tokens"] for item in ret)
         completion_tokens = sum(item["meta_info"]["completion_tokens"] for item in ret)
         response = CompletionResponse(
             id=ret[0]["meta_info"]["id"],
             model=request.model,
             choices=choices,
             usage=UsageInfo(
-                prompt_tokens=ret[0]["meta_info"]["prompt_tokens"],
+                prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                total_tokens=ret[0]["meta_info"]["prompt_tokens"] + completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
             ),
         )
     return response
@@ -513,8 +535,18 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
                     if not stream_buffer:  # The first chunk
                         if request.echo:
+                            if isinstance(request.prompt, str):
+                                # for the case of single str prompts
+                                prompts = request.prompt
+                            elif isinstance(request.prompt, list) and isinstance(
+                                request.prompt[0], int
+                            ):
+                                prompts = tokenizer_manager.tokenizer.decode(
+                                    request.prompt, skip_special_tokens=True
+                                )
+
                             # Prepend prompt in response text.
-                            text = request.prompt + text
+                            text = prompts + text
 
                     if request.logprobs:
                         # The first chunk and echo is enabled.
@@ -539,7 +571,6 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                                 "output_top_logprobs"
                             ][n_prev_token:],
                         )
-
                         n_prev_token = len(
                             content["meta_info"]["output_token_logprobs"]
                         )
@@ -588,13 +619,13 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     if not isinstance(ret, list):
         ret = [ret]
 
-    response = v1_generate_response(request, ret)
+    response = v1_generate_response(request, ret, tokenizer_manager)
     return response
 
 
 def v1_chat_generate_request(all_requests, tokenizer_manager):
 
-    texts = []
+    input_ids = []
     sampling_params_list = []
     image_data_list = []
     return_logprobs = []
@@ -608,8 +639,8 @@ def v1_chat_generate_request(all_requests, tokenizer_manager):
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             if chat_template_name is None:
-                prompt = tokenizer_manager.tokenizer.apply_chat_template(
-                    request.messages, tokenize=False, add_generation_prompt=True
+                prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                    request.messages, tokenize=True, add_generation_prompt=True
                 )
                 stop = request.stop
                 image_data = None
@@ -623,12 +654,13 @@ def v1_chat_generate_request(all_requests, tokenizer_manager):
                         stop.append(request.stop)
                     else:
                         stop.extend(request.stop)
+                prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
-            prompt = request.messages
+            prompt_ids = request.messages
             stop = request.stop
             image_data = None
-        texts.append(prompt)
+        input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         top_logprobs_nums.append(request.top_logprobs)
         sampling_params_list.append(
@@ -645,13 +677,22 @@ def v1_chat_generate_request(all_requests, tokenizer_manager):
         )
         image_data_list.append(image_data)
     if len(all_requests) == 1:
-        texts = texts[0]
+        input_ids = input_ids[0]
+        if isinstance(input_ids, str):
+            prompt_kwargs = {"text": input_ids}
+        else:
+            prompt_kwargs = {"input_ids": input_ids}
         sampling_params_list = sampling_params_list[0]
         image_data = image_data_list[0]
         return_logprobs = return_logprobs[0]
         top_logprobs_nums = top_logprobs_nums[0]
+    else:
+        if isinstance(input_ids[0], str):
+            prompt_kwargs = {"text": input_ids}
+        else:
+            prompt_kwargs = {"input_ids": input_ids}
     adapted_request = GenerateReqInput(
-        text=texts,
+        **prompt_kwargs,
         image_data=image_data,
         sampling_params=sampling_params_list,
         return_logprob=return_logprobs,
@@ -671,9 +712,9 @@ def v1_chat_generate_response(request, ret, to_file=False):
 
     for idx, ret_item in enumerate(ret):
         logprobs = False
-        if isinstance(request, List) and request[idx].logprobs:
+        if isinstance(request, list) and request[idx].logprobs:
             logprobs = True
-        elif (not isinstance(request, List)) and request.logprobs:
+        elif (not isinstance(request, list)) and request.logprobs:
             logprobs = True
         if logprobs:
             logprobs = to_openai_style_logprobs(
@@ -778,10 +819,58 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
             is_first = True
 
             stream_buffer = ""
+            n_prev_token = 0
             try:
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
                 ):
+                    prompt_tokens = content["meta_info"]["prompt_tokens"]
+                    completion_tokens = content["meta_info"]["completion_tokens"]
+                    if request.logprobs:
+                        logprobs = to_openai_style_logprobs(
+                            output_token_logprobs=content["meta_info"][
+                                "output_token_logprobs"
+                            ][n_prev_token:],
+                            output_top_logprobs=content["meta_info"][
+                                "output_top_logprobs"
+                            ][n_prev_token:],
+                        )
+
+                        n_prev_token = len(
+                            content["meta_info"]["output_token_logprobs"]
+                        )
+                        token_logprobs = []
+                        for token, logprob in zip(
+                            logprobs.tokens, logprobs.token_logprobs
+                        ):
+                            token_bytes = list(token.encode("utf-8"))
+                            top_logprobs = []
+                            if logprobs.top_logprobs:
+                                for top_token, top_logprob in logprobs.top_logprobs[
+                                    0
+                                ].items():
+                                    top_token_bytes = list(top_token.encode("utf-8"))
+                                    top_logprobs.append(
+                                        TopLogprob(
+                                            token=top_token,
+                                            bytes=top_token_bytes,
+                                            logprob=top_logprob,
+                                        )
+                                    )
+                            token_logprobs.append(
+                                ChatCompletionTokenLogprob(
+                                    token=token,
+                                    bytes=token_bytes,
+                                    logprob=logprob,
+                                    top_logprobs=top_logprobs,
+                                )
+                            )
+
+                        choice_logprobs = ChoiceLogprobs(content=token_logprobs)
+
+                    else:
+                        choice_logprobs = None
+
                     if is_first:
                         # First chunk with role
                         is_first = False
@@ -789,11 +878,17 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             index=0,
                             delta=DeltaMessage(role="assistant"),
                             finish_reason=content["meta_info"]["finish_reason"],
+                            logprobs=choice_logprobs,
                         )
                         chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
                             choices=[choice_data],
                             model=request.model,
+                            usage=UsageInfo(
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=prompt_tokens + completion_tokens,
+                            ),
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
@@ -804,11 +899,17 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         index=0,
                         delta=DeltaMessage(content=delta),
                         finish_reason=content["meta_info"]["finish_reason"],
+                        logprobs=choice_logprobs,
                     )
                     chunk = ChatCompletionStreamResponse(
                         id=content["meta_info"]["id"],
                         choices=[choice_data],
                         model=request.model,
+                        usage=UsageInfo(
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            total_tokens=prompt_tokens + completion_tokens,
+                        ),
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
             except ValueError as e:

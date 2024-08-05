@@ -13,6 +13,7 @@ import torch
 PACKAGE_LIST = [
     "sglang",
     "flashinfer",
+    "triton",
     "requests",
     "tqdm",
     "numpy",
@@ -30,6 +31,7 @@ PACKAGE_LIST = [
     "zmq",
     "vllm",
     "outlines",
+    "multipart",
     "openai",
     "tiktoken",
     "anthropic",

@@ -19,10 +19,8 @@ concurrency:
 
 jobs:
   unit-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: self-hosted
-
-    env:
-      HF_TOKEN : ${{ secrets.HF_TOKEN }}
 
     steps:
     - name: Checkout code
@@ -30,32 +28,22 @@ jobs:
 
     - name: Install dependencies
       run: |
-        cd /data/zhyncs/venv && source ./bin/activate && cd -
+        source $HOME/venv/bin/activate
+        echo "$HOME/venv/bin" >> $GITHUB_PATH
 
         pip cache purge
         pip install --upgrade pip
         pip install -e "python[all]"
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/ --force-reinstall
         pip install --upgrade transformers
+        pip install accelerate
 
-    - name: Test OpenAI Backend
+    - name: Test Frontend Language
       run: |
-        cd /data/zhyncs/venv && source ./bin/activate && cd -
-        export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-
         cd test/lang
-        python3 test_openai_backend.py
+        python3 run_suite.py --suite minimal
 
-    - name: Test SRT Backend
+    - name: Test Backend Runtime
       run: |
-        cd /data/zhyncs/venv && source ./bin/activate && cd -
-
-        cd test/lang
-        python3 test_srt_backend.py
-
-    - name: Test OpenAI API Server
-      run: |
-        cd /data/zhyncs/venv && source ./bin/activate && cd -
-
         cd test/srt
-        python3 test_openai_server.py
+        python3 run_suite.py --suite minimal
