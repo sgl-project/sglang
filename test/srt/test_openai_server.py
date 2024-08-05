@@ -139,10 +139,12 @@ class TestOpenAIServer(unittest.TestCase):
             model=self.model,
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant"},
-                {"role": "user", "content": "What is the capital of France?"},
+                {
+                    "role": "user",
+                    "content": "What is the capital of France? Answer in a few words.",
+                },
             ],
             temperature=0,
-            max_tokens=32,
             logprobs=logprobs is not None and logprobs > 0,
             top_logprobs=logprobs,
             n=parallel_sample_num,
@@ -178,7 +180,6 @@ class TestOpenAIServer(unittest.TestCase):
                 {"role": "user", "content": "What is the capital of France?"},
             ],
             temperature=0,
-            max_tokens=32,
             logprobs=logprobs is not None and logprobs > 0,
             top_logprobs=logprobs,
             stream=True,
