@@ -326,10 +326,17 @@ class TestOpenAIServer(unittest.TestCase):
             result_file_name = "batch_job_chat_results.jsonl"
         with open(result_file_name, "wb") as file:
             file.write(result_content)
+        results = []
+        with open(result_file_name, "r", encoding="utf-8") as file:
+            for line in file:
+                json_object = json.loads(
+                    line.strip()
+                )  
+                results.append(json_object)
         for delete_fid in [uploaded_file.id, result_file_id]:
             del_pesponse = client.files.delete(delete_fid)
             assert del_pesponse.deleted
-        assert len(result_content) == len(content)
+        assert len(results) == len(content)
 
     def test_completion(self):
         for echo in [False, True]:
