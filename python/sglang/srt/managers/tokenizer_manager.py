@@ -139,33 +139,39 @@ class TokenizerManager:
                 sampling_params.normalize(self.tokenizer)
                 sampling_params.verify()
 
-            if isinstance(obj.image_data, list) and len(obj.image_data) > 0:
-                # muti image/video (pad): num_frame, 3, 336 or 384, 336 or 384
-                # single image (anyres): num_patch, 3, 336 or 384, 336 or 384
-                pixel_values, image_hash, image_size = [], [], []
-                if len(obj.image_data) > 1:
-                    aspect_ratio = "pad" # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
-                    for image_data in obj.image_data:
+            try:
+                if isinstance(obj.image_data, list) and len(obj.image_data) > 0:
+                    # muti image/video (pad): num_frame, 3, 336 or 384, 336 or 384
+                    # single image (anyres): num_patch, 3, 336 or 384, 336 or 384
+                    pixel_values, image_hash, image_size = [], [], []
+                    if len(obj.image_data) > 1:
+                        aspect_ratio = "pad" # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
+                        for image_data in obj.image_data:
+                            pixel_v, image_h, image_s = await self.get_pixel_values(
+                                image_data, aspect_ratio
+                            )
+                            pixel_values.append(pixel_v)
+                            image_hash.append(image_h)
+                            image_size.append(image_s)
+                        pixel_values = np.stack(pixel_values, axis=0)
+                    else:
                         pixel_v, image_h, image_s = await self.get_pixel_values(
-                            image_data, aspect_ratio
+                            obj.image_data[0]
                         )
-                        pixel_values.append(pixel_v)
+                        pixel_values = pixel_v
                         image_hash.append(image_h)
                         image_size.append(image_s)
-                    pixel_values = np.stack(pixel_values, axis=0)
-                else:
-                    pixel_v, image_h, image_s = await self.get_pixel_values(
-                        obj.image_data[0]
+                elif isinstance(obj.image_data, str):
+                    pixel_values, image_hash, image_size = await self.get_pixel_values(
+                        obj.image_data
                     )
-                    pixel_values = pixel_v
-                    image_hash.append(image_h)
-                    image_size.append(image_s)
-            elif isinstance(obj.image_data, str):
-                pixel_values, image_hash, image_size = await self.get_pixel_values(
-                    obj.image_data
-                )
-            else:
+                else:
+                    pixel_values, image_hash, image_size = None, None, None
+                    
+            except Exception as e:
+                print(f"Error in get_pixel_values: {e}")
                 pixel_values, image_hash, image_size = None, None, None
+                
             tokenized_obj = TokenizedGenerateReqInput(
                 rid=rid,
                 input_text=obj.text,

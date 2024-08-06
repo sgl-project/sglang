@@ -387,9 +387,9 @@ def connect_rpyc_service(host, port):
             break
         except ConnectionRefusedError as e:
             time.sleep(1)
-        repeat_count += 1
-    if repeat_count == 20:
-        raise RuntimeError(f"Connect rpyc error: {e}")
+            repeat_count += 1
+            if repeat_count == 20:
+                raise RuntimeError(f"Connect rpyc error: {e}")
 
     return con.root
 

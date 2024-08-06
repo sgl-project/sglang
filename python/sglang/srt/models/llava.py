@@ -89,7 +89,7 @@ class LlavaLlamaForCausalLM(nn.Module):
             pad_ids = pad_value * (
                 (new_image_feature_len + len(pad_value)) // len(pad_value)
             )
-            print("calculated new_image_feature_len: ", new_image_feature_len)
+            # print("calculated new_image_feature_len: ", new_image_feature_len)
             offset = input_ids.index(self.config.image_token_index)
             # old_len + pad_len - 1, because we need to remove image_token_id
             input_ids = (
