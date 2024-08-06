@@ -340,10 +340,6 @@ def _set_envs_and_config(server_args: ServerArgs):
         # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
         maybe_set_triton_cache_manager()
 
-    # Set torch compile config
-    if server_args.enable_torch_compile:
-        set_torch_compile_config()
-
     # Set global chat template
     if server_args.chat_template:
         # TODO: replace this with huggingface transformers template
