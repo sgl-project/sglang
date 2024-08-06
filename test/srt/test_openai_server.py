@@ -217,7 +217,7 @@ class TestOpenAIServer(unittest.TestCase):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         if mode == "completion":
             input_file_path = "complete_input.jsonl"
-            ##write content to input file
+            # write content to input file
             content = [
                 {
                     "custom_id": "request-1",
