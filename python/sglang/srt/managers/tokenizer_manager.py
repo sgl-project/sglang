@@ -308,7 +308,6 @@ class TokenizerManager:
                 event = asyncio.Event()
                 state = ReqState([], False, event)
                 self.rid_to_state[rid] = state
-
         # Then wait for all responses
         output_list = []
         for i in range(batch_size):
@@ -341,7 +340,6 @@ class TokenizerManager:
                 )
                 assert state.finished
                 del self.rid_to_state[rid]
-
         yield output_list
 
     def _validate_input_length(self, input_ids: List[int]):
