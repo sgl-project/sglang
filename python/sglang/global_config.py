@@ -19,7 +19,6 @@ class GlobalConfig:
         self.init_new_token_ratio = 0.7
         self.base_min_new_token_ratio = 0.1
         self.new_token_ratio_decay = 0.001
-        self.new_token_ratio_recovery = 0.05
 
         # Runtime constants: The threshold (number of tokens) to trigger layer-wise cuda sync.
         # This can improve the speed for large batch sizes during prefill.
