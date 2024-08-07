@@ -14,6 +14,7 @@ PACKAGE_LIST = [
     "sglang",
     "flashinfer",
     "triton",
+    "transformers",
     "requests",
     "tqdm",
     "numpy",

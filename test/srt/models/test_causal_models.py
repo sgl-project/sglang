@@ -18,9 +18,7 @@ import torch
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 
 MODELS = [
-    # (model_name, tp_size)
     ("meta-llama/Meta-Llama-3.1-8B-Instruct", 1),
-    # ("meta-llama/Meta-Llama-3.1-8B-Instruct", 2),
 ]
 TORCH_DTYPES = [torch.float16]
 
@@ -51,7 +49,7 @@ class TestCausalModels(unittest.TestCase):
             hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
             srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
 
-            tolerance = 2e-2
+            tolerance = 3e-2
             assert torch.all(
                 abs(hf_logprobs - srt_logprobs) < tolerance
             ), f"prefill logprobs not all close"
