@@ -100,6 +100,9 @@ class Req:
         self.output_ids = []  # Each decode stage's output ids
         self.input_ids = None  # input_ids = origin_input_ids + output_ids
 
+        # Memory info
+        self.req_pool_idx = None
+
         # For incremental decoding
         # ----- | --------- read_ids -------|
         # ----- |   surr_ids  |
@@ -404,10 +407,10 @@ class ScheduleBatch:
         prefix_lens = []
         seq_lens = []
 
-        req_pool_indices = self.alloc_req_slots(bs)
-        req_pool_indices_cpu = req_pool_indices
+        req_pool_indices_cpu = self.alloc_req_slots(bs)
 
-        for i in range(bs):
+        for i, req in enumerate(reqs):
+            req.req_pool_idx = req_pool_indices_cpu[i]
             flatten_input_ids.extend(input_ids[i])
             extend_lens.append(len(input_ids[i]))
 
@@ -415,7 +418,7 @@ class ScheduleBatch:
                 prefix_lens.append(0)
             else:
                 prefix_lens.append(len(prefix_indices[i]))
-                self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
+                self.req_to_token_pool.req_to_token[req.req_pool_idx][
                     : len(prefix_indices[i])
                 ] = prefix_indices[i]
 
@@ -430,7 +433,7 @@ class ScheduleBatch:
 
         pt = 0
         for i in range(bs):
-            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
+            self.req_to_token_pool.req_to_token[req.req_pool_idx][
                 prefix_lens[i] : prefix_lens[i] + extend_lens[i]
             ] = out_cache_loc[pt : pt + extend_lens[i]]
             pt += extend_lens[i]
@@ -480,7 +483,6 @@ class ScheduleBatch:
 
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
-        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
         while (
             self.token_to_kv_pool.available_size()
             < len(sorted_indices) * global_config.retract_decode_steps
@@ -498,20 +500,20 @@ class ScheduleBatch:
 
             if isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req_pool_indices_cpu[idx]
-                ][: seq_lens_cpu[idx]]
+                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    : seq_lens_cpu[idx]
+                ]
                 self.token_to_kv_pool.free(token_indices)
-                self.req_to_token_pool.free(int(req_pool_indices_cpu[idx]))
+                self.req_to_token_pool.free(req.req_pool_idx)
                 del self.tree_cache.entries[req.rid]
             else:
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = len(req.prefix_indices)
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req_pool_indices_cpu[idx]
-                ][last_uncached_pos : seq_lens_cpu[idx]]
+                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    last_uncached_pos : seq_lens_cpu[idx]
+                ]
                 self.token_to_kv_pool.free(token_indices)
-                self.req_to_token_pool.free(int(req_pool_indices_cpu[idx]))
+                self.req_to_token_pool.free(req.req_pool_idx)
 
                 # release the last node
                 self.tree_cache.dec_lock_ref(req.last_node)
@@ -548,8 +550,6 @@ class ScheduleBatch:
     def check_for_jump_forward(self, model_runner):
         jump_forward_reqs = []
         filter_indices = [i for i in range(len(self.reqs))]
-
-        req_pool_indices_cpu = None
 
         for i, req in enumerate(self.reqs):
             if req.jump_forward_map is not None:
@@ -600,13 +600,11 @@ class ScheduleBatch:
                     req.vid += 1
 
                     # insert the old request into tree_cache
-                    if req_pool_indices_cpu is None:
-                        req_pool_indices_cpu = self.req_pool_indices.tolist()
                     self.tree_cache.cache_req(
                         rid=req.rid,
                         token_ids=cur_all_ids,
                         last_uncached_pos=len(req.prefix_indices),
-                        req_pool_idx=req_pool_indices_cpu[i],
+                        req_pool_idx=req.req_pool_idx,
                     )
 
                     # unlock the last node
