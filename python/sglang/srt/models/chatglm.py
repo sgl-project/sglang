@@ -45,7 +45,7 @@ from vllm.transformers_utils.configs import ChatGLMConfig
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.model_runner import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 LoraConfig = None
 

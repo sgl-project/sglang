@@ -45,7 +45,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.model_runner import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
 class MixtralMLP(nn.Module):
