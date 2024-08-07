@@ -232,8 +232,6 @@ class ModelTpServer:
         if new_batch is not None:
             # Run a new prefill batch
             self.forward_prefill_batch(new_batch)
-            self.cache_filled_batch(new_batch)
-            self.filter_out_inflight(new_batch)
 
             if not new_batch.is_empty():
                 if self.running_batch is None:
@@ -353,26 +351,20 @@ class ModelTpServer:
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
-        # TODO(lsyin): organize this function
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
         if running_bs >= self.max_running_requests:
-            return
+            return None
 
         # Compute matched prefix length
         for req in self.waiting_queue:
             req.input_ids = req.origin_input_ids + req.output_ids
-            try_match_ids = req.input_ids
-            if req.return_logprob:
-                try_match_ids = req.input_ids[: req.logprob_start_len]
             # NOTE: the prefix_indices must always be aligned with last_node
-            prefix_indices, last_node = self.tree_cache.match_prefix(
-                rid=req.rid, key=try_match_ids
+            req.prefix_indices, req.last_node = self.tree_cache.match_prefix(
+                rid=req.rid, key=req.adjust_max_prefix_ids()
             )
-            req.extend_input_len = len(req.input_ids) - len(prefix_indices)
-            req.prefix_indices = prefix_indices
-            req.last_node = last_node
+            req.extend_input_len = len(req.input_ids) - len(req.prefix_indices)
 
         # Get priority queue
         self.waiting_queue = self.scheduler.get_priority_queue(self.waiting_queue)
@@ -394,6 +386,24 @@ class ModelTpServer:
             )
 
         for req in self.waiting_queue:
+
+            # FIXME: Move this code into adjust_max_prefix_len
+            if req.return_logprob and req.normalized_prompt_logprob is None:
+                # Need at least two tokens to compute normalized logprob
+                if req.extend_input_len < 2:
+                    delta = 2 - req.extend_input_len
+                    req.extend_input_len += delta
+                    req.prefix_indices = req.prefix_indices[:-delta]
+                    if req.image_offset is not None:
+                        req.image_offset += delta
+
+            if req.extend_input_len == 0 and req.sampling_params.max_new_tokens > 0:
+                # Need at least one token to compute logits
+                req.extend_input_len = 1
+                req.prefix_indices = req.prefix_indices[:-1]
+                if req.image_offset is not None:
+                    req.image_offset += 1
+
             res = adder.add_one_req(req)
             if (
                 not res
@@ -470,9 +480,19 @@ class ModelTpServer:
         pt = 0
         for i, req in enumerate(batch.reqs):
             if req is not self.current_inflight_req:
+                # Inflight reqs' prefill is not finished
                 req.completion_tokens_wo_jump_forward += 1
                 req.output_ids.append(next_token_ids[i])
                 req.check_finished()
+
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
+            else:
+                self.tree_cache.cache_unfinished_req(req)
+
+            if req is self.current_inflight_req:
+                # Inflight request would get a new req idx
+                self.req_to_token_pool.free(req.req_pool_idx)
 
             if req.return_logprob:
                 self.add_logprob_return_values(i, req, pt, next_token_ids, output)
@@ -529,22 +549,6 @@ class ModelTpServer:
                 )
             req.output_top_logprobs.append(output.output_top_logprobs[i])
 
-    def cache_filled_batch(self, batch: ScheduleBatch):
-        for i, req in enumerate(batch.reqs):
-            new_prefix_indices, new_last_node = self.tree_cache.cache_req(
-                rid=req.rid,
-                token_ids=tuple(req.input_ids),
-                last_uncached_pos=len(req.prefix_indices),
-                req_pool_idx=req.req_pool_idx,
-                del_in_memory_pool=False,
-                old_last_node=req.last_node,
-            )
-            req.prefix_indices, req.last_node = new_prefix_indices, new_last_node
-
-            if req is self.current_inflight_req:
-                # inflight request would get a new req idx
-                self.req_to_token_pool.free(req.req_pool_idx)
-
     def forward_decode_batch(self, batch: ScheduleBatch):
         # Check if decode out of memory
         if not batch.check_decode_mem():
@@ -595,6 +599,9 @@ class ModelTpServer:
             req.output_ids.append(next_token_id)
             req.check_finished()
 
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
+
             if req.return_logprob:
                 req.output_token_logprobs.append(
                     (next_token_logprobs[i], next_token_id)
@@ -614,12 +621,9 @@ class ModelTpServer:
         output_spaces_between_special_tokens = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
-        finished_indices = []
         unfinished_indices = []
         for i, req in enumerate(batch.reqs):
-            if req.finished():
-                finished_indices.append(i)
-            else:
+            if not req.finished() and req is not self.current_inflight_req:
                 unfinished_indices.append(i)
 
             if req.finished() or (
@@ -683,34 +687,7 @@ class ModelTpServer:
                 )
             )
 
-        # Remove finished reqs
-        if finished_indices:
-            # Update radix cache
-            for i in finished_indices:
-                req = batch.reqs[i]
-                self.tree_cache.cache_req(
-                    rid=req.rid,
-                    token_ids=tuple(req.origin_input_ids + req.output_ids)[:-1],
-                    last_uncached_pos=len(req.prefix_indices),
-                    req_pool_idx=req.req_pool_idx,
-                )
-
-                self.tree_cache.dec_lock_ref(req.last_node)
-
-            # Update batch tensors
-            if unfinished_indices:
-                batch.filter_batch(unfinished_indices)
-            else:
-                batch.reqs = []
-
-    def filter_out_inflight(self, batch: ScheduleBatch):
-        # TODO(lsyin): reduce the overhead, make a special version for this
-        if self.current_inflight_req is None:
-            return
-
-        to_remove = batch.reqs.index(self.current_inflight_req)
-        unfinished_indices = [i for i in range(len(batch.reqs)) if i != to_remove]
-
+        # Remove finished reqs: update batch tensors
         batch.filter_batch(unfinished_indices)
 
     def flush_cache(self):

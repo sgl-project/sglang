@@ -17,7 +17,11 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
-    def cache_req(self, **kwargs):
+    def cache_finished_req(self, **kwargs):
+        pass
+
+    @abstractmethod
+    def cache_unfinished_req(self, **kwargs):
         pass
 
     @abstractmethod
