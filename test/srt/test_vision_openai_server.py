@@ -13,7 +13,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "liuhaotian/llava-v1.6-vicuna-7b"
-        cls.base_url = "http://localhost:8157"
+        cls.base_url = "http://127.0.0.1:8157"
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model,
