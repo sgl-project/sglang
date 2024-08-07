@@ -35,7 +35,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.policy_scheduler import PolicyScheduler
+from sglang.srt.managers.policy_scheduler import PolicyScheduler, PrefillAdder
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     BaseFinishReason,
@@ -377,151 +377,57 @@ class ModelTpServer:
         # Get priority queue
         self.waiting_queue = self.scheduler.get_priority_queue(self.waiting_queue)
 
-        # Add requests if there is available space
-        can_run_list = []
-        new_batch_total_tokens = 0
-        new_batch_input_tokens = 0
-
-        available_size = (
-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+        adder = PrefillAdder(
+            self.tree_cache,
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
+            self.max_prefill_tokens,
+            self.chunked_prefill_size,
         )
-        if self.running_batch:
-            available_size -= sum(
-                [
-                    (r.sampling_params.max_new_tokens - len(r.output_ids))
-                    * self.new_token_ratio
-                    for r in self.running_batch.reqs
-                ]
-            )
 
-        # Handle the current inflight request
-        take_inflight = 0
-        if self.current_inflight_req:
-            take_inflight = 1
-            r = self.current_inflight_req
-            r.input_ids = r.origin_input_ids + r.output_ids
-            truncated = (
-                len(r.input_ids) - len(r.prefix_indices) > self.chunked_prefill_size
-            )
-            r.extend_input_len = min(
-                len(r.input_ids) - len(r.prefix_indices), self.chunked_prefill_size
-            )
-            r.input_ids = r.input_ids[: len(r.prefix_indices) + r.extend_input_len]
-            can_run_list.append(r)
+        if self.running_batch is not None:
+            adder.remove_running_tokens(self.running_batch, self.new_token_ratio)
 
-            if not truncated:
-                # Finish inflight
-                self.current_inflight_req = None
-                new_batch_total_tokens += (
-                    r.extend_input_len + r.sampling_params.max_new_tokens
-                )
-                new_batch_input_tokens += r.extend_input_len
-            else:
-                new_batch_total_tokens += r.extend_input_len
-                new_batch_input_tokens += r.extend_input_len
+        has_inflight = self.current_inflight_req is not None
+        if self.current_inflight_req is not None:
+            self.current_inflight_req = adder.add_inflight_req(
+                self.current_inflight_req
+            )
 
         for req in self.waiting_queue:
-            if req.return_logprob and req.normalized_prompt_logprob is None:
-                # Need at least two tokens to compute normalized logprob
-                if req.extend_input_len < 2:
-                    delta = 2 - req.extend_input_len
-                    req.extend_input_len += delta
-                    req.prefix_indices = req.prefix_indices[:-delta]
-                    if req.image_offset is not None:
-                        req.image_offset += delta
-            if req.extend_input_len == 0 and req.sampling_params.max_new_tokens > 0:
-                # Need at least one token to compute logits
-                req.extend_input_len = 1
-                req.prefix_indices = req.prefix_indices[:-1]
-                if req.image_offset is not None:
-                    req.image_offset += 1
-
+            res = adder.add_one_req(req)
             if (
-                req.extend_input_len
-                + req.sampling_params.max_new_tokens
-                + new_batch_total_tokens
-                < available_size
-                and (
-                    req.extend_input_len + new_batch_input_tokens
-                    <= self.max_prefill_tokens
-                    or len(can_run_list) == 0
-                )
+                not res
+                or adder.no_remaining_tokens()
+                or running_bs + len(adder.can_run_list) >= self.max_running_requests
             ):
-                delta = self.tree_cache.inc_lock_ref(req.last_node)
-                available_size += delta
-
-                if not (
-                    req.extend_input_len
-                    + req.sampling_params.max_new_tokens
-                    + new_batch_total_tokens
-                    < available_size
-                ):
-                    # Undo locking
-                    delta = self.tree_cache.dec_lock_ref(req.last_node)
-                    available_size += delta
-                    break
-                else:
-                    # Add this request to the running batch
-                    if (
-                        self.chunked_prefill_size is None
-                        or (
-                            new_batch_input_tokens + req.extend_input_len
-                            <= self.chunked_prefill_size
-                        )
-                        or (
-                            req.return_logprob and req.normalized_prompt_logprob is None
-                        )
-                    ):
-                        can_run_list.append(req)
-                        new_batch_total_tokens += (
-                            req.extend_input_len + req.sampling_params.max_new_tokens
-                        )
-                        new_batch_input_tokens += req.extend_input_len
-                    else:
-                        trunc_len = self.chunked_prefill_size - new_batch_input_tokens
-
-                        if trunc_len <= 0:
-                            # Undo locking
-                            delta = self.tree_cache.dec_lock_ref(req.last_node)
-                            available_size += delta
-                            break
-
-                        req.extend_input_len = trunc_len
-                        req.input_ids = req.input_ids[
-                            : len(req.prefix_indices) + req.extend_input_len
-                        ]
-                        can_run_list.append(req)
-                        self.current_inflight_req = req
-                        new_batch_input_tokens += req.extend_input_len
-                        new_batch_total_tokens += req.extend_input_len
-                        break
-            else:
                 break
 
-            if running_bs + len(can_run_list) >= self.max_running_requests:
-                break
+        can_run_list = adder.can_run_list
+
+        if adder.new_inflight_req is not None:
+            assert self.current_inflight_req is None
+            self.current_inflight_req = adder.new_inflight_req
 
         if len(can_run_list) == 0:
             return None
 
         # Print stats
         if self.tp_rank == 0:
-            hit_tokens = sum(len(x.prefix_indices) for x in can_run_list)
             self.tree_cache_metrics["total"] += (
-                hit_tokens + new_batch_input_tokens
+                adder.log_input_tokens + adder.log_hit_tokens
             ) / 10**9
-            self.tree_cache_metrics["hit"] += hit_tokens / 10**9
+            self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10**9
             tree_cache_hit_rate = (
                 self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
             )
             logger.info(
                 f"[gpu={self.gpu_id}] Prefill batch. "
                 f"#new-seq: {len(can_run_list)}, "
-                f"#new-token: {new_batch_input_tokens}, "
-                f"#cached-token: {hit_tokens}, "
+                f"#new-token: {adder.log_input_tokens}, "
+                f"#cached-token: {adder.log_hit_tokens}, "
                 f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
                 f"#running-req: {running_bs}, "
-                f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + take_inflight}"
+                f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
             )
 
         # Return the new batch
