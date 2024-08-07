@@ -468,7 +468,7 @@ class ScheduleBatch:
         self.batch_sampling_params(vocab_size, int_token_logit_bias)
 
     def check_decode_mem(self):
-        bs = len(self.reqs)
+        bs = self.batch_size()
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 
