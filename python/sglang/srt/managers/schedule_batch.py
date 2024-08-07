@@ -402,7 +402,6 @@ class ScheduleBatch:
         prefix_indices = [r.prefix_indices for r in reqs]
 
         # Handle prefix
-        flatten_input_ids = []
         extend_lens = []
         prefix_lens = []
         seq_lens = []
@@ -411,7 +410,6 @@ class ScheduleBatch:
 
         for i, req in enumerate(reqs):
             req.req_pool_idx = req_pool_indices_cpu[i]
-            flatten_input_ids.extend(input_ids[i])
             extend_lens.append(len(input_ids[i]))
 
             if len(prefix_indices[i]) == 0:
@@ -423,8 +421,6 @@ class ScheduleBatch:
                 ] = prefix_indices[i]
 
             seq_lens.append(prefix_lens[-1] + extend_lens[-1])
-
-        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
 
         # Allocate memory
         seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
@@ -439,18 +435,18 @@ class ScheduleBatch:
             pt += extend_lens[i]
 
         # Set fields
-        self.input_ids = torch.tensor(
-            flatten_input_ids, dtype=torch.int32, device=device
-        )
+        with torch.device("cuda"):
+            self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
+            self.req_pool_indices = torch.tensor(req_pool_indices_cpu)
+            self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+            self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int32)
+
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
         self.image_offsets = [
             r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
         ]
-        self.req_pool_indices = torch.tensor(req_pool_indices_cpu, device=device)
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
-        self.position_ids_offsets = position_ids_offsets
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
