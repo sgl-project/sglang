@@ -232,7 +232,6 @@ class ModelTpServer:
         if new_batch is not None:
             # Run a new prefill batch
             self.forward_prefill_batch(new_batch)
-            self.filter_out_inflight(new_batch)
 
             if not new_batch.is_empty():
                 if self.running_batch is None:
