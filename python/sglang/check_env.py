@@ -75,8 +75,16 @@ def _get_gpu_info():
     devices = defaultdict(list)
     for k in range(torch.cuda.device_count()):
         devices[torch.cuda.get_device_name(k)].append(str(k))
+        capability = torch.cuda.get_device_capability(k)
+        devices[f"GPU {k} Compute Capability"] = f"{capability[0]}.{capability[1]}"
 
-    return {f"GPU {','.join(device_ids)}": name for name, device_ids in devices.items()}
+    gpu_info = {
+        f"GPU {','.join(device_ids)}": name
+        for name, device_ids in devices.items()
+        if not name.startswith("GPU")
+    }
+    gpu_info.update({k: v for k, v in devices.items() if k.startswith("GPU")})
+    return gpu_info
 
 
 def _get_cuda_version_info():
