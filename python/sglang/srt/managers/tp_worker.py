@@ -232,7 +232,6 @@ class ModelTpServer:
         if new_batch is not None:
             # Run a new prefill batch
             self.forward_prefill_batch(new_batch)
-            self.cache_filled_batch(new_batch)
             self.filter_out_inflight(new_batch)
 
             if not new_batch.is_empty():
@@ -353,12 +352,11 @@ class ModelTpServer:
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
-        # TODO(lsyin): organize this function
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
         if running_bs >= self.max_running_requests:
-            return
+            return None
 
         # Compute matched prefix length
         for req in self.waiting_queue:
@@ -470,9 +468,19 @@ class ModelTpServer:
         pt = 0
         for i, req in enumerate(batch.reqs):
             if req is not self.current_inflight_req:
+                # Inflight reqs' prefill is not finished
                 req.completion_tokens_wo_jump_forward += 1
                 req.output_ids.append(next_token_ids[i])
                 req.check_finished()
+
+            if req.finished():
+                pass
+            else:
+                self.tree_cache.cache_unfinished_req(req)
+
+            if req is self.current_inflight_req:
+                # Inflight request would get a new req idx
+                self.req_to_token_pool.free(req.req_pool_idx)
 
             if req.return_logprob:
                 self.add_logprob_return_values(i, req, pt, next_token_ids, output)
@@ -528,13 +536,6 @@ class ModelTpServer:
                     output.input_top_logprobs[i][-req.last_update_decode_tokens + 1 :]
                 )
             req.output_top_logprobs.append(output.output_top_logprobs[i])
-
-    def cache_filled_batch(self, batch: ScheduleBatch):
-        for req in batch.reqs:
-            self.tree_cache.cache_unfinished_req(req)
-            if req is self.current_inflight_req:
-                # inflight request would get a new req idx
-                self.req_to_token_pool.free(req.req_pool_idx)
 
     def forward_decode_batch(self, batch: ScheduleBatch):
         # Check if decode out of memory
