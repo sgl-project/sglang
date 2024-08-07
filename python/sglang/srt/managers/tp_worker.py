@@ -474,7 +474,7 @@ class ModelTpServer:
                 req.check_finished()
 
             if req.finished():
-                pass
+                self.tree_cache.cache_finished_req(req)
             else:
                 self.tree_cache.cache_unfinished_req(req)
 
@@ -587,6 +587,9 @@ class ModelTpServer:
             req.output_ids.append(next_token_id)
             req.check_finished()
 
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
+
             if req.return_logprob:
                 req.output_token_logprobs.append(
                     (next_token_logprobs[i], next_token_id)
@@ -606,12 +609,9 @@ class ModelTpServer:
         output_spaces_between_special_tokens = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
-        finished_indices = []
         unfinished_indices = []
         for i, req in enumerate(batch.reqs):
-            if req.finished():
-                finished_indices.append(i)
-            else:
+            if not req.finished() and req is not self.current_inflight_req:
                 unfinished_indices.append(i)
 
             if req.finished() or (
@@ -675,26 +675,7 @@ class ModelTpServer:
                 )
             )
 
-        # Remove finished reqs
-        if finished_indices:
-            # Update radix cache
-            for i in finished_indices:
-                self.tree_cache.cache_finished_req(batch.reqs[i])
-
-            # Update batch tensors
-            if unfinished_indices:
-                batch.filter_batch(unfinished_indices)
-            else:
-                batch.reqs = []
-
-    def filter_out_inflight(self, batch: ScheduleBatch):
-        # TODO(lsyin): reduce the overhead, make a special version for this
-        if self.current_inflight_req is None:
-            return
-
-        to_remove = batch.reqs.index(self.current_inflight_req)
-        unfinished_indices = [i for i in range(len(batch.reqs)) if i != to_remove]
-
+        # Remove finished reqs: update batch tensors
         batch.filter_batch(unfinished_indices)
 
     def flush_cache(self):

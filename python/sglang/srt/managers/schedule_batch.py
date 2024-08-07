@@ -613,8 +613,7 @@ class ScheduleBatch:
                     jump_forward_reqs.append(req)
                     filter_indices.remove(i)
 
-        if len(filter_indices) < len(self.reqs):
-            self.filter_batch(filter_indices)
+        self.filter_batch(filter_indices)
 
         return jump_forward_reqs
 
@@ -636,6 +635,15 @@ class ScheduleBatch:
         ] = self.out_cache_loc
 
     def filter_batch(self, unfinished_indices: List[int]):
+        if unfinished_indices is None or len(unfinished_indices) == 0:
+            # Filter out all requests
+            self.reqs = []
+            return
+
+        if len(unfinished_indices) == len(self.reqs):
+            # No need to filter
+            return
+
         self.reqs = [self.reqs[i] for i in unfinished_indices]
         new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cuda")
         self.seq_lens = self.seq_lens[new_indices]
