@@ -1,6 +1,6 @@
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-from sglang.srt.mem_cache.base_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 
 class ChunkCacheEntry:

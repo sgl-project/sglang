@@ -23,7 +23,7 @@ from collections import defaultdict
 
 import torch
 
-from sglang.srt.mem_cache.base_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 
 class TreeNode:
