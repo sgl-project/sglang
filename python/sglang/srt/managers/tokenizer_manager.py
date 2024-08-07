@@ -413,7 +413,7 @@ class TokenizerManager:
             # Log requests
             if self.server_args.log_requests and state.finished:
                 if obj.text is None:
-                    in_obj = {"input_ids": obj.input_ids)}
+                    in_obj = {"input_ids": obj.input_ids}
                 else:
                     in_obj = {"text": obj.text}
                 logger.info(f"in={in_obj}, out={out}")
