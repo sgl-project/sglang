@@ -124,7 +124,7 @@ class Req:
         # For vision input
         self.pixel_values = None
         self.image_size = None
-        self.image_offset = 0
+        self.image_offset = None
         self.pad_value = None
 
         # Prefix info
@@ -711,6 +711,7 @@ class ScheduleBatch:
             self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
 
     def sample(self, logits: torch.Tensor):
+        # TODO(lsyin): move this into a part of layer and run with CUDA Graph
         # Post process logits
         logits = logits.contiguous()
         logits.div_(self.temperatures)
