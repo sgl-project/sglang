@@ -41,18 +41,14 @@ from vllm.distributed import (
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
-from sglang.srt.managers.schedule_batch import (
-    Batch,
-    ForwardMode,
-    InputMetadata,
-    global_server_args_dict,
-)
+from sglang.srt.managers.schedule_batch import Batch, global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.model_config import AttentionArch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,

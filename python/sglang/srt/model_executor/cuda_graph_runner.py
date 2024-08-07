@@ -29,8 +29,8 @@ from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
 )
-from sglang.srt.managers.schedule_batch import (
-    Batch,
+from sglang.srt.managers.schedule_batch import Batch
+from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     InputMetadata,
     init_flashinfer_args,

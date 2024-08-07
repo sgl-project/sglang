@@ -50,8 +50,9 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.managers.schedule_batch import Batch, ForwardMode, Req
+from sglang.srt.managers.schedule_batch import Batch, Req
 from sglang.srt.model_config import ModelConfig
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
