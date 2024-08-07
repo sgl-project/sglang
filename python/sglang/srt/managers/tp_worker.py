@@ -530,17 +530,8 @@ class ModelTpServer:
             req.output_top_logprobs.append(output.output_top_logprobs[i])
 
     def cache_filled_batch(self, batch: ScheduleBatch):
-        for i, req in enumerate(batch.reqs):
-            new_prefix_indices, new_last_node = self.tree_cache.cache_req(
-                rid=req.rid,
-                token_ids=tuple(req.input_ids),
-                last_uncached_pos=len(req.prefix_indices),
-                req_pool_idx=req.req_pool_idx,
-                del_in_memory_pool=False,
-                old_last_node=req.last_node,
-            )
-            req.prefix_indices, req.last_node = new_prefix_indices, new_last_node
-
+        for req in batch.reqs:
+            self.tree_cache.cache_unfinished_req(req)
             if req is self.current_inflight_req:
                 # inflight request would get a new req idx
                 self.req_to_token_pool.free(req.req_pool_idx)
@@ -687,15 +678,7 @@ class ModelTpServer:
         if finished_indices:
             # Update radix cache
             for i in finished_indices:
-                req = batch.reqs[i]
-                self.tree_cache.cache_req(
-                    rid=req.rid,
-                    token_ids=tuple(req.origin_input_ids + req.output_ids)[:-1],
-                    last_uncached_pos=len(req.prefix_indices),
-                    req_pool_idx=req.req_pool_idx,
-                )
-
-                self.tree_cache.dec_lock_ref(req.last_node)
+                self.tree_cache.cache_finished_req(batch.reqs[i])
 
             # Update batch tensors
             if unfinished_indices:
