@@ -482,7 +482,7 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
             p.terminate()
             time.sleep(5)
             print(
-                "\nTimeout after {timeout_per_file} seconds when running {filename}\n"
+                f"\nTimeout after {timeout_per_file} seconds when running {filename}\n"
             )
             return False
 
