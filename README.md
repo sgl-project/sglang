@@ -49,7 +49,7 @@ pip install --upgrade pip
 pip install "sglang[all]"
 
 # Install FlashInfer CUDA kernels
-pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
+pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
 
 ### Method 2: From source
@@ -62,7 +62,7 @@ pip install --upgrade pip
 pip install -e "python[all]"
 
 # Install FlashInfer CUDA kernels
-pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
+pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
 
 ### Method 3: Using docker
