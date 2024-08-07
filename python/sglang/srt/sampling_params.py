@@ -25,6 +25,7 @@ class SamplingParams:
         self,
         max_new_tokens: int = 16,
         stop: Optional[Union[str, List[str]]] = None,
+        stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
@@ -43,6 +44,7 @@ class SamplingParams:
         self.frequency_penalty = frequency_penalty
         self.presence_penalty = presence_penalty
         self.stop_strs = stop
+        self.stop_token_ids = stop_token_ids
         self.max_new_tokens = max_new_tokens
         self.ignore_eos = ignore_eos
         self.skip_special_tokens = skip_special_tokens
@@ -90,13 +92,19 @@ class SamplingParams:
         # Process stop strings
         if self.stop_strs is None:
             self.stop_strs = []
-            self.stop_str_max_len = 0
+            if self.stop_token_ids is None:
+                self.stop_str_max_len = 0
+            else:
+                self.stop_str_max_len = 1
         else:
             if isinstance(self.stop_strs, str):
                 self.stop_strs = [self.stop_strs]
 
             stop_str_max_len = 0
             for stop_str in self.stop_strs:
-                stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
-                stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+                if tokenizer is not None:
+                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
+                    stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+                else:
+                    stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len

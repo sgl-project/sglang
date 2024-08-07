@@ -92,12 +92,16 @@ class TokenizerManager:
             self.context_len = get_context_length(self.hf_config)
 
         if is_multimodal_model(self.model_path):
-            self.processor = get_processor(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-            )
-            self.tokenizer = self.processor.tokenizer
+            if server_args.skip_tokenizer_init:
+                self.tokenizer = None
+            else:
+                self.processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+                self.tokenizer = self.processor.tokenizer
+
             os.environ["TOKENIZERS_PARALLELISM"] = "false"
             self.executor = concurrent.futures.ProcessPoolExecutor(
                 initializer=init_global_processor,
@@ -105,11 +109,14 @@ class TokenizerManager:
                 initargs=(server_args,),
             )
         else:
-            self.tokenizer = get_tokenizer(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-            )
+            if server_args.skip_tokenizer_init:
+                self.tokenizer = None
+            else:
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
 
         self.to_create_loop = True
         self.rid_to_state: Dict[str, ReqState] = {}
@@ -158,11 +165,11 @@ class TokenizerManager:
 
             rid = obj.rid if not_use_index else obj.rid[index]
             input_text = obj.text if not_use_index else obj.text[index]
-            input_ids = (
-                self.tokenizer.encode(input_text)
-                if obj.input_ids is None
-                else obj.input_ids
-            )
+            if obj.input_ids is None:
+                assert self.tokenizer is not None
+                input_ids = self.tokenizer.encode(input_text)
+            else:
+                input_ids = obj.input_ids
             if not not_use_index and obj.input_ids:
                 input_ids = obj.input_ids[index]
 
@@ -191,7 +198,20 @@ class TokenizerManager:
                 else:
                     input_text = obj.text
                     rid = obj.rid[0]
-                input_ids = self.tokenizer.encode(input_text)
+                if self.tokenizer is not None:
+                    input_ids = self.tokenizer.encode(input_text)
+                else:
+                    assert obj.input_ids is not None
+                    input_ids = obj.input_ids
+                    if isinstance(obj.input_ids, list) and isinstance(
+                        obj.input_ids[0], list
+                    ):
+                        # when obj["input_ids"] is List[List[int]]
+                        input_ids = obj.input_ids[index]
+                        rid = obj.rid[index]
+                    else:
+                        input_ids = obj.input_ids
+                        rid = obj.rid[0]
             else:
                 input_text = None
                 if isinstance(obj.input_ids, list) and isinstance(
@@ -393,7 +413,7 @@ class TokenizerManager:
             # Log requests
             if self.server_args.log_requests and state.finished:
                 if obj.text is None:
-                    in_obj = {"text": self.tokenizer.decode(obj.input_ids)}
+                    in_obj = {"input_ids": obj.input_ids)}
                 else:
                     in_obj = {"text": obj.text}
                 logger.info(f"in={in_obj}, out={out}")
@@ -513,6 +533,7 @@ class TokenizerManager:
         if not decode_to_text:
             return [(logprob, token_id, None) for logprob, token_id in token_logprobs]
 
+        assert self.tokenizer is not None
         token_ids = [tid for _, tid in token_logprobs]
         token_texts = self.tokenizer.batch_decode(token_ids)
         return [
