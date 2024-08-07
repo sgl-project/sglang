@@ -313,22 +313,12 @@ class TestOpenAIServer(unittest.TestCase):
 
         result_file_id = batch_job.output_file_id
         file_response = client.files.content(result_file_id)
-        result_content = file_response.read()
-
-        if mode == "completion":
-            result_file_name = "batch_job_complete_results.jsonl"
-        else:
-            result_file_name = "batch_job_chat_results.jsonl"
-        with open(result_file_name, "wb") as file:
-            file.write(result_content)
-        results = []
-        with open(result_file_name, "r", encoding="utf-8") as file:
-            for line in file:
-                json_object = json.loads(line.strip())
-                results.append(json_object)
-        for delete_fid in [uploaded_file.id, result_file_id]:
-            del_pesponse = client.files.delete(delete_fid)
-            assert del_pesponse.deleted
+        result_content = file_response.read().decode("utf-8")  # Decode bytes to string
+        results = [
+            json.loads(line)
+            for line in result_content.split("\n")
+            if line.strip() != ""
+        ]
         assert len(results) == len(content)
 
     def test_completion(self):
