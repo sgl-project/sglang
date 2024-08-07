@@ -162,6 +162,13 @@ class Req:
     def finished(self) -> bool:
         return self.finished_reason is not None
 
+    def adjust_max_prefix_ids(self):
+        max_prefix_ids = self.input_ids
+        if self.return_logprob:
+            max_prefix_ids = self.input_ids[: self.logprob_start_len]
+
+        return max_prefix_ids
+
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
         first_iter = self.surr_offset is None or self.read_offset is None

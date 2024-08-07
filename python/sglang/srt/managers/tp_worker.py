@@ -360,16 +360,11 @@ class ModelTpServer:
         # Compute matched prefix length
         for req in self.waiting_queue:
             req.input_ids = req.origin_input_ids + req.output_ids
-            try_match_ids = req.input_ids
-            if req.return_logprob:
-                try_match_ids = req.input_ids[: req.logprob_start_len]
             # NOTE: the prefix_indices must always be aligned with last_node
-            prefix_indices, last_node = self.tree_cache.match_prefix(
-                rid=req.rid, key=try_match_ids
+            req.prefix_indices, req.last_node = self.tree_cache.match_prefix(
+                rid=req.rid, key=req.adjust_max_prefix_ids()
             )
-            req.extend_input_len = len(req.input_ids) - len(prefix_indices)
-            req.prefix_indices = prefix_indices
-            req.last_node = last_node
+            req.extend_input_len = len(req.input_ids) - len(req.prefix_indices)
 
         # Get priority queue
         self.waiting_queue = self.scheduler.get_priority_queue(self.waiting_queue)
@@ -391,6 +386,24 @@ class ModelTpServer:
             )
 
         for req in self.waiting_queue:
+
+            # FIXME: Move this code into adjust_max_prefix_len
+            if req.return_logprob and req.normalized_prompt_logprob is None:
+                # Need at least two tokens to compute normalized logprob
+                if req.extend_input_len < 2:
+                    delta = 2 - req.extend_input_len
+                    req.extend_input_len += delta
+                    req.prefix_indices = req.prefix_indices[:-delta]
+                    if req.image_offset is not None:
+                        req.image_offset += delta
+
+            if req.extend_input_len == 0 and req.sampling_params.max_new_tokens > 0:
+                # Need at least one token to compute logits
+                req.extend_input_len = 1
+                req.prefix_indices = req.prefix_indices[:-1]
+                if req.image_offset is not None:
+                    req.image_offset += 1
+
             res = adder.add_one_req(req)
             if (
                 not res
