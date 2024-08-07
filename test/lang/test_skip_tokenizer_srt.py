@@ -1,0 +1,77 @@
+import json
+import unittest
+import os
+import sys
+cur_path = os.path.split(os.path.realpath(__file__))[0]
+sys.path.append(os.path.abspath(os.path.join(cur_path, '../../python')))
+
+import sglang as sgl
+from sglang.test.test_programs import (
+    test_decode_int,
+    test_decode_json_regex,
+    test_expert_answer,
+    test_few_shot_qa,
+    test_mt_bench,
+    test_parallel_decoding,
+    test_regex,
+    test_select,
+    test_stream,
+    test_tool_use,
+)
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+
+
+class TestSRTBackend(unittest.TestCase):
+    backend = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.backend = sgl.Runtime(model_path=DEFAULT_MODEL_NAME_FOR_TEST,
+                                  skip_tokenizer_init=True)
+        sgl.set_default_backend(cls.backend)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.backend.shutdown()
+
+    def test_few_shot_qa(self):
+        test_few_shot_qa()
+
+    def test_mt_bench(self):
+        test_mt_bench()
+
+    def test_select(self):
+        test_select(check_answer=False)
+
+    def test_decode_int(self):
+        test_decode_int()
+
+    def test_decode_json_regex(self):
+        test_decode_json_regex()
+
+    def test_expert_answer(self):
+        test_expert_answer()
+
+    def test_tool_use(self):
+        test_tool_use()
+
+    def test_parallel_decoding(self):
+        test_parallel_decoding()
+
+    def test_stream(self):
+        test_stream()
+
+    def test_regex(self):
+        test_regex()
+
+
+if __name__ == "__main__":
+    unittest.main(warnings="ignore")
+
+    # from sglang.global_config import global_config
+
+    # global_config.verbosity = 2
+    # t = TestSRTBackend()
+    # t.setUpClass()
+    # t.test_few_shot_qa()
+    # t.tearDownClass()
