@@ -432,7 +432,7 @@ class ScheduleBatch:
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
         pt = 0
-        for i in range(bs):
+        for i, req in enumerate(reqs):
             self.req_to_token_pool.req_to_token[req.req_pool_idx][
                 prefix_lens[i] : prefix_lens[i] + extend_lens[i]
             ] = out_cache_loc[pt : pt + extend_lens[i]]
