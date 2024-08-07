@@ -451,7 +451,8 @@ class ScheduleBatch:
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
         self.image_offsets = [
-            r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
+            (r.image_offset - p_len) if r.image_offset is not None else 0
+            for r, p_len in zip(reqs, prefix_lens)
         ]
         self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
         self.extend_num_tokens = extend_num_tokens
