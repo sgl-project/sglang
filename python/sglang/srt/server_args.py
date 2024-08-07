@@ -41,8 +41,9 @@ class ServerArgs:
     additional_ports: Optional[Union[List[int], int]] = None
 
     # Memory and scheduling
+    # A default value "None" means a computed default value will be used.
     mem_fraction_static: Optional[float] = None
-    max_prefill_tokens: Optional[int] = None
+    max_prefill_tokens: int = 16384
     max_running_requests: Optional[int] = None
     max_num_reqs: Optional[int] = None
     max_total_tokens: Optional[int] = None

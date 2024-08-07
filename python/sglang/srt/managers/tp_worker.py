@@ -113,11 +113,7 @@ class ModelTpServer:
                 trust_remote_code=server_args.trust_remote_code,
             )
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
-        self.max_prefill_tokens = (
-            16384
-            if server_args.max_prefill_tokens is None
-            else server_args.max_prefill_tokens
-        )
+        self.max_prefill_tokens = server_args.max_prefill_tokens
         self.max_running_requests = min(
             (
                 self.max_total_num_tokens // 2
@@ -176,8 +172,8 @@ class ModelTpServer:
         self.out_pyobjs = []
         self.decode_forward_ct = 0
         self.stream_interval = server_args.stream_interval
-        self.num_generated_tokens = 0
-        self.last_stats_tic = time.time()
+        self.total_decoded_tokens = 0
+        self.total_decoding_seconds = 0.0
 
         # Init the FSM cache for constrained generation
         self.regex_fsm_cache = FSMCache(
@@ -245,12 +241,16 @@ class ModelTpServer:
             if self.running_batch is not None:
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(global_config.num_continue_decode_steps):
-                    self.num_generated_tokens += len(self.running_batch.reqs)
+                    self.total_decoded_tokens += len(self.running_batch.reqs)
+                    # TODO (min): use cuda events for better timing measurements.
+                    start_tic = time.time()
                     self.forward_decode_batch(self.running_batch)
+                    self.total_decoding_seconds += time.time() - start_tic
+                    self.decode_forward_ct += 1
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
-                        self.print_stats()
+                        self.print_decode_stats()
 
                     if self.running_batch.is_empty():
                         self.running_batch = None
@@ -262,21 +262,22 @@ class ModelTpServer:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
 
-    def print_stats(self):
+    def print_decode_stats(self):
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
-        self.num_generated_tokens = 0
-        self.last_stats_tic = time.time()
+        throughput = self.total_decoded_tokens / self.total_decoding_seconds
         logger.info(
-            f"[gpu={self.gpu_id}] Decode batch. "
+            f"[gpu={self.gpu_id}] Decode batch (every 40 batches). "
             f"#running-req: {len(self.running_batch.reqs)}, "
             f"#token: {num_used}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-            f"gen throughput (token/s): {throughput:.2f}, "
+            f"throughput (token/s): {throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
+        # reset stats until the next print_decode_stats
+        self.total_decoded_tokens = 0
+        self.total_decoding_seconds = 0.0
 
     def check_memory(self):
         available_size = (
@@ -504,14 +505,14 @@ class ModelTpServer:
         if len(can_run_list) == 0:
             return None
 
-        # Print stats
+        # Print prefill stats
         if self.tp_rank == 0:
             hit_tokens = sum(len(x.prefix_indices) for x in can_run_list)
             self.tree_cache_metrics["total"] += (
                 hit_tokens + new_batch_input_tokens
-            ) / 10**9
-            self.tree_cache_metrics["hit"] += hit_tokens / 10**9
-            tree_cache_hit_rate = (
+            ) / 1e9
+            self.tree_cache_metrics["hit"] += hit_tokens / 1e9
+            tree_cache_hit_ratio = (
                 self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
             )
             logger.info(
@@ -519,7 +520,7 @@ class ModelTpServer:
                 f"#new-seq: {len(can_run_list)}, "
                 f"#new-token: {new_batch_input_tokens}, "
                 f"#cached-token: {hit_tokens}, "
-                f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                f"cache hit ratio: {100.0 * tree_cache_hit_ratio:.2f}%, "
                 f"#running-req: {running_bs}, "
                 f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + take_inflight}"
             )
@@ -667,7 +668,6 @@ class ModelTpServer:
                 return
 
         # Update batch tensors
-        self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         batch.prepare_for_decode()
 
         # Forward and sample the next tokens
