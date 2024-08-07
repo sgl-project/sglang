@@ -321,6 +321,9 @@ class ScheduleBatch:
             return_logprob=return_logprob,
         )
 
+    def batch_size(self):
+        return len(self.reqs) if self.reqs is not None else 0
+
     def is_empty(self):
         return len(self.reqs) == 0
 
@@ -328,9 +331,44 @@ class ScheduleBatch:
         # Return whether batch has at least 1 streaming request
         return any(r.stream for r in self.reqs)
 
+    def batch_sampling_params(self, vocab_size, int_token_logit_bias):
+        device = "cuda"
+        bs, reqs = self.batch_size(), self.reqs
+        self.temperatures = torch.tensor(
+            [r.sampling_params.temperature for r in reqs],
+            dtype=torch.float,
+            device=device,
+        ).view(-1, 1)
+        self.top_ps = torch.tensor(
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
+        )
+        self.top_ks = torch.tensor(
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
+        )
+        self.frequency_penalties = torch.tensor(
+            [r.sampling_params.frequency_penalty for r in reqs],
+            dtype=torch.float,
+            device=device,
+        )
+        self.presence_penalties = torch.tensor(
+            [r.sampling_params.presence_penalty for r in reqs],
+            dtype=torch.float,
+            device=device,
+        )
+
+        # Handle logit bias but only allocate when needed
+        self.logit_bias = None
+        for i in range(bs):
+            if reqs[i].sampling_params.dtype == "int":
+                if self.logit_bias is None:
+                    self.logit_bias = torch.zeros(
+                        (bs, vocab_size), dtype=torch.float32, device=device
+                    )
+                self.logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
+
     def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
         device = "cuda"
-        bs = len(self.reqs)
+        bs = self.batch_size()
         reqs = self.reqs
         input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
         prefix_indices = [r.prefix_indices for r in reqs]
@@ -388,16 +426,6 @@ class ScheduleBatch:
             ] = out_cache_loc[pt : pt + extend_lens[i]]
             pt += extend_lens[i]
 
-        # Handle logit bias but only allocate when needed
-        logit_bias = None
-        for i in range(bs):
-            if reqs[i].sampling_params.dtype == "int":
-                if logit_bias is None:
-                    logit_bias = torch.zeros(
-                        (bs, vocab_size), dtype=torch.float32, device=device
-                    )
-                logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
-
         # Set fields
         self.input_ids = torch.tensor(
             flatten_input_ids, dtype=torch.int32, device=device
@@ -415,31 +443,10 @@ class ScheduleBatch:
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
 
-        self.temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
-        self.top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        )
-        self.top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
-        )
-        self.frequency_penalties = torch.tensor(
-            [r.sampling_params.frequency_penalty for r in reqs],
-            dtype=torch.float,
-            device=device,
-        )
-        self.presence_penalties = torch.tensor(
-            [r.sampling_params.presence_penalty for r in reqs],
-            dtype=torch.float,
-            device=device,
-        )
-        self.logit_bias = logit_bias
+        self.batch_sampling_params(vocab_size, int_token_logit_bias)
 
     def check_decode_mem(self):
-        bs = len(self.reqs)
+        bs = self.batch_size()
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 
