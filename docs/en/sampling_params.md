@@ -33,7 +33,7 @@ The `sampling_params` follows this format
 
 ```python
 # The maximum number of output tokens
-max_new_tokens: int = 16,
+max_new_tokens: int = 128,
 # Stop when hitting any of the strings in this list.
 stop: Optional[Union[str, List[str]]] = None,
 # Sampling temperature
@@ -90,7 +90,7 @@ response = requests.post(
         "text": "The capital of France is",
         "sampling_params": {
             "temperature": 0,
-            "max_new_tokens": 256,
+            "max_new_tokens": 32,
         },
         "stream": True,
     },
@@ -133,7 +133,7 @@ response = requests.post(
         "image_data": "example_image.png",
         "sampling_params": {
             "temperature": 0,
-            "max_new_tokens": 32,
+            "max_new_tokens": 128,
         },
     },
 )

@@ -23,7 +23,7 @@ _SAMPLING_EPS = 1e-6
 class SamplingParams:
     def __init__(
         self,
-        max_new_tokens: int = 16,
+        max_new_tokens: int = 128,
         stop: Optional[Union[str, List[str]]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
