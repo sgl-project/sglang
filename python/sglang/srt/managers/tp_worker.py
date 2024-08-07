@@ -289,10 +289,10 @@ class ModelTpServer:
                 "KV cache pool leak detected!"
             )
 
-        if self.req_to_token_pool.can_use_mem_size != self.req_to_token_pool.size:
+        if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
             warnings.warn(
                 "Warning: "
-                f"available req slots={self.req_to_token_pool.can_use_mem_size}, "
+                f"available req slots={len(self.req_to_token_pool.free_slots)}, "
                 f"total slots={self.req_to_token_pool.size}\n"
                 "Memory pool leak detected!"
             )
