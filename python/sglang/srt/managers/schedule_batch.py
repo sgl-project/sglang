@@ -780,7 +780,7 @@ def top_k_top_p_sampling_from_probs_torch(
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
     except RuntimeError:
         batch_next_token_ids = torch.zeros(
-            (probs_sort.shape[0],), dtype=torch.int64, device=probs.device
+            (probs_sort.shape[0],), dtype=torch.int32, device=probs.device
         )
         success = torch.zeros(probs.shape[0], dtype=torch.bool, device=probs.device)
         return batch_next_token_ids, success

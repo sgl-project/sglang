@@ -74,7 +74,7 @@ class RadixCache(BasePrefixCache):
         if value:
             value = torch.concat(value)
         else:
-            value = torch.tensor([], dtype=torch.int64)
+            value = torch.tensor([], dtype=torch.int32)
         return value, last_node[0]
 
     def insert(self, key, value=None):
@@ -102,7 +102,7 @@ class RadixCache(BasePrefixCache):
             if del_in_memory_pool:
                 self.token_to_kv_pool.free(indices)
             else:
-                return torch.tensor([], dtype=torch.int64), self.root_node
+                return torch.tensor([], dtype=torch.int32), self.root_node
 
         # Radix Cache takes one ref in memory pool
         self.token_to_kv_pool.free(indices[last_uncached_pos:new_prefix_len])
