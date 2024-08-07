@@ -627,8 +627,7 @@ class ScheduleBatch:
                     jump_forward_reqs.append(req)
                     filter_indices.remove(i)
 
-        if len(filter_indices) < len(self.reqs):
-            self.filter_batch(filter_indices)
+        self.filter_batch(filter_indices)
 
         return jump_forward_reqs
 
