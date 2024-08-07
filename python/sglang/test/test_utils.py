@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import requests
@@ -18,7 +18,7 @@ from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import get_exception_traceback
 
-MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -457,7 +457,7 @@ def run_with_timeout(
     return ret_value[0]
 
 
-def run_unittest_files(files: list[str], timeout_per_file: float):
+def run_unittest_files(files: List[str], timeout_per_file: float):
     tic = time.time()
     success = True
 

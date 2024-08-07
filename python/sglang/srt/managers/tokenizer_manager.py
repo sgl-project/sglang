@@ -153,8 +153,9 @@ class TokenizerManager:
     async def _handle_single_request(
         self, obj, request, index=None, is_cache_for_prefill=False
     ):
-        if not is_cache_for_prefill:
-            not_use_index = not (index is not None)
+        if not is_cache_for_prefill:  # The normal case with a single prompt
+            not_use_index = index is None
+
             rid = obj.rid if not_use_index else obj.rid[index]
             input_text = obj.text if not_use_index else obj.text[index]
             input_ids = (
@@ -182,14 +183,27 @@ class TokenizerManager:
             top_logprobs_num = (
                 obj.top_logprobs_num if not_use_index else obj.top_logprobs_num[index]
             )
-        else:
-            if isinstance(obj.text, list):
-                input_text = obj.text[index]
-                rid = obj.rid[index]
+        else:  # A prefill request to cache the common prompt for parallel sampling
+            if obj.text is not None:
+                if isinstance(obj.text, list):
+                    input_text = obj.text[index]
+                    rid = obj.rid[index]
+                else:
+                    input_text = obj.text
+                    rid = obj.rid[0]
+                input_ids = self.tokenizer.encode(input_text)
             else:
-                input_text = obj.text
-                rid = obj.rid[0]
-            input_ids = self.tokenizer.encode(input_text)
+                input_text = None
+                if isinstance(obj.input_ids, list) and isinstance(
+                    obj.input_ids[0], list
+                ):
+                    # when obj["input_ids"] is List[List[int]]
+                    input_ids = obj.input_ids[index]
+                    rid = obj.rid[index]
+                else:
+                    input_ids = obj.input_ids
+                    rid = obj.rid[0]
+
             sampling_params = SamplingParams(**obj.sampling_params[0])
             sampling_params.max_new_tokens = 0
             pixel_values, image_hash, image_size = await self._get_pixel_values(
@@ -240,11 +254,11 @@ class TokenizerManager:
                 ):
                     if input_id_result is not None:
                         input_id_result.append(input_id)
-                    pass
-            if len(input_id_result) > 1 and input_id_result is not None:
+            if input_id_result is not None and len(input_id_result) > 1:
                 obj.input_ids = input_id_result
             elif input_id_result is not None:
                 obj.input_ids = input_id_result[0]
+
         # First send out all requests
         for i in range(batch_size):
             for j in range(parallel_sample_num):
@@ -264,11 +278,12 @@ class TokenizerManager:
                         input_text = None
                         input_ids = obj.input_ids[i]
                 else:
+                    assert obj.input_ids is not None
                     if batch_size == 1:
-                        input_text = obj.text
+                        input_text = None
                         input_ids = obj.input_ids
                     else:
-                        input_text = obj.text[i]
+                        input_text = None
                         input_ids = obj.input_ids[i]
                 sampling_params = self._get_sampling_params(obj.sampling_params[index])
                 pixel_values, image_hash, image_size = await self._get_pixel_values(
@@ -375,8 +390,13 @@ class TokenizerManager:
                 obj.return_text_in_logprobs,
             )
 
+            # Log requests
             if self.server_args.log_requests and state.finished:
-                logger.info(f"in={obj.text}, out={out}")
+                if obj.text is None:
+                    in_obj = {"text": self.tokenizer.decode(obj.input_ids)}
+                else:
+                    in_obj = {"text": obj.text}
+                logger.info(f"in={in_obj}, out={out}")
 
             state.out_list = []
             if state.finished:

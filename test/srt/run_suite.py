@@ -5,8 +5,9 @@ from sglang.test.test_utils import run_unittest_files
 
 suites = {
     "minimal": [
-        "test_openai_server.py",
         "test_eval_accuracy.py",
+        "test_openai_server.py",
+        "test_vision_openai_server.py",
         "test_chunked_prefill.py",
         "test_torch_compile.py",
         "models/test_causal_models.py",

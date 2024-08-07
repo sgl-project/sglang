@@ -538,24 +538,17 @@ class StreamExecutor:
             self.stream_var_event[name].set()
 
     def _execute_select(self, expr: SglSelect):
-        (
-            decision,
-            normalized_prompt_logprobs,
-            input_token_logprobs,
-            output_token_logprobs,
-        ) = self.backend.select(self, expr.choices, expr.temperature)
+        choices_decision = self.backend.select(
+            self, expr.choices, expr.temperature, expr.choices_method
+        )
         if expr.name is not None:
             name = expr.name
-            self.variables[name] = decision
-            self.meta_info[name] = {
-                "normalized_prompt_logprobs": normalized_prompt_logprobs,
-                "input_token_logprobs": input_token_logprobs,
-                "output_token_logprobs": output_token_logprobs,
-            }
+            self.variables[name] = choices_decision.decision
+            self.meta_info[name] = choices_decision.meta_info
             self.variable_event[name].set()
             if self.stream_var_event:
                 self.stream_var_event[name].set()
-        self.text_ += decision
+        self.text_ += choices_decision.decision
 
     def _execute_variable(self, expr: SglVariable):
         src_executor = expr.source_stream_executor
