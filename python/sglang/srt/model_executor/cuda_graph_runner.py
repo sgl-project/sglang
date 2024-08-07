@@ -29,8 +29,8 @@ from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
 )
-from sglang.srt.managers.schedule_batch import (
-    Batch,
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     InputMetadata,
     init_flashinfer_args,
@@ -202,7 +202,7 @@ class CudaGraphRunner:
         self.graph_memory_pool = graph.pool()
         return graph, None, out, flashinfer_decode_wrapper
 
-    def replay(self, batch: Batch):
+    def replay(self, batch: ScheduleBatch):
         assert batch.out_cache_loc is not None
         raw_bs = len(batch.reqs)
 

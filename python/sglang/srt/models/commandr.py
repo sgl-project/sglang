@@ -64,7 +64,7 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.model_runner import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
 @torch.compile

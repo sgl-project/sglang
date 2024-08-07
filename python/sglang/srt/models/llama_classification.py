@@ -25,7 +25,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.logits_processor import LogitProcessorOutput
-from sglang.srt.model_executor.model_runner import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama2 import LlamaModel
 
 

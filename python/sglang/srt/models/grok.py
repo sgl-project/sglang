@@ -52,7 +52,7 @@ from vllm.utils import print_warning_once
 from sglang.srt.layers.fused_moe import fused_moe
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.model_runner import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 use_fused = True
 
