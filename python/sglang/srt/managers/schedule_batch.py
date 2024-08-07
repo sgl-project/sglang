@@ -274,7 +274,7 @@ class Req:
 
 
 @dataclass
-class Batch:
+class ScheduleBatch:
     """Store all inforamtion of a batch."""
 
     # Request, memory pool, and cache
@@ -663,7 +663,7 @@ class Batch:
             if self_val is not None:  # logit_bias can be None
                 setattr(self, item, self_val[new_indices])
 
-    def merge(self, other: "Batch"):
+    def merge(self, other: "ScheduleBatch"):
         self.reqs.extend(other.reqs)
 
         self.req_pool_indices = torch.concat(

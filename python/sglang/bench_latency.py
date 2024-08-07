@@ -50,7 +50,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.managers.schedule_batch import Batch, Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -189,7 +189,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
 
 
 def extend(reqs, model_runner):
-    batch = Batch.init_new(
+    batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool=model_runner.token_to_kv_pool,
