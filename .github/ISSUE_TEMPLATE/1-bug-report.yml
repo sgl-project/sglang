@@ -11,6 +11,7 @@ body:
     - label: 1. I have searched related issues but cannot get the expected help.
     - label: 2. The bug has not been fixed in the latest version.
     - label: 3. Please note that if the bug-related issue you submitted lacks corresponding environment info and a minimal reproducible demo, it will be challenging for us to reproduce and resolve the issue, reducing the likelihood of receiving feedback.
+    - label: 4. If the issue you raised is not a bug but a question, please raise a discussion at https://github.com/sgl-project/sglang/discussions/new/choose Otherwise, it will be closed.
 - type: textarea
   attributes:
     label: Describe the bug
