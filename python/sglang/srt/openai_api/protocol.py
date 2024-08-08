@@ -294,3 +294,19 @@ class ChatCompletionStreamResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
+
+
+class EmbeddingRequest(BaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/embeddings/create
+    input: Union[List[int], List[List[int]], str, List[str]]
+    model: str
+    encoding_format: str = "float"
+    dimensions: int = None
+    user: Optional[str] = None
+
+
+class EmbeddingResponse(BaseModel):
+    index: str
+    embedding: List[float] = None
+    object: str = "embedding"
