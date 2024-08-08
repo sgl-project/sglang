@@ -388,23 +388,6 @@ class ModelTpServer:
 
         for req in self.waiting_queue:
 
-            # FIXME: Move this code into adjust_max_prefix_len
-            if req.return_logprob and req.normalized_prompt_logprob is None:
-                # Need at least two tokens to compute normalized logprob
-                if req.extend_input_len < 2:
-                    delta = 2 - req.extend_input_len
-                    req.extend_input_len += delta
-                    req.prefix_indices = req.prefix_indices[:-delta]
-                    if req.image_offset is not None:
-                        req.image_offset += delta
-
-            if req.extend_input_len == 0 and req.sampling_params.max_new_tokens > 0:
-                # Need at least one token to compute logits
-                req.extend_input_len = 1
-                req.prefix_indices = req.prefix_indices[:-1]
-                if req.image_offset is not None:
-                    req.image_offset += 1
-
             res = adder.add_one_req(req)
             if (
                 not res
