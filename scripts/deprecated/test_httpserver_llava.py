@@ -36,7 +36,7 @@ async def test_concurrent(args):
                     "image_data": "example_image.png",
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 16,
+                        "max_new_tokens": 64,
                     },
                 },
             )

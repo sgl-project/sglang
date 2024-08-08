@@ -35,7 +35,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.policy_scheduler import PolicyScheduler
+from sglang.srt.managers.policy_scheduler import PolicyScheduler, PrefillAdder
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     BaseFinishReason,
@@ -232,8 +232,6 @@ class ModelTpServer:
         if new_batch is not None:
             # Run a new prefill batch
             self.forward_prefill_batch(new_batch)
-            self.cache_filled_batch(new_batch)
-            self.filter_out_inflight(new_batch)
 
             if not new_batch.is_empty():
                 if self.running_batch is None:
@@ -353,175 +351,76 @@ class ModelTpServer:
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
-        # TODO(lsyin): organize this function
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
         if running_bs >= self.max_running_requests:
-            return
+            return None
 
         # Compute matched prefix length
         for req in self.waiting_queue:
             req.input_ids = req.origin_input_ids + req.output_ids
-            try_match_ids = req.input_ids
-            if req.return_logprob:
-                try_match_ids = req.input_ids[: req.logprob_start_len]
             # NOTE: the prefix_indices must always be aligned with last_node
-            prefix_indices, last_node = self.tree_cache.match_prefix(
-                rid=req.rid, key=try_match_ids
+            req.prefix_indices, req.last_node = self.tree_cache.match_prefix(
+                rid=req.rid, key=req.adjust_max_prefix_ids()
             )
-            req.extend_input_len = len(req.input_ids) - len(prefix_indices)
-            req.prefix_indices = prefix_indices
-            req.last_node = last_node
+            req.extend_input_len = len(req.input_ids) - len(req.prefix_indices)
 
         # Get priority queue
         self.waiting_queue = self.scheduler.get_priority_queue(self.waiting_queue)
 
-        # Add requests if there is available space
-        can_run_list = []
-        new_batch_total_tokens = 0
-        new_batch_input_tokens = 0
-
-        available_size = (
-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+        adder = PrefillAdder(
+            self.tree_cache,
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
+            self.max_prefill_tokens,
+            self.chunked_prefill_size,
         )
-        if self.running_batch:
-            available_size -= sum(
-                [
-                    (r.sampling_params.max_new_tokens - len(r.output_ids))
-                    * self.new_token_ratio
-                    for r in self.running_batch.reqs
-                ]
-            )
 
-        # Handle the current inflight request
-        take_inflight = 0
-        if self.current_inflight_req:
-            take_inflight = 1
-            r = self.current_inflight_req
-            r.input_ids = r.origin_input_ids + r.output_ids
-            truncated = (
-                len(r.input_ids) - len(r.prefix_indices) > self.chunked_prefill_size
-            )
-            r.extend_input_len = min(
-                len(r.input_ids) - len(r.prefix_indices), self.chunked_prefill_size
-            )
-            r.input_ids = r.input_ids[: len(r.prefix_indices) + r.extend_input_len]
-            can_run_list.append(r)
+        if self.running_batch is not None:
+            adder.remove_running_tokens(self.running_batch, self.new_token_ratio)
 
-            if not truncated:
-                # Finish inflight
-                self.current_inflight_req = None
-                new_batch_total_tokens += (
-                    r.extend_input_len + r.sampling_params.max_new_tokens
-                )
-                new_batch_input_tokens += r.extend_input_len
-            else:
-                new_batch_total_tokens += r.extend_input_len
-                new_batch_input_tokens += r.extend_input_len
+        has_inflight = self.current_inflight_req is not None
+        if self.current_inflight_req is not None:
+            self.current_inflight_req = adder.add_inflight_req(
+                self.current_inflight_req
+            )
 
         for req in self.waiting_queue:
-            if req.return_logprob and req.normalized_prompt_logprob is None:
-                # Need at least two tokens to compute normalized logprob
-                if req.extend_input_len < 2:
-                    delta = 2 - req.extend_input_len
-                    req.extend_input_len += delta
-                    req.prefix_indices = req.prefix_indices[:-delta]
-                    if req.image_offset is not None:
-                        req.image_offset += delta
-            if req.extend_input_len == 0 and req.sampling_params.max_new_tokens > 0:
-                # Need at least one token to compute logits
-                req.extend_input_len = 1
-                req.prefix_indices = req.prefix_indices[:-1]
-                if req.image_offset is not None:
-                    req.image_offset += 1
 
+            res = adder.add_one_req(req)
             if (
-                req.extend_input_len
-                + req.sampling_params.max_new_tokens
-                + new_batch_total_tokens
-                < available_size
-                and (
-                    req.extend_input_len + new_batch_input_tokens
-                    <= self.max_prefill_tokens
-                    or len(can_run_list) == 0
-                )
+                not res
+                or adder.no_remaining_tokens()
+                or running_bs + len(adder.can_run_list) >= self.max_running_requests
             ):
-                delta = self.tree_cache.inc_lock_ref(req.last_node)
-                available_size += delta
-
-                if not (
-                    req.extend_input_len
-                    + req.sampling_params.max_new_tokens
-                    + new_batch_total_tokens
-                    < available_size
-                ):
-                    # Undo locking
-                    delta = self.tree_cache.dec_lock_ref(req.last_node)
-                    available_size += delta
-                    break
-                else:
-                    # Add this request to the running batch
-                    if (
-                        self.chunked_prefill_size is None
-                        or (
-                            new_batch_input_tokens + req.extend_input_len
-                            <= self.chunked_prefill_size
-                        )
-                        or (
-                            req.return_logprob and req.normalized_prompt_logprob is None
-                        )
-                    ):
-                        can_run_list.append(req)
-                        new_batch_total_tokens += (
-                            req.extend_input_len + req.sampling_params.max_new_tokens
-                        )
-                        new_batch_input_tokens += req.extend_input_len
-                    else:
-                        trunc_len = self.chunked_prefill_size - new_batch_input_tokens
-
-                        if trunc_len <= 0:
-                            # Undo locking
-                            delta = self.tree_cache.dec_lock_ref(req.last_node)
-                            available_size += delta
-                            break
-
-                        req.extend_input_len = trunc_len
-                        req.input_ids = req.input_ids[
-                            : len(req.prefix_indices) + req.extend_input_len
-                        ]
-                        can_run_list.append(req)
-                        self.current_inflight_req = req
-                        new_batch_input_tokens += req.extend_input_len
-                        new_batch_total_tokens += req.extend_input_len
-                        break
-            else:
                 break
 
-            if running_bs + len(can_run_list) >= self.max_running_requests:
-                break
+        can_run_list = adder.can_run_list
+
+        if adder.new_inflight_req is not None:
+            assert self.current_inflight_req is None
+            self.current_inflight_req = adder.new_inflight_req
 
         if len(can_run_list) == 0:
             return None
 
         # Print stats
         if self.tp_rank == 0:
-            hit_tokens = sum(len(x.prefix_indices) for x in can_run_list)
             self.tree_cache_metrics["total"] += (
-                hit_tokens + new_batch_input_tokens
+                adder.log_input_tokens + adder.log_hit_tokens
             ) / 10**9
-            self.tree_cache_metrics["hit"] += hit_tokens / 10**9
+            self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10**9
             tree_cache_hit_rate = (
                 self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
             )
             logger.info(
                 f"[gpu={self.gpu_id}] Prefill batch. "
                 f"#new-seq: {len(can_run_list)}, "
-                f"#new-token: {new_batch_input_tokens}, "
-                f"#cached-token: {hit_tokens}, "
+                f"#new-token: {adder.log_input_tokens}, "
+                f"#cached-token: {adder.log_hit_tokens}, "
                 f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
                 f"#running-req: {running_bs}, "
-                f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + take_inflight}"
+                f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
             )
 
         # Return the new batch
@@ -564,9 +463,19 @@ class ModelTpServer:
         pt = 0
         for i, req in enumerate(batch.reqs):
             if req is not self.current_inflight_req:
+                # Inflight reqs' prefill is not finished
                 req.completion_tokens_wo_jump_forward += 1
                 req.output_ids.append(next_token_ids[i])
                 req.check_finished()
+
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
+            else:
+                self.tree_cache.cache_unfinished_req(req)
+
+            if req is self.current_inflight_req:
+                # Inflight request would get a new req idx
+                self.req_to_token_pool.free(req.req_pool_idx)
 
             if req.return_logprob:
                 self.add_logprob_return_values(i, req, pt, next_token_ids, output)
@@ -623,22 +532,6 @@ class ModelTpServer:
                 )
             req.output_top_logprobs.append(output.output_top_logprobs[i])
 
-    def cache_filled_batch(self, batch: ScheduleBatch):
-        for i, req in enumerate(batch.reqs):
-            new_prefix_indices, new_last_node = self.tree_cache.cache_req(
-                rid=req.rid,
-                token_ids=tuple(req.input_ids),
-                last_uncached_pos=len(req.prefix_indices),
-                req_pool_idx=req.req_pool_idx,
-                del_in_memory_pool=False,
-                old_last_node=req.last_node,
-            )
-            req.prefix_indices, req.last_node = new_prefix_indices, new_last_node
-
-            if req is self.current_inflight_req:
-                # inflight request would get a new req idx
-                self.req_to_token_pool.free(req.req_pool_idx)
-
     def forward_decode_batch(self, batch: ScheduleBatch):
         # Check if decode out of memory
         if not batch.check_decode_mem():
@@ -689,6 +582,9 @@ class ModelTpServer:
             req.output_ids.append(next_token_id)
             req.check_finished()
 
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
+
             if req.return_logprob:
                 req.output_token_logprobs.append(
                     (next_token_logprobs[i], next_token_id)
@@ -708,12 +604,9 @@ class ModelTpServer:
         output_spaces_between_special_tokens = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
-        finished_indices = []
         unfinished_indices = []
         for i, req in enumerate(batch.reqs):
-            if req.finished():
-                finished_indices.append(i)
-            else:
+            if not req.finished() and req is not self.current_inflight_req:
                 unfinished_indices.append(i)
 
             if req.finished() or (
@@ -777,34 +670,7 @@ class ModelTpServer:
                 )
             )
 
-        # Remove finished reqs
-        if finished_indices:
-            # Update radix cache
-            for i in finished_indices:
-                req = batch.reqs[i]
-                self.tree_cache.cache_req(
-                    rid=req.rid,
-                    token_ids=tuple(req.origin_input_ids + req.output_ids)[:-1],
-                    last_uncached_pos=len(req.prefix_indices),
-                    req_pool_idx=req.req_pool_idx,
-                )
-
-                self.tree_cache.dec_lock_ref(req.last_node)
-
-            # Update batch tensors
-            if unfinished_indices:
-                batch.filter_batch(unfinished_indices)
-            else:
-                batch.reqs = []
-
-    def filter_out_inflight(self, batch: ScheduleBatch):
-        # TODO(lsyin): reduce the overhead, make a special version for this
-        if self.current_inflight_req is None:
-            return
-
-        to_remove = batch.reqs.index(self.current_inflight_req)
-        unfinished_indices = [i for i in range(len(batch.reqs)) if i != to_remove]
-
+        # Remove finished reqs: update batch tensors
         batch.filter_batch(unfinished_indices)
 
     def flush_cache(self):
