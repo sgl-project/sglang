@@ -156,18 +156,20 @@ class InputMetadata:
             top_logprobs_nums=batch.top_logprobs_nums,
         )
 
-        prefix_lens = torch.tensor(
-            [len(r.prefix_indices) for r in batch.reqs], device="cuda"
-        )
-
         ret.compute_positions(batch)
 
         ret.compute_extend_infos(batch)
 
         ret.init_total_num_tokens(batch)
 
+        prefix_lens = None
+        if forward_mode != ForwardMode.DECODE:
+            prefix_lens = torch.tensor(
+                [len(r.prefix_indices) for r in batch.reqs], device="cuda"
+            )
+
         if model_runner.server_args.disable_flashinfer:
-            ret.init_triton_args(prefix_lens)
+            ret.init_triton_args(batch, prefix_lens)
 
         flashinfer_use_ragged = False
         if not model_runner.server_args.disable_flashinfer:
@@ -182,14 +184,11 @@ class InputMetadata:
 
         return ret
 
-    def init_triton_args(self, prefix_lens):
+    def init_triton_args(self, batch: ScheduleBatch, prefix_lens):
         """Init auxiliary variables for triton attention backend."""
-        batch_size = len(self.seq_lens)
-        self.triton_max_seq_len = int(torch.max(self.seq_lens))
+        self.triton_max_seq_len = max(len(r.input_ids) for r in batch.reqs)
         self.triton_prefix_lens = prefix_lens
-        self.triton_start_loc = torch.zeros(
-            (batch_size,), dtype=torch.int32, device="cuda"
-        )
+        self.triton_start_loc = torch.zeros_like(self.seq_lens, dtype=torch.int32)
         self.triton_start_loc[1:] = torch.cumsum(self.seq_lens[:-1], dim=0)
 
         if self.forward_mode == ForwardMode.DECODE:
