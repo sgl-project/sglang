@@ -20,7 +20,7 @@ concurrency:
 jobs:
   e2e-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: self-hosted
+    runs-on: bench
 
     steps:
     - name: Checkout code
@@ -38,6 +38,7 @@ jobs:
     - name: Benchmark Serving Throughput
       run: |
         python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
+        SERVER_PID=$!
 
         echo "Waiting for server to start..."
         for i in {1..120}; do
@@ -52,7 +53,7 @@ jobs:
           sleep 1
         done
 
-        cd $HOME && python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512
+        cd $HOME && python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 500 --random-input 4096 --random-output 2048
 
         echo "Stopping server..."
-        kill -9 $(ps aux | grep sglang | grep Meta-Llama-3.1-8B-Instruct | grep -- "--port 8413" | grep -v grep | awk '{print $2}')
+        kill -9 $SERVER_PID
