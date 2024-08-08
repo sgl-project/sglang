@@ -417,39 +417,34 @@ class ScheduleBatch:
         reqs = self.reqs
         input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
         prefix_indices = [r.prefix_indices for r in reqs]
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
 
         # Handle prefix
         extend_lens = []
         prefix_lens = []
         seq_lens = []
 
-        req_pool_indices_cpu = self.alloc_req_slots(bs)
-
-        for i, req in enumerate(reqs):
-            req.req_pool_idx = req_pool_indices_cpu[i]
-            extend_lens.append(len(input_ids[i]))
-
-            if len(prefix_indices[i]) == 0:
-                prefix_lens.append(0)
-            else:
-                prefix_lens.append(len(prefix_indices[i]))
-                self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    : len(prefix_indices[i])
-                ] = prefix_indices[i]
-
-            seq_lens.append(prefix_lens[-1] + extend_lens[-1])
-
         # Allocate memory
-        seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
-        extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
+        req_pool_indices_cpu = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
         pt = 0
         for i, req in enumerate(reqs):
+            req.req_pool_idx = req_pool_indices_cpu[i]
+            extend_lens.append(len(input_ids[i]))
+
+            prefix_lens.append(len(prefix_indices[i]))
+            if len(prefix_indices[i]) > 0:
+                self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    : len(prefix_indices[i])
+                ] = prefix_indices[i]
+
             self.req_to_token_pool.req_to_token[req.req_pool_idx][
                 prefix_lens[i] : prefix_lens[i] + extend_lens[i]
             ] = out_cache_loc[pt : pt + extend_lens[i]]
             pt += extend_lens[i]
+
+            seq_lens.append(prefix_lens[-1] + extend_lens[-1])
 
         # Set fields
         with torch.device("cuda"):
