@@ -223,11 +223,13 @@ def is_multimodal_model(model):
     raise ValueError("unrecognized type")
 
 
-def is_embedding_model(model_path):
-    # FIXME incomplete list
-    if "e5-mistral-7b-instruct" in model_path.lower():
-        return True
-    return False
+def is_generation_model(model_architectures):
+    if (
+        "LlamaEmbeddingModel" in model_architectures
+        or "MistralModel" in model_architectures
+    ):
+        return False
+    return True
 
 
 def decode_video_base64(video_base64):

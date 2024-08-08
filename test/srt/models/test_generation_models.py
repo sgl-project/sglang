@@ -35,7 +35,7 @@ class TestCausalModels(unittest.TestCase):
         torch_dtype,
     ) -> None:
         with HFRunner(
-            model_path, torch_dtype=torch_dtype, is_embedding_model=False
+            model_path, torch_dtype=torch_dtype, is_generation_model=True
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts)
 
@@ -43,7 +43,7 @@ class TestCausalModels(unittest.TestCase):
             model_path,
             tp_size=tp_size,
             torch_dtype=torch_dtype,
-            is_embedding_model=False,
+            is_generation_model=True,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts)
 

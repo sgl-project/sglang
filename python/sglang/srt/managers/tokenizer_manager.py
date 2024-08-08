@@ -50,7 +50,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import is_multimodal_model, load_image
+from sglang.srt.utils import is_generation_model, is_multimodal_model, load_image
 from sglang.utils import get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -88,6 +88,7 @@ class TokenizerManager:
             trust_remote_code=server_args.trust_remote_code,
             model_overide_args=model_overide_args,
         )
+        self.is_generation = is_generation_model(self.hf_config.architectures)
 
         if server_args.context_length is not None:
             self.context_len = server_args.context_length
@@ -150,7 +151,7 @@ class TokenizerManager:
                 yield response
         else:
             if isinstance(obj, EmbeddingReqInput):
-                raise NotImplementedError()
+                raise NotImplementedError("Please send only one prompt in each request")
             if obj.stream:
                 raise ValueError("Do not support stream for batch mode.")
 
@@ -164,8 +165,6 @@ class TokenizerManager:
         index=None,
         is_cache_for_prefill=False,
     ):
-        is_generation = isinstance(obj, GenerateReqInput)
-
         if not is_cache_for_prefill:  # The normal case with a single prompt
             not_use_index = index is None
 
@@ -182,7 +181,7 @@ class TokenizerManager:
                 obj.sampling_params if not_use_index else obj.sampling_params[index]
             )
 
-            if is_generation:
+            if self.is_generation:
                 pixel_values, image_hash, image_size = await self._get_pixel_values(
                     obj.image_data if not_use_index else obj.image_data[index]
                 )
@@ -200,7 +199,7 @@ class TokenizerManager:
                     else obj.top_logprobs_num[index]
                 )
         else:  # A prefill request to cache the common prompt for parallel sampling
-            assert is_generation
+            assert self.is_generation
             if obj.text is not None:
                 if isinstance(obj.text, list):
                     input_text = obj.text[index]
@@ -230,7 +229,7 @@ class TokenizerManager:
             logprob_start_len = obj.logprob_start_len[0]
             top_logprobs_num = obj.top_logprobs_num[0]
 
-        if is_generation:
+        if self.is_generation:
             tokenized_obj = TokenizedGenerateReqInput(
                 rid,
                 input_text,
@@ -407,7 +406,7 @@ class TokenizerManager:
                     raise ValueError(f"Abort request {rid}")
                 continue
 
-            if isinstance(obj, GenerateReqInput):
+            if self.is_generation:
                 out = self.convert_logprob_style(
                     state.out_list[-1],
                     obj.return_logprob,
@@ -504,7 +503,8 @@ class TokenizerManager:
                         "text": recv_obj.output_strs[i],
                         "meta_info": recv_obj.meta_info[i],
                     }
-                else:  # isinstance(recv_obj, BatchEmbeddingOut)
+                else:
+                    assert isinstance(recv_obj, BatchEmbeddingOut)
                     out_dict = {
                         "embedding": recv_obj.embeddings[i],
                         "meta_info": recv_obj.meta_info[i],

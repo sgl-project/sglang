@@ -72,7 +72,6 @@ from sglang.srt.utils import (
     allocate_init_ports,
     assert_pkg_version,
     enable_show_time_cost,
-    is_embedding_model,
     kill_child_process,
     maybe_set_triton_cache_manager,
     set_torch_compile_config,
@@ -99,7 +98,7 @@ async def health() -> Response:
 async def get_model_info():
     result = {
         "model_path": tokenizer_manager.model_path,
-        "is_embedding": is_embedding_model(tokenizer_manager.model_path),
+        "is_generation": tokenizer_manager.is_generation,
     }
     return result
 
@@ -184,11 +183,6 @@ def available_models():
     for served_model_name in served_model_names:
         model_cards.append(ModelCard(id=served_model_name, root=served_model_name))
     return ModelList(data=model_cards)
-
-
-@app.post("/v1/embeddings")
-async def openai_v1_embeddings(raw_request: Request):
-    return await v1_embeddings(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/files")
@@ -416,8 +410,8 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         sys.exit(1)
 
     # Send a warmup request
-    request_name = "/encode" if model_info["is_embedding"] else "/generate"
-    max_new_tokens = 0 if model_info["is_embedding"] else 8
+    request_name = "/generate" if model_info["is_generation"] else "/encode"
+    max_new_tokens = 8 if model_info["is_generation"] else 0
     try:
         for _ in range(server_args.dp_size):
             res = requests.post(

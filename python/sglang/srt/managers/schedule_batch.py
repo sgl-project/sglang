@@ -92,7 +92,7 @@ class FINISH_ABORT(BaseFinishReason):
 class Req:
     """Store all inforamtion of a request."""
 
-    def __init__(self, rid, origin_input_text, origin_input_ids, is_embedding=False):
+    def __init__(self, rid, origin_input_text, origin_input_ids):
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
@@ -142,7 +142,6 @@ class Req:
         self.finished_reason = None
 
         # Logprobs
-        self.is_embedding = is_embedding
         self.return_logprob = False
         self.embedding = None
         self.logprob_start_len = 0
@@ -321,9 +320,6 @@ class ScheduleBatch:
     out_cache_loc: torch.Tensor = None
     extend_num_tokens: int = None
 
-    # For embedding model
-    is_embedding: bool = False
-
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
@@ -337,9 +333,6 @@ class ScheduleBatch:
 
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
-        is_embedding = any(req.is_embedding for req in reqs)
-        if is_embedding:
-            assert all(req.is_embedding for req in reqs)
         return_logprob = any(req.return_logprob for req in reqs)
 
         return cls(
@@ -347,7 +340,6 @@ class ScheduleBatch:
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
-            is_embedding=is_embedding,
             return_logprob=return_logprob,
         )
 

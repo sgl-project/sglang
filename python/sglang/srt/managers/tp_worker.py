@@ -303,15 +303,10 @@ class ModelTpServer:
         self,
         recv_req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
-        if isinstance(recv_req, TokenizedGenerateReqInput):
-            req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
-        else:
-            req = Req(
-                recv_req.rid, recv_req.input_text, recv_req.input_ids, is_embedding=True
-            )
+        req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.tokenizer = self.tokenizer
         req.sampling_params = recv_req.sampling_params
-        if isinstance(recv_req, TokenizedGenerateReqInput):
+        if self.model_runner.is_generation:
             req.pixel_values = recv_req.pixel_values
             if req.pixel_values is not None:
                 req.pad_value = [
@@ -351,7 +346,7 @@ class ModelTpServer:
             )
             req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
 
-        if isinstance(recv_req, TokenizedGenerateReqInput):
+        if self.model_runner.is_generation:
             req.sampling_params.max_new_tokens = min(
                 (
                     req.sampling_params.max_new_tokens
@@ -452,7 +447,7 @@ class ModelTpServer:
             self.model_config.vocab_size, self.int_token_logit_bias
         )
 
-        if not batch.is_embedding:
+        if self.model_runner.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
                 output = self.model_runner.forward(batch, ForwardMode.EXTEND)
@@ -632,15 +627,15 @@ class ModelTpServer:
         output_rids = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
-        if batch.is_embedding:
-            output_embeddings = []
-        else:  # generation request
+        if self.model_runner.is_generation:
             output_vids = []
             decoded_texts = []
             output_read_ids = []
             output_read_offsets = []
             output_skip_special_tokens = []
             output_spaces_between_special_tokens = []
+        else:  # for embedding model
+            output_embeddings = []
         unfinished_indices = []
 
         for i, req in enumerate(batch.reqs):
@@ -658,13 +653,7 @@ class ModelTpServer:
             ):
                 output_rids.append(req.rid)
                 output_finished_reason.append(req.finished_reason)
-                if batch.is_embedding:
-                    output_embeddings.append(req.embedding)
-                    meta_info = {
-                        "prompt_tokens": len(req.origin_input_ids),
-                    }
-                    output_meta_info.append(meta_info)
-                else:  # generation request
+                if self.model_runner.is_generation:
                     output_vids.append(req.vid)
                     decoded_texts.append(req.decoded_text)
                     read_ids, read_offset = req.init_incremental_detokenize()
@@ -698,19 +687,16 @@ class ModelTpServer:
                             req.normalized_prompt_logprob,
                         )
                     output_meta_info.append(meta_info)
+                else:  # for embedding model
+                    output_embeddings.append(req.embedding)
+                    meta_info = {
+                        "prompt_tokens": len(req.origin_input_ids),
+                    }
+                    output_meta_info.append(meta_info)
 
         # Send to detokenizer
         if output_rids:
-            if batch.is_embedding:
-                self.out_pyobjs.append(
-                    BatchEmbeddingOut(
-                        output_rids,
-                        output_embeddings,
-                        output_meta_info,
-                        output_finished_reason,
-                    )
-                )
-            else:
+            if self.model_runner.is_generation:
                 self.out_pyobjs.append(
                     BatchTokenIDOut(
                         output_rids,
@@ -720,6 +706,15 @@ class ModelTpServer:
                         output_read_offsets,
                         output_skip_special_tokens,
                         output_spaces_between_special_tokens,
+                        output_meta_info,
+                        output_finished_reason,
+                    )
+                )
+            else:  # for embedding model
+                self.out_pyobjs.append(
+                    BatchEmbeddingOut(
+                        output_rids,
+                        output_embeddings,
                         output_meta_info,
                         output_finished_reason,
                     )

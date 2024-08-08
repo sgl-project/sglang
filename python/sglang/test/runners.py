@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.server import Runtime
-from sglang.srt.utils import is_embedding_model
+from sglang.srt.utils import is_generation_model
 
 DEFAULT_PROMPTS = [
     "The capital of France is",
@@ -54,7 +54,7 @@ class HFRunner:
         self,
         model_path,
         torch_dtype=torch.float16,
-        is_embedding_model=None,
+        is_generation_model=None,
     ):
         self.in_queue = multiprocessing.Queue()
         self.out_queue = multiprocessing.Queue()
@@ -66,13 +66,13 @@ class HFRunner:
                 self.out_queue,
                 model_path,
                 torch_dtype,
-                is_embedding_model,
+                is_generation_model,
             ),
         )
         self.model_proc.start()
 
     def start_model_process(
-        self, in_queue, out_queue, model_path, torch_dtype, is_embedding_model
+        self, in_queue, out_queue, model_path, torch_dtype, is_generation_model
     ):
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
@@ -80,12 +80,12 @@ class HFRunner:
             trust_remote_code=True,
         )
 
-        self.is_embedding_model = (
-            is_embedding_model(model_path)
-            if is_embedding_model is None
-            else is_embedding_model
+        self.is_generation_model = (
+            is_generation_model(model_path)
+            if is_generation_model is None
+            else is_generation_model
         )
-        if not self.is_embedding_model:
+        if self.is_generation_model:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
@@ -103,7 +103,7 @@ class HFRunner:
         while True:
             prompts, max_new_tokens = in_queue.get()
             if prompts is not None:
-                if not self.is_embedding_model:
+                if self.is_generation_model:
                     output_strs = []
                     prefill_logprobs = []
                     for p in prompts:
@@ -168,18 +168,17 @@ class SRTRunner:
         model_path,
         tp_size=1,
         torch_dtype=torch.float16,
-        is_embedding_model=None,
+        is_generation_model=None,
     ):
-        self.is_embedding_model = (
-            is_embedding_model(model_path)
-            if is_embedding_model is None
-            else is_embedding_model
+        self.is_generation_model = (
+            is_generation_model(model_path)
+            if is_generation_model is None
+            else is_generation_model
         )
         self.runtime = Runtime(
             model_path=model_path,
             tp_size=tp_size,
             dtype=get_dtype_str(torch_dtype),
-            disable_cuda_graph=self.is_embedding_model,
         )
 
     def forward(
@@ -187,7 +186,7 @@ class SRTRunner:
         prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
         max_new_tokens=64,
     ):
-        if not self.is_embedding_model:
+        if self.is_generation_model:
             # the return value contains logprobs from prefill
             output_strs = []
             top_input_logprobs = []
