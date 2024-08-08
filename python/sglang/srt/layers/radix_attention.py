@@ -144,24 +144,52 @@ class RadixAttention(nn.Module):
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
-    def launch_sp_comm_ops(self, kv_to_recv, kv_to_send, from_rank, my_rank, to_rank):
+    def launch_sp_comm_ops(
+        self, kv_to_recv, kv_to_send, from_rank, to_rank, my_rank, sp_size, itr
+    ):
+        # Interleaving workers for send and recv to avoid deadlock
+        def _send_first():
+            flags = [None for _ in range(sp_size)]
+            for _rank in range(sp_size):
+                _next = _rank
+                flag = True
+                while flags[_next] is None:
+                    flags[_next] = flag
+                    _next = (_next + itr) % sp_size
+                    flag = not flag
+            return flags[my_rank]
+
         def _send(handles, group):
             if my_rank != to_rank:
+                to_global_rank = group.first_rank + to_rank
                 for t in kv_to_send:
-                    handles.append(P2POp(op=isend, tensor=t, peer=to_rank, group=group))
+                    handles.append(
+                        P2POp(
+                            op=isend,
+                            tensor=t,
+                            peer=to_global_rank,
+                            group=group.device_group,
+                        )
+                    )
 
         def _recv(handles, group):
             if my_rank != from_rank:
+                from_global_rank = group.first_rank + from_rank
                 for t in kv_to_recv:
                     handles.append(
-                        P2POp(op=irecv, tensor=t, peer=from_rank, group=group)
+                        P2POp(
+                            op=irecv,
+                            tensor=t,
+                            peer=from_global_rank,
+                            group=group.device_group,
+                        )
                     )
 
         handles = []
         reqs = []
-        sp_group = get_sp_group().device_group
-        # Interleaving workers for send and recv to avoid deadlock
-        if my_rank % 2 == 0:
+        sp_group = get_sp_group()
+
+        if _send_first():
             _send(handles, sp_group)
             _recv(handles, sp_group)
         else:
@@ -242,7 +270,7 @@ class RadixAttention(nn.Module):
         to_rank = sp_rank  # which SP worker to send my sequence KV shard to.
         from_rank = sp_rank  # which SP worker to receive the sequence KV shard from.
         sid = sp_rank  # start from the worker's own shard
-        for _ in range(num_iters):
+        for itr in range(num_iters):
             to_rank = (to_rank + 1) % sp_size
             from_rank = (from_rank - 1) % sp_size
             if need_comm:  # Launch async communication operations
@@ -250,8 +278,10 @@ class RadixAttention(nn.Module):
                     kv_shards[from_rank],
                     kv_shards[sp_rank],
                     from_rank,
-                    sp_rank,
                     to_rank,
+                    sp_rank,
+                    sp_size,
+                    itr,
                 )
             q_shard = qs[sid]
             k_shard, v_shard = kv_shards[sid]
@@ -317,8 +347,52 @@ class RadixAttention(nn.Module):
     def seq_parallel_decode_forward_flashinfer(
         self, q, k, v, input_metadata: InputMetadata
     ):
-        # TODO: implementation
-        raise NotImplementedError("Sequence parallel decode is not supported.")
+        sp_size = input_metadata.sp_size
+        sp_rank = input_metadata.sp_rank
+        total_num_heads = self.tp_q_head_num * sp_size
+
+        sp_offset = input_metadata.sp_local_token_offset
+        sp_len = input_metadata.sp_local_token_length
+        sp_slice = slice(sp_offset, sp_offset + sp_len)
+        cache_k = k[sp_slice]
+        cache_v = v[sp_slice]
+        self.store_kv_cache(cache_k, cache_v, input_metadata)
+
+        # Convert Q back by gathering all TP heads.
+        q = q.contiguous().view(-1, self.tp_q_head_num, self.head_dim)
+        gathered_q = get_sp_group().all_gather(q.view(1, *q.shape), dim=0)
+        q = torch.empty_like(gathered_q).view(-1, total_num_heads, self.head_dim)
+        for i in range(sp_size):
+            idxs = _get_sequence_parallel_head_idxes(
+                total_num_heads, self.tp_k_head_num, i, sp_size
+            )
+            q[:, idxs] = gathered_q[i]
+
+        o, s = input_metadata.flashinfer_decode_wrapper.forward_return_lse(
+            q.contiguous().view(-1, total_num_heads, self.head_dim),
+            input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+            sm_scale=self.scaling,
+            logits_soft_cap=self.logit_cap,
+        )
+
+        # TODO: in fact we can use all-to-all to gather the output and state here
+        # to collect only q head shards that are needed by the current SP worker.
+        # All-to-all will save communication and `merge_state` computation.
+        os = get_sp_group().all_gather(o.view(1, *o.shape), dim=0)
+        ss = get_sp_group().all_gather(s.view(1, *s.shape), dim=0)
+        for i in range(sp_size):
+            if i != sp_rank:
+                o, s = merge_state(os[i], ss[i], o, s)
+
+        # TODO: consequently, if we use all-to-all rather than all-gather, we don't
+        # need to partition the output again along the head dimension.
+        # Partition the output again along the head dimension.
+        idxs = _get_sequence_parallel_head_idxes(
+            total_num_heads, self.tp_k_head_num, sp_rank, sp_size
+        )
+        o = o[:, idxs]
+
+        return o.view(-1, self.tp_q_head_num * self.head_dim)
 
     def forward(self, q, k, v, input_metadata: InputMetadata):
         k = k.view(-1, self.tp_k_head_num, self.head_dim)
@@ -360,3 +434,15 @@ except:
     ) -> None:
         kv_cache[cache_loc, 0] = k
         kv_cache[cache_loc, 1] = v
+
+
+def _get_sequence_parallel_head_idxes(total_num_heads, num_kv_heads, sp_rank, sp_size):
+    group_size = total_num_heads // num_kv_heads
+    shard_num_heads = group_size // sp_size
+
+    idxes = [
+        group_size * i + sp_rank * shard_num_heads + j
+        for i in range(num_kv_heads)
+        for j in range(0, shard_num_heads)
+    ]
+    return idxes

@@ -198,13 +198,12 @@ def correctness_test(
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
     rank_print("prefill logits (final)", next_token_logits)
 
-    # FIXME (yifan): enable decode later.
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
-    # for _ in range(bench_args.output_len):
-    #     next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-    #     for i in range(len(reqs)):
-    #         output_ids[i].append(next_token_ids[i])
+    for _ in range(bench_args.output_len):
+        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+        for i in range(len(reqs)):
+            output_ids[i].append(next_token_ids[i])
 
     # Print
     for i in range(len(reqs)):
