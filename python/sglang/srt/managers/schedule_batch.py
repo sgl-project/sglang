@@ -307,7 +307,6 @@ class ScheduleBatch:
     input_ids: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
-    prefix_lens: torch.Tensor = None
     position_ids_offsets: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
     extend_num_tokens: int = None
@@ -412,16 +411,12 @@ class ScheduleBatch:
                 self.logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
 
     def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
-        device = "cuda"
         bs = self.batch_size()
         reqs = self.reqs
         input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
-        prefix_indices = [r.prefix_indices for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
 
         # Handle prefix
-        extend_lens = []
-        prefix_lens = []
         seq_lens = []
 
         # Allocate memory
@@ -431,20 +426,19 @@ class ScheduleBatch:
         pt = 0
         for i, req in enumerate(reqs):
             req.req_pool_idx = req_pool_indices_cpu[i]
-            extend_lens.append(len(input_ids[i]))
+            pre_len, seq_len = len(req.prefix_indices), len(req.input_ids)
+            ext_len = seq_len - pre_len
+            seq_lens.append(seq_len)
 
-            prefix_lens.append(len(prefix_indices[i]))
-            if len(prefix_indices[i]) > 0:
+            if pre_len > 0:
                 self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    : len(prefix_indices[i])
-                ] = prefix_indices[i]
+                    :pre_len
+                ] = req.prefix_indices
 
-            self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                prefix_lens[i] : prefix_lens[i] + extend_lens[i]
-            ] = out_cache_loc[pt : pt + extend_lens[i]]
-            pt += extend_lens[i]
-
-            seq_lens.append(prefix_lens[-1] + extend_lens[-1])
+            self.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
+                out_cache_loc[pt : pt + ext_len]
+            )
+            pt += ext_len
 
         # Set fields
         with torch.device("cuda"):
@@ -456,10 +450,13 @@ class ScheduleBatch:
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
         self.image_offsets = [
-            (r.image_offset - p_len) if r.image_offset is not None else 0
-            for r, p_len in zip(reqs, prefix_lens)
+            (
+                (r.image_offset - len(r.prefix_indices))
+                if r.image_offset is not None
+                else 0
+            )
+            for r in reqs
         ]
-        self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
@@ -637,7 +634,6 @@ class ScheduleBatch:
             ]
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
-        self.prefix_lens = None
 
         # Alloc mem
         bs = self.batch_size()
@@ -662,7 +658,6 @@ class ScheduleBatch:
         self.seq_lens = self.seq_lens[new_indices]
         self.input_ids = None
         self.req_pool_indices = self.req_pool_indices[new_indices]
-        self.prefix_lens = None
         self.position_ids_offsets = self.position_ids_offsets[new_indices]
         self.out_cache_loc = None
         self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
@@ -687,7 +682,6 @@ class ScheduleBatch:
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
-        self.prefix_lens = None
         self.position_ids_offsets = torch.concat(
             [self.position_ids_offsets, other.position_ids_offsets]
         )
