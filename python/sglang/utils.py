@@ -6,7 +6,6 @@ import json
 import logging
 import signal
 import sys
-import threading
 import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor

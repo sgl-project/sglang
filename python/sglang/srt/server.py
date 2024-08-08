@@ -74,7 +74,6 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     kill_child_process,
     maybe_set_triton_cache_manager,
-    set_torch_compile_config,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
@@ -346,10 +345,6 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.tp_size * server_args.dp_size > 1:
         # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
         maybe_set_triton_cache_manager()
-
-    # Set torch compile config
-    if server_args.enable_torch_compile:
-        set_torch_compile_config()
 
     # Set global chat template
     if server_args.chat_template:

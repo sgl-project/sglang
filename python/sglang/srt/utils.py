@@ -622,19 +622,6 @@ def receive_addrs(model_port_args, server_args):
     dist.destroy_process_group()
 
 
-def set_torch_compile_config():
-    # The following configurations are for torch compile optimizations
-    import torch._dynamo.config
-    import torch._inductor.config
-
-    torch._inductor.config.coordinate_descent_tuning = True
-    torch._inductor.config.triton.unique_kernel_names = True
-    torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
-
-    # FIXME: tmp workaround
-    torch._dynamo.config.accumulated_cache_size_limit = 256
-
-
 def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
