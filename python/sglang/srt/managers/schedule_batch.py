@@ -217,7 +217,9 @@ class Req:
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(len(self.output_ids))
+            self.finished_reason = FINISH_LENGTH(
+                length=self.sampling_params.max_new_tokens
+            )
             return
 
         if (
