@@ -83,7 +83,7 @@ class InputMetadata:
 
         if self.forward_mode == ForwardMode.DECODE:
             self.positions = (self.seq_lens - 1) + position_ids_offsets
-            self.positions = self.positions.to(torch.int32)
+            self.positions = self.positions.to(torch.int64)
         else:
             seq_lens_cpu = self.seq_lens.cpu().numpy()
             prefix_lens_cpu = prefix_lens.cpu().numpy()
