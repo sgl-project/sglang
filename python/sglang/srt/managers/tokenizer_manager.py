@@ -328,7 +328,6 @@ class TokenizerManager:
                 event = asyncio.Event()
                 state = ReqState([], False, event)
                 self.rid_to_state[rid] = state
-
         # Then wait for all responses
         output_list = []
         for i in range(batch_size):
@@ -361,7 +360,6 @@ class TokenizerManager:
                 )
                 assert state.finished
                 del self.rid_to_state[rid]
-
         yield output_list
 
     def _validate_input_length(self, input_ids: List[int]):
@@ -481,7 +479,7 @@ class TokenizerManager:
 
     async def handle_loop(self):
         while True:
-            recv_obj: BatchTokenIDOut = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj: BatchStrOut = await self.recv_from_detokenizer.recv_pyobj()
             assert isinstance(recv_obj, BatchStrOut)
 
             for i, rid in enumerate(recv_obj.rids):

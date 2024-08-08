@@ -34,7 +34,7 @@ python3 bench_serving.py --backend srt --port 30000 --tokenizer meta-llama/Llama
 
 ### Profile with Nsight
 1. To profile a single batch, use `nsys profile --cuda-graph-trace=node python3 -m sglang.bench_latency --model meta-llama/Meta-Llama-3-8B --batch-size 64 --input-len 512`
-2. To profile a server, use `nsys profile --cuda-graph-trace=node python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3-8B`.
+2. To profile a server, use `nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3-8B`.
 
 
 ## Other baselines

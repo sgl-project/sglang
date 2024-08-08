@@ -49,20 +49,20 @@ pip install --upgrade pip
 pip install "sglang[all]"
 
 # Install FlashInfer CUDA kernels
-pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
+pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
 
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.2.10 https://github.com/sgl-project/sglang.git
+git clone -b v0.2.11 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
 pip install -e "python[all]"
 
 # Install FlashInfer CUDA kernels
-pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
+pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
 
 ### Method 3: Using docker

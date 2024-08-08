@@ -29,6 +29,6 @@ RUN pip3 --no-cache-dir install --upgrade pip \
     && git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && cd sglang \
     && pip --no-cache-dir install -e "python[all]" \
-    && pip3 --no-cache-dir install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
+    && pip3 --no-cache-dir install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 
 ENV DEBIAN_FRONTEND=interactive

@@ -16,7 +16,7 @@ REGEX_STRING = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
 
 @dataclasses.dataclass
 class SglSamplingParams:
-    max_new_tokens: int = 16
+    max_new_tokens: int = 128
     stop: Union[str, List[str]] = ()
     temperature: float = 1.0
     top_p: float = 1.0
@@ -140,7 +140,7 @@ class SglFunction:
     def run(
         self,
         *args,
-        max_new_tokens: int = 16,
+        max_new_tokens: int = 128,
         stop: Union[str, List[str]] = (),
         temperature: float = 1.0,
         top_p: float = 1.0,
@@ -179,7 +179,7 @@ class SglFunction:
         self,
         batch_kwargs,
         *,
-        max_new_tokens: int = 16,
+        max_new_tokens: int = 128,
         stop: Union[str, List[str]] = (),
         temperature: float = 1.0,
         top_p: float = 1.0,

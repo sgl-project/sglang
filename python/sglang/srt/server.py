@@ -59,6 +59,7 @@ from sglang.srt.openai_api.adapter import (
     v1_batches,
     v1_chat_completions,
     v1_completions,
+    v1_delete_file,
     v1_files_create,
     v1_retrieve_batch,
     v1_retrieve_file,
@@ -173,6 +174,12 @@ async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("bat
     return await v1_files_create(
         file, purpose, tokenizer_manager.server_args.file_storage_pth
     )
+
+
+@app.delete("/v1/files/{file_id}")
+async def delete_file(file_id: str):
+    # https://platform.openai.com/docs/api-reference/files/delete
+    return await v1_delete_file(file_id)
 
 
 @app.post("/v1/batches")
@@ -367,13 +374,23 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
     # Wait until the server is launched
+    success = False
     for _ in range(120):
         time.sleep(1)
         try:
-            requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            assert res.status_code == 200, f"{res}"
+            success = True
             break
-        except requests.exceptions.RequestException:
+        except (AssertionError, requests.exceptions.RequestException) as e:
+            last_traceback = get_exception_traceback()
             pass
+
+    if not success:
+        if pipe_finish_writer is not None:
+            pipe_finish_writer.send(last_traceback)
+        print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
+        sys.exit(1)
 
     # Send a warmup request
     try:
@@ -390,12 +407,13 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
                 headers=headers,
                 timeout=600,
             )
-            assert res.status_code == 200
+            assert res.status_code == 200, f"{res}"
     except Exception as e:
+        last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
-            pipe_finish_writer.send(get_exception_traceback())
-        print(f"Initialization failed. warmup error: {e}", flush=True)
-        raise e
+            pipe_finish_writer.send(last_traceback)
+        print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
+        sys.exit(1)
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
