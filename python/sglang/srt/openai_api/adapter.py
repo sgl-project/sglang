@@ -85,7 +85,7 @@ storage_dir = None
 def format_finish_reason(finish_reason) -> Optional[str]:
     if finish_reason.startswith("None"):
         return None
-    if finish_reason.startswith("FINISH_MATCHED"):
+    elif finish_reason.startswith("FINISH_MATCHED"):
         return "stop"
     elif finish_reason.startswith("FINISH_LENGTH"):
         return "length"
