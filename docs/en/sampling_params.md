@@ -133,7 +133,7 @@ response = requests.post(
         "image_data": "example_image.png",
         "sampling_params": {
             "temperature": 0,
-            "max_new_tokens": 128,
+            "max_new_tokens": 32,
         },
     },
 )
