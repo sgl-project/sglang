@@ -99,7 +99,7 @@ curl http://localhost:30000/generate \
   -d '{
     "text": "Once upon a time,",
     "sampling_params": {
-      "max_new_tokens": 128,
+      "max_new_tokens": 16,
       "temperature": 0
     }
   }'
