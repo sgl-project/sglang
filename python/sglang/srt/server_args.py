@@ -223,8 +223,7 @@ class ServerArgs:
         parser.add_argument(
             "--mem-fraction-static",
             type=float,
-            # default=ServerArgs.mem_fraction_static,
-            default=0.8,
+            default=ServerArgs.mem_fraction_static,
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
         )
         parser.add_argument(
