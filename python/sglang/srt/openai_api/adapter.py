@@ -89,9 +89,10 @@ def format_finish_reason(finish_reason) -> Optional[str]:
         return "stop"
     elif finish_reason.startswith("FINISH_LENGTH"):
         return "length"
+    elif finish_reason.startswith("FINISH_ABORT"):
+        return "abort"
     else:
-        raise ValueError(f"Unknown finish reason: {finish_reason}")
-
+        return "unknown"
 
 def create_error_response(
     message: str,
