@@ -71,6 +71,18 @@ def patch_model(
             tp_group.ca_comm = backup_ca_comm
 
 
+def set_torch_compile_config():
+    import torch._dynamo.config
+    import torch._inductor.config
+
+    torch._inductor.config.coordinate_descent_tuning = True
+    torch._inductor.config.triton.unique_kernel_names = True
+    torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
+
+    # FIXME: tmp workaround
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
+
+
 class CudaGraphRunner:
     def __init__(self, model_runner, max_batch_size_to_capture, use_torch_compile):
         self.model_runner = model_runner
@@ -111,6 +123,9 @@ class CudaGraphRunner:
         )
 
         self.compile_bs = [1, 2, 4, 8, 16, 24, 32] if use_torch_compile else []
+
+        if use_torch_compile:
+            set_torch_compile_config()
 
     def can_run(self, batch_size):
         return batch_size < self.max_bs
