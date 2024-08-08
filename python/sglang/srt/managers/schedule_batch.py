@@ -100,6 +100,9 @@ class Req:
         self.output_ids = []  # Each decode stage's output ids
         self.input_ids = None  # input_ids = origin_input_ids + output_ids
 
+        # Memory info
+        self.req_pool_idx = None
+
         # For incremental decoding
         # ----- | --------- read_ids -------|
         # ----- |   surr_ids  |
@@ -121,7 +124,7 @@ class Req:
         # For vision input
         self.pixel_values = None
         self.image_size = None
-        self.image_offset = 0
+        self.image_offset = None
         self.pad_value = None
 
         # Prefix info
@@ -158,6 +161,23 @@ class Req:
     # whether request reached finished condition
     def finished(self) -> bool:
         return self.finished_reason is not None
+
+    def adjust_max_prefix_ids(self):
+        input_len = len(self.input_ids)
+        max_prefix_len = input_len
+
+        if self.sampling_params.max_new_tokens > 0:
+            # Need at least one token to compute logits
+            max_prefix_len = min(max_prefix_len, input_len - 1)
+
+        if self.return_logprob:
+            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+
+            if self.normalized_prompt_logprob is None:
+                # Need at least two tokens to compute normalized logprob
+                max_prefix_len = min(max_prefix_len, input_len - 2)
+
+        return self.input_ids[:max_prefix_len]
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -289,7 +309,6 @@ class ScheduleBatch:
     input_ids: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
-    prefix_lens: torch.Tensor = None
     position_ids_offsets: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
     extend_num_tokens: int = None
@@ -297,11 +316,6 @@ class ScheduleBatch:
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
-
-    # For multimodal
-    pixel_values: List[torch.Tensor] = None
-    image_sizes: List[List[int]] = None
-    image_offsets: List[int] = None
 
     # Batched sampling params
     temperatures: torch.Tensor = None
@@ -323,6 +337,9 @@ class ScheduleBatch:
             return_logprob=return_logprob,
         )
 
+    def batch_size(self):
+        return len(self.reqs) if self.reqs is not None else 0
+
     def is_empty(self):
         return len(self.reqs) == 0
 
@@ -330,52 +347,22 @@ class ScheduleBatch:
         # Return whether batch has at least 1 streaming request
         return any(r.stream for r in self.reqs)
 
-    def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
-        device = "cuda"
-        bs = len(self.reqs)
-        reqs = self.reqs
-        input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
-        prefix_indices = [r.prefix_indices for r in reqs]
-
-        # Handle prefix
-        flatten_input_ids = []
-        extend_lens = []
-        prefix_lens = []
-        seq_lens = []
-
-        req_pool_indices = self.req_to_token_pool.alloc(bs)
-
+    def alloc_req_slots(self, num_reqs):
+        req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
         if req_pool_indices is None:
             raise RuntimeError(
                 "Out of memory. "
                 "Please set a smaller number for `--max-running-requests`."
             )
+        return req_pool_indices
 
-        req_pool_indices_cpu = req_pool_indices.cpu().numpy()
-        for i in range(bs):
-            flatten_input_ids.extend(input_ids[i])
-            extend_lens.append(len(input_ids[i]))
+    def alloc_token_slots(self, num_tokens: int):
+        out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
 
-            if len(prefix_indices[i]) == 0:
-                prefix_lens.append(0)
-            else:
-                prefix_lens.append(len(prefix_indices[i]))
-                self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
-                    : len(prefix_indices[i])
-                ] = prefix_indices[i]
-
-            seq_lens.append(prefix_lens[-1] + extend_lens[-1])
-
-        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
-
-        # Allocate memory
-        seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
-        extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
-        out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
             if self.tree_cache is not None:
-                self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
-                out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+                self.tree_cache.evict(num_tokens, self.token_to_kv_pool.free)
+                out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
 
             if out_cache_loc is None:
                 logger.error("Prefill out of memory. Try to lower your batch size.")
@@ -383,40 +370,11 @@ class ScheduleBatch:
                     self.tree_cache.pretty_print()
                 exit(1)
 
-        pt = 0
-        for i in range(bs):
-            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
-                prefix_lens[i] : prefix_lens[i] + extend_lens[i]
-            ] = out_cache_loc[pt : pt + extend_lens[i]]
-            pt += extend_lens[i]
+        return out_cache_loc
 
-        # Handle logit bias but only allocate when needed
-        logit_bias = None
-        for i in range(bs):
-            if reqs[i].sampling_params.dtype == "int":
-                if logit_bias is None:
-                    logit_bias = torch.zeros(
-                        (bs, vocab_size), dtype=torch.float32, device=device
-                    )
-                logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
-
-        # Set fields
-        self.input_ids = torch.tensor(
-            flatten_input_ids, dtype=torch.int32, device=device
-        )
-        self.pixel_values = [r.pixel_values for r in reqs]
-        self.image_sizes = [r.image_size for r in reqs]
-        self.image_offsets = [
-            r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
-        ]
-        self.req_pool_indices = req_pool_indices
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-        self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
-        self.position_ids_offsets = position_ids_offsets
-        self.extend_num_tokens = extend_num_tokens
-        self.out_cache_loc = out_cache_loc
-        self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
-
+    def batch_sampling_params(self, vocab_size, int_token_logit_bias):
+        device = "cuda"
+        bs, reqs = self.batch_size(), self.reqs
         self.temperatures = torch.tensor(
             [r.sampling_params.temperature for r in reqs],
             dtype=torch.float,
@@ -438,10 +396,60 @@ class ScheduleBatch:
             dtype=torch.float,
             device=device,
         )
-        self.logit_bias = logit_bias
+
+        # Handle logit bias but only allocate when needed
+        self.logit_bias = None
+        for i in range(bs):
+            if reqs[i].sampling_params.dtype == "int":
+                if self.logit_bias is None:
+                    self.logit_bias = torch.zeros(
+                        (bs, vocab_size), dtype=torch.float32, device=device
+                    )
+                self.logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
+
+    def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+        bs = self.batch_size()
+        reqs = self.reqs
+        input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        seq_lens = []
+
+        # Allocate memory
+        req_pool_indices_cpu = self.alloc_req_slots(bs)
+        out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+
+        pt = 0
+        for i, req in enumerate(reqs):
+            req.req_pool_idx = req_pool_indices_cpu[i]
+            pre_len, seq_len = len(req.prefix_indices), len(req.input_ids)
+            ext_len = seq_len - pre_len
+            seq_lens.append(seq_len)
+
+            if pre_len > 0:
+                self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    :pre_len
+                ] = req.prefix_indices
+
+            self.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
+                out_cache_loc[pt : pt + ext_len]
+            )
+            pt += ext_len
+
+        # Set fields
+        with torch.device("cuda"):
+            self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
+            self.req_pool_indices = torch.tensor(req_pool_indices_cpu)
+            self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+            self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int64)
+
+        self.extend_num_tokens = extend_num_tokens
+        self.out_cache_loc = out_cache_loc
+        self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+
+        self.batch_sampling_params(vocab_size, int_token_logit_bias)
 
     def check_decode_mem(self):
-        bs = len(self.reqs)
+        bs = self.batch_size()
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 
@@ -466,7 +474,6 @@ class ScheduleBatch:
 
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
-        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
         while (
             self.token_to_kv_pool.available_size()
             < len(sorted_indices) * global_config.retract_decode_steps
@@ -484,20 +491,20 @@ class ScheduleBatch:
 
             if isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req_pool_indices_cpu[idx]
-                ][: seq_lens_cpu[idx]]
+                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    : seq_lens_cpu[idx]
+                ]
                 self.token_to_kv_pool.free(token_indices)
-                self.req_to_token_pool.free(int(req_pool_indices_cpu[idx]))
+                self.req_to_token_pool.free(req.req_pool_idx)
                 del self.tree_cache.entries[req.rid]
             else:
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = len(req.prefix_indices)
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req_pool_indices_cpu[idx]
-                ][last_uncached_pos : seq_lens_cpu[idx]]
+                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    last_uncached_pos : seq_lens_cpu[idx]
+                ]
                 self.token_to_kv_pool.free(token_indices)
-                self.req_to_token_pool.free(int(req_pool_indices_cpu[idx]))
+                self.req_to_token_pool.free(req.req_pool_idx)
 
                 # release the last node
                 self.tree_cache.dec_lock_ref(req.last_node)
@@ -534,8 +541,6 @@ class ScheduleBatch:
     def check_for_jump_forward(self, model_runner):
         jump_forward_reqs = []
         filter_indices = [i for i in range(len(self.reqs))]
-
-        req_pool_indices_cpu = None
 
         for i, req in enumerate(self.reqs):
             if req.jump_forward_map is not None:
@@ -586,17 +591,7 @@ class ScheduleBatch:
                     req.vid += 1
 
                     # insert the old request into tree_cache
-                    if req_pool_indices_cpu is None:
-                        req_pool_indices_cpu = self.req_pool_indices.tolist()
-                    self.tree_cache.cache_req(
-                        rid=req.rid,
-                        token_ids=cur_all_ids,
-                        last_uncached_pos=len(req.prefix_indices),
-                        req_pool_idx=req_pool_indices_cpu[i],
-                    )
-
-                    # unlock the last node
-                    self.tree_cache.dec_lock_ref(req.last_node)
+                    self.tree_cache.cache_finished_req(req, cur_all_ids)
 
                     # re-applying image padding
                     if req.pixel_values is not None:
@@ -613,8 +608,7 @@ class ScheduleBatch:
                     jump_forward_reqs.append(req)
                     filter_indices.remove(i)
 
-        if len(filter_indices) < len(self.reqs):
-            self.filter_batch(filter_indices)
+        self.filter_batch(filter_indices)
 
         return jump_forward_reqs
 
@@ -625,29 +619,30 @@ class ScheduleBatch:
             ]
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
-        self.prefix_lens = None
 
         # Alloc mem
-        bs = len(self.reqs)
-        self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
-
-        if self.out_cache_loc is None:
-            logger.error("Decode out of memory. Try to lower your batch size.")
-            if self.tree_cache is not None:
-                self.tree_cache.pretty_print()
-            exit(1)
+        bs = self.batch_size()
+        self.out_cache_loc = self.alloc_token_slots(bs)
 
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
 
     def filter_batch(self, unfinished_indices: List[int]):
+        if unfinished_indices is None or len(unfinished_indices) == 0:
+            # Filter out all requests
+            self.reqs = []
+            return
+
+        if len(unfinished_indices) == len(self.reqs):
+            # No need to filter
+            return
+
         self.reqs = [self.reqs[i] for i in unfinished_indices]
         new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cuda")
         self.seq_lens = self.seq_lens[new_indices]
         self.input_ids = None
         self.req_pool_indices = self.req_pool_indices[new_indices]
-        self.prefix_lens = None
         self.position_ids_offsets = self.position_ids_offsets[new_indices]
         self.out_cache_loc = None
         self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
@@ -672,7 +667,6 @@ class ScheduleBatch:
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
-        self.prefix_lens = None
         self.position_ids_offsets = torch.concat(
             [self.position_ids_offsets, other.position_ids_offsets]
         )
@@ -709,6 +703,7 @@ class ScheduleBatch:
             self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
 
     def sample(self, logits: torch.Tensor):
+        # TODO(lsyin): move this into a part of layer and run with CUDA Graph
         # Post process logits
         logits = logits.contiguous()
         logits.div_(self.temperatures)
@@ -778,7 +773,7 @@ def top_k_top_p_sampling_from_probs_torch(
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
     except RuntimeError:
         batch_next_token_ids = torch.zeros(
-            (probs_sort.shape[0],), dtype=torch.int64, device=probs.device
+            (probs_sort.shape[0],), dtype=torch.int32, device=probs.device
         )
         success = torch.zeros(probs.shape[0], dtype=torch.bool, device=probs.device)
         return batch_next_token_ids, success

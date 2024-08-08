@@ -301,3 +301,20 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+
+
+class EmbeddingRequest(BaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/embeddings/create
+    input: Union[List[int], List[List[int]], str, List[str]]
+    model: str
+    encoding_format: str = "float"
+    dimensions: int = None
+    user: Optional[str] = None
+
+
+class EmbeddingResponse(BaseModel):
+    index: str
+    embedding: List[float] = None
+    object: str = "embedding"
+    usage: Optional[UsageInfo] = None

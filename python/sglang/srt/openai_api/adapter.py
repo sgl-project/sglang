@@ -52,6 +52,8 @@ from sglang.srt.openai_api.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     DeltaMessage,
+    EmbeddingRequest,
+    EmbeddingResponse,
     ErrorResponse,
     FileDeleteResponse,
     FileRequest,
@@ -370,7 +372,6 @@ async def v1_retrieve_file_content(file_id: str):
 
 
 def v1_generate_request(all_requests):
-
     prompts = []
     sampling_params_list = []
     return_logprobs = []
@@ -679,7 +680,6 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
 
 def v1_chat_generate_request(all_requests, tokenizer_manager):
-
     input_ids = []
     sampling_params_list = []
     image_data_list = []
@@ -1003,6 +1003,72 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
         ret = [ret]
 
     response = v1_chat_generate_response(request, ret)
+
+    return response
+
+
+def v1_embedding_request(all_requests, tokenizer_manager):
+    prompts = []
+    sampling_params_list = []
+    first_prompt_type = type(all_requests[0].prompt)
+
+    for request in all_requests:
+        prompt = request.prompt
+        assert (
+            type(prompt) == first_prompt_type
+        ), "All prompts must be of the same type in file input settings"
+        prompts.append(prompt)
+
+    if len(all_requests) == 1:
+        prompt = prompts[0]
+        if isinstance(prompt, str) or isinstance(prompt[0], str):
+            prompt_kwargs = {"text": prompt}
+        else:
+            prompt_kwargs = {"input_ids": prompt}
+    else:
+        if isinstance(prompts[0], str) or isinstance(propmt[0][0], str):
+            prompt_kwargs = {"text": prompts}
+        else:
+            prompt_kwargs = {"input_ids": prompts}
+
+    adapted_request = EmbeddingReqInput(
+        **prompt_kwargs,
+    )
+
+    if len(all_requests) == 1:
+        return adapted_request, all_requests[0]
+    return adapted_request, all_requests
+
+
+def v1_embedding_response(request, ret, to_file=False):
+    response = []
+    for idx, ret_item in enumerate(ret):
+        response.append(
+            EmbeddingResponse(
+                index=idx,
+                embedding=ret[idx],
+                object="embedding",
+            )
+        )
+    return response
+
+
+async def v1_embeddings(tokenizer_manager, raw_request: Request):
+    request_json = await raw_request.json()
+    all_requests = [EmbeddingRequest(**request_json)]
+    adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
+
+    try:
+        ret = await tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        ).__anext__()
+    except ValueError as e:
+        return create_error_response(str(e))
+
+    if not isinstance(ret, list):
+        ret = [ret]
+
+    response = v1_embedding_response(request, ret)
 
     return response
 

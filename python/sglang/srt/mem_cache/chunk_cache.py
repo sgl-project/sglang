@@ -1,6 +1,11 @@
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-from sglang.srt.mem_cache.base_cache import BasePrefixCache
+from typing import TYPE_CHECKING
+
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 
 class ChunkCacheEntry:
@@ -27,22 +32,32 @@ class ChunkCache(BasePrefixCache):
         entry = self.entries[rid]
         return entry.value, entry
 
-    def cache_req(
-        self, rid, token_ids, req_pool_idx, del_in_memory_pool=True, **kwargs
-    ):
-        indices = self.req_to_token_pool.req_to_token[req_pool_idx, : len(token_ids)]
-        if del_in_memory_pool:
-            assert rid in self.entries
-            self.req_to_token_pool.free(req_pool_idx)
-            self.token_to_kv_pool.free(indices)
-            return
+    def cache_finished_req(self, req: "Req", token_ids=None):
+        if token_ids is None:
+            token_ids = (req.input_ids + req.output_ids)[:-1]
 
-        if rid not in self.entries:
-            self.entries[rid] = ChunkCacheEntry(rid, indices)
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
+        assert req.rid in self.entries
+        self.req_to_token_pool.free(req.req_pool_idx)
+        self.token_to_kv_pool.free(kv_indices)
 
-        entry = self.entries[rid]
-        entry.value = indices
-        return indices, entry
+    def cache_unfinished_req(self, req: "Req", token_ids=None):
+        if token_ids is None:
+            token_ids = req.input_ids
+
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
+
+        if req.rid not in self.entries:
+            self.entries[req.rid] = ChunkCacheEntry(req.rid, kv_indices)
+
+        entry = self.entries[req.rid]
+        entry.value = kv_indices
+        req.prefix_indices = kv_indices
+        req.last_node = entry
 
     def insert(self):
         raise NotImplementedError
