@@ -163,11 +163,21 @@ class Req:
         return self.finished_reason is not None
 
     def adjust_max_prefix_ids(self):
-        max_prefix_ids = self.input_ids
-        if self.return_logprob:
-            max_prefix_ids = self.input_ids[: self.logprob_start_len]
+        input_len = len(self.input_ids)
+        max_prefix_len = input_len
 
-        return max_prefix_ids
+        if self.sampling_params.max_new_tokens > 0:
+            # Need at least one token to compute logits
+            max_prefix_len = min(max_prefix_len, input_len - 1)
+
+        if self.return_logprob:
+            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+
+            if self.normalized_prompt_logprob is None:
+                # Need at least two tokens to compute normalized logprob
+                max_prefix_len = min(max_prefix_len, input_len - 2)
+
+        return self.input_ids[:max_prefix_len]
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
