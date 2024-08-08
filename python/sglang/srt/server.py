@@ -74,6 +74,7 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     kill_child_process,
     maybe_set_triton_cache_manager,
+    prepare_model,
     set_torch_compile_config,
     set_ulimit,
 )
@@ -234,6 +235,10 @@ def launch_server(
         nccl_ports=ports[3:],
     )
     logger.info(f"{server_args=}")
+
+    # Use model from www.modelscope.cn, first download the model.
+    server_args.model_path = prepare_model(server_args.model_path)
+    server_args.tokenizer_path = prepare_model(server_args.tokenizer_path)
 
     # Launch processes for multi-node tensor parallelism
     if server_args.nnodes > 1:
