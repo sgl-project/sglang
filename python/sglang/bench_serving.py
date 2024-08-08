@@ -47,7 +47,7 @@ class RequestFuncInput:
     prompt_len: int
     output_len: int
     model: str
-    request_body: Dict[str, Any]
+    extra_request_body: Dict[str, Any]
 
 
 @dataclass
@@ -85,7 +85,7 @@ async def async_request_trt_llm(
             "stream": True,
             "min_length": request_func_input.output_len,
             "end_id": 1048576,
-            **request_func_input.request_body,
+            **request_func_input.extra_request_body,
         }
         if args.disable_ignore_eos:
             del payload["min_length"]
@@ -156,7 +156,7 @@ async def async_request_openai_completions(
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
-            **request_func_input.request_body,
+            **request_func_input.extra_request_body,
         }
         headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
 
@@ -545,7 +545,7 @@ async def benchmark(
     request_rate: float,
     disable_tqdm: bool,
     enable_multi: bool,
-    request_body: Dict[str, Any],
+    extra_request_body: Dict[str, Any],
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -560,7 +560,7 @@ async def benchmark(
         api_url=api_url,
         prompt_len=test_prompt_len,
         output_len=test_output_len,
-        request_body=request_body,
+        extra_request_body=extra_request_body,
     )
     test_output = await request_func(request_func_input=test_input)
     if not test_output.success:
@@ -583,7 +583,7 @@ async def benchmark(
             api_url=api_url,
             prompt_len=prompt_len,
             output_len=output_len,
-            request_body=request_body,
+            extra_request_body=extra_request_body,
         )
         tasks.append(
             asyncio.create_task(
@@ -752,9 +752,9 @@ def fire(args: argparse.Namespace):
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    request_body = {}
-    if args.request_body:
-        request_body = json.loads(args.request_body)
+    extra_request_body = {}
+    if args.extra_request_body:
+        extra_request_body = json.loads(args.extra_request_body)
 
     if args.port is None:
         args.port = {
@@ -848,7 +848,7 @@ def fire(args: argparse.Namespace):
                     request_rate=rate,
                     disable_tqdm=args.disable_tqdm,
                     enable_multi=args.multi,
-                    request_body=request_body,
+                    extra_request_body=extra_request_body,
                 )
             )
     else:
@@ -862,7 +862,7 @@ def fire(args: argparse.Namespace):
                 request_rate=args.request_rate,
                 disable_tqdm=args.disable_tqdm,
                 enable_multi=args.multi,
-                request_body=request_body,
+                extra_request_body=extra_request_body,
             )
         )
 
@@ -989,7 +989,7 @@ if __name__ == "__main__":
         help="Disable ignoring EOS.",
     )
     parser.add_argument(
-        "--request-body",
+        "--extra-request-body",
         metavar='{"key1": "value1", "key2": "value2"}',
         type=str,
         help="Append given JSON object to the request payload. You can use this to specify"

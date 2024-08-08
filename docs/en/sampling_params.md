@@ -229,7 +229,7 @@ P99 ITL (ms):                            440.18
 #### All Together
 
 ```
-$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --request-body '{
+$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --extra-request-body '{
   "frequency_penalty": 1.1,
   "presence_penalty": 1.1,
   "repetition_penalty": 0.1,
@@ -268,7 +268,7 @@ P99 ITL (ms):                            453.86
 #### Frequency Penalty
 
 ```
-$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --request-body '{
+$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --extra-request-body '{
     "frequency_penalty": 1.1
 }'
 
@@ -304,7 +304,7 @@ P99 ITL (ms):                            455.46
 #### Presence Penalty
 
 ```
-$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --request-body '{
+$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --extra-request-body '{
     "presence_penalty": 1.1
 }'
 
@@ -340,7 +340,7 @@ P99 ITL (ms):                            447.11
 #### Repetition Penalty
 
 ```
-$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --request-body '{
+$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --extra-request-body '{
     "repetition_penalty": 0.1
 }'
 
@@ -380,7 +380,7 @@ The min new tokens penalizer computes until generation process reaches given `mi
 Dislike other penalizers, setting this to higher value will have more latency implications.
 
 ```
-$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --request-body '{
+$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --extra-request-body '{
     "min_new_tokens": 5
 }'
 
