@@ -16,12 +16,16 @@ limitations under the License.
 """ModelRunner runs the forward passes of the models."""
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import List
+from typing import TYPE_CHECKING, List
 
 import numpy as np
 import torch
 
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 class ForwardMode(IntEnum):
@@ -111,7 +115,7 @@ class InputMetadata:
             self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
             self.extend_no_prefix = torch.all(prefix_lens == 0)
 
-    def init_total_num_tokens(self, model_runner):
+    def init_total_num_tokens(self, model_runner: "ModelRunner"):
         # FIXME: remove this
         if self.forward_mode == ForwardMode.DECODE:
             if not model_runner.server_args.disable_flashinfer:
@@ -122,6 +126,51 @@ class InputMetadata:
                 self.total_num_tokens = int(torch.sum(self.seq_lens))
         else:
             self.total_num_tokens = int(torch.sum(self.seq_lens))
+
+    @classmethod
+    def from_schedule_batch(
+        cls,
+        model_runner: "ModelRunner",
+        batch: ScheduleBatch,
+        forward_mode: ForwardMode,
+    ):
+        ret = cls(
+            forward_mode=forward_mode,
+            batch_size=batch.batch_size(),
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=batch.seq_lens,
+            req_to_token_pool=model_runner.req_to_token_pool,
+            token_to_kv_pool=model_runner.token_to_kv_pool,
+            out_cache_loc=batch.out_cache_loc,
+            return_logprob=batch.return_logprob,
+            top_logprobs_nums=batch.top_logprobs_nums,
+        )
+
+        prefix_lens = torch.tensor(
+            [len(r.prefix_indices) for r in batch.reqs], device="cuda"
+        )
+
+        ret.compute_positions(prefix_lens)
+
+        ret.compute_extend_infos(prefix_lens)
+
+        ret.init_total_num_tokens(model_runner)
+
+        if model_runner.server_args.disable_flashinfer:
+            ret.init_triton_args(prefix_lens)
+
+        flashinfer_use_ragged = False
+        if not model_runner.server_args.disable_flashinfer:
+            if (
+                forward_mode != ForwardMode.DECODE
+                and int(torch.sum(ret.seq_lens)) > 4096
+            ):
+                flashinfer_use_ragged = True
+            ret.init_flashinfer_handlers(
+                model_runner, prefix_lens, flashinfer_use_ragged
+            )
+
+        return ret
 
     @classmethod
     def create(
@@ -137,11 +186,9 @@ class InputMetadata:
         return_logprob=False,
         skip_flashinfer_init=False,
     ):
-        batch_size = len(req_pool_indices)
-
         ret = cls(
             forward_mode=forward_mode,
-            batch_size=batch_size,
+            batch_size=len(req_pool_indices),
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             req_to_token_pool=model_runner.req_to_token_pool,
