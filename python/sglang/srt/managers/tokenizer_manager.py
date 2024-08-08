@@ -479,8 +479,10 @@ class TokenizerManager:
 
     async def handle_loop(self):
         while True:
-            recv_obj: BatchStrOut = await self.recv_from_detokenizer.recv_pyobj()
-            assert isinstance(recv_obj, BatchStrOut)
+            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            is_str_output = isinstance(recv_obj, BatchStrOut)
+            is_token_id_output = isinstance(recv_obj, BatchTokenIDOut)
+            assert is_str_output or is_token_id_output, f"Unexpected obj received: {type(recv_obj)}"
 
             for i, rid in enumerate(recv_obj.rids):
                 state = self.rid_to_state.get(rid, None)
@@ -488,10 +490,18 @@ class TokenizerManager:
                     continue
 
                 recv_obj.meta_info[i]["id"] = rid
-                out_dict = {
-                    "text": recv_obj.output_strs[i],
-                    "meta_info": recv_obj.meta_info[i],
-                }
+                if is_str_output:
+                    out_dict = {
+                        "text": recv_obj.output_strs[i],
+                        "meta_info": recv_obj.meta_info[i],
+                    }
+                elif is_token_id_output:
+                    read_start = 0 if i==0 else recv_obj.read_offsets[i-1]
+                    out_dict = {
+                        "token_ids": recv_obj.decode_ids[read_start:recv_obj.read_offsets[i]],
+                        "meta_info": recv_obj.meta_info[i],
+                    }
+
                 state.out_list.append(out_dict)
                 state.finished = recv_obj.finished_reason[i] is not None
                 state.event.set()

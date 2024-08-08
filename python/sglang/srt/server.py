@@ -392,28 +392,29 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
         sys.exit(1)
 
-    # Send a warmup request
-    try:
-        for _ in range(server_args.dp_size):
-            res = requests.post(
-                url + "/generate",
-                json={
-                    "text": "The capital city of France is",
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": 8,
+    if not server_args.skip_tokenizer_init:
+        # Send a warmup request
+        try:
+            for _ in range(server_args.dp_size):
+                res = requests.post(
+                    url + "/generate",
+                    json={
+                        "text": "The capital city of France is",
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 8,
+                        },
                     },
-                },
-                headers=headers,
-                timeout=600,
-            )
-            assert res.status_code == 200, f"{res}"
-    except Exception as e:
-        last_traceback = get_exception_traceback()
-        if pipe_finish_writer is not None:
-            pipe_finish_writer.send(last_traceback)
-        print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
-        sys.exit(1)
+                    headers=headers,
+                    timeout=600,
+                )
+                assert res.status_code == 200, f"{res}"
+        except Exception as e:
+            last_traceback = get_exception_traceback()
+            if pipe_finish_writer is not None:
+                pipe_finish_writer.send(last_traceback)
+            print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
+            sys.exit(1)
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:

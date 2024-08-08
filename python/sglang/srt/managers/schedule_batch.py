@@ -193,6 +193,8 @@ class Req:
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
     def get_next_inc_detokenization(self):
+        if self.tokenizer is None:
+            return False, ""
         read_ids, read_offset = self.init_incremental_detokenize()
         surr_ids = read_ids[:read_offset]
 
@@ -220,10 +222,11 @@ class Req:
             self.finished_reason = FINISH_LENGTH(len(self.output_ids))
             return
 
-        if (
-            self.output_ids[-1] == self.tokenizer.eos_token_id
-            and not self.sampling_params.ignore_eos
-        ):
+        if self.tokenizer is None:
+            matched_eos = self.output_ids[-1] in self.sampling_params.stop_token_ids
+        else:
+            matched_eos = self.output_ids[-1] == self.tokenizer.eos_token_id
+        if matched_eos and not self.sampling_params.ignore_eos:
             self.finished_reason = FINISH_MATCHED_TOKEN(
                 matched=self.tokenizer.eos_token_id
             )

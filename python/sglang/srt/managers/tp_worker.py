@@ -100,18 +100,24 @@ class ModelTpServer:
         )
 
         if is_multimodal_model(server_args.model_path):
-            self.processor = get_processor(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-            )
-            self.tokenizer = self.processor.tokenizer
+            if server_args.skip_tokenizer_init:
+                self.tokenizer = None
+            else:
+                self.processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+                self.tokenizer = self.processor.tokenizer
         else:
-            self.tokenizer = get_tokenizer(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-            )
+            if server_args.skip_tokenizer_init:
+                self.tokenizer = None
+            else:
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = (
             16384
@@ -180,13 +186,15 @@ class ModelTpServer:
         self.last_stats_tic = time.time()
 
         # Init the FSM cache for constrained generation
-        self.regex_fsm_cache = FSMCache(
-            server_args.tokenizer_path,
-            {
-                "tokenizer_mode": server_args.tokenizer_mode,
-                "trust_remote_code": server_args.trust_remote_code,
-            },
-        )
+        if not server_args.skip_tokenizer_init:
+            self.regex_fsm_cache = FSMCache(
+                server_args.tokenizer_path,
+                {
+                    "tokenizer_mode": server_args.tokenizer_mode,
+                    "trust_remote_code": server_args.trust_remote_code,
+                },
+                skip_tokenizer_init=server_args.skip_tokenizer_init,
+            )
         self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
@@ -440,6 +448,7 @@ class ModelTpServer:
         )
 
         # Forward and sample the next tokens
+        next_token_ids = []
         if batch.extend_num_tokens != 0:
             output = self.model_runner.forward(batch, ForwardMode.EXTEND)
             next_token_ids = batch.sample(output.next_token_logits)
@@ -457,7 +466,11 @@ class ModelTpServer:
 
             next_token_ids = next_token_ids.tolist()
         else:
-            next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
+            if self.tokenizer is None:
+                for i, req in enumerate(batch.reqs):
+                    next_token_ids.extend(req.sampling_params.stop_token_ids)
+            else:
+                next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
 
         # Check finish conditions
         pt = 0
