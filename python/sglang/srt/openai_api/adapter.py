@@ -392,10 +392,13 @@ def v1_generate_request(all_requests):
             {
                 "temperature": request.temperature,
                 "max_new_tokens": request.max_tokens,
+                "min_new_tokens": request.min_tokens,
                 "stop": request.stop,
+                "stop_token_ids": request.stop_token_ids,
                 "top_p": request.top_p,
                 "presence_penalty": request.presence_penalty,
                 "frequency_penalty": request.frequency_penalty,
+                "repetition_penalty": request.repetition_penalty,
                 "regex": request.regex,
                 "n": request.n,
                 "ignore_eos": request.ignore_eos,
@@ -722,10 +725,13 @@ def v1_chat_generate_request(all_requests, tokenizer_manager):
             {
                 "temperature": request.temperature,
                 "max_new_tokens": request.max_tokens,
+                "min_new_tokens": request.min_tokens,
                 "stop": stop,
+                "stop_token_ids": request.stop_token_ids,
                 "top_p": request.top_p,
                 "presence_penalty": request.presence_penalty,
                 "frequency_penalty": request.frequency_penalty,
+                "repetition_penalty": request.repetition_penalty,
                 "regex": request.regex,
                 "n": request.n,
             }
