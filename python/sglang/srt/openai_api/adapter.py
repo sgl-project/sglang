@@ -82,6 +82,17 @@ file_id_storage: Dict[str, str] = {}
 storage_dir = None
 
 
+def format_finish_reason(finish_reason) -> Optional[str]:
+    if finish_reason.startswith("None"):
+        return None
+    if finish_reason.startswith("FINISH_MATCHED"):
+        return "stop"
+    elif finish_reason.startswith("FINISH_LENGTH"):
+        return "length"
+    else:
+        raise ValueError(f"Unknown finish reason: {finish_reason}")
+
+
 def create_error_response(
     message: str,
     err_type: str = "BadRequestError",
@@ -485,14 +496,18 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 "index": 0,
                 "text": text,
                 "logprobs": logprobs,
-                "finish_reason": ret_item["meta_info"]["finish_reason"],
+                "finish_reason": format_finish_reason(
+                    ret_item["meta_info"]["finish_reason"]
+                ),
             }
         else:
             choice_data = CompletionResponseChoice(
                 index=idx,
                 text=text,
                 logprobs=logprobs,
-                finish_reason=ret_item["meta_info"]["finish_reason"],
+                finish_reason=format_finish_reason(
+                    ret_item["meta_info"]["finish_reason"]
+                ),
             )
 
         choices.append(choice_data)
@@ -607,7 +622,9 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         index=0,
                         text=delta,
                         logprobs=logprobs,
-                        finish_reason=content["meta_info"]["finish_reason"],
+                        finish_reason=format_finish_reason(
+                            content["meta_info"]["finish_reason"]
+                        ),
                     )
                     chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
@@ -788,14 +805,18 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 "index": 0,
                 "message": {"role": "assistant", "content": ret_item["text"]},
                 "logprobs": choice_logprobs,
-                "finish_reason": ret_item["meta_info"]["finish_reason"],
+                "finish_reason": format_finish_reason(
+                    ret_item["meta_info"]["finish_reason"]
+                ),
             }
         else:
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(role="assistant", content=ret_item["text"]),
                 logprobs=choice_logprobs,
-                finish_reason=ret_item["meta_info"]["finish_reason"],
+                finish_reason=format_finish_reason(
+                    ret_item["meta_info"]["finish_reason"]
+                ),
             )
 
         choices.append(choice_data)
@@ -912,7 +933,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=0,
                             delta=DeltaMessage(role="assistant"),
-                            finish_reason=content["meta_info"]["finish_reason"],
+                            finish_reason=format_finish_reason(
+                                content["meta_info"]["finish_reason"]
+                            ),
                             logprobs=choice_logprobs,
                         )
                         chunk = ChatCompletionStreamResponse(
@@ -933,7 +956,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=0,
                         delta=DeltaMessage(content=delta),
-                        finish_reason=content["meta_info"]["finish_reason"],
+                        finish_reason=format_finish_reason(
+                            content["meta_info"]["finish_reason"]
+                        ),
                         logprobs=choice_logprobs,
                     )
                     chunk = ChatCompletionStreamResponse(
