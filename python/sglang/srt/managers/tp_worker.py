@@ -394,15 +394,11 @@ class ModelTpServer:
                     delta = 2 - req.extend_input_len
                     req.extend_input_len += delta
                     req.prefix_indices = req.prefix_indices[:-delta]
-                    if req.image_offset is not None:
-                        req.image_offset += delta
 
             if req.extend_input_len == 0 and req.sampling_params.max_new_tokens > 0:
                 # Need at least one token to compute logits
                 req.extend_input_len = 1
                 req.prefix_indices = req.prefix_indices[:-1]
-                if req.image_offset is not None:
-                    req.image_offset += 1
 
             res = adder.add_one_req(req)
             if (
