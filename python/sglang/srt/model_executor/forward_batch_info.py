@@ -81,30 +81,46 @@ class InputMetadata:
     def init_multimuldal_info(self):
         pass
 
-    def compute_positions(self, prefix_lens: torch.Tensor = None):
-        batch_size = len(self.seq_lens)
-        position_ids_offsets = torch.zeros_like(self.seq_lens)
+    def compute_positions(self, batch: ScheduleBatch):
+        position_ids_offsets = batch.position_ids_offsets
 
         if self.forward_mode == ForwardMode.DECODE:
-            self.positions = (self.seq_lens - 1) + position_ids_offsets
-            self.positions = self.positions.to(torch.int64)
+            if True:
+                self.positions = self.seq_lens - 1
+            else:
+                # Deprecated
+                self.positions = (self.seq_lens - 1) + position_ids_offsets
         else:
-            seq_lens_cpu = self.seq_lens.cpu().numpy()
-            prefix_lens_cpu = prefix_lens.cpu().numpy()
-            position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
-            self.positions = torch.tensor(
-                np.concatenate(
-                    [
-                        np.arange(
-                            prefix_lens_cpu[i] + position_ids_offsets_cpu[i],
-                            seq_lens_cpu[i] + position_ids_offsets_cpu[i],
-                        )
-                        for i in range(batch_size)
-                    ],
-                    axis=0,
-                ),
-                device="cuda",
-            )
+            if True:
+                self.positions = torch.tensor(
+                    np.concatenate(
+                        [
+                            np.arange(len(req.prefix_indices), len(req.input_ids))
+                            for req in batch.reqs
+                        ],
+                        axis=0,
+                    ),
+                    device="cuda",
+                )
+            else:
+                # Deprecated
+                position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
+                self.positions = torch.tensor(
+                    np.concatenate(
+                        [
+                            np.arange(
+                                len(req.prefix_indices) + position_ids_offsets_cpu[i],
+                                len(req.input_ids) + position_ids_offsets_cpu[i],
+                            )
+                            for i, req in enumerate(batch.reqs)
+                        ],
+                        axis=0,
+                    ),
+                    device="cuda",
+                )
+
+        # Positions should be in long type
+        self.positions = self.positions.to(torch.int64)
 
     def compute_extend_infos(self, prefix_lens):
         if self.forward_mode == ForwardMode.DECODE:
@@ -150,7 +166,7 @@ class InputMetadata:
             [len(r.prefix_indices) for r in batch.reqs], device="cuda"
         )
 
-        ret.compute_positions(prefix_lens)
+        ret.compute_positions(batch)
 
         ret.compute_extend_infos(prefix_lens)
 

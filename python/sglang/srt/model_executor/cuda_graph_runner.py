@@ -186,9 +186,9 @@ class CudaGraphRunner:
                 out_cache_loc=out_cache_loc,
                 return_logprob=False,
                 top_logprobs_nums=0,
+                positions=(seq_lens - 1).to(torch.int64),
                 flashinfer_decode_wrapper=flashinfer_decode_wrapper,
             )
-            input_metadata.compute_positions()
 
             return forward(input_ids, input_metadata.positions, input_metadata)
 

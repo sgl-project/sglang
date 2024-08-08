@@ -451,7 +451,7 @@ class ScheduleBatch:
             self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
             self.req_pool_indices = torch.tensor(req_pool_indices_cpu)
             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
-            self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int32)
+            self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int64)
 
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
