@@ -154,14 +154,25 @@ class InputMetadata:
         )
 
         if model_runner.server_args.disable_flashinfer:
-            (
-                ret.triton_max_seq_len,
-                ret.triton_max_extend_len,
-                ret.triton_start_loc,
-                ret.triton_prefix_lens,
-            ) = init_triton_args(forward_mode, seq_lens, prefix_lens)
+            ret.init_triton_args(prefix_lens)
 
         return ret
+
+    def init_triton_args(self, prefix_lens):
+        """Init auxiliary variables for triton attention backend."""
+        batch_size = len(self.seq_lens)
+        self.triton_max_seq_len = int(torch.max(self.seq_lens))
+        self.triton_prefix_lens = prefix_lens
+        self.triton_start_loc = torch.zeros(
+            (batch_size,), dtype=torch.int32, device="cuda"
+        )
+        self.triton_start_loc[1:] = torch.cumsum(self.seq_lens[:-1], dim=0)
+
+        if self.forward_mode == ForwardMode.DECODE:
+            self.triton_max_extend_len = None
+        else:
+            extend_seq_lens = self.seq_lens - prefix_lens
+            self.triton_max_extend_len = int(torch.max(extend_seq_lens))
 
 
 def init_flashinfer_args(
@@ -238,19 +249,3 @@ def init_flashinfer_args(
             head_dim,
             1,
         )
-
-
-def init_triton_args(forward_mode, seq_lens, prefix_lens):
-    """Init auxiliary variables for triton attention backend."""
-    batch_size = len(seq_lens)
-    max_seq_len = int(torch.max(seq_lens))
-    start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
-    start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
-
-    if forward_mode == ForwardMode.DECODE:
-        max_extend_len = None
-    else:
-        extend_seq_lens = seq_lens - prefix_lens
-        max_extend_len = int(torch.max(extend_seq_lens))
-
-    return max_seq_len, max_extend_len, start_loc, prefix_lens
