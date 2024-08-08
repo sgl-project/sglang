@@ -616,8 +616,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         model=request.model,
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
-                if request.stream_options.include_usage:
-
+                if request.stream_options and request.stream_options.include_usage:
                     usage = UsageInfo(
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
@@ -943,8 +942,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         model=request.model,
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
-                if request.stream_options.include_usage:
-
+                if request.stream_options and request.stream_options.include_usage:
                     usage = UsageInfo(
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,

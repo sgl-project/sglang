@@ -125,9 +125,6 @@ class TestOpenAIServer(unittest.TestCase):
 
             assert response.id
             assert response.created
-            assert response.usage.prompt_tokens > 0
-            assert response.usage.completion_tokens > 0
-            assert response.usage.total_tokens > 0
 
     def run_chat_completion(self, logprobs, parallel_sample_num):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
