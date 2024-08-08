@@ -25,7 +25,11 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.managers.io_struct import BatchStrOut, BatchTokenIDOut
+from sglang.srt.managers.io_struct import (
+    BatchEmbeddingOut,
+    BatchStrOut,
+    BatchTokenIDOut,
+)
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.utils import find_printable_text, get_exception_traceback, graceful_registry
@@ -66,6 +70,18 @@ class DetokenizerManager:
     async def handle_loop(self):
         while True:
             recv_obj: BatchTokenIDOut = await self.recv_from_router.recv_pyobj()
+
+            if isinstance(recv_obj, BatchEmbeddingOut):
+                self.send_to_tokenizer.send_pyobj(
+                    BatchEmbeddingOut(
+                        rids=recv_obj.rids,
+                        embeddings=recv_obj.embeddings,
+                        meta_info=recv_obj.meta_info,
+                        finished_reason=recv_obj.finished_reason,
+                    )
+                )
+                continue
+
             assert isinstance(recv_obj, BatchTokenIDOut)
             bs = len(recv_obj.rids)
 
