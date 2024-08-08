@@ -197,16 +197,14 @@ class Req:
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(len(self.output_ids))
+            self.finished_reason = "length"
             return
 
         if (
             self.output_ids[-1] == self.tokenizer.eos_token_id
             and not self.sampling_params.ignore_eos
         ):
-            self.finished_reason = FINISH_MATCHED_TOKEN(
-                matched=self.tokenizer.eos_token_id
-            )
+            self.finished_reason = "stop"
             return
 
         if len(self.sampling_params.stop_strs) > 0:

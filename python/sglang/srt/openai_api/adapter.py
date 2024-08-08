@@ -614,13 +614,26 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         object="text_completion",
                         choices=[choice_data],
                         model=request.model,
-                        usage=UsageInfo(
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            total_tokens=prompt_tokens + completion_tokens,
-                        ),
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
+                if request.stream_options.include_usage:
+
+                    usage = UsageInfo(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    )
+
+                    final_usage_chunk = CompletionStreamResponse(
+                        id=str(uuid.uuid4().hex),
+                        choices=[],
+                        model=request.model,
+                        usage=usage,
+                    )
+                    final_usage_data = final_usage_chunk.model_dump_json(
+                        exclude_unset=True, exclude_none=True
+                    )
+                    yield f"data: {final_usage_data}\n\n"
             except ValueError as e:
                 error = create_streaming_error_response(str(e))
                 yield f"data: {error}\n\n"
@@ -928,13 +941,26 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         id=content["meta_info"]["id"],
                         choices=[choice_data],
                         model=request.model,
-                        usage=UsageInfo(
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            total_tokens=prompt_tokens + completion_tokens,
-                        ),
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
+                if request.stream_options.include_usage:
+
+                    usage = UsageInfo(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    )
+
+                    final_usage_chunk = ChatCompletionStreamResponse(
+                        id=str(uuid.uuid4().hex),
+                        choices=[],
+                        model=request.model,
+                        usage=usage,
+                    )
+                    final_usage_data = final_usage_chunk.model_dump_json(
+                        exclude_unset=True, exclude_none=True
+                    )
+                    yield f"data: {final_usage_data}\n\n"
             except ValueError as e:
                 error = create_streaming_error_response(str(e))
                 yield f"data: {error}\n\n"
