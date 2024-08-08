@@ -39,17 +39,21 @@ class InputMetadata:
 
     forward_mode: ForwardMode
     batch_size: int
-    total_num_tokens: int
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
-    positions: torch.Tensor
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: BaseTokenToKVPool
 
+    # FIXME: Undefined infos
+    total_num_tokens: int = None
+
+    # Position information
+    positions: torch.Tensor = None
+
     # For extend
-    extend_seq_lens: torch.Tensor
-    extend_start_loc: torch.Tensor
-    extend_no_prefix: bool
+    extend_seq_lens: torch.Tensor = None
+    extend_start_loc: torch.Tensor = None
+    extend_no_prefix: bool = None
 
     # Output location of the KV cache
     out_cache_loc: torch.Tensor = None
@@ -69,6 +73,55 @@ class InputMetadata:
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
     flashinfer_use_ragged: bool = False
+
+    def init_multimuldal_info(self):
+        pass
+
+    def compute_positions(self, prefix_lens: torch.Tensor):
+        batch_size = len(self.seq_lens)
+        position_ids_offsets = torch.zeros_like(self.seq_lens)
+
+        if self.forward_mode == ForwardMode.DECODE:
+            self.positions = (self.seq_lens - 1) + position_ids_offsets
+            self.positions = self.positions.to(torch.int32)
+        else:
+            seq_lens_cpu = self.seq_lens.cpu().numpy()
+            prefix_lens_cpu = prefix_lens.cpu().numpy()
+            position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
+            self.positions = torch.tensor(
+                np.concatenate(
+                    [
+                        np.arange(
+                            prefix_lens_cpu[i] + position_ids_offsets_cpu[i],
+                            seq_lens_cpu[i] + position_ids_offsets_cpu[i],
+                        )
+                        for i in range(batch_size)
+                    ],
+                    axis=0,
+                ),
+                device="cuda",
+            )
+
+    def compute_extend_infos(self, prefix_lens):
+        if self.forward_mode == ForwardMode.DECODE:
+            self.extend_seq_lens = self.extend_start_loc = self.extend_no_prefix = None
+        else:
+            self.extend_seq_lens = self.seq_lens - prefix_lens
+            self.extend_start_loc = torch.zeros_like(self.seq_lens)
+            self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+            self.extend_no_prefix = torch.all(prefix_lens == 0)
+
+    def init_total_num_tokens(self, model_runner):
+        # FIXME: remove this
+        if self.forward_mode == ForwardMode.DECODE:
+            if not model_runner.server_args.disable_flashinfer:
+                # This variable is not needed in this case,
+                # we do not compute it to make it compatbile with cuda graph.
+                self.total_num_tokens = None
+            else:
+                self.total_num_tokens = int(torch.sum(self.seq_lens))
+        else:
+            self.total_num_tokens = int(torch.sum(self.seq_lens))
 
     @classmethod
     def create(
@@ -100,51 +153,14 @@ class InputMetadata:
 
         batch_size = len(req_pool_indices)
 
-        if forward_mode == ForwardMode.DECODE:
-            positions = ((seq_lens - 1) + position_ids_offsets).to(torch.int64)
-            extend_seq_lens = extend_start_loc = extend_no_prefix = None
-            if not model_runner.server_args.disable_flashinfer:
-                # This variable is not needed in this case,
-                # we do not compute it to make it compatbile with cuda graph.
-                total_num_tokens = None
-            else:
-                total_num_tokens = int(torch.sum(seq_lens))
-        else:
-            seq_lens_cpu = seq_lens.cpu().numpy()
-            prefix_lens_cpu = prefix_lens.cpu().numpy()
-            position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
-            positions = torch.tensor(
-                np.concatenate(
-                    [
-                        np.arange(
-                            prefix_lens_cpu[i] + position_ids_offsets_cpu[i],
-                            seq_lens_cpu[i] + position_ids_offsets_cpu[i],
-                        )
-                        for i in range(batch_size)
-                    ],
-                    axis=0,
-                ),
-                device="cuda",
-            )
-            extend_seq_lens = seq_lens - prefix_lens
-            extend_start_loc = torch.zeros_like(seq_lens)
-            extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-            extend_no_prefix = torch.all(prefix_lens == 0)
-            total_num_tokens = int(torch.sum(seq_lens))
-
         ret = cls(
             forward_mode=forward_mode,
             batch_size=batch_size,
-            total_num_tokens=total_num_tokens,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            positions=positions,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            extend_seq_lens=extend_seq_lens,
-            extend_start_loc=extend_start_loc,
-            extend_no_prefix=extend_no_prefix,
             return_logprob=return_logprob,
             top_logprobs_nums=top_logprobs_nums,
             flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
@@ -152,6 +168,12 @@ class InputMetadata:
             flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
             flashinfer_use_ragged=flashinfer_use_ragged,
         )
+
+        ret.compute_positions(prefix_lens)
+
+        ret.compute_extend_infos(prefix_lens)
+
+        ret.init_total_num_tokens(model_runner)
 
         if model_runner.server_args.disable_flashinfer:
             ret.init_triton_args(prefix_lens)
