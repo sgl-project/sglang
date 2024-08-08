@@ -48,6 +48,9 @@ class InputMetadata:
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: BaseTokenToKVPool
 
+    # Output location of the KV cache
+    out_cache_loc: torch.Tensor
+
     # FIXME: Undefined infos
     total_num_tokens: int = None
 
@@ -58,9 +61,6 @@ class InputMetadata:
     extend_seq_lens: torch.Tensor = None
     extend_start_loc: torch.Tensor = None
     extend_no_prefix: bool = None
-
-    # Output location of the KV cache
-    out_cache_loc: torch.Tensor = None
 
     # Output options
     return_logprob: bool = False
@@ -81,7 +81,7 @@ class InputMetadata:
     def init_multimuldal_info(self):
         pass
 
-    def compute_positions(self, prefix_lens: torch.Tensor):
+    def compute_positions(self, prefix_lens: torch.Tensor = None):
         batch_size = len(self.seq_lens)
         position_ids_offsets = torch.zeros_like(self.seq_lens)
 
@@ -165,51 +165,6 @@ class InputMetadata:
                 forward_mode != ForwardMode.DECODE
                 and int(torch.sum(ret.seq_lens)) > 4096
             ):
-                flashinfer_use_ragged = True
-            ret.init_flashinfer_handlers(
-                model_runner, prefix_lens, flashinfer_use_ragged
-            )
-
-        return ret
-
-    @classmethod
-    def create(
-        cls,
-        model_runner,
-        forward_mode,
-        req_pool_indices,
-        seq_lens,
-        prefix_lens,
-        position_ids_offsets,
-        out_cache_loc,
-        top_logprobs_nums=None,
-        return_logprob=False,
-        skip_flashinfer_init=False,
-    ):
-        ret = cls(
-            forward_mode=forward_mode,
-            batch_size=len(req_pool_indices),
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            req_to_token_pool=model_runner.req_to_token_pool,
-            token_to_kv_pool=model_runner.token_to_kv_pool,
-            out_cache_loc=out_cache_loc,
-            return_logprob=return_logprob,
-            top_logprobs_nums=top_logprobs_nums,
-        )
-
-        ret.compute_positions(prefix_lens)
-
-        ret.compute_extend_infos(prefix_lens)
-
-        ret.init_total_num_tokens(model_runner)
-
-        if model_runner.server_args.disable_flashinfer:
-            ret.init_triton_args(prefix_lens)
-
-        flashinfer_use_ragged = False
-        if not skip_flashinfer_init and not model_runner.server_args.disable_flashinfer:
-            if forward_mode != ForwardMode.DECODE and int(torch.sum(seq_lens)) > 4096:
                 flashinfer_use_ragged = True
             ret.init_flashinfer_handlers(
                 model_runner, prefix_lens, flashinfer_use_ragged
