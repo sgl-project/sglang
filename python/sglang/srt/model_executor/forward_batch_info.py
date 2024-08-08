@@ -51,7 +51,6 @@ class InputMetadata:
     # Output location of the KV cache
     out_cache_loc: torch.Tensor
 
-    # FIXME: Undefined infos
     total_num_tokens: int = None
 
     # Position information
@@ -66,6 +65,11 @@ class InputMetadata:
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
 
+    # For multimodal
+    pixel_values: List[torch.Tensor] = None
+    image_sizes: List[List[int]] = None
+    image_offsets: List[int] = None
+
     # Trition attention backend
     triton_max_seq_len: int = 0
     triton_max_extend_len: int = 0
@@ -78,8 +82,18 @@ class InputMetadata:
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
     flashinfer_use_ragged: bool = False
 
-    def init_multimuldal_info(self):
-        pass
+    def init_multimuldal_info(self, batch: ScheduleBatch):
+        reqs = batch.reqs
+        self.pixel_values = [r.pixel_values for r in reqs]
+        self.image_sizes = [r.image_size for r in reqs]
+        self.image_offsets = [
+            (
+                (r.image_offset - len(r.prefix_indices))
+                if r.image_offset is not None
+                else 0
+            )
+            for r in reqs
+        ]
 
     def compute_positions(self, batch: ScheduleBatch):
         position_ids_offsets = batch.position_ids_offsets
@@ -161,6 +175,9 @@ class InputMetadata:
         ret.compute_extend_infos(batch)
 
         ret.init_total_num_tokens(batch)
+
+        if forward_mode != ForwardMode.DECODE:
+            ret.init_multimuldal_info(batch)
 
         prefix_lens = None
         if forward_mode != ForwardMode.DECODE:

@@ -315,11 +315,6 @@ class ScheduleBatch:
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
 
-    # For multimodal
-    pixel_values: List[torch.Tensor] = None
-    image_sizes: List[List[int]] = None
-    image_offsets: List[int] = None
-
     # Batched sampling params
     temperatures: torch.Tensor = None
     top_ps: torch.Tensor = None
@@ -447,16 +442,6 @@ class ScheduleBatch:
             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
             self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int64)
 
-        self.pixel_values = [r.pixel_values for r in reqs]
-        self.image_sizes = [r.image_size for r in reqs]
-        self.image_offsets = [
-            (
-                (r.image_offset - len(r.prefix_indices))
-                if r.image_offset is not None
-                else 0
-            )
-            for r in reqs
-        ]
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
