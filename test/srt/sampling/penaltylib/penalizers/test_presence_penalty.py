@@ -6,8 +6,7 @@ import torch
 from sglang.srt.sampling.penaltylib.penalizers.presence_penalty import (
     BatchedPresencePenalizer,
 )
-
-from ..utils import (
+from sglang.test.srt.sampling.penaltylib.utils import (
     BaseBatchedPenalizerTest,
     MockSamplingParams,
     Step,

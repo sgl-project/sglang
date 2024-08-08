@@ -6,8 +6,7 @@ import torch
 from sglang.srt.sampling.penaltylib.penalizers.repetition_penalty import (
     BatchedRepetitionPenalizer,
 )
-
-from ..utils import (
+from sglang.test.srt.sampling.penaltylib.utils import (
     BaseBatchedPenalizerTest,
     MockSamplingParams,
     Step,
