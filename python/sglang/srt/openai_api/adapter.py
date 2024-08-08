@@ -942,11 +942,6 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             id=content["meta_info"]["id"],
                             choices=[choice_data],
                             model=request.model,
-                            usage=UsageInfo(
-                                prompt_tokens=prompt_tokens,
-                                completion_tokens=completion_tokens,
-                                total_tokens=prompt_tokens + completion_tokens,
-                            ),
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 

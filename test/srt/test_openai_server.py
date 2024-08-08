@@ -98,10 +98,17 @@ class TestOpenAIServer(unittest.TestCase):
             echo=echo,
             logprobs=logprobs,
             stream=True,
+            stream_options={"include_usage": True},
         )
 
         first = True
         for response in generator:
+            usage = response.usage
+            if usage is not None:
+                assert usage.prompt_tokens > 0
+                assert usage.completion_tokens > 0
+                assert usage.total_tokens > 0
+                continue
             if logprobs:
                 assert response.choices[0].logprobs
                 assert isinstance(response.choices[0].logprobs.tokens[0], str)
@@ -122,7 +129,6 @@ class TestOpenAIServer(unittest.TestCase):
                         prompt
                     ), f"{response.choices[0].text} and all args {echo} {logprobs} {token_input} {first}"
                 first = False
-
             assert response.id
             assert response.created
 
@@ -176,11 +182,20 @@ class TestOpenAIServer(unittest.TestCase):
             logprobs=logprobs is not None and logprobs > 0,
             top_logprobs=logprobs,
             stream=True,
+            stream_options={"include_usage": True},
         )
 
         is_first = True
         for response in generator:
+            usage = response.usage
+            if usage is not None:
+                assert usage.prompt_tokens > 0
+                assert usage.completion_tokens > 0
+                assert usage.total_tokens > 0
+                continue
+
             data = response.choices[0].delta
+
             if is_first:
                 data.role == "assistant"
                 is_first = False
