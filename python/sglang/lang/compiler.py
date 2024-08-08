@@ -125,7 +125,7 @@ class CompiledFunction:
     def run(
         self,
         *,
-        max_new_tokens: int = 16,
+        max_new_tokens: int = 128,
         stop: Union[str, List[str]] = (),
         temperature: float = 1.0,
         top_p: float = 1.0,
@@ -155,7 +155,7 @@ class CompiledFunction:
         self,
         batch_kwargs,
         *,
-        max_new_tokens: int = 16,
+        max_new_tokens: int = 128,
         stop: Union[str, List[str]] = (),
         temperature: float = 1.0,
         top_p: float = 1.0,
