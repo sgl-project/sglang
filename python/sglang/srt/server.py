@@ -73,7 +73,6 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     kill_child_process,
     maybe_set_triton_cache_manager,
-    set_torch_compile_config,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
