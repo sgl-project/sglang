@@ -396,6 +396,13 @@ class ScheduleBatch:
             [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
         )
 
+        # Each penalizers will do nothing if they evaluate themselves as not required by looking at
+        # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
+        # should not add hefty computation overhead other than simple checks.
+        #
+        # While we choose not to even create the class instances if they are not required, this
+        # could add additional complexity to the {ScheduleBatch} class, especially we need to
+        # handle {filter_batch()} and {merge()} cases as well.
         self.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
             batch=self,
