@@ -122,26 +122,20 @@ class InputMetadata:
         # Positions should be in long type
         self.positions = self.positions.to(torch.int64)
 
-    def compute_extend_infos(self, prefix_lens):
+    def compute_extend_infos(self, batch: ScheduleBatch):
         if self.forward_mode == ForwardMode.DECODE:
             self.extend_seq_lens = self.extend_start_loc = self.extend_no_prefix = None
         else:
-            self.extend_seq_lens = self.seq_lens - prefix_lens
+            prefix_lens_cpu = [
+                len(r.input_ids) - len(r.prefix_indices) for r in batch.reqs
+            ]
+            self.extend_seq_lens = torch.tensor(prefix_lens_cpu, device="cuda")
             self.extend_start_loc = torch.zeros_like(self.seq_lens)
             self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
-            self.extend_no_prefix = torch.all(prefix_lens == 0)
+            self.extend_no_prefix = all(x == 0 for x in prefix_lens_cpu)
 
-    def init_total_num_tokens(self, model_runner: "ModelRunner"):
-        # FIXME: remove this
-        if self.forward_mode == ForwardMode.DECODE:
-            if not model_runner.server_args.disable_flashinfer:
-                # This variable is not needed in this case,
-                # we do not compute it to make it compatbile with cuda graph.
-                self.total_num_tokens = None
-            else:
-                self.total_num_tokens = int(torch.sum(self.seq_lens))
-        else:
-            self.total_num_tokens = int(torch.sum(self.seq_lens))
+    def init_total_num_tokens(self, batch: ScheduleBatch):
+        self.total_num_tokens = sum(len(req.input_ids) for req in batch.reqs)
 
     @classmethod
     def from_schedule_batch(
@@ -168,9 +162,9 @@ class InputMetadata:
 
         ret.compute_positions(batch)
 
-        ret.compute_extend_infos(prefix_lens)
+        ret.compute_extend_infos(batch)
 
-        ret.init_total_num_tokens(model_runner)
+        ret.init_total_num_tokens(batch)
 
         if model_runner.server_args.disable_flashinfer:
             ret.init_triton_args(prefix_lens)
@@ -243,7 +237,6 @@ def update_flashinfer_indices(
     num_kv_heads = model_runner.model_config.get_num_kv_heads(model_runner.tp_size)
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
-    total_num_tokens = int(torch.sum(seq_lens))
 
     if flashinfer_use_ragged:
         paged_kernel_lens = prefix_lens
