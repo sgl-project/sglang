@@ -94,6 +94,7 @@ def format_finish_reason(finish_reason) -> Optional[str]:
     else:
         return "unknown"
 
+
 def create_error_response(
     message: str,
     err_type: str = "BadRequestError",
