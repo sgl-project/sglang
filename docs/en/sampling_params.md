@@ -60,20 +60,21 @@ n: int = 1,
 
 # Float that penalizes new tokens based on their frequency in the generated text so far.
 # Values > 0 encourage the model to use new tokens, while values < 0 encourage the model to
-# repeat tokens.
+# repeat tokens. Must be -2 <= value <= 2. Setting to 0 (default) will disable this penalty.
 frequency_penalty: float = 0.0,
 # Float that penalizes new tokens based on whether they appear in the generated text so far.
 # Values > 0 encourage the model to use new tokens, while values < 0 encourage the model to repeat
-# tokens.
+# tokens. Must be -2 <= value <= 2. Setting to 0 (default) will disable this penalty.
 presence_penalty: float = 0.0,
 # Float that penalizes new tokens based on whether they appear in the prompt and the generated text
 # so far. Values > 1 encourage the model to use new tokens, while values < 1 encourage the model to
-# repeat tokens.
+# repeat tokens. Must be 0 <= value <= 2. Setting to 1 (default) will disable this penalty.
 repetition_penalty: float = 1.0,
 # Guides inference to generate at least this number of tokens by penalizing logits of tokenizer's
 # EOS token and `stop_token_ids` to -inf, until the output token reaches given length.
 # Note that any of the `stop` string can be generated before reaching `min_new_tokens`, as it is
 # difficult to infer the correct token ID by given `stop` strings.
+# Must be 0 <= value < max_new_tokens. Setting to 0 (default) will disable this penalty.
 min_new_tokens: int = 0,
 ```
 
