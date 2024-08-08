@@ -1,12 +1,15 @@
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import List
+from typing import TYPE_CHECKING, List
 
 import numpy as np
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 class ForwardMode(IntEnum):
@@ -24,7 +27,6 @@ class InputMetadata:
 
     forward_mode: ForwardMode
     batch_size: int
-    total_num_tokens: int
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     req_to_token_pool: ReqToTokenPool
@@ -47,6 +49,11 @@ class InputMetadata:
     # Output options
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
+
+    # For multimodal
+    pixel_values: List[torch.Tensor] = None
+    image_sizes: List[List[int]] = None
+    image_offsets: List[int] = None
 
     # Trition attention backend
     triton_max_seq_len: int = 0
@@ -157,45 +164,71 @@ class InputMetadata:
     ):
         batch_size = len(req_pool_indices)
 
-        if forward_mode == ForwardMode.DECODE:
-            positions = ((seq_lens - 1) + position_ids_offsets).to(torch.int64)
-            extend_seq_lens = extend_start_loc = extend_no_prefix = None
-            if not model_runner.server_args.disable_flashinfer:
-                # This variable is not needed in this case,
-                # we do not compute it to make it compatbile with cuda graph.
-                total_num_tokens = None
+        if self.forward_mode == ForwardMode.DECODE:
+            if True:
+                self.positions = self.seq_lens - 1
             else:
-                total_num_tokens = int(torch.sum(seq_lens))
+                # Deprecated
+                self.positions = (self.seq_lens - 1) + position_ids_offsets
         else:
-            seq_lens_cpu = seq_lens.cpu().numpy()
-            prefix_lens_cpu = prefix_lens.cpu().numpy()
-            position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
-            positions = torch.tensor(
-                np.concatenate(
-                    [
-                        np.arange(
-                            prefix_lens_cpu[i] + position_ids_offsets_cpu[i],
-                            seq_lens_cpu[i] + position_ids_offsets_cpu[i],
-                        )
-                        for i in range(batch_size)
-                    ],
-                    axis=0,
-                ),
-                device="cuda",
-            )
-            extend_seq_lens = seq_lens - prefix_lens
-            extend_start_loc = torch.zeros_like(seq_lens)
-            extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-            extend_no_prefix = torch.all(prefix_lens == 0)
-            total_num_tokens = int(torch.sum(seq_lens))
+            if True:
+                self.positions = torch.tensor(
+                    np.concatenate(
+                        [
+                            np.arange(len(req.prefix_indices), len(req.input_ids))
+                            for req in batch.reqs
+                        ],
+                        axis=0,
+                    ),
+                    device="cuda",
+                )
+            else:
+                # Deprecated
+                position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
+                self.positions = torch.tensor(
+                    np.concatenate(
+                        [
+                            np.arange(
+                                len(req.prefix_indices) + position_ids_offsets_cpu[i],
+                                len(req.input_ids) + position_ids_offsets_cpu[i],
+                            )
+                            for i, req in enumerate(batch.reqs)
+                        ],
+                        axis=0,
+                    ),
+                    device="cuda",
+                )
 
+        # Positions should be in long type
+        self.positions = self.positions.to(torch.int64)
+
+    def compute_extend_infos(self, batch: ScheduleBatch):
+        if self.forward_mode == ForwardMode.DECODE:
+            self.extend_seq_lens = self.extend_start_loc = self.extend_no_prefix = None
+        else:
+            prefix_lens_cpu = [
+                len(r.input_ids) - len(r.prefix_indices) for r in batch.reqs
+            ]
+            self.extend_seq_lens = torch.tensor(prefix_lens_cpu, device="cuda")
+            self.extend_start_loc = torch.zeros_like(self.seq_lens)
+            self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+            self.extend_no_prefix = all(x == 0 for x in prefix_lens_cpu)
+
+    def init_total_num_tokens(self, batch: ScheduleBatch):
+        self.total_num_tokens = sum(len(req.input_ids) for req in batch.reqs)
+
+    @classmethod
+    def from_schedule_batch(
+        cls,
+        model_runner: "ModelRunner",
+        batch: ScheduleBatch,
+        forward_mode: ForwardMode,
+    ):
         ret = cls(
             forward_mode=forward_mode,
-            batch_size=batch_size,
-            total_num_tokens=total_num_tokens,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            positions=positions,
+            batch_size=batch.batch_size(),
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=batch.seq_lens,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
@@ -205,6 +238,21 @@ class InputMetadata:
             return_logprob=return_logprob,
             top_logprobs_nums=top_logprobs_nums,
         )
+
+        ret.compute_positions(batch)
+
+        ret.compute_extend_infos(batch)
+
+        ret.init_total_num_tokens(batch)
+
+        if forward_mode != ForwardMode.DECODE:
+            ret.init_multimuldal_info(batch)
+
+        prefix_lens = None
+        if forward_mode != ForwardMode.DECODE:
+            prefix_lens = torch.tensor(
+                [len(r.prefix_indices) for r in batch.reqs], device="cuda"
+            )
 
         if model_runner.server_args.disable_flashinfer:
             ret.init_triton_args(prefix_lens)
@@ -263,7 +311,7 @@ def update_flashinfer_indices(
     req_pool_indices,
     seq_lens,
     prefix_lens,
-    flashinfer_decode_wrapper,
+    flashinfer_decode_wrapper=None,
     flashinfer_use_ragged=False,
 ):
     """Init auxiliary variables for FlashInfer attention backend."""
@@ -271,7 +319,6 @@ def update_flashinfer_indices(
     num_kv_heads = model_runner.model_config.get_num_kv_heads(model_runner.tp_size)
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
-    total_num_tokens = int(torch.sum(seq_lens))
 
     if flashinfer_use_ragged:
         paged_kernel_lens = prefix_lens
@@ -294,6 +341,10 @@ def update_flashinfer_indices(
     kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
 
     if forward_mode == ForwardMode.DECODE:
+        # CUDA graph uses different flashinfer_decode_wrapper
+        if flashinfer_decode_wrapper is None:
+            flashinfer_decode_wrapper = model_runner.flashinfer_decode_wrapper
+
         flashinfer_decode_wrapper.end_forward()
         flashinfer_decode_wrapper.begin_forward(
             kv_indptr,

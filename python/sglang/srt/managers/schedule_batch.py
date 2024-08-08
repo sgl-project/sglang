@@ -463,7 +463,7 @@ class ScheduleBatch:
                 [r.req_pool_idx for r in reqs], dtype=torch.int32
             )
             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
-            self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int32)
+            self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int64)
 
         self.batch_sampling_params(vocab_size, int_token_logit_bias)
 

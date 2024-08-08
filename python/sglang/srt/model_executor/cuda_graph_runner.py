@@ -176,19 +176,19 @@ class CudaGraphRunner:
 
         # Run and capture
         def run_once():
-            input_metadata = InputMetadata.create(
-                self.model_runner,
+            input_metadata = InputMetadata(
                 forward_mode=ForwardMode.DECODE,
+                batch_size=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                prefix_lens=None,
-                position_ids_offsets=position_ids_offsets,
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 out_cache_loc=out_cache_loc,
                 return_logprob=False,
                 top_logprobs_nums=0,
-                skip_flashinfer_init=True,
+                positions=(seq_lens - 1).to(torch.int64),
+                flashinfer_decode_wrapper=flashinfer_decode_wrapper,
             )
-            input_metadata.flashinfer_decode_wrapper = flashinfer_decode_wrapper
 
             return forward(input_ids, input_metadata.positions, input_metadata)
 

@@ -459,7 +459,7 @@ class TokenizerManager:
 
     async def handle_loop(self):
         while True:
-            recv_obj: BatchTokenIDOut = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj: BatchStrOut = await self.recv_from_detokenizer.recv_pyobj()
             assert isinstance(recv_obj, BatchStrOut)
 
             for i, rid in enumerate(recv_obj.rids):
