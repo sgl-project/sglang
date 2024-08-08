@@ -84,3 +84,5 @@ class LlamaEmbeddingModel(nn.Module):
 
 
 EntryClass = LlamaEmbeddingModel
+# compat: e5-mistral model.config class == MistralModel
+EntryClassRemapping = [("MistralModel", LlamaEmbeddingModel)]

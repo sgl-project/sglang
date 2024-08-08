@@ -143,6 +143,7 @@ class Req:
 
         # Logprobs
         self.return_logprob = False
+        self.embedding = None
         self.logprob_start_len = 0
         self.top_logprobs_num = 0
         self.normalized_prompt_logprob = None
