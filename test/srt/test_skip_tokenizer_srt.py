@@ -1,13 +1,15 @@
 import json
-import unittest
 import os
 import sys
+import unittest
+
 import requests
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, popen_launch_server
 
+#os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 class TestSRTEndpoint(unittest.TestCase):
 
@@ -15,8 +17,9 @@ class TestSRTEndpoint(unittest.TestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = "http://127.0.0.1:8157"
-        cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300,
-                other_args=["--skip-tokenizer-init"])
+        cls.process = popen_launch_server(
+            cls.model, cls.base_url, timeout=300, other_args=["--skip-tokenizer-init"]
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -28,12 +31,20 @@ class TestSRTEndpoint(unittest.TestCase):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "input_ids": [50650, 18291, 30061, 5316, 26951],  # The capital of France is
+                "input_ids": [
+                    119689,
+                    50650,
+                    18291,
+                    30061,
+                    5316,
+                    26951,
+                    119690,
+                ],  # The capital of France is
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": 32,
                     "n": n,
-                    "stop_token_ids": [119690]
+                    "stop_token_ids": [119690],
                 },
                 "stream": False,
                 "return_logprob": return_logprob,
