@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
-from sglang.srt.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 @dataclass
