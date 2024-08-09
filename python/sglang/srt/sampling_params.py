@@ -24,12 +24,15 @@ class SamplingParams:
     def __init__(
         self,
         max_new_tokens: int = 128,
+        min_new_tokens: int = 0,
         stop: Optional[Union[str, List[str]]] = None,
+        stop_token_ids: Optional[List[int]] = [],
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        repetition_penalty: float = 1.0,
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
@@ -42,8 +45,11 @@ class SamplingParams:
         self.top_k = top_k
         self.frequency_penalty = frequency_penalty
         self.presence_penalty = presence_penalty
+        self.repetition_penalty = repetition_penalty
         self.stop_strs = stop
+        self.stop_token_ids = {*stop_token_ids}
         self.max_new_tokens = max_new_tokens
+        self.min_new_tokens = min_new_tokens
         self.ignore_eos = ignore_eos
         self.skip_special_tokens = skip_special_tokens
         self.spaces_between_special_tokens = spaces_between_special_tokens
@@ -80,10 +86,25 @@ class SamplingParams:
             raise ValueError(
                 "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
             )
+        if not 0.0 <= self.repetition_penalty <= 2.0:
+            raise ValueError(
+                "repetition_penalty must be in (0, 2], got "
+                f"{self.repetition_penalty}."
+            )
+        if not 0 <= self.min_new_tokens:
+            raise ValueError(
+                f"min_new_tokens must be in (0, max_new_tokens], got "
+                f"{self.min_new_tokens}."
+            )
         if self.max_new_tokens is not None:
             if self.max_new_tokens < 0:
                 raise ValueError(
                     f"max_new_tokens must be at least 0, got {self.max_new_tokens}."
+                )
+            if not self.min_new_tokens <= self.max_new_tokens:
+                raise ValueError(
+                    f"min_new_tokens must be in (0, max_new_tokens({self.max_new_tokens})], got "
+                    f"{self.min_new_tokens}."
                 )
 
     def normalize(self, tokenizer):

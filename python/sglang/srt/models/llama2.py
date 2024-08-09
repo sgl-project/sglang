@@ -39,7 +39,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitProcessorOutput, LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
@@ -310,7 +310,7 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> LogitProcessorOutput:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata

@@ -52,7 +52,7 @@ from sglang.srt.managers.controller_single import (
     start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
@@ -75,7 +75,6 @@ from sglang.srt.utils import (
     kill_child_process,
     maybe_set_triton_cache_manager,
     prepare_model,
-    set_torch_compile_config,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
@@ -99,6 +98,7 @@ async def health() -> Response:
 async def get_model_info():
     result = {
         "model_path": tokenizer_manager.model_path,
+        "is_generation": tokenizer_manager.is_generation,
     }
     return result
 
@@ -148,6 +148,21 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
 app.post("/generate")(generate_request)
 app.put("/generate")(generate_request)
+
+
+async def encode_request(obj: EmbeddingReqInput, request: Request):
+    """Handle an embedding request."""
+    try:
+        ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+        return ret
+    except ValueError as e:
+        return JSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
+app.post("/encode")(encode_request)
+app.put("/encode")(encode_request)
 
 
 @app.post("/v1/completions")
@@ -352,10 +367,6 @@ def _set_envs_and_config(server_args: ServerArgs):
         # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
         maybe_set_triton_cache_manager()
 
-    # Set torch compile config
-    if server_args.enable_torch_compile:
-        set_torch_compile_config()
-
     # Set global chat template
     if server_args.chat_template:
         # TODO: replace this with huggingface transformers template
@@ -390,6 +401,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         except (AssertionError, requests.exceptions.RequestException) as e:
             last_traceback = get_exception_traceback()
             pass
+    model_info = res.json()
 
     if not success:
         if pipe_finish_writer is not None:
@@ -398,15 +410,17 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         sys.exit(1)
 
     # Send a warmup request
+    request_name = "/generate" if model_info["is_generation"] else "/encode"
+    max_new_tokens = 8 if model_info["is_generation"] else 0
     try:
         for _ in range(server_args.dp_size):
             res = requests.post(
-                url + "/generate",
+                url + request_name,
                 json={
                     "text": "The capital city of France is",
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 8,
+                        "max_new_tokens": max_new_tokens,
                     },
                 },
                 headers=headers,
@@ -535,6 +549,19 @@ class Runtime:
         }
         response = requests.post(
             self.url + "/generate",
+            json=json_data,
+        )
+        return json.dumps(response.json())
+
+    def encode(
+        self,
+        prompt: str,
+    ):
+        json_data = {
+            "text": prompt,
+        }
+        response = requests.post(
+            self.url + "/encode",
             json=json_data,
         )
         return json.dumps(response.json())

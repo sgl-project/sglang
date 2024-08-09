@@ -35,6 +35,7 @@ jobs:
         pip install -e "python[all]"
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
         pip install accelerate
+        pip install sentence_transformers
 
     - name: Test Frontend Language
       run: |
