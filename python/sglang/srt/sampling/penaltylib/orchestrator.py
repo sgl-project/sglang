@@ -133,6 +133,10 @@ class BatchedPenalizerOrchestrator:
         """
         Merge the penalizers of another orchestrator into this one.
 
+        Note that this function **must** be called _before_ self.batch.reqs is updated (filtered).
+        Each unprepared penalizers would have to be prepared (creating tensors, etc.) first before merging.
+        This step requires the original batch.reqs, before it gets merged with other batch.reqs.
+
         Args:
             their (BatchedPenalizerOrchestrator): The orchestrator to merge into this one.
         """

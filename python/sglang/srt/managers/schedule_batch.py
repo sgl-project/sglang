@@ -679,6 +679,11 @@ class ScheduleBatch:
                 setattr(self, item, self_val[new_indices])
 
     def merge(self, other: "ScheduleBatch"):
+        # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
+        # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
+        # needs to be called with pre-merged Batch.reqs.
+        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+
         self.reqs.extend(other.reqs)
 
         self.req_pool_indices = torch.concat(
@@ -691,8 +696,6 @@ class ScheduleBatch:
         self.out_cache_loc = None
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
-
-        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         for item in [
             "temperatures",
