@@ -701,3 +701,23 @@ def add_api_key_middleware(app, api_key):
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
+
+
+def prepare_model(model_path):
+    if "SGLANG_USE_MODELSCOPE" in os.environ:
+        if not os.path.exists(model_path):
+            from modelscope import snapshot_download
+
+            return snapshot_download(model_path)
+    return model_path
+
+
+def prepare_tokenizer(tokenizer_path):
+    if "SGLANG_USE_MODELSCOPE" in os.environ:
+        if not os.path.exists(tokenizer_path):
+            from modelscope import snapshot_download
+
+            return snapshot_download(
+                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+            )
+    return tokenizer_path
