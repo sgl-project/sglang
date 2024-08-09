@@ -31,6 +31,7 @@ from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.model_config import ModelConfig
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -314,6 +315,10 @@ class ScheduleBatch:
     token_to_kv_pool: BaseTokenToKVPool
     tree_cache: RadixCache
 
+    # Some auxiliary fields
+    model_config: ModelConfig = None
+    int_token_logit_bias: torch.Tensor = None
+
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
@@ -334,7 +339,15 @@ class ScheduleBatch:
     logit_bias: torch.Tensor = None
 
     @classmethod
-    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+    def init_new(
+        cls,
+        reqs,
+        req_to_token_pool,
+        token_to_kv_pool,
+        tree_cache,
+        model_config,
+        int_token_logit_bias,
+    ):
         return_logprob = any(req.return_logprob for req in reqs)
 
         return cls(
@@ -343,6 +356,8 @@ class ScheduleBatch:
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
             return_logprob=return_logprob,
+            model_config=model_config,
+            int_token_logit_bias=int_token_logit_bias,
         )
 
     def batch_size(self):
@@ -380,7 +395,7 @@ class ScheduleBatch:
 
         return out_cache_loc
 
-    def batch_sampling_params(self, vocab_size, int_token_logit_bias):
+    def batch_sampling_params(self):
         device = "cuda"
         bs, reqs = self.batch_size(), self.reqs
         self.temperatures = torch.tensor(
@@ -403,7 +418,7 @@ class ScheduleBatch:
         # could add additional complexity to the {ScheduleBatch} class, especially we need to
         # handle {filter_batch()} and {merge()} cases as well.
         self.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
-            vocab_size=vocab_size,
+            vocab_size=self.model_config.vocab_size,
             batch=self,
             device=device,
             Penalizers={
@@ -420,11 +435,15 @@ class ScheduleBatch:
             if reqs[i].sampling_params.dtype == "int":
                 if self.logit_bias is None:
                     self.logit_bias = torch.zeros(
-                        (bs, vocab_size), dtype=torch.float32, device=device
+                        (bs, self.model_config.vocab_size),
+                        dtype=torch.float32,
+                        device=device,
                     )
-                self.logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
+                self.logit_bias[i][
+                    : len(self.int_token_logit_bias)
+                ] = self.int_token_logit_bias
 
-    def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+    def prepare_for_extend(self):
         bs = self.batch_size()
         reqs = self.reqs
         input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
@@ -463,7 +482,7 @@ class ScheduleBatch:
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
 
-        self.batch_sampling_params(vocab_size, int_token_logit_bias)
+        self.batch_sampling_params()
 
     def check_decode_mem(self):
         bs = self.batch_size()
@@ -710,18 +729,17 @@ class ScheduleBatch:
 
         # logit_bias can be None
         if self.logit_bias is not None or other.logit_bias is not None:
-            vocab_size = (
-                self.logit_bias.shape[1]
-                if self.logit_bias is not None
-                else other.logit_bias.shape[1]
-            )
             if self.logit_bias is None:
                 self.logit_bias = torch.zeros(
-                    (len(self.reqs), vocab_size), dtype=torch.float32, device="cuda"
+                    (len(self.reqs), self.model_config.vocab_size),
+                    dtype=torch.float32,
+                    device="cuda",
                 )
             if other.logit_bias is None:
                 other.logit_bias = torch.zeros(
-                    (len(other.reqs), vocab_size), dtype=torch.float32, device="cuda"
+                    (len(other.reqs), self.model_config.vocab_size),
+                    dtype=torch.float32,
+                    device="cuda",
                 )
             self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
 

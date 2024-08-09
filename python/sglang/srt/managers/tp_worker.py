@@ -431,15 +431,15 @@ class ModelTpServer:
             self.req_to_token_pool,
             self.token_to_kv_pool,
             self.tree_cache,
+            self.model_config,
+            self.int_token_logit_bias,
         )
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
         return new_batch
 
     def forward_prefill_batch(self, batch: ScheduleBatch):
         # Build batch tensors
-        batch.prepare_for_extend(
-            self.model_config.vocab_size, self.int_token_logit_bias
-        )
+        batch.prepare_for_extend()
 
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
