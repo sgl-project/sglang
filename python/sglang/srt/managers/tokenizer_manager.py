@@ -95,26 +95,22 @@ class TokenizerManager:
         else:
             self.context_len = get_context_length(self.hf_config)
 
-        if is_multimodal_model(self.model_path):
-            if server_args.skip_tokenizer_init:
-                self.tokenizer = None
-            else:
+        if server_args.skip_tokenizer_init:
+            self.tokenizer = self.processor = None
+        else:
+            if is_multimodal_model(self.model_path):
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                 )
                 self.tokenizer = self.processor.tokenizer
-
-            os.environ["TOKENIZERS_PARALLELISM"] = "false"
-            self.executor = concurrent.futures.ProcessPoolExecutor(
-                initializer=init_global_processor,
-                mp_context=mp.get_context("fork"),
-                initargs=(server_args,),
-            )
-        else:
-            if server_args.skip_tokenizer_init:
-                self.tokenizer = None
+                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+                self.executor = concurrent.futures.ProcessPoolExecutor(
+                    initializer=init_global_processor,
+                    mp_context=mp.get_context("fork"),
+                    initargs=(server_args,),
+                )
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,

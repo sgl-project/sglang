@@ -419,7 +419,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
             "max_new_tokens": max_new_tokens,
         },
     }
-    if servers_args.skip_tokenizer_init:
+    if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [10, 11, 12]
     else:
         json_data["text"] = "The capital city of France is"
