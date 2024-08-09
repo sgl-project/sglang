@@ -20,16 +20,22 @@ from sglang.srt.constrained.base_tool_cache import BaseToolCache
 
 
 class FSMCache(BaseToolCache):
-    def __init__(self, tokenizer_path, tokenizer_args_dict, enable=True, skip_tokenizer_init=False):
+    def __init__(
+        self,
+        tokenizer_path,
+        tokenizer_args_dict,
+        enable=True,
+        skip_tokenizer_init=False,
+    ):
         super().__init__(enable=enable)
 
         if (
-                skip_tokenizer_init 
-                or tokenizer_path.endswith(".json")
-                or tokenizer_path.endswith(".model")
-           ):
-                # Do not support TiktokenTokenizer or SentencePieceTokenizer
-                return
+            skip_tokenizer_init
+            or tokenizer_path.endswith(".json")
+            or tokenizer_path.endswith(".model")
+        ):
+            # Do not support TiktokenTokenizer or SentencePieceTokenizer
+            return
 
         from importlib.metadata import version
 

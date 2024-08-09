@@ -511,8 +511,9 @@ class TokenizerManager:
             recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut] = (
                 await self.recv_from_detokenizer.recv_pyobj()
             )
-            assert isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut,
-                    BatchTokenIDOut)), f"Unexpected obj received: {type(recv_obj)}"
+            assert isinstance(
+                recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)
+            ), f"Unexpected obj received: {type(recv_obj)}"
             for i, rid in enumerate(recv_obj.rids):
                 state = self.rid_to_state.get(rid, None)
                 if state is None:
@@ -525,9 +526,11 @@ class TokenizerManager:
                         "meta_info": recv_obj.meta_info[i],
                     }
                 elif isinstance(recv_obj, BatchTokenIDOut):
-                    read_start = 0 if i==0 else recv_obj.read_offsets[i-1]
+                    read_start = 0 if i == 0 else recv_obj.read_offsets[i - 1]
                     out_dict = {
-                        "token_ids": recv_obj.decode_ids[read_start:recv_obj.read_offsets[i]],
+                        "token_ids": recv_obj.decode_ids[
+                            read_start : recv_obj.read_offsets[i]
+                        ],
                         "meta_info": recv_obj.meta_info[i],
                     }
 
