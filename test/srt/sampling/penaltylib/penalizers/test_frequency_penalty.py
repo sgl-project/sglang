@@ -14,11 +14,16 @@ from sglang.test.srt.sampling.penaltylib.utils import (
     Subject,
 )
 
-FREQUENCY_PENALTY = 0.12
 
-
-class TestBatchedFrequencyPenalizer(BaseBatchedPenalizerTest):
+class BaseBatchedFrequencyPenalizerTest(BaseBatchedPenalizerTest):
     Penalizer = BatchedFrequencyPenalizer
+    frequency_penalty: float
+
+    def setUp(self):
+        if self.__class__ == BaseBatchedFrequencyPenalizerTest:
+            self.skipTest("Base class for frequency_penalty tests")
+
+        super().setUp()
 
     def _create_subject(self, frequency_penalty: float) -> Subject:
         return Subject(
@@ -72,8 +77,16 @@ class TestBatchedFrequencyPenalizer(BaseBatchedPenalizerTest):
         )
 
     def create_test_subjects(self) -> typing.List[Subject]:
-        self.enabled = self._create_subject(frequency_penalty=FREQUENCY_PENALTY)
+        self.enabled = self._create_subject(frequency_penalty=self.frequency_penalty)
         self.disabled = self._create_subject(frequency_penalty=0.0)
+
+
+class TestBatchedFrequencyPenalizerPositiveValue(BaseBatchedFrequencyPenalizerTest):
+    frequency_penalty = 0.12
+
+
+class TestBatchedFrequencyPenalizerNegativeValue(BaseBatchedFrequencyPenalizerTest):
+    frequency_penalty = -0.12
 
 
 if __name__ == "__main__":
