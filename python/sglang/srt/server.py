@@ -420,17 +420,22 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
+    json_data = {
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": max_new_tokens,
+        },
+    }
+    if server_args.skip_tokenizer_init:
+        json_data["input_ids"] = [10, 11, 12]
+    else:
+        json_data["text"] = "The capital city of France is"
+
     try:
         for _ in range(server_args.dp_size):
             res = requests.post(
                 url + request_name,
-                json={
-                    "text": "The capital city of France is",
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": max_new_tokens,
-                    },
-                },
+                json=json_data,
                 headers=headers,
                 timeout=600,
             )
