@@ -248,7 +248,7 @@ def main(args: argparse.Namespace):
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    api_url = f"http://{args.host}:{args.port}/generate"
+    api_url = f"{args.host}:{args.port}/generate"
     if args.tokenizer.endswith(".json") or args.tokenizer.endswith(".model"):
         from sglang.srt.hf_transformers_utils import get_tokenizer
 
@@ -297,7 +297,8 @@ def main(args: argparse.Namespace):
     benchmark_time = benchmark_end_time - benchmark_start_time
 
     # Compute the statistics.
-    avg_latency = np.mean([latency for _, _, latency in REQUEST_LATENCY])
+    latencies = [latency for _, _, latency in REQUEST_LATENCY]
+    avg_latency = np.mean(latencies)
     avg_per_token_latency = np.mean(
         [
             latency / (prompt_len + output_len)
@@ -310,6 +311,9 @@ def main(args: argparse.Namespace):
     decoding_throughput = (
         np.sum([output_len for _, output_len, _ in REQUEST_LATENCY]) / benchmark_time
     )
+
+    # latencies = [round(latency, 2) for _, _, latency in REQUEST_LATENCY]
+    # print(latencies)
 
     print(f"Total time: {benchmark_time:.2f} s")
     print(f"Request throughput: {args.num_prompts / benchmark_time:.2f} requests/s")
@@ -329,7 +333,7 @@ if __name__ == "__main__":
         default="srt",
         choices=["vllm", "tgi", "srt", "lightllm", "ginfer"],
     )
-    parser.add_argument("--host", type=str, default="localhost")
+    parser.add_argument("--host", type=str, default="http://localhost")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--dataset", type=str, help="Path to the dataset.")
     parser.add_argument("--input-len", type=int, default=2048)

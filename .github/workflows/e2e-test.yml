@@ -1,0 +1,58 @@
+name: E2E Test
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: self-hosted
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        source $HOME/venv/bin/activate
+        echo "$HOME/venv/bin" >> $GITHUB_PATH
+
+        pip install --upgrade pip
+        pip install -e "python[all]"
+        pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+    - name: Benchmark Serving Throughput
+      run: |
+        python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
+
+        echo "Waiting for server to start..."
+        for i in {1..120}; do
+          if curl -s http://127.0.0.1:8413/health; then
+            echo "Server is up!"
+            break
+          fi
+          if [ $i -eq 120 ]; then
+            echo "Server failed to start within 120 seconds"
+            exit 1
+          fi
+          sleep 1
+        done
+
+        cd $HOME && python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512
+
+        echo "Stopping server..."
+        kill -9 $(ps aux | grep sglang | grep Meta-Llama-3.1-8B-Instruct | grep -- "--port 8413" | grep -v grep | awk '{print $2}')

@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/token_attention_nopad_att1.py
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/token_attention_softmax_and_reducev.py
@@ -5,8 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.managers.controller.model_runner import global_server_args_dict
-from sglang.srt.utils import wrap_kernel_launcher
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 if global_server_args_dict.get("attention_reduce_in_fp32", False):
     REDUCE_TRITON_TYPE = tl.float32
@@ -40,6 +54,7 @@ def _fwd_kernel_stage1(
     att_stride_h,
     kv_group_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     logit_cap: tl.constexpr,
 ):
@@ -58,6 +73,10 @@ def _fwd_kernel_stage1(
     cur_batch_end_index = cur_batch_seq_len
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        off_qpe = cur_batch * stride_qbs + cur_head * stride_qh + offs_dpe
 
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
@@ -83,6 +102,19 @@ def _fwd_kernel_stage1(
             other=0.0,
         ).to(REDUCE_TRITON_TYPE)
         att_value = tl.sum(q[None, :] * k, 1)
+        if BLOCK_DPE > 0:
+            qpe = tl.load(Q + off_qpe + start_mark).to(REDUCE_TRITON_TYPE)
+            offs_buf_kpe = (
+                k_loc[:, None] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_dpe[None, :]
+            )
+            kpe = tl.load(
+                K_Buffer + offs_buf_kpe,
+                mask=offs_n_new[:, None] < cur_batch_end_index,
+                other=0.0,
+            ).to(REDUCE_TRITON_TYPE)
+            att_value += tl.sum(qpe[None, :] * kpe, 1)
         att_value *= sm_scale
 
         if logit_cap > 0:
@@ -162,10 +194,6 @@ def _fwd_kernel_stage2(
     tl.store(out_ptrs, acc)
 
 
-cached_kernel_stage1 = None
-cached_kernel_stage2 = None
-
-
 def _token_att_m_fwd(
     q,
     k_buffer,
@@ -182,7 +210,14 @@ def _token_att_m_fwd(
     # shape constraints
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
     assert Lq == Lk
-    assert Lk in {16, 32, 64, 128, 256}
+    assert Lk in {16, 32, 64, 128, 256, 576}
+
+    if Lk == 576:
+        BLOCK_DMODEL = 512
+        BLOCK_DPE = 64
+    else:
+        BLOCK_DMODEL = Lk
+        BLOCK_DPE = 0
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
 
@@ -193,28 +228,6 @@ def _token_att_m_fwd(
         num_warps = 4
     else:
         num_warps = 2
-
-    global cached_kernel_stage1
-    if cached_kernel_stage1:
-        cached_kernel_stage1(
-            grid,
-            num_warps,
-            q,
-            k_buffer,
-            sm_scale,
-            Req_to_tokens,
-            B_req_idx,
-            B_Start_Loc,
-            B_Seqlen,
-            att_out,
-            Req_to_tokens.stride(0),
-            q.stride(0),
-            q.stride(1),
-            k_buffer.stride(0),
-            k_buffer.stride(1),
-            att_out.stride(0),
-        )
-        return
 
     _fwd_kernel_stage1[grid](
         q,
@@ -232,13 +245,13 @@ def _token_att_m_fwd(
         k_buffer.stride(1),
         att_out.stride(0),
         kv_group_num=kv_group_num,
-        BLOCK_DMODEL=Lk,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DPE=BLOCK_DPE,
         BLOCK_N=BLOCK,
         logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=1,
     )
-    cached_kernel_stage1 = wrap_kernel_launcher(_fwd_kernel_stage1)
 
 
 def _token_softmax_reducev_fwd(
@@ -256,27 +269,6 @@ def _token_softmax_reducev_fwd(
     kv_group_num = logics.shape[0] // v_buffer.shape[1]
 
     num_warps = 1
-
-    global cached_kernel_stage2
-    if cached_kernel_stage2:
-        cached_kernel_stage2(
-            grid,
-            num_warps,
-            logics,
-            v_buffer,
-            o,
-            req_to_tokens,
-            b_req_idx,
-            b_start_loc,
-            b_seq_len,
-            logics.stride(0),
-            v_buffer.stride(0),
-            v_buffer.stride(1),
-            o.stride(0),
-            o.stride(1),
-            req_to_tokens.stride(0),
-        )
-        return
 
     _fwd_kernel_stage2[grid](
         logics,
@@ -298,7 +290,6 @@ def _token_softmax_reducev_fwd(
         num_warps=num_warps,
         num_stages=3,
     )
-    cached_kernel_stage2 = wrap_kernel_launcher(_fwd_kernel_stage2)
 
 
 def token_attention_fwd(
@@ -312,7 +303,7 @@ def token_attention_fwd(
     b_seq_len,
     max_len_in_batch,
     total_num_tokens,
-    sm_scale=None,
+    sm_scale,
     logit_cap=-1,
     att_m=None,
 ):
@@ -320,7 +311,6 @@ def token_attention_fwd(
         att_m = torch.empty(
             (q.shape[-2], total_num_tokens), dtype=REDUCE_TORCH_TYPE, device="cuda"
         )
-    sm_scale = 1.0 / (Lq**0.5) if sm_scale is None else sm_scale
 
     _token_att_m_fwd(
         q,

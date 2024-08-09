@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 # coding=utf-8
 # Adapted from
 # https://github.com/THUDM/ChatGLM2-6B
@@ -30,7 +45,7 @@ from vllm.transformers_utils.configs import ChatGLMConfig
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.controller.model_runner import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 LoraConfig = None
 
@@ -360,6 +375,7 @@ class ChatGLMForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.sampler = Sampler()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

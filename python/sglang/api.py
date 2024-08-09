@@ -4,8 +4,9 @@ import os
 import re
 from typing import Callable, List, Optional, Union
 
-from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config
+from sglang.lang.backend.base_backend import BaseBackend
+from sglang.lang.choices import ChoicesSamplingMethod, token_length_normalized
 from sglang.lang.ir import (
     SglExpr,
     SglExprList,
@@ -73,12 +74,18 @@ def gen(
     return_text_in_logprobs: Optional[bool] = None,
     dtype: Optional[type] = None,
     choices: Optional[List[str]] = None,
+    choices_method: Optional[ChoicesSamplingMethod] = None,
     regex: Optional[str] = None,
 ):
-    """Call the model to generate. See the meaning of the arguments in docs/sampling_params.md"""
+    """Call the model to generate. See the meaning of the arguments in docs/en/sampling_params.md"""
 
     if choices:
-        return SglSelect(name, choices, 0.0 if temperature is None else temperature)
+        return SglSelect(
+            name,
+            choices,
+            0.0 if temperature is None else temperature,
+            token_length_normalized if choices_method is None else choices_method,
+        )
 
     # check regex is valid
     if regex is not None:
@@ -186,9 +193,10 @@ def select(
     name: Optional[str] = None,
     choices: Optional[List[str]] = None,
     temperature: float = 0.0,
+    choices_method: ChoicesSamplingMethod = token_length_normalized,
 ):
     assert choices is not None
-    return SglSelect(name, choices, temperature)
+    return SglSelect(name, choices, temperature, choices_method)
 
 
 def _role_common(name: str, expr: Optional[SglExpr] = None):
@@ -208,6 +216,14 @@ def user(expr: Optional[SglExpr] = None):
 
 def assistant(expr: Optional[SglExpr] = None):
     return _role_common("assistant", expr)
+
+
+def system_begin():
+    return SglRoleBegin("system")
+
+
+def system_end():
+    return SglRoleEnd("system")
 
 
 def user_begin():

@@ -1,0 +1,52 @@
+name: Release Docker
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "python/sglang/version.py"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    environment: 'prod'
+    strategy:
+      matrix:
+        cuda_version: ['12.1.1', '12.4.1']
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Build and Push
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          
+          if [ "${{ matrix.cuda_version }}" = "12.1.1" ]; then
+            cuda_tag="cu121"
+          elif [ "${{ matrix.cuda_version }}" = "12.4.1" ]; then
+            cuda_tag="cu124"
+          else
+            echo "Unsupported CUDA version"
+            exit 1
+          fi
+          
+          tag=v${version}-${cuda_tag}
+          
+          docker build . -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.cuda_version }} -t lmsysorg/sglang:${tag} --no-cache
+          docker push lmsysorg/sglang:${tag}
+          
+          if [ "${{ matrix.cuda_version }}" = "12.1.1" ]; then
+            docker tag lmsysorg/sglang:${tag} lmsysorg/sglang:latest
+            docker push lmsysorg/sglang:latest
+          fi

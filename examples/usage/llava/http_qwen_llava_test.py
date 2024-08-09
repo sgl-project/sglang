@@ -14,16 +14,13 @@ Output:
 
 import argparse
 import asyncio
+import copy
 import json
 import time
-import copy
 
 import aiohttp
 import requests
-
-from llava.conversation import (
-    conv_qwen
-)
+from llava.conversation import conv_qwen
 
 
 async def send_request(url, data, delay=0):

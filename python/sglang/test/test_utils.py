@@ -1,15 +1,26 @@
 """Common utilities for testing and benchmarking"""
 
+import argparse
 import asyncio
+import multiprocessing
+import subprocess
+import threading
+import time
+import unittest
 from functools import partial
+from typing import Callable, List, Optional
 
 import numpy as np
 import requests
+import torch
+import torch.nn.functional as F
 
-from sglang.backend.openai import OpenAI
-from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.global_config import global_config
+from sglang.lang.backend.openai import OpenAI
+from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import get_exception_traceback
+
+DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -243,7 +254,7 @@ async def call_select_lmql(context, choices, temperature=0, max_len=4096, model=
     return choices.index(answer)
 
 
-def add_common_other_args_and_parse(parser):
+def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
@@ -282,7 +293,7 @@ def add_common_other_args_and_parse(parser):
     return args
 
 
-def add_common_sglang_args_and_parse(parser):
+def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
@@ -292,7 +303,7 @@ def add_common_sglang_args_and_parse(parser):
     return args
 
 
-def select_sglang_backend(args):
+def select_sglang_backend(args: argparse.Namespace):
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
             global_config.enable_parallel_decoding = False
@@ -305,7 +316,7 @@ def select_sglang_backend(args):
     return backend
 
 
-def _get_call_generate(args):
+def _get_call_generate(args: argparse.Namespace):
     if args.backend == "lightllm":
         return partial(call_generate_lightllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "vllm":
@@ -332,7 +343,7 @@ def _get_call_generate(args):
         raise ValueError(f"Invalid backend: {args.backend}")
 
 
-def _get_call_select(args):
+def _get_call_select(args: argparse.Namespace):
     if args.backend == "lightllm":
         return partial(call_select_lightllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "vllm":
@@ -355,7 +366,7 @@ def _get_call_select(args):
         raise ValueError(f"Invalid backend: {args.backend}")
 
 
-def get_call_generate(args):
+def get_call_generate(args: argparse.Namespace):
     call_generate = _get_call_generate(args)
 
     def func(*args, **kwargs):
@@ -368,7 +379,7 @@ def get_call_generate(args):
     return func
 
 
-def get_call_select(args):
+def get_call_select(args: argparse.Namespace):
     call_select = _get_call_select(args)
 
     def func(*args, **kwargs):
@@ -379,3 +390,111 @@ def get_call_select(args):
             raise
 
     return func
+
+
+def popen_launch_server(
+    model: str,
+    base_url: str,
+    timeout: float,
+    api_key: Optional[str] = None,
+    other_args: tuple = (),
+):
+    _, host, port = base_url.split(":")
+    host = host[2:]
+
+    command = [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        model,
+        "--host",
+        host,
+        "--port",
+        port,
+        *other_args,
+    ]
+    if api_key:
+        command += ["--api-key", api_key]
+
+    process = subprocess.Popen(command, stdout=None, stderr=None)
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            headers = {
+                "Content-Type": "application/json; charset=utf-8",
+                "Authorization": f"Bearer {api_key}",
+            }
+            response = requests.get(f"{base_url}/v1/models", headers=headers)
+            if response.status_code == 200:
+                return process
+        except requests.RequestException:
+            pass
+        time.sleep(10)
+    raise TimeoutError("Server failed to start within the timeout period.")
+
+
+def run_with_timeout(
+    func: Callable,
+    args: tuple = (),
+    kwargs: Optional[dict] = None,
+    timeout: float = None,
+):
+    """Run a function with timeout."""
+    ret_value = []
+
+    def _target_func():
+        ret_value.append(func(*args, **(kwargs or {})))
+
+    t = threading.Thread(target=_target_func)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        raise TimeoutError()
+
+    if not ret_value:
+        raise RuntimeError()
+
+    return ret_value[0]
+
+
+def run_unittest_files(files: List[str], timeout_per_file: float):
+    tic = time.time()
+    success = True
+
+    for filename in files:
+
+        def func():
+            print(f"\n\nRun {filename}\n\n")
+            ret = unittest.main(module=None, argv=["", "-vb"] + [filename])
+
+        p = multiprocessing.Process(target=func)
+
+        def run_one_file():
+            p.start()
+            p.join()
+
+        try:
+            run_with_timeout(run_one_file, timeout=timeout_per_file)
+            if p.exitcode != 0:
+                success = False
+                break
+        except TimeoutError:
+            p.terminate()
+            time.sleep(5)
+            print(
+                f"\nTimeout after {timeout_per_file} seconds when running {filename}\n"
+            )
+            return False
+
+    if success:
+        print(f"Success. Time elapsed: {time.time() - tic:.2f}s")
+    else:
+        print(f"Fail. Time elapsed: {time.time() - tic:.2f}s")
+
+    return 0 if success else -1
+
+
+def get_similarities(vec1, vec2):
+    return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)

@@ -9,15 +9,14 @@ import sglang as sgl
 
 @sgl.function
 def few_shot_qa(s, question):
-    s += (
-"""
+    s += """
 \n\nHuman: What is the capital of France?
 \n\nAssistant: Paris
 \n\nHuman: What is the capital of Germany?
 \n\nAssistant: Berlin
 \n\nHuman: What is the capital of Italy?
 \n\nAssistant: Rome
-""")
+"""
     s += "\n\nHuman: " + question + "\n"
     s += "\n\nAssistant:" + sgl.gen("answer", temperature=0)
 
@@ -33,8 +32,8 @@ def single():
 
 def stream():
     state = few_shot_qa.run(
-        question="What is the capital of the United States?",
-        stream=True)
+        question="What is the capital of the United States?", stream=True
+    )
 
     for out in state.text_iter("answer"):
         print(out, end="", flush=True)
@@ -42,10 +41,12 @@ def stream():
 
 
 def batch():
-    states = few_shot_qa.run_batch([
-        {"question": "What is the capital of the United States?"},
-        {"question": "What is the capital of China?"},
-    ])
+    states = few_shot_qa.run_batch(
+        [
+            {"question": "What is the capital of the United States?"},
+            {"question": "What is the capital of China?"},
+        ]
+    )
 
     for s in states:
         print(s["answer"])
