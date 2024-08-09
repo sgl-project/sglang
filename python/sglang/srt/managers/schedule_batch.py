@@ -164,7 +164,12 @@ class Req:
     def finished(self) -> bool:
         return self.finished_reason is not None
 
+    def init_next_round_input(self):
+        self.input_ids = self.origin_input_ids + self.output_ids
+        self.extend_input_len = len(self.input_ids) - len(self.prefix_indices)
+
     def adjust_max_prefix_ids(self):
+        self.input_ids = self.origin_input_ids + self.output_ids
         input_len = len(self.input_ids)
         max_prefix_len = input_len
 

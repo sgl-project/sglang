@@ -165,13 +165,7 @@ class ModelTpServer:
                 disable=server_args.disable_radix_cache,
             )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
-        self.scheduler = PolicyScheduler(
-            self.schedule_policy,
-            self.max_running_requests,
-            self.max_prefill_tokens,
-            self.max_total_num_tokens,
-            self.tree_cache,
-        )
+        self.scheduler = PolicyScheduler(self.schedule_policy, self.tree_cache)
         self.req_to_token_pool = self.model_runner.req_to_token_pool
         self.token_to_kv_pool = self.model_runner.token_to_kv_pool
 
@@ -373,17 +367,8 @@ class ModelTpServer:
         if running_bs >= self.max_running_requests:
             return None
 
-        # Compute matched prefix length
-        for req in self.waiting_queue:
-            req.input_ids = req.origin_input_ids + req.output_ids
-            # NOTE: the prefix_indices must always be aligned with last_node
-            req.prefix_indices, req.last_node = self.tree_cache.match_prefix(
-                rid=req.rid, key=req.adjust_max_prefix_ids()
-            )
-            req.extend_input_len = len(req.input_ids) - len(req.prefix_indices)
-
         # Get priority queue
-        self.waiting_queue = self.scheduler.get_priority_queue(self.waiting_queue)
+        self.scheduler.calc_priority(self.waiting_queue)
 
         adder = PrefillAdder(
             self.tree_cache,
@@ -397,12 +382,13 @@ class ModelTpServer:
 
         has_inflight = self.current_inflight_req is not None
         if self.current_inflight_req is not None:
+            self.current_inflight_req.init_next_round_input()
             self.current_inflight_req = adder.add_inflight_req(
                 self.current_inflight_req
             )
 
         for req in self.waiting_queue:
-
+            req.init_next_round_input()
             res = adder.add_one_req(req)
             if (
                 not res
