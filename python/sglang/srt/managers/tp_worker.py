@@ -17,6 +17,7 @@ limitations under the License.
 
 import logging
 import multiprocessing
+import os
 import pickle
 import time
 import warnings
@@ -285,6 +286,7 @@ class ModelTpServer:
         )
 
     def check_memory(self):
+        crash = os.getenv("CI", "false") == "true"
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
@@ -294,6 +296,7 @@ class ModelTpServer:
                 f"available_size={available_size}, max_total_num_tokens={self.max_total_num_tokens}\n"
                 "KV cache pool leak detected!"
             )
+            exit(1) if crash else None
 
         if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
             warnings.warn(
@@ -302,6 +305,7 @@ class ModelTpServer:
                 f"total slots={self.req_to_token_pool.size}\n"
                 "Memory pool leak detected!"
             )
+            exit(1) if crash else None
 
     def handle_generate_request(
         self,
