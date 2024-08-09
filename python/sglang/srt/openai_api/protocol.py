@@ -319,8 +319,14 @@ class EmbeddingRequest(BaseModel):
     user: Optional[str] = None
 
 
-class EmbeddingResponse(BaseModel):
-    index: str
-    embedding: List[float] = None
+class EmbeddingObject(BaseModel):
+    embedding: List[float]
+    index: int
     object: str = "embedding"
+
+
+class EmbeddingResponse(BaseModel):
+    data: List[EmbeddingObject]
+    model: str
+    object: str = "list"
     usage: Optional[UsageInfo] = None

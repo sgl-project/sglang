@@ -262,6 +262,7 @@ class TokenizerManager:
             ):
                 yield response
         else:
+            assert self.is_generation
             await self._wait_for_cache_prefill_response(event, state, obj, rid, request)
             yield input_ids
 

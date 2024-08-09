@@ -194,7 +194,8 @@ class EmbeddingReqInput:
         if is_single:
             if self.rid is None:
                 self.rid = uuid.uuid4().hex
-            self.sampling_params = {"max_new_tokens": 0}
+            if self.sampling_params is None:
+                self.sampling_params = {"max_new_tokens": 1}
         else:
             # support select operation
             self.batch_size = (
@@ -205,9 +206,10 @@ class EmbeddingReqInput:
             else:
                 if not isinstance(self.rid, list):
                     raise ValueError("The rid should be a list.")
-            self.sampling_params = [
-                {"max_new_tokens": 0} for _ in range(self.batch_size)
-            ]
+            if self.sampling_params is None:
+                self.sampling_params = [
+                    {"max_new_tokens": 1} for _ in range(self.batch_size)
+                ]
 
 
 @dataclass
