@@ -202,6 +202,9 @@ class StreamExecutor:
         self.cur_role = None
         self.cur_role_begin_pos = None
 
+        # For function calling
+        self.function_calls_messages = []  # The messages in the OpenAI API format
+
         # For vision
         self.images_ = []
         self.cur_images = []
@@ -487,6 +490,17 @@ class StreamExecutor:
         return comp, meta_info
 
     def _execute_gen(self, expr: SglGen):
+        if expr.tools:
+            # Previous function calls are not remembered, users are expected to
+            # provide all candidate functions in the current generate call
+            self.function_calls_messages = self.backend.build_function_call_messages(
+                self, expr.tools, expr.tool_choice
+            )
+            self._execute_gen_helper(expr)
+        else:
+            self._execute_gen_helper(expr)
+
+    def _execute_gen_helper(self, expr: SglGen):
         sampling_params = self._resolve_sampling_params(expr.sampling_params)
         name = expr.name
 
@@ -495,6 +509,7 @@ class StreamExecutor:
                 comp, meta_info = self.backend.generate(
                     self,
                     sampling_params=sampling_params,
+                    function_call_messages=self.function_calls_messages,
                 )
             else:
                 if self.backend.is_chat_model:
@@ -521,7 +536,9 @@ class StreamExecutor:
                 self.num_api_spec_tokens is None
             ), "stream is not supported with api speculative execution"
             generator = self.backend.generate_stream(
-                self, sampling_params=sampling_params
+                self,
+                sampling_params=sampling_params,
+                function_call_messages=self.function_calls_messages,
             )
 
             self.variables[name] = ""

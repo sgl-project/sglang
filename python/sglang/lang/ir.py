@@ -409,6 +409,8 @@ class SglGen(SglExpr):
         return_text_in_logprobs: Optional[bool] = None,
         dtype: Optional[type] = None,
         regex: Optional[str] = None,
+        tools: Optional[List[str]] = None,
+        tool_choice: Optional[str] = "auto",
     ):
         """Call the model to generate. See the meaning of the arguments in docs/en/sampling_params.md"""
         super().__init__()
@@ -429,6 +431,8 @@ class SglGen(SglExpr):
             dtype=dtype,
             regex=regex,
         )
+        self.tools = tools
+        self.tool_choice = tool_choice
 
     def __repr__(self):
         return f"Gen('{self.name}')"
