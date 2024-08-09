@@ -165,13 +165,7 @@ class ModelTpServer:
                 disable=server_args.disable_radix_cache,
             )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
-        self.scheduler = PolicyScheduler(
-            self.schedule_policy,
-            self.max_running_requests,
-            self.max_prefill_tokens,
-            self.max_total_num_tokens,
-            self.tree_cache,
-        )
+        self.scheduler = PolicyScheduler(self.schedule_policy, self.tree_cache)
         self.req_to_token_pool = self.model_runner.req_to_token_pool
         self.token_to_kv_pool = self.model_runner.token_to_kv_pool
 

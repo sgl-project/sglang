@@ -24,22 +24,12 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
 class PolicyScheduler:
-    def __init__(
-        self,
-        policy,
-        max_running_seqs,
-        max_prefill_num_tokens,
-        max_total_num_tokens,
-        tree_cache,
-    ):
-        if tree_cache.disable and policy == "lpm":
-            # LMP is meaningless when the tree cache is disabled.
+    def __init__(self, policy, tree_cache):
+        if tree_cache.disable and policy in ["lpm", "dfs-weight"]:
+            # LPM and DFS-weight is meaningless when the tree cache is disabled.
             policy = "fcfs"
 
         self.policy = policy
-        self.max_running_seqs = max_running_seqs
-        self.max_prefill_num_tokens = max_prefill_num_tokens
-        self.max_total_num_tokens = max_total_num_tokens
         self.tree_cache = tree_cache
 
     def calc_priority(self, waiting_queue: List[Req]):
