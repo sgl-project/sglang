@@ -225,18 +225,13 @@ class Req:
                 length=self.sampling_params.max_new_tokens
             )
             return
-
+        
+        last_token_id = self.output_ids[-1]
         if self.tokenizer is None:
-            matched_eos = self.output_ids[-1] in self.sampling_params.stop_token_ids
+            matched_eos = last_token_id in self.sampling_params.stop_token_ids
         else:
-            matched_eos = self.output_ids[-1] == self.tokenizer.eos_token_id
+            matched_eos = last_token_id == self.tokenizer.eos_token_id
         if matched_eos and not self.sampling_params.ignore_eos:
-            self.finished_reason = FINISH_MATCHED_TOKEN(
-                matched=self.tokenizer.eos_token_id
-            )
-            return
-
-        if last_token_id in self.sampling_params.stop_token_ids:
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
             return
 
