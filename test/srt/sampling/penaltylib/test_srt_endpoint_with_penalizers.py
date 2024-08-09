@@ -1,5 +1,6 @@
 import json
 import unittest
+from multiprocessing import Process
 
 import requests
 
@@ -57,6 +58,40 @@ class TestBatchPenalizerE2E(unittest.TestCase):
 
     def test_default_values(self):
         self.run_decode()
+
+    def test_mixed(self):
+        """
+        Sends two requests with one with penalizers disabled, and the other with penalizers enabled.
+        This will cause two different {ScheduleBatch} to be initialized and eventually gets merged.
+
+        Merging batch with penalizers enabled with enabled, or disabled is trivial. However disabled + enabled is not.
+        This is because the penalizer will not be prepared if it is not required, then it will be prepared during the merge.
+
+        This test triggers the merge of disabled + enabled.
+        """
+
+        processes = []
+
+        p = Process(
+            target=self.run_decode,
+        )
+        processes.append(p)
+        p.start()
+
+        p = Process(
+            target=self.run_decode,
+            kwargs={
+                "frequency_penalty": 2,
+                "min_new_tokens": 16,
+                "presence_penalty": 2,
+                "repetition_penalty": 2,
+            },
+        )
+        processes.append(p)
+        p.start()
+
+        for p in processes:
+            p.join()
 
     def test_frequency_penalty(self):
         self.run_decode(frequency_penalty=2)
