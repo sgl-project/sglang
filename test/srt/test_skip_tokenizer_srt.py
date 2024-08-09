@@ -9,7 +9,8 @@ from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, popen_launch_server
 
-#os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 
 class TestSRTEndpoint(unittest.TestCase):
 

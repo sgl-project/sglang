@@ -225,7 +225,7 @@ class Req:
                 length=self.sampling_params.max_new_tokens
             )
             return
-        
+
         last_token_id = self.output_ids[-1]
         if self.tokenizer is None:
             matched_eos = last_token_id in self.sampling_params.stop_token_ids
