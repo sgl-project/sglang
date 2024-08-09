@@ -23,8 +23,6 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -38,13 +36,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
 class InternLM2MLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -74,7 +73,6 @@ class InternLM2MLP(nn.Module):
 
 
 class InternLM2Attention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -150,7 +148,6 @@ class InternLM2Attention(nn.Module):
 
 
 class InternLMDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -207,7 +204,6 @@ class InternLMDecoderLayer(nn.Module):
 
 
 class InternLM2Model(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -254,7 +250,6 @@ class InternLM2Model(nn.Module):
 
 
 class InternLM2ForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
