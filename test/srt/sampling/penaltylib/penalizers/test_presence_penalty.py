@@ -14,11 +14,16 @@ from sglang.test.srt.sampling.penaltylib.utils import (
     Subject,
 )
 
-PRESENCE_PENALTY = 0.12
 
-
-class TestBatchedPresencePenalizer(BaseBatchedPenalizerTest):
+class BaseBatchedPresencePenalizerTest(BaseBatchedPenalizerTest):
     Penalizer = BatchedPresencePenalizer
+    presence_penalty: float
+
+    def setUp(self):
+        if self.__class__ == BaseBatchedPresencePenalizerTest:
+            self.skipTest("Base class for presence_penalty tests")
+
+        super().setUp()
 
     def _create_subject(self, presence_penalty: float) -> Subject:
         return Subject(
@@ -72,8 +77,16 @@ class TestBatchedPresencePenalizer(BaseBatchedPenalizerTest):
         )
 
     def create_test_subjects(self) -> typing.List[Subject]:
-        self.enabled = self._create_subject(presence_penalty=PRESENCE_PENALTY)
+        self.enabled = self._create_subject(presence_penalty=self.presence_penalty)
         self.disabled = self._create_subject(presence_penalty=0.0)
+
+
+class TestBatchedPresencePenalizerPositiveValue(BaseBatchedPresencePenalizerTest):
+    presence_penalty = 0.12
+
+
+class TestBatchedPresencePenalizerNegativeValue(BaseBatchedPresencePenalizerTest):
+    presence_penalty = -0.12
 
 
 if __name__ == "__main__":
