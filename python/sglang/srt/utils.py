@@ -710,3 +710,14 @@ def prepare_model(model_path):
 
             return snapshot_download(model_path)
     return model_path
+
+
+def prepare_tokenizer(tokenizer_path):
+    if "SGLANG_USE_MODELSCOPE" in os.environ:
+        if not os.path.exists(tokenizer_path):
+            from modelscope import snapshot_download
+
+            return snapshot_download(
+                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+            )
+    return tokenizer_path
