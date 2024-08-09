@@ -238,7 +238,7 @@ def correctness_test(
 
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
-    for _ in range(bench_args.output_len):
+    for _ in range(bench_args.output_len[0]):
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
         for i in range(len(reqs)):
             output_ids[i].append(next_token_ids[i])
