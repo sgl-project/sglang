@@ -27,6 +27,7 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
+    skip_tokenizer_init: bool = False
     load_format: str = "auto"
     dtype: str = "auto"
     trust_remote_code: bool = True
@@ -150,6 +151,11 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--skip-tokenizer-init",
+            action="store_true",
+            help="If set, skip init tokenizer and pass input_ids in generate request",
         )
         parser.add_argument(
             "--load-format",

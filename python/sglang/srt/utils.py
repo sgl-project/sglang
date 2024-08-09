@@ -197,6 +197,8 @@ def allocate_init_ports(
 def get_int_token_logit_bias(tokenizer, vocab_size):
     """Get the logit bias for integer-only tokens."""
     # a bug when model's vocab size > tokenizer.vocab_size
+    if tokenizer == None:
+        return [-1e5] * vocab_size
     vocab_size = tokenizer.vocab_size
     logit_bias = np.zeros(vocab_size, dtype=np.float32)
     for t_id in range(vocab_size):

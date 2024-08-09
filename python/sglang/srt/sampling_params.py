@@ -111,13 +111,19 @@ class SamplingParams:
         # Process stop strings
         if self.stop_strs is None:
             self.stop_strs = []
-            self.stop_str_max_len = 0
+            if self.stop_token_ids is None:
+                self.stop_str_max_len = 0
+            else:
+                self.stop_str_max_len = 1
         else:
             if isinstance(self.stop_strs, str):
                 self.stop_strs = [self.stop_strs]
 
             stop_str_max_len = 0
             for stop_str in self.stop_strs:
-                stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
-                stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+                if tokenizer is not None:
+                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
+                    stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+                else:
+                    stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
