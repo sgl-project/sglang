@@ -508,7 +508,6 @@ class TokenizerManager:
 
     async def handle_loop(self):
         while True:
-            assert is_str_output or is_token_id_output,
             recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut] = (
                 await self.recv_from_detokenizer.recv_pyobj()
             )

@@ -100,20 +100,16 @@ class ModelTpServer:
             nccl_port=nccl_port,
             server_args=server_args,
         )
-
-        if is_multimodal_model(server_args.model_path):
-            if server_args.skip_tokenizer_init:
-                self.tokenizer = None
-            else:
+        if server_args.skip_tokenizer_init:
+            self.tokenizer = self.processor = None
+        else:
+            if is_multimodal_model(server_args.model_path):
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                 )
                 self.tokenizer = self.processor.tokenizer
-        else:
-            if server_args.skip_tokenizer_init:
-                self.tokenizer = None
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,
