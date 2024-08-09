@@ -507,6 +507,8 @@ class ModelTpServer:
                 req.embedding = embeddings[i]
                 if req is not self.current_inflight_req:
                     # Inflight reqs' prefill is not finished
+                    # dummy output token for embedding models
+                    req.output_ids.append(0)
                     req.check_finished()
 
                 if req.finished():
