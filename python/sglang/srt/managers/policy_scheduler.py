@@ -18,6 +18,7 @@ limitations under the License.
 import random
 from collections import defaultdict
 from contextlib import contextmanager
+from typing import List
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
@@ -41,21 +42,18 @@ class PolicyScheduler:
         self.max_total_num_tokens = max_total_num_tokens
         self.tree_cache = tree_cache
 
-    def get_priority_queue(self, waiting_queue):
+    def calc_priority(self, waiting_queue: List[Req]):
         if self.policy == "lpm":
             # longest prefix match
             waiting_queue.sort(key=lambda x: -len(x.prefix_indices))
-            return waiting_queue
         elif self.policy == "fcfs":
             # first come first serve
-            return waiting_queue
+            pass
         elif self.policy == "lof":
             # longest output first
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
-            return waiting_queue
         elif self.policy == "random":
             random.shuffle(waiting_queue)
-            return waiting_queue
         elif self.policy == "dfs-weight":
             last_node_to_reqs = defaultdict(list)
             for req in waiting_queue:
@@ -66,12 +64,13 @@ class PolicyScheduler:
                 node_to_weight[node] = len(last_node_to_reqs[node])
             self.calc_weight(self.tree_cache.root_node, node_to_weight)
 
-            q = []
+            waiting_queue.clear()
             self.get_dfs_priority(
-                self.tree_cache.root_node, node_to_weight, last_node_to_reqs, q
+                self.tree_cache.root_node,
+                node_to_weight,
+                last_node_to_reqs,
+                waiting_queue,
             )
-            assert len(q) == len(waiting_queue)
-            return q
         else:
             raise ValueError(f"Unknown schedule_policy: {self.policy}")
 

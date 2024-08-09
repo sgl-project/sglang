@@ -383,7 +383,7 @@ class ModelTpServer:
             req.extend_input_len = len(req.input_ids) - len(req.prefix_indices)
 
         # Get priority queue
-        self.waiting_queue = self.scheduler.get_priority_queue(self.waiting_queue)
+        self.scheduler.calc_priority(self.waiting_queue)
 
         adder = PrefillAdder(
             self.tree_cache,
