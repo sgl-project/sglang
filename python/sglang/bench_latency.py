@@ -332,6 +332,7 @@ def latency_test(
     )
 
     # Warm up
+    rank_print("Warmup ...")
     latency_test_run_once(
         bench_args.run_name,
         model_runner,
@@ -341,6 +342,7 @@ def latency_test(
         bench_args.input_len[0],
         4,  # shorter decoding to speed up the warmup
     )
+    rank_print("Benchmark ...")
 
     # Run the sweep
     result_list = []
