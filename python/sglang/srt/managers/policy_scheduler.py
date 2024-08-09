@@ -33,8 +33,16 @@ class PolicyScheduler:
         self.tree_cache = tree_cache
 
     def calc_priority(self, waiting_queue: List[Req]):
+        if self.policy in ["lpm", "dfs-weight"]:
+            # Compute matched prefix length
+            for r in waiting_queue:
+                # NOTE: the prefix_indices must always be aligned with last_node
+                r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
+                    rid=r.rid, key=r.adjust_max_prefix_ids()
+                )
+
         if self.policy == "lpm":
-            # longest prefix match
+            # Longest Prefix Match
             waiting_queue.sort(key=lambda x: -len(x.prefix_indices))
         elif self.policy == "fcfs":
             # first come first serve
@@ -128,8 +136,6 @@ class PrefillAdder:
         self.log_input_tokens += extend_input_len
 
     def add_inflight_req(self, req: Req):
-        req.input_ids = req.origin_input_ids + req.output_ids
-        req.extend_input_len = len(req.input_ids) - len(req.prefix_indices)
         truncated = req.extend_input_len > self.rem_chunk_tokens
         req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
         req.input_ids = req.input_ids[: len(req.prefix_indices) + req.extend_input_len]
