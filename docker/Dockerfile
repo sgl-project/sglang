@@ -1,6 +1,6 @@
 ARG CUDA_VERSION=12.1.1
 
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04 AS base
 
 ARG PYTHON_VERSION=3
 
@@ -32,3 +32,22 @@ RUN pip3 --no-cache-dir install --upgrade pip \
     && pip3 --no-cache-dir install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 
 ENV DEBIAN_FRONTEND=interactive
+
+# build the wheel
+FROM base AS build
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install build
+
+WORKDIR /sgl-workspace/sglang/python
+RUN python3 -m build
+
+# minimal sglang srt image
+FROM python:3.10-slim AS srt
+
+RUN --mount=type=bind,from=build,src=/sgl-workspace/sglang/python/dist,target=/sgl-workspace/dist \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install --verbose $(find /sgl-workspace/dist -name "*.whl" -printf "%p[srt] ") && \
+    pip install --index https://flashinfer.ai/whl/cu121/torch2.4/ flashinfer
+
+ENTRYPOINT [ "python3", "-m", "sglang.launch_server" ]

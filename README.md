@@ -79,6 +79,18 @@ docker run --gpus all \
     python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --host 0.0.0.0 --port 30000
 ```
 
+or, if you only want to run the srt server, you can try out the new slim srt-only images:
+
+```bash
+docker run --gpus all \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=<secret>" \
+    --ipc=host \
+    lmsysorg/sglang:latest-srt \
+    --model-path meta-llama/Meta-Llama-3-8B-Instruct --host 0.0.0.0 --port 30000
+```
+
 ### Common Notes
 - If you cannot install FlashInfer, check out its [installation](https://docs.flashinfer.ai/installation.html#) page. If you still cannot install it, you can use the slower Triton kernels by adding `--disable-flashinfer` when launching the server.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
