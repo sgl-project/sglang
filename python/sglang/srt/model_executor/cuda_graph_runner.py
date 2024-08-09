@@ -33,7 +33,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     InputMetadata,
-    init_flashinfer_args,
+    update_flashinfer_indices,
 )
 from sglang.srt.utils import monkey_patch_vllm_all_gather
 
@@ -69,6 +69,18 @@ def patch_model(
             _to_torch(model, reverse=True)
             monkey_patch_vllm_all_gather(reverse=True)
             tp_group.ca_comm = backup_ca_comm
+
+
+def set_torch_compile_config():
+    import torch._dynamo.config
+    import torch._inductor.config
+
+    torch._inductor.config.coordinate_descent_tuning = True
+    torch._inductor.config.triton.unique_kernel_names = True
+    torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
+
+    # FIXME: tmp workaround
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 
 class CudaGraphRunner:
@@ -111,6 +123,9 @@ class CudaGraphRunner:
         )
 
         self.compile_bs = [1, 2, 4, 8, 16, 24, 32] if use_torch_compile else []
+
+        if use_torch_compile:
+            set_torch_compile_config()
 
     def can_run(self, batch_size):
         return batch_size < self.max_bs
@@ -165,7 +180,7 @@ class CudaGraphRunner:
             paged_kv_indices_buffer=self.flashinfer_kv_indices,
             paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[:bs],
         )
-        init_flashinfer_args(
+        update_flashinfer_indices(
             ForwardMode.DECODE,
             self.model_runner,
             req_pool_indices,
@@ -176,19 +191,19 @@ class CudaGraphRunner:
 
         # Run and capture
         def run_once():
-            input_metadata = InputMetadata.create(
-                self.model_runner,
+            input_metadata = InputMetadata(
                 forward_mode=ForwardMode.DECODE,
+                batch_size=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                prefix_lens=None,
-                position_ids_offsets=position_ids_offsets,
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 out_cache_loc=out_cache_loc,
                 return_logprob=False,
                 top_logprobs_nums=0,
-                skip_flashinfer_init=True,
+                positions=(seq_lens - 1).to(torch.int64),
+                flashinfer_decode_wrapper=flashinfer_decode_wrapper,
             )
-            input_metadata.flashinfer_decode_wrapper = flashinfer_decode_wrapper
 
             return forward(input_ids, input_metadata.positions, input_metadata)
 
@@ -222,7 +237,7 @@ class CudaGraphRunner:
         self.out_cache_loc[:raw_bs] = batch.out_cache_loc
 
         # FlashInfer inputs
-        init_flashinfer_args(
+        update_flashinfer_indices(
             ForwardMode.DECODE,
             self.model_runner,
             self.req_pool_indices[:bs],

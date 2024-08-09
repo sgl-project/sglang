@@ -56,7 +56,8 @@ class ChunkCache(BasePrefixCache):
 
         entry = self.entries[req.rid]
         entry.value = kv_indices
-        return kv_indices, entry
+        req.prefix_indices = kv_indices
+        req.last_node = entry
 
     def insert(self):
         raise NotImplementedError

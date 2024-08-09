@@ -10,10 +10,23 @@ suites = {
         "test_vision_openai_server.py",
         "test_chunked_prefill.py",
         "test_torch_compile.py",
-        "models/test_causal_models.py",
+        "test_models_from_modelscope.py",
+        "models/test_generation_models.py",
+        "models/test_embedding_models.py",
+        "sampling/penaltylib",
     ],
+    "sampling/penaltylib": glob.glob(
+        "sampling/penaltylib/**/test_*.py", recursive=True
+    ),
 }
 
+for target_suite_name, target_tests in suites.items():
+    for suite_name, tests in suites.items():
+        if suite_name == target_suite_name:
+            continue
+        if target_suite_name in tests:
+            tests.remove(target_suite_name)
+            tests.extend(target_tests)
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
