@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from flashinfer.sampling import top_k_top_p_sampling_from_probs
 
+import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
@@ -142,6 +143,7 @@ class Req:
 
         # Logprobs
         self.return_logprob = False
+        self.embedding = None
         self.logprob_start_len = 0
         self.top_logprobs_num = 0
         self.normalized_prompt_logprob = None
@@ -217,16 +219,23 @@ class Req:
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(len(self.output_ids))
+            self.finished_reason = FINISH_LENGTH(
+                length=self.sampling_params.max_new_tokens
+            )
             return
 
+        last_token_id = self.output_ids[-1]
         if (
-            self.output_ids[-1] == self.tokenizer.eos_token_id
+            last_token_id == self.tokenizer.eos_token_id
             and not self.sampling_params.ignore_eos
         ):
             self.finished_reason = FINISH_MATCHED_TOKEN(
                 matched=self.tokenizer.eos_token_id
             )
+            return
+
+        if last_token_id in self.sampling_params.stop_token_ids:
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
             return
 
         if len(self.sampling_params.stop_strs) > 0:
@@ -307,7 +316,6 @@ class ScheduleBatch:
     input_ids: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
-    prefix_lens: torch.Tensor = None
     position_ids_offsets: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
     extend_num_tokens: int = None
@@ -316,17 +324,11 @@ class ScheduleBatch:
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
 
-    # For multimodal
-    pixel_values: List[torch.Tensor] = None
-    image_sizes: List[List[int]] = None
-    image_offsets: List[int] = None
-
     # Batched sampling params
     temperatures: torch.Tensor = None
     top_ps: torch.Tensor = None
     top_ks: torch.Tensor = None
-    frequency_penalties: torch.Tensor = None
-    presence_penalties: torch.Tensor = None
+    penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
     logit_bias: torch.Tensor = None
 
     @classmethod
@@ -390,15 +392,24 @@ class ScheduleBatch:
         self.top_ks = torch.tensor(
             [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
         )
-        self.frequency_penalties = torch.tensor(
-            [r.sampling_params.frequency_penalty for r in reqs],
-            dtype=torch.float,
+
+        # Each penalizers will do nothing if they evaluate themselves as not required by looking at
+        # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
+        # should not add hefty computation overhead other than simple checks.
+        #
+        # While we choose not to even create the class instances if they are not required, this
+        # could add additional complexity to the {ScheduleBatch} class, especially we need to
+        # handle {filter_batch()} and {merge()} cases as well.
+        self.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
+            vocab_size=vocab_size,
+            batch=self,
             device=device,
-        )
-        self.presence_penalties = torch.tensor(
-            [r.sampling_params.presence_penalty for r in reqs],
-            dtype=torch.float,
-            device=device,
+            Penalizers={
+                penaltylib.BatchedFrequencyPenalizer,
+                penaltylib.BatchedMinNewTokensPenalizer,
+                penaltylib.BatchedPresencePenalizer,
+                penaltylib.BatchedRepetitionPenalizer,
+            },
         )
 
         # Handle logit bias but only allocate when needed
@@ -412,59 +423,40 @@ class ScheduleBatch:
                 self.logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
 
     def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
-        device = "cuda"
         bs = self.batch_size()
         reqs = self.reqs
         input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
-        prefix_indices = [r.prefix_indices for r in reqs]
-
-        # Handle prefix
-        extend_lens = []
-        prefix_lens = []
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = []
 
-        req_pool_indices_cpu = self.alloc_req_slots(bs)
-
-        for i, req in enumerate(reqs):
-            req.req_pool_idx = req_pool_indices_cpu[i]
-            extend_lens.append(len(input_ids[i]))
-
-            if len(prefix_indices[i]) == 0:
-                prefix_lens.append(0)
-            else:
-                prefix_lens.append(len(prefix_indices[i]))
-                self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    : len(prefix_indices[i])
-                ] = prefix_indices[i]
-
-            seq_lens.append(prefix_lens[-1] + extend_lens[-1])
-
         # Allocate memory
-        seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
-        extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
+        req_pool_indices_cpu = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
         pt = 0
         for i, req in enumerate(reqs):
-            self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                prefix_lens[i] : prefix_lens[i] + extend_lens[i]
-            ] = out_cache_loc[pt : pt + extend_lens[i]]
-            pt += extend_lens[i]
+            req.req_pool_idx = req_pool_indices_cpu[i]
+            pre_len, seq_len = len(req.prefix_indices), len(req.input_ids)
+            ext_len = seq_len - pre_len
+            seq_lens.append(seq_len)
+
+            if pre_len > 0:
+                self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    :pre_len
+                ] = req.prefix_indices
+
+            self.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
+                out_cache_loc[pt : pt + ext_len]
+            )
+            pt += ext_len
 
         # Set fields
         with torch.device("cuda"):
             self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
             self.req_pool_indices = torch.tensor(req_pool_indices_cpu)
             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
-            self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int32)
+            self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int64)
 
-        self.pixel_values = [r.pixel_values for r in reqs]
-        self.image_sizes = [r.image_size for r in reqs]
-        self.image_offsets = [
-            (r.image_offset - p_len) if r.image_offset is not None else 0
-            for r, p_len in zip(reqs, prefix_lens)
-        ]
-        self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
@@ -640,9 +632,11 @@ class ScheduleBatch:
             input_ids = [
                 r.output_ids[-1] if r.output_ids else r.input_ids[-1] for r in self.reqs
             ]
+        else:
+            self.penalizer_orchestrator.cumulate_input_tokens(input_ids)
+
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
-        self.prefix_lens = None
 
         # Alloc mem
         bs = self.batch_size()
@@ -667,18 +661,17 @@ class ScheduleBatch:
         self.seq_lens = self.seq_lens[new_indices]
         self.input_ids = None
         self.req_pool_indices = self.req_pool_indices[new_indices]
-        self.prefix_lens = None
         self.position_ids_offsets = self.position_ids_offsets[new_indices]
         self.out_cache_loc = None
         self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
+        self.penalizer_orchestrator.filter(unfinished_indices, new_indices)
+
         for item in [
             "temperatures",
             "top_ps",
             "top_ks",
-            "frequency_penalties",
-            "presence_penalties",
             "logit_bias",
         ]:
             self_val = getattr(self, item, None)
@@ -692,7 +685,6 @@ class ScheduleBatch:
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
-        self.prefix_lens = None
         self.position_ids_offsets = torch.concat(
             [self.position_ids_offsets, other.position_ids_offsets]
         )
@@ -700,12 +692,12 @@ class ScheduleBatch:
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
+        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+
         for item in [
             "temperatures",
             "top_ps",
             "top_ks",
-            "frequency_penalties",
-            "presence_penalties",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
@@ -747,7 +739,8 @@ class ScheduleBatch:
                     ] = 1
                     logits[i].masked_fill_(~allowed_mask, float("-inf"))
 
-        # TODO(lmzheng): apply penalty
+        logits = self.penalizer_orchestrator.apply(logits)
+
         probs = torch.softmax(logits, dim=-1)
 
         if not global_server_args_dict["disable_flashinfer_sampling"]:
@@ -779,6 +772,8 @@ class ScheduleBatch:
                     req.regex_fsm_state = req.regex_fsm.get_next_state(
                         req.regex_fsm_state, batch_next_token_ids_cpu[i]
                     )
+
+        self.penalizer_orchestrator.cumulate_output_tokens(batch_next_token_ids)
 
         return batch_next_token_ids
 

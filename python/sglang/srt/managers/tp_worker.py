@@ -20,7 +20,7 @@ import multiprocessing
 import pickle
 import time
 import warnings
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -31,8 +31,10 @@ from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    BatchEmbeddingOut,
     BatchTokenIDOut,
     FlushCacheReq,
+    TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.policy_scheduler import PolicyScheduler, PrefillAdder
@@ -205,7 +207,9 @@ class ModelTpServer:
         try:
             # Recv requests
             for recv_req in recv_reqs:
-                if isinstance(recv_req, TokenizedGenerateReqInput):
+                if isinstance(
+                    recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                ):
                     self.handle_generate_request(recv_req)
                 elif isinstance(recv_req, FlushCacheReq):
                     self.flush_cache()
@@ -297,41 +301,42 @@ class ModelTpServer:
 
     def handle_generate_request(
         self,
-        recv_req: TokenizedGenerateReqInput,
+        recv_req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
         req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
-        req.pixel_values = recv_req.pixel_values
-        if req.pixel_values is not None:
-            req.pad_value = [
-                (recv_req.image_hash) % self.model_config.vocab_size,
-                (recv_req.image_hash >> 16) % self.model_config.vocab_size,
-                (recv_req.image_hash >> 32) % self.model_config.vocab_size,
-                (recv_req.image_hash >> 64) % self.model_config.vocab_size,
-            ]
-            req.image_size = recv_req.image_size
-            (
-                req.origin_input_ids,
-                req.image_offset,
-            ) = self.model_runner.model.pad_input_ids(
-                req.origin_input_ids_unpadded,
-                req.pad_value,
-                req.pixel_values.shape,
-                req.image_size,
-            )
-        req.sampling_params = recv_req.sampling_params
-        req.return_logprob = recv_req.return_logprob
-        req.logprob_start_len = recv_req.logprob_start_len
-        req.top_logprobs_num = recv_req.top_logprobs_num
-        req.stream = recv_req.stream
         req.tokenizer = self.tokenizer
-
-        # Init regex fsm
-        if req.sampling_params.regex is not None:
-            req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)
-            if not self.disable_regex_jump_forward:
-                req.jump_forward_map = self.jump_forward_cache.query(
-                    req.sampling_params.regex
+        req.sampling_params = recv_req.sampling_params
+        if self.model_runner.is_generation:
+            req.pixel_values = recv_req.pixel_values
+            if req.pixel_values is not None:
+                req.pad_value = [
+                    (recv_req.image_hash) % self.model_config.vocab_size,
+                    (recv_req.image_hash >> 16) % self.model_config.vocab_size,
+                    (recv_req.image_hash >> 32) % self.model_config.vocab_size,
+                    (recv_req.image_hash >> 64) % self.model_config.vocab_size,
+                ]
+                req.image_size = recv_req.image_size
+                (
+                    req.origin_input_ids,
+                    req.image_offset,
+                ) = self.model_runner.model.pad_input_ids(
+                    req.origin_input_ids_unpadded,
+                    req.pad_value,
+                    req.pixel_values.shape,
+                    req.image_size,
                 )
+            req.return_logprob = recv_req.return_logprob
+            req.logprob_start_len = recv_req.logprob_start_len
+            req.top_logprobs_num = recv_req.top_logprobs_num
+            req.stream = recv_req.stream
+
+            # Init regex fsm
+            if req.sampling_params.regex is not None:
+                req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)
+                if not self.disable_regex_jump_forward:
+                    req.jump_forward_map = self.jump_forward_cache.query(
+                        req.sampling_params.regex
+                    )
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) >= self.max_req_input_len:
@@ -340,14 +345,17 @@ class ModelTpServer:
                 "the max context length. Truncated!!!"
             )
             req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
-        req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
-            self.max_req_input_len - 1 - len(req.origin_input_ids),
-        )
+
+        if self.model_runner.is_generation:
+            req.sampling_params.max_new_tokens = min(
+                (
+                    req.sampling_params.max_new_tokens
+                    if req.sampling_params.max_new_tokens is not None
+                    else 1 << 30
+                ),
+                self.max_req_input_len - 1 - len(req.origin_input_ids),
+            )
+
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
@@ -439,47 +447,68 @@ class ModelTpServer:
             self.model_config.vocab_size, self.int_token_logit_bias
         )
 
-        # Forward and sample the next tokens
-        if batch.extend_num_tokens != 0:
-            output = self.model_runner.forward(batch, ForwardMode.EXTEND)
-            next_token_ids = batch.sample(output.next_token_logits)
+        if self.model_runner.is_generation:
+            # Forward and sample the next tokens
+            if batch.extend_num_tokens != 0:
+                output = self.model_runner.forward(batch, ForwardMode.EXTEND)
+                next_token_ids = batch.sample(output.next_token_logits)
 
-            # Move logprobs to cpu
-            if output.next_token_logprobs is not None:
-                output.next_token_logprobs = output.next_token_logprobs[
-                    torch.arange(len(next_token_ids), device=next_token_ids.device),
-                    next_token_ids,
-                ].tolist()
-                output.input_token_logprobs = output.input_token_logprobs.tolist()
-                output.normalized_prompt_logprobs = (
-                    output.normalized_prompt_logprobs.tolist()
-                )
+                # Move logprobs to cpu
+                if output.next_token_logprobs is not None:
+                    output.next_token_logprobs = output.next_token_logprobs[
+                        torch.arange(len(next_token_ids), device=next_token_ids.device),
+                        next_token_ids,
+                    ].tolist()
+                    output.input_token_logprobs = output.input_token_logprobs.tolist()
+                    output.normalized_prompt_logprobs = (
+                        output.normalized_prompt_logprobs.tolist()
+                    )
 
-            next_token_ids = next_token_ids.tolist()
-        else:
-            next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
-
-        # Check finish conditions
-        pt = 0
-        for i, req in enumerate(batch.reqs):
-            if req is not self.current_inflight_req:
-                # Inflight reqs' prefill is not finished
-                req.completion_tokens_wo_jump_forward += 1
-                req.output_ids.append(next_token_ids[i])
-                req.check_finished()
-
-            if req.finished():
-                self.tree_cache.cache_finished_req(req)
+                next_token_ids = next_token_ids.tolist()
             else:
-                self.tree_cache.cache_unfinished_req(req)
+                next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
 
-            if req is self.current_inflight_req:
-                # Inflight request would get a new req idx
-                self.req_to_token_pool.free(req.req_pool_idx)
+            # Check finish conditions
+            pt = 0
+            for i, req in enumerate(batch.reqs):
+                if req is not self.current_inflight_req:
+                    # Inflight reqs' prefill is not finished
+                    req.completion_tokens_wo_jump_forward += 1
+                    req.output_ids.append(next_token_ids[i])
+                    req.check_finished()
 
-            if req.return_logprob:
-                self.add_logprob_return_values(i, req, pt, next_token_ids, output)
-                pt += req.extend_input_len
+                if req.finished():
+                    self.tree_cache.cache_finished_req(req)
+                else:
+                    self.tree_cache.cache_unfinished_req(req)
+
+                if req is self.current_inflight_req:
+                    # Inflight request would get a new req idx
+                    self.req_to_token_pool.free(req.req_pool_idx)
+
+                if req.return_logprob:
+                    self.add_logprob_return_values(i, req, pt, next_token_ids, output)
+                    pt += req.extend_input_len
+        else:
+            assert batch.extend_num_tokens != 0
+            output = self.model_runner.forward(batch, ForwardMode.EXTEND)
+            embeddings = output.embeddings.tolist()
+
+            # Check finish conditions
+            for i, req in enumerate(batch.reqs):
+                req.embedding = embeddings[i]
+                if req is not self.current_inflight_req:
+                    # Inflight reqs' prefill is not finished
+                    req.check_finished()
+
+                if req.finished():
+                    self.tree_cache.cache_finished_req(req)
+                else:
+                    self.tree_cache.cache_unfinished_req(req)
+
+                if req is self.current_inflight_req:
+                    # Inflight request would get a new req idx
+                    self.req_to_token_pool.free(req.req_pool_idx)
 
         self.handle_finished_requests(batch)
 
@@ -596,15 +625,19 @@ class ModelTpServer:
 
     def handle_finished_requests(self, batch: ScheduleBatch):
         output_rids = []
-        output_vids = []
-        decoded_texts = []
-        output_read_ids = []
-        output_read_offsets = []
-        output_skip_special_tokens = []
-        output_spaces_between_special_tokens = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
+        if self.model_runner.is_generation:
+            output_vids = []
+            decoded_texts = []
+            output_read_ids = []
+            output_read_offsets = []
+            output_skip_special_tokens = []
+            output_spaces_between_special_tokens = []
+        else:  # for embedding model
+            output_embeddings = []
         unfinished_indices = []
+
         for i, req in enumerate(batch.reqs):
             if not req.finished() and req is not self.current_inflight_req:
                 unfinished_indices.append(i)
@@ -619,56 +652,73 @@ class ModelTpServer:
                 )
             ):
                 output_rids.append(req.rid)
-                output_vids.append(req.vid)
-                decoded_texts.append(req.decoded_text)
-                read_ids, read_offset = req.init_incremental_detokenize()
-                output_read_ids.append(read_ids)
-                output_read_offsets.append(read_offset)
-                output_skip_special_tokens.append(
-                    req.sampling_params.skip_special_tokens
-                )
-                output_spaces_between_special_tokens.append(
-                    req.sampling_params.spaces_between_special_tokens
-                )
-
-                meta_info = {
-                    "prompt_tokens": len(req.origin_input_ids),
-                    "completion_tokens": len(req.output_ids),
-                    "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
-                    "finish_reason": str(req.finished_reason),
-                }
-                if req.return_logprob:
-                    (
-                        meta_info["input_token_logprobs"],
-                        meta_info["output_token_logprobs"],
-                        meta_info["input_top_logprobs"],
-                        meta_info["output_top_logprobs"],
-                        meta_info["normalized_prompt_logprob"],
-                    ) = (
-                        req.input_token_logprobs,
-                        req.output_token_logprobs,
-                        req.input_top_logprobs,
-                        req.output_top_logprobs,
-                        req.normalized_prompt_logprob,
-                    )
-                output_meta_info.append(meta_info)
                 output_finished_reason.append(req.finished_reason)
+                if self.model_runner.is_generation:
+                    output_vids.append(req.vid)
+                    decoded_texts.append(req.decoded_text)
+                    read_ids, read_offset = req.init_incremental_detokenize()
+                    output_read_ids.append(read_ids)
+                    output_read_offsets.append(read_offset)
+                    output_skip_special_tokens.append(
+                        req.sampling_params.skip_special_tokens
+                    )
+                    output_spaces_between_special_tokens.append(
+                        req.sampling_params.spaces_between_special_tokens
+                    )
+
+                    meta_info = {
+                        "prompt_tokens": len(req.origin_input_ids),
+                        "completion_tokens": len(req.output_ids),
+                        "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
+                        "finish_reason": str(req.finished_reason),
+                    }
+                    if req.return_logprob:
+                        (
+                            meta_info["input_token_logprobs"],
+                            meta_info["output_token_logprobs"],
+                            meta_info["input_top_logprobs"],
+                            meta_info["output_top_logprobs"],
+                            meta_info["normalized_prompt_logprob"],
+                        ) = (
+                            req.input_token_logprobs,
+                            req.output_token_logprobs,
+                            req.input_top_logprobs,
+                            req.output_top_logprobs,
+                            req.normalized_prompt_logprob,
+                        )
+                    output_meta_info.append(meta_info)
+                else:  # for embedding model
+                    output_embeddings.append(req.embedding)
+                    meta_info = {
+                        "prompt_tokens": len(req.origin_input_ids),
+                    }
+                    output_meta_info.append(meta_info)
 
         # Send to detokenizer
         if output_rids:
-            self.out_pyobjs.append(
-                BatchTokenIDOut(
-                    output_rids,
-                    output_vids,
-                    decoded_texts,
-                    output_read_ids,
-                    output_read_offsets,
-                    output_skip_special_tokens,
-                    output_spaces_between_special_tokens,
-                    output_meta_info,
-                    output_finished_reason,
+            if self.model_runner.is_generation:
+                self.out_pyobjs.append(
+                    BatchTokenIDOut(
+                        output_rids,
+                        output_vids,
+                        decoded_texts,
+                        output_read_ids,
+                        output_read_offsets,
+                        output_skip_special_tokens,
+                        output_spaces_between_special_tokens,
+                        output_meta_info,
+                        output_finished_reason,
+                    )
                 )
-            )
+            else:  # for embedding model
+                self.out_pyobjs.append(
+                    BatchEmbeddingOut(
+                        output_rids,
+                        output_embeddings,
+                        output_meta_info,
+                        output_finished_reason,
+                    )
+                )
 
         # Remove finished reqs: update batch tensors
         batch.filter_batch(unfinished_indices)

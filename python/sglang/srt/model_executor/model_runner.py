@@ -52,6 +52,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetad
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    is_generation_model,
     is_llama3_405b_fp8,
     is_multimodal_model,
     monkey_patch_vllm_dummy_weight_loader,
@@ -132,8 +133,10 @@ class ModelRunner:
         self.init_cublas()
         self.init_flashinfer()
 
-        # Capture cuda graphs
-        self.init_cuda_graphs()
+        if self.is_generation:
+            # FIXME Currently, cuda graph only capture decode steps, which only exists in causal models
+            # Capture cuda graphs
+            self.init_cuda_graphs()
 
     def load_model(self):
         logger.info(
@@ -184,6 +187,10 @@ class ModelRunner:
             scheduler_config=None,
             cache_config=None,
         )
+        self.is_generation = is_generation_model(
+            self.model_config.hf_config.architectures
+        )
+
         logger.info(
             f"[gpu={self.gpu_id}] Load weight end. "
             f"type={type(self.model).__name__}, "
@@ -350,33 +357,18 @@ class ModelRunner:
         if self.cuda_graph_runner and self.cuda_graph_runner.can_run(len(batch.reqs)):
             return self.cuda_graph_runner.replay(batch)
 
-        input_metadata = InputMetadata.create(
-            self,
-            forward_mode=ForwardMode.DECODE,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            prefix_lens=batch.prefix_lens,
-            position_ids_offsets=batch.position_ids_offsets,
-            out_cache_loc=batch.out_cache_loc,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            return_logprob=batch.return_logprob,
+        input_metadata = InputMetadata.from_schedule_batch(
+            self, batch, ForwardMode.DECODE
         )
+
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
         )
 
     @torch.inference_mode()
     def forward_extend(self, batch: ScheduleBatch):
-        input_metadata = InputMetadata.create(
-            self,
-            forward_mode=ForwardMode.EXTEND,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            prefix_lens=batch.prefix_lens,
-            position_ids_offsets=batch.position_ids_offsets,
-            out_cache_loc=batch.out_cache_loc,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            return_logprob=batch.return_logprob,
+        input_metadata = InputMetadata.from_schedule_batch(
+            self, batch, forward_mode=ForwardMode.EXTEND
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -384,24 +376,16 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward_extend_multi_modal(self, batch: ScheduleBatch):
-        input_metadata = InputMetadata.create(
-            self,
-            forward_mode=ForwardMode.EXTEND,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            prefix_lens=batch.prefix_lens,
-            position_ids_offsets=batch.position_ids_offsets,
-            out_cache_loc=batch.out_cache_loc,
-            return_logprob=batch.return_logprob,
-            top_logprobs_nums=batch.top_logprobs_nums,
+        input_metadata = InputMetadata.from_schedule_batch(
+            self, batch, forward_mode=ForwardMode.EXTEND
         )
         return self.model.forward(
             batch.input_ids,
             input_metadata.positions,
             input_metadata,
-            batch.pixel_values,
-            batch.image_sizes,
-            batch.image_offsets,
+            input_metadata.pixel_values,
+            input_metadata.image_sizes,
+            input_metadata.image_offsets,
         )
 
     def forward(self, batch: ScheduleBatch, forward_mode: ForwardMode):
@@ -429,8 +413,10 @@ def import_model_classes():
                     entry, list
                 ):  # To support multiple model classes in one module
                     for tmp in entry:
+                        assert tmp.__name__ not in model_arch_name_to_cls
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
+                    assert entry.__name__ not in model_arch_name_to_cls
                     model_arch_name_to_cls[entry.__name__] = entry
 
             # compat: some models such as chatglm has incorrect class set in config.json
@@ -440,6 +426,7 @@ def import_model_classes():
             ):
                 for remap in module.EntryClassRemapping:
                     if isinstance(remap, tuple) and len(remap) == 2:
+                        assert remap[0] not in model_arch_name_to_cls
                         model_arch_name_to_cls[remap[0]] = remap[1]
 
     return model_arch_name_to_cls
