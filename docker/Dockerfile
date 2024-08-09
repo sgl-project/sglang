@@ -47,3 +47,5 @@ RUN if [ "$CUDA_VERSION" = "12.1.1" ]; then \
 RUN python3 -m pip cache purge
 
 ENV DEBIAN_FRONTEND=interactive
+
+ENTRYPOINT ["python3", "-m", "sglang.launch_server"]
