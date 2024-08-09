@@ -60,6 +60,7 @@ from sglang.srt.openai_api.adapter import (
     v1_chat_completions,
     v1_completions,
     v1_delete_file,
+    v1_embeddings,
     v1_files_create,
     v1_retrieve_batch,
     v1_retrieve_file,
@@ -174,6 +175,12 @@ async def openai_v1_completions(raw_request: Request):
 @app.post("/v1/chat/completions")
 async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
+
+
+@app.post("/v1/embeddings")
+async def openai_v1_embeddings(raw_request: Request):
+    response = await v1_embeddings(tokenizer_manager, raw_request)
+    return response
 
 
 @app.get("/v1/models")
@@ -412,7 +419,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
-    max_new_tokens = 8 if model_info["is_generation"] else 0
+    max_new_tokens = 8 if model_info["is_generation"] else 1
     try:
         for _ in range(server_args.dp_size):
             res = requests.post(
