@@ -79,7 +79,7 @@ docker run --gpus all \
     python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --host 0.0.0.0 --port 30000
 ```
 
-or, if you only want to run the srt server, you can try out the new slim srt-only images:
+or, if you only want to run the SRT server, you can try out the new slim SRT-only images:
 
 ```bash
 docker run --gpus all \
