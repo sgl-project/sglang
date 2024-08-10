@@ -88,11 +88,4 @@ class TestOpenAIBackend(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # from sglang.global_config import global_config
-
-    # global_config.verbosity = 2
-    # t = TestOpenAIBackend()
-    # t.setUpClass()
-    # t.test_stream()
+    unittest.main()

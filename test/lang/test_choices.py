@@ -87,9 +87,4 @@ class TestChoices(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # t = TestChoices()
-    # t.test_token_length_normalized()
-    # t.test_greedy_token_selection()
-    # t.test_unconditional_likelihood_normalized()
+    unittest.main()

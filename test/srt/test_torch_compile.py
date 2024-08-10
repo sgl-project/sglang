@@ -34,9 +34,4 @@ class TestAccuracy(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # t = TestAccuracy()
-    # t.setUpClass()
-    # t.test_mmlu()
-    # t.tearDownClass()
+    unittest.main()

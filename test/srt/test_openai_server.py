@@ -399,9 +399,4 @@ class TestOpenAIServer(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # t = TestOpenAIServer()
-    # t.setUpClass()
-    # t.test_completion()
-    # t.tearDownClass()
+    unittest.main()
