@@ -167,17 +167,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - If the model does not have a template in the Hugging Face tokenizer, you can specify a [custom chat template](docs/en/custom_chat_template.md).
 - To enable fp8 quantization, you can add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable experimental torch.compile support, you can add `--enable-torch-compile`. It accelerates small models on small batch sizes.
-
-### Use Models From ModelScope
-To use model from [ModelScope](https://www.modelscope.cn), setting environment variable SGLANG_USE_MODELSCOPE.
-```
-export SGLANG_USE_MODELSCOPE=true
-```
-Launch [Qwen2-7B-Instruct](https://www.modelscope.cn/models/qwen/qwen2-7b-instruct) Server
-```
-SGLANG_USE_MODELSCOPE=true python -m sglang.launch_server --model-path qwen/Qwen2-7B-Instruct --port 30000
-```    
-  
+ 
 ### Supported Models
 
 - Llama / Llama 2 / Llama 3 / Llama 3.1
@@ -203,7 +193,17 @@ SGLANG_USE_MODELSCOPE=true python -m sglang.launch_server --model-path qwen/Qwen
 
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/en/model_support.md).
 
-### Run Llama 3.1 405B
+#### Use Models From ModelScope
+To use model from [ModelScope](https://www.modelscope.cn), setting environment variable SGLANG_USE_MODELSCOPE.
+```
+export SGLANG_USE_MODELSCOPE=true
+```
+Launch [Qwen2-7B-Instruct](https://www.modelscope.cn/models/qwen/qwen2-7b-instruct) Server
+```
+SGLANG_USE_MODELSCOPE=true python -m sglang.launch_server --model-path qwen/Qwen2-7B-Instruct --port 30000
+```    
+
+#### Run Llama 3.1 405B
 
 ```bash
 ## Run 405B (fp8) on a single node

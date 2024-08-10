@@ -21,11 +21,4 @@ class TestAnthropicBackend(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # from sglang.global_config import global_config
-
-    # global_config.verbosity = 2
-    # t = TestAnthropicBackend()
-    # t.setUpClass()
-    # t.test_mt_bench()
+    unittest.main()

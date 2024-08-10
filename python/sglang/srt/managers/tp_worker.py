@@ -461,8 +461,11 @@ class ModelTpServer:
                 next_token_ids = next_token_ids.tolist()
             else:
                 if self.tokenizer is None:
-                    for i, req in enumerate(batch.reqs):
-                        next_token_ids.extend(req.sampling_params.stop_token_ids)
+                    next_token_ids = []
+                    for req in batch.reqs:
+                        next_token_ids.append(
+                            next(iter(req.sampling_params.stop_token_ids))
+                        )
                 else:
                     next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
 

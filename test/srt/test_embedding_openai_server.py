@@ -1,11 +1,8 @@
-import json
-import time
 import unittest
 
 import openai
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.openai_api.protocol import EmbeddingObject
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import popen_launch_server
 
@@ -65,12 +62,12 @@ class TestOpenAIServer(unittest.TestCase):
         ), f"{response.usage.total_tokens} vs {num_prompt_tokens}"
 
     def run_batch(self):
-        # FIXME not implemented
+        # FIXME: not implemented
         pass
 
     def test_embedding(self):
-        # TODO the fields of encoding_format, dimensions, user are skipped
-        # TODO support use_list_input
+        # TODO: the fields of encoding_format, dimensions, user are skipped
+        # TODO: support use_list_input
         for use_list_input in [False, True]:
             for token_input in [False, True]:
                 self.run_embedding(use_list_input, token_input)
@@ -80,9 +77,4 @@ class TestOpenAIServer(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # t = TestOpenAIServer()
-    # t.setUpClass()
-    # t.test_embedding()
-    # t.tearDownClass()
+    unittest.main()

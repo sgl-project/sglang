@@ -48,8 +48,4 @@ class TestBind(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # t = TestBind()
-    # t.setUpClass()
-    # t.test_cache()
+    unittest.main()
