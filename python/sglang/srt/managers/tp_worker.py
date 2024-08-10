@@ -84,6 +84,7 @@ class ModelTpServer:
         # Chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
         self.current_inflight_req = None
+        self.mixed_style = self.chunked_prefill_size is not None
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -375,6 +376,11 @@ class ModelTpServer:
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
             self.max_prefill_tokens,
             self.chunked_prefill_size,
+            (
+                self.running_batch.batch_size()
+                if self.mixed_style and self.running_batch is not None
+                else 0
+            ),
         )
 
         if self.running_batch is not None:
@@ -440,6 +446,11 @@ class ModelTpServer:
         batch.prepare_for_extend(
             self.model_config.vocab_size, self.int_token_logit_bias
         )
+
+        if self.mixed_style and self.running_batch is not None:
+            self.running_batch.prepare_for_decode()
+            batch.mix_with_running(self.running_batch)
+            self.running_batch = None
 
         if self.model_runner.is_generation:
             # Forward and sample the next tokens

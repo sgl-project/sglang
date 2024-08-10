@@ -465,6 +465,18 @@ class ScheduleBatch:
 
         self.batch_sampling_params(vocab_size, int_token_logit_bias)
 
+    def mix_with_running(self, running_batch: "ScheduleBatch"):
+        for req in running_batch.reqs:
+            req.init_next_round_input()
+        input_ids = torch.cat([self.input_ids, running_batch.input_ids])
+        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        extend_num_tokens = self.extend_num_tokens + running_batch.batch_size()
+        running_batch.seq_lens += 1
+        self.merge(running_batch)
+        self.input_ids = input_ids
+        self.out_cache_loc = out_cache_loc
+        self.extend_num_tokens = extend_num_tokens
+
     def check_decode_mem(self):
         bs = self.batch_size()
         if self.token_to_kv_pool.available_size() >= bs:
