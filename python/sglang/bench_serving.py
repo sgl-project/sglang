@@ -349,7 +349,7 @@ def sample_sharegpt_requests(
 
         # Tokenize the prompts and completions.
         prompt = dataset[i][0]
-        prompt_token_ids = tokenizer(prompt).input_ids
+        prompt_token_ids = tokenizer.encode(prompt)
         completion = dataset[i][1]
         completion_token_ids = tokenizer(completion).input_ids
         prompt_len = len(prompt_token_ids)
