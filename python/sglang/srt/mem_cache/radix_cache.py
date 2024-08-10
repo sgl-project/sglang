@@ -116,7 +116,7 @@ class RadixCache(BasePrefixCache):
             return
 
         if token_ids is None:
-            token_ids = req.input_ids
+            token_ids = req.fill_ids
 
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)

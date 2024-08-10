@@ -515,7 +515,7 @@ class ModelTpServer:
 
         self.handle_finished_requests(batch)
 
-    def add_logprob_return_values(self, i, req, pt, next_token_ids, output):
+    def add_logprob_return_values(self, i, req: Req, pt, next_token_ids, output):
         if req.normalized_prompt_logprob is None:
             req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
 
@@ -524,12 +524,12 @@ class ModelTpServer:
             req.input_token_logprobs = list(
                 zip(
                     output.input_token_logprobs[pt : pt + req.extend_input_len - 1],
-                    req.input_ids[-req.extend_input_len + 1 :],
+                    req.fill_ids[-req.extend_input_len + 1 :],
                 )
             )
             if req.logprob_start_len == 0:
                 req.input_token_logprobs = [
-                    (None, req.input_ids[0])
+                    (None, req.fill_ids[0])
                 ] + req.input_token_logprobs
 
         if req.last_update_decode_tokens != 0:
@@ -543,7 +543,7 @@ class ModelTpServer:
                             + req.extend_input_len
                             - 1
                         ],
-                        req.input_ids[-req.last_update_decode_tokens + 1 :],
+                        req.fill_ids[-req.last_update_decode_tokens + 1 :],
                     )
                 )
             )
