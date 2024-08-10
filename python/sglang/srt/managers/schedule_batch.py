@@ -632,7 +632,8 @@ class ScheduleBatch:
     def prepare_for_decode(self, input_ids=None):
         if input_ids is None:
             input_ids = [
-                r.output_ids[-1] if r.output_ids else r.input_ids[-1] for r in self.reqs
+                r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
+                for r in self.reqs
             ]
         else:
             self.penalizer_orchestrator.cumulate_input_tokens(input_ids)
