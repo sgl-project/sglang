@@ -92,7 +92,7 @@ class RadixCache(BasePrefixCache):
     def cache_finished_req(self, req: "Req", token_ids=None):
         """Cache request when it finishes."""
         if token_ids is None:
-            token_ids = (req.input_ids + req.output_ids)[:-1]
+            token_ids = (req.origin_input_ids + req.output_ids)[:-1]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -116,7 +116,7 @@ class RadixCache(BasePrefixCache):
             return
 
         if token_ids is None:
-            token_ids = req.input_ids
+            token_ids = req.fill_ids
 
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
