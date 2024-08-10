@@ -38,8 +38,9 @@ class TestOpenAIServer(unittest.TestCase):
             num_prompt_tokens = len(self.tokenizer.encode(prompt))
 
         if use_list_input:
-            prompt_arg = [prompt_input, prompt_input]
+            prompt_arg = [prompt_input] * 2
             num_prompts = len(prompt_arg)
+            num_prompt_tokens *= num_prompts
         else:
             prompt_arg = prompt_input
             num_prompts = 1
@@ -70,7 +71,7 @@ class TestOpenAIServer(unittest.TestCase):
     def test_embedding(self):
         # TODO the fields of encoding_format, dimensions, user are skipped
         # TODO support use_list_input
-        for use_list_input in [False]:
+        for use_list_input in [False, True]:
             for token_input in [False, True]:
                 self.run_embedding(use_list_input, token_input)
 

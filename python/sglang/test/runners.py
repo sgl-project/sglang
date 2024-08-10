@@ -219,11 +219,9 @@ class SRTRunner:
                 output_strs=output_strs, top_input_logprobs=top_input_logprobs
             )
         else:
-            logits = []
-            for prompt in prompts:
-                response = self.runtime.encode(prompt)
-                response = json.loads(response)
-                logits.append(response["embedding"])
+            response = self.runtime.encode(prompts)
+            response = json.loads(response)
+            logits = [x["embedding"] for x in response]
             return ModelOutput(embed_logits=logits)
 
     def __enter__(self):
