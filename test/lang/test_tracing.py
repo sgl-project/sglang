@@ -125,7 +125,4 @@ class TestTracing(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # t = TestTracing()
-    # t.test_multi_function()
+    unittest.main()
