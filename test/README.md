@@ -3,7 +3,7 @@
 SGLang uses the built-in library [unittest](https://docs.python.org/3/library/unittest.html) as the testing framework.  
 
 ## Test Backend Runtime
-```
+```bash
 cd sglang/test/srt
 
 # Run a single file
@@ -17,7 +17,7 @@ python3 run_suite.py --suite minimal
 ```
 
 ## Test Frontend Language
-```
+```bash
 cd sglang/test/lang
 export OPENAI_API_KEY=sk-*****
 

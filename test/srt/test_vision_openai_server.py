@@ -113,9 +113,4 @@ class TestOpenAIVisionServer(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # t = TestOpenAIVisionServer()
-    # t.setUpClass()
-    # t.test_chat_completion()
-    # t.tearDownClass()
+    unittest.main()
