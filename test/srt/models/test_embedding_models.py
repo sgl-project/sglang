@@ -44,7 +44,9 @@ class TestEmbeddingModels(unittest.TestCase):
             torch_dtype=torch_dtype,
             is_generation_model=False,
         ) as srt_runner:
-            srt_outputs = srt_runner.forward(prompts)
+            srt_outputs = srt_runner.forward(
+                prompts,
+            )
 
         for i in range(len(prompts)):
             hf_logits = torch.Tensor(hf_outputs.embed_logits[i])
