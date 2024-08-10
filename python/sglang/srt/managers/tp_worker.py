@@ -118,11 +118,7 @@ class ModelTpServer:
                     trust_remote_code=server_args.trust_remote_code,
                 )
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
-        self.max_prefill_tokens = (
-            16384
-            if server_args.max_prefill_tokens is None
-            else server_args.max_prefill_tokens
-        )
+        self.max_prefill_tokens = server_args.max_prefill_tokens
         self.max_running_requests = min(
             (
                 self.max_total_num_tokens // 2
