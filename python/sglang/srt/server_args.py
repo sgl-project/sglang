@@ -96,6 +96,7 @@ class ServerArgs:
             self.served_model_name = self.model_path
 
         if self.chunked_prefill_size <= 0:
+            # Disable chunked prefill
             self.chunked_prefill_size = None
 
         if self.mem_fraction_static is None:
