@@ -99,7 +99,7 @@ class Req:
         self.origin_input_ids_unpadded = origin_input_ids  # Before image padding
         self.origin_input_ids = origin_input_ids
         self.output_ids = []  # Each decode stage's output ids
-        self.input_ids = None  # input_ids = origin_input_ids + output_ids
+        self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
 
         # Memory info
         self.req_pool_idx = None
@@ -165,12 +165,12 @@ class Req:
         return self.finished_reason is not None
 
     def init_next_round_input(self):
-        self.input_ids = self.origin_input_ids + self.output_ids
-        self.extend_input_len = len(self.input_ids) - len(self.prefix_indices)
+        self.fill_ids = self.origin_input_ids + self.output_ids
+        self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
-        self.input_ids = self.origin_input_ids + self.output_ids
-        input_len = len(self.input_ids)
+        self.fill_ids = self.origin_input_ids + self.output_ids
+        input_len = len(self.fill_ids)
         max_prefix_len = input_len
 
         if self.sampling_params.max_new_tokens > 0:
@@ -184,7 +184,7 @@ class Req:
                 # Need at least two tokens to compute normalized logprob
                 max_prefix_len = min(max_prefix_len, input_len - 2)
 
-        return self.input_ids[:max_prefix_len]
+        return self.fill_ids[:max_prefix_len]
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -427,7 +427,7 @@ class ScheduleBatch:
     def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
         bs = self.batch_size()
         reqs = self.reqs
-        input_ids = [r.input_ids[len(r.prefix_indices) :] for r in reqs]
+        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = []
 
@@ -438,7 +438,7 @@ class ScheduleBatch:
         pt = 0
         for i, req in enumerate(reqs):
             req.req_pool_idx = req_pool_indices_cpu[i]
-            pre_len, seq_len = len(req.prefix_indices), len(req.input_ids)
+            pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             ext_len = seq_len - pre_len
             seq_lens.append(seq_len)
 
@@ -632,7 +632,8 @@ class ScheduleBatch:
     def prepare_for_decode(self, input_ids=None):
         if input_ids is None:
             input_ids = [
-                r.output_ids[-1] if r.output_ids else r.input_ids[-1] for r in self.reqs
+                r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
+                for r in self.reqs
             ]
         else:
             self.penalizer_orchestrator.cumulate_input_tokens(input_ids)

@@ -138,7 +138,7 @@ class PrefillAdder:
     def add_inflight_req(self, req: Req):
         truncated = req.extend_input_len > self.rem_chunk_tokens
         req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
-        req.input_ids = req.input_ids[: len(req.prefix_indices) + req.extend_input_len]
+        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
 
         self._prefill_one_req(
@@ -193,7 +193,7 @@ class PrefillAdder:
                     return False
 
                 req.extend_input_len = trunc_len
-                req.input_ids = req.input_ids[: len(req.prefix_indices) + trunc_len]
+                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
                 self.can_run_list.append(req)
                 self.new_inflight_req = req
                 self.tree_cache.inc_lock_ref(req.last_node)
