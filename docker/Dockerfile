@@ -3,6 +3,7 @@ ARG CUDA_VERSION=12.1.1
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04
 
 ARG PYTHON_VERSION=3
+ARG BUILD_TYPE=all
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -28,7 +29,11 @@ RUN pip3 --no-cache-dir install --upgrade pip \
     && pip3 --no-cache-dir install --upgrade setuptools wheel \
     && git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && cd sglang \
-    && pip --no-cache-dir install -e "python[all]" \
+    && if [ "$BUILD_TYPE" = "srt" ]; then \
+         pip --no-cache-dir install -e "python[srt]"; \
+       else \
+         pip --no-cache-dir install -e "python[all]"; \
+       fi \
     && pip3 --no-cache-dir install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 
 ENV DEBIAN_FRONTEND=interactive
