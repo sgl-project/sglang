@@ -77,7 +77,7 @@ class FileMetadata:
 batch_storage: Dict[str, BatchResponse] = {}
 file_id_request: Dict[str, FileMetadata] = {}
 file_id_response: Dict[str, FileResponse] = {}
-# map file id to file path in SGlang backend
+# map file id to file path in SGLang backend
 file_id_storage: Dict[str, str] = {}
 
 
@@ -335,7 +335,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
         }
 
     except Exception as e:
-        print("error in SGlang:", e)
+        print("error in SGLang:", e)
         # Update batch status to "failed"
         retrieve_batch = batch_storage[batch_id]
         retrieve_batch.status = "failed"

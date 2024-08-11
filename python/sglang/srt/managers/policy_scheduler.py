@@ -15,6 +15,7 @@ limitations under the License.
 
 """Request policy scheduler"""
 
+import os
 import random
 from collections import defaultdict
 from contextlib import contextmanager
@@ -24,9 +25,11 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import TreeNode
 
-# Clip the max new tokens for the request whose max_new_tokens is very large.
+# Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
-CLIP_MAX_NEW_TOKENS = 4096
+# Note that this only clips the estimation in the scheduler but does not change the stop
+# condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
+CLIP_MAX_NEW_TOKENS = int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS", "4096"))
 
 
 class PolicyScheduler:
