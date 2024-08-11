@@ -33,6 +33,5 @@ body:
     description: |
       Please provide necessary environment information here with `python3 -m sglang.check_env`.
     placeholder: Environment here.
-    render: Shell
   validations:
     required: true
