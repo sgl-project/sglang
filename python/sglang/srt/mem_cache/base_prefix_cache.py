@@ -41,7 +41,7 @@ class BasePrefixCache(ABC):
         pass
 
     def total_size(self):
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def pretty_print(self):
-        raise NotImplementedError
+        raise NotImplementedError()
