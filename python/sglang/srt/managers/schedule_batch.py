@@ -467,11 +467,14 @@ class ScheduleBatch:
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         for req in running_batch.reqs:
+            self.tree_cache.cache_unfinished_req(
+                req, (req.origin_input_ids + req.output_ids)[:-1]
+            )
             req.init_next_round_input()
+
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
         extend_num_tokens = self.extend_num_tokens + running_batch.batch_size()
-        running_batch.seq_lens += 1
         self.merge(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
