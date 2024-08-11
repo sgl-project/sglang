@@ -39,9 +39,11 @@ class ChunkCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
-        assert req.rid in self.entries
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool.free(kv_indices)
+
+        if req.rid in self.entries:
+            del self.entries[req.rid]
 
     def cache_unfinished_req(self, req: "Req", token_ids=None):
         if token_ids is None:
