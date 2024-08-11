@@ -204,6 +204,7 @@ class Gemma2Attention(nn.Module):
         # odd layer, vLLM currently ignores it and uses global attention for
         # all layers.
         use_sliding_window = (layer_idx % 2 == 1 and hasattr(config, "sliding_window_size"))
+        use_sliding_window = False
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -403,8 +404,8 @@ class Gemma2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.model.embed_tokens.weight, input_metadata
         )
 
-    def get_window_size(self):
-        return self.config.sliding_window
+    # def get_window_size(self):
+    #     return self.config.sliding_window
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

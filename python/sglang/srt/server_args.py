@@ -462,7 +462,7 @@ class ServerArgs:
             self.disable_regex_jump_forward = True
             self.disable_flashinfer = False
             self.disable_cuda_graph = True
-            self.chunked_prefill_size = -1
+            self.chunked_prefill_size = None
 
 
 @dataclasses.dataclass

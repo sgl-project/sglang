@@ -31,6 +31,7 @@ DEFAULT_PROMPTS = [
     "The capital of the United Kindom is",
     "Today is a sunny day and I like",
     "AI is a field of computer science focused on",
+    # "Apple is red. Banana is Yellow. " * 1000 + "Apple is",
 ]
 
 NUM_TOP_LOGPROBS = 5

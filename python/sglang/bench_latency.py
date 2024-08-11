@@ -64,7 +64,7 @@ class BenchArgs:
     run_name: str = "before"
     batch_size: Tuple[int] = (1,)
     input_len: Tuple[int] = (1024,)
-    output_len: Tuple[int] = (4,)
+    output_len: Tuple[int] = (16,)
     result_filename: str = ""
     correctness_test: bool = False
     # This is only used for correctness test
