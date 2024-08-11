@@ -203,7 +203,7 @@ class InputMetadata:
 
     def init_triton_args(self, batch: ScheduleBatch, prefix_lens):
         """Init auxiliary variables for triton attention backend."""
-        self.triton_max_seq_len = max(len(r.fill_ids) for r in batch.reqs)
+        self.triton_max_seq_len = int(torch.max(self.seq_lens))
         self.triton_prefix_lens = prefix_lens
         self.triton_start_loc = torch.zeros_like(self.seq_lens, dtype=torch.int32)
         self.triton_start_loc[1:] = torch.cumsum(self.seq_lens[:-1], dim=0)
