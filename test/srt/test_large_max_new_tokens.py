@@ -25,6 +25,7 @@ class TestOpenAIServer(unittest.TestCase):
             api_key=cls.api_key,
             other_args=("--max-total-token", "1024"),
             env={"SGLANG_CLIP_MAX_NEW_TOKENS": "256", **os.environ},
+            return_stdout_stderr=True,
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_MODEL_NAME_FOR_TEST)

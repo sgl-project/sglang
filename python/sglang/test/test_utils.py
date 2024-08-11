@@ -399,7 +399,7 @@ def popen_launch_server(
     api_key: Optional[str] = None,
     other_args: tuple = (),
     env: Optional[dict] = None,
-    return_text_output: bool = False,
+    return_stdout_stderr: bool = False,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -419,7 +419,7 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
-    if return_text_output:
+    if return_stdout_stderr:
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
