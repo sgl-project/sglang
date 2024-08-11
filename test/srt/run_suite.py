@@ -8,7 +8,7 @@ suites = {
         "test_chunked_prefill.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy.py",
-        # "test_models_from_modelscope.py",
+        "test_large_max_new_tokens.py",
         "test_openai_server.py",
         "test_skip_tokenizer_init.py",
         "test_torch_compile.py",
