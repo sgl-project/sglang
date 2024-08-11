@@ -97,7 +97,9 @@ class PrefillAdder:
         self.tree_cache = tree_cache
         self.rem_total_tokens = rem_total_tokens - mixed_with_decode_tokens
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
-        self.rem_chunk_tokens = rem_chunk_tokens - mixed_with_decode_tokens
+        self.rem_chunk_tokens = rem_chunk_tokens
+        if self.rem_chunk_tokens is not None:
+            self.rem_chunk_tokens -= mixed_with_decode_tokens
 
         self.can_run_list = []
         self.new_inflight_req = None
