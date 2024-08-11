@@ -13,15 +13,17 @@ limitations under the License.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from flashinfer.activation import silu_and_mul
+from vllm.model_executor.custom_op import CustomOp
 
 
-class SiluAndMul(nn.Module):
+class SiluAndMul(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
