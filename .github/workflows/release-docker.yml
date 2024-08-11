@@ -14,7 +14,7 @@ jobs:
     environment: 'prod'
     strategy:
       matrix:
-        cuda_version: ['12.1.1', '12.4.1']
+        cuda_version: ['11.8.0', '12.1.1', '12.4.1']
         build_type: ['all', 'srt']
     steps:
       - name: Delete huge unnecessary tools folder
@@ -33,7 +33,9 @@ jobs:
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
 
-          if [ "${{ matrix.cuda_version }}" = "12.1.1" ]; then
+          if [ "${{ matrix.cuda_version }}" = "11.8.0" ]; then
+            cuda_tag="cu118"
+          elif [ "${{ matrix.cuda_version }}" = "12.1.1" ]; then
             cuda_tag="cu121"
           elif [ "${{ matrix.cuda_version }}" = "12.4.1" ]; then
             cuda_tag="cu124"
