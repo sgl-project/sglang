@@ -127,7 +127,8 @@ class PrefillAdder:
     ):
         self.rem_total_tokens -= sum(
             [
-                (r.sampling_params.max_new_tokens - len(r.output_ids)) * new_token_ratio
+                min((r.sampling_params.max_new_tokens - len(r.output_ids)), 2048)
+                * new_token_ratio
                 for r in running_batch.reqs
             ]
         )
