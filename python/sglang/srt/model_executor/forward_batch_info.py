@@ -148,9 +148,6 @@ class InputMetadata:
             self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
             self.extend_no_prefix = all(x == 0 for x in prefix_lens_cpu)
 
-    def init_total_num_tokens(self, batch: ScheduleBatch):
-        self.total_num_tokens = sum(len(req.fill_ids) for req in batch.reqs)
-
     @classmethod
     def from_schedule_batch(
         cls,
@@ -174,7 +171,11 @@ class InputMetadata:
 
         ret.compute_extend_infos(batch)
 
-        ret.init_total_num_tokens(batch)
+        if (
+            forward_mode != ForwardMode.DECODE
+            or model_runner.server_args.disable_flashinfer
+        ):
+            ret.total_num_tokens = int(torch.sum(ret.seq_lens))
 
         if forward_mode != ForwardMode.DECODE:
             ret.init_multimuldal_info(batch)
