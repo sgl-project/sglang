@@ -369,11 +369,7 @@ class ModelTpServer:
             return None
 
         # Get priority queue
-        self.scheduler.calc_priority(self.waiting_queue)
-
-        prefix_calc = None
-        if self.schedule_policy not in ["lpm", "dfs-weight"]:
-            prefix_calc = self.tree_cache
+        prefix_computed = self.scheduler.calc_priority(self.waiting_queue)
 
         adder = PrefillAdder(
             self.tree_cache,
@@ -387,13 +383,15 @@ class ModelTpServer:
 
         has_inflight = self.current_inflight_req is not None
         if self.current_inflight_req is not None:
-            self.current_inflight_req.init_next_round_input(prefix_calc)
+            self.current_inflight_req.init_next_round_input(
+                None if prefix_computed else self.tree_cache
+            )
             self.current_inflight_req = adder.add_inflight_req(
                 self.current_inflight_req
             )
 
         for req in self.waiting_queue:
-            req.init_next_round_input(prefix_calc)
+            req.init_next_round_input(None if prefix_computed else self.tree_cache)
             res = adder.add_one_req(req)
             if (
                 not res

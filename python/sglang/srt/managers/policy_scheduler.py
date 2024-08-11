@@ -40,12 +40,14 @@ class PolicyScheduler:
 
     def calc_priority(self, waiting_queue: List[Req]):
         # Compute matched prefix length
+        prefix_computed = False
         if self.policy in ["lpm", "dfs-weight"]:
             for r in waiting_queue:
                 # NOTE: the prefix_indices must always be aligned with last_node
                 r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
                     rid=r.rid, key=r.adjust_max_prefix_ids()
                 )
+            prefix_computed = True
 
         if self.policy == "lpm":
             # Longest Prefix Match
@@ -77,6 +79,8 @@ class PolicyScheduler:
             )
         else:
             raise ValueError(f"Unknown schedule_policy: {self.policy}")
+
+        return prefix_computed
 
     def calc_weight(self, cur_node: TreeNode, node_to_weight: Dict):
         for child in cur_node.children.values():
