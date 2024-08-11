@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Callable
 
 
 class BasePrefixCache(ABC):
@@ -25,7 +26,7 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
-    def evict(self, num_tokens, evict_callback):
+    def evict(self, num_tokens: int, evict_callback: Callable):
         pass
 
     @abstractmethod
