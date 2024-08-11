@@ -57,18 +57,6 @@ jobs:
         EOF
         chmod +x wait-for-server.sh
 
-    - name: Run benchmark without FlashInfer
-      run: |
-        python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache --disable-flashinfer &
-        SERVER_PID=$!
-        
-        ./wait-for-server.sh http://127.0.0.1:8413/health
-        
-        cd $HOME && python3 -m sglang.bench_serving --backend sglang --port 8413
-        
-        kill $SERVER_PID
-        wait $SERVER_PID 2>/dev/null || true
-
     - name: Run benchmark with FlashInfer
       run: |
         python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
@@ -80,3 +68,16 @@ jobs:
         
         kill $SERVER_PID
         wait $SERVER_PID 2>/dev/null || true
+
+    - name: Run benchmark without FlashInfer
+      run: |
+        python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache --disable-flashinfer &
+        SERVER_PID=$!
+        
+        ./wait-for-server.sh http://127.0.0.1:8413/health
+        
+        cd $HOME && python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 500 --random-input 4096 --random-output 2048
+        
+        kill $SERVER_PID
+        wait $SERVER_PID 2>/dev/null || true
+        sleep 5
