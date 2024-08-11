@@ -18,9 +18,10 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from flashinfer.norm import fused_add_rmsnorm, rmsnorm
+from vllm.model_executor.custom_op import CustomOp
 
 
-class RMSNorm(nn.Module):
+class RMSNorm(CustomOp):
     def __init__(
         self,
         hidden_size: int,
@@ -30,7 +31,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(
+    def forward_cuda(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
