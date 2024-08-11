@@ -26,34 +26,57 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v3
 
-    - name: Install dependencies
+    - name: Set up Python environment
       run: |
         source $HOME/venv/bin/activate
         echo "$HOME/venv/bin" >> $GITHUB_PATH
 
+    - name: Install dependencies
+      run: |
         pip install --upgrade pip
         pip install -e "python[all]"
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
-    - name: Benchmark Serving Throughput
+    - name: Create wait-for-server script
       run: |
-        python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
-        SERVER_PID=$!
-
-        echo "Waiting for server to start..."
-        for i in {1..120}; do
-          if curl -s http://127.0.0.1:8413/health; then
+        cat << EOF > wait-for-server.sh
+        #!/bin/bash
+        url=\$1
+        max_attempts=120
+        for i in \$(seq 1 \$max_attempts); do
+          if curl -s \$url; then
             echo "Server is up!"
-            break
+            exit 0
           fi
-          if [ $i -eq 120 ]; then
-            echo "Server failed to start within 120 seconds"
+          if [ \$i -eq \$max_attempts ]; then
+            echo "Server failed to start within \$max_attempts seconds"
             exit 1
           fi
           sleep 1
         done
+        EOF
+        chmod +x wait-for-server.sh
 
+    - name: Run benchmark without FlashInfer
+      run: |
+        python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache --disable-flashinfer &
+        SERVER_PID=$!
+        
+        ./wait-for-server.sh http://127.0.0.1:8413/health
+        
+        cd $HOME && python3 -m sglang.bench_serving --backend sglang --port 8413
+        
+        kill $SERVER_PID
+        wait $SERVER_PID 2>/dev/null || true
+
+    - name: Run benchmark with FlashInfer
+      run: |
+        python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8413 --disable-radix-cache &
+        SERVER_PID=$!
+        
+        ./wait-for-server.sh http://127.0.0.1:8413/health
+        
         cd $HOME && python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 500 --random-input 4096 --random-output 2048
-
-        echo "Stopping server..."
-        kill -9 $SERVER_PID
+        
+        kill $SERVER_PID
+        wait $SERVER_PID 2>/dev/null || true
