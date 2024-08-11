@@ -68,6 +68,7 @@ jobs:
         
         kill $SERVER_PID
         wait $SERVER_PID 2>/dev/null || true
+        sleep 5
 
     - name: Run benchmark without FlashInfer
       run: |
@@ -80,4 +81,3 @@ jobs:
         
         kill $SERVER_PID
         wait $SERVER_PID 2>/dev/null || true
-        sleep 5
