@@ -398,6 +398,8 @@ def popen_launch_server(
     timeout: float,
     api_key: Optional[str] = None,
     other_args: tuple = (),
+    env: Optional[dict] = None,
+    return_stdout_stderr: bool = False,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -417,7 +419,16 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
-    process = subprocess.Popen(command, stdout=None, stderr=None)
+    if return_stdout_stderr:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+        )
+    else:
+        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     start_time = time.time()
     while time.time() - start_time < timeout:

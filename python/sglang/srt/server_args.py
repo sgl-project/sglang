@@ -64,7 +64,7 @@ class ServerArgs:
 
     # Other
     api_key: Optional[str] = None
-    file_storage_pth: str = "SGlang_storage"
+    file_storage_pth: str = "SGLang_storage"
 
     # Data parallelism
     dp_size: int = 1
