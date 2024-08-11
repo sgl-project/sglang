@@ -18,13 +18,15 @@ limitations under the License.
 import random
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import List
+from typing import Dict, List
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.radix_cache import TreeNode
 
 
 class PolicyScheduler:
-    def __init__(self, policy, tree_cache):
+    def __init__(self, policy: str, tree_cache: BasePrefixCache):
         if tree_cache.disable and policy in ["lpm", "dfs-weight"]:
             # LPM and DFS-weight is meaningless when the tree cache is disabled.
             policy = "fcfs"
@@ -72,12 +74,18 @@ class PolicyScheduler:
         else:
             raise ValueError(f"Unknown schedule_policy: {self.policy}")
 
-    def calc_weight(self, cur_node, node_to_weight):
+    def calc_weight(self, cur_node: TreeNode, node_to_weight: Dict):
         for child in cur_node.children.values():
             self.calc_weight(child, node_to_weight)
             node_to_weight[cur_node] += node_to_weight[child]
 
-    def get_dfs_priority(self, cur_node, node_to_priority, last_node_to_reqs, q):
+    def get_dfs_priority(
+        self,
+        cur_node: TreeNode,
+        node_to_priority: Dict,
+        last_node_to_reqs: Dict,
+        q: List,
+    ):
         childs = [child for child in cur_node.children.values()]
         childs.sort(key=lambda x: -node_to_priority[x])
         for child in childs:
@@ -88,10 +96,10 @@ class PolicyScheduler:
 class PrefillAdder:
     def __init__(
         self,
-        tree_cache,
-        rem_total_tokens,
-        rem_input_tokens,
-        rem_chunk_tokens,
+        tree_cache: BasePrefixCache,
+        rem_total_tokens: int,
+        rem_input_tokens: int,
+        rem_chunk_tokens: int,
     ):
         self.tree_cache = tree_cache
         self.rem_total_tokens = rem_total_tokens
@@ -151,7 +159,7 @@ class PrefillAdder:
         return req if truncated else None
 
     @contextmanager
-    def _lock_node(self, last_node):
+    def _lock_node(self, last_node: TreeNode):
         try:
             delta = self.tree_cache.inc_lock_ref(last_node)
             self.rem_total_tokens += delta
