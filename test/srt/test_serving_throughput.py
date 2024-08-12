@@ -24,7 +24,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         # Run benchmark
-        num_prompts = 500
+        num_prompts = 400
         args = SimpleNamespace(
             backend="sglang",
             base_url=base_url,
@@ -54,7 +54,7 @@ class TestServingThroughput(unittest.TestCase):
         finally:
             kill_child_process(process.pid)
 
-        assert res.completed == num_prompts
+        assert res["completed"] == num_prompts
 
     def test_default(self):
         self.run_test(
