@@ -36,6 +36,7 @@ class TestServingThroughput(unittest.TestCase):
             model=None,
             tokenizer=None,
             num_prompts=500,
+            sharegpt_output_len=None,
             random_input_len=4096,
             random_output_len=2048,
             random_range_ratio=0.0,
