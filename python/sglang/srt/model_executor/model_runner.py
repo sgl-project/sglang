@@ -125,10 +125,6 @@ class ModelRunner:
 
         # Load the model and create memory pool
         self.load_model()
-        if hasattr(self.model, "get_window_size"):
-            self.window_size = self.model.get_window_size()
-        else:
-            self.window_size = None
         self.init_memory_pool(
             total_gpu_memory,
             server_args.max_num_reqs,
@@ -299,11 +295,15 @@ class ModelRunner:
         return c
 
     def init_flashinfer(self):
-        self.sliding_window_size = self.model.get_window_size() if hasattr(self.model, "get_window_size") else None
+        self.sliding_window_size = (
+            self.model.get_window_size()
+            if hasattr(self.model, "get_window_size")
+            else None
+        )
 
         if self.server_args.disable_flashinfer:
             assert (
-                self.window_size is None
+                self.sliding_window_size is None
             ), "turn on flashinfer to support window attention"
             self.flashinfer_prefill_wrapper_ragged = None
             self.flashinfer_prefill_wrapper_paged = None
@@ -320,10 +320,15 @@ class ModelRunner:
 
         if self.sliding_window_size is None:
             self.flashinfer_workspace_buffers = torch.empty(
-                2, global_config.flashinfer_workspace_size, dtype=torch.uint8, device="cuda"
+                2,
+                global_config.flashinfer_workspace_size,
+                dtype=torch.uint8,
+                device="cuda",
             )
-            self.flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-                self.flashinfer_workspace_buffers[0], "NHD"
+            self.flashinfer_prefill_wrapper_ragged = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.flashinfer_workspace_buffers[0], "NHD"
+                )
             )
             self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
                 self.flashinfer_workspace_buffers[1], "NHD"
@@ -345,11 +350,15 @@ class ModelRunner:
             self.flashinfer_decode_wrapper = []
             for i in range(2):
                 self.flashinfer_prefill_wrapper_ragged.append(
-                    BatchPrefillWithRaggedKVCacheWrapper(workspace_buffers[2 * i + 0], "NHD")
+                    BatchPrefillWithRaggedKVCacheWrapper(
+                        workspace_buffers[2 * i + 0], "NHD"
+                    )
                 )
-                self.flashinfer_prefill_wrapper_paged.append(BatchPrefillWithPagedKVCacheWrapper(
-                    workspace_buffers[2 * i + 1], "NHD"
-                ))
+                self.flashinfer_prefill_wrapper_paged.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        workspace_buffers[2 * i + 1], "NHD"
+                    )
+                )
                 self.flashinfer_decode_wrapper.append(
                     BatchDecodeWithPagedKVCacheWrapper(
                         workspace_buffers[2 * i + 0],
@@ -392,7 +401,10 @@ class ModelRunner:
             return self.cuda_graph_runner.replay(batch)
 
         input_metadata = InputMetadata.from_schedule_batch(
-            self, batch, ForwardMode.DECODE, sliding_window_size=self.sliding_window_size
+            self,
+            batch,
+            ForwardMode.DECODE,
+            sliding_window_size=self.sliding_window_size,
         )
 
         return self.model.forward(
@@ -402,7 +414,10 @@ class ModelRunner:
     @torch.inference_mode()
     def forward_extend(self, batch: ScheduleBatch):
         input_metadata = InputMetadata.from_schedule_batch(
-            self, batch, forward_mode=ForwardMode.EXTEND, sliding_window_size=self.sliding_window_size
+            self,
+            batch,
+            forward_mode=ForwardMode.EXTEND,
+            sliding_window_size=self.sliding_window_size,
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -411,7 +426,10 @@ class ModelRunner:
     @torch.inference_mode()
     def forward_extend_multi_modal(self, batch: ScheduleBatch):
         input_metadata = InputMetadata.from_schedule_batch(
-            self, batch, forward_mode=ForwardMode.EXTEND, sliding_window_size=self.sliding_window_size
+            self,
+            batch,
+            forward_mode=ForwardMode.EXTEND,
+            sliding_window_size=self.sliding_window_size,
         )
         return self.model.forward(
             batch.input_ids,

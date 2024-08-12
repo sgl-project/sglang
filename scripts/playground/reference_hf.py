@@ -35,6 +35,7 @@ def normal_text(args):
         args.model_path,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
+        device_map="auto",
         trust_remote_code=True,
     )
     m.cuda()

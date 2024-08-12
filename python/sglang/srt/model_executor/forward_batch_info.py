@@ -217,7 +217,11 @@ class InputMetadata:
             self.triton_max_extend_len = int(torch.max(extend_seq_lens))
 
     def init_flashinfer_handlers(
-        self, model_runner, prefix_lens, flashinfer_use_ragged, sliding_window_size=None,
+        self,
+        model_runner,
+        prefix_lens,
+        flashinfer_use_ragged,
+        sliding_window_size=None,
     ):
         update_flashinfer_indices(
             self.forward_mode,
@@ -322,29 +326,30 @@ def update_flashinfer_indices(
                 1,
             )
     else:
-        kv_indptr = [None, None]
-        kv_indices = [None, None]
         kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
         for wrapper_id in range(2):
             if flashinfer_use_ragged:
                 paged_kernel_lens = prefix_lens
             else:
                 paged_kernel_lens = seq_lens
-            
+
             if wrapper_id == 0 and forward_mode == ForwardMode.DECODE:
-                paged_kernel_lens = torch.minimum(paged_kernel_lens, torch.tensor(window_size))
+                paged_kernel_lens = torch.minimum(
+                    paged_kernel_lens, torch.tensor(sliding_window_size)
+                )
                 kv_start_idx = seq_lens - paged_kernel_lens
             else:
                 kv_start_idx = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
 
-            kv_indptr[wrapper_id] = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
-            kv_indptr[wrapper_id][1:] = torch.cumsum(paged_kernel_lens, dim=0)
+            kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
+            kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
             req_pool_indices_cpu = req_pool_indices.cpu().numpy()
             paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
-            kv_indices[wrapper_id] = torch.cat(
+            kv_indices = torch.cat(
                 [
                     model_runner.req_to_token_pool.req_to_token[
-                        req_pool_indices_cpu[i], kv_start_idx[i] : kv_start_idx[i] + paged_kernel_lens_cpu[i]
+                        req_pool_indices_cpu[i],
+                        kv_start_idx[i] : kv_start_idx[i] + paged_kernel_lens_cpu[i],
                     ]
                     for i in range(batch_size)
                 ],
@@ -358,8 +363,8 @@ def update_flashinfer_indices(
 
                 flashinfer_decode_wrapper[wrapper_id].end_forward()
                 flashinfer_decode_wrapper[wrapper_id].begin_forward(
-                    kv_indptr[wrapper_id],
-                    kv_indices[wrapper_id],
+                    kv_indptr,
+                    kv_indices,
                     kv_last_page_len,
                     num_qo_heads,
                     num_kv_heads,
@@ -368,12 +373,18 @@ def update_flashinfer_indices(
                 )
             else:
                 # extend part
-                qo_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
+                qo_indptr = torch.zeros(
+                    (batch_size + 1,), dtype=torch.int32, device="cuda"
+                )
                 qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
 
                 if flashinfer_use_ragged:
-                    model_runner.flashinfer_prefill_wrapper_ragged[wrapper_id].end_forward()
-                    model_runner.flashinfer_prefill_wrapper_ragged[wrapper_id].begin_forward(
+                    model_runner.flashinfer_prefill_wrapper_ragged[
+                        wrapper_id
+                    ].end_forward()
+                    model_runner.flashinfer_prefill_wrapper_ragged[
+                        wrapper_id
+                    ].begin_forward(
                         qo_indptr,
                         qo_indptr,
                         num_qo_heads,
@@ -385,12 +396,11 @@ def update_flashinfer_indices(
                 model_runner.flashinfer_prefill_wrapper_paged[wrapper_id].end_forward()
                 model_runner.flashinfer_prefill_wrapper_paged[wrapper_id].begin_forward(
                     qo_indptr,
-                    kv_indptr[wrapper_id],
-                    kv_indices[wrapper_id],
+                    kv_indptr,
+                    kv_indices,
                     kv_last_page_len,
                     num_qo_heads,
                     num_kv_heads,
                     head_dim,
                     1,
                 )
- 
