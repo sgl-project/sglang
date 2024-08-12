@@ -66,7 +66,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 performance
+            # A100 (PCIE) performance
             assert res["output_throughput"] >= 1400
 
     def test_default_without_radix_cache(self):
@@ -77,7 +77,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 performance
+            # A100 (PCIE) performance
             assert res["output_throughput"] >= 1450
 
     def test_default_without_flashinfer(self):
