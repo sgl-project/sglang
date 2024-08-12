@@ -10,13 +10,15 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEvalAccuracyMini(unittest.TestCase):
+class TestEvalAccuracyLarge(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300)
+        cls.process = popen_launch_server(
+            cls.model, cls.base_url, timeout=300, other_args=["-http-log-leval", "warn"]
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -27,8 +29,20 @@ class TestEvalAccuracyMini(unittest.TestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=20,
-            num_threads=20,
+            num_examples=None,
+            num_threads=2048,
+        )
+
+        metrics = run_eval(args)
+        assert metrics["score"] >= 0.7
+
+    def test_human_eval(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="humaneval",
+            num_examples=None,
+            num_threads=2048,
         )
 
         metrics = run_eval(args)
