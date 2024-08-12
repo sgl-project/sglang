@@ -12,7 +12,7 @@ class TestSRTEndpoint(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = "http://127.0.0.1:8157"
+        cls.base_url = "http://127.0.0.1:9157"
         cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300)
 
     @classmethod
