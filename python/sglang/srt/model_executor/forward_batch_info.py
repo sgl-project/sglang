@@ -186,8 +186,8 @@ class InputMetadata:
                 [len(r.prefix_indices) for r in batch.reqs], device="cuda"
             )
 
-        if model_runner.server_args.disable_flashinfer:
-            ret.init_triton_args(batch, prefix_lens)
+        # if model_runner.server_args.disable_flashinfer:
+        ret.init_triton_args(batch, prefix_lens)
 
         flashinfer_use_ragged = False
         if not model_runner.server_args.disable_flashinfer:
@@ -244,7 +244,7 @@ class InputMetadata:
 
 def update_flashinfer_indices(
     forward_mode,
-    model_runner,
+    model_runner: "ModelRunner",
     req_pool_indices,
     seq_lens,
     prefix_lens,

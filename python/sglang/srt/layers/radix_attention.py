@@ -135,7 +135,7 @@ class RadixAttention(nn.Module):
         )
 
         if input_metadata.extend_no_prefix:
-            o2 = o1
+            o3 = o1
         else:
             o2, s2 = (
                 input_metadata.flashinfer_prefill_wrapper_paged2.forward_return_lse(
@@ -146,14 +146,45 @@ class RadixAttention(nn.Module):
                     logits_soft_cap=self.logit_cap,
                 )
             )
+            o2_ = input_metadata.flashinfer_prefill_wrapper_paged2.forward(
+                q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+                input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
+                causal=False,
+                sm_scale=self.scaling,
+                logits_soft_cap=self.logit_cap,
+            )
 
-            o2, _ = merge_state(o1, s1, o2, s2)
+            o3, _ = merge_state(o1, s1, o2, s2)
 
         if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
             torch.cuda.synchronize()
 
+        if self.layer_id == 0:
+            m = torch.mean(torch.abs(o - o3))
+            if torch.isnan(m) or m > 1e-3:
+                print(f"\x1b[31m{input_metadata.seq_lens}\x1b[0m")
+                print(f"\x1b[31m{input_metadata.triton_prefix_lens}\x1b[0m")
+                print(f"\x1b[31m{m}\x1b[0m")
+                assert not input_metadata.extend_no_prefix
+                print(torch.any(torch.isnan(o2)))
+                print(torch.any(torch.isnan(s2)))
+                print(f"\x1b[33m{torch.mean(torch.abs(o2 - o2_))}\x1b[0m")
+
+                # req_pool_indices = input_metadata.req_pool_indices.tolist()
+                # for i in range(input_metadata.batch_size):
+                #     print(
+                #         input_metadata.req_to_token_pool.req_to_token[
+                #             req_pool_indices[i], : input_metadata.seq_lens[i]
+                #         ]
+                #     )
+
+            # else:
+            #     print(f"{input_metadata.seq_lens}")
+            #     print(f"{input_metadata.triton_prefix_lens}")
+            #     print(f"{m}")
+
         # return o.view(-1, self.tp_q_head_num * self.head_dim)
-        return o2.view(-1, self.tp_q_head_num * self.head_dim)
+        return o3.view(-1, self.tp_q_head_num * self.head_dim)
 
     def decode_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         self.store_kv_cache(k, v, input_metadata)
