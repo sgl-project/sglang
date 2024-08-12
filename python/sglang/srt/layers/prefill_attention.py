@@ -13,6 +13,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+"""
+Memory-efficient attention for prefill.
+It supporst page size = 1.
+"""
+
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
 import torch

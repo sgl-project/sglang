@@ -13,6 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+"""
+Memory-efficient attention for decoding.
+"""
+
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/token_attention_nopad_att1.py
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/token_attention_softmax_and_reducev.py
@@ -194,7 +198,7 @@ def _fwd_kernel_stage2(
     tl.store(out_ptrs, acc)
 
 
-def _token_att_m_fwd(
+def _decode_att_m_fwd(
     q,
     k_buffer,
     att_out,
@@ -254,7 +258,7 @@ def _token_att_m_fwd(
     )
 
 
-def _token_softmax_reducev_fwd(
+def _decode_softmax_reducev_fwd(
     logics,
     v_buffer,
     o,
@@ -292,7 +296,7 @@ def _token_softmax_reducev_fwd(
     )
 
 
-def token_attention_fwd(
+def decode_attention_fwd(
     q,
     k_buffer,
     v_buffer,
@@ -312,7 +316,7 @@ def token_attention_fwd(
             (q.shape[-2], total_num_tokens), dtype=REDUCE_TORCH_TYPE, device="cuda"
         )
 
-    _token_att_m_fwd(
+    _decode_att_m_fwd(
         q,
         k_buffer,
         att_m,
@@ -324,7 +328,7 @@ def token_attention_fwd(
         sm_scale,
         logit_cap,
     )
-    _token_softmax_reducev_fwd(
+    _decode_softmax_reducev_fwd(
         att_m,
         v_buffer,
         o,

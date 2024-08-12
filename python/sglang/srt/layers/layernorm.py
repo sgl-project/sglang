@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+"""Fused operators for normalization layers."""
+
 from typing import Optional, Tuple, Union
 
 import torch
