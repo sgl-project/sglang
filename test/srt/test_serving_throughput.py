@@ -65,7 +65,8 @@ class TestServingThroughput(unittest.TestCase):
             chunked_prefill_size=-1,
         )
 
-        if os.getenv("CI", "false") == "true":  # A100
+        if os.getenv("CI", "false") == "true":
+            # A100 performance
             assert res["output_token_throughput"] >= 1300
 
     def test_default_without_radix_cache(self):
@@ -75,7 +76,8 @@ class TestServingThroughput(unittest.TestCase):
             chunked_prefill_size=-1,
         )
 
-        if os.getenv("CI", "false") == "true":  # A100
+        if os.getenv("CI", "false") == "true":
+            # A100 performance
             assert res["output_token_throughput"] >= 1400
 
     def test_default_without_flashinfer(self):
