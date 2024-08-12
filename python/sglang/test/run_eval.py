@@ -16,6 +16,8 @@ from sglang.test.simple_eval_common import (
 
 
 def run_eval(args):
+    set_ulimit()
+
     if "OPENAI_API_KEY" not in os.environ:
         os.environ["OPENAI_API_KEY"] = "EMPTY"
 
@@ -117,7 +119,6 @@ if __name__ == "__main__":
     parser.add_argument("--eval-name", type=str, default="mmlu")
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
-    set_ulimit()
     args = parser.parse_args()
 
     run_eval(args)

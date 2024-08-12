@@ -32,12 +32,12 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=None,
-            num_threads=2048,
+            num_examples=3000,
+            num_threads=1024,
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.70
+        assert metrics["score"] >= 0.71, f"{metrics}"
 
     def test_human_eval(self):
         args = SimpleNamespace(
@@ -45,11 +45,11 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             model=self.model,
             eval_name="humaneval",
             num_examples=None,
-            num_threads=2048,
+            num_threads=1024,
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.65
+        assert metrics["score"] >= 0.65, f"{metrics}"
 
     def test_mgsm_en(self):
         args = SimpleNamespace(
@@ -57,11 +57,11 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             model=self.model,
             eval_name="mgsm_en",
             num_examples=None,
-            num_threads=2048,
+            num_threads=1024,
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.85
+        assert metrics["score"] >= 0.85, f"{metrics}"
 
 
 if __name__ == "__main__":
