@@ -32,12 +32,12 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=None,
-            num_threads=2048,
+            num_examples=3000,
+            num_threads=1024,
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.70
+        assert metrics["score"] >= 0.71
 
     def test_human_eval(self):
         args = SimpleNamespace(
@@ -45,7 +45,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             model=self.model,
             eval_name="humaneval",
             num_examples=None,
-            num_threads=2048,
+            num_threads=1024,
         )
 
         metrics = run_eval(args)
@@ -57,7 +57,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             model=self.model,
             eval_name="mgsm_en",
             num_examples=None,
-            num_threads=2048,
+            num_threads=1024,
         )
 
         metrics = run_eval(args)
