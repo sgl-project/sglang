@@ -20,8 +20,8 @@ from flashinfer.cascade import merge_state
 from torch import nn
 
 from sglang.global_config import global_config
+from sglang.srt.layers.decode_attention import decode_attention_fwd
 from sglang.srt.layers.extend_attention import extend_attention_fwd
-from sglang.srt.layers.token_attention import token_attention_fwd
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.model_executor.model_runner import global_server_args_dict
 
@@ -95,7 +95,7 @@ class RadixAttention(nn.Module):
             o = torch.empty_like(q)
         self.store_kv_cache(k, v, input_metadata)
 
-        token_attention_fwd(
+        decode_attention_fwd(
             q.view(-1, self.tp_q_head_num, self.qk_head_dim),
             input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id),
             input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id),
