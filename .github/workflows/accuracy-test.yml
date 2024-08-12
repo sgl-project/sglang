@@ -35,7 +35,7 @@ jobs:
         pip install -e "python[all]"
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
-        git clone git@github.com:merrymercy/human-eval.git
+        git clone https://github.com/merrymercy/human-eval.git
         cd human-eval
         pip install -e .
 
