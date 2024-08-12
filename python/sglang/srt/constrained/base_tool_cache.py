@@ -54,7 +54,7 @@ class BaseToolCache:
         return val
 
     def init_value(self, key):
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def get_cache_hit_rate(self):
         if self.metrics["total"] == 0:

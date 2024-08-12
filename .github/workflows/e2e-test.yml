@@ -45,8 +45,7 @@ jobs:
         cd test/srt
         python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_radix_cache
 
-    - name: Benchmark Serving Throughput (w/o FlashInfer)
+    - name: Benchmark Serving Throughput (w/ ChunkedPrefill)
       run: |
         cd test/srt
-        python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_flashinfer
-
+        python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_with_chunked_prefill

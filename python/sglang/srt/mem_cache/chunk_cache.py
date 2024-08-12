@@ -68,7 +68,7 @@ class ChunkCache(BasePrefixCache):
         req.last_node = entry
 
     def insert(self):
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def evict(self, num_tokens: int, evict_callback: Callable):
         pass
