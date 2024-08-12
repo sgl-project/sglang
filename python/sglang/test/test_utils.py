@@ -21,6 +21,7 @@ from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import get_exception_traceback
 
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+DEFAULT_URL_FOR_TEST = "http://127.0.0.1:8157"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
