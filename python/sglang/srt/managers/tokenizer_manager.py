@@ -195,8 +195,10 @@ class TokenizerManager:
                     if not_use_index
                     else obj.logprob_start_len[index]
                 )
-                if return_logprob and logprob_start_len == 0:
-                    logprob_start_len = len(input_ids)
+                if return_logprob and logprob_start_len == -1 and (not obj.echo):
+                    logprob_start_len = len(input_ids) - 1
+                elif logprob_start_len == -1:
+                    logprob_start_len = 0
                 top_logprobs_num = (
                     obj.top_logprobs_num
                     if not_use_index
@@ -244,8 +246,10 @@ class TokenizerManager:
             )
             return_logprob = obj.return_logprob[0]
             logprob_start_len = obj.logprob_start_len[0]
-            if return_logprob and logprob_start_len == 0:
-                logprob_start_len = len(input_ids)
+            if return_logprob and logprob_start_len == -1 and (not obj.echo):
+                logprob_start_len = len(input_ids) - 1
+            elif logprob_start_len == -1:
+                logprob_start_len = 0
             top_logprobs_num = obj.top_logprobs_num[0]
 
         if self.is_generation:
@@ -335,8 +339,14 @@ class TokenizerManager:
                     else:
                         input_text = None
                         input_ids = obj.input_ids[i]
-                if obj.return_logprob[index] and obj.logprob_start_len[index] == 0:
-                    obj.logprob_start_len[index] = len(input_ids)
+                if (
+                    obj.return_logprob[index]
+                    and obj.logprob_start_len[index] == -1
+                    and (not obj.echo)
+                ):
+                    obj.logprob_start_len[index] = len(input_ids) - 1
+                elif obj.logprob_start_len[index] == -1:
+                    obj.logprob_start_len[index] = 0
                 sampling_params = self._get_sampling_params(obj.sampling_params[index])
 
                 if self.is_generation:

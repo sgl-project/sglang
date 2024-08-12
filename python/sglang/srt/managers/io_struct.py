@@ -51,6 +51,8 @@ class GenerateReqInput:
     return_text_in_logprobs: bool = False
     # Whether to stream output.
     stream: bool = False
+    # Whether echo the input.
+    echo: bool = False
 
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (
@@ -143,7 +145,7 @@ class GenerateReqInput:
                 self.return_logprob = [self.return_logprob] * num
 
             if self.logprob_start_len is None:
-                self.logprob_start_len = [0] * num
+                self.logprob_start_len = [-1] * num
             elif not isinstance(self.logprob_start_len, list):
                 self.logprob_start_len = [self.logprob_start_len] * num
 
