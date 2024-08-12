@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.bench_serving import run_benchmark
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, popen_launch_server
 
@@ -60,9 +61,9 @@ class TestServingThroughput(unittest.TestCase):
 
     def test_default(self):
         res = self.run_test(
-            disable_radix_cache=False,
-            disable_flashinfer=False,
-            chunked_prefill_size=-1,
+            disable_radix_cache=ServerArgs.disable_radix_cache,
+            disable_flashinfer=ServerArgs.disable_flashinfer,
+            chunked_prefill_size=ServerArgs.chunked_prefill_size,
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
@@ -72,20 +73,24 @@ class TestServingThroughput(unittest.TestCase):
     def test_default_without_radix_cache(self):
         res = self.run_test(
             disable_radix_cache=True,
-            disable_flashinfer=False,
-            chunked_prefill_size=-1,
+            disable_flashinfer=ServerArgs.disable_flashinfer,
+            chunked_prefill_size=ServerArgs.chunked_prefill_size,
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
             # A100 (PCIE) performance
             assert res["output_throughput"] >= 1450
 
-    def test_default_without_flashinfer(self):
-        self.run_test(
-            disable_radix_cache=False,
-            disable_flashinfer=True,
-            chunked_prefill_size=-1,
+    def test_default_with_chunked_prefill(self):
+        res = self.run_test(
+            disable_radix_cache=ServerArgs.disable_radix_cache,
+            disable_flashinfer=ServerArgs.disable_flashinfer,
+            chunked_prefill_size=8192,
         )
+
+        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+            # A100 (PCIE) performance
+            assert res["output_throughput"] >= 1400
 
     def test_all_cases(self):
         for disable_radix_cache in [False, True]:
