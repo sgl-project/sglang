@@ -15,9 +15,12 @@ class TestEvalAccuracyLarge(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.base_url = "http://127.0.0.1:9157"
         cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=300, other_args=["-http-log-leval", "warn"]
+            cls.model,
+            cls.base_url,
+            timeout=300,
+            other_args=["--log-level-http", "warning"],
         )
 
     @classmethod
@@ -34,7 +37,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.7
+        assert metrics["score"] >= 0.70
 
     def test_human_eval(self):
         args = SimpleNamespace(
@@ -46,7 +49,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.5
+        assert metrics["score"] >= 0.65
 
 
 if __name__ == "__main__":

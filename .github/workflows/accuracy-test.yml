@@ -34,9 +34,17 @@ jobs:
         pip install --upgrade pip
         pip install -e "python[all]"
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
-        pip install git+https://github.com/merrymercy/human-eval.git
+
+        git clone git@github.com:merrymercy/human-eval.git
+        cd human-eval
+        pip install -e .
 
     - name: Evaluate MMLU
       run: |
         cd test/srt
         python3 -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
+
+    - name: Evaluate HumanEval
+      run: |
+        cd test/srt
+        python3 -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_human_eval
