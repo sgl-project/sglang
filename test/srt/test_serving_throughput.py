@@ -65,7 +65,7 @@ class TestServingThroughput(unittest.TestCase):
             chunked_prefill_size=-1,
         )
 
-        if os.getenv("CI", "false") == "true":
+        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
             # A100 performance
             assert res["output_token_throughput"] >= 1300
 
@@ -76,7 +76,7 @@ class TestServingThroughput(unittest.TestCase):
             chunked_prefill_size=-1,
         )
 
-        if os.getenv("CI", "false") == "true":
+        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
             # A100 performance
             assert res["output_token_throughput"] >= 1400
 
