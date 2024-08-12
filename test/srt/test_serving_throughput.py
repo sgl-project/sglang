@@ -62,6 +62,23 @@ class TestServingThroughput(unittest.TestCase):
             chunked_prefill_size=-1,
         )
 
+    def test_default_case_without_flashinfer(self):
+        self.run_test(
+            disable_radix_attention=False,
+            disable_flashinfer=True,
+            chunked_prefill_size=-1,
+        )
+
+    def test_all_cases(self):
+        for disable_radix_attention in [False, True]:
+            for disable_flashinfer in [False, True]:
+                for chunked_prefill_size in [-1, 2048]:
+                    self.run_test(
+                        disable_radix_attention=False,
+                        disable_flashinfer=False,
+                        chunked_prefill_size=-1,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -38,4 +38,9 @@ jobs:
     - name: Benchmark Serving Throughput
       run: |
         cd test/srt
-        python3 test_serving_throughput.py
+        python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_case
+
+    - name: Benchmark Serving Throughput
+      run: |
+        cd test/srt
+        python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_case_without_flashinfer
