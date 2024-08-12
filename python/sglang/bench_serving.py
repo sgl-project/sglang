@@ -39,6 +39,8 @@ from transformers import (
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
+global args
+
 
 @dataclass
 class RequestFuncInput:
@@ -749,7 +751,11 @@ def check_chat_template(model_path):
         return False
 
 
-def fire(args: argparse.Namespace):
+def run_benchmark(args_: argparse.Namespace):
+    global args
+    args = args_
+
+    set_ulimit()
     random.seed(args.seed)
     np.random.seed(args.seed)
 
@@ -853,7 +859,7 @@ def fire(args: argparse.Namespace):
                 )
             )
     else:
-        asyncio.run(
+        return asyncio.run(
             benchmark(
                 backend=backend,
                 api_url=api_url,
@@ -963,11 +969,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=0, help="Default is 0.")
     parser.add_argument(
-        "--disable-tqdm",
-        action="store_true",
-        help="Specify to disable tqdm progress bar.",
-    )
-    parser.add_argument(
         "--multi",
         action="store_true",
         help="Use request rate range rather than single value.",
@@ -979,6 +980,11 @@ if __name__ == "__main__":
         help="Range of request rates in the format start,stop,step. Default is 2,34,2. It also supports a list of request rates, requiring the parameters to not equal three.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
+    parser.add_argument(
+        "--disable-tqdm",
+        action="store_true",
+        help="Specify to disable tqdm progress bar.",
+    )
     parser.add_argument(
         "--disable-stream",
         action="store_true",
@@ -996,8 +1002,5 @@ if __name__ == "__main__":
         help="Append given JSON object to the request payload. You can use this to specify"
         "additional generate params like sampling params.",
     )
-
-    set_ulimit()
-
     args = parser.parse_args()
-    fire(args)
+    run_benchmark(args)
