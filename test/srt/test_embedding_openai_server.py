@@ -4,15 +4,14 @@ import openai
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_child_process
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, popen_launch_server
+from sglang.test.test_utils import DEFAULT_URL_FOR_UNIT_TEST, popen_launch_server
 
 
 class TestOpenAIServer(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = "intfloat/e5-mistral-7b-instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_UNIT_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model, cls.base_url, timeout=300, api_key=cls.api_key

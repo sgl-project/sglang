@@ -5,20 +5,19 @@ from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_URL_FOR_TEST,
+    DEFAULT_URL_FOR_UNIT_TEST,
     popen_launch_server,
 )
 
 
 class TestChunkedPrefill(unittest.TestCase):
-
     def run_mmlu(self, disable_radix_cache):
         other_args = ["--chunked-prefill-size", "32"]
         if disable_radix_cache:
             other_args += ["--disable-radix-cache"]
 
         model = DEFAULT_MODEL_NAME_FOR_TEST
-        base_url = DEFAULT_URL_FOR_TEST
+        base_url = DEFAULT_URL_FOR_UNIT_TEST
         process = popen_launch_server(
             model,
             base_url,
