@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e2e-test:
+  accuracy-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: accuracy
 
