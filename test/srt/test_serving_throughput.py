@@ -55,14 +55,21 @@ class TestServingThroughput(unittest.TestCase):
         finally:
             kill_child_process(process.pid)
 
-    def test_default_case(self):
+    def test_default(self):
         self.run_test(
             disable_radix_attention=False,
             disable_flashinfer=False,
             chunked_prefill_size=-1,
         )
 
-    def test_default_case_without_flashinfer(self):
+    def test_default_without_radix_attention(self):
+        self.run_test(
+            disable_radix_attention=True,
+            disable_flashinfer=True,
+            chunked_prefill_size=-1,
+        )
+
+    def test_default_without_flashinfer(self):
         self.run_test(
             disable_radix_attention=False,
             disable_flashinfer=True,
