@@ -298,6 +298,7 @@ class ModelRunner:
         if self.server_args.disable_flashinfer:
             self.flashinfer_prefill_wrapper_ragged = None
             self.flashinfer_prefill_wrapper_paged = None
+            self.flashinfer_prefill_wrapper_paged2 = None
             self.flashinfer_decode_wrapper = None
             return
 
@@ -310,13 +311,16 @@ class ModelRunner:
             use_tensor_cores = False
 
         self.flashinfer_workspace_buffers = torch.empty(
-            2, global_config.flashinfer_workspace_size, dtype=torch.uint8, device="cuda"
+            3, global_config.flashinfer_workspace_size, dtype=torch.uint8, device="cuda"
         )
         self.flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.flashinfer_workspace_buffers[0], "NHD"
         )
         self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
             self.flashinfer_workspace_buffers[1], "NHD"
+        )
+        self.flashinfer_prefill_wrapper_paged2 = BatchPrefillWithPagedKVCacheWrapper(
+            self.flashinfer_workspace_buffers[2], "NHD"
         )
         self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             self.flashinfer_workspace_buffers[0],

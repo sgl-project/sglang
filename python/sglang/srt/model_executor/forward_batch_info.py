@@ -216,7 +216,7 @@ class InputMetadata:
             self.triton_max_extend_len = int(torch.max(extend_seq_lens))
 
     def init_flashinfer_handlers(
-        self, model_runner, prefix_lens, flashinfer_use_ragged
+        self, model_runner: "ModelRunner", prefix_lens, flashinfer_use_ragged
     ):
         update_flashinfer_indices(
             self.forward_mode,
@@ -230,11 +230,13 @@ class InputMetadata:
         (
             self.flashinfer_prefill_wrapper_ragged,
             self.flashinfer_prefill_wrapper_paged,
+            self.flashinfer_prefill_wrapper_paged2,
             self.flashinfer_decode_wrapper,
             self.flashinfer_use_ragged,
         ) = (
             model_runner.flashinfer_prefill_wrapper_ragged,
             model_runner.flashinfer_prefill_wrapper_paged,
+            model_runner.flashinfer_prefill_wrapper_paged2,
             model_runner.flashinfer_decode_wrapper,
             flashinfer_use_ragged,
         )
@@ -255,10 +257,50 @@ def update_flashinfer_indices(
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
 
-    if flashinfer_use_ragged:
+    if forward_mode != ForwardMode.DECODE:
         paged_kernel_lens = prefix_lens
-    else:
-        paged_kernel_lens = seq_lens
+
+        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
+        kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+        req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+        paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
+        kv_indices = torch.cat(
+            [
+                model_runner.req_to_token_pool.req_to_token[
+                    req_pool_indices_cpu[i], : paged_kernel_lens_cpu[i]
+                ]
+                for i in range(batch_size)
+            ],
+            dim=0,
+        ).contiguous()
+        kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
+
+        qo_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
+        qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+
+        model_runner.flashinfer_prefill_wrapper_ragged.end_forward()
+        model_runner.flashinfer_prefill_wrapper_ragged.begin_forward(
+            qo_indptr,
+            qo_indptr,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+        )
+
+        # cached part
+        model_runner.flashinfer_prefill_wrapper_paged2.end_forward()
+        model_runner.flashinfer_prefill_wrapper_paged2.begin_forward(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            1,
+        )
+
+    paged_kernel_lens = seq_lens
 
     kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
     kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -294,16 +336,6 @@ def update_flashinfer_indices(
         # extend part
         qo_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
-
-        if flashinfer_use_ragged:
-            model_runner.flashinfer_prefill_wrapper_ragged.end_forward()
-            model_runner.flashinfer_prefill_wrapper_ragged.begin_forward(
-                qo_indptr,
-                qo_indptr,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-            )
 
         # cached part
         model_runner.flashinfer_prefill_wrapper_paged.end_forward()
