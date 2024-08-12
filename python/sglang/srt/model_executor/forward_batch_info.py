@@ -140,13 +140,13 @@ class InputMetadata:
         if self.forward_mode == ForwardMode.DECODE:
             self.extend_seq_lens = self.extend_start_loc = self.extend_no_prefix = None
         else:
-            prefix_lens_cpu = [
+            extend_lens_cpu = [
                 len(r.fill_ids) - len(r.prefix_indices) for r in batch.reqs
             ]
-            self.extend_seq_lens = torch.tensor(prefix_lens_cpu, device="cuda")
+            self.extend_seq_lens = torch.tensor(extend_lens_cpu, device="cuda")
             self.extend_start_loc = torch.zeros_like(self.seq_lens)
             self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
-            self.extend_no_prefix = all(x == 0 for x in prefix_lens_cpu)
+            self.extend_no_prefix = all(len(r.prefix_indices) == 0 for r in batch.reqs)
 
     @classmethod
     def from_schedule_batch(
