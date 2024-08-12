@@ -48,3 +48,8 @@ jobs:
       run: |
         cd test/srt
         python3 -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_human_eval
+
+    - name: Evaluate MGSM (English subset)
+      run: |
+        cd test/srt
+        python3 -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mgsm_en

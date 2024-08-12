@@ -39,6 +39,14 @@ def run_eval(args):
         eval_obj = MathEval(
             filename, equality_checker, args.num_examples, args.num_threads
         )
+    elif args.eval_name == "mgsm":
+        from sglang.test.simple_eval_mgsm import MGSMEval
+
+        eval_obj = MGSMEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "mgsm_en":
+        from sglang.test.simple_eval_mgsm import MGSMEval
+
+        eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
     elif args.eval_name == "gpqa":
         from sglang.test.simple_eval_gpqa import GPQAEval
 
