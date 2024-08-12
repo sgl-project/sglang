@@ -66,7 +66,7 @@ class TestServingThroughput(unittest.TestCase):
     def test_default_without_radix_cache(self):
         self.run_test(
             disable_radix_cache=True,
-            disable_flashinfer=True,
+            disable_flashinfer=False,
             chunked_prefill_size=-1,
         )
 
