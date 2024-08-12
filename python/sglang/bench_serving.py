@@ -859,7 +859,7 @@ def run_benchmark(args_: argparse.Namespace):
                 )
             )
     else:
-        asyncio.run(
+        return asyncio.run(
             benchmark(
                 backend=backend,
                 api_url=api_url,
