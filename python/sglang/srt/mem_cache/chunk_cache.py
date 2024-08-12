@@ -30,12 +30,13 @@ class ChunkCache(BasePrefixCache):
     def reset(self):
         self.entries = {}
 
-    def match_prefix(self, rid, **kwargs):
+    def match_prefix(self, rid, key):
         if rid not in self.entries:
             return [], None
 
         entry = self.entries[rid]
-        return entry.value, entry
+        max_prefix_len = len(key)
+        return entry.value[:max_prefix_len], entry
 
     def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         if token_ids is None:
