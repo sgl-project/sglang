@@ -410,13 +410,16 @@ class ModelTpServer:
 
         # Print stats
         if self.tp_rank == 0:
-            self.tree_cache_metrics["total"] += (
-                adder.log_input_tokens + adder.log_hit_tokens
-            ) / 10**9
-            self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10**9
-            tree_cache_hit_rate = (
-                self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
-            )
+            if isinstance(self.tree_cache, RadixCache):
+                self.tree_cache_metrics["total"] += (
+                    adder.log_input_tokens + adder.log_hit_tokens
+                ) / 10**9
+                self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10**9
+                tree_cache_hit_rate = (
+                    self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
+                )
+            else:
+                tree_cache_hit_rate = 0.0
             logger.info(
                 f"[gpu={self.gpu_id}] Prefill batch. "
                 f"#new-seq: {len(can_run_list)}, "
