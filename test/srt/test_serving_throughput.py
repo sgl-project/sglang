@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -55,20 +56,29 @@ class TestServingThroughput(unittest.TestCase):
             kill_child_process(process.pid)
 
         assert res["completed"] == num_prompts
+        return res
 
     def test_default(self):
-        self.run_test(
+        res = self.run_test(
             disable_radix_cache=False,
             disable_flashinfer=False,
             chunked_prefill_size=-1,
         )
 
+        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+            # A100 performance
+            assert res["output_throughput"] >= 1300
+
     def test_default_without_radix_cache(self):
-        self.run_test(
+        res = self.run_test(
             disable_radix_cache=True,
             disable_flashinfer=False,
             chunked_prefill_size=-1,
         )
+
+        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+            # A100 performance
+            assert res["output_throughput"] >= 1400
 
     def test_default_without_flashinfer(self):
         self.run_test(

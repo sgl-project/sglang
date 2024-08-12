@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestAccuracy(unittest.TestCase):
+class TestTorchCompile(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -29,12 +29,12 @@ class TestAccuracy(unittest.TestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=20,
-            num_threads=20,
+            num_examples=32,
+            num_threads=32,
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.5
+        assert metrics["score"] >= 0.6
 
 
 if __name__ == "__main__":

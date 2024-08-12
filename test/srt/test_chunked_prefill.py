@@ -10,34 +10,41 @@ from sglang.test.test_utils import (
 )
 
 
-class TestAccuracy(unittest.TestCase):
+class TestChunkedPrefill(unittest.TestCase):
 
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
+    def run_mmlu(self, disable_radix_cache):
+        other_args = ["--chunked-prefill-size", "32"]
+        if disable_radix_cache:
+            other_args += ["--disable-radix-cache"]
+
+        model = DEFAULT_MODEL_NAME_FOR_TEST
+        base_url = DEFAULT_URL_FOR_TEST
+        process = popen_launch_server(
+            model,
+            base_url,
             timeout=300,
-            other_args=["--chunked-prefill-size", "32"],
+            other_args=other_args,
         )
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
-
-    def test_mmlu(self):
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
+            base_url=base_url,
+            model=model,
             eval_name="mmlu",
-            num_examples=20,
-            num_threads=20,
+            num_examples=32,
+            num_threads=32,
         )
 
-        metrics = run_eval(args)
-        assert metrics["score"] >= 0.5
+        try:
+            metrics = run_eval(args)
+            assert metrics["score"] >= 0.6
+        finally:
+            kill_child_process(process.pid)
+
+    def test_chunked_prefill(self):
+        self.run_mmlu(disable_radix_cache=False)
+
+    def test_chunked_prefill_without_radix_cache(self):
+        self.run_mmlu(disable_radix_cache=True)
 
 
 if __name__ == "__main__":

@@ -64,8 +64,7 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-# TODO: Rename "CI" to "SGLANG_IS_IN_CI".
-crash_on_warning = os.getenv("CI", "false") == "true"
+crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
 
 
 class ModelTpServer:
