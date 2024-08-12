@@ -39,17 +39,7 @@ jobs:
         cd human-eval
         pip install -e .
 
-    - name: Evaluate MMLU
+    - name: Evaluate Accuracy
       run: |
         cd test/srt
-        python3 -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
-
-    - name: Evaluate HumanEval
-      run: |
-        cd test/srt
-        python3 -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_human_eval
-
-    - name: Evaluate MGSM (English subset)
-      run: |
-        cd test/srt
-        python3 -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mgsm_en
+        python3 test_eval_accuracy_large.py
