@@ -28,6 +28,12 @@ class MHATokenToKVPool:
     def get_kv_buffer(self, layer_id: int):
         return self.k_buffer[layer_id], self.v_buffer[layer_id]
 
+    def get_key_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id]
+
+    def get_value_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id]
+
 
 flashinfer_workspace_size = 192 * 1024 * 1024
 flashinfer_workspace_buffers = torch.empty(
@@ -123,6 +129,47 @@ def init_pagged(batch_size, seq_lens, prefix_lens):
     )
 
 
+def run_triton(
+    prefix_lens, seq_lens, q, k, v, num_qo_heads, head_dim, scaling, logit_cap
+):
+    """Init auxiliary variables for triton attention backend."""
+    triton_max_seq_len = int(torch.max(seq_lens))
+    triton_prefix_lens = prefix_lens
+    triton_start_loc = torch.zeros_like(seq_lens, dtype=torch.int32)
+    triton_start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+
+    extend_seq_lens = seq_lens - prefix_lens
+    extend_start_loc = torch.zeros_like(seq_lens)
+    extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+    triton_max_extend_len = int(torch.max(extend_seq_lens))
+
+    o = torch.empty_like(q)
+
+    from sglang.srt.layers.extend_attention import extend_attention_fwd
+
+    extend_attention_fwd(
+        q.view(-1, num_qo_heads, head_dim),
+        k.contiguous(),
+        v.contiguous(),
+        o.view(-1, num_qo_heads, head_dim),
+        token_to_kv_pool.get_key_buffer(0),
+        token_to_kv_pool.get_value_buffer(0),
+        req_to_token_pool,
+        req_pool_indices,
+        triton_start_loc,
+        seq_lens,
+        triton_prefix_lens,
+        extend_start_loc,
+        extend_seq_lens,
+        triton_max_seq_len,
+        triton_max_extend_len,
+        sm_scale=scaling,
+        logit_cap=logit_cap,
+    )
+
+    return o
+
+
 def main():
     # batch_size = 5
     # prefix_lens = torch.tensor([128, 156, 127, 176, 243], dtype=torch.int32, device="cuda")
@@ -204,6 +251,17 @@ def main():
         sm_scale=scaling,
         logits_soft_cap=logit_cap,
     )
+
+    o_triton = run_triton(
+        prefix_lens, seq_lens, q, k, v, num_qo_heads, head_dim, scaling, logit_cap
+    )
+
+    print("=" * 20, "Diff With Triton", "=" * 20)
+
+    print("Mean: ", torch.mean(torch.abs(o - o_triton)))
+    print("Max: ", torch.max(torch.abs(o - o_triton)))
+
+    print("=" * 20, "Diff With Ragged", "=" * 20)
 
     print("Mean: ", torch.mean(torch.abs(o - o3)))
     print("Max: ", torch.max(torch.abs(o - o3)))
