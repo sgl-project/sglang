@@ -294,6 +294,7 @@ class Batch:
     sp_size: int = None
     sp_rank: int = None
     prefill_extend_lens: np.ndarray = None
+    decode_local_lens: np.ndarray = None
 
     @classmethod
     def init_new(
@@ -636,8 +637,12 @@ class Batch:
             exit()
 
         if self.sp_size > 1:
+            # With SP, reqs are partitioned across SP workers so we need to use
+            # decode_local_lens instead of seq_lens when preparing KV cache.
+            decode_local_lens_cpu = self._get_decode_local_len(range(len(self.reqs)))
+            self.decode_local_lens = torch.from_numpy(decode_local_lens_cpu)
             local_req_indices = self.req_pool_indices[sp_local_indices]
-            local_lens_cpu = self._get_decode_local_len(sp_local_indices)
+            local_lens_cpu = decode_local_lens_cpu[sp_local_indices]
             self.req_to_token_pool.req_to_token[
                 local_req_indices, local_lens_cpu - 1
             ] = self.out_cache_loc
@@ -789,8 +794,8 @@ class Batch:
         # extend_lens % sp + 1, ...
         # For example, if sp = 4, extend lens = 6, the first decode remainder
         # token is at rank 3 (7 % 4)
-        decode_extra_tok_offset = (self.sp_rank - extend_lens) % sp_size
-        decode_extra_tok = decode_extra_tok_offset <= (decode_lens % sp_size)
+        decode_extra_tok_offset = (self.sp_rank - extend_lens - 1) % sp_size
+        decode_extra_tok = decode_extra_tok_offset < (decode_lens % sp_size)
         decode_size = decode_lens // sp_size + decode_extra_tok
         return extend_size + decode_size
 
@@ -856,6 +861,7 @@ class InputMetadata:
         top_logprobs_nums=None,
         return_logprob=False,
         skip_flashinfer_init=False,
+        decode_local_lens=None,
     ):
         batch_size = len(req_pool_indices)
 
@@ -982,6 +988,7 @@ class InputMetadata:
                 prefix_lens,
                 model_runner.flashinfer_decode_wrapper,
                 normal_to_sp_indices,
+                decode_local_lens,
             )
 
         if model_runner.server_args.disable_flashinfer:
@@ -1003,6 +1010,7 @@ def init_flashinfer_args(
     prefix_lens,
     flashinfer_decode_wrapper,
     normal_to_sp_indices,
+    decode_local_lens=None,
 ):
     """Init auxiliary variables for FlashInfer attention backend."""
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -1017,18 +1025,14 @@ def init_flashinfer_args(
     extend_lens = seq_lens - prefix_lens
 
     if forward_mode == ForwardMode.DECODE:
-        sp_rank = model_runner.sp_rank
-        sp_size = model_runner.sp_size
-        sp_seq_lens = torch.ceil(seq_lens / sp_size).to(torch.int32)
-        if sp_rank != sp_size - 1:
-            seq_lens = sp_seq_lens
-        else:
-            seq_lens = seq_lens - sp_rank * sp_seq_lens
-
-        seq_lens = seq_lens[normal_to_sp_indices]
+        # With SP, reqs may have been reordered so we track them here.
         req_ids = normal_to_sp_indices.tolist()
-        paged_kernel_lens = seq_lens
+        sp_size = model_runner.sp_size
+        paged_kernel_lens = seq_lens if sp_size == 1 else decode_local_lens
     else:
+        # With SP, we use different kernels for sequences that are not evenly partitioned
+        # across SP workers. Here seq_lens works for most SP workers that do not need
+        # masks, and we initiaize kernels with masks separately below.
         seq_lens = torch.ceil(seq_lens / model_runner.sp_size).to(torch.int32)
         prefix_lens = torch.ceil(prefix_lens / model_runner.sp_size).to(torch.int32)
 
@@ -1093,7 +1097,7 @@ def init_flashinfer_args(
 
     if (
         model_runner.sp_size > 1 and forward_mode != ForwardMode.DECODE
-    ):  # Sequence parallel enabled.
+    ):  # Sequence parallel enabled, initialize SP kernels with custom masks.
         # NOTE (yifan): here we assume that when sequence parallel is enabled,
         # prefix_lens are always 0s, and we will use flashinfer paged attn kernel
         # for cross-SP-shard attn computation. If later prefix_lens can be non-0s, (
