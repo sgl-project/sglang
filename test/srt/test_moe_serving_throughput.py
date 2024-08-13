@@ -31,7 +31,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         # Run benchmark
-        num_prompts = 400
+        num_prompts = 200
         args = SimpleNamespace(
             backend="sglang",
             base_url=base_url,

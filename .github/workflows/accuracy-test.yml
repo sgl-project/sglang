@@ -43,3 +43,4 @@ jobs:
       run: |
         cd test/srt
         python3 test_eval_accuracy_large.py
+      timeout-minutes: 20
