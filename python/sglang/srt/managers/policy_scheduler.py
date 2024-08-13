@@ -188,6 +188,9 @@ class PrefillAdder:
             self.rem_total_tokens += delta
 
     def add_one_req(self, req: Req):
+        if len(req.prefix_indices) == 0:
+            self.rem_chunk_tokens = min(1, self.rem_chunk_tokens)
+
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
         )
