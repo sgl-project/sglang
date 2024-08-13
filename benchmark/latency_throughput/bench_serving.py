@@ -133,6 +133,7 @@ async def send_request(
             "use_beam_search": use_beam_search,
             "temperature": 0.0 if use_beam_search else 1.0,
             "top_p": 1.0,
+            "min_p": 0,
             "max_tokens": output_len,
             "ignore_eos": True,
             "stream": False,

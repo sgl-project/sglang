@@ -51,6 +51,7 @@ async def test_concurrent(args):
                         "max_new_tokens": 1024,
                         "temperature": 0,
                         "top_p": 1.0,
+                        "min_p": 0,
                         "presence_penalty": 2,
                         "frequency_penalty": 2,
                         "stop": "<|eot_id|>",

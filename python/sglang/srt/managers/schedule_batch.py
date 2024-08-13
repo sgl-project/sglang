@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
-from flashinfer.sampling import top_k_top_p_sampling_from_probs
+from flashinfer.sampling import top_k_top_p_sampling_from_probs, min_p_sampling_from_probs
 
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.global_config import global_config
@@ -333,6 +333,7 @@ class ScheduleBatch:
     temperatures: torch.Tensor = None
     top_ps: torch.Tensor = None
     top_ks: torch.Tensor = None
+    min_ps: torch.Tensor = None
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
     logit_bias: torch.Tensor = None
 
@@ -396,6 +397,9 @@ class ScheduleBatch:
         )
         self.top_ks = torch.tensor(
             [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
+        )
+        self.min_ps = torch.tensor(
+            [r.sampling_params.min_p for r in reqs], dtype=torch.int, device=device
         )
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
@@ -678,6 +682,7 @@ class ScheduleBatch:
             "temperatures",
             "top_ps",
             "top_ks",
+            "min_ps",
             "logit_bias",
         ]:
             self_val = getattr(self, item, None)
@@ -706,6 +711,7 @@ class ScheduleBatch:
         for item in [
             "temperatures",
             "top_ps",
+            "min_ps",
             "top_ks",
         ]:
             self_val = getattr(self, item, None)
@@ -760,10 +766,16 @@ class ScheduleBatch:
             batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
                 probs, uniform_samples, self.top_ks, self.top_ps
             )
+            batch_next_token_ids, success = min_p_sampling_from_probs(
+                batch_next_token_ids, uniform_samples, self.min_ps, True
+            )
         else:
             # Here we provide a slower fallback implementation.
             batch_next_token_ids, success = top_k_top_p_sampling_from_probs_torch(
                 probs, self.top_ks, self.top_ps
+            )
+            batch_next_token_ids, success = min_p_sampling_from_probs_torch(
+                batch_next_token_ids, self.min_ps
             )
 
         if not torch.all(success):
@@ -786,6 +798,22 @@ class ScheduleBatch:
 
         return batch_next_token_ids
 
+def min_p_sampling_from_probs_torch(
+    logits: torch.Tensor,
+    min_ps: List[float],
+) -> torch.Tensor:
+    """
+    Adapted from
+    https://github.com/oobabooga/text-generation-webui/blob/3146124ec01f02c8fb1650a6517cf1b60b537aaf/modules/sampler_hijack.py#L16C17-L16C17
+    """
+    min_p = torch.tensor(min_ps, dtype=logits.dtype, device=logits.device)
+    probs = torch.softmax(logits, dim=-1)
+    top_probs, _ = probs.max(dim=-1, keepdim=True)
+    scaled_min_p = min_p.unsqueeze(dim=1) * top_probs
+    tokens_to_remove = probs < scaled_min_p
+    logits = logits.masked_fill(tokens_to_remove, -float("inf"))
+
+    return logits
 
 def top_k_top_p_sampling_from_probs_torch(
     probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor

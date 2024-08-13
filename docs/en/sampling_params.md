@@ -43,6 +43,8 @@ stop_token_ids: Optional[List[int]] = [],
 temperature: float = 1.0,
 # Top-p sampling
 top_p: float = 1.0,
+# Min-p sampling
+min_p: float = 0,
 # Top-k sampling
 top_k: int = -1,
 # Whether to ignore EOS token.
