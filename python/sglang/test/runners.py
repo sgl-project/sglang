@@ -174,6 +174,7 @@ class SRTRunner:
         tp_size=1,
         torch_dtype=torch.float16,
         is_generation_model=None,
+        port=5157,
     ):
         self.is_generation_model = (
             is_generation_model(model_path)
@@ -184,6 +185,7 @@ class SRTRunner:
             model_path=model_path,
             tp_size=tp_size,
             dtype=get_dtype_str(torch_dtype),
+            port=port,
         )
 
     def forward(
