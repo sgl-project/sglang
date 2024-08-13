@@ -455,7 +455,12 @@ class ModelTpServer:
         if self.mixed_style and self.running_batch is not None:
             self.running_batch.prepare_for_decode()
             batch.mix_with_running(self.running_batch)
+            running_bs = self.running_batch.batch_size()
             self.running_batch = None
+
+            logger.info(
+                f"[gpu={self.gpu_id}] mixed with decode. " f"#decode-req: {running_bs}"
+            )
 
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
