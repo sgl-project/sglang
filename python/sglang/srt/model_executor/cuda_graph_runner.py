@@ -120,12 +120,12 @@ class CudaGraphRunner:
         )
         if model_runner.sliding_window_size is None:
             self.flashinfer_workspace_buffer = (
-                self.model_runner.flashinfer_workspace_buffers[0]
+                self.model_runner.flashinfer_workspace_buffer
             )
         else:
-            self.flashinfer_workspace_buffers = [
-                self.model_runner.flashinfer_workspace_buffers[0],
-                self.model_runner.flashinfer_workspace_buffers[2],
+            self.flashinfer_workspace_buffer = [
+                self.model_runner.flashinfer_workspace_buffer
+                self.model_runner.flashinfer_workspace_buffer
             ]
             self.flashinfer_kv_indptr = [
                 self.flashinfer_kv_indptr,
@@ -200,7 +200,7 @@ class CudaGraphRunner:
             for i in range(2):
                 flashinfer_decode_wrapper.append(
                     BatchDecodeWithPagedKVCacheWrapper(
-                        self.flashinfer_workspace_buffers[i],
+                        self.flashinfer_workspace_buffer[i],
                         "NHD",
                         use_cuda_graph=True,
                         use_tensor_cores=use_tensor_cores,
