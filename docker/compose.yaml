@@ -9,6 +9,8 @@ services:
     # Or you can only publish port 30000
     # ports:
     #   - 30000:30000
+    environment:
+      HF_TOKEN: <secret>
     entrypoint: python3 -m sglang.launch_server
     command:
       --model-path meta-llama/Meta-Llama-3.1-8B-Instruct
@@ -18,6 +20,8 @@ services:
       memlock: -1
       stack: 67108864
     ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
     deploy:
       resources:
         reservations:
