@@ -1,0 +1,37 @@
+name: Cancel PR Workflow on Merge
+on:
+  pull_request:
+    types:
+      - closed
+
+jobs:
+  cancel:
+    if: github.event.pull_request.merged === true
+    runs-on: ubuntu-latest
+    steps:
+      - name: cancel
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: context.payload.pull_request.head.ref,
+              event: 'pull_request',
+              status: 'in_progress'
+            });
+
+            for (const run of runs) {
+              if (
+                run.pull_requests &&
+                run.pull_requests.some(pr => pr.number === context.payload.pull_request.number)
+              ) {
+                console.log(`Cancelling run ${run.id}`);
+                await github.rest.actions.cancelWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id
+                });
+              }
+            }
