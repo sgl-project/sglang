@@ -1,0 +1,76 @@
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia
+handler: nvidia
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meta-llama-31-8b-instruct-sglang
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: meta-llama-31-8b-instruct-sglang
+  template:
+    metadata:
+      labels:
+        app: meta-llama-31-8b-instruct-sglang
+        model: meta-llama-31-8b-instruct
+        engine: sglang
+    spec:
+      hostIPC: true
+      restartPolicy: Always
+      runtimeClassName: nvidia
+      containers:
+        - name: meta-llama-31-8b-instruct-sglang
+          image: docker.io/lmsysorg/sglang:latest
+          imagePullPolicy: Always  # IfNotPresent or Never
+          ports:
+            - containerPort: 30000
+          command: ["python3", "-m", "sglang.launch_server"]
+          args: ["--model-path", "meta-llama/Meta-Llama-3.1-8B-Instruct", "--host", "0.0.0.0", "--port", "30000"]
+          env:
+            - name: HF_TOKEN
+              value: <secret>
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+              readOnly: true
+            - name: localtime
+              mountPath: /etc/localtime
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 30000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: hf-cache
+          hostPath:
+            path: /root/.cache/huggingface
+            type: Directory
+        - name: localtime
+          hostPath:
+            path: /etc/localtime
+            type: File
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: meta-llama-31-8b-instruct-sglang
+spec:
+  selector:
+    app: meta-llama-31-8b-instruct-sglang
+  ports:
+    - protocol: TCP
+      port: 30000  # port on host
+      targetPort: 30000  # port in container
+  type: LoadBalancer
