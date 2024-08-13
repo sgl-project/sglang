@@ -55,8 +55,8 @@ class TestGenerationModels(unittest.TestCase):
             srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
 
             print("max_diff", torch.max(abs(hf_logprobs - srt_logprobs)))
-            tolerance = 3e-2
             if hf_logprobs.shape[0] <= 100:
+                tolerance = 3e-2
                 assert torch.all(
                     abs(hf_logprobs - srt_logprobs) < tolerance
                 ), f"prefill logprobs not all close"

@@ -443,11 +443,6 @@ class ServerArgs:
         )
 
     def check_server_args(self):
-        logging.basicConfig(
-            level=getattr(logging, self.log_level.upper()),
-            format="%(message)s",
-        )
-
         assert (
             self.tp_size % self.nnodes == 0
         ), "tp_size must be divisible by number of nodes"
