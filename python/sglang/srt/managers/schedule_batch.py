@@ -399,7 +399,7 @@ class ScheduleBatch:
             [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
         )
         self.min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.int, device=device
+            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
         )
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
@@ -717,7 +717,6 @@ class ScheduleBatch:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             setattr(self, item, torch.concat([self_val, other_val]))
-
         # logit_bias can be None
         if self.logit_bias is not None or other.logit_bias is not None:
             vocab_size = (
@@ -757,17 +756,16 @@ class ScheduleBatch:
         logits = self.penalizer_orchestrator.apply(logits)
 
         probs = torch.softmax(logits, dim=-1)
-
         if not global_server_args_dict["disable_flashinfer_sampling"]:
             max_top_k_round, batch_size = 32, probs.shape[0]
             uniform_samples = torch.rand(
                 (max_top_k_round, batch_size), device=probs.device
             )
-            batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
-                probs, uniform_samples, self.top_ks, self.top_ps
-            )
+            #batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
+            #    probs, uniform_samples, self.top_ks, self.top_ps
+            #)
             batch_next_token_ids, success = min_p_sampling_from_probs(
-                batch_next_token_ids, uniform_samples, self.min_ps, True
+                probs, uniform_samples, self.min_ps, False
             )
         else:
             # Here we provide a slower fallback implementation.
@@ -775,7 +773,7 @@ class ScheduleBatch:
                 probs, self.top_ks, self.top_ps
             )
             batch_next_token_ids, success = min_p_sampling_from_probs_torch(
-                batch_next_token_ids, self.min_ps
+                probs, self.min_ps
             )
 
         if not torch.all(success):
