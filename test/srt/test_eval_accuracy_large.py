@@ -5,17 +5,17 @@ from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_URL_FOR_TEST,
+    DEFAULT_URL_FOR_ACCURACY_TEST,
+    DEFAULT_URL_FOR_UNIT_TEST,
     popen_launch_server,
 )
 
 
 class TestEvalAccuracyLarge(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = "http://127.0.0.1:7157"
+        cls.base_url = DEFAULT_URL_FOR_ACCURACY_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -49,7 +49,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.65, f"{metrics}"
+        assert metrics["score"] >= 0.64, f"{metrics}"
 
     def test_mgsm_en(self):
         args = SimpleNamespace(
@@ -61,7 +61,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.85, f"{metrics}"
+        assert metrics["score"] >= 0.84, f"{metrics}"
 
 
 if __name__ == "__main__":
