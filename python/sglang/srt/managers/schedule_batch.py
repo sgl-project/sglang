@@ -18,9 +18,8 @@ limitations under the License.
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List, Optional, Union
 
-import numpy as np
 import torch
 from flashinfer.sampling import top_k_top_p_sampling_from_probs
 
@@ -28,9 +27,9 @@ import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -164,8 +163,12 @@ class Req:
     def finished(self) -> bool:
         return self.finished_reason is not None
 
-    def init_next_round_input(self):
+    def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         self.fill_ids = self.origin_input_ids + self.output_ids
+        if tree_cache is not None:
+            self.prefix_indices, self.last_node = tree_cache.match_prefix(
+                rid=self.rid, key=self.adjust_max_prefix_ids()
+            )
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -312,7 +315,7 @@ class ScheduleBatch:
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: BaseTokenToKVPool
-    tree_cache: RadixCache
+    tree_cache: BasePrefixCache
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
@@ -549,7 +552,7 @@ class ScheduleBatch:
                 residual_size = max(0, residual_size)
                 self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
 
-            req.prefix_indices = None
+            req.prefix_indices = []
             req.last_node = None
             req.extend_input_len = 0
 

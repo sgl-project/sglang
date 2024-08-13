@@ -13,11 +13,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+"""
+Memory-efficient attention for prefill.
+It supporst page size = 1 and prefill with KV cache (i.e. extend).
+"""
+
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
+from sglang.srt.layers.prefill_attention import context_attention_fwd
 
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
 

@@ -10,15 +10,13 @@ from sglang.test.test_utils import (
 )
 
 
-class TestTorchCompile(unittest.TestCase):
+class TestEvalAccuracyMini(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=300, other_args=["--enable-torch-compile"]
-        )
+        cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300)
 
     @classmethod
     def tearDownClass(cls):

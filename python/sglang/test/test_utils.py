@@ -21,6 +21,7 @@ from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import get_exception_traceback
 
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+DEFAULT_URL_FOR_TEST = "http://127.0.0.1:8157"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -398,6 +399,8 @@ def popen_launch_server(
     timeout: float,
     api_key: Optional[str] = None,
     other_args: tuple = (),
+    env: Optional[dict] = None,
+    return_stdout_stderr: bool = False,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -417,7 +420,16 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
-    process = subprocess.Popen(command, stdout=None, stderr=None)
+    if return_stdout_stderr:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+        )
+    else:
+        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     start_time = time.time()
     while time.time() - start_time < timeout:

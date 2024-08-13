@@ -5,7 +5,7 @@ import openai
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_child_process
-from sglang.test.test_utils import popen_launch_server
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, popen_launch_server
 
 
 class TestOpenAIVisionServer(unittest.TestCase):
@@ -13,7 +13,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "liuhaotian/llava-v1.6-vicuna-7b"
-        cls.base_url = "http://127.0.0.1:8157"
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model,

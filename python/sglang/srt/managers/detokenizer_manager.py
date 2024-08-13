@@ -32,7 +32,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.utils import find_printable_text, get_exception_traceback, graceful_registry
+from sglang.utils import find_printable_text, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -164,8 +164,6 @@ def start_detokenizer_process(
     port_args: PortArgs,
     pipe_writer,
 ):
-    graceful_registry(inspect.currentframe().f_code.co_name)
-
     try:
         manager = DetokenizerManager(server_args, port_args)
     except Exception:

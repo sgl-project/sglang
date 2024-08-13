@@ -16,7 +16,7 @@ limitations under the License.
 """Memory pool."""
 
 import logging
-from typing import List
+from typing import List, Union
 
 import torch
 
@@ -42,7 +42,7 @@ class ReqToTokenPool:
 
         return select_index
 
-    def free(self, free_index):
+    def free(self, free_index: Union[int, List[int]]):
         if isinstance(free_index, (int,)):
             self.free_slots.append(free_index)
         else:

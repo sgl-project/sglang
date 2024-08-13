@@ -384,7 +384,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.1.3",
+            "0.1.4",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -446,6 +446,15 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
             pipe_finish_writer.send(last_traceback)
         print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
         sys.exit(1)
+
+    # Print warnings here
+    if server_args.disable_radix_cache and server_args.chunked_prefill_size is not None:
+        logger.warning(
+            "You set both `--disable-radix-cache` and `--chunked-prefill-size`. "
+            "This combination is an experimental feature and we noticed it can lead to "
+            "wrong generation results. If you want to use chunked prefill, it is recommended "
+            "not using `--disable-radix-cache`."
+        )
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
