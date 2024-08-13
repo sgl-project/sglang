@@ -6,8 +6,12 @@ services:
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
     restart: always
     network_mode: host
+    # Or you can only publish port 30000
+    # ports:
+    #   - 30000:30000
+    entrypoint: python3 -m sglang.launch_server
     command:
-      --model-path meta-llama/Meta-Llama-3-8B-Instruct
+      --model-path meta-llama/Meta-Llama-3.1-8B-Instruct
       --host 0.0.0.0
       --port 30000
     ulimits:
@@ -21,4 +25,3 @@ services:
             - driver: nvidia
               device_ids: ['0']
               capabilities: [gpu]
-
