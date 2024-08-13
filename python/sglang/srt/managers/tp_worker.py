@@ -28,7 +28,7 @@ import torch.distributed
 import torch.distributed as dist
 
 from sglang.global_config import global_config
-from sglang.srt.constrained.fsm_cache import FSMCache
+from sglang.srt.constrained.fsm_cache import FSMCache, FSMJsonCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -198,6 +198,14 @@ class ModelTpServer:
                 },
                 skip_tokenizer_init=server_args.skip_tokenizer_init,
             )
+            self.json_fsm_cache = FSMJsonCache(
+                server_args.tokenizer_path,
+                {
+                    "tokenizer_mode": server_args.tokenizer_mode,
+                    "trust_remote_code": server_args.trust_remote_code,
+                },
+                skip_tokenizer_init=server_args.skip_tokenizer_init,
+            )
         self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
@@ -349,8 +357,15 @@ class ModelTpServer:
             req.top_logprobs_num = recv_req.top_logprobs_num
             req.stream = recv_req.stream
 
+            # Init regex fsm fron json
+            if req.sampling_params.json_schema is not None:
+                req.regex_fsm, computed_regex_string = self.json_fsm_cache.query(req.sampling_params.json_schema)
+                if not self.disable_regex_jump_forward:
+                    req.jump_forward_map = self.jump_forward_cache.query(
+                        computed_regex_string
+                    )
             # Init regex fsm
-            if req.sampling_params.regex is not None:
+            elif req.sampling_params.regex is not None:
                 req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)
                 if not self.disable_regex_jump_forward:
                     req.jump_forward_map = self.jump_forward_cache.query(

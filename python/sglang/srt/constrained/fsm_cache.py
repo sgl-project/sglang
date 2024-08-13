@@ -17,6 +17,7 @@ limitations under the License.
 
 from sglang.srt.constrained import RegexGuide, TransformerTokenizer
 from sglang.srt.constrained.base_tool_cache import BaseToolCache
+from outlines.fsm.json_schema import build_regex_from_schema
 
 
 class FSMCache(BaseToolCache):
@@ -74,3 +75,10 @@ class FSMCache(BaseToolCache):
 
     def init_value(self, regex):
         return RegexGuide(regex, self.outlines_tokenizer)
+
+
+class FSMJsonCache(FSMCache):
+    # Exactly the same as FSMCache, but the input is json_schema, and output also contains the regex.
+    def init_value(self, json_schema):
+        regex = build_regex_from_schema(json_schema)
+        return RegexGuide(regex, self.outlines_tokenizer), regex
