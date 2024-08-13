@@ -452,14 +452,16 @@ class ModelTpServer:
             self.model_config.vocab_size, self.int_token_logit_bias
         )
 
+        decoding_reqs = []
         if self.mixed_style and self.running_batch is not None:
             self.running_batch.prepare_for_decode()
             batch.mix_with_running(self.running_batch)
-            running_bs = self.running_batch.batch_size()
+            decoding_reqs = self.running_batch.reqs
             self.running_batch = None
 
             logger.info(
-                f"[gpu={self.gpu_id}] mixed with decode. " f"#decode-req: {running_bs}"
+                f"[gpu={self.gpu_id}] mixed with decode. "
+                f"#decode-req: {len(decoding_reqs)}"
             )
 
         if self.model_runner.is_generation:
@@ -501,7 +503,8 @@ class ModelTpServer:
 
                 if req.finished():
                     self.tree_cache.cache_finished_req(req)
-                else:
+                elif req not in decoding_reqs:
+                    # To reduce overhead, only cache prefill reqs
                     self.tree_cache.cache_unfinished_req(req)
 
                 if req is self.current_inflight_req:
