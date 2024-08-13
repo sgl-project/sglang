@@ -64,6 +64,7 @@ class MixtralMoE(nn.Module):
         tp_size: Optional[int] = None,
         prefix: str = "",
     ):
+        super().__init__()
         self.hidden_size = hidden_size
 
         # Gate always runs at half / full precision for now.
