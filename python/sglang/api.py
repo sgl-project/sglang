@@ -72,7 +72,7 @@ def gen(
     logprob_start_len: Optional[int] = None,
     top_logprobs_num: Optional[int] = None,
     return_text_in_logprobs: Optional[bool] = None,
-    dtype: Optional[type] = None,
+    dtype: Optional[Union[type, str]] = None,
     choices: Optional[List[str]] = None,
     choices_method: Optional[ChoicesSamplingMethod] = None,
     regex: Optional[str] = None,

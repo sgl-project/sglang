@@ -8,10 +8,10 @@ from typing import List, Optional, Union
 from sglang.global_config import global_config
 from sglang.lang.choices import ChoicesSamplingMethod
 
-REGEX_INT = r"[-+]?[0-9]+"
-REGEX_FLOAT = r"[-+]?[0-9]*\.?[0-9]+"
+REGEX_INT = r"[-+]?[0-9]+[ \n]*"
+REGEX_FLOAT = r"[-+]?[0-9]*\.?[0-9]+[ \n]*"
 REGEX_BOOL = r"(True|False)"
-REGEX_STRING = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
+REGEX_STR = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
 
 
 @dataclasses.dataclass
