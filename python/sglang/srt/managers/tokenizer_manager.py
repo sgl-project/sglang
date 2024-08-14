@@ -190,7 +190,7 @@ class TokenizerManager:
                     # single image (anyres): num_patch, 3, 336 or 384, 336 or 384
                     pixel_values, image_hash, image_size = [], [], []
                     if len(obj.image_data) > 1:
-                        aspect_ratio = "pad" # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
+                        aspect_ratio = "pad"  # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
                         for image_data in obj.image_data:
                             pixel_v, image_h, image_s = await self.get_pixel_values(
                                 image_data, aspect_ratio
@@ -212,11 +212,11 @@ class TokenizerManager:
                     )
                 else:
                     pixel_values, image_hash, image_size = None, None, None
-                    
+
             except Exception as e:
                 print(f"Error in get_pixel_values: {e}")
                 pixel_values, image_hash, image_size = None, None, None
-                
+
             tokenized_obj = TokenizedGenerateReqInput(
                 rid=rid,
                 input_text=obj.text,

@@ -148,7 +148,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--video-dir",
         type=str,
-        default="./videos/Q98Z4OTh8RwmDonc.mp4",
+        default="./assets/jobs.mp4",
         help="The directory or path for the processed video files.",
     )
     parser.add_argument(

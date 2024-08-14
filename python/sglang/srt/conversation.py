@@ -407,7 +407,7 @@ def generate_chat_conv(
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
-                            real_content += "\n" # for video
+                            real_content += "\n"  # for video
                         real_content += content.text
                     elif content.type == "image_url":
                         # NOTE: Only works for llava

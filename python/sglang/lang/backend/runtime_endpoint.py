@@ -21,7 +21,8 @@ class RuntimeEndpoint(BaseBackend):
         base_url: str,
         api_key: Optional[str] = None,
         verify: Optional[str] = None,
-        **kwargs
+        chat_template: Optional[str] = None,
+        **kwargs,
     ):
         super().__init__()
         self.support_concate_and_append = True
@@ -38,7 +39,7 @@ class RuntimeEndpoint(BaseBackend):
         self._assert_success(res)
         self.model_info = res.json()
 
-        self.chat_template = get_chat_template_by_model_path(
+        self.chat_template = chat_template or get_chat_template_by_model_path(
             self.model_info["model_path"]
         )
 

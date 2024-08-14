@@ -8,19 +8,24 @@ import argparse
 import json
 import os
 
-from transformers import AutoConfig, AutoTokenizer, AutoProcessor, LlavaConfig, AutoImageProcessor
+from transformers import (
+    AutoConfig,
+    AutoImageProcessor,
+    AutoProcessor,
+    AutoTokenizer,
+    LlavaConfig,
+)
+
 
 def add_image_token(model_path: str, hub_path: str):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    tokenizer.add_tokens(
-        ["<image>"],
-        special_tokens=True
-    )
+    tokenizer.add_tokens(["<image>"], special_tokens=True)
 
     print(tokenizer)
     # tokenizer.save_pretrained(model_path)
     tokenizer.push_to_hub(hub_path, private=True)
     return tokenizer.convert_tokens_to_ids("<image>")
+
 
 def edit_model_config(model_path, image_token_index, hub_path):
     config = LlavaConfig.from_pretrained(model_path)

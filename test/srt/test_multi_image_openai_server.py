@@ -1,7 +1,7 @@
 import openai
+
 client = openai.Client(api_key="EMPTY", base_url="http://127.0.0.1:30000/v1")
 import sys
-
 
 request_1 = client.chat.completions.create(
     model="default",
@@ -15,7 +15,10 @@ request_1 = client.chat.completions.create(
                         "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/mixtral_8x7b.jpg"
                     },
                 },
-                {"type": "text", "text": "Please describe this image. Please list the benchmarks and the models."},
+                {
+                    "type": "text",
+                    "text": "Please describe this image. Please list the benchmarks and the models.",
+                },
             ],
         },
     ],
@@ -37,7 +40,7 @@ print()  # Add a newline at the end of the stream
 
 # from decord import VideoReader, cpu
 # import numpy as np
-# video_path = "/mnt/bn/vl-research/workspace/boli01/projects/demos/sglang_codebase/assets/jobs.mp4"
+# video_path = "./assets/jobs.mp4"
 # max_frames_num = 32
 # vr = VideoReader(video_path, ctx=cpu(0))
 # total_frame_num = len(vr)

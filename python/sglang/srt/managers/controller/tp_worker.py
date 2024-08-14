@@ -273,7 +273,11 @@ class ModelTpServer:
         req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.pixel_values = recv_req.pixel_values
         if req.pixel_values is not None:
-            img_hash = sum(recv_req.image_hash) if type(recv_req.image_hash) is list else recv_req.image_hash
+            img_hash = (
+                hash(recv_req.image_hash)
+                if type(recv_req.image_hash) is list
+                else recv_req.image_hash
+            )
             req.pad_value = [
                 (img_hash) % self.model_config.vocab_size,
                 (img_hash >> 16) % self.model_config.vocab_size,
@@ -315,7 +319,9 @@ class ModelTpServer:
         self.forward_queue.append(req)
 
     def get_new_fill_batch(self) -> Optional[Batch]:
-        running_bs = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        running_bs = (
+            len(self.running_batch.reqs) if self.running_batch is not None else 0
+        )
         if running_bs >= self.max_running_requests:
             return
 
@@ -356,19 +362,15 @@ class ModelTpServer:
                     req.extend_input_len += delta
                     req.prefix_indices = req.prefix_indices[:-delta]
                     if req.image_offset is not None:
-                        if isinstance(req.image_offse, list):
-                            req.image_offset  = [x + delta for x in req.image_offset]
-                        else:
-                            req.image_offset += delta
+                        req.image_offset += delta
+
             if req.extend_input_len == 0 and req.max_new_tokens() > 0:
                 # Need at least one token to compute logits
                 req.extend_input_len = 1
                 req.prefix_indices = req.prefix_indices[:-1]
                 if req.image_offset is not None:
-                    if isinstance(req.image_offset, list):
-                        req.image_offset = [x + 1 for x in req.image_offset]
-                    else:
-                        req.image_offset += 1
+                    req.image_offset += 1
+
             if (
                 req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
                 < available_size
