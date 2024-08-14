@@ -311,11 +311,12 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             req.pixel_values = recv_req.pixel_values
             if req.pixel_values is not None:
+                img_hash = sum(recv_req.image_hash)
                 req.pad_value = [
-                    (recv_req.image_hash) % self.model_config.vocab_size,
-                    (recv_req.image_hash >> 16) % self.model_config.vocab_size,
-                    (recv_req.image_hash >> 32) % self.model_config.vocab_size,
-                    (recv_req.image_hash >> 64) % self.model_config.vocab_size,
+                    (img_hash) % self.model_config.vocab_size,
+                    (img_hash >> 16) % self.model_config.vocab_size,
+                    (img_hash >> 32) % self.model_config.vocab_size,
+                    (img_hash >> 64) % self.model_config.vocab_size,
                 ]
                 req.image_size = recv_req.image_size
                 (
