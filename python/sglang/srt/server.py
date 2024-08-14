@@ -512,7 +512,14 @@ class Runtime:
             )
 
         server_args_dict = dataclasses.asdict(self.server_args)
-        self.endpoint = RuntimeEndpoint(self.url, **server_args_dict)
+        chat_template = (
+            server_args_dict.pop("chat_template")
+            if "chat_template" in server_args_dict
+            else None
+        )
+        self.endpoint = RuntimeEndpoint(
+            self.url, chat_template=chat_template, **server_args_dict
+        )
 
     def shutdown(self):
         if self.pid is not None:

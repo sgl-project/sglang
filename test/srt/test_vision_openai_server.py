@@ -11,7 +11,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_UNIT_TEST, popen_launch_serve
 class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "liuhaotian/llava-v1.6-vicuna-7b"
+        cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
         cls.base_url = DEFAULT_URL_FOR_UNIT_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -21,9 +21,9 @@ class TestOpenAIVisionServer(unittest.TestCase):
             api_key=cls.api_key,
             other_args=[
                 "--chat-template",
-                "vicuna_v1.1",
+                "chatml-llava",
                 "--tokenizer-path",
-                "llava-hf/llava-1.5-7b-hf",
+                "lmms-lab/llavanext-qwen-siglip-tokenizer",
                 "--log-requests",
             ],
         )
