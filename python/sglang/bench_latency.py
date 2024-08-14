@@ -221,6 +221,7 @@ def correctness_test(
 
     # Prepare inputs
     input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
+    rank_print(f"{input_ids=}")
 
     if bench_args.cut_len > 0:
         # Prefill
