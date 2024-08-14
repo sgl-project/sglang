@@ -195,7 +195,7 @@ def extend(reqs, model_runner):
         token_to_kv_pool=model_runner.token_to_kv_pool,
         tree_cache=None,
     )
-    batch.prepare_for_extend(model_runner.model_config.vocab_size, None)
+    batch.prepare_for_extend(model_runner.model_config.vocab_size)
     output = model_runner.forward(batch, ForwardMode.EXTEND)
     next_token_ids = batch.sample(output.next_token_logits)
     return next_token_ids, output.next_token_logits, batch

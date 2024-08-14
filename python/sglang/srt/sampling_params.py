@@ -36,7 +36,6 @@ class SamplingParams:
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
-        dtype: Optional[str] = None,
         regex: Optional[str] = None,
         n: int = 1,
     ) -> None:
@@ -53,7 +52,6 @@ class SamplingParams:
         self.ignore_eos = ignore_eos
         self.skip_special_tokens = skip_special_tokens
         self.spaces_between_special_tokens = spaces_between_special_tokens
-        self.dtype = dtype
         self.regex = regex
         self.n = n
 
@@ -63,8 +61,6 @@ class SamplingParams:
             self.top_k = 1
         if self.top_k == -1:
             self.top_k = 1 << 30  # whole vocabulary
-        if self.dtype == "int":
-            self.stop_strs = [" ", "\n"]
 
     def verify(self):
         if self.temperature < 0.0:
