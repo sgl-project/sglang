@@ -16,14 +16,18 @@ limitations under the License.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/mixtral.py#L1
 """Inference-only Grok1 model."""
-from typing import Iterable, Optional, Tuple
+import warnings
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -35,6 +39,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.fused_moe import FusedMoE
@@ -293,6 +298,10 @@ class Grok1ModelForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
 
+        # Monkey patch _prepare_weights to load pre-sharded weights
+        setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
+        warnings.filterwarnings("ignore", category=FutureWarning)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -354,6 +363,7 @@ class Grok1ModelForCausalLM(nn.Module):
                         weight_name,
                         shard_id=shard_id,
                         expert_id=expert_id,
+                        pre_sharded=get_tensor_model_parallel_world_size() > 1,
                     )
                     break
                 else:
@@ -368,6 +378,31 @@ class Grok1ModelForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+
+old_prepare_weights = getattr(DefaultModelLoader, "_prepare_weights")
+
+
+def _prepare_presharded_weights(
+    self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+) -> Tuple[str, List[str], bool]:
+    import glob
+    import os
+
+    if get_tensor_model_parallel_world_size() == 1:
+        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
+
+    tp_rank = get_tensor_model_parallel_rank()
+    allow_patterns = [f"*-{tp_rank:03d}.bin"]
+
+    hf_folder = model_name_or_path
+
+    hf_weights_files: List[str] = []
+    for pattern in allow_patterns:
+        hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+    use_safetensors = False
+
+    return hf_folder, hf_weights_files, use_safetensors
 
 
 EntryClass = Grok1ModelForCausalLM
