@@ -6,11 +6,13 @@ on:
     paths:
       - "python/sglang/**"
       - "test/**"
+      - ".github/workflows/moe-test.yml"
   pull_request:
     branches: [ main ]
     paths:
       - "python/sglang/**"
       - "test/**"
+      - ".github/workflows/moe-test.yml"
   workflow_dispatch:
 
 concurrency:
@@ -36,7 +38,12 @@ jobs:
                 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
             - name: Benchmark MOE Serving Throughput
-              run: |
-                cd test/srt
-                python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default
-                python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default_without_radix_cache
+              uses: nick-fields/retry@v3
+              with:
+                timeout_minutes: 15
+                max_attempts: 2
+                retry_on: error
+                command: |
+                  cd test/srt
+                  python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default
+                  python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default_without_radix_cache
