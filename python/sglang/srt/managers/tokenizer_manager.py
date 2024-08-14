@@ -507,7 +507,7 @@ class TokenizerManager:
             if obj.is_single:
                 self.abort_request(obj.rid)
             else:
-                for rid in obj.rids:
+                for rid in obj.rid:
                     self.abort_request(rid)
 
         background_tasks = BackgroundTasks()

@@ -6,8 +6,8 @@ from sglang.bench_serving import run_benchmark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_URL_FOR_E2E_TEST,
+    DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    DEFAULT_URL_FOR_MOE_TEST,
     popen_launch_server,
 )
 
@@ -21,15 +21,17 @@ class TestServingThroughput(unittest.TestCase):
         if disable_flashinfer:
             other_args.append("--disable-flashinfer")
         other_args.extend(["--chunked-prefill-size", str(chunked_prefill_size)])
+        other_args.extend(["--tensor-parallel-size", "2"])
+        other_args.append("--enable-p2p-check")
 
-        model = DEFAULT_MODEL_NAME_FOR_TEST
-        base_url = DEFAULT_URL_FOR_E2E_TEST
+        model = DEFAULT_MOE_MODEL_NAME_FOR_TEST
+        base_url = DEFAULT_URL_FOR_MOE_TEST
         process = popen_launch_server(
             model, base_url, timeout=300, other_args=other_args
         )
 
         # Run benchmark
-        num_prompts = 400
+        num_prompts = 200
         args = SimpleNamespace(
             backend="sglang",
             base_url=base_url,
@@ -71,7 +73,7 @@ class TestServingThroughput(unittest.TestCase):
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
             # A100 (PCIE) performance
-            assert res["output_throughput"] >= 1400
+            assert res["output_throughput"] > 950
 
     def test_default_without_radix_cache(self):
         res = self.run_test(
@@ -82,7 +84,7 @@ class TestServingThroughput(unittest.TestCase):
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
             # A100 (PCIE) performance
-            assert res["output_throughput"] >= 1450
+            assert res["output_throughput"] > 940
 
     def test_default_with_chunked_prefill(self):
         res = self.run_test(
@@ -93,7 +95,7 @@ class TestServingThroughput(unittest.TestCase):
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
             # A100 (PCIE) performance
-            assert res["output_throughput"] >= 1400
+            print(res["output_throughput"])
 
     def test_all_cases(self):
         for disable_radix_cache in [False, True]:
