@@ -86,9 +86,11 @@ class InputMetadata:
         reqs = batch.reqs
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
+        # Req.image_offset has type List[int],
+        # can not support operand - with int
         self.image_offsets = [
             (
-                (r.image_offset - len(r.prefix_indices))
+                [(image_offset - len(r.prefix_indices)) for image_offset in r.image_offset]
                 if r.image_offset is not None
                 else 0
             )
