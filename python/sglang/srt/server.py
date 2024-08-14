@@ -556,7 +556,7 @@ class Runtime:
                         if chunk == "data: [DONE]\n\n":
                             break
                         data = json.loads(chunk[5:].strip("\n"))
-                        if hasattr(data, 'text'):
+                        if hasattr(data, "text"):
                             cur = data["text"][pos:]
                             if cur:
                                 yield cur
