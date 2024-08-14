@@ -35,7 +35,6 @@ import torch
 import torch.distributed as dist
 from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
-from starlette.middleware.base import BaseHTTPMiddleware
 from torch.nn.parameter import Parameter
 from triton.runtime.cache import (
     FileCacheManager,
@@ -644,7 +643,7 @@ def set_ulimit(target_soft_limit=65535):
             logger.warn(f"Fail to set RLIMIT_NOFILE: {e}")
 
 
-def is_llama3_405b_fp8(model_config):
+def is_llama3_405b_fp8_head_16(model_config):
     """Return whether the model is meta-llama/Meta-Llama-3.1-405B-FP8 with 16 kv heads."""
     if (
         model_config.hf_config.architectures[0] == "LlamaForCausalLM"
