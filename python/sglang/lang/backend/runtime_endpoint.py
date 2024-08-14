@@ -7,12 +7,17 @@ from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.lang.choices import ChoicesDecision, ChoicesSamplingMethod
 from sglang.lang.interpreter import StreamExecutor
-from sglang.lang.ir import SglSamplingParams
+from sglang.lang.ir import (
+    REGEX_BOOL,
+    REGEX_FLOAT,
+    REGEX_INT,
+    REGEX_STR,
+    SglSamplingParams,
+)
 from sglang.utils import http_request
 
 
 class RuntimeEndpoint(BaseBackend):
-
     def __init__(
         self,
         base_url: str,
@@ -101,21 +106,17 @@ class RuntimeEndpoint(BaseBackend):
 
         dtype_regex = None
         if sampling_params.dtype in ["int", int]:
-            from sglang.lang.ir import REGEX_INT
 
             dtype_regex = REGEX_INT
             sampling_params.stop.extend([" ", "\n"])
         elif sampling_params.dtype in ["float", float]:
-            from sglang.lang.ir import REGEX_FLOAT
 
             dtype_regex = REGEX_FLOAT
             sampling_params.stop.extend([" ", "\n"])
         elif sampling_params.dtype in ["str", str]:
-            from sglang.lang.ir import REGEX_STR
 
             dtype_regex = REGEX_STR
         elif sampling_params.dtype in ["bool", bool]:
-            from sglang.lang.ir import REGEX_BOOL
 
             dtype_regex = REGEX_BOOL
         else:
