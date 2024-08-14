@@ -90,7 +90,6 @@ class LlavaLlamaForCausalLM(nn.Module):
                 h = num_patch_height * height
                 w = num_patch_width * width
                 new_h, new_w = unpad_image_shape(h, w, image_s)
-                print(new_h, new_w, image_s)
 
                 if "anyres_max" in self.config.image_aspect_ratio:
                     matched_anyres_max_num_patches = re.match(
