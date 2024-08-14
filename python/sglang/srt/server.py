@@ -547,8 +547,6 @@ class Runtime:
             }
         pos = 0
 
-        print(json_data)
-        print(self.generate_url)
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.post(self.generate_url, json=json_data) as response:
