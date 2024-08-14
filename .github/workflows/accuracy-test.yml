@@ -6,11 +6,13 @@ on:
     paths:
       - "python/sglang/**"
       - "test/**"
+      - ".github/workflows/accuracy-test.yml"
   pull_request:
     branches: [ main ]
     paths:
       - "python/sglang/**"
       - "test/**"
+      - ".github/workflows/accuracy-test.yml"
   workflow_dispatch:
 
 concurrency:
@@ -43,4 +45,4 @@ jobs:
       run: |
         cd test/srt
         python3 test_eval_accuracy_large.py
-      timeout-minutes: 20
+      timeout-minutes: 10
