@@ -344,7 +344,6 @@ def match_chat_ml(model_path: str):
         or "llava-next-video-34b" in model_path
         or "llava-onevision-qwen2" in model_path
     ):
-        print("######################## Matched chatml-llava ########################")
         return get_chat_template("chatml-llava")
 
 

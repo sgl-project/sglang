@@ -464,17 +464,6 @@ register_conv_template(
     )
 )
 
-# conv_qwen = Conversation(
-#     system="""<|im_start|>system
-# You are a helpful assistant.""",
-#     roles=("<|im_start|>user", "<|im_start|>assistant"),
-#     version="qwen",
-#     messages=[],
-#     offset=0,
-#     sep_style=SeparatorStyle.CHATML,
-#     sep="<|im_end|>",
-# )
-
 register_conv_template(
     Conversation(
         name="vicuna_v1.1",
