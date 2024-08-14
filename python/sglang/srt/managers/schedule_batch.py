@@ -385,7 +385,7 @@ class ScheduleBatch:
 
         return out_cache_loc
 
-    def batch_sampling_params(self, vocab_size, int_token_logit_bias):
+    def batch_sampling_params(self, vocab_size):
         device = "cuda"
         bs, reqs = self.batch_size(), self.reqs
         self.temperatures = torch.tensor(
@@ -421,15 +421,8 @@ class ScheduleBatch:
 
         # Handle logit bias but only allocate when needed
         self.logit_bias = None
-        for i in range(bs):
-            if reqs[i].sampling_params.dtype == "int":
-                if self.logit_bias is None:
-                    self.logit_bias = torch.zeros(
-                        (bs, vocab_size), dtype=torch.float32, device=device
-                    )
-                self.logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
 
-    def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+    def prepare_for_extend(self, vocab_size: int):
         bs = self.batch_size()
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -468,7 +461,7 @@ class ScheduleBatch:
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
 
-        self.batch_sampling_params(vocab_size, int_token_logit_bias)
+        self.batch_sampling_params(vocab_size)
 
     def check_decode_mem(self):
         bs = self.batch_size()

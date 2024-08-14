@@ -6,13 +6,11 @@ on:
     paths:
       - "python/sglang/**"
       - "test/**"
-      - ".github/workflows/accuracy-test.yml"
   pull_request:
     branches: [ main ]
     paths:
       - "python/sglang/**"
       - "test/**"
-      - ".github/workflows/accuracy-test.yml"
   workflow_dispatch:
 
 concurrency:
