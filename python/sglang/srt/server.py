@@ -533,11 +533,18 @@ class Runtime:
         prompt: str,
         sampling_params: Optional[Dict] = None,
     ):
-        json_data = {
-            "text": prompt,
-            "sampling_params": sampling_params,
-            "stream": True,
-        }
+        if self.server_args.skip_tokenizer_init:
+            json_data = {
+                "input_ids": prompt,
+                "sampling_params": sampling_params,
+                "stream": True,
+            }
+        else:
+            json_data = {
+                "text": prompt,
+                "sampling_params": sampling_params,
+                "stream": True,
+            }
         pos = 0
 
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
@@ -549,10 +556,13 @@ class Runtime:
                         if chunk == "data: [DONE]\n\n":
                             break
                         data = json.loads(chunk[5:].strip("\n"))
-                        cur = data["text"][pos:]
-                        if cur:
-                            yield cur
-                        pos += len(cur)
+                        if hasattr(data, "text"):
+                            cur = data["text"][pos:]
+                            if cur:
+                                yield cur
+                            pos += len(cur)
+                        else:
+                            yield data
 
     add_request = async_generate
 
