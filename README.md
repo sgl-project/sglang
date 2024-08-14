@@ -76,8 +76,16 @@ docker run --gpus all \
     --env "HF_TOKEN=<secret>" \
     --ipc=host \
     lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --host 0.0.0.0 --port 30000
+    python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 ```
+
+### Method 4: Using docker compose
+
+> This method is recommended if you plan to serve it as a service.
+> A better approach is to use the [k8s-sglang-service.yaml](./docker/k8s-sglang-service.yaml).
+
+1. Copy the [compose.yml](./docker/compose.yaml) to your local machine
+2. Execute the command `docker compose up -d` in your terminal.
 
 ### Common Notes
 - If you cannot install FlashInfer, check out its [installation](https://docs.flashinfer.ai/installation.html#) page. If you still cannot install it, you can use the slower Triton kernels by adding `--disable-flashinfer` when launching the server.

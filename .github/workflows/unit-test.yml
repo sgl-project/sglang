@@ -6,11 +6,13 @@ on:
     paths:
       - "python/sglang/**"
       - "test/**"
+      - ".github/workflows/unit-test.yml"
   pull_request:
     branches: [ main ]
     paths:
       - "python/sglang/**"
       - "test/**"
+      - ".github/workflows/unit-test.yml"
   workflow_dispatch:
 
 concurrency:
@@ -41,8 +43,10 @@ jobs:
       run: |
         cd test/srt
         python3 run_suite.py --suite minimal
+      timeout-minutes: 15
 
     - name: Test Frontend Language
       run: |
         cd test/lang
         python3 run_suite.py --suite minimal
+      timeout-minutes: 10

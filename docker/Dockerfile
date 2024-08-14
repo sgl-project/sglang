@@ -1,5 +1,5 @@
 ARG CUDA_VERSION=12.1.1
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu20.04
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04
 ARG BUILD_TYPE=all
 ENV DEBIAN_FRONTEND=noninteractive
 

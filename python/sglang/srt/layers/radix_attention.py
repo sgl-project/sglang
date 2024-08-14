@@ -34,6 +34,7 @@ class RadixAttention(nn.Module):
         scaling: float,
         num_kv_heads: int,
         layer_id: int,
+        sliding_window_size: int = -1,
         logit_cap: int = -1,
         v_head_dim: int = -1,
     ):
@@ -46,6 +47,7 @@ class RadixAttention(nn.Module):
         self.v_head_dim = v_head_dim if v_head_dim != -1 else head_dim
         self.scaling = scaling
         self.layer_id = layer_id
+        self.sliding_window_size = sliding_window_size
 
         if (
             not global_server_args_dict.get("disable_flashinfer", False)
@@ -113,39 +115,51 @@ class RadixAttention(nn.Module):
         return o
 
     def extend_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
+        # using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+        prefill_wrapper_ragged = input_metadata.flashinfer_prefill_wrapper_ragged
+        prefill_wrapper_paged = input_metadata.flashinfer_prefill_wrapper_paged
+        if self.sliding_window_size != -1:
+            prefill_wrapper_ragged = prefill_wrapper_ragged[0]
+            prefill_wrapper_paged = prefill_wrapper_paged[0]
+        else:
+            if isinstance(prefill_wrapper_ragged, list):
+                prefill_wrapper_ragged = prefill_wrapper_ragged[1]
+            if isinstance(prefill_wrapper_paged, list):
+                prefill_wrapper_paged = prefill_wrapper_paged[1]
+
         if not input_metadata.flashinfer_use_ragged:
             self.store_kv_cache(k, v, input_metadata)
 
-            o = input_metadata.flashinfer_prefill_wrapper_paged.forward(
+            o = prefill_wrapper_paged.forward(
                 q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
                 input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
                 causal=True,
                 sm_scale=self.scaling,
+                window_left=self.sliding_window_size,
                 logits_soft_cap=self.logit_cap,
             )
         else:
-            o1, s1 = (
-                input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
-                    q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-                    k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
-                    v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
-                    causal=True,
-                    sm_scale=self.scaling,
-                    logits_soft_cap=self.logit_cap,
-                )
+            o1, s1 = prefill_wrapper_ragged.forward_return_lse(
+                q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+                k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
+                v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
+                causal=True,
+                sm_scale=self.scaling,
+                window_left=self.sliding_window_size,
+                logits_soft_cap=self.logit_cap,
             )
 
             if input_metadata.extend_no_prefix:
                 o = o1
             else:
-                o2, s2 = (
-                    input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
-                        q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-                        input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
-                        causal=False,
-                        sm_scale=self.scaling,
-                        logits_soft_cap=self.logit_cap,
-                    )
+                # TODO window attention + radix attention will come up in next PR
+                assert self.sliding_window_size == -1
+                o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                    q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+                    input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
+                    causal=False,
+                    sm_scale=self.scaling,
+                    logits_soft_cap=self.logit_cap,
                 )
 
                 o, _ = merge_state(o1, s1, o2, s2)
@@ -158,9 +172,16 @@ class RadixAttention(nn.Module):
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
     def decode_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
+        decode_wrapper = input_metadata.flashinfer_decode_wrapper
+        if self.sliding_window_size != -1:
+            decode_wrapper = decode_wrapper[0]
+        else:
+            if isinstance(decode_wrapper, list):
+                decode_wrapper = decode_wrapper[1]
+
         self.store_kv_cache(k, v, input_metadata)
 
-        o = input_metadata.flashinfer_decode_wrapper.forward(
+        o = decode_wrapper.forward(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
             input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
             sm_scale=self.scaling,
