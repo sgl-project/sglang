@@ -20,7 +20,7 @@ concurrency:
 jobs:
   unit-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: self-hosted
+    runs-on: unit
 
     steps:
     - name: Checkout code
@@ -37,12 +37,12 @@ jobs:
         pip install accelerate
         pip install sentence_transformers
 
-    - name: Test Frontend Language
-      run: |
-        cd test/lang
-        python3 run_suite.py --suite minimal
-
     - name: Test Backend Runtime
       run: |
         cd test/srt
+        python3 run_suite.py --suite minimal
+
+    - name: Test Frontend Language
+      run: |
+        cd test/lang
         python3 run_suite.py --suite minimal

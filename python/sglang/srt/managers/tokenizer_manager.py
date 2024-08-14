@@ -95,25 +95,28 @@ class TokenizerManager:
         else:
             self.context_len = get_context_length(self.hf_config)
 
-        if is_multimodal_model(self.model_path):
-            self.processor = get_processor(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-            )
-            self.tokenizer = self.processor.tokenizer
-            os.environ["TOKENIZERS_PARALLELISM"] = "false"
-            self.executor = concurrent.futures.ProcessPoolExecutor(
-                initializer=init_global_processor,
-                mp_context=mp.get_context("fork"),
-                initargs=(server_args,),
-            )
+        if server_args.skip_tokenizer_init:
+            self.tokenizer = self.processor = None
         else:
-            self.tokenizer = get_tokenizer(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-            )
+            if is_multimodal_model(self.model_path):
+                self.processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+                self.tokenizer = self.processor.tokenizer
+                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+                self.executor = concurrent.futures.ProcessPoolExecutor(
+                    initializer=init_global_processor,
+                    mp_context=mp.get_context("fork"),
+                    initargs=(server_args,),
+                )
+            else:
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
 
         self.to_create_loop = True
         self.rid_to_state: Dict[str, ReqState] = {}
@@ -150,9 +153,7 @@ class TokenizerManager:
             async for response in self._handle_single_request(obj, request):
                 yield response
         else:
-            if isinstance(obj, EmbeddingReqInput):
-                raise NotImplementedError("Please send only one prompt in each request")
-            if obj.stream:
+            if hasattr(obj, "stream") and obj.stream:
                 raise ValueError("Do not support stream for batch mode.")
 
             async for response in self._handle_batch_request(obj, request):
@@ -171,6 +172,7 @@ class TokenizerManager:
             rid = obj.rid if not_use_index else obj.rid[index]
             input_text = obj.text if not_use_index else obj.text[index]
             if obj.input_ids is None:
+                assert self.tokenizer is not None
                 input_ids = self.tokenizer.encode(input_text)
             else:
                 input_ids = obj.input_ids if not_use_index else obj.input_ids[index]
@@ -207,7 +209,20 @@ class TokenizerManager:
                 else:
                     input_text = obj.text
                     rid = obj.rid[0]
-                input_ids = self.tokenizer.encode(input_text)
+                if self.tokenizer is not None:
+                    input_ids = self.tokenizer.encode(input_text)
+                else:
+                    assert obj.input_ids is not None
+                    input_ids = obj.input_ids
+                    if isinstance(obj.input_ids, list) and isinstance(
+                        obj.input_ids[0], list
+                    ):
+                        # when obj["input_ids"] is List[List[int]]
+                        input_ids = obj.input_ids[index]
+                        rid = obj.rid[index]
+                    else:
+                        input_ids = obj.input_ids
+                        rid = obj.rid[0]
             else:
                 input_text = None
                 if isinstance(obj.input_ids, list) and isinstance(
@@ -262,27 +277,33 @@ class TokenizerManager:
             ):
                 yield response
         else:
+            assert self.is_generation
             await self._wait_for_cache_prefill_response(event, state, obj, rid, request)
             yield input_ids
 
-    async def _handle_batch_request(self, obj: GenerateReqInput, request):
+    async def _handle_batch_request(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput], request
+    ):
         batch_size = obj.batch_size
-        parallel_sample_num = obj.parallel_sample_num
+        if self.is_generation:
+            parallel_sample_num = obj.parallel_sample_num
 
-        if parallel_sample_num != 1:
-            # Send prefill requests to cache the common input
-            parallel_sample_num += 1
-            input_id_result = [] if obj.input_ids is None else None
-            for i in range(batch_size):
-                async for input_id in self._handle_single_request(
-                    obj, request, index=i, is_cache_for_prefill=True
-                ):
-                    if input_id_result is not None:
-                        input_id_result.append(input_id)
-            if input_id_result is not None and len(input_id_result) > 1:
-                obj.input_ids = input_id_result
-            elif input_id_result is not None:
-                obj.input_ids = input_id_result[0]
+            if parallel_sample_num != 1:
+                # Send prefill requests to cache the common input
+                parallel_sample_num += 1
+                input_id_result = [] if obj.input_ids is None else None
+                for i in range(batch_size):
+                    async for input_id in self._handle_single_request(
+                        obj, request, index=i, is_cache_for_prefill=True
+                    ):
+                        if input_id_result is not None:
+                            input_id_result.append(input_id)
+                if input_id_result is not None and len(input_id_result) > 1:
+                    obj.input_ids = input_id_result
+                elif input_id_result is not None:
+                    obj.input_ids = input_id_result[0]
+        else:
+            parallel_sample_num = 1
 
         # First send out all requests
         for i in range(batch_size):
@@ -311,28 +332,38 @@ class TokenizerManager:
                         input_text = None
                         input_ids = obj.input_ids[i]
                 sampling_params = self._get_sampling_params(obj.sampling_params[index])
-                pixel_values, image_hash, image_size = await self._get_pixel_values(
-                    obj.image_data[index]
-                )
 
-                tokenized_obj = TokenizedGenerateReqInput(
-                    rid,
-                    input_text,
-                    input_ids,
-                    pixel_values,
-                    image_hash,
-                    image_size,
-                    sampling_params,
-                    obj.return_logprob[index],
-                    obj.logprob_start_len[index],
-                    obj.top_logprobs_num[index],
-                    obj.stream,
-                )
+                if self.is_generation:
+                    pixel_values, image_hash, image_size = await self._get_pixel_values(
+                        obj.image_data[index]
+                    )
+
+                    tokenized_obj = TokenizedGenerateReqInput(
+                        rid,
+                        input_text,
+                        input_ids,
+                        pixel_values,
+                        image_hash,
+                        image_size,
+                        sampling_params,
+                        obj.return_logprob[index],
+                        obj.logprob_start_len[index],
+                        obj.top_logprobs_num[index],
+                        obj.stream,
+                    )
+                else:
+                    tokenized_obj = TokenizedEmbeddingReqInput(
+                        rid,
+                        input_text,
+                        input_ids,
+                        sampling_params,
+                    )
                 self.send_to_router.send_pyobj(tokenized_obj)
 
                 event = asyncio.Event()
                 state = ReqState([], False, event)
                 self.rid_to_state[rid] = state
+
         # Then wait for all responses
         output_list = []
         for i in range(batch_size):
@@ -355,14 +386,17 @@ class TokenizerManager:
                                 self.abort_request(rid)
                             raise ValueError(f"Abort request {rid}")
                         continue
-                output_list.append(
-                    self.convert_logprob_style(
-                        state.out_list[-1],
-                        obj.return_logprob[index],
-                        obj.top_logprobs_num[index],
-                        obj.return_text_in_logprobs,
+                if self.is_generation:
+                    output_list.append(
+                        self.convert_logprob_style(
+                            state.out_list[-1],
+                            obj.return_logprob[index],
+                            obj.top_logprobs_num[index],
+                            obj.return_text_in_logprobs,
+                        )
                     )
-                )
+                else:
+                    output_list.append(state.out_list[-1])
                 assert state.finished
                 del self.rid_to_state[rid]
         yield output_list
@@ -419,7 +453,7 @@ class TokenizerManager:
             # Log requests
             if self.server_args.log_requests and state.finished:
                 if obj.text is None:
-                    in_obj = {"text": self.tokenizer.decode(obj.input_ids)}
+                    in_obj = {"input_ids": obj.input_ids}
                 else:
                     in_obj = {"text": obj.text}
                 logger.info(f"in={in_obj}, out={out}")
@@ -473,7 +507,7 @@ class TokenizerManager:
             if obj.is_single:
                 self.abort_request(obj.rid)
             else:
-                for rid in obj.rids:
+                for rid in obj.rid:
                     self.abort_request(rid)
 
         background_tasks = BackgroundTasks()
@@ -487,11 +521,12 @@ class TokenizerManager:
 
     async def handle_loop(self):
         while True:
-            recv_obj: Union[BatchStrOut, BatchEmbeddingOut] = (
+            recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut] = (
                 await self.recv_from_detokenizer.recv_pyobj()
             )
-            assert isinstance(recv_obj, (BatchStrOut, BatchEmbeddingOut))
-
+            assert isinstance(
+                recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)
+            ), f"Unexpected obj received: {type(recv_obj)}"
             for i, rid in enumerate(recv_obj.rids):
                 state = self.rid_to_state.get(rid, None)
                 if state is None:
@@ -503,6 +538,15 @@ class TokenizerManager:
                         "text": recv_obj.output_strs[i],
                         "meta_info": recv_obj.meta_info[i],
                     }
+                elif isinstance(recv_obj, BatchTokenIDOut):
+                    read_start = 0 if i == 0 else recv_obj.read_offsets[i - 1]
+                    out_dict = {
+                        "token_ids": recv_obj.decode_ids[
+                            read_start : recv_obj.read_offsets[i]
+                        ],
+                        "meta_info": recv_obj.meta_info[i],
+                    }
+
                 else:
                     assert isinstance(recv_obj, BatchEmbeddingOut)
                     out_dict = {
@@ -548,6 +592,7 @@ class TokenizerManager:
         if not decode_to_text:
             return [(logprob, token_id, None) for logprob, token_id in token_logprobs]
 
+        assert self.tokenizer is not None
         token_ids = [tid for _, tid in token_logprobs]
         token_texts = self.tokenizer.batch_decode(token_ids)
         return [

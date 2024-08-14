@@ -15,6 +15,7 @@ limitations under the License.
 
 import json
 import multiprocessing
+import os
 from dataclasses import dataclass
 from typing import List, Union
 
@@ -26,10 +27,18 @@ from sglang.srt.server import Runtime
 from sglang.srt.utils import is_generation_model
 
 DEFAULT_PROMPTS = [
-    "The capital of France is",
+    # the output of gemma-2-2b from SRT is unstable on the commented prompt
+    # "The capital of France is",
     "The capital of the United Kindom is",
     "Today is a sunny day and I like",
+    "AI is a field of computer science focused on",
+    "Apple is red. Banana is Yellow. " * 800 + "Apple is",
 ]
+
+dirpath = os.path.dirname(__file__)
+with open(os.path.join(dirpath, "long_prompt"), "r") as f:
+    long_prompt = f.read()
+DEFAULT_PROMPTS.append(long_prompt)
 
 NUM_TOP_LOGPROBS = 5
 
@@ -43,10 +52,11 @@ def get_dtype_str(torch_dtype):
 
 @dataclass
 class ModelOutput:
-    output_strs: str = None
-    top_input_logprobs: torch.Tensor = None
-    top_output_logprobs: torch.Tensor = None
-    embed_logits: torch.Tensor = None
+    output_strs: List[str] = None
+    output_ids: List[int] = None
+    top_input_logprobs: List[torch.Tensor] = None
+    top_output_logprobs: List[torch.Tensor] = None
+    embed_logits: List[torch.Tensor] = None
 
 
 class HFRunner:
@@ -117,19 +127,19 @@ class HFRunner:
                         output_ids = self.model.generate(
                             input_ids, do_sample=False, max_new_tokens=max_new_tokens
                         )
-                        output_strs.append(self.tokenizer.decode(output_ids[0]))
+                        output_strs.append(
+                            self.tokenizer.decode(output_ids[0][len(input_ids[0]) :])
+                        )
 
                         logits = self.model.forward(input_ids).logits[0]
-                        logprobs = F.log_softmax(
-                            logits, dim=-1, dtype=torch.float32
-                        ).tolist()
-                        # index_of_max = (lambda nums: nums.index(max(nums)))(logprobs[-1])
-                        # print("index", index_of_max)
-                        logprobs = [
-                            sorted(token_logprobs, reverse=True)[:NUM_TOP_LOGPROBS]
-                            for token_logprobs in logprobs
-                        ]
-                        prefill_logprobs.append(logprobs)
+                        logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
+                        logprobs, top_indices = torch.topk(
+                            logprobs, k=NUM_TOP_LOGPROBS, dim=-1
+                        )
+                        # print("index", top_indices)
+                        prefill_logprobs.append(logprobs.tolist())
+                        del logits
+                        del logprobs
 
                     out_queue.put(
                         ModelOutput(
@@ -145,7 +155,7 @@ class HFRunner:
     def forward(
         self,
         prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
-        max_new_tokens=64,
+        max_new_tokens=8,
     ):
         self.in_queue.put((prompts, max_new_tokens))
         return self.out_queue.get()
@@ -169,6 +179,7 @@ class SRTRunner:
         tp_size=1,
         torch_dtype=torch.float16,
         is_generation_model=None,
+        port=5157,
     ):
         self.is_generation_model = (
             is_generation_model(model_path)
@@ -179,12 +190,14 @@ class SRTRunner:
             model_path=model_path,
             tp_size=tp_size,
             dtype=get_dtype_str(torch_dtype),
+            port=port,
+            mem_fraction_static=0.7,
         )
 
     def forward(
         self,
         prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
-        max_new_tokens=64,
+        max_new_tokens=8,
     ):
         if self.is_generation_model:
             # the return value contains logprobs from prefill
@@ -219,11 +232,9 @@ class SRTRunner:
                 output_strs=output_strs, top_input_logprobs=top_input_logprobs
             )
         else:
-            logits = []
-            for prompt in prompts:
-                response = self.runtime.encode(prompt)
-                response = json.loads(response)
-                logits.append(response["embedding"])
+            response = self.runtime.encode(prompts)
+            response = json.loads(response)
+            logits = [x["embedding"] for x in response]
             return ModelOutput(embed_logits=logits)
 
     def __enter__(self):

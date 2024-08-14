@@ -13,11 +13,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+"""
+Memory-efficient attention for prefill.
+It supporst page size = 1 and prefill with KV cache (i.e. extend).
+"""
+
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
+from sglang.srt.layers.prefill_attention import context_attention_fwd
 
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
@@ -270,7 +275,9 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = Lv
 
-    if CUDA_CAPABILITY[0] >= 8:
+    if CUDA_CAPABILITY[0] >= 9:
+        BLOCK_M, BLOCK_N = (128, 64)
+    elif CUDA_CAPABILITY[0] >= 8:
         BLOCK_M, BLOCK_N = (128, 128) if Lq <= 128 else (64, 64)
     else:
         BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)

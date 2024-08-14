@@ -32,7 +32,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.utils import find_printable_text, get_exception_traceback, graceful_registry
+from sglang.utils import find_printable_text, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -59,11 +59,14 @@ class DetokenizerManager:
         self.send_to_tokenizer = context.socket(zmq.PUSH)
         self.send_to_tokenizer.connect(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
 
-        self.tokenizer = get_tokenizer(
-            server_args.tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
-            trust_remote_code=server_args.trust_remote_code,
-        )
+        if server_args.skip_tokenizer_init:
+            self.tokenizer = None
+        else:
+            self.tokenizer = get_tokenizer(
+                server_args.tokenizer_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+            )
 
         self.decode_status = {}
 
@@ -84,6 +87,11 @@ class DetokenizerManager:
 
             assert isinstance(recv_obj, BatchTokenIDOut)
             bs = len(recv_obj.rids)
+
+            if self.tokenizer is None:
+                # Send BatchTokenIDOut if no tokenizer init'ed.
+                self.send_to_tokenizer.send_pyobj(recv_obj)
+                continue
 
             # Initialize decode status
             read_ids, surr_ids = [], []
@@ -156,8 +164,6 @@ def start_detokenizer_process(
     port_args: PortArgs,
     pipe_writer,
 ):
-    graceful_registry(inspect.currentframe().f_code.co_name)
-
     try:
         manager = DetokenizerManager(server_args, port_args)
     except Exception:

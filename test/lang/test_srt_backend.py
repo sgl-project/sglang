@@ -61,12 +61,4 @@ class TestSRTBackend(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # from sglang.global_config import global_config
-
-    # global_config.verbosity = 2
-    # t = TestSRTBackend()
-    # t.setUpClass()
-    # t.test_few_shot_qa()
-    # t.tearDownClass()
+    unittest.main()

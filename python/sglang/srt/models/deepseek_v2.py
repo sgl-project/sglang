@@ -26,9 +26,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -43,6 +41,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -445,11 +445,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope_out = q_input[..., : self.kv_lora_rank]
         torch.bmm(q_nope.transpose(0, 1), self.w_kc, out=q_nope_out.transpose(0, 1))
 
-        k_input = self.kv_a_proj_with_mqa(hidden_states)[0].unsqueeze(1)
-        k_pe = k_input[..., self.kv_lora_rank :]
-        v_input = k_input[..., : self.kv_lora_rank]
-        v_input = self.kv_a_layernorm(v_input.contiguous())
+        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        v_input = latent_cache[..., : self.kv_lora_rank]
+        v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
+        k_input = latent_cache.unsqueeze(1)
         k_input[..., : self.kv_lora_rank] = v_input
+        k_pe = k_input[..., self.kv_lora_rank :]
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q_input[..., self.kv_lora_rank :] = q_pe

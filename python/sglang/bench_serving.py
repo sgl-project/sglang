@@ -39,6 +39,8 @@ from transformers import (
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
+global args
+
 
 @dataclass
 class RequestFuncInput:
@@ -195,7 +197,8 @@ async def async_request_openai_completions(
                                     output.ttft = ttft
 
                                 # Decoding phase
-                                output.itl.append(timestamp - most_recent_timestamp)
+                                else:
+                                    output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
@@ -666,19 +669,20 @@ async def benchmark(
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": request_rate,
-            "total_input": metrics.total_input,
-            "total_output": metrics.total_output,
-            "total_output_retokenized": metrics.total_output_retokenized,
-            "mean_e2e_latency": metrics.mean_e2e_latency_ms,
-            "median_e2e_latency": metrics.median_e2e_latency_ms,
-            "median_ttft": metrics.median_ttft_ms,
-            "median_itl": metrics.median_itl_ms,
-            "output_token_throughput": metrics.output_throughput,
+            "total_input_tokens": metrics.total_input,
+            "total_output_tokens": metrics.total_output,
+            "total_output_tokens_retokenized": metrics.total_output_retokenized,
+            "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
+            "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
+            "median_ttft_ms": metrics.median_ttft_ms,
+            "median_itl_ms": metrics.median_itl_ms,
+            "output_throughput": metrics.output_throughput,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
-            "benchmark_duration": benchmark_duration,
+            "duration": benchmark_duration,
+            "completed": metrics.completed,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -748,7 +752,11 @@ def check_chat_template(model_path):
         return False
 
 
-def fire(args: argparse.Namespace):
+def run_benchmark(args_: argparse.Namespace):
+    global args
+    args = args_
+
+    set_ulimit()
     random.seed(args.seed)
     np.random.seed(args.seed)
 
@@ -852,7 +860,7 @@ def fire(args: argparse.Namespace):
                 )
             )
     else:
-        asyncio.run(
+        return asyncio.run(
             benchmark(
                 backend=backend,
                 api_url=api_url,
@@ -962,11 +970,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=0, help="Default is 0.")
     parser.add_argument(
-        "--disable-tqdm",
-        action="store_true",
-        help="Specify to disable tqdm progress bar.",
-    )
-    parser.add_argument(
         "--multi",
         action="store_true",
         help="Use request rate range rather than single value.",
@@ -978,6 +981,11 @@ if __name__ == "__main__":
         help="Range of request rates in the format start,stop,step. Default is 2,34,2. It also supports a list of request rates, requiring the parameters to not equal three.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
+    parser.add_argument(
+        "--disable-tqdm",
+        action="store_true",
+        help="Specify to disable tqdm progress bar.",
+    )
     parser.add_argument(
         "--disable-stream",
         action="store_true",
@@ -995,8 +1003,5 @@ if __name__ == "__main__":
         help="Append given JSON object to the request payload. You can use this to specify"
         "additional generate params like sampling params.",
     )
-
-    set_ulimit()
-
     args = parser.parse_args()
-    fire(args)
+    run_benchmark(args)

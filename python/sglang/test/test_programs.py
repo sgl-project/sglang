@@ -149,7 +149,7 @@ def test_decode_json():
     assert isinstance(js_obj["population"], int)
 
 
-def test_expert_answer():
+def test_expert_answer(check_answer=True):
     @sgl.function
     def expert_answer(s, question):
         s += "Question: " + question + "\n"
@@ -167,7 +167,9 @@ def test_expert_answer():
         )
 
     ret = expert_answer.run(question="What is the capital of France?", temperature=0.1)
-    assert "paris" in ret.text().lower()
+
+    if check_answer:
+        assert "paris" in ret.text().lower(), f"Answer: {ret.text()}"
 
 
 def test_tool_use():

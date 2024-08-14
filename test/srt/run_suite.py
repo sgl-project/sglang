@@ -5,12 +5,16 @@ from sglang.test.test_utils import run_unittest_files
 
 suites = {
     "minimal": [
-        "test_eval_accuracy.py",
-        "test_openai_server.py",
-        "test_vision_openai_server.py",
         "test_chunked_prefill.py",
+        "test_embedding_openai_server.py",
+        "test_eval_accuracy_mini.py",
+        "test_large_max_new_tokens.py",
+        "test_openai_server.py",
+        "test_skip_tokenizer_init.py",
         "test_torch_compile.py",
-        "test_models_from_modelscope.py",
+        "test_triton_attn_backend.py",
+        "test_vision_openai_server.py",
+        "test_large_max_new_tokens.py",
         "models/test_generation_models.py",
         "models/test_embedding_models.py",
         "sampling/penaltylib",
