@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 # coding=utf-8
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
@@ -8,34 +23,36 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-
 from vllm.config import CacheConfig
-from vllm.distributed import (get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_reduce)
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               QKVParallelLinear,
-                                               ReplicatedLinear,
-                                               RowParallelLinear)
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.sequence import IntermediateTensors, SamplerOutput
 
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.controller.model_runner import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
+
 
 class Qwen2MoeMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -46,17 +63,20 @@ class Qwen2MoeMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2,
+            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
             bias=False,
-            quant_config=quant_config)
-        self.down_proj = RowParallelLinear(intermediate_size,
-                                           hidden_size,
-                                           bias=False,
-                                           quant_config=quant_config,
-                                           reduce_results=reduce_results)
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+        )
         if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}. "
-                             "Only silu is supported for now.")
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
+            )
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -67,7 +87,6 @@ class Qwen2MoeMLP(nn.Module):
 
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -79,20 +98,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}.")
+                f"the number of experts {config.num_experts}."
+            )
 
-        self.experts = FusedMoE(num_experts=config.num_experts,
-                                top_k=config.num_experts_per_tok,
-                                hidden_size=config.hidden_size,
-                                intermediate_size=config.moe_intermediate_size,
-                                reduce_results=False,
-                                renormalize=config.norm_topk_prob,
-                                quant_config=quant_config)
+        self.experts = FusedMoE(
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            reduce_results=False,
+            renormalize=config.norm_topk_prob,
+            quant_config=quant_config,
+        )
 
-        self.gate = ReplicatedLinear(config.hidden_size,
-                                     config.num_experts,
-                                     bias=False,
-                                     quant_config=None)
+        self.gate = ReplicatedLinear(
+            config.hidden_size, config.num_experts, bias=False, quant_config=None
+        )
         if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -103,9 +124,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert = None
-        self.shared_expert_gate = torch.nn.Linear(config.hidden_size,
-                                                  1,
-                                                  bias=False)
+        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -114,24 +133,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
-                shared_output = F.sigmoid(
-                    self.shared_expert_gate(hidden_states)) * shared_output
+                shared_output = (
+                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
+                )
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states=hidden_states,
-                                           router_logits=router_logits)
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
 class Qwen2MoeAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -190,17 +209,19 @@ class Qwen2MoeAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        self.attn = RadixAttention(self.num_heads,
-                                   self.head_dim,
-                                   self.scaling,
-                                   num_kv_heads=self.num_kv_heads,
-                                   layer_id=layer_id)
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata
+        input_metadata: InputMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -211,7 +232,6 @@ class Qwen2MoeAttention(nn.Module):
 
 
 class Qwen2MoeDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -223,8 +243,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          8192)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -239,13 +258,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         # Note: Qwen/Qwen2-57B-A14B-Instruct does not have
         # `mlp_only_layers` in the config.
-        mlp_only_layers = ([] if not hasattr(config, "mlp_only_layers") else
-                           config.mlp_only_layers)
+        mlp_only_layers = (
+            [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
+        )
         if (layer_id not in mlp_only_layers) and (
-                config.num_experts > 0 and
-            (layer_id + 1) % config.decoder_sparse_step == 0):
-            self.mlp = Qwen2MoeSparseMoeBlock(config=config,
-                                              quant_config=quant_config)
+            config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0
+        ):
+            self.mlp = Qwen2MoeSparseMoeBlock(config=config, quant_config=quant_config)
         else:
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -253,10 +272,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
             )
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -270,23 +289,20 @@ class Qwen2MoeDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            input_metadata=input_metadata
+            input_metadata=input_metadata,
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
 class Qwen2MoeModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -301,13 +317,14 @@ class Qwen2MoeModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.layers = nn.ModuleList([
-            Qwen2MoeDecoderLayer(config,
-                                 layer_id,
-                                 cache_config,
-                                 quant_config=quant_config)
-            for layer_id in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                Qwen2MoeDecoderLayer(
+                    config, layer_id, cache_config, quant_config=quant_config
+                )
+                for layer_id in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -315,7 +332,7 @@ class Qwen2MoeModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
-        input_embeds: torch.Tensor = None
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -324,10 +341,9 @@ class Qwen2MoeModel(nn.Module):
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(positions,
-                                            hidden_states,
-                                            input_metadata,
-                                            residual)
+            hidden_states, residual = layer(
+                positions, hidden_states, input_metadata, residual
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -346,37 +362,34 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen2MoeModel(config, cache_config, quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size,
-                                      config.hidden_size,
-                                      quant_config=quant_config)
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, quant_config=quant_config
+        )
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
-        input_embeds: torch.Tensor = None
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, input_metadata,
-                                   input_embeds)
-        return self.logits_processor(input_ids, hidden_states, self.lm_head.weight,
-                                     input_metadata)
+        hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head.weight, input_metadata
+        )
 
-    def compute_logits(self, input_ids: torch.Tensor, hidden_states: torch.Tensor,
-                       input_metadata: InputMetadata) -> torch.Tensor:
-        logits = self.logits_processor(input_ids, hidden_states, self.lm_head.weight,
-                                       input_metadata)
-        return logits
-
-    def sample(
+    def compute_logits(
         self,
-        logits: Optional[torch.Tensor],
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+        logits = self.logits_processor(
+            input_ids, hidden_states, self.lm_head.weight, input_metadata
+        )
+        return logits
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -391,18 +404,27 @@ class Qwen2MoeForCausalLM(nn.Module):
         expert_params_mapping = [
             # These are the weights for the experts
             # (param_name, weight_name, expert_id, shard_id)
-            ("experts.w13_weight" if weight_name in ["gate_proj", "up_proj"]
-             else "experts.w2_weight",
-             f"experts.{expert_id}.{weight_name}.weight", expert_id, shard_id)
-            for expert_id in range(self.config.num_experts) for shard_id,
-            weight_name in enumerate(["gate_proj", "down_proj", "up_proj"])
+            (
+                (
+                    "experts.w13_weight"
+                    if weight_name in ["gate_proj", "up_proj"]
+                    else "experts.w2_weight"
+                ),
+                f"experts.{expert_id}.{weight_name}.weight",
+                expert_id,
+                shard_id,
+            )
+            for expert_id in range(self.config.num_experts)
+            for shard_id, weight_name in enumerate(
+                ["gate_proj", "down_proj", "up_proj"]
+            )
         ]
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
@@ -433,11 +455,13 @@ class Qwen2MoeForCausalLM(nn.Module):
                     name = name.replace(weight_name, param_name)
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(param,
-                                  loaded_weight,
-                                  weight_name,
-                                  shard_id=shard_id,
-                                  expert_id=expert_id)
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        weight_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
@@ -447,8 +471,10 @@ class Qwen2MoeForCausalLM(nn.Module):
                         continue
 
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
+
 
 EntryClass = Qwen2MoeForCausalLM

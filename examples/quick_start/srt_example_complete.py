@@ -2,20 +2,20 @@
 Usage:
 python3 srt_example_complete.py
 """
+
 import sglang as sgl
 
 
 @sgl.function
 def few_shot_qa(s, question):
-    s += (
-"""The following are questions with answers.
+    s += """The following are questions with answers.
 Q: What is the capital of France?
 A: Paris
 Q: What is the capital of Germany?
 A: Berlin
 Q: What is the capital of Italy?
 A: Rome
-""")
+"""
     s += "Q: " + question + "\n"
     s += "A:" + sgl.gen("answer", stop="\n", temperature=0)
 
@@ -31,8 +31,8 @@ def single():
 
 def stream():
     state = few_shot_qa.run(
-        question="What is the capital of the United States?",
-        stream=True)
+        question="What is the capital of the United States?", stream=True
+    )
 
     for out in state.text_iter("answer"):
         print(out, end="", flush=True)
@@ -40,10 +40,12 @@ def stream():
 
 
 def batch():
-    states = few_shot_qa.run_batch([
-        {"question": "What is the capital of the United States?"},
-        {"question": "What is the capital of China?"},
-    ])
+    states = few_shot_qa.run_batch(
+        [
+            {"question": "What is the capital of the United States?"},
+            {"question": "What is the capital of China?"},
+        ]
+    )
 
     for s in states:
         print(s["answer"])

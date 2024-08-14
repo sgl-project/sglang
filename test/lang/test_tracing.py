@@ -1,7 +1,7 @@
 import unittest
 
 import sglang as sgl
-from sglang.backend.base_backend import BaseBackend
+from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template
 
 
@@ -16,7 +16,7 @@ class TestTracing(unittest.TestCase):
             s += "A:" + sgl.gen("answer", stop="\n")
 
         tracer = few_shot_qa.trace()
-        print(tracer.last_node.print_graph_dfs() + "\n")
+        # print(tracer.last_node.print_graph_dfs() + "\n")
 
     def test_select(self):
         @sgl.function
@@ -26,7 +26,7 @@ class TestTracing(unittest.TestCase):
             s += "It is a city" + sgl.gen("description", stop=".")
 
         tracer = capital.trace()
-        print(tracer.last_node.print_graph_dfs() + "\n")
+        # print(tracer.last_node.print_graph_dfs() + "\n")
 
     def test_raise_warning(self):
         @sgl.function
@@ -66,11 +66,11 @@ class TestTracing(unittest.TestCase):
             s += "In summary" + sgl.gen("summary")
 
         compiled = tip_suggestion.compile()
-        compiled.print_graph()
+        # compiled.print_graph()
 
         sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo-instruct"))
         state = compiled.run(topic="staying healthy")
-        print(state.text() + "\n")
+        # print(state.text() + "\n")
 
         states = compiled.run_batch(
             [
@@ -80,8 +80,8 @@ class TestTracing(unittest.TestCase):
             ],
             temperature=0,
         )
-        for s in states:
-            print(s.text() + "\n")
+        # for s in states:
+        #     print(s.text() + "\n")
 
     def test_role(self):
         @sgl.function
@@ -95,7 +95,7 @@ class TestTracing(unittest.TestCase):
         backend.chat_template = get_chat_template("llama-2-chat")
 
         compiled = multi_turn_chat.compile(backend=backend)
-        compiled.print_graph()
+        # compiled.print_graph()
 
     def test_fork(self):
         @sgl.function
@@ -118,14 +118,11 @@ class TestTracing(unittest.TestCase):
             s += "In summary" + sgl.gen("summary")
 
         tracer = tip_suggestion.trace()
-        print(tracer.last_node.print_graph_dfs())
+        # print(tracer.last_node.print_graph_dfs())
 
         a = tip_suggestion.run(backend=sgl.OpenAI("gpt-3.5-turbo-instruct"))
-        print(a.text())
+        # print(a.text())
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # t = TestTracing()
-    # t.test_multi_function()
+    unittest.main()

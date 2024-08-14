@@ -3,8 +3,10 @@ Usage:
 export OPENROUTER_API_KEY=sk-******
 python3 together_example_chat.py
 """
-import sglang as sgl
+
 import os
+
+import sglang as sgl
 
 
 @sgl.function

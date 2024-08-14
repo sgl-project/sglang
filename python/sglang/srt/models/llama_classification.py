@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -10,7 +25,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.logits_processor import LogitProcessorOutput
-from sglang.srt.managers.controller.model_runner import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama2 import LlamaModel
 
 
@@ -31,6 +46,7 @@ class LlamaForClassification(nn.Module):
         )
         self.eos_token_id = config.eos_token_id
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -53,9 +69,9 @@ class LlamaForClassification(nn.Module):
             next_token_logits=scores,
             next_token_logprobs=scores,
             normalized_prompt_logprobs=scores,
-            prefill_token_logprobs=torch.ones_like(input_ids),
-            prefill_top_logprobs=None,
-            decode_top_logprobs=None,
+            input_token_logprobs=torch.ones_like(input_ids),
+            input_top_logprobs=None,
+            output_top_logprobs=None,
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

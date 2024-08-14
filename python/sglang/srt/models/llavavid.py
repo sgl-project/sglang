@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """Inference-only LLaVa video model compatible with HuggingFace weights."""
 
 from typing import Iterable, List, Optional, Tuple
@@ -11,13 +26,12 @@ from vllm.config import CacheConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.managers.controller.infer_batch import ForwardMode
-from sglang.srt.managers.controller.model_runner import InputMetadata
 from sglang.srt.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
     unpad_image_shape,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.models.llama2 import LlamaForCausalLM
 
 
@@ -106,6 +120,7 @@ class LlavaVidForCausalLM(nn.Module):
 
         return image_features
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.LongTensor,

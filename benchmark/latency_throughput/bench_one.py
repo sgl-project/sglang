@@ -17,7 +17,8 @@ def run_one_batch_size(bs):
 
     if args.input_len:
         input_ids = [
-            [int(x) for x in np.random.randint(0, high=16384, size=(args.input_len,))] for _ in range(bs)
+            [int(x) for x in np.random.randint(0, high=16384, size=(args.input_len,))]
+            for _ in range(bs)
         ]
     else:
         text = [f"{i, }" for i in range(bs)]
@@ -95,8 +96,14 @@ def run_one_batch_size(bs):
         ret = response.json()
     print(ret)
 
+    input_len = args.input_len if args.input_len else 1
+    output_len = max_new_tokens
+
     output_throughput = bs * max_new_tokens / latency
-    print(f"latency: {latency:.2f} s, speed: {output_throughput:.2f} token/s")
+    overall_throughput = bs * (input_len + output_len) / latency
+    print(f"latency: {latency:.2f} s")
+    print(f"output throughput: {output_throughput:.2f} token/s")
+    print(f"(input + output) throughput: {overall_throughput:.2f} token/s")
 
     with open("results.jsonl", "a") as fout:
         res = {
@@ -106,6 +113,7 @@ def run_one_batch_size(bs):
             "batch_size": bs,
             "latency": latency,
             "output_throughput": output_throughput,
+            "overall_throughput": overall_throughput,
         }
         fout.write(json.dumps(res) + "\n")
 
@@ -116,9 +124,11 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--backend", type=str, default="srt")
     parser.add_argument("--input-len", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, nargs='*', default=[1])
+    parser.add_argument("--batch-size", type=int, nargs="*", default=[1])
     parser.add_argument("--max-tokens", type=int, default=256)
-    parser.add_argument("--vllm-model-name", type=str, default="meta-llama/Meta-Llama-3-70B")
+    parser.add_argument(
+        "--vllm-model-name", type=str, default="meta-llama/Meta-Llama-3-70B"
+    )
     args = parser.parse_args()
 
     if args.port is None:
