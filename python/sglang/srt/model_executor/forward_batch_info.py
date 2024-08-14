@@ -154,7 +154,6 @@ class InputMetadata:
         model_runner: "ModelRunner",
         batch: ScheduleBatch,
         forward_mode: ForwardMode,
-        sliding_window_size: Optional[int] = None,
     ):
         ret = cls(
             forward_mode=forward_mode,
@@ -198,7 +197,7 @@ class InputMetadata:
             ):
                 flashinfer_use_ragged = True
             ret.init_flashinfer_handlers(
-                model_runner, prefix_lens, flashinfer_use_ragged, sliding_window_size
+                model_runner, prefix_lens, flashinfer_use_ragged
             )
 
         return ret
@@ -221,7 +220,6 @@ class InputMetadata:
         model_runner,
         prefix_lens,
         flashinfer_use_ragged,
-        sliding_window_size=None,
     ):
         update_flashinfer_indices(
             self.forward_mode,
@@ -230,7 +228,6 @@ class InputMetadata:
             self.seq_lens,
             prefix_lens,
             flashinfer_use_ragged=flashinfer_use_ragged,
-            sliding_window_size=sliding_window_size,
         )
 
         (
@@ -254,7 +251,6 @@ def update_flashinfer_indices(
     prefix_lens,
     flashinfer_decode_wrapper=None,
     flashinfer_use_ragged=False,
-    sliding_window_size=None,
 ):
     """Init auxiliary variables for FlashInfer attention backend."""
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -262,7 +258,7 @@ def update_flashinfer_indices(
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
 
-    if sliding_window_size is None:
+    if model_runner.sliding_window_size is None:
         if flashinfer_use_ragged:
             paged_kernel_lens = prefix_lens
         else:
@@ -335,7 +331,7 @@ def update_flashinfer_indices(
 
             if wrapper_id == 0 and forward_mode == ForwardMode.DECODE:
                 paged_kernel_lens = torch.minimum(
-                    paged_kernel_lens, torch.tensor(sliding_window_size)
+                    paged_kernel_lens, torch.tensor(model_runner.sliding_window_size)
                 )
                 kv_start_idx = seq_lens - paged_kernel_lens
             else:
