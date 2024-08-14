@@ -658,6 +658,7 @@ class StreamExecutor:
         for item in [
             "max_new_tokens",
             "stop",
+            "stop_token_ids",
             "temperature",
             "top_p",
             "top_k",
