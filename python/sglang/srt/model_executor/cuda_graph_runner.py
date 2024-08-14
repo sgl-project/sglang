@@ -107,9 +107,6 @@ class CudaGraphRunner:
         )
 
         # FlashInfer inputs
-        self.flashinfer_workspace_buffer = (
-            self.model_runner.flashinfer_workspace_buffers[0]
-        )
         self.flashinfer_kv_indptr = torch.zeros(
             (self.max_bs + 1,), dtype=torch.int32, device="cuda"
         )
@@ -121,6 +118,23 @@ class CudaGraphRunner:
         self.flashinfer_kv_last_page_len = torch.ones(
             (self.max_bs,), dtype=torch.int32, device="cuda"
         )
+        if model_runner.sliding_window_size is None:
+            self.flashinfer_workspace_buffer = (
+                self.model_runner.flashinfer_workspace_buffers[0]
+            )
+        else:
+            self.flashinfer_workspace_buffers = [
+                self.model_runner.flashinfer_workspace_buffers[0],
+                self.model_runner.flashinfer_workspace_buffers[2],
+            ]
+            self.flashinfer_kv_indptr = [
+                self.flashinfer_kv_indptr,
+                self.flashinfer_kv_indptr.clone(),
+            ]
+            self.flashinfer_kv_indices = [
+                self.flashinfer_kv_indices,
+                self.flashinfer_kv_indices.clone(),
+            ]
 
         self.compile_bs = [1, 2, 4, 8, 16, 24, 32] if use_torch_compile else []
 
@@ -171,15 +185,32 @@ class CudaGraphRunner:
             use_tensor_cores = True
         else:
             use_tensor_cores = False
-        flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-            self.flashinfer_workspace_buffer,
-            "NHD",
-            use_cuda_graph=True,
-            use_tensor_cores=use_tensor_cores,
-            paged_kv_indptr_buffer=self.flashinfer_kv_indptr[: bs + 1],
-            paged_kv_indices_buffer=self.flashinfer_kv_indices,
-            paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[:bs],
-        )
+        if self.model_runner.sliding_window_size is None:
+            flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                self.flashinfer_workspace_buffer,
+                "NHD",
+                use_cuda_graph=True,
+                use_tensor_cores=use_tensor_cores,
+                paged_kv_indptr_buffer=self.flashinfer_kv_indptr[: bs + 1],
+                paged_kv_indices_buffer=self.flashinfer_kv_indices,
+                paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[:bs],
+            )
+        else:
+            flashinfer_decode_wrapper = []
+            for i in range(2):
+                flashinfer_decode_wrapper.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.flashinfer_workspace_buffers[i],
+                        "NHD",
+                        use_cuda_graph=True,
+                        use_tensor_cores=use_tensor_cores,
+                        paged_kv_indptr_buffer=self.flashinfer_kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buffer=self.flashinfer_kv_indices[i],
+                        paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[
+                            :bs
+                        ],
+                    )
+                )
         update_flashinfer_indices(
             ForwardMode.DECODE,
             self.model_runner,
