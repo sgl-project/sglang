@@ -376,7 +376,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         maybe_set_triton_cache_manager()
 
     # Set global chat template
-    if server_args.chat_template:
+    if server_args.chat_template and not server_args.chat_template.endswith(".jinja"):
         # TODO: replace this with huggingface transformers template
         load_chat_template_for_openai_api(server_args.chat_template)
 

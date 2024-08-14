@@ -118,6 +118,14 @@ class TokenizerManager:
                     trust_remote_code=server_args.trust_remote_code,
                 )
 
+        if (
+            server_args.chat_template is not None
+            and server_args.chat_template.endswith(".jinja")
+        ):
+            with open(server_args.chat_template, "r") as f:
+                chat_template = "".join(f.readlines()).strip("\n")
+            self.tokenizer.chat_template = chat_template.replace("\\n", "\n")
+
         self.to_create_loop = True
         self.rid_to_state: Dict[str, ReqState] = {}
 
