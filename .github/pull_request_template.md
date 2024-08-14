@@ -10,6 +10,7 @@ Briefly describe the changes made in this PR.
 
 ## Checklist
 
-1. Ensure pre-commit `pre-commit run --all-files` or other linting tools are used to fix potential lint issues.
-2. Confirm that modifications are covered by complete unit tests. If not, please add more unit tests for correctness.
-3. Modify documentation as needed, such as docstrings or example tutorials.
+-[] Before submitting a PR for review, make sure it has passed verification in your local development environment **at least**.
+-[] Ensure pre-commit `pre-commit run --all-files` or other linting tools are used to fix potential lint issues.
+-[] Confirm that modifications are covered by complete unit tests. If not, please add more unit tests for correctness.
+-[] Modify documentation as needed, such as docstrings or example tutorials.
