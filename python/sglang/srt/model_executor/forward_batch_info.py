@@ -90,7 +90,10 @@ class InputMetadata:
         # can not support operand - with int
         self.image_offsets = [
             (
-                [(image_offset - len(r.prefix_indices)) for image_offset in r.image_offset]
+                [
+                    (image_offset - len(r.prefix_indices))
+                    for image_offset in r.image_offset
+                ]
                 if r.image_offset is not None
                 else 0
             )
