@@ -88,8 +88,8 @@ def main(args):
     for i in range(len(states)):
         preds.append(get_answer_value(states[i]["answer"]))
 
-    print(f"{preds=}")
-    print(f"{labels=}")
+    # print(f"{preds=}")
+    # print(f"{labels=}")
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
