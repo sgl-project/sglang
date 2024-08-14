@@ -54,7 +54,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    get_int_token_logit_bias,
     is_multimodal_model,
     set_random_seed,
     suppress_other_loggers,
@@ -131,9 +130,6 @@ class ModelTpServer:
                 else server_args.max_running_requests
             ),
             self.model_runner.req_to_token_pool.size - 1,
-        )
-        self.int_token_logit_bias = torch.tensor(
-            get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
         )
         self.max_req_input_len = min(
             self.model_config.context_len - 1,
@@ -442,9 +438,7 @@ class ModelTpServer:
 
     def forward_prefill_batch(self, batch: ScheduleBatch):
         # Build batch tensors
-        batch.prepare_for_extend(
-            self.model_config.vocab_size, self.int_token_logit_bias
-        )
+        batch.prepare_for_extend(self.model_config.vocab_size)
 
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
