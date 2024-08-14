@@ -62,16 +62,22 @@ class JumpForwardMap:
                 id_to_symbol.setdefault(id_, []).append(symbol)
 
             transitions = fsm_info.transitions
-            outgoings_ct = defaultdict(int)
-            state_to_jump_forward = {}
 
+            outgoings_ct = defaultdict(int)
+            # NOTE(lsyin): Final states can lead to terminate, so they have one outgoing edge naturally
+            for s in fsm_info.finals:
+                outgoings_ct[s] = 1
+
+            state_to_jump_forward = {}
             for (state, id_), next_state in transitions.items():
                 if id_ == fsm_info.alphabet_anything_value:
+                    # Arbitrarily symbol cannot be recognized as jump forward
                     continue
+
                 symbols = id_to_symbol[id_]
                 for c in symbols:
                     if len(c) > 1:
-                        # Skip byte level transitions
+                        # Skip byte level transitions like c = "5E"
                         continue
 
                     outgoings_ct[state] += 1
@@ -87,6 +93,9 @@ class JumpForwardMap:
 
             # Process the byte level jump forward
             outgoings_ct = defaultdict(int)
+            for s in fsm_info.finals:
+                outgoings_ct[s] = 1
+
             for (state, id_), next_state in transitions.items():
                 if id_ == fsm_info.alphabet_anything_value:
                     continue
@@ -177,3 +186,5 @@ if __name__ == "__main__":
     test_main(r"霍格沃茨特快列车|霍比特人比尔博")
     # 霍格: \xe9\x9c\x8d \xe6\xa0\xbc ...
     # 霍比: \xe9\x9c\x8d \xe6\xaf\x94 ...
+
+    test_main(r"[-+]?[0-9]+[ ]*")
