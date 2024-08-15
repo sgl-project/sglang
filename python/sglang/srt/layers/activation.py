@@ -14,7 +14,6 @@ limitations under the License.
 """Fused operators for activation layers."""
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from flashinfer.activation import silu_and_mul
 from vllm.model_executor.custom_op import CustomOp

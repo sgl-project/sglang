@@ -453,10 +453,12 @@ class ServerArgs:
             logger.info(
                 f"When using sliding window in gemma-2, disable radix_cache, regex_jump_forward, and turn on flashinfer."
             )
+            # FIXME: compatibility with radix attention
             self.disable_radix_cache = True
+            # FIXME: compatibility with jump forward
             self.disable_regex_jump_forward = True
             self.disable_flashinfer = False
-            self.disable_cuda_graph = True
+            # FIXME: compatibility with chunked prefill
             self.chunked_prefill_size = None
 
 
