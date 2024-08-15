@@ -460,11 +460,11 @@ class ModelTpServer:
         )
 
         if self.controller_info:
+            num = 0
+            for r in batch.reqs:
+                num += len(r.origin_input_ids)
             with self.controller_info.lock:
-                for r in batch.reqs:
-                    self.controller_info.current_bs[self.dp_rank].value -= len(
-                        r.origin_input_ids
-                    )
+                self.controller_info.current_bs[self.dp_rank].value -= num
 
         if self.model_runner.is_generation:
             # Forward and sample the next tokens

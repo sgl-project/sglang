@@ -156,7 +156,7 @@ class ControllerMultiFlex:
             remained_token[index] += len(r.input_ids)
         with self.controller_info.lock:
             for i, v in enumerate(remained_token):
-                self.controller_info.current_bs[i] += v
+                self.controller_info.current_bs[i].value = v
 
     def round_robin_scheduler(self, input_requests):
         for r in input_requests:
