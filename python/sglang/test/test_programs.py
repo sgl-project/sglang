@@ -106,13 +106,16 @@ def test_decode_json_regex():
         from sglang.lang.ir import REGEX_FLOAT, REGEX_INT, REGEX_STR
 
         s += "Generate a JSON object to describe the basic city information of Paris.\n"
+        s += "Here are the JSON object:\n"
+
+        # NOTE: we recommend using dtype gen or whole regex string to control the output
 
         with s.var_scope("json_output"):
             s += "{\n"
-            s += '  "name": ' + sgl.gen(regex=REGEX_STR + ",") + "\n"
-            s += '  "population": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
-            s += '  "area": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
-            s += '  "latitude": ' + sgl.gen(regex=REGEX_FLOAT) + "\n"
+            s += '  "name": ' + sgl.gen(regex=REGEX_STR) + ",\n"
+            s += '  "population": ' + sgl.gen(regex=REGEX_INT, stop=[" ", "\n"]) + ",\n"
+            s += '  "area": ' + sgl.gen(regex=REGEX_INT, stop=[" ", "\n"]) + ",\n"
+            s += '  "latitude": ' + sgl.gen(regex=REGEX_FLOAT, stop=[" ", "\n"]) + "\n"
             s += "}"
 
     ret = decode_json.run(temperature=0.0)
