@@ -19,7 +19,7 @@ request_1 = client.chat.completions.create(
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/mixtral_8x7b.jpg"
+                        "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
                     },
                 },
                 {
