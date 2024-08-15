@@ -256,32 +256,6 @@ class LlavaLlamaForCausalLM(nn.Module):
                             # )
 
                             if "unpad" in self.mm_patch_merge_type:
-                                image_feature = image_feature.permute(
-                                    4, 0, 2, 1, 3
-                                ).contiguous()
-                                image_feature = image_feature.flatten(1, 2).flatten(
-                                    2, 3
-                                )
-                                image_feature = unpad_image(
-                                    image_feature, image_sizes[image_idx][0]
-                                )
-                                image_feature = torch.cat(
-                                    (
-                                        image_feature,
-                                        self.language_model.model.image_newline[
-                                            :, None, None
-                                        ].expand(*image_feature.shape[:-1], 1),
-                                    ),
-                                    dim=-1,
-                                )
-                                image_feature = image_feature.flatten(1, 2).transpose(
-                                    0, 1
-                                )
-                            elif (
-                                "unpad" in self.mm_patch_merge_type
-                                and "anyres_max" in image_aspect_ratio
-                                and matched_anyres_max_num_patches
-                            ):
                                 unit = image_feature.shape[2]
                                 image_feature = image_feature.permute(
                                     4, 0, 2, 1, 3
@@ -292,15 +266,21 @@ class LlavaLlamaForCausalLM(nn.Module):
                                 image_feature = unpad_image(
                                     image_feature, image_sizes[image_idx][0]
                                 )
-                                c, h, w = image_feature.shape
-                                times = math.sqrt(h * w / (max_num_patches * unit**2))
-                                if times > 1.1:
-                                    image_feature = image_feature[None]
-                                    image_feature = nn.functional.interpolate(
-                                        image_feature,
-                                        [int(h // times), int(w // times)],
-                                        mode="bilinear",
-                                    )[0]
+                                if (
+                                    "anyres_max" in image_aspect_ratio
+                                    and matched_anyres_max_num_patches
+                                ):
+                                    c, h, w = image_feature.shape
+                                    times = math.sqrt(
+                                        h * w / (max_num_patches * unit**2)
+                                    )
+                                    if times > 1.1:
+                                        image_feature = image_feature[None]
+                                        image_feature = nn.functional.interpolate(
+                                            image_feature,
+                                            [int(h // times), int(w // times)],
+                                            mode="bilinear",
+                                        )[0]
                                 image_feature = torch.cat(
                                     (
                                         image_feature,
