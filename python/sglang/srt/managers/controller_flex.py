@@ -154,6 +154,9 @@ class ControllerMultiFlex:
             index = remained_token.index(min(remained_token))
             self.workers[index].queue.put(r)
             remained_token[index] += len(r.input_ids)
+        with self.controller_info.lock:
+            for i, v in enumerate(remained_token):
+                self.controller_info.current_bs[i] += v
 
     def round_robin_scheduler(self, input_requests):
         for r in input_requests:

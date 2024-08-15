@@ -374,14 +374,6 @@ class ModelTpServer:
                 ),
                 self.max_req_input_len - 1 - len(req.origin_input_ids),
             )
-        if self.controller_info:
-            self.controller_info.available_kv_cache[self.dp_rank] = (
-                self.token_to_kv_pool.available_size()
-            )
-            self.controller_info.current_bs[self.dp_rank].value += len(
-                req.origin_input_ids
-            )
-
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
@@ -468,12 +460,11 @@ class ModelTpServer:
         )
 
         if self.controller_info:
-            self.controller_info.available_kv_cache[self.dp_rank] = (
-                self.token_to_kv_pool.available_size()
-            )
-            self.controller_info.current_bs[
-                self.dp_rank
-            ].value -= batch.input_ids.numel()
+            with self.controller_info.lock:
+                for r in batch.reqs:
+                    self.controller_info.current_bs[self.dp_rank].value -= len(
+                        r.origin_input_ids
+                    )
 
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
