@@ -123,10 +123,10 @@ class CudaGraphRunner:
                 self.model_runner.flashinfer_workspace_buffer
             )
         else:
-            self.flashinfer_workspace_buffer = [
-                self.model_runner.flashinfer_workspace_buffer,
-                self.model_runner.flashinfer_workspace_buffer,
-            ]
+            self.flashinfer_workspace_buffer = (
+                self.model_runner.flashinfer_workspace_buffer
+            )
+
             self.flashinfer_kv_indptr = [
                 self.flashinfer_kv_indptr,
                 self.flashinfer_kv_indptr.clone(),
@@ -200,7 +200,7 @@ class CudaGraphRunner:
             for i in range(2):
                 flashinfer_decode_wrapper.append(
                     BatchDecodeWithPagedKVCacheWrapper(
-                        self.flashinfer_workspace_buffer[i],
+                        self.flashinfer_workspace_buffer,
                         "NHD",
                         use_cuda_graph=True,
                         use_tensor_cores=use_tensor_cores,
