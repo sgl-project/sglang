@@ -40,8 +40,8 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitProcessorOutput, LogitsProcessor
 from sglang.srt.layers.parallel_utils import get_kv_tensor_model_parallel_world_size
-from sglang.srt.layers.sp_linear import QKVParallelLinear, RowSeqParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.sp_linear import QKVParallelLinear, RowSeqParallelLinear
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
@@ -324,6 +324,8 @@ class LlamaForCausalLM(nn.Module):
     ) -> LogitProcessorOutput:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
         if input_metadata.sp_size > 1:
+            # TODO: instead of a GPU indexing, sample under SP layout and parse
+            # sampling result back to normal layout
             hidden_states = hidden_states[
                 input_metadata.sp_to_normal_indices
             ].contiguous()

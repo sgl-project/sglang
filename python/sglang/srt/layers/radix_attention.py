@@ -477,6 +477,7 @@ class RadixAttention(nn.Module):
         k_cache[input_metadata.out_cache_loc] = cache_k
         v_cache[input_metadata.out_cache_loc] = cache_v
 
+
 def _get_sequence_parallel_head_idxes(total_num_heads, num_kv_heads, sp_rank, sp_size):
     group_size = total_num_heads // num_kv_heads
     shard_num_heads = group_size // sp_size

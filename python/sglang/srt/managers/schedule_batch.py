@@ -28,13 +28,15 @@ import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
+from sglang.srt.managers.seq_parallel_layout import (
+    seq_parallel_decode_indices,
+    seq_parallel_input_ids_decode,
+    seq_parallel_input_ids_extend,
+    seq_parallel_local_len_extend,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.managers.seq_parallel_layout import (
-    seq_parallel_decode_indices, seq_parallel_input_ids_decode,
-    seq_parallel_input_ids_extend, seq_parallel_local_len_extend,
-)
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -451,15 +453,16 @@ class ScheduleBatch:
         if self.sp_size == 1:
             flatten_input_ids = sum(input_ids, [])
         else:
-            flatten_input_ids = seq_parallel_input_ids_extend(input_ids,
-                                                              self.sp_size, bs)
+            flatten_input_ids = seq_parallel_input_ids_extend(
+                input_ids, self.sp_size, bs
+            )
 
         # Allocate memory
         req_pool_indices_cpu = self.alloc_req_slots(bs)
         if self.sp_size > 1:
-            ext_lens = np.asarray([
-                len(req.fill_ids) - len(req.prefix_indices) for req in reqs
-            ])
+            ext_lens = np.asarray(
+                [len(req.fill_ids) - len(req.prefix_indices) for req in reqs]
+            )
             extend_local_token_nums = seq_parallel_local_len_extend(
                 self.sp_rank, self.sp_size, ext_lens
             )
@@ -678,8 +681,7 @@ class ScheduleBatch:
             input_ids = seq_parallel_input_ids_decode(
                 input_ids, self.sp_size, seq_lens_cpu
             )
-        self.input_ids = torch.tensor(input_ids, dtype=torch.int32,
-                                      device="cuda")
+        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
 
         # Alloc mem
         bs = self.batch_size()
