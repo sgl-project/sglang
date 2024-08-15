@@ -337,7 +337,7 @@ class ModelRunner:
                 use_tensor_cores=use_tensor_cores,
             )
         else:
-            self.flashinfer_workspace_buffers = torch.empty(
+            self.flashinfer_workspace_buffer = torch.empty(
                 global_config.flashinfer_workspace_size,
                 dtype=torch.uint8,
                 device="cuda",
