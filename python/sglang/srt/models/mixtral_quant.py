@@ -160,7 +160,6 @@ class MixtralAttention(nn.Module):
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
         quant_config: Optional[QuantizationConfig] = None,
-        sliding_window: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -183,7 +182,6 @@ class MixtralAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
-        self.sliding_window = sliding_window
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -246,7 +244,6 @@ class MixtralDecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
             rope_theta=rope_theta,
-            sliding_window=config.sliding_window,
             quant_config=quant_config,
         )
         self.block_sparse_moe = MixtralMoE(config=config, quant_config=quant_config)

@@ -288,6 +288,8 @@ def launch_server(
 
     # Launch processes
     tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
+    if server_args.chat_template:
+        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
     pipe_controller_reader, pipe_controller_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
@@ -375,16 +377,11 @@ def _set_envs_and_config(server_args: ServerArgs):
         # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
         maybe_set_triton_cache_manager()
 
-    # Set global chat template
-    if server_args.chat_template:
-        # TODO: replace this with huggingface transformers template
-        load_chat_template_for_openai_api(server_args.chat_template)
-
     # Check flashinfer version
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.1.4",
+            "0.1.5",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -533,11 +530,18 @@ class Runtime:
         prompt: str,
         sampling_params: Optional[Dict] = None,
     ):
-        json_data = {
-            "text": prompt,
-            "sampling_params": sampling_params,
-            "stream": True,
-        }
+        if self.server_args.skip_tokenizer_init:
+            json_data = {
+                "input_ids": prompt,
+                "sampling_params": sampling_params,
+                "stream": True,
+            }
+        else:
+            json_data = {
+                "text": prompt,
+                "sampling_params": sampling_params,
+                "stream": True,
+            }
         pos = 0
 
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
@@ -549,10 +553,13 @@ class Runtime:
                         if chunk == "data: [DONE]\n\n":
                             break
                         data = json.loads(chunk[5:].strip("\n"))
-                        cur = data["text"][pos:]
-                        if cur:
-                            yield cur
-                        pos += len(cur)
+                        if hasattr(data, "text"):
+                            cur = data["text"][pos:]
+                            if cur:
+                                yield cur
+                            pos += len(cur)
+                        else:
+                            yield data
 
     add_request = async_generate
 

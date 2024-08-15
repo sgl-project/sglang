@@ -53,7 +53,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_generation_model,
-    is_llama3_405b_fp8,
+    is_llama3_405b_fp8_head_16,
     is_multimodal_model,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
@@ -158,7 +158,7 @@ class ModelRunner:
             skip_tokenizer_init=True,
         )
 
-        if is_llama3_405b_fp8(self.model_config) and self.tp_size <= 8:
+        if is_llama3_405b_fp8_head_16(self.model_config) and self.tp_size <= 8:
             # A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints
             self.model_config.hf_config.num_key_value_heads = 8
             vllm_model_config.hf_config.num_key_value_heads = 8
@@ -186,6 +186,11 @@ class ModelRunner:
             parallel_config=None,
             scheduler_config=None,
             cache_config=None,
+        )
+        self.sliding_window_size = (
+            self.model.get_window_size()
+            if hasattr(self.model, "get_window_size")
+            else None
         )
         self.is_generation = is_generation_model(
             self.model_config.hf_config.architectures
@@ -296,6 +301,9 @@ class ModelRunner:
 
     def init_flashinfer(self):
         if self.server_args.disable_flashinfer:
+            assert (
+                self.sliding_window_size is None
+            ), "turn on flashinfer to support window attention"
             self.flashinfer_prefill_wrapper_ragged = None
             self.flashinfer_prefill_wrapper_paged = None
             self.flashinfer_decode_wrapper = None
@@ -309,20 +317,52 @@ class ModelRunner:
         else:
             use_tensor_cores = False
 
-        self.flashinfer_workspace_buffers = torch.empty(
-            2, global_config.flashinfer_workspace_size, dtype=torch.uint8, device="cuda"
-        )
-        self.flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.flashinfer_workspace_buffers[0], "NHD"
-        )
-        self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
-            self.flashinfer_workspace_buffers[1], "NHD"
-        )
-        self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-            self.flashinfer_workspace_buffers[0],
-            "NHD",
-            use_tensor_cores=use_tensor_cores,
-        )
+        if self.sliding_window_size is None:
+            self.flashinfer_workspace_buffer = torch.empty(
+                global_config.flashinfer_workspace_size,
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            self.flashinfer_prefill_wrapper_ragged = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.flashinfer_workspace_buffer, "NHD"
+                )
+            )
+            self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
+                self.flashinfer_workspace_buffer, "NHD"
+            )
+            self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                self.flashinfer_workspace_buffer,
+                "NHD",
+                use_tensor_cores=use_tensor_cores,
+            )
+        else:
+            self.flashinfer_workspace_buffers = torch.empty(
+                global_config.flashinfer_workspace_size,
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            self.flashinfer_prefill_wrapper_ragged = []
+            self.flashinfer_prefill_wrapper_paged = []
+            self.flashinfer_decode_wrapper = []
+            for i in range(2):
+                self.flashinfer_prefill_wrapper_ragged.append(
+                    BatchPrefillWithRaggedKVCacheWrapper(
+                        self.flashinfer_workspace_buffer, "NHD"
+                    )
+                )
+                self.flashinfer_prefill_wrapper_paged.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.flashinfer_workspace_buffer, "NHD"
+                    )
+                )
+                self.flashinfer_decode_wrapper.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.flashinfer_workspace_buffer,
+                        "NHD",
+                        use_tensor_cores=use_tensor_cores,
+                    )
+                )
 
     def init_cuda_graphs(self):
         from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -358,7 +398,9 @@ class ModelRunner:
             return self.cuda_graph_runner.replay(batch)
 
         input_metadata = InputMetadata.from_schedule_batch(
-            self, batch, ForwardMode.DECODE
+            self,
+            batch,
+            ForwardMode.DECODE,
         )
 
         return self.model.forward(
@@ -368,7 +410,9 @@ class ModelRunner:
     @torch.inference_mode()
     def forward_extend(self, batch: ScheduleBatch):
         input_metadata = InputMetadata.from_schedule_batch(
-            self, batch, forward_mode=ForwardMode.EXTEND
+            self,
+            batch,
+            forward_mode=ForwardMode.EXTEND,
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -377,7 +421,9 @@ class ModelRunner:
     @torch.inference_mode()
     def forward_extend_multi_modal(self, batch: ScheduleBatch):
         input_metadata = InputMetadata.from_schedule_batch(
-            self, batch, forward_mode=ForwardMode.EXTEND
+            self,
+            batch,
+            forward_mode=ForwardMode.EXTEND,
         )
         return self.model.forward(
             batch.input_ids,
