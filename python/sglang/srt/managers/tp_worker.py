@@ -89,8 +89,7 @@ class ModelTpServer:
         self.chunked_prefill_size = server_args.chunked_prefill_size
         self.current_inflight_req = None
         self.is_mixed_chunk = (
-            self.chunked_prefill_size is not None
-            and not server_args.disable_mixed_chunk
+            self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
 
         # Init model and tokenizer

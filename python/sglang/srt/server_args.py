@@ -80,7 +80,7 @@ class ServerArgs:
     disable_regex_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_disk_cache: bool = False
-    disable_mixed_chunk: bool = False
+    enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     enable_p2p_check: bool = False
     enable_mla: bool = False
@@ -398,7 +398,7 @@ class ServerArgs:
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
         )
         parser.add_argument(
-            "--disable-mixed-chunk",
+            "--enable-mixed-chunk",
             action="store_true",
             help="Disable mixed style chunked prefill.",
         )
