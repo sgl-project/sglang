@@ -334,11 +334,7 @@ class ModelRunner:
                 dtype=torch.uint8,
                 device="cuda",
             )
-            self.flashinfer_prefill_wrapper_ragged = (
-                BatchPrefillWithRaggedKVCacheWrapper(
-                    self.flashinfer_workspace_buffer, "NHD"
-                )
-            )
+            self.flashinfer_prefill_wrapper_ragged = None
             self.flashinfer_prefill_wrapper_paged = []
             self.flashinfer_decode_wrapper = []
             for i in range(2):
