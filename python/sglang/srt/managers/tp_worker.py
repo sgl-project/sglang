@@ -88,7 +88,10 @@ class ModelTpServer:
         # Chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
         self.current_inflight_req = None
-        self.mixed_style = self.chunked_prefill_size is not None
+        self.is_mixed_chunk = (
+            self.chunked_prefill_size is not None
+            and not server_args.disable_mixed_chunk
+        )
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -374,7 +377,7 @@ class ModelTpServer:
             self.chunked_prefill_size,
             (
                 self.running_batch.batch_size()
-                if self.mixed_style and self.running_batch is not None
+                if self.is_mixed_chunk and self.running_batch is not None
                 else 0
             ),
         )
@@ -447,7 +450,7 @@ class ModelTpServer:
         batch.prepare_for_extend(self.model_config.vocab_size)
 
         decoding_reqs = []
-        if self.mixed_style and self.running_batch is not None:
+        if self.is_mixed_chunk and self.running_batch is not None:
             self.running_batch.prepare_for_decode()
             batch.mix_with_running(self.running_batch)
             decoding_reqs = self.running_batch.reqs

@@ -49,7 +49,7 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_num_reqs: Optional[int] = None
     max_total_tokens: Optional[int] = None
-    chunked_prefill_size: int = 8192
+    chunked_prefill_size: int = -1
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
@@ -80,6 +80,7 @@ class ServerArgs:
     disable_regex_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_disk_cache: bool = False
+    disable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     enable_p2p_check: bool = False
     enable_mla: bool = False
@@ -395,6 +396,11 @@ class ServerArgs:
             "--disable-disk-cache",
             action="store_true",
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
+        )
+        parser.add_argument(
+            "--disable-mixed-chunk",
+            action="store_true",
+            help="Disable mixed style chunked prefill.",
         )
         parser.add_argument(
             "--enable-torch-compile",
