@@ -213,7 +213,7 @@ class Gemma2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_idx,
-            sliding_window_size=get_window_size(config) if use_sliding_window else -1,
+            sliding_window_size=get_window_size(config) if use_sliding_window else None,
             logit_cap=self.config.attn_logit_softcapping,
         )
 
