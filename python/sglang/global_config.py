@@ -27,7 +27,7 @@ class GlobalConfig:
         # Runtime constants: others
         self.num_continue_decode_steps = 10
         self.retract_decode_steps = 20
-        self.flashinfer_workspace_size = 192 * 1024 * 1024
+        self.flashinfer_workspace_size = 384 * 1024 * 1024
 
         # Output tokenization configs
         self.skip_special_tokens_in_output = True
