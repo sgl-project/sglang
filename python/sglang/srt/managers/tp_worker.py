@@ -370,16 +370,14 @@ class ModelTpServer:
         # Get priority queue
         prefix_computed = self.scheduler.calc_priority(self.waiting_queue)
 
+        num_mixed_running = running_bs if self.is_mixed_chunk else 0
+
         adder = PrefillAdder(
             self.tree_cache,
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
             self.max_prefill_tokens,
             self.chunked_prefill_size,
-            (
-                self.running_batch.batch_size()
-                if self.is_mixed_chunk and self.running_batch is not None
-                else 0
-            ),
+            num_mixed_running,
         )
 
         if self.running_batch is not None:
@@ -425,15 +423,27 @@ class ModelTpServer:
                 )
             else:
                 tree_cache_hit_rate = 0.0
-            logger.info(
-                f"[gpu={self.gpu_id}] Prefill batch. "
-                f"#new-seq: {len(can_run_list)}, "
-                f"#new-token: {adder.log_input_tokens}, "
-                f"#cached-token: {adder.log_hit_tokens}, "
-                f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
-                f"#running-req: {running_bs}, "
-                f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
-            )
+
+            if num_mixed_running > 0:
+                logger.info(
+                    f"[gpu={self.gpu_id}] Prefill batch"
+                    f"(mixed #running-req: {num_mixed_running}). "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
+                )
+            else:
+                logger.info(
+                    f"[gpu={self.gpu_id}] Prefill batch. "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"#running-req: {running_bs}, "
+                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
+                )
 
         # Return the new batch
         new_batch = ScheduleBatch.init_new(
@@ -455,11 +465,6 @@ class ModelTpServer:
             batch.mix_with_running(self.running_batch)
             decoding_reqs = self.running_batch.reqs
             self.running_batch = None
-
-            logger.info(
-                f"[gpu={self.gpu_id}] mixed with decode. "
-                f"#decode-req: {len(decoding_reqs)}"
-            )
 
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
