@@ -226,7 +226,8 @@ class ModelRunner:
             kv_tp_size = self.tp_size // self.sp_size
             head_num = self.model_config.get_num_kv_heads(kv_tp_size)
             cell_size = (
-                head_num * self.model_config.head_dim
+                head_num
+                * self.model_config.head_dim
                 * self.model_config.num_hidden_layers
                 * 2
                 * torch._utils._element_size(self.dtype)

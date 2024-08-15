@@ -4,9 +4,9 @@ import random
 import torch
 from vllm.distributed import init_distributed_environment
 
-from sglang.srt.layers.parallel_utils.parallel_state import initialize_model_parallel
+from sglang.srt.layers.parallel_utils import initialize_model_parallel
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.controller.model_runner import InputMetadata
+from sglang.srt.model_executor.model_runner import InputMetadata
 
 NUM_HEADS = 32
 HEAD_DIM = 128

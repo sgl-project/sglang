@@ -23,7 +23,8 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.seq_parallel_layout import (
-    init_sequence_parallel_args, seq_parallel_local_len_extend,
+    init_sequence_parallel_args,
+    seq_parallel_local_len_extend,
     seq_parallel_pad_zeros,
 )
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -151,8 +152,9 @@ class InputMetadata:
 
         # Positions should be in long type
         self.positions = self.positions.to(torch.int64)
-        update_positions_for_seq_parallel(self, normal_to_sp_indices,
-                                          batch.prefill_extend_lens)
+        update_positions_for_seq_parallel(
+            self, normal_to_sp_indices, batch.prefill_extend_lens
+        )
 
     def compute_extend_infos(self, batch: ScheduleBatch):
         if self.forward_mode == ForwardMode.DECODE:
@@ -173,8 +175,9 @@ class InputMetadata:
         batch: ScheduleBatch,
         forward_mode: ForwardMode,
     ):
-        sp_args, aux_args = init_sequence_parallel_args(model_runner, batch,
-                                                        forward_mode)
+        sp_args, aux_args = init_sequence_parallel_args(
+            model_runner, batch, forward_mode
+        )
         ret = cls(
             forward_mode=forward_mode,
             batch_size=batch.batch_size(),
@@ -219,8 +222,11 @@ class InputMetadata:
             ):
                 flashinfer_use_ragged = True
             ret.init_flashinfer_handlers(
-                model_runner, prefix_lens, flashinfer_use_ragged,
-                aux_args["normal_to_sp_indices"], batch.sp_decode_local_lens
+                model_runner,
+                prefix_lens,
+                flashinfer_use_ragged,
+                aux_args["normal_to_sp_indices"],
+                batch.sp_decode_local_lens,
             )
 
         return ret
@@ -387,10 +393,12 @@ def update_flashinfer_indices(
             # Prepare masks.
             sp_size = sp_size
             extend_lens_cpu = extend_lens.cpu().numpy()
-            padded_extend_lens = seq_parallel_local_len_extend(0, sp_size,
-                                                            extend_lens_cpu)
-            last_extend_lens = seq_parallel_local_len_extend(sp_size - 1, sp_size,
-                                                            extend_lens_cpu)
+            padded_extend_lens = seq_parallel_local_len_extend(
+                0, sp_size, extend_lens_cpu
+            )
+            last_extend_lens = seq_parallel_local_len_extend(
+                sp_size - 1, sp_size, extend_lens_cpu
+            )
             qo_len = (seq_lens - prefix_lens).cpu().tolist()
             full_mask_arr = []
             causal_mask_arr = []
@@ -506,9 +514,9 @@ def update_flashinfer_indices(
                 )
 
 
-def update_positions_for_seq_parallel(input_metadata: InputMetadata,
-                                      normal_to_sp_indices,
-                                      extend_seq_lens):
+def update_positions_for_seq_parallel(
+    input_metadata: InputMetadata, normal_to_sp_indices, extend_seq_lens
+):
     sp_size = input_metadata.sp_size
     if sp_size == 1:
         return

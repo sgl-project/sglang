@@ -1,4 +1,5 @@
 """Util functions for sequence parallel layout and runtime metadata."""
+
 import itertools
 from typing import TYPE_CHECKING, Sequence, Union
 
@@ -9,6 +10,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import InputMetadata
     from sglang.srt.model_executor.model_runner import ModelRunner
+
 
 #### Offset of a sequence parallel shard under the sequence parallel layout.
 def _seq_parallel_offset_extend(sp_rank, sp_size, extend_seq_lens: np.ndarray):
@@ -59,7 +61,8 @@ def _sp_to_normal_indices_decode(sp_size, seq_lens: np.ndarray):
 def _debug_normal_to_sp_indices_decode(sp_size, seq_lens):
     """(Debug only) Indices from normal layout to the SP layout (padded)."""
     indices = [
-        seq_parallel_decode_indices(sp_rank, sp_size, seq_lens) for sp_rank in range(sp_size)
+        seq_parallel_decode_indices(sp_rank, sp_size, seq_lens)
+        for sp_rank in range(sp_size)
     ]
     indices = [(np.arange(len(idxs)), idxs) for idxs in indices]
     return indices
@@ -154,8 +157,9 @@ def _get_num_padding_tokens(sp_size, extend_seq_lens: np.ndarray):
 
 
 #### Get length/indices of sequence parallel local tokens within a batch
-def seq_parallel_local_len_extend(sp_rank, sp_size,
-                                  extend_seq_lens: Union[int, np.ndarray]):
+def seq_parallel_local_len_extend(
+    sp_rank, sp_size, extend_seq_lens: Union[int, np.ndarray]
+):
     """Get the number of tokens in this SP. Padding is not considered."""
     padded_size = np.ceil(extend_seq_lens / sp_size).astype(np.int32)
     return (
@@ -178,8 +182,9 @@ def seq_parallel_decode_indices(sp_rank, sp_size, seq_lens: np.ndarray):
 
 
 #### Transpose to sequence parallel layout
-def seq_parallel_input_ids_extend(input_ids: Sequence[Sequence[int]],
-                                          sp_size: int, bs: int):
+def seq_parallel_input_ids_extend(
+    input_ids: Sequence[Sequence[int]], sp_size: int, bs: int
+):
     # Note: The flatten input ids with Sequence Parallel is in form of:
     # [req_0_sp_0, req_1_sp_0, ... req_n_sp_0,
     #  req_0_sp_1, req_1_sp_1, ..., req_n_sp_1,
@@ -205,8 +210,9 @@ def seq_parallel_input_ids_extend(input_ids: Sequence[Sequence[int]],
     return flatten_input_ids
 
 
-def seq_parallel_input_ids_decode(input_ids: Sequence[int], sp_size: int,
-                                  seq_lens: np.ndarray):
+def seq_parallel_input_ids_decode(
+    input_ids: Sequence[int], sp_size: int, seq_lens: np.ndarray
+):
     input_ids_sp = [[] for _ in range(sp_size)]
     # NOTE: in the extend phase, we evenly do sequence partition on extended
     # tokens (extend_len). However, since prefix lens is cleaned, we instead
@@ -218,10 +224,11 @@ def seq_parallel_input_ids_decode(input_ids: Sequence[int], sp_size: int,
     flatten_input_ids = list(itertools.chain(*input_ids_sp))
     return flatten_input_ids
 
+
 #### Handle metadata
-def init_sequence_parallel_args(model_runner: "ModelRunner",
-                                batch: "ScheduleBatch",
-                                forward_mode):
+def init_sequence_parallel_args(
+    model_runner: "ModelRunner", batch: "ScheduleBatch", forward_mode
+):
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
     sp_rank = model_runner.sp_rank
@@ -234,9 +241,7 @@ def init_sequence_parallel_args(model_runner: "ModelRunner",
         # to get positions for each SP shard.
         if forward_mode == ForwardMode.DECODE:
             seq_lens_cpu = seq_lens.cpu().numpy()
-            sp_to_normal_indices = _sp_to_normal_indices_decode(
-                sp_size, seq_lens_cpu
-            )
+            sp_to_normal_indices = _sp_to_normal_indices_decode(sp_size, seq_lens_cpu)
             sp_local_token_length = seq_parallel_decode_indices(
                 sp_rank, sp_size, seq_lens_cpu
             ).size
@@ -280,11 +285,12 @@ def init_sequence_parallel_args(model_runner: "ModelRunner",
             )
         else:
             _debug_normal_to_sp_metadata = _debug_normal_to_sp_indices_extend(
-            sp_size, extend_seq_lens_cpu
-        )
+                sp_size, extend_seq_lens_cpu
+            )
 
     init_args = {
-        "sp_size": sp_size, "sp_rank": sp_rank,
+        "sp_size": sp_size,
+        "sp_rank": sp_rank,
         "sp_to_normal_indices": sp_to_normal_indices,
         "sp_local_token_length": sp_local_token_length,
         "sp_local_token_offset": sp_local_token_offset,
@@ -292,7 +298,5 @@ def init_sequence_parallel_args(model_runner: "ModelRunner",
         "flashinfer_prefill_wrapper_sp_full": model_runner.flashinfer_prefill_wrapper_sp_full,
         "flashinfer_prefill_wrapper_sp_causal": model_runner.flashinfer_prefill_wrapper_sp_causal,
     }
-    aux_args = {
-        "normal_to_sp_indices": normal_to_sp_indices
-    }
+    aux_args = {"normal_to_sp_indices": normal_to_sp_indices}
     return init_args, aux_args
