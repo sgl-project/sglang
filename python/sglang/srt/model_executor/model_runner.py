@@ -319,10 +319,14 @@ class ModelRunner:
 
         if self.sliding_window_size is None:
             self.flashinfer_workspace_buffer = torch.empty(
-                global_config.flashinfer_workspace_size, dtype=torch.uint8, device="cuda"
+                global_config.flashinfer_workspace_size,
+                dtype=torch.uint8,
+                device="cuda",
             )
-            self.flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-                self.flashinfer_workspace_buffer, "NHD"
+            self.flashinfer_prefill_wrapper_ragged = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.flashinfer_workspace_buffer, "NHD"
+                )
             )
             self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
                 self.flashinfer_workspace_buffer, "NHD"
