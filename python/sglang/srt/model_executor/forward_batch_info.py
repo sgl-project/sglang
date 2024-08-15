@@ -194,6 +194,7 @@ class InputMetadata:
             if (
                 forward_mode != ForwardMode.DECODE
                 and int(torch.sum(ret.seq_lens)) > 4096
+                and model_runner.sliding_window_size is None
             ):
                 flashinfer_use_ragged = True
             ret.init_flashinfer_handlers(
@@ -322,22 +323,25 @@ def update_flashinfer_indices(
                 1,
             )
     else:
+        # window attention use paged only
         kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
         for wrapper_id in range(2):
-            if flashinfer_use_ragged and wrapper_id == 1:
-                # full attention use ragged+paged
-                paged_kernel_lens = prefix_lens
+            if wrapper_id == 0:
+                if forward_mode == ForwardMode.DECODE:
+                    paged_kernel_lens = torch.minimum(
+                        seq_lens, torch.tensor(model_runner.sliding_window_size + 1)
+                    )
+                else:
+                    paged_kernel_lens = torch.minimum(
+                        seq_lens,
+                        torch.tensor(model_runner.sliding_window_size)
+                        + seq_lens
+                        - prefix_lens,
+                    )
             else:
-                # window attention use paged only
                 paged_kernel_lens = seq_lens
 
-            if wrapper_id == 0 and forward_mode == ForwardMode.DECODE:
-                paged_kernel_lens = torch.minimum(
-                    paged_kernel_lens, torch.tensor(model_runner.sliding_window_size)
-                )
-                kv_start_idx = seq_lens - paged_kernel_lens
-            else:
-                kv_start_idx = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+            kv_start_idx = seq_lens - paged_kernel_lens
 
             kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
             kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -376,17 +380,6 @@ def update_flashinfer_indices(
                 )
                 qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
 
-                if flashinfer_use_ragged and wrapper_id == 1:
-                    model_runner.flashinfer_prefill_wrapper_ragged.end_forward()
-                    model_runner.flashinfer_prefill_wrapper_ragged.begin_forward(
-                        qo_indptr,
-                        qo_indptr,
-                        num_qo_heads,
-                        num_kv_heads,
-                        head_dim,
-                    )
-
-                # cached part
                 model_runner.flashinfer_prefill_wrapper_paged[wrapper_id].end_forward()
                 model_runner.flashinfer_prefill_wrapper_paged[wrapper_id].begin_forward(
                     qo_indptr,
