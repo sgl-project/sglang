@@ -26,7 +26,6 @@ from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -40,6 +39,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitProcessorOutput, LogitsProcessor
+from sglang.srt.layers.parallel_utils import get_kv_tensor_model_parallel_world_size
+from sglang.srt.layers.sp_linear import QKVParallelLinear, RowSeqParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
@@ -99,20 +100,28 @@ class LlamaAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        # This is KV_TP_SIZE * SP_SIZE
         tp_size = get_tensor_model_parallel_world_size()
+        # This is the KV-TP size
+        kv_tp_size = get_kv_tensor_model_parallel_world_size()
+        # Sequence parallel size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
+        # num_heads is partitioned by both TP and SP so here use tp_size which
+        # represents the total TP x SP parallelism.
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
+        # num_kv_heads is partitioned only by TP so here use kv_tp_size which
+        # represents the KV-TP parallelism.
+        if self.total_num_kv_heads >= kv_tp_size:
+            # Number of KV heads is greater than KV-TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % kv_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert kv_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // kv_tp_size)
         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
@@ -132,9 +141,12 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = RowSeqParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
+            self.total_num_heads,
+            self.num_kv_heads,
+            self.head_dim,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
@@ -162,8 +174,7 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = self.qkv_proj(hidden_states)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
@@ -312,6 +323,11 @@ class LlamaForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> LogitProcessorOutput:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
+        if input_metadata.sp_size > 1:
+            hidden_states = hidden_states[
+                input_metadata.sp_to_normal_indices
+            ].contiguous()
+            input_ids = input_ids[input_metadata.sp_to_normal_indices].contiguous()
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
@@ -342,11 +358,14 @@ class LlamaForCausalLM(nn.Module):
     ):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
+            ("qkv_proj.kv_proj", "k_proj", "k"),
+            ("qkv_proj.kv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+        ]
+        renamed_params_mapping = [
+            # (param_name, weight_name)
+            ("qkv_proj.q_proj", "q_proj"),
         ]
         params_dict = dict(self.named_parameters())
 
@@ -376,6 +395,10 @@ class LlamaForCausalLM(nn.Module):
                     return
                 if name.startswith("model.vision_tower") and name not in params_dict:
                     return
+                for param_name, weight_name in renamed_params_mapping:
+                    if weight_name not in name:
+                        return
+                    name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

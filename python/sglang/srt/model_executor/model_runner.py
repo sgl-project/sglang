@@ -33,14 +33,11 @@ from flashinfer import (
 from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
-from vllm.distributed import (
-    get_tp_group,
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from vllm.distributed import get_tp_group, init_distributed_environment
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
+from sglang.srt.layers.parallel_utils import initialize_model_parallel
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -73,6 +70,8 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        sp_rank: int = 0,
+        sp_size: int = 1,
     ):
         # Parse args
         self.model_config = model_config
@@ -80,6 +79,8 @@ class ModelRunner:
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.sp_rank = sp_rank
+        self.sp_size = sp_size
         self.nccl_port = nccl_port
         self.server_args = server_args
         self.is_multimodal_model = is_multimodal_model(self.model_config)
@@ -110,7 +111,10 @@ class ModelRunner:
             local_rank=self.gpu_id,
             distributed_init_method=nccl_init_method,
         )
-        initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+        initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            sequence_parallel_size=self.sp_size,
+        )
         self.tp_group = get_tp_group()
         total_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
@@ -211,15 +215,18 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and self.server_args.enable_mla
         ):
+            # FIXME: temporarily disable SP with MLA
+            assert self.sp_size == 1, "sequence parallel with MLA not supported"
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * self.model_config.num_hidden_layers
                 * torch._utils._element_size(self.dtype)
             )
         else:
+            kv_tp_size = self.tp_size // self.sp_size
+            head_num = self.model_config.get_num_kv_heads(kv_tp_size)
             cell_size = (
-                self.model_config.get_num_kv_heads(self.tp_size)
-                * self.model_config.head_dim
+                head_num * self.model_config.head_dim
                 * self.model_config.num_hidden_layers
                 * 2
                 * torch._utils._element_size(self.dtype)
@@ -233,6 +240,11 @@ class ModelRunner:
     def init_memory_pool(
         self, total_gpu_memory, max_num_reqs=None, max_total_tokens=None
     ):
+        if self.tp_size % self.sp_size != 0:
+            raise ValueError(
+                f"Invalid sequence parallel configuration. tp_size={self.tp_size} "
+                f"must be divisible by sp_size={self.sp_size}"
+            )
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
@@ -267,6 +279,8 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and self.server_args.enable_mla
         ):
+            # FIXME: temporarily disable SP with MLA
+            assert self.sp_size == 1, "sequence parallel with MLA not supported"
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.dtype,
@@ -278,10 +292,11 @@ class ModelRunner:
             # FIXME: temporarily only Triton MLA is supported
             self.server_args.disable_flashinfer = True
         else:
+            kv_tp_size = self.tp_size // self.sp_size
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.dtype,
-                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_num=self.model_config.get_num_kv_heads(kv_tp_size),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
             )
@@ -307,6 +322,9 @@ class ModelRunner:
             self.flashinfer_prefill_wrapper_ragged = None
             self.flashinfer_prefill_wrapper_paged = None
             self.flashinfer_decode_wrapper = None
+            # NOTE: for sequence parallel, we need to use a dedicated kernel for cross-shard attn.
+            self.flashinfer_prefill_wrapper_sp_full = None
+            self.flashinfer_prefill_wrapper_sp_causal = None
             return
 
         if not _grouped_size_compiled_for_decode_kernels(
@@ -317,9 +335,12 @@ class ModelRunner:
         else:
             use_tensor_cores = False
 
+        self.flashinfer_prefill_wrapper_sp_full = None
+        self.flashinfer_prefill_wrapper_sp_causal = None
         if self.sliding_window_size is None:
+            num_buffers = 2 + (self.sp_size > 1) * 2
             self.flashinfer_workspace_buffers = torch.empty(
-                2,
+                num_buffers,
                 global_config.flashinfer_workspace_size,
                 dtype=torch.uint8,
                 device="cuda",
@@ -337,6 +358,17 @@ class ModelRunner:
                 "NHD",
                 use_tensor_cores=use_tensor_cores,
             )
+            if self.sp_size > 1:  # Sequence parallel enabled.
+                self.flashinfer_prefill_wrapper_sp_full = (
+                    BatchPrefillWithRaggedKVCacheWrapper(
+                        self.flashinfer_workspace_buffers[2], "NHD"
+                    )
+                )
+                self.flashinfer_prefill_wrapper_sp_causal = (
+                    BatchPrefillWithRaggedKVCacheWrapper(
+                        self.flashinfer_workspace_buffers[3], "NHD"
+                    )
+                )
         else:
             self.flashinfer_workspace_buffers = torch.empty(
                 4,
