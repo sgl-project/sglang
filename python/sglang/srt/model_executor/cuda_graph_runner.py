@@ -124,8 +124,8 @@ class CudaGraphRunner:
             )
         else:
             self.flashinfer_workspace_buffer = [
-                self.model_runner.flashinfer_workspace_buffer
-                self.model_runner.flashinfer_workspace_buffer
+                self.model_runner.flashinfer_workspace_buffer,
+                self.model_runner.flashinfer_workspace_buffer,
             ]
             self.flashinfer_kv_indptr = [
                 self.flashinfer_kv_indptr,
