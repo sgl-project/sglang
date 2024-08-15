@@ -44,6 +44,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.constrained import disable_cache
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.managers.controller_flex import (
+    start_controller_process as start_controller_process_flex,
+)
 from sglang.srt.managers.controller_multi import (
     start_controller_process as start_controller_process_multi,
 )
@@ -294,7 +297,7 @@ def launch_server(
     if server_args.dp_size == 1:
         start_process = start_controller_process_single
     else:
-        start_process = start_controller_process_multi
+        start_process = start_controller_process_flex
     proc_controller = mp.Process(
         target=start_process,
         args=(server_args, port_args, pipe_controller_writer, model_overide_args),
