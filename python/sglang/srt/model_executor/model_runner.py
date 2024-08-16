@@ -38,6 +38,7 @@ from vllm.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
@@ -112,9 +113,12 @@ class ModelRunner:
             distributed_init_method=nccl_init_method,
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
-        self.tp_group = get_tp_group()
         total_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
+        )
+        self.tp_group = get_tp_group()
+        self.is_multi_node_tp = not all(
+            in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)
         )
 
         if self.tp_size > 1:
