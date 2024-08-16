@@ -1,6 +1,26 @@
 import base64
 import io
+import os
 import sys
+
+import requests
+
+url = (
+    "https://github.com/EvolvingLMMs-Lab/sglang/raw/dev/onevision_main/assets/jobs.mp4"
+)
+
+cache_dir = os.path.expanduser("~/.cache")
+file_path = os.path.join(cache_dir, "jobs.mp4")
+
+os.makedirs(cache_dir, exist_ok=True)
+
+response = requests.get(url)
+response.raise_for_status()  # Raise an exception for bad responses
+
+with open(file_path, "wb") as f:
+    f.write(response.content)
+
+print(f"File downloaded and saved to: {file_path}")
 
 import numpy as np
 import openai
@@ -45,7 +65,7 @@ for chunk in request_1:
 
 print()  # Add a newline at the end of the stream
 
-video_path = "./assets/jobs.mp4"
+video_path = os.path.expanduser("~/.cache/jobs.mp4")
 max_frames_num = 32
 vr = VideoReader(video_path, ctx=cpu(0))
 total_frame_num = len(vr)
