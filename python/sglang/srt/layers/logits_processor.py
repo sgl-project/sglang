@@ -67,10 +67,12 @@ class LogitsMetadata:
 
 
 class LogitsProcessor(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, skip_all_gather: bool = False):
         super().__init__()
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.do_tensor_parallel_all_gather = (
+            not skip_all_gather and get_tensor_model_parallel_world_size() > 1
+        )
 
     def _get_normalized_prompt_logprobs(
         self, input_token_logprobs, logits_metadata: LogitsMetadata
@@ -159,7 +161,7 @@ class LogitsProcessor(nn.Module):
             last_hidden = hidden_states[last_index]
 
         last_logits = torch.matmul(last_hidden, weight.T)
-        if self.tp_size > 1:
+        if self.do_tensor_parallel_all_gather:
             last_logits = tensor_model_parallel_all_gather(last_logits)
         last_logits = last_logits[:, : self.config.vocab_size].float()
 
@@ -204,7 +206,7 @@ class LogitsProcessor(nn.Module):
                 )
             else:
                 all_logits = torch.matmul(hidden_states, weight.T)
-                if self.tp_size > 1:
+                if self.do_tensor_parallel_all_gather:
                     all_logits = tensor_model_parallel_all_gather(all_logits)
                 all_logits = all_logits[:, : self.config.vocab_size].float()
 

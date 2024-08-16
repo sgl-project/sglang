@@ -142,7 +142,7 @@ class CudaGraphRunner:
             set_torch_compile_config()
 
     def can_run(self, batch_size):
-        return batch_size < self.max_bs
+        return batch_size <= self.max_bs
 
     def capture(self, batch_size_list):
         self.batch_size_list = batch_size_list
@@ -239,12 +239,23 @@ class CudaGraphRunner:
             return forward(input_ids, input_metadata.positions, input_metadata)
 
         for _ in range(2):
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+
             run_once()
 
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+
         torch.cuda.synchronize()
+        self.model_runner.tp_group.barrier()
+
         with torch.cuda.graph(graph, pool=self.graph_memory_pool, stream=stream):
             out = run_once()
+
         torch.cuda.synchronize()
+        self.model_runner.tp_group.barrier()
+
         self.graph_memory_pool = graph.pool()
         return graph, None, out, flashinfer_decode_wrapper
 
@@ -278,7 +289,9 @@ class CudaGraphRunner:
         )
 
         # Replay
+        torch.cuda.synchronize()
         self.graphs[bs].replay()
+        torch.cuda.synchronize()
         output = self.output_buffers[bs]
 
         # Unpad
