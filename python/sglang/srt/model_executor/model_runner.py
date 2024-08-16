@@ -38,6 +38,7 @@ from vllm.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
@@ -167,15 +168,6 @@ class ModelRunner:
         self.dtype = vllm_model_config.dtype
         if self.model_config.model_overide_args is not None:
             vllm_model_config.hf_config.update(self.model_config.model_overide_args)
-
-        if (
-            self.server_args.efficient_weight_load
-            and "llama" in self.server_args.model_path.lower()
-            and self.server_args.quantization == "fp8"
-        ):
-            from sglang.srt.model_loader.model_loader import get_model
-        else:
-            from vllm.model_executor.model_loader import get_model
 
         self.model = get_model(
             model_config=vllm_model_config,
@@ -342,15 +334,10 @@ class ModelRunner:
                 dtype=torch.uint8,
                 device="cuda",
             )
-            self.flashinfer_prefill_wrapper_ragged = []
+            self.flashinfer_prefill_wrapper_ragged = None
             self.flashinfer_prefill_wrapper_paged = []
             self.flashinfer_decode_wrapper = []
             for i in range(2):
-                self.flashinfer_prefill_wrapper_ragged.append(
-                    BatchPrefillWithRaggedKVCacheWrapper(
-                        self.flashinfer_workspace_buffer, "NHD"
-                    )
-                )
                 self.flashinfer_prefill_wrapper_paged.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.flashinfer_workspace_buffer, "NHD"

@@ -456,16 +456,8 @@ class ServerArgs:
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
         if "gemma-2" in self.model_path.lower():
-            logger.info(
-                f"When using sliding window in gemma-2, disable radix_cache, regex_jump_forward, and turn on flashinfer."
-            )
-            # FIXME: compatibility with radix attention
-            self.disable_radix_cache = True
-            # FIXME: compatibility with jump forward
-            self.disable_regex_jump_forward = True
+            logger.info(f"When using sliding window in gemma-2, turn on flashinfer.")
             self.disable_flashinfer = False
-            # FIXME: compatibility with chunked prefill
-            self.chunked_prefill_size = None
 
 
 @dataclasses.dataclass
