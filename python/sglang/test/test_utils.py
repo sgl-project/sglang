@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import multiprocessing
+import os
 import subprocess
 import threading
 import time
@@ -22,10 +23,17 @@ from sglang.utils import get_exception_traceback
 
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-DEFAULT_URL_FOR_MOE_TEST = "http://127.0.0.1:6157"
-DEFAULT_URL_FOR_ACCURACY_TEST = "http://127.0.0.1:7157"
-DEFAULT_URL_FOR_UNIT_TEST = "http://127.0.0.1:8157"
-DEFAULT_URL_FOR_E2E_TEST = "http://127.0.0.1:9157"
+
+if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+    DEFAULT_URL_FOR_MOE_TEST = "http://127.0.0.1:6157"
+    DEFAULT_URL_FOR_ACCURACY_TEST = "http://127.0.0.1:7157"
+    DEFAULT_URL_FOR_UNIT_TEST = "http://127.0.0.1:8157"
+    DEFAULT_URL_FOR_E2E_TEST = "http://127.0.0.1:9157"
+else:
+    DEFAULT_URL_FOR_MOE_TEST = "http://127.0.0.1:1157"
+    DEFAULT_URL_FOR_ACCURACY_TEST = "http://127.0.0.1:1257"
+    DEFAULT_URL_FOR_UNIT_TEST = "http://127.0.0.1:1357"
+    DEFAULT_URL_FOR_E2E_TEST = "http://127.0.0.1:1457"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
