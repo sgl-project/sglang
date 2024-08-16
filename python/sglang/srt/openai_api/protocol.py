@@ -16,7 +16,7 @@ limitations under the License.
 """Pydantic models for OpenAI API protocol"""
 
 import time
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 
 from pydantic import BaseModel, Field
 from typing_extensions import Literal
@@ -259,6 +259,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     user: Optional[str] = None
+    tools: Optional[List[Dict[str, Any]]] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
@@ -270,6 +271,7 @@ class ChatCompletionRequest(BaseModel):
 class ChatMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 class ChatCompletionResponseChoice(BaseModel):

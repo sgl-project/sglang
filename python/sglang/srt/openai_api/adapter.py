@@ -22,6 +22,7 @@ import time
 import uuid
 from http import HTTPStatus
 from typing import Dict, List, Optional
+import random
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -710,7 +711,7 @@ def v1_chat_generate_request(all_requests, tokenizer_manager):
             # Apply chat template and its stop strings.
             if chat_template_name is None:
                 prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
-                    request.messages, tokenize=True, add_generation_prompt=True
+                    request.messages, request.tools, tokenize=True, add_generation_prompt=True
                 )
                 stop = request.stop
                 image_data = None
@@ -819,6 +820,41 @@ def v1_chat_generate_response(request, ret, to_file=False):
         else:
             choice_logprobs = None
 
+        # ----
+        # Lets parse the response for tool support
+        llm_output = ret_item["text"]
+        llm_output = ">>>" + llm_output
+        chunks = llm_output.split(">>>")
+        chunks = [chunk.strip() for chunk in chunks if len(chunk.strip()) > 0]
+        tool_calls = []
+        text_content = None
+        for chunk in chunks:
+            # format: function_name\narguments<end_of_functioncall>
+            index = chunk.find("\n")
+            func_name = chunk[:index].strip()
+            arguments = chunk[index + 1 :].strip()
+            if func_name == "all":
+                text_content = arguments
+            else:
+                tool_calls.append(
+                    {
+                        "function": {"name": func_name, "arguments": arguments},
+                        "id": "".join(
+                            random.choices(
+                                "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+                                k=29,
+                            )
+                        ),
+                        "type": "function",
+                    }
+                )
+        if len(tool_calls) == 0:
+            tool_calls = None
+            print("No tool calls found in the response")
+
+        print(f"Tool calls: {tool_calls}")
+
+
         if to_file:
             # to make the choice data json serializable
             choice_data = {
@@ -832,7 +868,7 @@ def v1_chat_generate_response(request, ret, to_file=False):
         else:
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
-                message=ChatMessage(role="assistant", content=ret_item["text"]),
+                message=ChatMessage(role="assistant", content=text_content, tool_calls=tool_calls,
                 logprobs=choice_logprobs,
                 finish_reason=format_finish_reason(
                     ret_item["meta_info"]["finish_reason"]
