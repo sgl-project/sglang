@@ -329,6 +329,9 @@ class ScheduleBatch:
     out_cache_loc: torch.Tensor = None
     extend_num_tokens: int = None
 
+    # For mixed chunekd prefill
+    prefix_lens_cpu: List[int] = None
+
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
@@ -462,8 +465,32 @@ class ScheduleBatch:
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+        self.prefix_lens_cpu = [len(r.prefix_indices) for r in reqs]
 
         self.batch_sampling_params(vocab_size)
+
+    def mix_with_running(self, running_batch: "ScheduleBatch"):
+        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+        prefix_lens_cpu = [len(r.prefix_indices) for r in self.reqs]
+        prefix_lens_cpu.extend(
+            [
+                len(r.origin_input_ids) + len(r.output_ids) - 1
+                for r in running_batch.reqs
+            ]
+        )
+
+        for req in running_batch.reqs:
+            req.fill_ids = req.origin_input_ids + req.output_ids
+            req.extend_input_len = 1
+
+        input_ids = torch.cat([self.input_ids, running_batch.input_ids])
+        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        extend_num_tokens = self.extend_num_tokens + running_batch.batch_size()
+        self.merge(running_batch)
+        self.input_ids = input_ids
+        self.out_cache_loc = out_cache_loc
+        self.extend_num_tokens = extend_num_tokens
+        self.prefix_lens_cpu = prefix_lens_cpu
 
     def check_decode_mem(self):
         bs = self.batch_size()

@@ -9,7 +9,7 @@ https://arxiv.org/abs/2107.03374 https://github.com/openai/human-eval/
 import random
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import tqdm
 
@@ -61,7 +61,7 @@ def evaluate_functional_correctness(
 class HumanEval(Eval):
     def __init__(
         self,
-        num_examples: int | None,
+        num_examples: Optional[int],
         num_threads: int,
         num_samples_per_task: int = 5,
         ks_passes: List[int] = [1, 2, 5],
