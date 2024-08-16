@@ -5,9 +5,7 @@ import sys
 
 import requests
 
-url = (
-    "https://github.com/EvolvingLMMs-Lab/sglang/raw/dev/onevision_main/assets/jobs.mp4"
-)
+url = "https://github.com/EvolvingLMMs-Lab/sglang/blob/dev/onevision_local/assets/jobs.mp4"
 
 cache_dir = os.path.expanduser("~/.cache")
 file_path = os.path.join(cache_dir, "jobs.mp4")
