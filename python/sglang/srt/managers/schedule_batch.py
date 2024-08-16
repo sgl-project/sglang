@@ -21,7 +21,9 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
+import torch.distributed as dist
 from flashinfer.sampling import top_k_top_p_sampling_from_probs
+from vllm.distributed import get_tensor_model_parallel_group
 
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.global_config import global_config
@@ -751,7 +753,7 @@ class ScheduleBatch:
                 )
             self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
 
-    def sample(self, logits: torch.Tensor):
+    def sample(self, logits: torch.Tensor, is_multi_node_tp=False):
         # TODO(lsyin): move this into a part of layer and run with CUDA Graph
         # Post process logits
         logits = logits.contiguous()
@@ -805,6 +807,16 @@ class ScheduleBatch:
                     )
 
         self.penalizer_orchestrator.cumulate_output_tokens(batch_next_token_ids)
+
+        if is_multi_node_tp:
+            # If the tensor parallelism spans across multiple nodes, there is some indeterminism
+            # that can cause the TP workers to generate different tokens, so we need to
+            # sync here
+            torch.distributed.all_reduce(
+                batch_next_token_ids,
+                op=dist.ReduceOp.MIN,
+                group=get_tensor_model_parallel_group().device_group,
+            )
 
         return batch_next_token_ids
 
