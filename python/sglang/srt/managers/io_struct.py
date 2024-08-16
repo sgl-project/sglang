@@ -51,8 +51,6 @@ class GenerateReqInput:
     return_text_in_logprobs: bool = False
     # Whether to stream output.
     stream: bool = False
-    # Whether echo the input.
-    echo: bool = False
 
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (

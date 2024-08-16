@@ -443,7 +443,6 @@ def v1_generate_request(all_requests):
         top_logprobs_num=top_logprobs_nums,
         return_text_in_logprobs=True,
         stream=all_requests[0].stream,
-        echo=all_requests[0].echo,
     )
 
     if len(all_requests) == 1:
