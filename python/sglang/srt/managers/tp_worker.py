@@ -85,10 +85,6 @@ class ModelTpServer:
         self.schedule_policy = server_args.schedule_policy
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
 
-        # Chunked prefill
-        self.chunked_prefill_size = server_args.chunked_prefill_size
-        self.current_inflight_req = None
-
         # Init model and tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,
@@ -174,6 +170,10 @@ class ModelTpServer:
         self.stream_interval = server_args.stream_interval
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
+
+        # Chunked prefill
+        self.chunked_prefill_size = server_args.chunked_prefill_size
+        self.current_inflight_req = None
 
         # Init the FSM cache for constrained generation
         if not server_args.skip_tokenizer_init:
@@ -444,7 +444,9 @@ class ModelTpServer:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
                 output = self.model_runner.forward(batch, ForwardMode.EXTEND)
-                next_token_ids = batch.sample(output.next_token_logits)
+                next_token_ids = batch.sample(
+                    output.next_token_logits, self.model_runner.is_multi_node_tp
+                )
 
                 # Move logprobs to cpu
                 if output.next_token_logprobs is not None:
@@ -603,7 +605,9 @@ class ModelTpServer:
 
         # Forward and sample the next tokens
         output = self.model_runner.forward(batch, ForwardMode.DECODE)
-        next_token_ids = batch.sample(output.next_token_logits)
+        next_token_ids = batch.sample(
+            output.next_token_logits, self.model_runner.is_multi_node_tp
+        )
 
         # Move logprobs to cpu
         if output.next_token_logprobs is not None:
