@@ -15,9 +15,10 @@ limitations under the License.
 
 """Cache for the compressed finite state machine."""
 
+from outlines.fsm.json_schema import build_regex_from_schema
+
 from sglang.srt.constrained import RegexGuide, TransformerTokenizer
 from sglang.srt.constrained.base_tool_cache import BaseToolCache
-from outlines.fsm.json_schema import build_regex_from_schema
 
 
 class FSMCache(BaseToolCache):

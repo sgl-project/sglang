@@ -18,14 +18,16 @@ class TestJSONConstrained(unittest.TestCase):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_UNIT_TEST
         cls.api_key = "sk-123456"
-        cls.json_schema = json.dumps({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "pattern": "^[\\w]+$"},
-                "population": {"type": "integer"}
-            },
-            "required": ["name", "population"]
-        })
+        cls.json_schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "pattern": "^[\\w]+$"},
+                    "population": {"type": "integer"},
+                },
+                "required": ["name", "population"],
+            }
+        )
         cls.process = popen_launch_server(
             cls.model, cls.base_url, timeout=300, api_key=cls.api_key
         )
@@ -62,7 +64,6 @@ class TestJSONConstrained(unittest.TestCase):
             raise
         assert isinstance(js_obj["name"], str)
         assert isinstance(js_obj["population"], int)
-
 
     def test_json_generate(self):
         self.run_decode()

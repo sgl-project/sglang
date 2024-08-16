@@ -359,7 +359,9 @@ class ModelTpServer:
 
             # Init regex fsm fron json
             if req.sampling_params.json_schema is not None:
-                req.regex_fsm, computed_regex_string = self.json_fsm_cache.query(req.sampling_params.json_schema)
+                req.regex_fsm, computed_regex_string = self.json_fsm_cache.query(
+                    req.sampling_params.json_schema
+                )
                 if not self.disable_regex_jump_forward:
                     req.jump_forward_map = self.jump_forward_cache.query(
                         computed_regex_string
