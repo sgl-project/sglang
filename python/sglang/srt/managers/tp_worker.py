@@ -174,6 +174,9 @@ class ModelTpServer:
         # Chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
         self.current_inflight_req = None
+        self.is_mixed_chunk = (
+            self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
+        )
 
         # Init the FSM cache for constrained generation
         if not server_args.skip_tokenizer_init:
@@ -366,11 +369,14 @@ class ModelTpServer:
         # Get priority queue
         prefix_computed = self.scheduler.calc_priority(self.waiting_queue)
 
+        num_mixed_running = running_bs if self.is_mixed_chunk else 0
+
         adder = PrefillAdder(
             self.tree_cache,
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
             self.max_prefill_tokens,
             self.chunked_prefill_size,
+            num_mixed_running,
         )
 
         if self.running_batch is not None:
@@ -416,15 +422,27 @@ class ModelTpServer:
                 )
             else:
                 tree_cache_hit_rate = 0.0
-            logger.info(
-                f"[gpu={self.gpu_id}] Prefill batch. "
-                f"#new-seq: {len(can_run_list)}, "
-                f"#new-token: {adder.log_input_tokens}, "
-                f"#cached-token: {adder.log_hit_tokens}, "
-                f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
-                f"#running-req: {running_bs}, "
-                f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
-            )
+
+            if num_mixed_running > 0:
+                logger.info(
+                    f"[gpu={self.gpu_id}] Prefill batch"
+                    f"(mixed #running-req: {num_mixed_running}). "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
+                )
+            else:
+                logger.info(
+                    f"[gpu={self.gpu_id}] Prefill batch. "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"#running-req: {running_bs}, "
+                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
+                )
 
         # Return the new batch
         new_batch = ScheduleBatch.init_new(
@@ -439,6 +457,13 @@ class ModelTpServer:
     def forward_prefill_batch(self, batch: ScheduleBatch):
         # Build batch tensors
         batch.prepare_for_extend(self.model_config.vocab_size)
+
+        decoding_reqs = []
+        if self.is_mixed_chunk and self.running_batch is not None:
+            self.running_batch.prepare_for_decode()
+            batch.mix_with_running(self.running_batch)
+            decoding_reqs = self.running_batch.reqs
+            self.running_batch = None
 
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
@@ -481,7 +506,8 @@ class ModelTpServer:
 
                 if req.finished():
                     self.tree_cache.cache_finished_req(req)
-                else:
+                elif req not in decoding_reqs:
+                    # To reduce overhead, only cache prefill reqs
                     self.tree_cache.cache_unfinished_req(req)
 
                 if req is self.current_inflight_req:

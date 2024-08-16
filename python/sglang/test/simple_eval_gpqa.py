@@ -8,6 +8,7 @@ https://arxiv.org/abs/2311.12022
 
 import random
 import re
+from typing import Optional
 
 import pandas
 
@@ -28,7 +29,7 @@ class GPQAEval(Eval):
     def __init__(
         self,
         filename: str,
-        num_examples: int | None,
+        num_examples: Optional[int],
         num_threads: int,
         n_repeats: int = 1,
     ):

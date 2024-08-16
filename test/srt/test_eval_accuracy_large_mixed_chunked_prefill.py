@@ -19,7 +19,13 @@ class TestEvalAccuracyLargeChunkedPrefill(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=300,
-            other_args=["--log-level-http", "warning", "--chunked-prefill-size", "256"],
+            other_args=[
+                "--log-level-http",
+                "warning",
+                "--chunked-prefill-size",
+                "256",
+                "--enable-mixed-chunk",
+            ],
         )
 
     @classmethod
