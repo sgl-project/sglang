@@ -102,7 +102,7 @@ class LogitsProcessor(nn.Module):
         return normalized_prompt_logprobs
 
     @staticmethod
-    def get_top_logprobs(all_logprobs, logits_metadata: LogitsMetadata):
+    def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
         if logits_metadata.forward_mode == ForwardMode.DECODE:
             output_top_logprobs = []
             max_k = max(logits_metadata.top_logprobs_nums)
@@ -116,7 +116,7 @@ class LogitsProcessor(nn.Module):
             # TODO: vectorize the code below
             input_top_logprobs, output_top_logprobs = [], []
             pt = 0
-            extend_seq_lens_cpu = logits_metadata.extend_seq_lens.tolist()
+            extend_seq_lens_cpu = logits_metadata.extend_seq_lens_cpu
 
             max_k = max(logits_metadata.top_logprobs_nums)
             ret = all_logprobs.topk(max_k, dim=1)
@@ -124,26 +124,30 @@ class LogitsProcessor(nn.Module):
             indices = ret.indices.tolist()
 
             for i, extend_seq_len in enumerate(extend_seq_lens_cpu):
+                start_len = logits_metadata.logprob_start_lens_cpu[i]
+                pruned_len = extend_seq_len - start_len
+
                 if extend_seq_len == 0:
                     input_top_logprobs.append([])
                     output_top_logprobs.append([])
                     continue
+
                 k = logits_metadata.top_logprobs_nums[i]
                 input_top_logprobs.append(
                     [
                         list(zip(values[pt + j][:k], indices[pt + j][:k]))
-                        for j in range(extend_seq_len - 1)
+                        for j in range(pruned_len - 1)
                     ]
                 )
                 output_top_logprobs.append(
                     list(
                         zip(
-                            values[pt + extend_seq_len - 1][:k],
-                            indices[pt + extend_seq_len - 1][:k],
+                            values[pt + pruned_len - 1][:k],
+                            indices[pt + pruned_len - 1][:k],
                         )
                     )
                 )
-                pt += extend_seq_len
+                pt += pruned_len
 
             return input_top_logprobs, output_top_logprobs
 
@@ -270,6 +274,9 @@ class LogitsProcessor(nn.Module):
                     cum_start_len1,
                     logits_metadata,
                 )
+
+                # Remove the last token logprob for the prefill tokens.
+                input_token_logprobs = input_token_logprobs[:-1]
 
                 return LogitProcessorOutput(
                     next_token_logits=last_logits,
