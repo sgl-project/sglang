@@ -39,6 +39,7 @@ def tanh(x):
     # Tanh is just a scaled sigmoid
     return 2 * tl.sigmoid(2 * x) - 1
 
+
 @triton.jit
 def _fwd_kernel_stage1(
     Q,
@@ -268,6 +269,7 @@ def _decode_softmax_reducev_fwd(
         num_stages=3,
     )
 
+
 @triton.jit
 def _fwd_grouped_kernel_stage1(
     Q,
@@ -297,7 +299,7 @@ def _fwd_grouped_kernel_stage1(
     start_n = tl.program_id(2)
 
     cur_head = cur_kv_head * kv_group_num + tl.arange(0, BLOCK_H)
-    mask_h = cur_head < (cur_kv_head+1) * kv_group_num
+    mask_h = cur_head < (cur_kv_head + 1) * kv_group_num
     mask_h = mask_h & (cur_head < q_head_num)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
@@ -312,7 +314,9 @@ def _fwd_grouped_kernel_stage1(
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
-        off_qpe = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+        off_qpe = (
+            cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+        )
 
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
@@ -320,7 +324,9 @@ def _fwd_grouped_kernel_stage1(
     block_mask = tl.where(block_stard_index < cur_batch_seq_len, 1, 0)
 
     for start_mark in range(0, block_mask, 1):
-        q = tl.load(Q + offs_q + start_mark, mask=mask_h[:, None]).to(REDUCE_TRITON_TYPE)
+        q = tl.load(Q + offs_q + start_mark, mask=mask_h[:, None]).to(
+            REDUCE_TRITON_TYPE
+        )
         offs_n_new = cur_batch_start_index + offs_n
         k_loc = tl.load(
             Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + offs_n_new,
@@ -339,7 +345,9 @@ def _fwd_grouped_kernel_stage1(
         ).to(REDUCE_TRITON_TYPE)
         qk = tl.dot(q, k)
         if BLOCK_DPE > 0:
-            qpe = tl.load(Q + off_qpe + start_mark, mask=mask_h[:, None]).to(REDUCE_TRITON_TYPE)
+            qpe = tl.load(Q + off_qpe + start_mark, mask=mask_h[:, None]).to(
+                REDUCE_TRITON_TYPE
+            )
             offs_buf_kpe = (
                 k_loc[None, :] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
@@ -356,9 +364,15 @@ def _fwd_grouped_kernel_stage1(
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
 
-        offs_o = cur_head[:, None] * att_stride_h + (cur_batch_in_all_start_index + offs_n[None, :])
+        offs_o = cur_head[:, None] * att_stride_h + (
+            cur_batch_in_all_start_index + offs_n[None, :]
+        )
 
-        tl.store(Att_Out + offs_o, qk, mask=mask_h[:, None] & (offs_n_new[None, :] < cur_batch_end_index))
+        tl.store(
+            Att_Out + offs_o,
+            qk,
+            mask=mask_h[:, None] & (offs_n_new[None, :] < cur_batch_end_index),
+        )
 
 
 @triton.jit
@@ -386,7 +400,7 @@ def _fwd_grouped_kernel_stage2(
     cur_kv_head = tl.program_id(1)
 
     cur_head = cur_kv_head * kv_group_num + tl.arange(0, BLOCK_H)
-    mask_h = cur_head < (cur_kv_head+1) * kv_group_num
+    mask_h = cur_head < (cur_kv_head + 1) * kv_group_num
     mask_h = mask_h & (cur_head < q_head_num)
 
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
@@ -413,7 +427,9 @@ def _fwd_grouped_kernel_stage2(
             other=0,
         )
 
-        offs_qk = cur_head[:, None] * stride_logic_h + (cur_batch_start_loc + start_n + offs_n[None, :])
+        offs_qk = cur_head[:, None] * stride_logic_h + (
+            cur_batch_start_loc + start_n + offs_n[None, :]
+        )
 
         qk = tl.load(
             Logics + offs_qk,
@@ -465,7 +481,11 @@ def _decode_grouped_att_m_fwd(
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     BLOCK_H = max(16, triton.next_power_of_2(kv_group_num))
-    grid = (batch, triton.cdiv(head_num, min(BLOCK_H, kv_group_num)), triton.cdiv(max_len_in_batch, BLOCK))
+    grid = (
+        batch,
+        triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
+        triton.cdiv(max_len_in_batch, BLOCK),
+    )
 
     num_warps = 4
 
@@ -556,7 +576,7 @@ def decode_attention_fwd(
         att_m = torch.empty(
             (q.shape[-2], total_num_tokens), dtype=REDUCE_TORCH_TYPE, device="cuda"
         )
-    
+
     kv_group_num = q.shape[1] // v_buffer.shape[1]
 
     if kv_group_num == 1:
