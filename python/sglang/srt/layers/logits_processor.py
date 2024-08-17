@@ -55,6 +55,9 @@ class LogitsMetadata:
     extend_start_loc: Optional[torch.Tensor] = None
     top_logprobs_nums: Optional[List[int]] = None
 
+    extend_seq_lens_cpu: List[int] = None
+    logprob_start_lens_cpu: List[int] = None
+
     @classmethod
     def from_input_metadata(cls, input_metadata: InputMetadata):
         return cls(
@@ -63,6 +66,8 @@ class LogitsMetadata:
             extend_start_loc=input_metadata.extend_start_loc,
             return_logprob=input_metadata.return_logprob,
             top_logprobs_nums=input_metadata.top_logprobs_nums,
+            extend_seq_lens_cpu=input_metadata.extend_seq_lens_cpu,
+            logprob_start_lens_cpu=input_metadata.logprob_start_lens_cpu,
         )
 
 
@@ -75,12 +80,16 @@ class LogitsProcessor(nn.Module):
         )
 
     def _get_normalized_prompt_logprobs(
-        self, input_token_logprobs, logits_metadata: LogitsMetadata
+        self,
+        input_token_logprobs: torch.Tensor,
+        cum_start_len0: torch.Tensor,
+        cum_start_len1: torch.Tensor,
+        logits_metadata: LogitsMetadata,
     ):
         logprobs_cumsum = torch.cumsum(input_token_logprobs, dim=0, dtype=torch.float32)
 
-        start = logits_metadata.extend_start_loc.clone()
-        end = start + logits_metadata.extend_seq_lens - 2
+        start = logits_metadata.extend_start_loc.clone() - cum_start_len0
+        end = start + logits_metadata.extend_seq_lens - 2 - cum_start_len1
         start.clamp_(min=0, max=input_token_logprobs.shape[0] - 1)
         end.clamp_(min=0, max=input_token_logprobs.shape[0] - 1)
         sum_logp = (
@@ -205,7 +214,23 @@ class LogitsProcessor(nn.Module):
                     output_top_logprobs=output_top_logprobs,
                 )
             else:
-                all_logits = torch.matmul(hidden_states, weight.T)
+                pt, states, pruned_input_ids = 0, [], []
+                for i, extend_len in enumerate(logits_metadata.extend_seq_lens_cpu):
+                    start_len = logits_metadata.logprob_start_lens_cpu[i]
+                    states.append(hidden_states[pt + start_len : pt + extend_len])
+                    pruned_input_ids.append(input_ids[pt + start_len : pt + extend_len])
+                    pt += extend_len
+
+                states = torch.cat(states, dim=0)
+                pruned_input_ids = torch.cat(pruned_input_ids, dim=0)
+
+                cum_start_len1 = torch.tensor(
+                    logits_metadata.logprob_start_lens_cpu, device="cuda"
+                ).cumsum(0)
+                cum_start_len0 = torch.zeros_like(cum_start_len1)
+                cum_start_len0[1:] = cum_start_len1[:-1]
+
+                all_logits = torch.matmul(states, weight.T)
                 if self.do_tensor_parallel_all_gather:
                     all_logits = tensor_model_parallel_all_gather(all_logits)
                 all_logits = all_logits[:, : self.config.vocab_size].float()
@@ -230,17 +255,20 @@ class LogitsProcessor(nn.Module):
                 else:
                     input_top_logprobs = output_top_logprobs = None
 
-                last_logprobs = all_logprobs[last_index]
+                last_logprobs = all_logprobs[last_index - cum_start_len1]
 
                 # Compute the logprobs and normalized logprobs for the prefill tokens.
                 # Note that we pad a zero at the end of each sequence for easy computation.
                 input_token_logprobs = all_logprobs[
                     torch.arange(all_logprobs.shape[0], device="cuda"),
-                    torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
+                    torch.cat([pruned_input_ids[1:], torch.tensor([0], device="cuda")]),
                 ]
 
                 normalized_prompt_logprobs = self._get_normalized_prompt_logprobs(
-                    input_token_logprobs, logits_metadata
+                    input_token_logprobs,
+                    cum_start_len0,
+                    cum_start_len1,
+                    logits_metadata,
                 )
 
                 return LogitProcessorOutput(
