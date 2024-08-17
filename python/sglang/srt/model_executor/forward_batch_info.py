@@ -155,9 +155,12 @@ class InputMetadata:
             self.extend_seq_lens_cpu = extend_lens_cpu
             self.logprob_start_lens_cpu = [
                 (
-                    req.logprob_start_len - batch.prefix_lens_cpu[i]
+                    min(
+                        req.logprob_start_len - batch.prefix_lens_cpu[i],
+                        extend_lens_cpu[i] - 1,
+                    )
                     if req.logprob_start_len >= batch.prefix_lens_cpu[i]
-                    else extend_lens_cpu[i]  # Fake extend, actually decode
+                    else extend_lens_cpu[i] - 1  # Fake extend, actually decode
                 )
                 for i, req in enumerate(batch.reqs)
             ]
