@@ -34,7 +34,6 @@ from typing import Dict, List, Optional, Union
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
-import psutil
 import requests
 import uvicorn
 import uvloop

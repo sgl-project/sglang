@@ -17,7 +17,6 @@ limitations under the License.
 
 import asyncio
 import dataclasses
-import inspect
 from typing import List
 
 import uvloop
@@ -126,8 +125,6 @@ class DetokenizerManager:
                 spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
             )
 
-            # Trim stop str
-            # TODO(lmzheng): handle the case where multiple stop strs are hit
             output_strs = []
             for i in range(bs):
                 s = self.decode_status[recv_obj.rids[i]]
@@ -144,6 +141,7 @@ class DetokenizerManager:
 
                 output_strs.append(s.decoded_text + new_text)
 
+                # Trim stop str. TODO(lmzheng): handle the case where multiple stop strs are hit
                 if isinstance(recv_obj.finished_reason[i], FINISH_MATCHED_STR):
                     pos = output_strs[i].find(recv_obj.finished_reason[i].matched)
                     if pos != -1:
