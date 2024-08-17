@@ -148,6 +148,11 @@ class ModelRunner:
             f"[gpu={self.gpu_id}] Load weight begin. "
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
+        if torch.cuda.get_device_capability()[0] < 8:
+            logger.info(
+                "Compute capability below sm80 use float16 due to lack of bfloat16 support."
+            )
+            self.server_args.dtype = "float16"
 
         monkey_patch_vllm_dummy_weight_loader()
         device_config = DeviceConfig()
