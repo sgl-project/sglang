@@ -15,6 +15,7 @@ limitations under the License.
 
 """ModelRunner runs the forward passes of the models."""
 
+import gc
 import importlib
 import importlib.resources
 import logging
@@ -22,7 +23,6 @@ import pkgutil
 import warnings
 from functools import lru_cache
 from typing import Optional, Type
-import gc
 
 import torch
 import torch.nn as nn
@@ -177,7 +177,9 @@ class ModelRunner:
 
         self.dtype = self.vllm_model_config.dtype
         if self.model_config.model_overide_args is not None:
-            self.vllm_model_config.hf_config.update(self.model_config.model_overide_args)
+            self.vllm_model_config.hf_config.update(
+                self.model_config.model_overide_args
+            )
 
         self.model = get_model(
             model_config=self.vllm_model_config,
@@ -206,11 +208,16 @@ class ModelRunner:
         )
 
     def update_weights(self, model_path, load_format):
-        from vllm.model_executor.model_loader.utils import set_default_torch_dtype
-        from vllm.model_executor.model_loader.loader import get_model_loader
-        from vllm.model_executor.model_loader.loader import device_loading_context
-        from vllm.model_executor.model_loader.loader import DefaultModelLoader
-        from vllm.model_executor.model_loader.utils import get_model_architecture
+        from vllm.model_executor.model_loader.loader import (
+            DefaultModelLoader,
+            device_loading_context,
+            get_model_loader,
+        )
+        from vllm.model_executor.model_loader.utils import (
+            get_model_architecture,
+            set_default_torch_dtype,
+        )
+
         target_device = torch.device(self.device_config.device)
 
         try:
@@ -229,23 +236,23 @@ class ModelRunner:
             return False, "Failed to update model weights"
 
         logger.info("start updating weights")
-        
+
         load_config = LoadConfig(load_format=self.server_args.load_format)
         loader = get_model_loader(load_config)
         if not isinstance(loader, DefaultModelLoader):
             logger.error("Failed to get weights iterator: Unsupported loader")
             return False, "Failed to update model weights"
-        
 
         def get_weight_iter(config):
-            iter = loader._get_weights_iterator(config.model,
-                                                config.revision,
-                                                fall_back_to_pt=getattr(
-                                                self.model,
-                                                "fall_back_to_pt_during_load",
-                                                True))
+            iter = loader._get_weights_iterator(
+                config.model,
+                config.revision,
+                fall_back_to_pt=getattr(
+                    self.model, "fall_back_to_pt_during_load", True
+                ),
+            )
             return iter
-        
+
         def model_load_weights(model, iter):
             model.load_weights(iter)
             for _, module in self.model.named_modules():
@@ -269,7 +276,9 @@ class ModelRunner:
             try:
                 model = model_load_weights(self.model, iter)
             except Exception as e:
-                logger.error(f"Failed to update weights: {e}. \n Rolling back to original weights")
+                logger.error(
+                    f"Failed to update weights: {e}. \n Rolling back to original weights"
+                )
                 del iter
                 gc.collect()
                 iter = get_weight_iter(self.vllm_model_config)
@@ -280,7 +289,7 @@ class ModelRunner:
         self.server_args.load_format = load_format
         self.vllm_model_config = model_config
         self.load_config = load_config
-            
+
         logger.info("finish updating weights")
         return True, "Updating model weights succeeded"
 

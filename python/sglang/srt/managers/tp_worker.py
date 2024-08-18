@@ -40,7 +40,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightReqInput,
-    UpdateWeightReqOutput
+    UpdateWeightReqOutput,
 )
 from sglang.srt.managers.policy_scheduler import PolicyScheduler, PrefillAdder
 from sglang.srt.managers.schedule_batch import (
@@ -802,9 +802,11 @@ class ModelTpServer:
                 if req.rid == recv_req.rid:
                     req.finished_reason = FINISH_ABORT()
                     break
-    
+
     def update_weights(self, recv_req):
-        success, message = self.model_runner.update_weights(recv_req.model_path, recv_req.load_format)
+        success, message = self.model_runner.update_weights(
+            recv_req.model_path, recv_req.load_format
+        )
         if success:
             self.flush_cache()
         return success, message

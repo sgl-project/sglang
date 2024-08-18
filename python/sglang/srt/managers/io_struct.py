@@ -289,6 +289,7 @@ class UpdateWeightReqOutput:
     success: bool
     message: str
 
+
 @dataclass
 class AbortReq:
     # The request id

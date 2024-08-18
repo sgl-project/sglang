@@ -51,8 +51,11 @@ from sglang.srt.managers.controller_single import (
     start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
-from sglang.srt.managers.io_struct import UpdateWeightReqInput
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    UpdateWeightReqInput,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
@@ -119,6 +122,7 @@ async def flush_cache():
         status_code=200,
     )
 
+
 @app.post("/update_weights")
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
 
@@ -127,15 +131,14 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
     print(content)
     if success:
         return JSONResponse(
-        content,
-        status_code=HTTPStatus.OK,
-    )
+            content,
+            status_code=HTTPStatus.OK,
+        )
     else:
         return JSONResponse(
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
-
 
 
 async def generate_request(obj: GenerateReqInput, request: Request):

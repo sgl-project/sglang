@@ -47,7 +47,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightReqInput,
-    UpdateWeightReqOutput
+    UpdateWeightReqOutput,
 )
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.sampling_params import SamplingParams
@@ -552,9 +552,9 @@ class TokenizerManager:
 
     async def handle_loop(self):
         while True:
-            recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, UpdateWeightReqOutput] = (
-                await self.recv_from_detokenizer.recv_pyobj()
-            )
+            recv_obj: Union[
+                BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, UpdateWeightReqOutput
+            ] = await self.recv_from_detokenizer.recv_pyobj()
 
             if isinstance(recv_obj, UpdateWeightReqOutput):
                 model_update_result.set_result(recv_obj)
