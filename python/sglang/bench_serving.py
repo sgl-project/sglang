@@ -226,68 +226,7 @@ async def async_request_ginfer(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
-    import grpc
-    from xlm.proto import sampler_pb2, sampler_pb2_grpc
-
-    sampler_channel = grpc.aio.insecure_channel(request_func_input.api_url)
-    sampler = sampler_pb2_grpc.SamplerStub(sampler_channel)
-
-    prompt = f"Human: {request_func_input.prompt}<|separator|>\n\nAssistant:"
-
-    # TODO: We use a special rng seed to represent "ignore_eos".
-    # Later, we should move this to the proto
-    IGNORE_EOS_RNG_SEED = 3892593487
-
-    sample_request = sampler_pb2.SampleTextRequest(
-        prompt=prompt,
-        settings=sampler_pb2.SampleSettings(
-            max_len=request_func_input.output_len,
-            rng_seed=0 if args.disable_ignore_eos else IGNORE_EOS_RNG_SEED,
-            temperature=1e-10,
-            nucleus_p=1,
-            stop_strings=["<|eos|>"] if args.disable_ignore_eos else [],
-        ),
-    )
-
-    output = RequestFuncOutput()
-    output.prompt_len = request_func_input.prompt_len
-
-    generated_text = ""
-    ttft = 0.0
-    st = time.perf_counter()
-    most_recent_timestamp = st
-
-    try:
-        stream = sampler.SampleText(sample_request)
-        async for out in stream:
-            timestamp = time.perf_counter()
-
-            # First token
-            if ttft == 0.0:
-                ttft = time.perf_counter() - st
-                output.ttft = ttft
-
-            # Decoding phase
-            else:
-                output.itl.append(timestamp - most_recent_timestamp)
-
-            most_recent_timestamp = timestamp
-            generated_text += out.text
-
-        output.generated_text = generated_text
-        output.success = True
-        output.latency = timestamp - st
-        output.output_len = request_func_input.output_len
-    except Exception:
-        output.success = False
-        exc_info = sys.exc_info()
-        output.error = "".join(traceback.format_exception(*exc_info))
-
-    # print(prompt, output.generated_text)
-
-    if pbar:
-        pbar.update(1)
-    return output
+    raise NotImplementedError()
 
 
 def get_model(pretrained_model_name_or_path: str) -> str:
