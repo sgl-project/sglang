@@ -44,11 +44,6 @@ except ImportError:
 
 from sglang.srt.utils import is_multimodal_model
 
-_CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
-    ChatGLMConfig.model_type: ChatGLMConfig,
-    DbrxConfig.model_type: DbrxConfig,
-}
-
 
 def download_from_hf(model_path: str):
     if os.path.exists(model_path):

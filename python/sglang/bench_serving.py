@@ -222,7 +222,7 @@ async def async_request_openai_completions(
     return output
 
 
-async def async_request_ginfer(
+async def async_request_gserver(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
@@ -268,7 +268,7 @@ ASYNC_REQUEST_FUNCS = {
     "vllm": async_request_openai_completions,
     "lmdeploy": async_request_openai_completions,
     "trt": async_request_trt_llm,
-    "ginfer": async_request_ginfer,
+    "gserver": async_request_gserver,
 }
 
 
@@ -790,7 +790,7 @@ def run_benchmark(args_: argparse.Namespace):
             "lmdeploy": 23333,
             "vllm": 8000,
             "trt": 8000,
-            "ginfer": 9988,
+            "gserver": 9988,
         }.get(args.backend, 30000)
 
     api_url = (
@@ -813,7 +813,7 @@ def run_benchmark(args_: argparse.Namespace):
         if args.model is None:
             print("Please provide a model using `--model` when using `trt` backend.")
             sys.exit(1)
-    elif args.backend == "ginfer":
+    elif args.backend == "gserver":
         api_url = args.base_url if args.base_url else f"{args.host}:{args.port}"
         args.model = args.model or "default"
 
