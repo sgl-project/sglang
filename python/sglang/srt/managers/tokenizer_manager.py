@@ -46,6 +46,8 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateWeightReqInput,
+    UpdateWeightReqOutput
 )
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.sampling_params import SamplingParams
@@ -63,6 +65,10 @@ class ReqState:
     out_list: List
     finished: bool
     event: asyncio.Event
+
+
+model_update_lock = asyncio.Lock()
+model_update_result = None
 
 
 class TokenizerManager:
@@ -145,6 +151,11 @@ class TokenizerManager:
     ):
         if self.to_create_loop:
             self.create_handle_loop()
+
+        global model_update_lock
+
+        while model_update_lock.locked():
+            await asyncio.sleep(0.001)
 
         obj.post_init()
         is_single = obj.is_single
@@ -493,6 +504,26 @@ class TokenizerManager:
         req = FlushCacheReq()
         self.send_to_router.send_pyobj(req)
 
+    async def update_weights(self, obj: UpdateWeightReqInput, request):
+        global model_update_lock
+        global model_update_result
+        if self.to_create_loop:
+            self.create_handle_loop()
+        if not model_update_lock.locked():
+            async with model_update_lock:
+                while len(self.rid_to_state) > 0:
+                    await asyncio.sleep(1)
+                self.send_to_router.send_pyobj(obj)
+                model_update_result = asyncio.Future()
+                result = await model_update_result
+                if result.success:
+                    self.server_args.model_path = obj.model_path
+                    self.server_args.load_format = obj.load_format
+
+            return result.success, result.message
+        else:
+            return False, "Another update is in progress. Please try again later."
+
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
             return
@@ -521,12 +552,18 @@ class TokenizerManager:
 
     async def handle_loop(self):
         while True:
-            recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut] = (
+            recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, UpdateWeightReqOutput] = (
                 await self.recv_from_detokenizer.recv_pyobj()
             )
+
+            if isinstance(recv_obj, UpdateWeightReqOutput):
+                model_update_result.set_result(recv_obj)
+                continue
+
             assert isinstance(
                 recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)
             ), f"Unexpected obj received: {type(recv_obj)}"
+
             for i, rid in enumerate(recv_obj.rids):
                 state = self.rid_to_state.get(rid, None)
                 if state is None:

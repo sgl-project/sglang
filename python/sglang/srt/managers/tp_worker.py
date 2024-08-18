@@ -39,6 +39,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateWeightReqInput,
+    UpdateWeightReqOutput
 )
 from sglang.srt.managers.policy_scheduler import PolicyScheduler, PrefillAdder
 from sglang.srt.managers.schedule_batch import (
@@ -214,6 +216,9 @@ class ModelTpServer:
                     self.flush_cache()
                 elif isinstance(recv_req, AbortReq):
                     self.abort_request(recv_req)
+                elif isinstance(recv_req, UpdateWeightReqInput):
+                    success, message = self.update_weights(recv_req)
+                    self.out_pyobjs.append(UpdateWeightReqOutput(success, message))
                 else:
                     raise ValueError(f"Invalid request: {recv_req}")
 
@@ -797,6 +802,12 @@ class ModelTpServer:
                 if req.rid == recv_req.rid:
                     req.finished_reason = FINISH_ABORT()
                     break
+    
+    def update_weights(self, recv_req):
+        success, message = self.model_runner.update_weights(recv_req.model_path, recv_req.load_format)
+        if success:
+            self.flush_cache()
+        return success, message
 
 
 def run_tp_server(

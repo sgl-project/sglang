@@ -279,6 +279,17 @@ class FlushCacheReq:
 
 
 @dataclass
+class UpdateWeightReqInput:
+    model_path: str
+    load_format: str
+
+
+@dataclass
+class UpdateWeightReqOutput:
+    success: bool
+    message: str
+
+@dataclass
 class AbortReq:
     # The request id
     rid: str

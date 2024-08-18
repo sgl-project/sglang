@@ -22,6 +22,7 @@ import pkgutil
 import warnings
 from functools import lru_cache
 from typing import Optional, Type
+import gc
 
 import torch
 import torch.nn as nn
@@ -155,9 +156,9 @@ class ModelRunner:
             self.server_args.dtype = "float16"
 
         monkey_patch_vllm_dummy_weight_loader()
-        device_config = DeviceConfig()
-        load_config = LoadConfig(load_format=self.server_args.load_format)
-        vllm_model_config = VllmModelConfig(
+        self.device_config = DeviceConfig()
+        self.load_config = LoadConfig(load_format=self.server_args.load_format)
+        self.vllm_model_config = VllmModelConfig(
             model=self.server_args.model_path,
             quantization=self.server_args.quantization,
             tokenizer=None,
@@ -171,17 +172,17 @@ class ModelRunner:
         if is_llama3_405b_fp8_head_16(self.model_config) and self.tp_size <= 8:
             # A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints
             self.model_config.hf_config.num_key_value_heads = 8
-            vllm_model_config.hf_config.num_key_value_heads = 8
+            self.vllm_model_config.hf_config.num_key_value_heads = 8
             monkey_patch_vllm_qvk_linear_loader()
 
-        self.dtype = vllm_model_config.dtype
+        self.dtype = self.vllm_model_config.dtype
         if self.model_config.model_overide_args is not None:
-            vllm_model_config.hf_config.update(self.model_config.model_overide_args)
+            self.vllm_model_config.hf_config.update(self.model_config.model_overide_args)
 
         self.model = get_model(
-            model_config=vllm_model_config,
-            device_config=device_config,
-            load_config=load_config,
+            model_config=self.vllm_model_config,
+            device_config=self.device_config,
+            load_config=self.load_config,
             lora_config=None,
             multimodal_config=None,
             parallel_config=None,
@@ -203,6 +204,85 @@ class ModelRunner:
             f"dtype={self.dtype}, "
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
+
+    def update_weights(self, model_path, load_format):
+        from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+        from vllm.model_executor.model_loader.loader import get_model_loader
+        from vllm.model_executor.model_loader.loader import device_loading_context
+        from vllm.model_executor.model_loader.loader import DefaultModelLoader
+        from vllm.model_executor.model_loader.utils import get_model_architecture
+        target_device = torch.device(self.device_config.device)
+
+        try:
+            model_config = VllmModelConfig(
+                model=model_path,
+                quantization=self.server_args.quantization,
+                tokenizer=None,
+                tokenizer_mode=None,
+                trust_remote_code=self.server_args.trust_remote_code,
+                dtype=self.server_args.dtype,
+                seed=42,
+                skip_tokenizer_init=True,
+            )
+        except Exception as e:
+            logger.error(f"Failed to load model config: {e}")
+            return False, "Failed to update model weights"
+
+        logger.info("start updating weights")
+        
+        load_config = LoadConfig(load_format=self.server_args.load_format)
+        loader = get_model_loader(load_config)
+        if not isinstance(loader, DefaultModelLoader):
+            logger.error("Failed to get weights iterator: Unsupported loader")
+            return False, "Failed to update model weights"
+        
+
+        def get_weight_iter(config):
+            iter = loader._get_weights_iterator(config.model,
+                                                config.revision,
+                                                fall_back_to_pt=getattr(
+                                                self.model,
+                                                "fall_back_to_pt_during_load",
+                                                True))
+            return iter
+        
+        def model_load_weights(model, iter):
+            model.load_weights(iter)
+            for _, module in self.model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    # When quant methods need to process weights after loading
+                    # (for repacking, quantizing, etc), they expect parameters
+                    # to be on the global target device. This scope is for the
+                    # case where cpu offloading is used, where we will move the
+                    # parameters onto device for processing and back off after.
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+            return model
+
+        with set_default_torch_dtype(model_config.dtype):
+            try:
+                iter = get_weight_iter(model_config)
+            except Exception as e:
+                logger.error(f"Failed to get weights iterator: {e}")
+                return False, "Failed to update model"
+            try:
+                model = model_load_weights(self.model, iter)
+            except Exception as e:
+                logger.error(f"Failed to update weights: {e}. \n Rolling back to original weights")
+                del iter
+                gc.collect()
+                iter = get_weight_iter(self.vllm_model_config)
+                self.model = model_load_weights(self.model, iter)
+                return False, "Failed to update model"
+
+        self.server_args.model_path = model_path
+        self.server_args.load_format = load_format
+        self.vllm_model_config = model_config
+        self.load_config = load_config
+            
+        logger.info("finish updating weights")
+        return True, "Updating model weights succeeded"
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(
