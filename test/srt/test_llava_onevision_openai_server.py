@@ -74,7 +74,7 @@ def video_stream_request_test(client, video_path):
     video_request = client.chat.completions.create(
         model="default",
         messages=messages,
-        temperature=0.7,
+        temperature=0,
         max_tokens=1024,
         stream=True,
     )
@@ -112,7 +112,7 @@ def image_speed_test(client):
                 ],
             },
         ],
-        temperature=0.7,
+        temperature=0,
         max_tokens=1024,
     )
     end_time = time.time()
@@ -130,7 +130,7 @@ def video_speed_test(client, video_path):
     video_request = client.chat.completions.create(
         model="default",
         messages=messages,
-        temperature=0.7,
+        temperature=0,
         max_tokens=1024,
     )
     end_time = time.time()
@@ -170,7 +170,7 @@ def prepare_video_messages(video_path):
         )
         messages[0]["content"].append(frame_format.copy())
 
-    prompt = {"type": "text", "text": "What's in the video?"}
+    prompt = {"type": "text", "text": "Please describe the video in detail."}
     messages[0]["content"].append(prompt)
 
     return messages
