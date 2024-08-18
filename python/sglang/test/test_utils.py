@@ -112,7 +112,7 @@ def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
     return pred
 
 
-def call_generate_ginfer(prompt, temperature, max_tokens, stop=None, url=None):
+def call_generate_gserver(prompt, temperature, max_tokens, stop=None, url=None):
     raise NotImplementedError()
 
 
@@ -256,7 +256,7 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
             "vllm",
             "outlines",
             "lightllm",
-            "ginfer",
+            "gserver",
             "guidance",
             "lmql",
             "srt-raw",
@@ -277,7 +277,7 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
             "lightllm": 22000,
             "lmql": 23000,
             "srt-raw": 30000,
-            "ginfer": 9988,
+            "gserver": 9988,
         }
         args.port = default_port.get(args.backend, None)
     return args
@@ -313,8 +313,8 @@ def _get_call_generate(args: argparse.Namespace):
         return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "srt-raw":
         return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "ginfer":
-        return partial(call_generate_ginfer, url=f"{args.host}:{args.port}")
+    elif args.backend == "gserver":
+        return partial(call_generate_gserver, url=f"{args.host}:{args.port}")
     elif args.backend == "outlines":
         return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "guidance":
