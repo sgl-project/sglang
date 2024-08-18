@@ -992,7 +992,7 @@ if __name__ == "__main__":
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is 128.0.",
     )
-    parser.add_argument("--seed", type=int, default=1, help="Default is 0.")
+    parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
         "--multi",
         action="store_true",
