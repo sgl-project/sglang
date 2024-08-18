@@ -149,7 +149,7 @@ async def async_request_openai_completions(
         "completions"
     ), "OpenAI Completions API URL must end with 'completions'."
 
-    prompt = f"Human: {request_func_input.prompt}<|separator|>\n\nAssistant:"
+    prompt = request_func_input.prompt
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
