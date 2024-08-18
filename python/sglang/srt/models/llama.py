@@ -324,6 +324,37 @@ class LlamaForCausalLM(nn.Module):
         sample_output = self.sampler(logits_output, input_metadata.sampling_info)
         return sample_output, logits_output
 
+    def get_hidden_dim(self, module_name):
+        if module_name in ["qkv_proj", "o_proj"]:
+            return self.config.hidden_size, self.config.hidden_size
+        elif module_name == "gate_up_proj":
+            return self.config.hidden_size, self.config.intermediate_size
+        elif module_name == "down_proj":
+            return self.config.intermediate_size, self.config.hidden_size
+        else:
+            raise NotImplementedError()
+
+    def get_module_name(self, name):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id, num_shard)
+            ("qkv_proj", "q_proj", "q", 3),
+            ("qkv_proj", "k_proj", "k", 3),
+            ("qkv_proj", "v_proj", "v", 3),
+            ("gate_up_proj", "gate_proj", 0, 2),
+            ("gate_up_proj", "up_proj", 1, 2),
+        ]
+        for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
+            if weight_name in name:
+                return (
+                    name.replace(weight_name, param_name)[: -len(".weight")],
+                    num_shard,
+                )
+        return name[: -len(".weight")], 1
+
+    def get_num_params(self):
+        params_dict = dict(self.named_parameters())
+        return len(params_dict)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

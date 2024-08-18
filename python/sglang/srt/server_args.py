@@ -101,6 +101,10 @@ class ServerArgs:
     enable_mla: bool = False
     triton_attention_reduce_in_fp32: bool = False
 
+    # LoRA
+    lora_paths: Optional[List[str]] = None
+    max_loras_per_batch: Optional[int] = 8
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -520,6 +524,21 @@ class ServerArgs:
             "--efficient-weight-load",
             action="store_true",
             help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
+        )
+
+        # LoRA options
+        parser.add_argument(
+            "--lora-paths",
+            type=str,
+            nargs="*",
+            default=None,
+            help="The list of LoRA adapters.",
+        )
+        parser.add_argument(
+            "--max-loras-per-batch",
+            type=int,
+            default=8,
+            help="Maximum number of adapters for a running batch",
         )
 
     @classmethod

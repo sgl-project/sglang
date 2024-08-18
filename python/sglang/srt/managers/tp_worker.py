@@ -323,7 +323,15 @@ class ModelTpServer:
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
+        if isinstance(recv_req, TokenizedGenerateReqInput):
+            req = Req(
+                recv_req.rid,
+                recv_req.input_text,
+                recv_req.input_ids,
+                recv_req.lora_path,
+            )
+        else:
+            req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.tokenizer = self.tokenizer
         req.sampling_params = recv_req.sampling_params
         req.pixel_values = recv_req.pixel_values

@@ -21,6 +21,7 @@ from typing import List, Union
 
 import torch
 import torch.nn.functional as F
+from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.server import Runtime
@@ -95,7 +96,7 @@ class HFRunner:
         )
 
         if self.is_generation:
-            self.model = AutoModelForCausalLM.from_pretrained(
+            self.base_model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=False,
@@ -110,19 +111,33 @@ class HFRunner:
             )
 
         while True:
-            prompts, max_new_tokens = in_queue.get()
+            prompts, max_new_tokens, lora_paths = in_queue.get()
+            if lora_paths is not None:
+                assert len(prompts) == len(lora_paths)
+
             if prompts is not None:
                 if self.is_generation:
                     output_strs = []
                     top_input_logprobs = []
                     top_output_logprobs = []
-                    for p in prompts:
+                    for i, p in enumerate(prompts):
                         if isinstance(p, str):
                             input_ids = self.tokenizer.encode(
                                 p, return_tensors="pt"
                             ).cuda()
                         else:
                             input_ids = torch.tensor([p], device="cuda")
+
+                        if lora_paths is not None:
+                            self.model = PeftModel.from_pretrained(
+                                self.base_model,
+                                lora_paths[i],
+                                torch_dtype=torch_dtype,
+                                is_trainable=False,
+                            )
+                        else:
+                            self.model = self.base_model
+
 
                         outputs = self.model.generate(
                             input_ids,
@@ -167,8 +182,9 @@ class HFRunner:
         self,
         prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
         max_new_tokens=8,
+        lora_paths=None,
     ):
-        self.in_queue.put((prompts, max_new_tokens))
+        self.in_queue.put((prompts, max_new_tokens, lora_paths))
         return self.out_queue.get()
 
     def terminate(self):
@@ -191,6 +207,7 @@ class SRTRunner:
         is_generation,
         tp_size=1,
         port=DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
+        lora_paths=None,
     ):
         self.is_generation = is_generation
         self.runtime = Runtime(
@@ -201,12 +218,15 @@ class SRTRunner:
             mem_fraction_static=0.69,
             trust_remote_code=False,
             is_embedding=not self.is_generation,
+            lora_paths=lora_paths,
+            disable_cuda_graph=True,
         )
 
     def forward(
         self,
         prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
         max_new_tokens=8,
+        lora_paths=None,
     ):
         if self.is_generation:
             # the return value contains logprobs from prefill
@@ -214,9 +234,10 @@ class SRTRunner:
             top_input_logprobs = []
             top_output_logprobs = []
             sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
-            for prompt in prompts:
+            for i, prompt in enumerate(prompts):
                 response = self.runtime.generate(
                     prompt,
+                    lora_paths=lora_paths[i] if lora_paths else None,
                     sampling_params=sampling_params,
                     return_logprob=True,
                     logprob_start_len=0,

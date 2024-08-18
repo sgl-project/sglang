@@ -606,18 +606,20 @@ class Runtime:
 
     def generate(
         self,
-        prompt: Union[str, List[str]],
+        prompts: Union[str, List[str]],
         sampling_params: Optional[Dict] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_paths: Optional[List[Optional[str]]] = None,
     ):
         json_data = {
-            "text": prompt,
+            "text": prompts,
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
             "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
+            "lora_path": lora_paths,
         }
         response = requests.post(
             self.url + "/generate",
@@ -627,10 +629,10 @@ class Runtime:
 
     def encode(
         self,
-        prompt: Union[str, List[str]],
+        prompts: Union[str, List[str]],
     ):
         json_data = {
-            "text": prompt,
+            "text": prompts,
         }
         response = requests.post(
             self.url + "/encode",

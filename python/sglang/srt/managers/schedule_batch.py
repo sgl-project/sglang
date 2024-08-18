@@ -98,7 +98,7 @@ class FINISH_ABORT(BaseFinishReason):
 class Req:
     """Store all inforamtion of a request."""
 
-    def __init__(self, rid, origin_input_text, origin_input_ids):
+    def __init__(self, rid, origin_input_text, origin_input_ids, lora_path=None):
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
@@ -106,6 +106,7 @@ class Req:
         self.origin_input_ids = origin_input_ids
         self.output_ids = []  # Each decode stage's output ids
         self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
+        self.lora_path = lora_path
 
         # Memory info
         self.req_pool_idx = None
