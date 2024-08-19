@@ -232,7 +232,6 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
   - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.6-vicuna-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
   - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.6-34b --tokenizer-path liuhaotian/llava-v1.6-34b-tokenizer --port 30000`
   - `python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --tokenizer-path lmms-lab/llama3-llava-next-8b-tokenizer --port=30000 --host=127.0.0.1 --tp-size=1 --chat-template=llava_llama_3`
-  - `python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --tokenizer-path lmms-lab/llama3-llava-next-8b-tokenizer --port=30000 --host=127.0.0.1 --tp-size=1 --chat-template=llava_llama_3`  
   - `python -m sglang.launch_server --model-path lmms-lab/llava-next-72b --tokenizer-path lmms-lab/llavanext-qwen-tokenizer --port=30000 --host="127.0.0.1" --tp-size=8`
 - LLaVA-NeXT-Video
   - see [examples/usage/llava_video](examples/usage/llava_video)
