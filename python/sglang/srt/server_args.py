@@ -458,6 +458,9 @@ class ServerArgs:
         if "gemma-2" in self.model_path.lower():
             logger.info(f"When using sliding window in gemma-2, turn on flashinfer.")
             self.disable_flashinfer = False
+            self.disable_radix_cache = True
+            self.chunked_prefill_size = None
+            self.disable_regex_jump_forward = True
 
 
 @dataclasses.dataclass

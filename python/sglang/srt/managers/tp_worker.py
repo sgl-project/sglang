@@ -445,12 +445,22 @@ class ModelTpServer:
                 )
 
         # Return the new batch
-        new_batch = ScheduleBatch.init_new(
-            can_run_list,
-            self.req_to_token_pool,
-            self.token_to_kv_pool,
-            self.tree_cache,
-        )
+        if self.model_runner.sliding_window_size is None:
+            new_batch = ScheduleBatch.init_new(
+                can_run_list,
+                self.req_to_token_pool,
+                self.token_to_kv_pool,
+                self.tree_cache,
+            )
+        else:
+            new_batch = ScheduleBatch.init_new(
+                can_run_list,
+                self.req_to_token_pool,
+                self.token_to_kv_pool,
+                self.tree_cache,
+                self.model_runner.sliding_window_size,
+                self.model_runner.model.num_layer_blocks,
+            )
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
         return new_batch
 

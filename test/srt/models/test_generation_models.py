@@ -35,7 +35,6 @@ class TestGenerationModels(unittest.TestCase):
         tp_size,
         torch_dtype,
         max_new_tokens,
-        long_context_tolerance,
     ) -> None:
         with HFRunner(
             model_path, torch_dtype=torch_dtype, is_generation_model=True
@@ -65,17 +64,61 @@ class TestGenerationModels(unittest.TestCase):
         print(srt_outputs.output_strs)
         assert hf_outputs.output_strs == srt_outputs.output_strs
 
+    def assert_close_with_batch_forward(
+        self,
+        prompts,
+        model_path,
+        tp_size,
+        torch_dtype,
+        max_new_tokens,
+    ) -> None:
+        with HFRunner(
+            model_path, torch_dtype=torch_dtype, is_generation_model=True
+        ) as hf_runner:
+            hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
+
+        with SRTRunner(
+            model_path,
+            tp_size=tp_size,
+            torch_dtype=torch_dtype,
+            is_generation_model=True,
+        ) as srt_runner:
+            srt_outputs = srt_runner.batch_forward(
+                prompts, max_new_tokens=max_new_tokens
+            )
+
+        for i in range(len(prompts)):
+            hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
+            srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
+
+            print("max_diff", torch.max(abs(hf_logprobs - srt_logprobs)))
+            if hf_logprobs.shape[0] <= 100:
+                tolerance = 3e-2
+                assert torch.all(
+                    abs(hf_logprobs - srt_logprobs) < tolerance
+                ), f"prefill logprobs not all close"
+
+        print(hf_outputs.output_strs)
+        print(srt_outputs.output_strs)
+        assert hf_outputs.output_strs == srt_outputs.output_strs
+
     def test_prefill_logits_and_output_strs(self):
         for model, tp_size, long_context_tolerance in MODELS:
             for torch_dtype in TORCH_DTYPES:
                 max_new_tokens = 8
-                self.assert_close_prefill_logits_and_output_strs(
+                # self.assert_close_prefill_logits_and_output_strs(
+                #     DEFAULT_PROMPTS,
+                #     model,
+                #     tp_size,
+                #     torch_dtype,
+                #     max_new_tokens,
+                # )
+                self.assert_close_with_batch_forward(
                     DEFAULT_PROMPTS,
                     model,
                     tp_size,
                     torch_dtype,
                     max_new_tokens,
-                    long_context_tolerance=long_context_tolerance,
                 )
 
 

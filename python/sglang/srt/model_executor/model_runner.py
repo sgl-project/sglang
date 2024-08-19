@@ -45,6 +45,8 @@ from vllm.model_executor.models import ModelRegistry
 from sglang.global_config import global_config
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
+    InterleaveReqToTokenPool,
+    InterleaveTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -203,6 +205,7 @@ class ModelRunner:
             f"dtype={self.dtype}, "
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
+        print(f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB", flush=True)
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(
@@ -215,6 +218,14 @@ class ModelRunner:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * self.model_config.num_hidden_layers
+                * torch._utils._element_size(self.dtype)
+            )
+        elif self.sliding_window_size is not None:
+            cell_size = (
+                self.model_config.get_num_kv_heads(self.tp_size)
+                * self.model_config.head_dim
+                * self.model.num_layer_in_block
+                * 2
                 * torch._utils._element_size(self.dtype)
             )
         else:
@@ -260,14 +271,14 @@ class ModelRunner:
                 5120,
             )
 
-        self.req_to_token_pool = ReqToTokenPool(
-            max_num_reqs,
-            self.model_config.context_len + 8,
-        )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
             and self.server_args.enable_mla
         ):
+            self.req_to_token_pool = ReqToTokenPool(
+                max_num_reqs,
+                self.model_config.context_len + 8,
+            )
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.dtype,
@@ -278,7 +289,26 @@ class ModelRunner:
             logger.info("using MLA Triton implementaion, flashinfer is disabled")
             # FIXME: temporarily only Triton MLA is supported
             self.server_args.disable_flashinfer = True
+
+        elif self.sliding_window_size is not None:
+            self.req_to_token_pool = InterleaveReqToTokenPool(
+                max_num_reqs,
+                self.model_config.context_len + 8,
+                self.model.num_layer_blocks,
+            )
+            self.token_to_kv_pool = InterleaveTokenToKVPool(
+                self.max_total_num_tokens,
+                self.model.num_layer_blocks,
+                dtype=self.dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+            )
         else:
+            self.req_to_token_pool = ReqToTokenPool(
+                max_num_reqs,
+                self.model_config.context_len + 8,
+            )
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.dtype,
@@ -346,7 +376,7 @@ class ModelRunner:
             self.flashinfer_prefill_wrapper_ragged = None
             self.flashinfer_prefill_wrapper_paged = []
             self.flashinfer_decode_wrapper = []
-            for i in range(2):
+            for i in range(self.model.num_layer_blocks):
                 self.flashinfer_prefill_wrapper_paged.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.flashinfer_workspace_buffer, "NHD"

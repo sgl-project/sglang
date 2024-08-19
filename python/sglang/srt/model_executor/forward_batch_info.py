@@ -82,7 +82,7 @@ class InputMetadata:
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
     flashinfer_use_ragged: bool = False
 
-    def init_multimuldal_info(self, batch: ScheduleBatch):
+    def init_multimodal_info(self, batch: ScheduleBatch):
         reqs = batch.reqs
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
@@ -179,7 +179,7 @@ class InputMetadata:
             ret.total_num_tokens = int(torch.sum(ret.seq_lens))
 
         if forward_mode != ForwardMode.DECODE:
-            ret.init_multimuldal_info(batch)
+            ret.init_multimodal_info(batch)
 
         if model_runner.server_args.disable_flashinfer:
             ret.init_triton_args(batch)
@@ -323,10 +323,10 @@ def update_flashinfer_indices(
                 1,
             )
     else:
-        # window attention use paged only
+        # interleaved attention use paged only
         kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
-        for wrapper_id in range(2):
-            if wrapper_id == 0:
+        for layer_block_id in range(model_runner.model.num_layer_blocks):
+            if layer_block_id != 0:  # window attention
                 if forward_mode == ForwardMode.DECODE:
                     paged_kernel_lens = torch.minimum(
                         seq_lens, torch.tensor(model_runner.sliding_window_size + 1)
@@ -338,10 +338,11 @@ def update_flashinfer_indices(
                         + seq_lens
                         - prefix_lens,
                     )
-            else:
+            else:  # full attention
                 paged_kernel_lens = seq_lens
 
             kv_start_idx = seq_lens - paged_kernel_lens
+            # kv_start_idx = cached_lens - paged_kernel_lens
 
             kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
             kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -351,6 +352,7 @@ def update_flashinfer_indices(
                 [
                     model_runner.req_to_token_pool.req_to_token[
                         req_pool_indices_cpu[i],
+                        layer_block_id,
                         kv_start_idx[i] : kv_start_idx[i] + paged_kernel_lens_cpu[i],
                     ]
                     for i in range(batch_size)
@@ -363,8 +365,8 @@ def update_flashinfer_indices(
                 if flashinfer_decode_wrapper is None:
                     flashinfer_decode_wrapper = model_runner.flashinfer_decode_wrapper
 
-                flashinfer_decode_wrapper[wrapper_id].end_forward()
-                flashinfer_decode_wrapper[wrapper_id].begin_forward(
+                flashinfer_decode_wrapper[layer_block_id].end_forward()
+                flashinfer_decode_wrapper[layer_block_id].begin_forward(
                     kv_indptr,
                     kv_indices,
                     kv_last_page_len,
@@ -380,8 +382,12 @@ def update_flashinfer_indices(
                 )
                 qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
 
-                model_runner.flashinfer_prefill_wrapper_paged[wrapper_id].end_forward()
-                model_runner.flashinfer_prefill_wrapper_paged[wrapper_id].begin_forward(
+                model_runner.flashinfer_prefill_wrapper_paged[
+                    layer_block_id
+                ].end_forward()
+                model_runner.flashinfer_prefill_wrapper_paged[
+                    layer_block_id
+                ].begin_forward(
                     qo_indptr,
                     kv_indptr,
                     kv_indices,

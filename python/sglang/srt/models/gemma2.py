@@ -40,7 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import InterleaveRadixAttention
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
@@ -207,12 +207,14 @@ class Gemma2Attention(nn.Module):
         )
 
         use_sliding_window = layer_idx % 2 == 0 and hasattr(config, "sliding_window")
-        self.attn = RadixAttention(
+        self.attn = InterleaveRadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            layer_id=layer_idx,
+            layer_id=layer_idx // 2,
+            layer_block_id=1 if use_sliding_window else 0,
+            num_layer_blocks=2,
             sliding_window_size=get_window_size(config) if use_sliding_window else None,
             logit_cap=self.config.attn_logit_softcapping,
         )
@@ -392,6 +394,7 @@ class Gemma2ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.model = Gemma2Model(config, cache_config, quant_config)
         self.logits_processor = LogitsProcessor(config)
+        self._collect_layer_map_for_kv_pool()
 
     @torch.no_grad()
     def forward(
@@ -405,6 +408,12 @@ class Gemma2ForCausalLM(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens.weight, input_metadata
         )
+
+    def _collect_layer_map_for_kv_pool(self):
+        self.tot_num_layer = self.config.num_hidden_layers
+        self.num_layer_blocks = 2
+        self.num_layer_in_block = self.config.num_hidden_layers // 2
+        self.window_size = get_window_size(self.config)
 
     def get_window_size(self):
         return get_window_size(self.config)

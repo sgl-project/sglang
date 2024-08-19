@@ -170,6 +170,8 @@ class HFRunner:
     def __exit__(self, exc_type, exc_value, traceback):
         self.model_proc.terminate()
         self.in_queue = self.out_queue = None
+        del self.model_proc
+        del self.in_queue, self.out_queue
 
 
 class SRTRunner:
@@ -191,7 +193,7 @@ class SRTRunner:
             tp_size=tp_size,
             dtype=get_dtype_str(torch_dtype),
             port=port,
-            mem_fraction_static=0.7,
+            mem_fraction_static=0.6,
         )
 
     def forward(
@@ -228,6 +230,48 @@ class SRTRunner:
                     ]
                 )
 
+            return ModelOutput(
+                output_strs=output_strs, top_input_logprobs=top_input_logprobs
+            )
+        else:
+            response = self.runtime.encode(prompts)
+            response = json.loads(response)
+            logits = [x["embedding"] for x in response]
+            return ModelOutput(embed_logits=logits)
+
+    def batch_forward(
+        self,
+        prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
+        max_new_tokens=8,
+    ):
+        if self.is_generation_model:
+            # the return value contains logprobs from prefill
+            output_strs = []
+            top_input_logprobs = []
+            sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
+            response = self.runtime.generate(
+                prompts,
+                sampling_params=sampling_params,
+                return_logprob=True,
+                top_logprobs_num=NUM_TOP_LOGPROBS,
+            )
+            responses = json.loads(response)
+            for res in responses:
+                output_strs.append(res["text"])
+                top_input_logprobs.append(
+                    [
+                        [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
+                        for x in res["meta_info"]["input_top_logprobs"][1:]
+                    ]
+                    + [
+                        [
+                            tup[0]
+                            for tup in res["meta_info"]["output_top_logprobs"][0][
+                                :NUM_TOP_LOGPROBS
+                            ]
+                        ]
+                    ]
+                )
             return ModelOutput(
                 output_strs=output_strs, top_input_logprobs=top_input_logprobs
             )

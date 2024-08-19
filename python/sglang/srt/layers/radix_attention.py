@@ -117,13 +117,12 @@ class RadixAttention(nn.Module):
         return o
 
     def extend_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
-        # using two wrappers is unnecessary in the current PR, but are prepared for future PRs
         prefill_wrapper_paged = input_metadata.flashinfer_prefill_wrapper_paged
         if self.sliding_window_size != -1:
-            prefill_wrapper_paged = prefill_wrapper_paged[0]
+            prefill_wrapper_paged = prefill_wrapper_paged[1]
         else:
             if isinstance(prefill_wrapper_paged, list):
-                prefill_wrapper_paged = prefill_wrapper_paged[1]
+                prefill_wrapper_paged = prefill_wrapper_paged[0]
 
         if not input_metadata.flashinfer_use_ragged:
             if k is not None:
@@ -173,10 +172,10 @@ class RadixAttention(nn.Module):
     def decode_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         decode_wrapper = input_metadata.flashinfer_decode_wrapper
         if self.sliding_window_size != -1:
-            decode_wrapper = decode_wrapper[0]
+            decode_wrapper = decode_wrapper[1]
         else:
             if isinstance(decode_wrapper, list):
-                decode_wrapper = decode_wrapper[1]
+                decode_wrapper = decode_wrapper[0]
 
         if k is not None:
             assert v is not None
@@ -207,3 +206,87 @@ class RadixAttention(nn.Module):
         v_cache = input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id)
         k_cache[input_metadata.out_cache_loc] = cache_k
         v_cache[input_metadata.out_cache_loc] = cache_v
+
+
+class InterleaveRadixAttention(RadixAttention):
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        scaling: float,
+        num_kv_heads: int,
+        layer_id: int,  # layer_id in the memory pool
+        layer_block_id: int,
+        num_layer_blocks: int,
+        sliding_window_size: Optional[int] = None,
+        logit_cap: int = -1,
+        v_head_dim: int = -1,
+    ):
+        super().__init__(
+            num_heads,
+            head_dim,
+            scaling,
+            num_kv_heads,
+            layer_id,
+            sliding_window_size,
+            logit_cap,
+            v_head_dim,
+        )
+
+        self.layer_block_id = layer_block_id
+        self.num_layer_blocks = num_layer_blocks
+        assert (
+            not global_server_args_dict.get("disable_flashinfer", False)
+            and self.qk_head_dim == self.v_head_dim
+        )
+
+    def extend_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
+        prefill_wrapper_paged = input_metadata.flashinfer_prefill_wrapper_paged[
+            self.layer_block_id
+        ]
+
+        assert not input_metadata.flashinfer_use_ragged
+        if k is not None:
+            assert v is not None
+            self.store_kv_cache(k, v, input_metadata)
+
+        o = prefill_wrapper_paged.forward(
+            q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+            input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
+            causal=True,
+            sm_scale=self.scaling,
+            window_left=self.sliding_window_size,
+            logits_soft_cap=self.logit_cap,
+        )
+
+        return o.view(-1, self.tp_q_head_num * self.head_dim)
+
+    def decode_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
+        decode_wrapper = input_metadata.flashinfer_decode_wrapper[self.layer_block_id]
+
+        if k is not None:
+            assert v is not None
+            self.store_kv_cache(k, v, input_metadata)
+
+        o = decode_wrapper.forward(
+            q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+            input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
+            sm_scale=self.scaling,
+            logits_soft_cap=self.logit_cap,
+        )
+
+        return o.view(-1, self.tp_q_head_num * self.head_dim)
+
+    def store_kv_cache(self, cache_k, cache_v, input_metadata: InputMetadata):
+        k_cache = input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id)
+        v_cache = input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id)
+
+        if input_metadata.forward_mode == ForwardMode.DECODE:
+            k_cache[input_metadata.out_cache_loc[self.layer_block_id]] = cache_k
+            v_cache[input_metadata.out_cache_loc[self.layer_block_id]] = cache_v
+        else:
+            block_size = len(input_metadata.out_cache_loc) // self.num_layer_blocks
+            start = block_size * self.layer_block_id
+            end = start + block_size
+            k_cache[input_metadata.out_cache_loc[start:end]] = cache_k
+            v_cache[input_metadata.out_cache_loc[start:end]] = cache_v

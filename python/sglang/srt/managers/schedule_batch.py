@@ -343,8 +343,20 @@ class ScheduleBatch:
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
     logit_bias: torch.Tensor = None
 
+    # For interleaved attention
+    sliding_window_size: int = None
+    num_layer_blocks: int = None
+
     @classmethod
-    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+    def init_new(
+        cls,
+        reqs,
+        req_to_token_pool,
+        token_to_kv_pool,
+        tree_cache,
+        sliding_window_size=None,
+        num_layer_blocks=None,
+    ):
         return_logprob = any(req.return_logprob for req in reqs)
 
         return cls(
@@ -353,6 +365,8 @@ class ScheduleBatch:
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
             return_logprob=return_logprob,
+            sliding_window_size=sliding_window_size,
+            num_layer_blocks=num_layer_blocks,
         )
 
     def batch_size(self):
@@ -436,24 +450,44 @@ class ScheduleBatch:
 
         # Allocate memory
         req_pool_indices_cpu = self.alloc_req_slots(bs)
-        out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+        if self.sliding_window_size is None:
+            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+        else:
+            out_cache_loc = self.alloc_token_slots(
+                extend_num_tokens * self.num_layer_blocks
+            )
 
         pt = 0
-        for i, req in enumerate(reqs):
-            req.req_pool_idx = req_pool_indices_cpu[i]
-            pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
-            ext_len = seq_len - pre_len
-            seq_lens.append(seq_len)
+        if self.sliding_window_size is None:
+            for i, req in enumerate(reqs):
+                req.req_pool_idx = req_pool_indices_cpu[i]
+                pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
+                ext_len = seq_len - pre_len
+                seq_lens.append(seq_len)
 
-            if pre_len > 0:
+                if pre_len > 0:
+                    self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                        :pre_len
+                    ] = req.prefix_indices
+
                 self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    :pre_len
-                ] = req.prefix_indices
+                    pre_len:seq_len
+                ] = out_cache_loc[pt : pt + ext_len]
+                pt += ext_len
+        else:
+            for layer_block_id in range(self.num_layer_blocks):
+                for i, req in enumerate(reqs):
+                    req.req_pool_idx = req_pool_indices_cpu[i]
+                    pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
+                    ext_len = seq_len - pre_len
+                    if layer_block_id == 0:
+                        seq_lens.append(seq_len)
 
-            self.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
-                out_cache_loc[pt : pt + ext_len]
-            )
-            pt += ext_len
+                    assert pre_len == 0
+                    self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                        layer_block_id
+                    ][pre_len:seq_len] = out_cache_loc[pt : pt + ext_len]
+                    pt += ext_len
 
         # Set fields
         with torch.device("cuda"):
@@ -494,14 +528,22 @@ class ScheduleBatch:
 
     def check_decode_mem(self):
         bs = self.batch_size()
-        if self.token_to_kv_pool.available_size() >= bs:
-            return True
+        if self.sliding_window_size is None:
+            if self.token_to_kv_pool.available_size() >= bs:
+                return True
 
-        self.tree_cache.evict(bs, self.token_to_kv_pool.free)
+            self.tree_cache.evict(bs, self.token_to_kv_pool.free)
 
-        if self.token_to_kv_pool.available_size() >= bs:
-            return True
+            if self.token_to_kv_pool.available_size() >= bs:
+                return True
+        else:
+            if self.token_to_kv_pool.available_size() >= bs * self.num_layer_blocks:
+                return True
 
+            # self.tree_cache.evict(bs, self.token_to_kv_pool.free)
+
+            # if self.token_to_kv_pool.available_size() >= bs * self.num_layer_blocks:
+            #     return True
         return False
 
     def retract_decode(self):
@@ -518,10 +560,11 @@ class ScheduleBatch:
 
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
-        while (
-            self.token_to_kv_pool.available_size()
-            < len(sorted_indices) * global_config.retract_decode_steps
-        ):
+        num_blocks = 1 if self.sliding_window_size is None else self.num_layer_blocks
+        needed_num_tokens = (
+            len(sorted_indices) * global_config.retract_decode_steps * num_blocks
+        )
+        while self.token_to_kv_pool.available_size() < needed_num_tokens:
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 assert (
@@ -533,14 +576,34 @@ class ScheduleBatch:
             req = self.reqs[idx]
             retracted_reqs.append(req)
 
-            if isinstance(self.tree_cache, ChunkCache):
-                # ChunkCache does not have eviction
-                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    : seq_lens_cpu[idx]
-                ]
-                self.token_to_kv_pool.free(token_indices)
-                self.req_to_token_pool.free(req.req_pool_idx)
-                del self.tree_cache.entries[req.rid]
+            if self.sliding_window_size is None:
+                if isinstance(self.tree_cache, ChunkCache):
+                    # ChunkCache does not have eviction
+                    token_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx
+                    ][: seq_lens_cpu[idx]]
+                    self.token_to_kv_pool.free(token_indices)
+                    self.req_to_token_pool.free(req.req_pool_idx)
+                    del self.tree_cache.entries[req.rid]
+                else:
+                    # TODO: apply more fine-grained retraction
+                    last_uncached_pos = len(req.prefix_indices)
+                    token_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx
+                    ][last_uncached_pos : seq_lens_cpu[idx]]
+                    self.token_to_kv_pool.free(token_indices)
+                    self.req_to_token_pool.free(req.req_pool_idx)
+
+                    # release the last node
+                    self.tree_cache.dec_lock_ref(req.last_node)
+
+                    # NOTE(lsyin): we should use the newly evictable memory instantly.
+                    residual_size = (
+                        len(sorted_indices) * global_config.retract_decode_steps
+                        - self.token_to_kv_pool.available_size()
+                    )
+                    residual_size = max(0, residual_size)
+                    self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
             else:
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = len(req.prefix_indices)
@@ -551,15 +614,15 @@ class ScheduleBatch:
                 self.req_to_token_pool.free(req.req_pool_idx)
 
                 # release the last node
-                self.tree_cache.dec_lock_ref(req.last_node)
+                # self.tree_cache.dec_lock_ref(req.last_node)
 
                 # NOTE(lsyin): we should use the newly evictable memory instantly.
-                residual_size = (
-                    len(sorted_indices) * global_config.retract_decode_steps
-                    - self.token_to_kv_pool.available_size()
-                )
-                residual_size = max(0, residual_size)
-                self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
+                # residual_size = (
+                #     len(sorted_indices) * global_config.retract_decode_steps
+                #     - self.token_to_kv_pool.available_size()
+                # )
+                # residual_size = max(0, residual_size)
+                # self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
 
             req.prefix_indices = []
             req.last_node = None
@@ -669,12 +732,22 @@ class ScheduleBatch:
         self.seq_lens.add_(1)
 
         # Alloc mem
-        bs = self.batch_size()
-        self.out_cache_loc = self.alloc_token_slots(bs)
+        if self.sliding_window_size is None:
+            bs = self.batch_size()
+            self.out_cache_loc = self.alloc_token_slots(bs)
 
-        self.req_to_token_pool.req_to_token[
-            self.req_pool_indices, self.seq_lens - 1
-        ] = self.out_cache_loc
+            self.req_to_token_pool.req_to_token[
+                self.req_pool_indices, self.seq_lens - 1
+            ] = self.out_cache_loc
+        else:
+            bs = self.batch_size()
+            self.out_cache_loc = self.alloc_token_slots(
+                bs * self.num_layer_blocks
+            ).reshape(self.num_layer_blocks, -1)
+
+            self.req_to_token_pool.req_to_token[
+                self.req_pool_indices, :, self.seq_lens - 1
+            ] = self.out_cache_loc.transpose(0, 1)
 
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:

@@ -175,3 +175,56 @@ class MLATokenToKVPool(BaseTokenToKVPool):
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+
+class InterleaveReqToTokenPool(ReqToTokenPool):
+    """A memory pool that maps a request to its token locations."""
+
+    def __init__(self, size: int, max_context_len: int, num_layer_blocks: int):
+        self.size = size
+        self.free_slots = list(range(size))
+        self.req_to_token = torch.empty(
+            (size, num_layer_blocks, max_context_len), dtype=torch.int32, device="cuda"
+        )
+
+
+class InterleaveTokenToKVPool(BaseTokenToKVPool):
+
+    def __init__(
+        self,
+        size: int,
+        num_layer_blocks: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+    ):
+        self.size = size
+
+        # We also add one slot. This slot is used for writing dummy output from padded tokens.
+        self.mem_state = torch.ones((self.size + 1,), dtype=torch.bool, device="cuda")
+
+        # Prefetch buffer
+        self.prefetch_buffer = torch.empty(0, device="cuda", dtype=torch.int32)
+        self.prefetch_chunk_size = 8192
+
+        self.can_use_mem_size = self.size
+        self.clear()
+
+        self.k_buffer = [
+            torch.empty((self.size, head_num, head_dim), dtype=dtype, device="cuda")
+            for _ in range((layer_num - 1) // num_layer_blocks + 1)
+        ]
+        self.v_buffer = [
+            torch.empty((self.size, head_num, head_dim), dtype=dtype, device="cuda")
+            for _ in range((layer_num - 1) // num_layer_blocks + 1)
+        ]
+
+    def get_key_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id]
+
+    def get_value_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id], self.v_buffer[layer_id]
