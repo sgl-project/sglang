@@ -182,6 +182,7 @@ class InterleaveReqToTokenPool(ReqToTokenPool):
 
     def __init__(self, size: int, max_context_len: int, num_layer_blocks: int):
         self.size = size
+        self.num_layer_blocks = num_layer_blocks
         self.free_slots = list(range(size))
         self.req_to_token = torch.empty(
             (size, num_layer_blocks, max_context_len), dtype=torch.int32, device="cuda"
@@ -212,11 +213,11 @@ class InterleaveTokenToKVPool(BaseTokenToKVPool):
         self.clear()
 
         self.k_buffer = [
-            torch.empty((self.size, head_num, head_dim), dtype=dtype, device="cuda")
+            torch.empty((self.size + 1, head_num, head_dim), dtype=dtype, device="cuda")
             for _ in range((layer_num - 1) // num_layer_blocks + 1)
         ]
         self.v_buffer = [
-            torch.empty((self.size, head_num, head_dim), dtype=dtype, device="cuda")
+            torch.empty((self.size + 1, head_num, head_dim), dtype=dtype, device="cuda")
             for _ in range((layer_num - 1) // num_layer_blocks + 1)
         ]
 

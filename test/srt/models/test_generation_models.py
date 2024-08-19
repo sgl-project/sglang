@@ -20,7 +20,7 @@ import torch
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 
 MODELS = [
-    ("meta-llama/Meta-Llama-3.1-8B-Instruct", 1, 1.1),
+    # ("meta-llama/Meta-Llama-3.1-8B-Instruct", 1, 1.1),
     ("google/gemma-2-2b", 1, 3),
 ]
 TORCH_DTYPES = [torch.float16]

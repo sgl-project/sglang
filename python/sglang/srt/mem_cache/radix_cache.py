@@ -27,7 +27,11 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    BaseTokenToKVPool,
+    InterleaveReqToTokenPool,
+    ReqToTokenPool,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -101,18 +105,37 @@ class RadixCache(BasePrefixCache):
         """Cache request when it finishes."""
         if token_ids is None:
             token_ids = (req.origin_input_ids + req.output_ids)[:-1]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
+        if not isinstance(self.req_to_token_pool, InterleaveReqToTokenPool):
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(token_ids)
+            ]
+            if self.disable:
+                self.token_to_kv_pool.free(kv_indices)
+                self.req_to_token_pool.free(req.req_pool_idx)
+                return
 
-        if self.disable:
-            self.token_to_kv_pool.free(kv_indices)
+            # Radix Cache takes one ref in memory pool
+            new_prefix_len = self.insert(token_ids, kv_indices.clone())
+            self.token_to_kv_pool.free(
+                kv_indices[len(req.prefix_indices) : new_prefix_len]
+            )
+        else:
+            assert self.disable
+            self.token_to_kv_pool.free(
+                self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, 0, : len(token_ids)
+                ]
+            )
+            for layer_block_id in range(1, self.req_to_token_pool.num_layer_blocks):
+                self.token_to_kv_pool.free(
+                    self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx,
+                        layer_block_id,
+                        req.last_cached_token : len(token_ids),
+                    ]
+                )
             self.req_to_token_pool.free(req.req_pool_idx)
             return
-
-        # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(token_ids, kv_indices.clone())
-        self.token_to_kv_pool.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)

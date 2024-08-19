@@ -286,6 +286,7 @@ class ModelTpServer:
         if available_size != self.max_total_num_tokens:
             warnings.warn(
                 "Warning: "
+                f"{self.token_to_kv_pool.available_size()}, {self.tree_cache.evictable_size()}\n"
                 f"available_size={available_size}, max_total_num_tokens={self.max_total_num_tokens}\n"
                 "KV cache pool leak detected!"
             )
@@ -377,6 +378,16 @@ class ModelTpServer:
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             num_mixed_running,
+            num_layer_blocks=(
+                self.model_runner.model.num_layer_blocks
+                if hasattr(self.model_runner.model, "num_layer_blocks")
+                else None
+            ),
+            sliding_window_size=(
+                self.model_runner.model.window_size
+                if hasattr(self.model_runner.model, "window_size")
+                else None
+            ),
         )
 
         if self.running_batch is not None:

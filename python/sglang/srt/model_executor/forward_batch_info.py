@@ -342,7 +342,6 @@ def update_flashinfer_indices(
                 paged_kernel_lens = seq_lens
 
             kv_start_idx = seq_lens - paged_kernel_lens
-            # kv_start_idx = cached_lens - paged_kernel_lens
 
             kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
             kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)

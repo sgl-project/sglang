@@ -24,6 +24,7 @@ from typing import Dict, List, Optional
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import TreeNode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
@@ -112,6 +113,8 @@ class PrefillAdder:
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
+        num_layer_blocks: Optional[int] = None,
+        sliding_window_size: Optional[int] = None,
     ):
         self.tree_cache = tree_cache
         self.rem_total_tokens = rem_total_tokens - mixed_with_decode_tokens
@@ -124,6 +127,20 @@ class PrefillAdder:
         self.new_inflight_req = None
         self.log_hit_tokens = 0
         self.log_input_tokens = 0
+
+        self.num_layer_blocks = num_layer_blocks
+        self.sliding_window_size = sliding_window_size
+
+    def num_kv_cells(self, prefix_len, new_len, mode: ForwardMode):
+        if self.num_layer_blocks is None:
+            return new_len
+        else:
+            if mode == ForwardMode.EXTEND:
+                return new_len * self.num_layer_blocks
+            else:
+                window_part = max(self.sliding_window_size - prefix_len, 0)
+                ext_part = new_len
+                return window_part * (self.num_layer_blocks - 1) + ext_part
 
     def no_remaining_tokens(self):
         return (
@@ -141,9 +158,13 @@ class PrefillAdder:
     ):
         self.rem_total_tokens -= sum(
             [
-                min(
-                    (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                    CLIP_MAX_NEW_TOKENS,
+                self.num_kv_cells(
+                    len(r.prefix_indices) + len(r.output_ids),
+                    min(
+                        (r.sampling_params.max_new_tokens - len(r.output_ids)),
+                        CLIP_MAX_NEW_TOKENS,
+                    ),
+                    ForwardMode.DECODE,
                 )
                 * new_token_ratio
                 for r in running_batch.reqs
@@ -153,7 +174,12 @@ class PrefillAdder:
     def _prefill_one_req(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
-        self.rem_total_tokens -= extend_input_len + max_new_tokens
+        self.rem_total_tokens -= self.num_kv_cells(
+            prefix_len, extend_input_len, ForwardMode.EXTEND
+        )
+        self.rem_total_tokens -= self.num_kv_cells(
+            prefix_len + extend_input_len, max_new_tokens, ForwardMode.DECODE
+        )
         self.rem_input_tokens -= extend_input_len
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= extend_input_len
@@ -191,8 +217,13 @@ class PrefillAdder:
             self.rem_total_tokens += delta
 
     def add_one_req(self, req: Req):
-        total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+        total_tokens = self.num_kv_cells(
+            len(req.prefix_indices), req.extend_input_len, ForwardMode.EXTEND
+        )
+        total_tokens += self.num_kv_cells(
+            len(req.prefix_indices) + req.extend_input_len,
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+            ForwardMode.DECODE,
         )
         input_tokens = req.extend_input_len
         prefix_len = len(req.prefix_indices)

@@ -133,6 +133,8 @@ class Req:
         self.extend_input_len = 0
         self.prefix_indices = []
         self.last_node = None
+        # For interleaved attention
+        self.last_cached_token = -1
 
         # Sampling parameters
         self.sampling_params = None
@@ -452,13 +454,8 @@ class ScheduleBatch:
         req_pool_indices_cpu = self.alloc_req_slots(bs)
         if self.sliding_window_size is None:
             out_cache_loc = self.alloc_token_slots(extend_num_tokens)
-        else:
-            out_cache_loc = self.alloc_token_slots(
-                extend_num_tokens * self.num_layer_blocks
-            )
 
-        pt = 0
-        if self.sliding_window_size is None:
+            pt = 0
             for i, req in enumerate(reqs):
                 req.req_pool_idx = req_pool_indices_cpu[i]
                 pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
@@ -475,19 +472,36 @@ class ScheduleBatch:
                 ] = out_cache_loc[pt : pt + ext_len]
                 pt += ext_len
         else:
+            out_cache_loc = self.alloc_token_slots(
+                extend_num_tokens * self.num_layer_blocks
+            )
+
+            pt = 0
             for layer_block_id in range(self.num_layer_blocks):
                 for i, req in enumerate(reqs):
                     req.req_pool_idx = req_pool_indices_cpu[i]
                     pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
-                    ext_len = seq_len - pre_len
+                    assert pre_len == 0
+
                     if layer_block_id == 0:
                         seq_lens.append(seq_len)
+                        start = pre_len
+                    else:
+                        start = max(0, pre_len - self.sliding_window_size)
 
-                    assert pre_len == 0
+                    ext_len = seq_len - start
                     self.req_to_token_pool.req_to_token[req.req_pool_idx][
                         layer_block_id
-                    ][pre_len:seq_len] = out_cache_loc[pt : pt + ext_len]
+                    ][start:seq_len] = out_cache_loc[pt : pt + ext_len]
                     pt += ext_len
+
+                    if start > req.last_cached_token:
+                        self.req_to_token_pool.free(
+                            self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                                layer_block_id
+                            ][req.last_cached_token : start]
+                        )
+                        req.last_cached_token = start
 
         # Set fields
         with torch.device("cuda"):
@@ -748,6 +762,20 @@ class ScheduleBatch:
             self.req_to_token_pool.req_to_token[
                 self.req_pool_indices, :, self.seq_lens - 1
             ] = self.out_cache_loc.transpose(0, 1)
+
+            for layer_block_id in range(self.num_layer_blocks):
+                if layer_block_id > 0:
+                    end = self.seq_lens - self.sliding_window_size
+                    for i, req in enumerate(self.reqs):
+                        if end[i] > req.last_cached_token:
+                            self.token_to_kv_pool.free(
+                                self.req_to_token_pool.req_to_token[
+                                    req.req_pool_idx,
+                                    layer_block_id,
+                                    req.last_cached_token : end[i],
+                                ]
+                            )
+                            req.last_cached_token = end[i]
 
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:
