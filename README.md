@@ -89,7 +89,7 @@ docker run --gpus all \
 
 ### Method 5: Run on Kubernetes or Clouds with SkyPilot
 
-To deploy on Kubernetes or clouds, you can use [SkyPilot](https://github.com/skypilot-org/skypilot).
+To deploy on Kubernetes or 12+ clouds, you can use [SkyPilot](https://github.com/skypilot-org/skypilot).
 
 1. Install SkyPilot and set up Kubernetes cluster or cloud access: see [SkyPilot's documentation](https://skypilot.readthedocs.io/en/latest/getting-started/installation.html).
 2. Deploy on your own infra with a single command and get the HTTP API endpoint:
