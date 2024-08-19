@@ -209,6 +209,7 @@ class SRTRunner:
                     prompt,
                     sampling_params=sampling_params,
                     return_logprob=True,
+                    logprob_start_len=0,
                     top_logprobs_num=NUM_TOP_LOGPROBS,
                 )
                 response = json.loads(response)
