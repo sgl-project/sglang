@@ -70,13 +70,12 @@ class TestOpenAIServer(unittest.TestCase):
             assert isinstance(response.choices[0].logprobs.tokens[0], str)
             assert isinstance(response.choices[0].logprobs.top_logprobs[1], dict)
             ret_num_top_logprobs = len(response.choices[0].logprobs.top_logprobs[1])
+
             # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some out_put id maps to the same output token and duplicate in the map
             # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
+
             assert ret_num_top_logprobs > 0
-            if echo:
-                assert response.choices[0].logprobs.token_logprobs[0] == None
-            else:
-                assert response.choices[0].logprobs.token_logprobs[0] != None
+            assert response.choices[0].logprobs.token_logprobs[0] != None
 
         assert response.id
         assert response.created
