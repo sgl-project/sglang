@@ -429,10 +429,12 @@ class ServerArgs:
             action="store_true",
             help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
         )
-        parser.add_argument('--disable-custom-all-reduce',
-             action='store_true',
-             default=False,
-             help='Disable the custom all-reduce kernel and fall back to NCCL.')
+        parser.add_argument(
+            "--disable-custom-all-reduce",
+            action="store_true",
+            default=False,
+            help="Disable the custom all-reduce kernel and fall back to NCCL.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
