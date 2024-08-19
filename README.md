@@ -123,6 +123,7 @@ HF_TOKEN=<secret> sky launch -c sglang --env HF_TOKEN sglang.yaml
 # Get the HTTP API endpoint
 sky status --endpoint 30000 sglang
 ```
+3. To further scale up your deployment with autoscaling and failure recovery, check out the [SkyServe + SGLang guide](https://github.com/skypilot-org/skypilot/tree/master/llm/sglang#serving-llama-2-with-sglang-for-more-traffic-using-skyserve).
 
 
 
