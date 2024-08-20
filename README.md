@@ -116,6 +116,7 @@ run: |
     --host 0.0.0.0 \
     --port 30000
 ```
+</details>
 
 ```bash
 # Deploy on any cloud or Kubernetes cluster. Use --cloud <cloud> to select a specific cloud provider.
