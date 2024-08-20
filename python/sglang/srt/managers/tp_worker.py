@@ -774,7 +774,7 @@ class ModelTpServer:
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
         else:
-            warnings.warn(
+            logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
                 f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"

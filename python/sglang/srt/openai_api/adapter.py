@@ -17,10 +17,10 @@ limitations under the License.
 
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
-import warnings
 from http import HTTPStatus
 from typing import Dict, List, Optional
 
@@ -64,6 +64,8 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
+
+logger = logging.getLogger(__name__)
 
 chat_template_name = None
 
@@ -408,7 +410,7 @@ def v1_generate_request(all_requests: List[CompletionRequest]):
                 "Parallel sampling is not supported for completions from files"
             )
         if request.echo and request.logprobs:
-            warnings.warn(
+            logger.warning(
                 "Echo is not compatible with logprobs. "
                 "To compute logprobs of input prompt, please use SGLang /request API."
             )
