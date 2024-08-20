@@ -101,18 +101,18 @@ class RuntimeEndpoint(BaseBackend):
         if sampling_params.dtype is None:
             return
 
-        if sampling_params.stop == ():
-            sampling_params.stop = []
+        if sampling_params.stop_strs == ():
+            sampling_params.stop_strs = []
 
         dtype_regex = None
         if sampling_params.dtype in ["int", int]:
 
             dtype_regex = REGEX_INT
-            sampling_params.stop.extend([" ", "\n"])
+            sampling_params.stop_strs.extend([" ", "\n"])
         elif sampling_params.dtype in ["float", float]:
 
             dtype_regex = REGEX_FLOAT
-            sampling_params.stop.extend([" ", "\n"])
+            sampling_params.stop_strs.extend([" ", "\n"])
         elif sampling_params.dtype in ["str", str]:
 
             dtype_regex = REGEX_STR

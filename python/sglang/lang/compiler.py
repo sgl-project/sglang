@@ -141,7 +141,7 @@ class CompiledFunction:
 
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
-            stop=stop,
+            stop_strs=stop,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -174,7 +174,7 @@ class CompiledFunction:
 
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
-            stop=stop,
+            stop_strs=stop,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,

@@ -119,7 +119,7 @@ class OpenAI(BaseBackend):
 
         params = sampling_params.to_openai_kwargs()
         for key, value in params.items():
-            if key in ["stop"]:
+            if key in ["stop_strs"]:
                 continue
             if key in ["max_tokens"]:
                 warnings.warn(
@@ -133,7 +133,7 @@ class OpenAI(BaseBackend):
                     value == self.spec_kwargs[key]
                 ), "sampling parameters should be consistent if turn on api speculative execution."
         self.spec_format.append(
-            {"text": "", "stop": params["stop"], "name": spec_var_name}
+            {"text": "", "stop": params["stop_strs"], "name": spec_var_name}
         )
         return "", {}
 
