@@ -28,6 +28,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    UpdateWeightReqOutput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -82,6 +83,10 @@ class DetokenizerManager:
                         finished_reason=recv_obj.finished_reason,
                     )
                 )
+                continue
+
+            if isinstance(recv_obj, UpdateWeightReqOutput):
+                self.send_to_tokenizer.send_pyobj(recv_obj)
                 continue
 
             assert isinstance(recv_obj, BatchTokenIDOut)
