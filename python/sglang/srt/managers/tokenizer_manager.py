@@ -153,7 +153,7 @@ class TokenizerManager:
             self.create_handle_loop()
 
         while self.model_update_lock.locked():
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0)
 
         obj.post_init()
         is_single = obj.is_single

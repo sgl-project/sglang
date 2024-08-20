@@ -292,7 +292,7 @@ class ModelRunner:
         self.model_config.path = model_path
 
         logger.info(f"[gpu={self.gpu_id}] Update weights end.")
-        return True, "Updating model weights succeeded"
+        return True, "Succeeded to update model weights"
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(
