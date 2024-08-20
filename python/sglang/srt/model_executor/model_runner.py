@@ -214,14 +214,18 @@ class ModelRunner:
             get_model_loader,
         )
         from vllm.model_executor.model_loader.utils import (
-            get_model_architecture,
             set_default_torch_dtype,
+        )
+
+        logger.info(
+            f"[gpu={self.gpu_id}] Update weights begin. "
+            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
 
         target_device = torch.device(self.device_config.device)
 
         try:
-            model_config = VllmModelConfig(
+            vllm_model_config = VllmModelConfig(
                 model=model_path,
                 quantization=self.server_args.quantization,
                 tokenizer=None,
@@ -235,9 +239,9 @@ class ModelRunner:
             logger.error(f"Failed to load model config: {e}")
             return False, "Failed to update model weights"
 
-        logger.info("start updating weights")
+        load_config = LoadConfig(load_format=load_format)
 
-        load_config = LoadConfig(load_format=self.server_args.load_format)
+        # Only support vllm DefaultModelLoader for now
         loader = get_model_loader(load_config)
         if not isinstance(loader, DefaultModelLoader):
             logger.error("Failed to get weights iterator: Unsupported loader")
@@ -258,18 +262,13 @@ class ModelRunner:
             for _, module in self.model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
-                    # When quant methods need to process weights after loading
-                    # (for repacking, quantizing, etc), they expect parameters
-                    # to be on the global target device. This scope is for the
-                    # case where cpu offloading is used, where we will move the
-                    # parameters onto device for processing and back off after.
                     with device_loading_context(module, target_device):
                         quant_method.process_weights_after_loading(module)
             return model
 
-        with set_default_torch_dtype(model_config.dtype):
+        with set_default_torch_dtype(vllm_model_config.dtype):
             try:
-                iter = get_weight_iter(model_config)
+                iter = get_weight_iter(vllm_model_config)
             except Exception as e:
                 logger.error(f"Failed to get weights iterator: {e}")
                 return False, "Failed to update model"
@@ -285,12 +284,14 @@ class ModelRunner:
                 self.model = model_load_weights(self.model, iter)
                 return False, "Failed to update model"
 
+        self.model = model
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
-        self.vllm_model_config = model_config
+        self.vllm_model_config = vllm_model_config
         self.load_config = load_config
+        self.model_config.path = model_path
 
-        logger.info("finish updating weights")
+        logger.info(f"[gpu={self.gpu_id}] Update weights end.")
         return True, "Updating model weights succeeded"
 
     def profile_max_num_token(self, total_gpu_memory):

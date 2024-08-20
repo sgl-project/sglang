@@ -128,7 +128,6 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
 
     success, message = await tokenizer_manager.update_weights(obj, request)
     content = {"message": message, "success": str(success)}
-    print(content)
     if success:
         return JSONResponse(
             content,
