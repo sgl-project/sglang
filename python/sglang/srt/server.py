@@ -98,7 +98,8 @@ async def health(request: Request) -> Response:
         text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
     )
     try:
-        _ = await tokenizer_manager.generate_request(gri, request).__anext__()
+        async for _ in tokenizer_manager.generate_request(gri, request):
+            break
         return Response(status_code=200)
     except Exception as e:
         logger.exception(e)
