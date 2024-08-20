@@ -213,9 +213,7 @@ class ModelRunner:
             device_loading_context,
             get_model_loader,
         )
-        from vllm.model_executor.model_loader.utils import (
-            set_default_torch_dtype,
-        )
+        from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
         logger.info(
             f"[gpu={self.gpu_id}] Update weights begin. "
