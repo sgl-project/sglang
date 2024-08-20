@@ -35,7 +35,7 @@ The `sampling_params` follows this format
 # The maximum number of output tokens
 max_new_tokens: int = 128,
 # Stop when hitting any of the strings in this list.
-stop: Optional[Union[str, List[str]]] = None,
+stop_strs: Optional[Union[str, List[str]]] = None,
 # Stop when hitting any of the token_ids in this list. Could be useful when mixed with
 # `min_new_tokens`.
 stop_token_ids: Optional[List[int]] = [],
@@ -72,8 +72,8 @@ presence_penalty: float = 0.0,
 repetition_penalty: float = 1.0,
 # Guides inference to generate at least this number of tokens by penalizing logits of tokenizer's
 # EOS token and `stop_token_ids` to -inf, until the output token reaches given length.
-# Note that any of the `stop` string can be generated before reaching `min_new_tokens`, as it is
-# difficult to infer the correct token ID by given `stop` strings.
+# Note that any of the `stop_strs` string can be generated before reaching `min_new_tokens`, as it is
+# difficult to infer the correct token ID by given `stop_strs` strings.
 # Must be 0 <= value < max_new_tokens. Setting to 0 (default) will disable this penalty.
 min_new_tokens: int = 0,
 ```
