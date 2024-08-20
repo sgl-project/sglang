@@ -286,7 +286,6 @@ class ModelTpServer:
         if available_size != self.max_total_num_tokens:
             warnings.warn(
                 "Warning: "
-                f"{self.token_to_kv_pool.available_size()}, {self.tree_cache.evictable_size()}\n"
                 f"available_size={available_size}, max_total_num_tokens={self.max_total_num_tokens}\n"
                 "KV cache pool leak detected!"
             )

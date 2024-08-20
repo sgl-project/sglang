@@ -134,7 +134,7 @@ class Req:
         self.prefix_indices = []
         self.last_node = None
         # For interleaved attention
-        self.last_cached_token = -1
+        self.last_cached_token = 0
 
         # Sampling parameters
         self.sampling_params = None
@@ -481,27 +481,30 @@ class ScheduleBatch:
                 for i, req in enumerate(reqs):
                     req.req_pool_idx = req_pool_indices_cpu[i]
                     pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
+                    ext_len = seq_len - pre_len
                     assert pre_len == 0
 
                     if layer_block_id == 0:
                         seq_lens.append(seq_len)
-                        start = pre_len
-                    else:
-                        start = max(0, pre_len - self.sliding_window_size)
 
-                    ext_len = seq_len - start
                     self.req_to_token_pool.req_to_token[req.req_pool_idx][
                         layer_block_id
-                    ][start:seq_len] = out_cache_loc[pt : pt + ext_len]
+                    ][pre_len:seq_len] = out_cache_loc[pt : pt + ext_len]
                     pt += ext_len
 
+                    start = (
+                        0
+                        if layer_block_id == 0
+                        else max(0, pre_len - self.sliding_window_size)
+                    )
                     if start > req.last_cached_token:
                         self.req_to_token_pool.free(
                             self.req_to_token_pool.req_to_token[req.req_pool_idx][
                                 layer_block_id
                             ][req.last_cached_token : start]
                         )
-                        req.last_cached_token = start
+                        if layer_block_id == self.num_layer_blocks - 1:
+                            req.last_cached_token = start
 
         # Set fields
         with torch.device("cuda"):
@@ -574,10 +577,12 @@ class ScheduleBatch:
 
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
-        num_blocks = 1 if self.sliding_window_size is None else self.num_layer_blocks
-        needed_num_tokens = (
-            len(sorted_indices) * global_config.retract_decode_steps * num_blocks
-        )
+        if self.sliding_window_size is None:
+            needed_num_tokens = len(sorted_indices) * global_config.retract_decode_steps
+        else:
+            needed_num_tokens = (
+                len(sorted_indices) * self.num_layer_blocks
+            ) * global_config.retract_decode_steps
         while self.token_to_kv_pool.available_size() < needed_num_tokens:
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
@@ -621,11 +626,19 @@ class ScheduleBatch:
             else:
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = len(req.prefix_indices)
-                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    last_uncached_pos : seq_lens_cpu[idx]
-                ]
-                self.token_to_kv_pool.free(token_indices)
+                assert last_uncached_pos == 0
+                for layer_block_id in range(self.num_layer_blocks):
+                    start = (
+                        last_uncached_pos
+                        if layer_block_id == 0
+                        else max(last_uncached_pos, req.last_cached_token)
+                    )
+                    token_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx
+                    ][layer_block_id][start : seq_lens_cpu[idx]]
+                    self.token_to_kv_pool.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
+                req.last_cached_token = 0
 
                 # release the last node
                 # self.tree_cache.dec_lock_ref(req.last_node)
@@ -765,7 +778,7 @@ class ScheduleBatch:
 
             for layer_block_id in range(self.num_layer_blocks):
                 if layer_block_id > 0:
-                    end = self.seq_lens - self.sliding_window_size
+                    end = self.seq_lens - self.sliding_window_size - 1
                     for i, req in enumerate(self.reqs):
                         if end[i] > req.last_cached_token:
                             self.token_to_kv_pool.free(
@@ -775,7 +788,8 @@ class ScheduleBatch:
                                     req.last_cached_token : end[i],
                                 ]
                             )
-                            req.last_cached_token = end[i]
+                            if layer_block_id == self.num_layer_blocks - 1:
+                                req.last_cached_token = end[i]
 
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:
