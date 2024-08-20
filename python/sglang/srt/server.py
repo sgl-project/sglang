@@ -521,21 +521,17 @@ class Runtime:
         prompt: str,
         sampling_params: Optional[Dict] = None,
     ):
-        if isinstance(sampling_params, dict) and sampling_params.get("n", 1) > 1:
-            stream = False
-        else:
-            stream = True
         if self.server_args.skip_tokenizer_init:
             json_data = {
                 "input_ids": prompt,
                 "sampling_params": sampling_params,
-                "stream": stream,
+                "stream": True,
             }
         else:
             json_data = {
                 "text": prompt,
                 "sampling_params": sampling_params,
-                "stream": stream,
+                "stream": True,
             }
         pos = 0
 
