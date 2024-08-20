@@ -17,7 +17,7 @@ REGEX_STR = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
 @dataclasses.dataclass
 class SglSamplingParams:
     max_new_tokens: int = 128
-    stop: Union[str, List[str]] = ()
+    stop_strs: Union[str, List[str]] = ()
     stop_token_ids: Optional[List[int]] = ()
     temperature: float = 1.0
     top_p: float = 1.0
@@ -37,7 +37,7 @@ class SglSamplingParams:
     def clone(self):
         return SglSamplingParams(
             self.max_new_tokens,
-            self.stop,
+            self.stop_strs,
             self.stop_token_ids,
             self.temperature,
             self.top_p,
@@ -57,7 +57,7 @@ class SglSamplingParams:
             warnings.warn("Regular expression is not supported in the OpenAI backend.")
         return {
             "max_tokens": self.max_new_tokens,
-            "stop": self.stop or None,
+            "stop": self.stop_strs or None,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "frequency_penalty": self.frequency_penalty,
@@ -72,7 +72,7 @@ class SglSamplingParams:
         return {
             "candidate_count": 1,
             "max_output_tokens": self.max_new_tokens,
-            "stop_sequences": self.stop,
+            "stop_sequences": self.stop_strs,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k if self.top_k > 0 else None,
@@ -87,7 +87,7 @@ class SglSamplingParams:
         return {
             "max_tokens": self.max_new_tokens,
             "stop_sequences": (
-                self.stop if isinstance(self.stop, (list, tuple)) else [self.stop]
+                self.stop_strs if isinstance(self.stop_strs, (list, tuple)) else [self.stop_strs]
             ),
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -99,7 +99,7 @@ class SglSamplingParams:
             warnings.warn("Regular expression is not supported in the LiteLLM backend.")
         return {
             "max_tokens": self.max_new_tokens,
-            "stop": self.stop or None,
+            "stop": self.stop_strs or None,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "frequency_penalty": self.frequency_penalty,
@@ -109,7 +109,7 @@ class SglSamplingParams:
     def to_srt_kwargs(self):
         return {
             "max_new_tokens": self.max_new_tokens,
-            "stop": self.stop,
+            "stop_strs": self.stop_strs,
             "stop_token_ids": self.stop_token_ids,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -164,7 +164,7 @@ class SglFunction:
 
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
-            stop=stop,
+            stop_strs=stop,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
             top_p=top_p,
@@ -223,7 +223,7 @@ class SglFunction:
 
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
-            stop=stop,
+            stop_strs=stop,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
             top_p=top_p,
@@ -423,7 +423,7 @@ class SglGen(SglExpr):
         self.name = name
         self.sampling_params = SglSamplingParams(
             max_new_tokens=max_new_tokens,
-            stop=stop,
+            stop_strs=stop,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
             top_p=top_p,
