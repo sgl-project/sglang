@@ -270,7 +270,7 @@ class Req:
 
         if all_ids[prompt_tokens - 1] != self.origin_input_ids_unpadded[-1]:
             # TODO(lsyin): fix token fusion
-            warnings.warn(
+            logging.warning(
                 "Token fusion between input and output, try to avoid this by removing the space at the end of the input."
             )
             return False
@@ -791,7 +791,7 @@ class ScheduleBatch:
             )
 
         if not torch.all(success):
-            warnings.warn("Sampling failed, fallback to top_k=1 strategy")
+            logging.warning("Sampling failed, fallback to top_k=1 strategy")
             probs = probs.masked_fill(torch.isnan(probs), 0.0)
             argmax_ids = torch.argmax(probs, dim=-1)
             batch_next_token_ids = torch.where(
