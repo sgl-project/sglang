@@ -580,12 +580,14 @@ class Runtime:
         prompt: str,
         sampling_params: Optional[Dict] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
     ):
         json_data = {
             "text": prompt,
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
+            "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
         }
         response = requests.post(
