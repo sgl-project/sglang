@@ -280,8 +280,10 @@ class FlushCacheReq:
 
 @dataclass
 class UpdateWeightReqInput:
+    # The model path with the new weights
     model_path: str
-    load_format: str
+    # The format to load the weights
+    load_format: Optional[str] = None
 
 
 @dataclass

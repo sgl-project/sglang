@@ -506,6 +506,10 @@ class TokenizerManager:
         if self.to_create_loop:
             self.create_handle_loop()
 
+        # default the load format to the server_args
+        if obj.load_format is None:
+            obj.load_format = self.server_args.load_format
+
         if not self.model_update_lock.locked():
             async with self.model_update_lock:
                 # wait for the previous generation requests to finish
