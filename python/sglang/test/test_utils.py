@@ -60,7 +60,7 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None
         "prompt": prompt,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "stop": stop,
+        "stop_strs": stop,
         "n": n,
     }
     res = requests.post(url, json=data)
@@ -81,7 +81,7 @@ def call_generate_outlines(
         "prompt": prompt,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "stop": stop,
+        "stop_strs": stop,
         "regex": regex,
         "n": n,
     }
@@ -102,7 +102,7 @@ def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
         "sampling_params": {
             "temperature": temperature,
             "max_new_tokens": max_tokens,
-            "stop": stop,
+            "stop_strs": stop,
         },
     }
     res = requests.post(url, json=data)
