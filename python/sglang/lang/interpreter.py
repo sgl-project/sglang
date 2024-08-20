@@ -438,7 +438,7 @@ class StreamExecutor:
         #     self.backend.fill_image(self)
 
     def _spec_gen(self, sampling_params):
-        stop = sampling_params.stop
+        stop = sampling_params.stop_strs
         max_new_tokens = sampling_params.max_new_tokens
         meta_info = {}
 
@@ -448,7 +448,7 @@ class StreamExecutor:
             sampling_params.max_new_tokens = max(
                 sampling_params.max_new_tokens, self.num_api_spec_tokens
             )
-            sampling_params.stop = None
+            sampling_params.stop_strs = None
             self.speculated_text, meta_info = self.backend.generate(
                 self, sampling_params=sampling_params
             )
@@ -658,7 +658,7 @@ class StreamExecutor:
         clone = None
         for item in [
             "max_new_tokens",
-            "stop",
+            "stop_strs",
             "stop_token_ids",
             "temperature",
             "top_p",
@@ -682,11 +682,11 @@ class StreamExecutor:
         if self.chat_template.stop_str:
             if not clone:
                 clone = self.default_sampling_para.clone()
-            if clone.stop == ():
-                clone.stop = []
-            elif isinstance(clone.stop, str):
-                clone.stop = [clone.stop]
-            clone.stop += self.chat_template.stop_str
+            if clone.stop_strs == ():
+                clone.stop_strs = []
+            elif isinstance(clone.stop_strs, str):
+                clone.stop_strs = [clone.stop_strs]
+            clone.stop_strs += self.chat_template.stop_str
 
         return clone or self.default_sampling_para
 
