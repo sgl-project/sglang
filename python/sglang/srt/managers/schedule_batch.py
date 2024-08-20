@@ -22,8 +22,12 @@ from typing import List, Optional, Union
 
 import torch
 import torch.distributed as dist
-from flashinfer.sampling import top_k_top_p_sampling_from_probs, \
-        top_p_renorm_prob,top_k_renorm_prob,min_p_sampling_from_probs
+from flashinfer.sampling import (
+    min_p_sampling_from_probs,
+    top_k_renorm_prob,
+    top_k_top_p_sampling_from_probs,
+    top_p_renorm_prob,
+)
 from vllm.distributed import get_tensor_model_parallel_group
 
 import sglang.srt.sampling.penaltylib as penaltylib
@@ -792,12 +796,12 @@ class ScheduleBatch:
                 probs = top_k_renorm_prob(probs, self.top_ks)
                 probs = top_p_renorm_prob(probs, self.top_ps)
                 batch_next_token_ids, success = min_p_sampling_from_probs(
-                        probs, uniform_samples, self.min_ps
+                    probs, uniform_samples, self.min_ps
                 )
             else:
                 batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
                     probs, uniform_samples, self.top_ks, self.top_ps
-                ) 
+                )
         else:
             # Here we provide a slower fallback implementation.
             batch_next_token_ids, success = top_k_top_p_min_p_sampling_from_probs_torch(
@@ -836,12 +840,15 @@ class ScheduleBatch:
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
-        probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor, min_ps: torch.Tensor
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
 ):
     """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    min_p_thresholds = probs_sort[:,0] * min_ps
+    min_p_thresholds = probs_sort[:, 0] * min_ps
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
     probs_sort[
         torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
