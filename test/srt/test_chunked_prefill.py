@@ -11,10 +11,13 @@ from sglang.test.test_utils import (
 
 
 class TestChunkedPrefill(unittest.TestCase):
-    def run_mmlu(self, disable_radix_cache):
+    def run_mmlu(self, disable_radix_cache, enable_mixed_chunk):
         other_args = ["--chunked-prefill-size", "32"]
         if disable_radix_cache:
             other_args += ["--disable-radix-cache"]
+
+        if enable_mixed_chunk:
+            other_args += ["--enable-mixed-chunk"]
 
         model = DEFAULT_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_UNIT_TEST
@@ -40,10 +43,16 @@ class TestChunkedPrefill(unittest.TestCase):
             kill_child_process(process.pid)
 
     def test_chunked_prefill(self):
-        self.run_mmlu(disable_radix_cache=False)
+        self.run_mmlu(disable_radix_cache=False, enable_mixed_chunk=False)
+
+    def test_mixed_chunked_prefill(self):
+        self.run_mmlu(disable_radix_cache=False, enable_mixed_chunk=True)
 
     def test_chunked_prefill_without_radix_cache(self):
-        self.run_mmlu(disable_radix_cache=True)
+        self.run_mmlu(disable_radix_cache=True, enable_mixed_chunk=False)
+
+    def test_mixed_chunked_prefill_without_radix_cache(self):
+        self.run_mmlu(disable_radix_cache=True, enable_mixed_chunk=True)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import multiprocessing
+import os
 import subprocess
 import threading
 import time
@@ -22,10 +23,17 @@ from sglang.utils import get_exception_traceback
 
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-DEFAULT_URL_FOR_MOE_TEST = "http://127.0.0.1:6157"
-DEFAULT_URL_FOR_ACCURACY_TEST = "http://127.0.0.1:7157"
-DEFAULT_URL_FOR_UNIT_TEST = "http://127.0.0.1:8157"
-DEFAULT_URL_FOR_E2E_TEST = "http://127.0.0.1:9157"
+
+if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+    DEFAULT_URL_FOR_MOE_TEST = "http://127.0.0.1:6157"
+    DEFAULT_URL_FOR_ACCURACY_TEST = "http://127.0.0.1:7157"
+    DEFAULT_URL_FOR_UNIT_TEST = "http://127.0.0.1:8157"
+    DEFAULT_URL_FOR_E2E_TEST = "http://127.0.0.1:9157"
+else:
+    DEFAULT_URL_FOR_MOE_TEST = "http://127.0.0.1:1157"
+    DEFAULT_URL_FOR_ACCURACY_TEST = "http://127.0.0.1:1257"
+    DEFAULT_URL_FOR_UNIT_TEST = "http://127.0.0.1:1357"
+    DEFAULT_URL_FOR_E2E_TEST = "http://127.0.0.1:1457"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -104,31 +112,8 @@ def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
     return pred
 
 
-def call_generate_ginfer(prompt, temperature, max_tokens, stop=None, url=None):
-    import grpc
-    from ginfer import sampler_pb2, sampler_pb2_grpc
-
-    sampler_channel = grpc.insecure_channel(url.replace("http://", ""))
-    sampler = sampler_pb2_grpc.SamplerStub(sampler_channel)
-
-    if stop is None:
-        stop_strings = None
-    else:
-        stop_strings = [stop]
-
-    sample_request = sampler_pb2.SampleTextRequest(
-        prompt=prompt,
-        settings=sampler_pb2.SampleSettings(
-            max_len=max_tokens,
-            rng_seed=0,
-            temperature=max(temperature, 1e-7),
-            nucleus_p=1,
-            stop_strings=stop_strings,
-        ),
-    )
-    stream = sampler.SampleText(sample_request)
-    response = "".join([x.text for x in stream])
-    return response
+def call_generate_gserver(prompt, temperature, max_tokens, stop=None, url=None):
+    raise NotImplementedError()
 
 
 def call_generate_guidance(
@@ -271,7 +256,7 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
             "vllm",
             "outlines",
             "lightllm",
-            "ginfer",
+            "gserver",
             "guidance",
             "lmql",
             "srt-raw",
@@ -292,7 +277,7 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
             "lightllm": 22000,
             "lmql": 23000,
             "srt-raw": 30000,
-            "ginfer": 9988,
+            "gserver": 9988,
         }
         args.port = default_port.get(args.backend, None)
     return args
@@ -328,8 +313,8 @@ def _get_call_generate(args: argparse.Namespace):
         return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "srt-raw":
         return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "ginfer":
-        return partial(call_generate_ginfer, url=f"{args.host}:{args.port}")
+    elif args.backend == "gserver":
+        return partial(call_generate_gserver, url=f"{args.host}:{args.port}")
     elif args.backend == "outlines":
         return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "guidance":

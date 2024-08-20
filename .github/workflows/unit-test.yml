@@ -41,8 +41,10 @@ jobs:
       run: |
         cd test/srt
         python3 run_suite.py --suite minimal
+      timeout-minutes: 18
 
     - name: Test Frontend Language
       run: |
         cd test/lang
         python3 run_suite.py --suite minimal
+      timeout-minutes: 10

@@ -20,7 +20,6 @@ from sglang.lang.ir import (
     SglConstantText,
     SglExpr,
     SglExprList,
-    SglFunction,
     SglGen,
     SglImage,
     SglRoleBegin,
@@ -181,8 +180,10 @@ class StreamExecutor:
         num_api_spec_tokens=None,
         use_thread=True,
     ):
+        from sglang.lang.backend.base_backend import BaseBackend
+
         self.sid = uuid.uuid4().hex
-        self.backend = backend
+        self.backend: BaseBackend = backend
         self.arguments: Dict[str, Any] = arguments
         self.default_sampling_para = default_sampling_para
         self.stream = stream
@@ -658,6 +659,7 @@ class StreamExecutor:
         for item in [
             "max_new_tokens",
             "stop",
+            "stop_token_ids",
             "temperature",
             "top_p",
             "top_k",

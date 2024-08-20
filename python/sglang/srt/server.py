@@ -34,7 +34,6 @@ from typing import Dict, List, Optional, Union
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
-import psutil
 import requests
 import uvicorn
 import uvloop
@@ -288,6 +287,8 @@ def launch_server(
 
     # Launch processes
     tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
+    if server_args.chat_template:
+        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
     pipe_controller_reader, pipe_controller_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
@@ -358,6 +359,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 
     # Set ulimit
     set_ulimit()
@@ -375,16 +377,11 @@ def _set_envs_and_config(server_args: ServerArgs):
         # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
         maybe_set_triton_cache_manager()
 
-    # Set global chat template
-    if server_args.chat_template:
-        # TODO: replace this with huggingface transformers template
-        load_chat_template_for_openai_api(server_args.chat_template)
-
     # Check flashinfer version
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.1.4",
+            "0.1.5",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -446,15 +443,6 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
             pipe_finish_writer.send(last_traceback)
         print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
         sys.exit(1)
-
-    # Print warnings here
-    if server_args.disable_radix_cache and server_args.chunked_prefill_size is not None:
-        logger.warning(
-            "You set both `--disable-radix-cache` and `--chunked-prefill-size`. "
-            "This combination is an experimental feature and we noticed it can lead to "
-            "wrong generation results. If you want to use chunked prefill, it is recommended "
-            "not using `--disable-radix-cache`."
-        )
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
@@ -571,12 +559,14 @@ class Runtime:
         prompt: str,
         sampling_params: Optional[Dict] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
     ):
         json_data = {
             "text": prompt,
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
+            "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
         }
         response = requests.post(

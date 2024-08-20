@@ -21,7 +21,9 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
+import torch.distributed as dist
 from flashinfer.sampling import top_k_top_p_sampling_from_probs
+from vllm.distributed import get_tensor_model_parallel_group
 
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.global_config import global_config
@@ -235,10 +237,12 @@ class Req:
             return
 
         last_token_id = self.output_ids[-1]
-        if self.tokenizer is None:
-            matched_eos = last_token_id in self.sampling_params.stop_token_ids
-        else:
-            matched_eos = last_token_id == self.tokenizer.eos_token_id
+
+        matched_eos = last_token_id in self.sampling_params.stop_token_ids
+
+        if self.tokenizer is not None:
+            matched_eos |= last_token_id == self.tokenizer.eos_token_id
+
         if matched_eos and not self.sampling_params.ignore_eos:
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
             return
@@ -325,6 +329,9 @@ class ScheduleBatch:
     out_cache_loc: torch.Tensor = None
     extend_num_tokens: int = None
 
+    # For mixed chunekd prefill
+    prefix_lens_cpu: List[int] = None
+
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
@@ -383,7 +390,7 @@ class ScheduleBatch:
 
         return out_cache_loc
 
-    def batch_sampling_params(self, vocab_size, int_token_logit_bias):
+    def batch_sampling_params(self, vocab_size):
         device = "cuda"
         bs, reqs = self.batch_size(), self.reqs
         self.temperatures = torch.tensor(
@@ -419,15 +426,8 @@ class ScheduleBatch:
 
         # Handle logit bias but only allocate when needed
         self.logit_bias = None
-        for i in range(bs):
-            if reqs[i].sampling_params.dtype == "int":
-                if self.logit_bias is None:
-                    self.logit_bias = torch.zeros(
-                        (bs, vocab_size), dtype=torch.float32, device=device
-                    )
-                self.logit_bias[i][: len(int_token_logit_bias)] = int_token_logit_bias
 
-    def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+    def prepare_for_extend(self, vocab_size: int):
         bs = self.batch_size()
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -465,8 +465,32 @@ class ScheduleBatch:
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+        self.prefix_lens_cpu = [len(r.prefix_indices) for r in reqs]
 
-        self.batch_sampling_params(vocab_size, int_token_logit_bias)
+        self.batch_sampling_params(vocab_size)
+
+    def mix_with_running(self, running_batch: "ScheduleBatch"):
+        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+        prefix_lens_cpu = [len(r.prefix_indices) for r in self.reqs]
+        prefix_lens_cpu.extend(
+            [
+                len(r.origin_input_ids) + len(r.output_ids) - 1
+                for r in running_batch.reqs
+            ]
+        )
+
+        for req in running_batch.reqs:
+            req.fill_ids = req.origin_input_ids + req.output_ids
+            req.extend_input_len = 1
+
+        input_ids = torch.cat([self.input_ids, running_batch.input_ids])
+        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        extend_num_tokens = self.extend_num_tokens + running_batch.batch_size()
+        self.merge(running_batch)
+        self.input_ids = input_ids
+        self.out_cache_loc = out_cache_loc
+        self.extend_num_tokens = extend_num_tokens
+        self.prefix_lens_cpu = prefix_lens_cpu
 
     def check_decode_mem(self):
         bs = self.batch_size()
@@ -729,7 +753,7 @@ class ScheduleBatch:
                 )
             self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
 
-    def sample(self, logits: torch.Tensor):
+    def sample(self, logits: torch.Tensor, is_multi_node_tp=False):
         # TODO(lsyin): move this into a part of layer and run with CUDA Graph
         # Post process logits
         logits = logits.contiguous()
@@ -783,6 +807,16 @@ class ScheduleBatch:
                     )
 
         self.penalizer_orchestrator.cumulate_output_tokens(batch_next_token_ids)
+
+        if is_multi_node_tp:
+            # If the tensor parallelism spans across multiple nodes, there is some indeterminism
+            # that can cause the TP workers to generate different tokens, so we need to
+            # sync here
+            torch.distributed.all_reduce(
+                batch_next_token_ids,
+                op=dist.ReduceOp.MIN,
+                group=get_tensor_model_parallel_group().device_group,
+            )
 
         return batch_next_token_ids
 

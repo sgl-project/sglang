@@ -49,7 +49,7 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_num_reqs: Optional[int] = None
     max_total_tokens: Optional[int] = None
-    chunked_prefill_size: int = -1
+    chunked_prefill_size: int = 8192
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
@@ -80,6 +80,7 @@ class ServerArgs:
     disable_regex_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_disk_cache: bool = False
+    enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     enable_p2p_check: bool = False
     enable_mla: bool = False
@@ -397,6 +398,11 @@ class ServerArgs:
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
         )
         parser.add_argument(
+            "--enable-mixed-chunk",
+            action="store_true",
+            help="Enabling mixing prefill and decode in a chunked batch.",
+        )
+        parser.add_argument(
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile, experimental feature.",
@@ -450,14 +456,8 @@ class ServerArgs:
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
         if "gemma-2" in self.model_path.lower():
-            logger.info(
-                f"When using sliding window in gemma-2, disable radix_cache, regex_jump_forward, and turn on flashinfer."
-            )
-            self.disable_radix_cache = True
-            self.disable_regex_jump_forward = True
+            logger.info(f"When using sliding window in gemma-2, turn on flashinfer.")
             self.disable_flashinfer = False
-            self.disable_cuda_graph = True
-            self.chunked_prefill_size = None
 
 
 @dataclasses.dataclass

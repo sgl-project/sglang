@@ -36,7 +36,7 @@ DEFAULT_PROMPTS = [
 ]
 
 dirpath = os.path.dirname(__file__)
-with open(os.path.join(dirpath, "long_prompt"), "r") as f:
+with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
     long_prompt = f.read()
 DEFAULT_PROMPTS.append(long_prompt)
 
@@ -209,6 +209,7 @@ class SRTRunner:
                     prompt,
                     sampling_params=sampling_params,
                     return_logprob=True,
+                    logprob_start_len=0,
                     top_logprobs_num=NUM_TOP_LOGPROBS,
                 )
                 response = json.loads(response)

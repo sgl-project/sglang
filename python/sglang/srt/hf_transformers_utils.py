@@ -30,14 +30,19 @@ from transformers import (
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
-from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
+
+try:
+    from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
+
+    _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
+        ChatGLMConfig.model_type: ChatGLMConfig,
+        DbrxConfig.model_type: DbrxConfig,
+    }
+except ImportError:
+    # We want this file to run without vllm dependency
+    _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {}
 
 from sglang.srt.utils import is_multimodal_model
-
-_CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
-    ChatGLMConfig.model_type: ChatGLMConfig,
-    DbrxConfig.model_type: DbrxConfig,
-}
 
 
 def download_from_hf(model_path: str):

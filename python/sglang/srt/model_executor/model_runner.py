@@ -38,6 +38,8 @@ from vllm.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.distributed.parallel_state import in_the_same_node_as
+from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
@@ -53,7 +55,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_generation_model,
-    is_llama3_405b_fp8,
+    is_llama3_405b_fp8_head_16,
     is_multimodal_model,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
@@ -111,9 +113,12 @@ class ModelRunner:
             distributed_init_method=nccl_init_method,
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
-        self.tp_group = get_tp_group()
         total_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
+        )
+        self.tp_group = get_tp_group()
+        self.is_multi_node_tp = not all(
+            in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)
         )
 
         if self.tp_size > 1:
@@ -143,6 +148,11 @@ class ModelRunner:
             f"[gpu={self.gpu_id}] Load weight begin. "
             f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
+        if torch.cuda.get_device_capability()[0] < 8:
+            logger.info(
+                "Compute capability below sm80 use float16 due to lack of bfloat16 support."
+            )
+            self.server_args.dtype = "float16"
 
         monkey_patch_vllm_dummy_weight_loader()
         device_config = DeviceConfig()
@@ -158,7 +168,7 @@ class ModelRunner:
             skip_tokenizer_init=True,
         )
 
-        if is_llama3_405b_fp8(self.model_config) and self.tp_size <= 8:
+        if is_llama3_405b_fp8_head_16(self.model_config) and self.tp_size <= 8:
             # A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints
             self.model_config.hf_config.num_key_value_heads = 8
             vllm_model_config.hf_config.num_key_value_heads = 8
@@ -167,15 +177,6 @@ class ModelRunner:
         self.dtype = vllm_model_config.dtype
         if self.model_config.model_overide_args is not None:
             vllm_model_config.hf_config.update(self.model_config.model_overide_args)
-
-        if (
-            self.server_args.efficient_weight_load
-            and "llama" in self.server_args.model_path.lower()
-            and self.server_args.quantization == "fp8"
-        ):
-            from sglang.srt.model_loader.model_loader import get_model
-        else:
-            from vllm.model_executor.model_loader import get_model
 
         self.model = get_model(
             model_config=vllm_model_config,
@@ -186,6 +187,11 @@ class ModelRunner:
             parallel_config=None,
             scheduler_config=None,
             cache_config=None,
+        )
+        self.sliding_window_size = (
+            self.model.get_window_size()
+            if hasattr(self.model, "get_window_size")
+            else None
         )
         self.is_generation = is_generation_model(
             self.model_config.hf_config.architectures
@@ -295,12 +301,6 @@ class ModelRunner:
         return c
 
     def init_flashinfer(self):
-        self.sliding_window_size = (
-            self.model.get_window_size()
-            if hasattr(self.model, "get_window_size")
-            else None
-        )
-
         if self.server_args.disable_flashinfer:
             assert (
                 self.sliding_window_size is None
@@ -319,49 +319,42 @@ class ModelRunner:
             use_tensor_cores = False
 
         if self.sliding_window_size is None:
-            self.flashinfer_workspace_buffers = torch.empty(
-                2,
+            self.flashinfer_workspace_buffer = torch.empty(
                 global_config.flashinfer_workspace_size,
                 dtype=torch.uint8,
                 device="cuda",
             )
             self.flashinfer_prefill_wrapper_ragged = (
                 BatchPrefillWithRaggedKVCacheWrapper(
-                    self.flashinfer_workspace_buffers[0], "NHD"
+                    self.flashinfer_workspace_buffer, "NHD"
                 )
             )
             self.flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
-                self.flashinfer_workspace_buffers[1], "NHD"
+                self.flashinfer_workspace_buffer, "NHD"
             )
             self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                self.flashinfer_workspace_buffers[0],
+                self.flashinfer_workspace_buffer,
                 "NHD",
                 use_tensor_cores=use_tensor_cores,
             )
         else:
-            workspace_buffers = torch.empty(
-                4,
+            self.flashinfer_workspace_buffer = torch.empty(
                 global_config.flashinfer_workspace_size,
                 dtype=torch.uint8,
                 device="cuda",
             )
-            self.flashinfer_prefill_wrapper_ragged = []
+            self.flashinfer_prefill_wrapper_ragged = None
             self.flashinfer_prefill_wrapper_paged = []
             self.flashinfer_decode_wrapper = []
             for i in range(2):
-                self.flashinfer_prefill_wrapper_ragged.append(
-                    BatchPrefillWithRaggedKVCacheWrapper(
-                        workspace_buffers[2 * i + 0], "NHD"
-                    )
-                )
                 self.flashinfer_prefill_wrapper_paged.append(
                     BatchPrefillWithPagedKVCacheWrapper(
-                        workspace_buffers[2 * i + 1], "NHD"
+                        self.flashinfer_workspace_buffer, "NHD"
                     )
                 )
                 self.flashinfer_decode_wrapper.append(
                     BatchDecodeWithPagedKVCacheWrapper(
-                        workspace_buffers[2 * i + 0],
+                        self.flashinfer_workspace_buffer,
                         "NHD",
                         use_tensor_cores=use_tensor_cores,
                     )
@@ -404,7 +397,6 @@ class ModelRunner:
             self,
             batch,
             ForwardMode.DECODE,
-            sliding_window_size=self.sliding_window_size,
         )
 
         return self.model.forward(
@@ -417,7 +409,6 @@ class ModelRunner:
             self,
             batch,
             forward_mode=ForwardMode.EXTEND,
-            sliding_window_size=self.sliding_window_size,
         )
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -429,7 +420,6 @@ class ModelRunner:
             self,
             batch,
             forward_mode=ForwardMode.EXTEND,
-            sliding_window_size=self.sliding_window_size,
         )
         return self.model.forward(
             batch.input_ids,

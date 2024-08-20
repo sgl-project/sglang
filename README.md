@@ -55,7 +55,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.2.12 https://github.com/sgl-project/sglang.git
+git clone -b v0.2.13 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -87,8 +87,48 @@ docker run --gpus all \
 1. Copy the [compose.yml](./docker/compose.yaml) to your local machine
 2. Execute the command `docker compose up -d` in your terminal.
 
+### Method 5: Run on Kubernetes or Clouds with SkyPilot
+
+To deploy on Kubernetes or 12+ clouds, you can use [SkyPilot](https://github.com/skypilot-org/skypilot).
+
+1. Install SkyPilot and set up Kubernetes cluster or cloud access: see [SkyPilot's documentation](https://skypilot.readthedocs.io/en/latest/getting-started/installation.html).
+2. Deploy on your own infra with a single command and get the HTTP API endpoint:
+<details>
+<summary>SkyPilot YAML: <code>sglang.yaml</code></summary>
+
+```yaml
+# sglang.yaml
+envs:
+  HF_TOKEN: null
+
+resources:
+  image_id: docker:lmsysorg/sglang:latest
+  accelerators: A100
+  ports: 30000
+
+run: |
+  conda deactivate
+  python3 -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --host 0.0.0.0 \
+    --port 30000
+```
+
+</details>
+
+```bash
+# Deploy on any cloud or Kubernetes cluster. Use --cloud <cloud> to select a specific cloud provider.
+HF_TOKEN=<secret> sky launch -c sglang --env HF_TOKEN sglang.yaml
+
+# Get the HTTP API endpoint
+sky status --endpoint 30000 sglang
+```
+3. To further scale up your deployment with autoscaling and failure recovery, check out the [SkyServe + SGLang guide](https://github.com/skypilot-org/skypilot/tree/master/llm/sglang#serving-llama-2-with-sglang-for-more-traffic-using-skyserve).
+
+
+
 ### Common Notes
-- If you cannot install FlashInfer, check out its [installation](https://docs.flashinfer.ai/installation.html#) page. If you still cannot install it, you can use the slower Triton kernels by adding `--disable-flashinfer` when launching the server.
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is currently one of the dependencies that must be installed for SGLang. If you are using NVIDIA GPU devices below sm80, such as T4, you can't use SGLang for the time being. We expect to resolve this issue soon, so please stay tuned. If you encounter any FlashInfer-related issues on sm80+ devices (e.g., A100, L40S, H100), consider using Triton's kernel by `--disable-flashinfer --disable-flashinfer-sampling` and raise a issue.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
 
 ## Backend: SGLang Runtime (SRT)

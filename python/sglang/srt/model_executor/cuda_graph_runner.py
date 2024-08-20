@@ -98,8 +98,8 @@ class CudaGraphRunner:
         self.req_pool_indices = torch.zeros(
             (self.max_bs,), dtype=torch.int32, device="cuda"
         )
-        self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int32, device="cuda")
-        self.position_ids_offsets = torch.zeros(
+        self.seq_lens = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+        self.position_ids_offsets = torch.ones(
             (self.max_bs,), dtype=torch.int32, device="cuda"
         )
         self.out_cache_loc = torch.zeros(
@@ -107,9 +107,6 @@ class CudaGraphRunner:
         )
 
         # FlashInfer inputs
-        self.flashinfer_workspace_buffer = (
-            self.model_runner.flashinfer_workspace_buffers[0]
-        )
         self.flashinfer_kv_indptr = torch.zeros(
             (self.max_bs + 1,), dtype=torch.int32, device="cuda"
         )
@@ -121,6 +118,23 @@ class CudaGraphRunner:
         self.flashinfer_kv_last_page_len = torch.ones(
             (self.max_bs,), dtype=torch.int32, device="cuda"
         )
+        if model_runner.sliding_window_size is None:
+            self.flashinfer_workspace_buffer = (
+                self.model_runner.flashinfer_workspace_buffer
+            )
+        else:
+            self.flashinfer_workspace_buffer = (
+                self.model_runner.flashinfer_workspace_buffer
+            )
+
+            self.flashinfer_kv_indptr = [
+                self.flashinfer_kv_indptr,
+                self.flashinfer_kv_indptr.clone(),
+            ]
+            self.flashinfer_kv_indices = [
+                self.flashinfer_kv_indices,
+                self.flashinfer_kv_indices.clone(),
+            ]
 
         self.compile_bs = [1, 2, 4, 8, 16, 24, 32] if use_torch_compile else []
 
@@ -128,7 +142,7 @@ class CudaGraphRunner:
             set_torch_compile_config()
 
     def can_run(self, batch_size):
-        return batch_size < self.max_bs
+        return batch_size <= self.max_bs
 
     def capture(self, batch_size_list):
         self.batch_size_list = batch_size_list
@@ -171,15 +185,32 @@ class CudaGraphRunner:
             use_tensor_cores = True
         else:
             use_tensor_cores = False
-        flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-            self.flashinfer_workspace_buffer,
-            "NHD",
-            use_cuda_graph=True,
-            use_tensor_cores=use_tensor_cores,
-            paged_kv_indptr_buffer=self.flashinfer_kv_indptr[: bs + 1],
-            paged_kv_indices_buffer=self.flashinfer_kv_indices,
-            paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[:bs],
-        )
+        if self.model_runner.sliding_window_size is None:
+            flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                self.flashinfer_workspace_buffer,
+                "NHD",
+                use_cuda_graph=True,
+                use_tensor_cores=use_tensor_cores,
+                paged_kv_indptr_buffer=self.flashinfer_kv_indptr[: bs + 1],
+                paged_kv_indices_buffer=self.flashinfer_kv_indices,
+                paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[:bs],
+            )
+        else:
+            flashinfer_decode_wrapper = []
+            for i in range(2):
+                flashinfer_decode_wrapper.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.flashinfer_workspace_buffer,
+                        "NHD",
+                        use_cuda_graph=True,
+                        use_tensor_cores=use_tensor_cores,
+                        paged_kv_indptr_buffer=self.flashinfer_kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buffer=self.flashinfer_kv_indices[i],
+                        paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[
+                            :bs
+                        ],
+                    )
+                )
         update_flashinfer_indices(
             ForwardMode.DECODE,
             self.model_runner,
@@ -201,19 +232,30 @@ class CudaGraphRunner:
                 out_cache_loc=out_cache_loc,
                 return_logprob=False,
                 top_logprobs_nums=0,
-                positions=(seq_lens - 1).to(torch.int64),
+                positions=(seq_lens - 1 + position_ids_offsets).to(torch.int64),
                 flashinfer_decode_wrapper=flashinfer_decode_wrapper,
             )
 
             return forward(input_ids, input_metadata.positions, input_metadata)
 
         for _ in range(2):
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+
             run_once()
 
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+
         torch.cuda.synchronize()
+        self.model_runner.tp_group.barrier()
+
         with torch.cuda.graph(graph, pool=self.graph_memory_pool, stream=stream):
             out = run_once()
+
         torch.cuda.synchronize()
+        self.model_runner.tp_group.barrier()
+
         self.graph_memory_pool = graph.pool()
         return graph, None, out, flashinfer_decode_wrapper
 
@@ -225,8 +267,8 @@ class CudaGraphRunner:
         index = bisect.bisect_left(self.batch_size_list, raw_bs)
         bs = self.batch_size_list[index]
         if bs != raw_bs:
-            self.seq_lens.fill_(1)
-            self.position_ids_offsets.zero_()
+            self.seq_lens.zero_()
+            self.position_ids_offsets.fill_(1)
             self.out_cache_loc.zero_()
 
         # Common inputs
@@ -247,7 +289,9 @@ class CudaGraphRunner:
         )
 
         # Replay
+        torch.cuda.synchronize()
         self.graphs[bs].replay()
+        torch.cuda.synchronize()
         output = self.output_buffers[bs]
 
         # Unpad

@@ -64,7 +64,9 @@ def main(args):
     @sgl.function
     def few_shot_gsm8k(s, question):
         s += few_shot_examples + question
-        s += sgl.gen("answer", max_tokens=512, stop="Question")
+        s += sgl.gen(
+            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+        )
 
     #####################################
     ########## SGL Program End ##########
@@ -87,6 +89,9 @@ def main(args):
     preds = []
     for i in range(len(states)):
         preds.append(get_answer_value(states[i]["answer"]))
+
+    # print(f"{preds=}")
+    # print(f"{labels=}")
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
