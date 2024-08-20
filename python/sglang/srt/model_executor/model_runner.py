@@ -38,6 +38,7 @@ from vllm.distributed import (
     get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
+    set_custom_all_reduce,
 )
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.model_executor.model_loader import get_model
@@ -106,6 +107,7 @@ class ModelRunner:
             nccl_init_method = f"tcp://{server_args.nccl_init_addr}"
         else:
             nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port}"
+        set_custom_all_reduce(not server_args.disable_custom_all_reduce)
         init_distributed_environment(
             backend="nccl",
             world_size=self.tp_size,
@@ -325,7 +327,7 @@ class ModelRunner:
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
-                warnings.warn(
+                logging.warning(
                     f"max_total_tokens={max_total_tokens} is larger than the profiled value "
                     f"{self.max_total_num_tokens}. "
                     f"Use the profiled value instead."

@@ -170,6 +170,17 @@ def get_gpu_topology():
         return None
 
 
+def get_hypervisor_vendor():
+    try:
+        output = subprocess.check_output(["lscpu"], text=True)
+        for line in output.split("\n"):
+            if "Hypervisor vendor:" in line:
+                return line.split(":")[1].strip()
+        return None
+    except:
+        return None
+
+
 def check_env():
     """
     Check and print environment information.
@@ -183,6 +194,10 @@ def check_env():
     gpu_topo = get_gpu_topology()
     if gpu_topo:
         env_info["NVIDIA Topology"] = gpu_topo
+
+    hypervisor_vendor = get_hypervisor_vendor()
+    if hypervisor_vendor:
+        env_info["Hypervisor vendor"] = hypervisor_vendor
 
     ulimit_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
     env_info["ulimit soft"] = ulimit_soft

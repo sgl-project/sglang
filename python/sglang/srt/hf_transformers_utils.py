@@ -147,13 +147,12 @@ def get_tokenizer(
         and kwargs.get("use_fast", True)
         and tokenizer_name != _FAST_LLAMA_TOKENIZER
     ):
-        pass
-        # warnings.warn(
-        #    "For some LLaMA V1 models, initializing the fast tokenizer may "
-        #    "take a long time. To reduce the initialization time, consider "
-        #    f"using '{_FAST_LLAMA_TOKENIZER}' instead of the original "
-        #    "tokenizer."
-        # )
+        warnings.warn(
+            "For some LLaMA V1 models, initializing the fast tokenizer may "
+            "take a long time. To reduce the initialization time, consider "
+            f"using '{_FAST_LLAMA_TOKENIZER}' instead of the original "
+            "tokenizer."
+        )
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
