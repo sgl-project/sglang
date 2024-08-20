@@ -268,19 +268,19 @@ class ModelRunner:
             try:
                 iter = get_weight_iter(vllm_model_config)
             except Exception as e:
-                logger.error(f"Failed to get weights iterator: {e}")
-                return False, "Failed to update model"
+                message = f"Failed to get weights iterator: {e}"
+                logger.error(message)
+                return False, message
             try:
                 model = model_load_weights(self.model, iter)
             except Exception as e:
-                logger.error(
-                    f"Failed to update weights: {e}. \n Rolling back to original weights"
-                )
+                message = f"Failed to update weights: {e}. \n Rolling back to original weights"
+                logger.error(message)
                 del iter
                 gc.collect()
                 iter = get_weight_iter(self.vllm_model_config)
                 self.model = model_load_weights(self.model, iter)
-                return False, "Failed to update model"
+                return False, message
 
         self.model = model
         self.server_args.model_path = model_path

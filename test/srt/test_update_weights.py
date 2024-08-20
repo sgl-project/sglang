@@ -77,6 +77,14 @@ class TestReplaceWeights(unittest.TestCase):
         updated_response = self.run_decode()
         assert origin_response[:32] != updated_response[:32]
 
+        # update weights back
+        self.run_update_weights(origin_model_path)
+        updated_model_path = self.get_model_info()
+        assert updated_model_path == origin_model_path
+
+        updated_response = self.run_decode()
+        assert origin_response[:32] == updated_response[:32]
+
     def test_replace_weights_unexist_model(self):
         origin_model_path = self.get_model_info()
         print(f"origin_model_path: {origin_model_path}")

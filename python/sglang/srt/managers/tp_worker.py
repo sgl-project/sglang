@@ -778,12 +778,15 @@ class ModelTpServer:
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
+            if_success = True
         else:
             warnings.warn(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
                 f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
             )
+            if_success = False
+        return if_success
 
     def abort_request(self, recv_req):
         # Delete requests in the waiting queue
@@ -808,7 +811,8 @@ class ModelTpServer:
             recv_req.model_path, recv_req.load_format
         )
         if success:
-            self.flush_cache()
+            flash_cache_success = self.flush_cache()
+            assert flash_cache_success, "Cache flush failed after updating weights"
         return success, message
 
 
