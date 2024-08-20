@@ -534,7 +534,7 @@ class TokenizerManager:
             async with self.model_update_lock:
                 # wait for the previous generation requests to finish
                 while len(self.rid_to_state) > 0:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0)
                 self.send_to_router.send_pyobj(obj)
                 self.model_update_result = asyncio.Future()
                 result = await self.model_update_result
