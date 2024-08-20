@@ -46,6 +46,8 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateWeightReqInput,
+    UpdateWeightReqOutput,
 )
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.sampling_params import SamplingParams
@@ -121,6 +123,10 @@ class TokenizerManager:
         self.to_create_loop = True
         self.rid_to_state: Dict[str, ReqState] = {}
 
+        # for update model weights
+        self.model_update_lock = asyncio.Lock()
+        self.model_update_result = None
+
     async def get_pixel_values(self, image_data):
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
@@ -145,6 +151,9 @@ class TokenizerManager:
     ):
         if self.to_create_loop:
             self.create_handle_loop()
+
+        while self.model_update_lock.locked():
+            await asyncio.sleep(0)
 
         obj.post_init()
         is_single = obj.is_single
@@ -513,6 +522,30 @@ class TokenizerManager:
         req = FlushCacheReq()
         self.send_to_router.send_pyobj(req)
 
+    async def update_weights(self, obj: UpdateWeightReqInput, request):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        # default the load format to the server_args
+        if obj.load_format is None:
+            obj.load_format = self.server_args.load_format
+
+        if not self.model_update_lock.locked():
+            async with self.model_update_lock:
+                # wait for the previous generation requests to finish
+                while len(self.rid_to_state) > 0:
+                    await asyncio.sleep(0)
+                self.send_to_router.send_pyobj(obj)
+                self.model_update_result = asyncio.Future()
+                result = await self.model_update_result
+                if result.success:
+                    self.server_args.model_path = obj.model_path
+                    self.server_args.load_format = obj.load_format
+                    self.model_path = obj.model_path
+            return result.success, result.message
+        else:
+            return False, "Another update is in progress. Please try again later."
+
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
             return
@@ -541,12 +574,18 @@ class TokenizerManager:
 
     async def handle_loop(self):
         while True:
-            recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut] = (
-                await self.recv_from_detokenizer.recv_pyobj()
-            )
+            recv_obj: Union[
+                BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, UpdateWeightReqOutput
+            ] = await self.recv_from_detokenizer.recv_pyobj()
+
+            if isinstance(recv_obj, UpdateWeightReqOutput):
+                self.model_update_result.set_result(recv_obj)
+                continue
+
             assert isinstance(
                 recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)
             ), f"Unexpected obj received: {type(recv_obj)}"
+
             for i, rid in enumerate(recv_obj.rids):
                 state = self.rid_to_state.get(rid, None)
                 if state is None:
