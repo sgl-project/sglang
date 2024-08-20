@@ -86,6 +86,7 @@ class ServerArgs:
     enable_mla: bool = False
     attention_reduce_in_fp32: bool = False
     efficient_weight_load: bool = False
+    disable_custom_all_reduce: bool = False
 
     # Distributed args
     nccl_init_addr: Optional[str] = None
@@ -427,6 +428,12 @@ class ServerArgs:
             "--efficient-weight-load",
             action="store_true",
             help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
+        )
+        parser.add_argument(
+            "--disable-custom-all-reduce",
+            action="store_true",
+            default=False,
+            help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
 
     @classmethod
