@@ -279,6 +279,20 @@ class FlushCacheReq:
 
 
 @dataclass
+class UpdateWeightReqInput:
+    # The model path with the new weights
+    model_path: str
+    # The format to load the weights
+    load_format: Optional[str] = None
+
+
+@dataclass
+class UpdateWeightReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
 class AbortReq:
     # The request id
     rid: str

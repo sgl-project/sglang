@@ -39,6 +39,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateWeightReqInput,
+    UpdateWeightReqOutput,
 )
 from sglang.srt.managers.policy_scheduler import PolicyScheduler, PrefillAdder
 from sglang.srt.managers.schedule_batch import (
@@ -214,6 +216,9 @@ class ModelTpServer:
                     self.flush_cache()
                 elif isinstance(recv_req, AbortReq):
                     self.abort_request(recv_req)
+                elif isinstance(recv_req, UpdateWeightReqInput):
+                    success, message = self.update_weights(recv_req)
+                    self.out_pyobjs.append(UpdateWeightReqOutput(success, message))
                 else:
                     raise ValueError(f"Invalid request: {recv_req}")
 
@@ -773,12 +778,15 @@ class ModelTpServer:
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
+            if_success = True
         else:
-            warnings.warn(
+            logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
                 f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
             )
+            if_success = False
+        return if_success
 
     def abort_request(self, recv_req):
         # Delete requests in the waiting queue
@@ -797,6 +805,15 @@ class ModelTpServer:
                 if req.rid == recv_req.rid:
                     req.finished_reason = FINISH_ABORT()
                     break
+
+    def update_weights(self, recv_req):
+        success, message = self.model_runner.update_weights(
+            recv_req.model_path, recv_req.load_format
+        )
+        if success:
+            flash_cache_success = self.flush_cache()
+            assert flash_cache_success, "Cache flush failed after updating weights"
+        return success, message
 
 
 def run_tp_server(

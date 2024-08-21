@@ -1,16 +1,15 @@
-<!-- Thank you for your contribution, we really appreciate it. The following instructions will help improve your pull request and make it easier to receive feedback. If there are any items you don't understand, don't worry. Just submit the pull request and ask the maintainers for help. -->
+<!-- Thank you for your contribution! We appreciate it. The following guidelines will help improve your pull request and facilitate feedback. If anything is unclear, don't hesitate to submit your pull request and ask the maintainers for assistance. -->
 
 ## Motivation
 
-<!-- Please explain the motivation behind this PR and the goal you aim to achieve with it. -->
+<!-- Explain the purpose of this PR and the goals it aims to achieve. -->
 
-## Modification
+## Modifications
 
-<!-- Briefly describe the changes made in this PR. -->
+<!-- Describe the changes made in this PR. -->
 
 ## Checklist
 
-- [ ] Before submitting a PR for review, make sure it has passed verification in your local development environment **at least**.
-- [ ] Ensure pre-commit `pre-commit run --all-files` or other linting tools are used to fix potential lint issues.
-- [ ] Confirm that modifications are covered by complete unit tests. If not, please add more unit tests for correctness.
-- [ ] Modify documentation as needed, such as docstrings or example tutorials.
+- [ ] Format your code according to the [Contributor Guide](https://github.com/sgl-project/sglang/blob/main/docs/en/contributor_guide.md).
+- [ ] Add unit tests as outlined in the [Contributor Guide](https://github.com/sgl-project/sglang/blob/main/docs/en/contributor_guide.md).
+- [ ] Update documentation as needed, including docstrings or example tutorials.

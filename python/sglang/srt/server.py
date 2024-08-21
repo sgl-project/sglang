@@ -51,7 +51,11 @@ from sglang.srt.managers.controller_single import (
     start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    UpdateWeightReqInput,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
@@ -89,6 +93,23 @@ app = FastAPI()
 tokenizer_manager = None
 
 
+@app.get("/v1/health")
+async def health(request: Request) -> Response:
+    """
+    Generate 1 token to verify the health of the inference service.
+    """
+    gri = GenerateReqInput(
+        text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+    )
+    try:
+        async for _ in tokenizer_manager.generate_request(gri, request):
+            break
+        return Response(status_code=200)
+    except Exception as e:
+        logger.exception(e)
+        return Response(status_code=503)
+
+
 @app.get("/health")
 async def health() -> Response:
     """Health check."""
@@ -117,6 +138,23 @@ async def flush_cache():
         "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
+
+
+@app.post("/update_weights")
+async def update_weights(obj: UpdateWeightReqInput, request: Request):
+
+    success, message = await tokenizer_manager.update_weights(obj, request)
+    content = {"message": message, "success": str(success)}
+    if success:
+        return JSONResponse(
+            content,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return JSONResponse(
+            content,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 
 async def generate_request(obj: GenerateReqInput, request: Request):
