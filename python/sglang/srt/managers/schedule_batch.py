@@ -21,11 +21,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
-import torch.distributed as dist
-from flashinfer.sampling import top_k_top_p_sampling_from_probs
-from vllm.distributed import get_tensor_model_parallel_group
 
-import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
@@ -686,55 +682,13 @@ class ScheduleBatch:
                     ] = 1
                     logits[i].masked_fill_(~allowed_mask, float("-inf"))
 
-        # TODO(lsyin): move this into a part of layer and run with CUDA Graph
-        # Post process logits
-        logits = logits.contiguous()
-        logits.div_(self.sampling_info.temperatures)
-        if self.sampling_info.logit_bias is not None:
-            logits.add_(self.sampling_info.logit_bias)
+        from sglang.srt.layers.sampler import Sampler
 
-        logits = self.sampling_info.penalizer_orchestrator.apply(logits)
+        sampler = Sampler()
 
-        probs = torch.softmax(logits, dim=-1)
-
-        if not global_server_args_dict["disable_flashinfer_sampling"]:
-            max_top_k_round, batch_size = 32, probs.shape[0]
-            uniform_samples = torch.rand(
-                (max_top_k_round, batch_size), device=probs.device
-            )
-            batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
-                probs,
-                uniform_samples,
-                self.sampling_info.top_ks,
-                self.sampling_info.top_ps,
-            )
-        else:
-            # Here we provide a slower fallback implementation.
-            batch_next_token_ids, success = top_k_top_p_sampling_from_probs_torch(
-                probs, self.sampling_info.top_ks, self.sampling_info.top_ps
-            )
-
-        if not torch.all(success):
-            logging.warning("Sampling failed, fallback to top_k=1 strategy")
-            probs = probs.masked_fill(torch.isnan(probs), 0.0)
-            argmax_ids = torch.argmax(probs, dim=-1)
-            batch_next_token_ids = torch.where(
-                success, batch_next_token_ids, argmax_ids
-            )
-
-        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            batch_next_token_ids
+        batch_next_token_ids = sampler.sample(
+            logits, self.sampling_info, is_multi_node_tp
         )
-
-        if is_multi_node_tp:
-            # If the tensor parallelism spans across multiple nodes, there is some indeterminism
-            # that can cause the TP workers to generate different tokens, so we need to
-            # sync here
-            dist.all_reduce(
-                batch_next_token_ids,
-                op=dist.ReduceOp.MIN,
-                group=get_tensor_model_parallel_group().device_group,
-            )
 
         if has_regex:
             batch_next_token_ids_cpu = batch_next_token_ids.cpu().numpy()
@@ -745,29 +699,3 @@ class ScheduleBatch:
                     )
 
         return batch_next_token_ids
-
-
-def top_k_top_p_sampling_from_probs_torch(
-    probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor
-):
-    """A top-k and top-k sampling implementation with native pytorch operations."""
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
-    try:
-        sampled_index = torch.multinomial(probs_sort, num_samples=1)
-    except RuntimeError:
-        batch_next_token_ids = torch.zeros(
-            (probs_sort.shape[0],), dtype=torch.int32, device=probs.device
-        )
-        success = torch.zeros(probs.shape[0], dtype=torch.bool, device=probs.device)
-        return batch_next_token_ids, success
-
-    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
-    success = torch.ones(probs.shape[0], dtype=torch.bool, device=probs.device)
-    return batch_next_token_ids, success
