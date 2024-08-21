@@ -133,6 +133,13 @@ class ModelTpServer:
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
         )
+
+        # Sync random seed
+        server_args.random_seed = broadcast_recv_input(
+            [server_args.random_seed],
+            self.tp_rank,
+            self.model_runner.tp_group.cpu_group,
+        )[0]
         set_random_seed(server_args.random_seed)
 
         # Print info
@@ -474,9 +481,7 @@ class ModelTpServer:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
                 output = self.model_runner.forward(batch, ForwardMode.EXTEND)
-                next_token_ids = batch.sample(
-                    output.next_token_logits, self.model_runner.is_multi_node_tp
-                )
+                next_token_ids = batch.sample(output.next_token_logits)
 
                 # Move logprobs to cpu
                 if output.next_token_logprobs is not None:
@@ -636,9 +641,7 @@ class ModelTpServer:
 
         # Forward and sample the next tokens
         output = self.model_runner.forward(batch, ForwardMode.DECODE)
-        next_token_ids = batch.sample(
-            output.next_token_logits, self.model_runner.is_multi_node_tp
-        )
+        next_token_ids = batch.sample(output.next_token_logits)
 
         # Move logprobs to cpu
         if output.next_token_logprobs is not None:
@@ -879,6 +882,7 @@ def broadcast_recv_input(
 
             dist.broadcast(tensor_size, src=0, group=dist_group)
             dist.broadcast(tensor_data, src=0, group=dist_group)
+        return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
         dist.broadcast(tensor_size, src=0, group=dist_group)
