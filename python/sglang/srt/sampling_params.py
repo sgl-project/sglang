@@ -128,7 +128,7 @@ class SamplingParams:
         return {
             "max_new_tokens": self.max_new_tokens,
             "stop": self.stop_strs,
-            "stop_token_ids": self.stop_token_ids,
+            "stop_token_ids": list(self.stop_token_ids),
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,
