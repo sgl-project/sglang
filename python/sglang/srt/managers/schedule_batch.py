@@ -675,13 +675,6 @@ class ScheduleBatch:
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
     def sample(self, logits: torch.Tensor, is_multi_node_tp=False):
-        # TODO(lsyin): move this into a part of layer and run with CUDA Graph
-        # Post process logits
-        logits = logits.contiguous()
-        logits.div_(self.sampling_info.temperatures)
-        if self.sampling_info.logit_bias is not None:
-            logits.add_(self.sampling_info.logit_bias)
-
         has_regex = any(req.regex_fsm is not None for req in self.reqs)
         if has_regex:
             allowed_mask = torch.empty_like(logits[0], dtype=torch.bool)
@@ -692,6 +685,13 @@ class ScheduleBatch:
                         req.regex_fsm.get_next_instruction(req.regex_fsm_state).tokens
                     ] = 1
                     logits[i].masked_fill_(~allowed_mask, float("-inf"))
+
+        # TODO(lsyin): move this into a part of layer and run with CUDA Graph
+        # Post process logits
+        logits = logits.contiguous()
+        logits.div_(self.sampling_info.temperatures)
+        if self.sampling_info.logit_bias is not None:
+            logits.add_(self.sampling_info.logit_bias)
 
         logits = self.sampling_info.penalizer_orchestrator.apply(logits)
 
@@ -722,14 +722,6 @@ class ScheduleBatch:
                 success, batch_next_token_ids, argmax_ids
             )
 
-        if has_regex:
-            batch_next_token_ids_cpu = batch_next_token_ids.cpu().numpy()
-            for i, req in enumerate(self.reqs):
-                if req.regex_fsm is not None:
-                    req.regex_fsm_state = req.regex_fsm.get_next_state(
-                        req.regex_fsm_state, batch_next_token_ids_cpu[i]
-                    )
-
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             batch_next_token_ids
         )
@@ -738,11 +730,19 @@ class ScheduleBatch:
             # If the tensor parallelism spans across multiple nodes, there is some indeterminism
             # that can cause the TP workers to generate different tokens, so we need to
             # sync here
-            torch.distributed.all_reduce(
+            dist.all_reduce(
                 batch_next_token_ids,
                 op=dist.ReduceOp.MIN,
                 group=get_tensor_model_parallel_group().device_group,
             )
+
+        if has_regex:
+            batch_next_token_ids_cpu = batch_next_token_ids.cpu().numpy()
+            for i, req in enumerate(self.reqs):
+                if req.regex_fsm is not None:
+                    req.regex_fsm_state = req.regex_fsm.get_next_state(
+                        req.regex_fsm_state, batch_next_token_ids_cpu[i]
+                    )
 
         return batch_next_token_ids
 
