@@ -629,6 +629,8 @@ class ScheduleBatch:
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
 
+        self.sampling_info.update_regex_vocab_mask(self)
+
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:
             # Filter out all requests
@@ -671,17 +673,6 @@ class ScheduleBatch:
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
     def sample(self, logits: torch.Tensor, is_multi_node_tp=False):
-        has_regex = any(req.regex_fsm is not None for req in self.reqs)
-        if has_regex:
-            allowed_mask = torch.empty_like(logits[0], dtype=torch.bool)
-            for i, req in enumerate(self.reqs):
-                if req.regex_fsm is not None:
-                    allowed_mask.zero_()
-                    allowed_mask[
-                        req.regex_fsm.get_next_instruction(req.regex_fsm_state).tokens
-                    ] = 1
-                    logits[i].masked_fill_(~allowed_mask, float("-inf"))
-
         from sglang.srt.layers.sampler import Sampler
 
         sampler = Sampler()
@@ -690,6 +681,7 @@ class ScheduleBatch:
             logits, self.sampling_info, is_multi_node_tp
         )
 
+        has_regex = any(req.regex_fsm is not None for req in self.reqs)
         if has_regex:
             batch_next_token_ids_cpu = batch_next_token_ids.cpu().numpy()
             for i, req in enumerate(self.reqs):

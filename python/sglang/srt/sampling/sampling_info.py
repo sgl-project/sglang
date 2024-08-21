@@ -22,6 +22,7 @@ class SamplingInfo:
     top_ks: torch.Tensor = None
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
     logit_bias: torch.Tensor = None
+    vocab_mask: torch.Tensor = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -63,7 +64,28 @@ class SamplingInfo:
         # Handle logit bias but only allocate when needed
         ret.logit_bias = None
 
+        ret.update_regex_vocab_mask(batch)
+
         return ret
+
+    def update_regex_vocab_mask(self, batch: ScheduleBatch):
+        bs, reqs = batch.batch_size(), batch.reqs
+        device = "cuda"
+        has_regex = any(req.regex_fsm is not None for req in reqs)
+
+        # Reset the vocab mask
+        self.vocab_mask = None
+
+        if has_regex:
+            for i, req in enumerate(reqs):
+                if req.regex_fsm is not None:
+                    if self.vocab_mask is None:
+                        self.vocab_mask = torch.zeros(
+                            bs, self.vocab_size, dtype=torch.bool, device=device
+                        )
+                    self.vocab_mask[i][
+                        req.regex_fsm.get_next_instruction(req.regex_fsm_state).tokens
+                    ] = 1
 
     def filter(self, unfinished_indices: List[int], new_indices: torch.Tensor):
         self.penalizer_orchestrator.filter(unfinished_indices, new_indices)
