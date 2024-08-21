@@ -120,9 +120,6 @@ class ModelRunner:
             self.gpu_id, distributed=self.tp_size > 1
         )
         self.tp_group = get_tp_group()
-        self.is_multi_node_tp = not all(
-            in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)
-        )
 
         if self.tp_size > 1:
             total_local_gpu_memory = get_available_gpu_memory(self.gpu_id)

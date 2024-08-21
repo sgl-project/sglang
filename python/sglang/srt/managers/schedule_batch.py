@@ -671,14 +671,12 @@ class ScheduleBatch:
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
-    def sample(self, logits: torch.Tensor, is_multi_node_tp=False):
+    def sample(self, logits: torch.Tensor):
         from sglang.srt.layers.sampler import Sampler
 
         sampler = Sampler()
 
-        batch_next_token_ids = sampler.sample(
-            logits, self.sampling_info, is_multi_node_tp
-        )
+        batch_next_token_ids = sampler.sample(logits, self.sampling_info)
 
         has_regex = any(req.regex_fsm is not None for req in self.reqs)
         if has_regex:

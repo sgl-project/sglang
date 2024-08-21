@@ -17,9 +17,7 @@ class Sampler(nn.Module):
     def __init__(self):
         pass
 
-    def sample(
-        self, logits: torch.Tensor, sampling_info: SamplingInfo, is_multi_node_tp: bool
-    ):
+    def sample(self, logits: torch.Tensor, sampling_info: SamplingInfo):
         # Post process logits
         logits = logits.contiguous()
         logits.div_(sampling_info.temperatures)
@@ -61,16 +59,6 @@ class Sampler(nn.Module):
         sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             batch_next_token_ids
         )
-
-        if is_multi_node_tp:
-            # If the tensor parallelism spans across multiple nodes, there is some indeterminism
-            # that can cause the TP workers to generate different tokens, so we need to
-            # sync here
-            dist.all_reduce(
-                batch_next_token_ids,
-                op=dist.ReduceOp.MIN,
-                group=get_tensor_model_parallel_group().device_group,
-            )
 
         return batch_next_token_ids
 
