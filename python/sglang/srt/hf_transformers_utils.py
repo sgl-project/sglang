@@ -233,6 +233,8 @@ class TiktokenTokenizer:
         }
         assert tok_dict["word_split"] == "V1"
 
+        default_allowed_special = None
+
         kwargs = {
             "name": name,
             "pat_str": tok_dict.get("pat_str", PAT_STR_B),
@@ -246,14 +248,18 @@ class TiktokenTokenizer:
                     for bytes_list in tok_dict["default_allowed_special"]
                 ]
             )
-        else:
-            default_allowed_special = None
         if "vocab_size" in tok_dict:
             kwargs["explicit_n_vocab"] = tok_dict["vocab_size"]
 
+        PAD = "<|pad|>"
+        EOS = "<|eos|>"
+        SEP = "<|separator|>"
+
+        DEFAULT_CONTROL_TOKENS = {"pad": PAD, "sep": EOS, "eos": SEP}
+
         tokenizer = tiktoken.Encoding(**kwargs)
         tokenizer._default_allowed_special = default_allowed_special or set()
-        tokenizer._default_allowed_special |= {"<|separator|>"}
+        tokenizer._control_tokens = DEFAULT_CONTROL_TOKENS
 
         def encode_patched(
             self,
@@ -270,14 +276,14 @@ class TiktokenTokenizer:
                 self,
                 text,
                 allowed_special=allowed_special,
-                disallowed_special=disallowed_special,
+                disallowed_special=(),
             )
 
         tokenizer.encode = functools.partial(encode_patched, tokenizer)
 
         # Convert to HF interface
         self.tokenizer = tokenizer
-        self.eos_token_id = tokenizer._special_tokens["<|eos|>"]
+        self.eos_token_id = tokenizer._special_tokens[EOS]
         self.vocab_size = tokenizer.n_vocab
         self.chat_template = Template(
             "{% for message in messages %}{% if message['role'] == 'user' %}{{ 'Human: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'system' %}{{ 'System: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'assistant' %}{{ 'Assistant: '  + message['content'] + '<|separator|>\n\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
