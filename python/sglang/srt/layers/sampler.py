@@ -54,10 +54,6 @@ class Sampler(CustomOp):
                 success, batch_next_token_ids, argmax_ids
             )
 
-        sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            batch_next_token_ids
-        )
-
         return batch_next_token_ids
 
     def forward_native():
