@@ -16,7 +16,6 @@ limitations under the License.
 """Meta data for requests and batches"""
 
 import logging
-import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
@@ -267,7 +266,7 @@ class Req:
 
         if all_ids[prompt_tokens - 1] != self.origin_input_ids_unpadded[-1]:
             # TODO(lsyin): fix token fusion
-            logging.warning(
+            logger.warning(
                 "Token fusion between input and output, try to avoid this by removing the space at the end of the input."
             )
             return False
