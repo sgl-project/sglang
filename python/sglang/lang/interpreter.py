@@ -663,6 +663,7 @@ class StreamExecutor:
             "temperature",
             "top_p",
             "top_k",
+            "min_p",
             "frequency_penalty",
             "presence_penalty",
             "ignore_eos",
