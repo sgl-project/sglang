@@ -465,6 +465,7 @@ class ModelRunner:
             self,
             max_batch_size_to_capture=max(batch_size_list),
             use_torch_compile=self.server_args.enable_torch_compile,
+            disable_padding=self.server_args.disable_cuda_graph_padding,
         )
         try:
             self.cuda_graph_runner.capture(batch_size_list)
