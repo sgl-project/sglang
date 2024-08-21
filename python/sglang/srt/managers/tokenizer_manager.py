@@ -140,6 +140,37 @@ class TokenizerManager:
         grid_pinpoints = (
             self.hf_config.image_grid_pinpoints if "anyres" in aspect_ratio else None
         )
+
+        if isinstance(image_data, list) and len(image_data) > 0:
+            pixel_values, image_hash, image_size = [], [], []
+            if len(image_data) > 1:
+                aspect_ratio = "pad"  # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
+                for img_data in image_data:
+                    pixel_v, image_h, image_s = await self._process_single_image(
+                        img_data, aspect_ratio, grid_pinpoints
+                    )
+                    pixel_values.append(pixel_v)
+                    image_hash.append(image_h)
+                    image_size.append(image_s)
+                pixel_values = np.stack(pixel_values, axis=0)
+            else:
+                pixel_values, image_hash, image_size = await self._process_single_image(
+                    image_data[0], aspect_ratio, grid_pinpoints
+                )
+                image_hash = [image_hash]
+                image_size = [image_size]
+        elif isinstance(image_data, str):
+            pixel_values, image_hash, image_size = await self._process_single_image(
+                image_data, aspect_ratio, grid_pinpoints
+            )
+            image_hash = [image_hash]
+            image_size = [image_size]
+        else:
+            pixel_values, image_hash, image_size = None, None, None
+
+        return pixel_values, image_hash, image_size
+
+    async def _process_single_image(self, image_data, aspect_ratio, grid_pinpoints):
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
@@ -197,50 +228,22 @@ class TokenizerManager:
                 obj.sampling_params if not_use_index else obj.sampling_params[index]
             )
 
-            if self.is_generation:
-                if isinstance(obj.image_data, list) and len(obj.image_data) > 0:
-                    # muti image/video (pad): num_frame, 3, 336 or 384, 336 or 384
-                    # single image (anyres): num_patch, 3, 336 or 384, 336 or 384
-                    pixel_values, image_hash, image_size = [], [], []
-                    if len(obj.image_data) > 1:
-                        aspect_ratio = "pad"  # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
-                        for image_data in obj.image_data:
-                            pixel_v, image_h, image_s = await self.get_pixel_values(
-                                image_data, aspect_ratio
-                            )
-                            pixel_values.append(pixel_v)
-                            image_hash.append(image_h)
-                            image_size.append(image_s)
-                        pixel_values = np.stack(pixel_values, axis=0)
-                    else:
-                        pixel_v, image_h, image_s = await self.get_pixel_values(
-                            obj.image_data[0]
-                        )
-                        pixel_values = pixel_v
-                        image_hash.append(image_h)
-                        image_size.append(image_s)
-                elif isinstance(obj.image_data, str):
-                    pixel_values, image_hash, image_size = await self.get_pixel_values(
-                        obj.image_data
-                    )
-                else:
-                    pixel_values, image_hash, image_size = None, None, None
-                return_logprob = (
-                    obj.return_logprob if not_use_index else obj.return_logprob[index]
-                )
-                logprob_start_len = (
-                    obj.logprob_start_len
-                    if not_use_index
-                    else obj.logprob_start_len[index]
-                )
-                if return_logprob and logprob_start_len == -1:
-                    logprob_start_len = len(input_ids) - 1
+        if self.is_generation:
+            pixel_values, image_hash, image_size = await self.get_pixel_values(
+                obj.image_data
+            )
+            return_logprob = (
+                obj.return_logprob if not_use_index else obj.return_logprob[index]
+            )
+            logprob_start_len = (
+                obj.logprob_start_len if not_use_index else obj.logprob_start_len[index]
+            )
+            if return_logprob and logprob_start_len == -1:
+                logprob_start_len = len(input_ids) - 1
 
-                top_logprobs_num = (
-                    obj.top_logprobs_num
-                    if not_use_index
-                    else obj.top_logprobs_num[index]
-                )
+            top_logprobs_num = (
+                obj.top_logprobs_num if not_use_index else obj.top_logprobs_num[index]
+            )
         else:  # A prefill request to cache the common prompt for parallel sampling
             assert self.is_generation
             if obj.text is not None:
