@@ -514,6 +514,11 @@ class ModelTpServer:
                     req.output_ids.append(next_token_ids[i])
                     req.check_finished()
 
+                if req.regex_fsm is not None:
+                    req.regex_fsm_state = req.regex_fsm.get_next_state(
+                        req.regex_fsm_state, next_token_ids[i]
+                    )
+
                 if req.finished():
                     self.tree_cache.cache_finished_req(req)
                 elif req not in decoding_reqs:
@@ -657,6 +662,11 @@ class ModelTpServer:
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
             req.check_finished()
+
+            if req.regex_fsm is not None:
+                req.regex_fsm_state = req.regex_fsm.get_next_state(
+                    req.regex_fsm_state, next_token_id
+                )
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)

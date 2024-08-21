@@ -678,13 +678,4 @@ class ScheduleBatch:
 
         batch_next_token_ids = sampler.sample(logits, self.sampling_info)
 
-        has_regex = any(req.regex_fsm is not None for req in self.reqs)
-        if has_regex:
-            batch_next_token_ids_cpu = batch_next_token_ids.cpu().numpy()
-            for i, req in enumerate(self.reqs):
-                if req.regex_fsm is not None:
-                    req.regex_fsm_state = req.regex_fsm.get_next_state(
-                        req.regex_fsm_state, batch_next_token_ids_cpu[i]
-                    )
-
         return batch_next_token_ids
