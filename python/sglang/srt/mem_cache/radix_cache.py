@@ -21,6 +21,8 @@ The radix tree data structure for managing the KV cache.
 
 import heapq
 import time
+import threading
+from functools import wraps
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, List, Optional
 
@@ -55,6 +57,15 @@ def _key_match(key0: List, key1: List):
     return i
 
 
+def synchronized(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with self.lock:
+            return func(self, *args, **kwargs)
+
+    return wrapper
+
+
 class RadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -65,10 +76,15 @@ class RadixCache(BasePrefixCache):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
         self.disable = disable
+        # serialize accesses from concurrent threads, use reentrant lock to prevent deadlock
+        # read access is not required to be synchronized, but we decorate as well for accurate profiling
+        # note all operations are supposed to be short
+        self.lock = threading.RLock()
         self.reset()
 
     ##### Public API #####
 
+    @synchronized
     def reset(self):
         self.root_node = TreeNode()
         self.root_node.key = []
@@ -76,6 +92,7 @@ class RadixCache(BasePrefixCache):
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
 
+    @synchronized
     def match_prefix(self, key: List, **kwargs):
         if self.disable:
             return [], self.root_node
@@ -89,6 +106,7 @@ class RadixCache(BasePrefixCache):
             value = torch.tensor([], dtype=torch.int32)
         return value, last_node[0]
 
+    @synchronized
     def insert(self, key: List, value=None):
         if self.disable:
             return 0
@@ -97,6 +115,7 @@ class RadixCache(BasePrefixCache):
             value = [x for x in key]
         return self._insert_helper(self.root_node, key, value)
 
+    @synchronized
     def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         """Cache request when it finishes."""
         if token_ids is None:
@@ -118,6 +137,7 @@ class RadixCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
+    @synchronized
     def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         """Cache request when it is unfinished."""
         if self.disable:
@@ -146,13 +166,16 @@ class RadixCache(BasePrefixCache):
         req.prefix_indices = new_indices
         req.last_node = new_last_node
 
+    @synchronized
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
         print(f"#tokens: {self.total_size()}")
 
+    @synchronized
     def total_size(self):
         return self._total_size_helper(self.root_node)
 
+    @synchronized
     def evict(self, num_tokens: int, evict_callback: Callable):
         if self.disable:
             return
@@ -176,6 +199,7 @@ class RadixCache(BasePrefixCache):
             if len(x.parent.children) == 0:
                 heapq.heappush(leaves, x.parent)
 
+    @synchronized
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0
@@ -189,6 +213,7 @@ class RadixCache(BasePrefixCache):
             node = node.parent
         return delta
 
+    @synchronized
     def dec_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0
@@ -202,6 +227,7 @@ class RadixCache(BasePrefixCache):
             node = node.parent
         return delta
 
+    @synchronized
     def evictable_size(self):
         return self.evictable_size_
 
