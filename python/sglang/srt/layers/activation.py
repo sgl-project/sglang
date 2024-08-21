@@ -20,11 +20,18 @@ from vllm.model_executor.custom_op import CustomOp
 
 
 class SiluAndMul(CustomOp):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.is_lower_sm80 = torch.cuda.get_device_capability()[0] < 8
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if self.is_lower_sm80:
+            return self.forward_native(x)
+
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
