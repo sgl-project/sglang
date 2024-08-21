@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 @dataclasses.dataclass
-class SamplingInfo:
+class SamplingBatchInfo:
     # Basic Info
     vocab_size: int
 
@@ -105,7 +105,7 @@ class SamplingInfo:
             if self_val is not None:  # logit_bias can be None
                 setattr(self, item, self_val[new_indices])
 
-    def merge(self, other: "SamplingInfo"):
+    def merge(self, other: "SamplingBatchInfo"):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         for item in [

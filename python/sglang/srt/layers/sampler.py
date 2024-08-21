@@ -11,7 +11,7 @@ from vllm.model_executor.custom_op import CustomOp
 
 # TODO: move this dict to another place
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.sampling.sampling_info import SamplingInfo
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ class Sampler(CustomOp):
     def __init__(self):
         super().__init__()
 
-    def forward_cuda(self, logits: torch.Tensor, sampling_info: SamplingInfo):
+    def forward_cuda(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
         # Post process logits
         logits = logits.contiguous()
         logits.div_(sampling_info.temperatures)

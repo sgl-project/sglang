@@ -27,7 +27,7 @@ from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.sampling.sampling_info import SamplingInfo
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -419,7 +419,7 @@ class ScheduleBatch:
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
         self.prefix_lens_cpu = [len(r.prefix_indices) for r in reqs]
 
-        self.sampling_info = SamplingInfo.from_schedule_batch(self, vocab_size)
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
