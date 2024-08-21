@@ -46,6 +46,8 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateWeightReqInput,
+    UpdateWeightReqOutput,
 )
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.sampling_params import SamplingParams
@@ -121,6 +123,10 @@ class TokenizerManager:
         self.to_create_loop = True
         self.rid_to_state: Dict[str, ReqState] = {}
 
+        # for update model weights
+        self.model_update_lock = asyncio.Lock()
+        self.model_update_result = None
+
     async def get_pixel_values(self, image_data):
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
@@ -146,6 +152,9 @@ class TokenizerManager:
         if self.to_create_loop:
             self.create_handle_loop()
 
+        while self.model_update_lock.locked():
+            await asyncio.sleep(0)
+
         obj.post_init()
         is_single = obj.is_single
 
@@ -153,9 +162,6 @@ class TokenizerManager:
             async for response in self._handle_single_request(obj, request):
                 yield response
         else:
-            if hasattr(obj, "stream") and obj.stream:
-                raise ValueError("Do not support stream for batch mode.")
-
             async for response in self._handle_batch_request(obj, request):
                 yield response
 
@@ -311,6 +317,7 @@ class TokenizerManager:
             parallel_sample_num = 1
 
         # First send out all requests
+        generators = []
         for i in range(batch_size):
             for j in range(parallel_sample_num):
                 if j == 0 and parallel_sample_num != 1:
@@ -371,42 +378,48 @@ class TokenizerManager:
                 state = ReqState([], False, event)
                 self.rid_to_state[rid] = state
 
-        # Then wait for all responses
-        output_list = []
-        for i in range(batch_size):
-            for j in range(parallel_sample_num):
-                if j == 0 and parallel_sample_num != 1:
-                    continue
-                index = i * parallel_sample_num + j
-                if parallel_sample_num != 1:
-                    index += batch_size - 1 - i
-                rid = obj.rid[index]
-                state = self.rid_to_state[rid]
-
-                while True:
-                    try:
-                        await asyncio.wait_for(state.event.wait(), timeout=4)
-                        break
-                    except asyncio.TimeoutError:
-                        if request is not None and await request.is_disconnected():
-                            for rid in obj.rid:
-                                self.abort_request(rid)
-                            raise ValueError(f"Abort request {rid}")
-                        continue
-                if self.is_generation:
-                    output_list.append(
-                        self.convert_logprob_style(
-                            state.out_list[-1],
-                            obj.return_logprob[index],
-                            obj.top_logprobs_num[index],
-                            obj.return_text_in_logprobs,
-                        )
+                generators.append(
+                    self._wait_for_response(
+                        event,
+                        state,
+                        obj,
+                        rid,
+                        request,
+                        index=index,
+                        response_index=len(generators),
                     )
-                else:
-                    output_list.append(state.out_list[-1])
-                assert state.finished
-                del self.rid_to_state[rid]
-        yield output_list
+                )
+
+        # Then process the responses based on streaming option
+
+        is_stream = hasattr(obj, "stream") and obj.stream
+
+        tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
+        output_list = []
+
+        while tasks:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+            for task in done:
+                gen_index = tasks.index(task)
+
+                try:
+                    result = task.result()
+
+                    if is_stream:
+                        yield result
+                    else:
+                        output_list.append(result)
+
+                    tasks[gen_index] = asyncio.create_task(
+                        generators[gen_index].__anext__()
+                    )
+                except StopAsyncIteration:
+                    del generators[gen_index]
+                    del tasks[gen_index]
+
+        if not is_stream:
+            yield output_list
 
     def _validate_input_length(self, input_ids: List[int]):
         if len(input_ids) >= self.context_len:
@@ -437,25 +450,34 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         rid: str,
         request,
+        index: int = None,
+        response_index: int = 0,
     ):
         while True:
             try:
                 await asyncio.wait_for(event.wait(), timeout=4)
             except asyncio.TimeoutError:
                 if request is not None and await request.is_disconnected():
-                    self.abort_request(rid)
+                    for rid in [obj.rid] if obj.is_single else obj.rid:
+                        self.abort_request(rid)
                     raise ValueError(f"Abort request {rid}")
                 continue
 
             if self.is_generation:
                 out = self.convert_logprob_style(
                     state.out_list[-1],
-                    obj.return_logprob,
-                    obj.top_logprobs_num,
+                    obj.return_logprob if index is None else obj.return_logprob[index],
+                    (
+                        obj.top_logprobs_num
+                        if index is None
+                        else obj.top_logprobs_num[index]
+                    ),
                     obj.return_text_in_logprobs,
                 )
             else:  # isinstance(obj, EmbeddingReqInput)
                 out = state.out_list[-1]
+
+            out["index"] = response_index
 
             # Log requests
             if self.server_args.log_requests and state.finished:
@@ -500,6 +522,30 @@ class TokenizerManager:
         req = FlushCacheReq()
         self.send_to_router.send_pyobj(req)
 
+    async def update_weights(self, obj: UpdateWeightReqInput, request):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        # default the load format to the server_args
+        if obj.load_format is None:
+            obj.load_format = self.server_args.load_format
+
+        if not self.model_update_lock.locked():
+            async with self.model_update_lock:
+                # wait for the previous generation requests to finish
+                while len(self.rid_to_state) > 0:
+                    await asyncio.sleep(0)
+                self.send_to_router.send_pyobj(obj)
+                self.model_update_result = asyncio.Future()
+                result = await self.model_update_result
+                if result.success:
+                    self.server_args.model_path = obj.model_path
+                    self.server_args.load_format = obj.load_format
+                    self.model_path = obj.model_path
+            return result.success, result.message
+        else:
+            return False, "Another update is in progress. Please try again later."
+
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
             return
@@ -528,12 +574,18 @@ class TokenizerManager:
 
     async def handle_loop(self):
         while True:
-            recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut] = (
-                await self.recv_from_detokenizer.recv_pyobj()
-            )
+            recv_obj: Union[
+                BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, UpdateWeightReqOutput
+            ] = await self.recv_from_detokenizer.recv_pyobj()
+
+            if isinstance(recv_obj, UpdateWeightReqOutput):
+                self.model_update_result.set_result(recv_obj)
+                continue
+
             assert isinstance(
                 recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)
             ), f"Unexpected obj received: {type(recv_obj)}"
+
             for i, rid in enumerate(recv_obj.rids):
                 state = self.rid_to_state.get(rid, None)
                 if state is None:

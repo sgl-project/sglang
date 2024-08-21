@@ -81,14 +81,17 @@ docker run --gpus all \
 
 ### Method 4: Using docker compose
 
+<details>
 > This method is recommended if you plan to serve it as a service.
 > A better approach is to use the [k8s-sglang-service.yaml](./docker/k8s-sglang-service.yaml).
 
 1. Copy the [compose.yml](./docker/compose.yaml) to your local machine
 2. Execute the command `docker compose up -d` in your terminal.
+</details>
 
 ### Method 5: Run on Kubernetes or Clouds with SkyPilot
 
+<details>
 To deploy on Kubernetes or 12+ clouds, you can use [SkyPilot](https://github.com/skypilot-org/skypilot).
 
 1. Install SkyPilot and set up Kubernetes cluster or cloud access: see [SkyPilot's documentation](https://skypilot.readthedocs.io/en/latest/getting-started/installation.html).
@@ -113,7 +116,6 @@ run: |
     --host 0.0.0.0 \
     --port 30000
 ```
-
 </details>
 
 ```bash
@@ -124,7 +126,7 @@ HF_TOKEN=<secret> sky launch -c sglang --env HF_TOKEN sglang.yaml
 sky status --endpoint 30000 sglang
 ```
 3. To further scale up your deployment with autoscaling and failure recovery, check out the [SkyServe + SGLang guide](https://github.com/skypilot-org/skypilot/tree/master/llm/sglang#serving-llama-2-with-sglang-for-more-traffic-using-skyserve).
-
+</details>
 
 
 ### Common Notes

@@ -24,7 +24,6 @@ import json
 import logging
 import multiprocessing as mp
 import os
-import sys
 import threading
 import time
 from http import HTTPStatus
@@ -51,7 +50,11 @@ from sglang.srt.managers.controller_single import (
     start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    UpdateWeightReqInput,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
@@ -89,6 +92,23 @@ app = FastAPI()
 tokenizer_manager = None
 
 
+@app.get("/v1/health")
+async def health(request: Request) -> Response:
+    """
+    Generate 1 token to verify the health of the inference service.
+    """
+    gri = GenerateReqInput(
+        text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+    )
+    try:
+        async for _ in tokenizer_manager.generate_request(gri, request):
+            break
+        return Response(status_code=200)
+    except Exception as e:
+        logger.exception(e)
+        return Response(status_code=503)
+
+
 @app.get("/health")
 async def health() -> Response:
     """Health check."""
@@ -117,6 +137,23 @@ async def flush_cache():
         "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
+
+
+@app.post("/update_weights")
+async def update_weights(obj: UpdateWeightReqInput, request: Request):
+
+    success, message = await tokenizer_manager.update_weights(obj, request)
+    content = {"message": message, "success": str(success)}
+    if success:
+        return JSONResponse(
+            content,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return JSONResponse(
+            content,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 
 async def generate_request(obj: GenerateReqInput, request: Request):
@@ -263,27 +300,29 @@ def launch_server(
     server_args.tokenizer_path = prepare_tokenizer(server_args.tokenizer_path)
 
     # Launch processes for multi-node tensor parallelism
-    if server_args.nnodes > 1:
-        if server_args.node_rank != 0:
-            tp_size_local = server_args.tp_size // server_args.nnodes
-            gpu_ids = [
-                i for _ in range(server_args.nnodes) for i in range(tp_size_local)
-            ]
-            tp_rank_range = list(
-                range(
-                    server_args.node_rank * tp_size_local,
-                    (server_args.node_rank + 1) * tp_size_local,
-                )
+    if server_args.nnodes > 1 and server_args.node_rank != 0:
+        tp_size_local = server_args.tp_size // server_args.nnodes
+        gpu_ids = [i for _ in range(server_args.nnodes) for i in range(tp_size_local)]
+        tp_rank_range = list(
+            range(
+                server_args.node_rank * tp_size_local,
+                (server_args.node_rank + 1) * tp_size_local,
             )
-            procs = launch_tp_servers(
-                gpu_ids,
-                tp_rank_range,
-                server_args,
-                ports[3],
-                model_overide_args,
-            )
-            while True:
-                pass
+        )
+        procs = launch_tp_servers(
+            gpu_ids,
+            tp_rank_range,
+            server_args,
+            ports[3],
+            model_overide_args,
+        )
+
+        try:
+            for p in procs:
+                p.join()
+        finally:
+            kill_child_process(os.getpid(), including_parent=False)
+            return
 
     # Launch processes
     tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
@@ -318,15 +357,11 @@ def launch_server(
     if controller_init_state != "init ok" or detoken_init_state != "init ok":
         proc_controller.kill()
         proc_detoken.kill()
-        print(
-            f"Initialization failed. controller_init_state: {controller_init_state}",
-            flush=True,
+        raise RuntimeError(
+            "Initialization failed. "
+            f"controller_init_state: {controller_init_state}, "
+            f"detoken_init_state: {detoken_init_state}"
         )
-        print(
-            f"Initialization failed. detoken_init_state: {detoken_init_state}",
-            flush=True,
-        )
-        sys.exit(1)
     assert proc_controller.is_alive() and proc_detoken.is_alive()
 
     # Add api key authorization
@@ -335,12 +370,12 @@ def launch_server(
 
     # Send a warmup request
     t = threading.Thread(
-        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
+        target=_wait_and_warmup, args=(server_args, pipe_finish_writer, os.getpid())
     )
     t.start()
 
-    # Listen for requests
     try:
+        # Listen for requests
         uvicorn.run(
             app,
             host=server_args.host,
@@ -388,7 +423,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
 
 
-def _wait_and_warmup(server_args, pipe_finish_writer):
+def _wait_and_warmup(server_args, pipe_finish_writer, pid):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
@@ -411,8 +446,9 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
     if not success:
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
-        print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
-        sys.exit(1)
+        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+        kill_child_process(pid, including_parent=False)
+        return
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
@@ -437,12 +473,13 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
-    except Exception as e:
+    except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
-        print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
-        sys.exit(1)
+        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+        kill_child_process(pid, including_parent=False)
+        return
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
