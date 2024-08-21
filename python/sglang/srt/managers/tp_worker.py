@@ -329,9 +329,9 @@ class ModelTpServer:
                 )
                 req.pad_value = [
                     (image_hash) % self.model_config.vocab_size,
-                    (image_hash) % self.model_config.vocab_size,
-                    (image_hash) % self.model_config.vocab_size,
-                    (image_hash) % self.model_config.vocab_size,
+                    (image_hash >> 16) % self.model_config.vocab_size,
+                    (image_hash >> 32) % self.model_config.vocab_size,
+                    (image_hash >> 64) % self.model_config.vocab_size,
                 ]
                 req.image_size = recv_req.image_size
                 (
