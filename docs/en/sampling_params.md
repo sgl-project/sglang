@@ -45,6 +45,8 @@ temperature: float = 1.0,
 top_p: float = 1.0,
 # Top-k sampling
 top_k: int = -1,
+# Min-p sampling
+min_p: float = 0.0,
 # Whether to ignore EOS token.
 ignore_eos: bool = False,
 # Whether to skip the special tokens during detokenization.
