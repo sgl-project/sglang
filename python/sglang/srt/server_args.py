@@ -79,6 +79,7 @@ class ServerArgs:
     disable_radix_cache: bool = False
     disable_regex_jump_forward: bool = False
     disable_cuda_graph: bool = False
+    disable_cuda_graph_padding: bool = False
     disable_disk_cache: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
@@ -392,6 +393,11 @@ class ServerArgs:
             "--disable-cuda-graph",
             action="store_true",
             help="Disable cuda graph.",
+        )
+        parser.add_argument(
+            "--disable-cuda-graph-padding",
+            action="store_true",
+            help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
             "--disable-disk-cache",

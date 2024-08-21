@@ -84,13 +84,20 @@ def set_torch_compile_config():
 
 
 class CudaGraphRunner:
-    def __init__(self, model_runner, max_batch_size_to_capture, use_torch_compile):
+    def __init__(
+        self,
+        model_runner,
+        max_batch_size_to_capture: int,
+        use_torch_compile: bool,
+        disable_padding: bool,
+    ):
         self.model_runner = model_runner
         self.graphs = {}
         self.input_buffers = {}
         self.output_buffers = {}
         self.flashinfer_handlers = {}
         self.graph_memory_pool = None
+        self.disable_padding = disable_padding
 
         # Common inputs
         self.max_bs = max_batch_size_to_capture
@@ -142,13 +149,17 @@ class CudaGraphRunner:
             set_torch_compile_config()
 
     def can_run(self, batch_size):
-        return batch_size <= self.max_bs
+        if self.disable_padding:
+            return batch_size in self.graphs
+        else:
+            return batch_size <= self.max_bs
 
     def capture(self, batch_size_list):
         self.batch_size_list = batch_size_list
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
             for bs in batch_size_list:
+                print(f"{bs}, ", end="", flush=True)
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
