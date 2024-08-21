@@ -20,6 +20,7 @@ class SamplingInfo:
     temperatures: torch.Tensor = None
     top_ps: torch.Tensor = None
     top_ks: torch.Tensor = None
+    min_ps: torch.Tensor = None
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
     logit_bias: torch.Tensor = None
     vocab_mask: torch.Tensor = None
@@ -40,6 +41,9 @@ class SamplingInfo:
         )
         ret.top_ks = torch.tensor(
             [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
+        )
+        ret.min_ps = torch.tensor(
+            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
         )
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
@@ -94,6 +98,7 @@ class SamplingInfo:
             "temperatures",
             "top_ps",
             "top_ks",
+            "min_ps",
             "logit_bias",
         ]:
             self_val = getattr(self, item, None)
@@ -107,6 +112,7 @@ class SamplingInfo:
             "temperatures",
             "top_ps",
             "top_ks",
+            "min_ps",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
