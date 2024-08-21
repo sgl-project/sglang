@@ -50,7 +50,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightReqOutput,
 )
 from sglang.srt.mm_utils import expand2square, process_anyres_image
-from sglang.srt.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import is_generation_model, is_multimodal_model, load_image
 from sglang.utils import get_exception_traceback

@@ -482,6 +482,9 @@ class ModelTpServer:
             if batch.extend_num_tokens != 0:
                 output = self.model_runner.forward(batch, ForwardMode.EXTEND)
                 next_token_ids = batch.sample(output.next_token_logits)
+                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                    next_token_ids
+                )
 
                 # Move logprobs to cpu
                 if output.next_token_logprobs is not None:
@@ -513,6 +516,11 @@ class ModelTpServer:
                     req.completion_tokens_wo_jump_forward += 1
                     req.output_ids.append(next_token_ids[i])
                     req.check_finished()
+
+                if req.regex_fsm is not None:
+                    req.regex_fsm_state = req.regex_fsm.get_next_state(
+                        req.regex_fsm_state, next_token_ids[i]
+                    )
 
                 if req.finished():
                     self.tree_cache.cache_finished_req(req)
@@ -642,6 +650,9 @@ class ModelTpServer:
         # Forward and sample the next tokens
         output = self.model_runner.forward(batch, ForwardMode.DECODE)
         next_token_ids = batch.sample(output.next_token_logits)
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            next_token_ids
+        )
 
         # Move logprobs to cpu
         if output.next_token_logprobs is not None:
@@ -657,6 +668,11 @@ class ModelTpServer:
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
             req.check_finished()
+
+            if req.regex_fsm is not None:
+                req.regex_fsm_state = req.regex_fsm.get_next_state(
+                    req.regex_fsm_state, next_token_id
+                )
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
