@@ -82,6 +82,7 @@ docker run --gpus all \
 ### Method 4: Using docker compose
 
 <details>
+
 > This method is recommended if you plan to serve it as a service.
 > A better approach is to use the [k8s-sglang-service.yaml](./docker/k8s-sglang-service.yaml).
 
@@ -92,6 +93,7 @@ docker run --gpus all \
 ### Method 5: Run on Kubernetes or Clouds with SkyPilot
 
 <details>
+
 To deploy on Kubernetes or 12+ clouds, you can use [SkyPilot](https://github.com/skypilot-org/skypilot).
 
 1. Install SkyPilot and set up Kubernetes cluster or cloud access: see [SkyPilot's documentation](https://skypilot.readthedocs.io/en/latest/getting-started/installation.html).
