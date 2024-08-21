@@ -212,6 +212,4 @@ def start_controller_process(
     except Exception:
         logger.error("Exception in ControllerMulti:\n" + get_exception_traceback())
     finally:
-        for w in controller.workers:
-            os.kill(w.proc.pid, 9)
         kill_parent_process()

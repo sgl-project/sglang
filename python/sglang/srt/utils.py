@@ -369,14 +369,11 @@ def kill_parent_process():
     """Kill the parent process and all children of the parent process."""
     current_process = psutil.Process()
     parent_process = current_process.parent()
-    children = parent_process.children(recursive=True)
-    for child in children:
-        if child.pid != current_process.pid:
-            os.kill(child.pid, 9)
-    os.kill(parent_process.pid, 9)
+    kill_child_process(parent_process.pid, skip_pid=current_process.pid)
 
 
-def kill_child_process(pid, including_parent=True):
+def kill_child_process(pid, including_parent=True, skip_pid=None):
+    """Kill the process and all its children process."""
     try:
         parent = psutil.Process(pid)
     except psutil.NoSuchProcess:
@@ -384,6 +381,8 @@ def kill_child_process(pid, including_parent=True):
 
     children = parent.children(recursive=True)
     for child in children:
+        if child.pid == skip_pid:
+            continue
         try:
             child.kill()
         except psutil.NoSuchProcess:

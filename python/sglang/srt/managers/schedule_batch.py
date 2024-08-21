@@ -16,7 +16,6 @@ limitations under the License.
 """Meta data for requests and batches"""
 
 import logging
-import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
@@ -270,7 +269,7 @@ class Req:
 
         if all_ids[prompt_tokens - 1] != self.origin_input_ids_unpadded[-1]:
             # TODO(lsyin): fix token fusion
-            logging.warning(
+            logger.warning(
                 "Token fusion between input and output, try to avoid this by removing the space at the end of the input."
             )
             return False
@@ -753,7 +752,7 @@ class ScheduleBatch:
                 )
             self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
 
-    def sample(self, logits: torch.Tensor, is_multi_node_tp=False):
+    def sample(self, logits: torch.Tensor):
         # TODO(lsyin): move this into a part of layer and run with CUDA Graph
         # Post process logits
         logits = logits.contiguous()
@@ -791,7 +790,7 @@ class ScheduleBatch:
             )
 
         if not torch.all(success):
-            logging.warning("Sampling failed, fallback to top_k=1 strategy")
+            logger.warning(f"Sampling failed. Fallback to top_k=1 strategy. {logits=}")
             probs = probs.masked_fill(torch.isnan(probs), 0.0)
             argmax_ids = torch.argmax(probs, dim=-1)
             batch_next_token_ids = torch.where(
@@ -807,16 +806,6 @@ class ScheduleBatch:
                     )
 
         self.penalizer_orchestrator.cumulate_output_tokens(batch_next_token_ids)
-
-        if is_multi_node_tp:
-            # If the tensor parallelism spans across multiple nodes, there is some indeterminism
-            # that can cause the TP workers to generate different tokens, so we need to
-            # sync here
-            torch.distributed.all_reduce(
-                batch_next_token_ids,
-                op=dist.ReduceOp.MIN,
-                group=get_tensor_model_parallel_group().device_group,
-            )
 
         return batch_next_token_ids
 
@@ -835,7 +824,8 @@ def top_k_top_p_sampling_from_probs_torch(
     probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
     try:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
-    except RuntimeError:
+    except RuntimeError as e:
+        logger.warning(f"Sampling error: {e}")
         batch_next_token_ids = torch.zeros(
             (probs_sort.shape[0],), dtype=torch.int32, device=probs.device
         )
