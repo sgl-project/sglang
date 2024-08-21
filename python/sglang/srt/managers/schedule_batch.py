@@ -676,6 +676,6 @@ class ScheduleBatch:
 
         sampler = Sampler()
 
-        batch_next_token_ids = sampler.sample(logits, self.sampling_info)
+        batch_next_token_ids = sampler(logits, self.sampling_info)
 
         return batch_next_token_ids

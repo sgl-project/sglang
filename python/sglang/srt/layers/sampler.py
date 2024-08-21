@@ -2,9 +2,7 @@ import logging
 
 import torch
 from flashinfer.sampling import top_k_top_p_sampling_from_probs
-from torch import distributed as dist
-from torch import nn
-from vllm.distributed import get_tensor_model_parallel_group
+from vllm.model_executor.custom_op import CustomOp
 
 # TODO: move this dict to another place
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -13,11 +11,11 @@ from sglang.srt.sampling.sampling_info import SamplingInfo
 logger = logging.getLogger(__name__)
 
 
-class Sampler(nn.Module):
+class Sampler(CustomOp):
     def __init__(self):
-        pass
+        super().__init__()
 
-    def sample(self, logits: torch.Tensor, sampling_info: SamplingInfo):
+    def forward_cuda(self, logits: torch.Tensor, sampling_info: SamplingInfo):
         # Post process logits
         logits = logits.contiguous()
         logits.div_(sampling_info.temperatures)
@@ -61,6 +59,9 @@ class Sampler(nn.Module):
         )
 
         return batch_next_token_ids
+
+    def forward_native():
+        raise NotImplementedError("Native forward is not implemented yet.")
 
 
 def top_k_top_p_sampling_from_probs_torch(
