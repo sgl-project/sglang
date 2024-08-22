@@ -21,7 +21,6 @@ Each data parallel worker can manage multiple tensor parallel workers.
 import dataclasses
 import logging
 import multiprocessing
-import os
 from enum import Enum, auto
 
 import numpy as np
