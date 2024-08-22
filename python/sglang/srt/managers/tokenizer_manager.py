@@ -138,7 +138,10 @@ class TokenizerManager:
             else aspect_ratio
         )
         grid_pinpoints = (
-            self.hf_config.image_grid_pinpoints if "anyres" in aspect_ratio else None
+            self.hf_config.image_grid_pinpoints
+            if "anyres" in aspect_ratio
+            and hasattr(self.hf_config, "image_grid_pinpoints")
+            else None
         )
 
         if isinstance(image_data, list) and len(image_data) > 0:
