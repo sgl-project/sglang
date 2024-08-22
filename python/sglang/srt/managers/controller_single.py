@@ -91,6 +91,7 @@ class ControllerSingle:
         self.tp_cpu_group = self.tp_server.model_runner.tp_group.cpu_group
 
     def loop_for_forward(self):
+        self.tp_server.compute_loop_thread.start()
         while True:
             if not self.is_dp_worker:
                 recv_reqs = self.recv_requests_from_zmq()
