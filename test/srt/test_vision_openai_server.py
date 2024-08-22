@@ -1,8 +1,16 @@
+import base64
+import io
 import json
 import os
+import sys
+import time
 import unittest
 
+import numpy as np
 import openai
+import requests
+from decord import VideoReader, cpu
+from PIL import Image
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_child_process
