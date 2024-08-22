@@ -10,6 +10,10 @@ import requests
 from decord import VideoReader, cpu
 from PIL import Image
 
+# pip install httpx==0.23.3
+# pip install decord
+# pip install protobuf==3.20.0
+
 
 def download_video(url, cache_dir):
     file_path = os.path.join(cache_dir, "jobs.mp4")

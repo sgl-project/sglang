@@ -323,7 +323,7 @@ class ModelTpServer:
             req.pixel_values = recv_req.pixel_values
             if req.pixel_values is not None:
                 image_hash = (
-                    sum(recv_req.image_hash)
+                    hash(tuple(recv_req.image_hash))
                     if isinstance(recv_req.image_hash, list)
                     else recv_req.image_hash
                 )
