@@ -92,11 +92,15 @@ app = FastAPI()
 tokenizer_manager = None
 
 
-@app.get("/v1/health")
-async def health(request: Request) -> Response:
-    """
-    Generate 1 token to verify the health of the inference service.
-    """
+@app.get("/health")
+async def health() -> Response:
+    """Check the health of the http server."""
+    return Response(status_code=200)
+
+
+@app.get("/health_generate")
+async def health_generate(request: Request) -> Response:
+    """Check the health of the inference server by generating one token."""
     gri = GenerateReqInput(
         text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
     )
@@ -107,12 +111,6 @@ async def health(request: Request) -> Response:
     except Exception as e:
         logger.exception(e)
         return Response(status_code=503)
-
-
-@app.get("/health")
-async def health() -> Response:
-    """Health check."""
-    return Response(status_code=200)
 
 
 @app.get("/get_model_info")
