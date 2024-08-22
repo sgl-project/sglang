@@ -920,7 +920,7 @@ def run_tp_server(
             model_overide_args,
         )
         tp_cpu_group = model_server.model_runner.tp_group.cpu_group
-
+        model_server.compute_loop_thread.start()
         while True:
             recv_reqs = broadcast_recv_input(None, tp_rank, tp_cpu_group)
             model_server.exposed_step(recv_reqs)
