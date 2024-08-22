@@ -17,8 +17,8 @@ limitations under the License.
 
 import logging
 import threading
-from typing import List, Union
 from functools import wraps
+from typing import List, Union
 
 import torch
 

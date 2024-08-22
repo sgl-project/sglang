@@ -15,14 +15,14 @@ limitations under the License.
 
 """A tensor parallel worker."""
 
+import enum
 import logging
 import multiprocessing
 import os
 import pickle
-import time
-import enum
 import queue
 import threading
+import time
 import warnings
 from typing import Any, List, Optional, Union
 
@@ -280,15 +280,15 @@ class ModelTpServer:
                 self.out_pyobjs_queue.put(UpdateWeightReqOutput(success, message))
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
-        else:
-            # avoid busy waiting, could be adjusted
-            time.sleep(0.01)
 
         if self.phase_indicator is not Phase.PREFILLing:
             if self.ready_prefill_batch.empty():
                 new_batch = self.get_new_prefill_batch()
                 if new_batch is not None:
                     self.ready_prefill_batch.put(new_batch)
+
+        # avoid busy waiting, could be adjusted
+        time.sleep(0.01)
 
     @torch.inference_mode()
     def forward_step(self):
