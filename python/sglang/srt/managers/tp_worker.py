@@ -445,7 +445,7 @@ class ModelTpServer:
             return None
 
         # Get priority queue
-        prefix_computed = self.scheduler.calc_priority(self.waiting_queue)
+        self.scheduler.calc_priority(self.waiting_queue)
 
         num_mixed_running = running_bs if self.is_mixed_chunk else 0
 
@@ -457,20 +457,19 @@ class ModelTpServer:
             num_mixed_running,
         )
 
+        # todo: atomic global token counter
         if self.running_batch is not None:
             adder.remove_running_tokens(self.running_batch, self.new_token_ratio)
 
         has_inflight = self.current_inflight_req is not None
         if self.current_inflight_req is not None:
-            self.current_inflight_req.init_next_round_input(
-                None if prefix_computed else self.tree_cache
-            )
+            # info for inflight reqs is precomputed
+            self.current_inflight_req.init_next_round_input(None)
             self.current_inflight_req = adder.add_inflight_req(
                 self.current_inflight_req
             )
 
         for req in self.waiting_queue:
-            # req.init_next_round_input(None if prefix_computed else self.tree_cache)
             res = adder.add_one_req(req)
             if (
                 not res
@@ -589,7 +588,6 @@ class ModelTpServer:
                     )
 
                 if req.finished():
-                    # self.tree_cache.cache_finished_req(req)
                     pass
                 elif req not in decoding_reqs:
                     # To reduce overhead, only cache prefill reqs
@@ -617,7 +615,6 @@ class ModelTpServer:
                     req.check_finished()
 
                 if req.finished():
-                    # self.tree_cache.cache_finished_req(req)
                     pass
                 else:
                     self.tree_cache.cache_unfinished_req(req)
@@ -743,9 +740,6 @@ class ModelTpServer:
                 req.regex_fsm_state = req.regex_fsm.get_next_state(
                     req.regex_fsm_state, next_token_id
                 )
-
-            if req.finished():
-                self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob:
                 req.output_token_logprobs.append(

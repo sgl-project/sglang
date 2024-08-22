@@ -38,6 +38,9 @@ class ChunkCache(BasePrefixCache):
         max_prefix_len = len(key)
         return entry.value[:max_prefix_len], entry
 
+    def match_prefix_lock(self, rid: int, key: List[int]):
+        return *self.match_prefix(rid, key), 0
+
     def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         if token_ids is None:
             token_ids = (req.origin_input_ids + req.output_ids)[:-1]
