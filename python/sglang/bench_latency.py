@@ -350,7 +350,7 @@ def latency_test(
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
-        req = prepare_synthetic_inputs_for_latency_test(bs, il)
+        reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
         ret = latency_test_run_once(
             bench_args.run_name, model_runner, rank_print, reqs, bs, il, ol
         )
