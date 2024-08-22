@@ -228,22 +228,26 @@ class TokenizerManager:
                 obj.sampling_params if not_use_index else obj.sampling_params[index]
             )
 
-        if self.is_generation:
-            pixel_values, image_hash, image_size = await self.get_pixel_values(
-                obj.image_data
-            )
-            return_logprob = (
-                obj.return_logprob if not_use_index else obj.return_logprob[index]
-            )
-            logprob_start_len = (
-                obj.logprob_start_len if not_use_index else obj.logprob_start_len[index]
-            )
-            if return_logprob and logprob_start_len == -1:
-                logprob_start_len = len(input_ids) - 1
+            if self.is_generation:
+                pixel_values, image_hash, image_size = await self.get_pixel_values(
+                    obj.image_data
+                )
+                return_logprob = (
+                    obj.return_logprob if not_use_index else obj.return_logprob[index]
+                )
+                logprob_start_len = (
+                    obj.logprob_start_len
+                    if not_use_index
+                    else obj.logprob_start_len[index]
+                )
+                if return_logprob and logprob_start_len == -1:
+                    logprob_start_len = len(input_ids) - 1
 
-            top_logprobs_num = (
-                obj.top_logprobs_num if not_use_index else obj.top_logprobs_num[index]
-            )
+                top_logprobs_num = (
+                    obj.top_logprobs_num
+                    if not_use_index
+                    else obj.top_logprobs_num[index]
+                )
         else:  # A prefill request to cache the common prompt for parallel sampling
             assert self.is_generation
             if obj.text is not None:
