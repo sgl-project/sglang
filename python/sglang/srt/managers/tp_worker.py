@@ -331,6 +331,8 @@ class ModelTpServer:
                 time.sleep(0.01)
 
     def compute_loop(self):
+        # synchrnoize the gpu id to the compute thread
+        torch.cuda.set_device(self.gpu_id)
         while True:
             try:
                 self.forward_step()
