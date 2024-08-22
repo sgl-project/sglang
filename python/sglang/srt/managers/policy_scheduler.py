@@ -190,21 +190,34 @@ class PrefillAdder:
             delta = self.tree_cache.dec_lock_ref(last_node)
             self.rem_total_tokens += delta
 
-    def add_one_req(self, req: Req):
-        total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+    @contextmanager
+    def _lock_req(self, req: Req):
+        # match prefix again and lock the last node to prevent data racing
+        req.fill_ids = req.origin_input_ids + req.output_ids
+        req.prefix_indices, req.last_node, delta = self.tree_cache.match_prefix_lock(
+            rid=req.rid, key=req.adjust_max_prefix_ids()
         )
-        input_tokens = req.extend_input_len
-        prefix_len = len(req.prefix_indices)
+        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+        try:
+            self.rem_total_tokens += delta
+            yield None
+        finally:
+            delta = self.tree_cache.dec_lock_ref(req.last_node)
+            self.rem_total_tokens += delta
 
-        if total_tokens >= self.rem_total_tokens:
-            return False
+    def add_one_req(self, req: Req):
 
-        if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
-            return False
+        with self._lock_req(req):
+            total_tokens = req.extend_input_len + min(
+                req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            )
+            input_tokens = req.extend_input_len
+            prefix_len = len(req.prefix_indices)
 
-        with self._lock_node(req.last_node):
-            if total_tokens > self.rem_total_tokens:
+            if total_tokens >= self.rem_total_tokens:
+                return False
+
+            if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
                 return False
 
             if (

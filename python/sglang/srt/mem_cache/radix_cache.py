@@ -107,6 +107,13 @@ class RadixCache(BasePrefixCache):
         return value, last_node[0]
 
     @synchronized
+    def match_prefix_lock(self, key: List, **kwargs):
+        # to protect the referenced nodes from eviction
+        value, last_node = self.match_prefix(key)
+        delta = self.inc_lock_ref(last_node)
+        return value, last_node, delta
+
+    @synchronized
     def insert(self, key: List, value=None):
         if self.disable:
             return 0
