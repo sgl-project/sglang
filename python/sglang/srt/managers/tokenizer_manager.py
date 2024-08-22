@@ -62,12 +62,16 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class ReqState:
+    """Store the state a request."""
+
     out_list: List
     finished: bool
     event: asyncio.Event
 
 
 class TokenizerManager:
+    """TokenizerManager is a process that tokenizes the text."""
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -481,11 +485,7 @@ class TokenizerManager:
 
             # Log requests
             if self.server_args.log_requests and state.finished:
-                if obj.text is None:
-                    in_obj = {"input_ids": obj.input_ids}
-                else:
-                    in_obj = {"text": obj.text}
-                logger.info(f"in={in_obj}, out={out}")
+                logger.info(f"in={obj}, out={out}")
 
             state.out_list = []
             if state.finished:

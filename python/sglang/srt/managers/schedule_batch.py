@@ -615,7 +615,7 @@ class ScheduleBatch:
                 for r in self.reqs
             ]
         else:
-            self.penalizer_orchestrator.cumulate_input_tokens(input_ids)
+            self.sampling_info.penalizer_orchestrator.cumulate_input_tokens(input_ids)
 
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)

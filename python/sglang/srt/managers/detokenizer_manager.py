@@ -39,6 +39,8 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 @dataclasses.dataclass
 class DecodeStatus:
+    """Store the status of incremental decoding."""
+
     vid: int
     decoded_text: str
     decode_ids: List[int]
@@ -47,6 +49,8 @@ class DecodeStatus:
 
 
 class DetokenizerManager:
+    """DetokenizerManager is a process that detokenizes the token ids."""
+
     def __init__(
         self,
         server_args: ServerArgs,
