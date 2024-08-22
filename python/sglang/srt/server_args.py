@@ -422,13 +422,13 @@ class ServerArgs:
         parser.add_argument(
             "--enable-mla",
             action="store_true",
-            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2",
+            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
             "--attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
-            "This only affects Triton attention kernels",
+            "This only affects Triton attention kernels.",
         )
         parser.add_argument(
             "--efficient-weight-load",
@@ -452,15 +452,6 @@ class ServerArgs:
     def url(self):
         return f"http://{self.host}:{self.port}"
 
-    def print_mode_args(self):
-        return (
-            f"disable_flashinfer={self.disable_flashinfer}, "
-            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}, "
-            f"disable_radix_cache={self.disable_radix_cache}, "
-            f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
-            f"disable_disk_cache={self.disable_disk_cache}, "
-        )
-
     def check_server_args(self):
         assert (
             self.tp_size % self.nnodes == 0
@@ -469,7 +460,7 @@ class ServerArgs:
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
         if "gemma-2" in self.model_path.lower():
-            logger.info(f"When using sliding window in gemma-2, turn on flashinfer.")
+            logger.info("When using sliding window in gemma-2, turn on flashinfer.")
             self.disable_flashinfer = False
 
 
