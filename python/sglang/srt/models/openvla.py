@@ -287,6 +287,10 @@ class OpenVLAConfig(PretrainedConfig):
             else CONFIG_MAPPING[LLM_BACKBONE_TO_HF_METACLASS[self.llm_backbone_id]]()
         )
 
+        self.hidden_size = 4096
+        self.num_attention_heads = 32
+        self.num_hidden_layers = 32
+        self.vocab_size = 32064
         # Dispatch **kwargs to super() =>> note that `pad_token_id` collides, so we pass it in here as well...
         super().__init__(pad_token_id=pad_token_id, **kwargs)
 
@@ -335,10 +339,10 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         )
 
         # Instantiate LLM Backbone
-        # self.language_model = LlamaForCausalLM(config, quant_config=quant_config)
-        self.language_model = AutoModelForCausalLM.from_config(
-            config.text_config, attn_implementation=config._attn_implementation
-        )
+        self.language_model = LlamaForCausalLM(config.text_config, quant_config=quant_config)
+        # self.language_model = AutoModelForCausalLM.from_config(
+        #     config.text_config, attn_implementation=config._attn_implementation
+        # )
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = config.pad_token_id
 
@@ -430,7 +434,12 @@ class OpenVLAForActionPrediction(PreTrainedModel):
 
     def inference(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor,
+        positions: torch.Tensor,
+        input_metadata: InputMetadata,
+        pixel_values: Optional[List[Optional[np.array]]] = None,
+        image_sizes: Optional[List[List[int]]] = None,
+        image_offsets: Optional[List[int]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -463,17 +472,21 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         # print(input_ids.shape if input_ids is not None else None)
         # print(attention_mask.shape if attention_mask  is not None else None)
         # print(inputs_embeds.shape if inputs_embeds  is not None else None)
+        if input_ids is not None:
+            input_ids = input_ids.unsqueeze(0)
+        print(input_ids)
         language_model_output = self.language_model(
                 input_ids=input_ids,
                 # attention_mask=attention_mask,
-                position_ids=None,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict
+                positions=positions,
+                input_metadata=input_metadata,
+                # past_key_values=past_key_values,
+                input_embeds=inputs_embeds,
+                # labels=labels,
+                # use_cache=use_cache,
+                # output_attentions=output_attentions,
+                # output_hidden_states=output_hidden_states,
+                # return_dict=return_dict
             )
         # language_model_output = CausalLMOutputWithPast(
         #     loss=language_model_output.loss,  # Assuming loss is a scalar
@@ -484,7 +497,7 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         # )
 
         # print(time.time()-t0)
-
+        print("===== Inference finished =====")
         return language_model_output
    
         # @torch.no_grad()
@@ -501,9 +514,13 @@ class OpenVLAForActionPrediction(PreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor,
+        positions: torch.Tensor,
+        input_metadata: InputMetadata,
+        pixel_values: Optional[List[Optional[np.array]]] = None,
+        image_sizes: Optional[List[List[int]]] = None,
+        image_offsets: Optional[List[int]] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -538,7 +555,8 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         print(input_ids.shape)
         print(pixel_values)
         print(type(pixel_values))
-        pixel_values = pixel_values.pixel_values[0]
+        if pixel_values != None:
+            pixel_values = pixel_values.pixel_values[0]
         # input_ids = input_ids.unsqueeze(0)
 
         if len(input_ids.shape)>1 and input_ids.shape[1] == 1 and past_key_values:
@@ -548,6 +566,8 @@ class OpenVLAForActionPrediction(PreTrainedModel):
             assert labels is None, "Unexpected key `labels` provided during cached generation!"
             language_model_output = self.inference(
                 input_ids=input_ids,
+                input_metadata=input_metadata,
+                positions=positions,
                 attention_mask=None,
                 past_key_values=past_key_values,
                 inputs_embeds=None,
@@ -566,6 +586,8 @@ class OpenVLAForActionPrediction(PreTrainedModel):
             print(input_ids.shape)
             language_model_output = self.inference(
                 input_ids=input_ids,
+                input_metadata=input_metadata,
+                positions=positions,
                 # attention_mask=attention_mask,
                 past_key_values=None,
                 inputs_embeds=None,
@@ -621,6 +643,8 @@ class OpenVLAForActionPrediction(PreTrainedModel):
             # Dispatch to Language Model
             language_model_output = self.inference(
                 input_ids=None,
+                input_metadata=input_metadata,
+                positions=positions,
                 attention_mask=multimodal_attention_mask,
                 past_key_values=None,
                 inputs_embeds=multimodal_embeddings,
@@ -653,7 +677,8 @@ class OpenVLAForActionPrediction(PreTrainedModel):
                 return *language_model_output, projected_patch_embeddings
 
             return language_model_output
-
+        # language_model_output.next_token_logits = language_model_output.logits
+        return language_model_output
         return PrismaticCausalLMOutputWithPast(
             loss=language_model_output.loss,
             logits=language_model_output.logits,
