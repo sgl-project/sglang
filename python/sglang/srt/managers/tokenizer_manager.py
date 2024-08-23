@@ -46,9 +46,11 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateWeightReqInput,
+    UpdateWeightReqOutput,
 )
 from sglang.srt.mm_utils import expand2square, process_anyres_image
-from sglang.srt.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import is_generation_model, is_multimodal_model, load_image
 from sglang.utils import get_exception_traceback
@@ -60,12 +62,16 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class ReqState:
+    """Store the state a request."""
+
     out_list: List
     finished: bool
     event: asyncio.Event
 
 
 class TokenizerManager:
+    """TokenizerManager is a process that tokenizes the text."""
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -121,11 +127,53 @@ class TokenizerManager:
         self.to_create_loop = True
         self.rid_to_state: Dict[str, ReqState] = {}
 
-    async def get_pixel_values(self, image_data):
-        aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
-        grid_pinpoints = (
-            self.hf_config.image_grid_pinpoints if aspect_ratio == "anyres" else None
+        # for update model weights
+        self.model_update_lock = asyncio.Lock()
+        self.model_update_result = None
+
+    async def get_pixel_values(self, image_data, aspect_ratio=None):
+        aspect_ratio = (
+            getattr(self.hf_config, "image_aspect_ratio", None)
+            if aspect_ratio is None
+            else aspect_ratio
         )
+        grid_pinpoints = (
+            self.hf_config.image_grid_pinpoints
+            if hasattr(self.hf_config, "image_grid_pinpoints")
+            and "anyres" in aspect_ratio
+            else None
+        )
+
+        if isinstance(image_data, list) and len(image_data) > 0:
+            pixel_values, image_hash, image_size = [], [], []
+            if len(image_data) > 1:
+                aspect_ratio = "pad"  # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
+                for img_data in image_data:
+                    pixel_v, image_h, image_s = await self._process_single_image(
+                        img_data, aspect_ratio, grid_pinpoints
+                    )
+                    pixel_values.append(pixel_v)
+                    image_hash.append(image_h)
+                    image_size.append(image_s)
+                pixel_values = np.stack(pixel_values, axis=0)
+            else:
+                pixel_values, image_hash, image_size = await self._process_single_image(
+                    image_data[0], aspect_ratio, grid_pinpoints
+                )
+                image_hash = [image_hash]
+                image_size = [image_size]
+        elif isinstance(image_data, str):
+            pixel_values, image_hash, image_size = await self._process_single_image(
+                image_data, aspect_ratio, grid_pinpoints
+            )
+            image_hash = [image_hash]
+            image_size = [image_size]
+        else:
+            pixel_values, image_hash, image_size = None, None, None
+
+        return pixel_values, image_hash, image_size
+
+    async def _process_single_image(self, image_data, aspect_ratio, grid_pinpoints):
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
@@ -146,6 +194,9 @@ class TokenizerManager:
         if self.to_create_loop:
             self.create_handle_loop()
 
+        while self.model_update_lock.locked():
+            await asyncio.sleep(0)
+
         obj.post_init()
         is_single = obj.is_single
 
@@ -153,9 +204,6 @@ class TokenizerManager:
             async for response in self._handle_single_request(obj, request):
                 yield response
         else:
-            if hasattr(obj, "stream") and obj.stream:
-                raise ValueError("Do not support stream for batch mode.")
-
             async for response in self._handle_batch_request(obj, request):
                 yield response
 
@@ -184,8 +232,8 @@ class TokenizerManager:
             )
 
             if self.is_generation:
-                pixel_values, image_hash, image_size = await self._get_pixel_values(
-                    obj.image_data if not_use_index else obj.image_data[index]
+                pixel_values, image_hash, image_size = await self.get_pixel_values(
+                    obj.image_data
                 )
                 return_logprob = (
                     obj.return_logprob if not_use_index else obj.return_logprob[index]
@@ -195,6 +243,9 @@ class TokenizerManager:
                     if not_use_index
                     else obj.logprob_start_len[index]
                 )
+                if return_logprob and logprob_start_len == -1:
+                    logprob_start_len = len(input_ids) - 1
+
                 top_logprobs_num = (
                     obj.top_logprobs_num
                     if not_use_index
@@ -245,6 +296,8 @@ class TokenizerManager:
             top_logprobs_num = obj.top_logprobs_num[0]
 
         if self.is_generation:
+            if return_logprob and logprob_start_len == -1:
+                logprob_start_len = len(input_ids) - 1
             tokenized_obj = TokenizedGenerateReqInput(
                 rid,
                 input_text,
@@ -306,6 +359,7 @@ class TokenizerManager:
             parallel_sample_num = 1
 
         # First send out all requests
+        generators = []
         for i in range(batch_size):
             for j in range(parallel_sample_num):
                 if j == 0 and parallel_sample_num != 1:
@@ -334,6 +388,8 @@ class TokenizerManager:
                 sampling_params = self._get_sampling_params(obj.sampling_params[index])
 
                 if self.is_generation:
+                    if obj.return_logprob[index] and obj.logprob_start_len[index] == -1:
+                        obj.logprob_start_len[index] = len(input_ids) - 1
                     pixel_values, image_hash, image_size = await self._get_pixel_values(
                         obj.image_data[index]
                     )
@@ -364,42 +420,48 @@ class TokenizerManager:
                 state = ReqState([], False, event)
                 self.rid_to_state[rid] = state
 
-        # Then wait for all responses
-        output_list = []
-        for i in range(batch_size):
-            for j in range(parallel_sample_num):
-                if j == 0 and parallel_sample_num != 1:
-                    continue
-                index = i * parallel_sample_num + j
-                if parallel_sample_num != 1:
-                    index += batch_size - 1 - i
-                rid = obj.rid[index]
-                state = self.rid_to_state[rid]
-
-                while True:
-                    try:
-                        await asyncio.wait_for(state.event.wait(), timeout=4)
-                        break
-                    except asyncio.TimeoutError:
-                        if request is not None and await request.is_disconnected():
-                            for rid in obj.rid:
-                                self.abort_request(rid)
-                            raise ValueError(f"Abort request {rid}")
-                        continue
-                if self.is_generation:
-                    output_list.append(
-                        self.convert_logprob_style(
-                            state.out_list[-1],
-                            obj.return_logprob[index],
-                            obj.top_logprobs_num[index],
-                            obj.return_text_in_logprobs,
-                        )
+                generators.append(
+                    self._wait_for_response(
+                        event,
+                        state,
+                        obj,
+                        rid,
+                        request,
+                        index=index,
+                        response_index=len(generators),
                     )
-                else:
-                    output_list.append(state.out_list[-1])
-                assert state.finished
-                del self.rid_to_state[rid]
-        yield output_list
+                )
+
+        # Then process the responses based on streaming option
+
+        is_stream = hasattr(obj, "stream") and obj.stream
+
+        tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
+        output_list = []
+
+        while tasks:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+            for task in done:
+                gen_index = tasks.index(task)
+
+                try:
+                    result = task.result()
+
+                    if is_stream:
+                        yield result
+                    else:
+                        output_list.append(result)
+
+                    tasks[gen_index] = asyncio.create_task(
+                        generators[gen_index].__anext__()
+                    )
+                except StopAsyncIteration:
+                    del generators[gen_index]
+                    del tasks[gen_index]
+
+        if not is_stream:
+            yield output_list
 
     def _validate_input_length(self, input_ids: List[int]):
         if len(input_ids) >= self.context_len:
@@ -430,33 +492,38 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         rid: str,
         request,
+        index: int = None,
+        response_index: int = 0,
     ):
         while True:
             try:
                 await asyncio.wait_for(event.wait(), timeout=4)
             except asyncio.TimeoutError:
                 if request is not None and await request.is_disconnected():
-                    self.abort_request(rid)
+                    for rid in [obj.rid] if obj.is_single else obj.rid:
+                        self.abort_request(rid)
                     raise ValueError(f"Abort request {rid}")
                 continue
 
             if self.is_generation:
                 out = self.convert_logprob_style(
                     state.out_list[-1],
-                    obj.return_logprob,
-                    obj.top_logprobs_num,
+                    obj.return_logprob if index is None else obj.return_logprob[index],
+                    (
+                        obj.top_logprobs_num
+                        if index is None
+                        else obj.top_logprobs_num[index]
+                    ),
                     obj.return_text_in_logprobs,
                 )
             else:  # isinstance(obj, EmbeddingReqInput)
                 out = state.out_list[-1]
 
+            out["index"] = response_index
+
             # Log requests
             if self.server_args.log_requests and state.finished:
-                if obj.text is None:
-                    in_obj = {"input_ids": obj.input_ids}
-                else:
-                    in_obj = {"text": obj.text}
-                logger.info(f"in={in_obj}, out={out}")
+                logger.info(f"in={obj}, out={out}")
 
             state.out_list = []
             if state.finished:
@@ -493,6 +560,30 @@ class TokenizerManager:
         req = FlushCacheReq()
         self.send_to_router.send_pyobj(req)
 
+    async def update_weights(self, obj: UpdateWeightReqInput, request):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        # default the load format to the server_args
+        if obj.load_format is None:
+            obj.load_format = self.server_args.load_format
+
+        if not self.model_update_lock.locked():
+            async with self.model_update_lock:
+                # wait for the previous generation requests to finish
+                while len(self.rid_to_state) > 0:
+                    await asyncio.sleep(0)
+                self.send_to_router.send_pyobj(obj)
+                self.model_update_result = asyncio.Future()
+                result = await self.model_update_result
+                if result.success:
+                    self.server_args.model_path = obj.model_path
+                    self.server_args.load_format = obj.load_format
+                    self.model_path = obj.model_path
+            return result.success, result.message
+        else:
+            return False, "Another update is in progress. Please try again later."
+
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
             return
@@ -521,12 +612,18 @@ class TokenizerManager:
 
     async def handle_loop(self):
         while True:
-            recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut] = (
-                await self.recv_from_detokenizer.recv_pyobj()
-            )
+            recv_obj: Union[
+                BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, UpdateWeightReqOutput
+            ] = await self.recv_from_detokenizer.recv_pyobj()
+
+            if isinstance(recv_obj, UpdateWeightReqOutput):
+                self.model_update_result.set_result(recv_obj)
+                continue
+
             assert isinstance(
                 recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)
             ), f"Unexpected obj received: {type(recv_obj)}"
+
             for i, rid in enumerate(recv_obj.rids):
                 state = self.rid_to_state.get(rid, None)
                 if state is None:
@@ -645,7 +742,7 @@ def get_pixel_values(
                     tuple(int(x * 255) for x in processor.image_processor.image_mean),
                 )
                 pixel_values = processor.image_processor(image)["pixel_values"][0]
-            elif image_aspect_ratio == "anyres":
+            elif image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
                 pixel_values = process_anyres_image(
                     image, processor.image_processor, image_grid_pinpoints
                 )

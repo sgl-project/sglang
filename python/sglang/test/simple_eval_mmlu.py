@@ -8,6 +8,7 @@ https://arxiv.org/abs/2009.03300
 
 import random
 import re
+from typing import Optional
 
 import pandas
 
@@ -84,7 +85,7 @@ subject2category = {
 
 
 class MMLUEval(Eval):
-    def __init__(self, filename: str, num_examples: int | None, num_threads: int):
+    def __init__(self, filename: str, num_examples: Optional[int], num_threads: int):
         df = pandas.read_csv(filename)
         examples = [row.to_dict() for _, row in df.iterrows()]
         if num_examples:

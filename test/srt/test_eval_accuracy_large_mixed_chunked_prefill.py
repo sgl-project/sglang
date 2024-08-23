@@ -6,12 +6,11 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_ACCURACY_TEST,
-    DEFAULT_URL_FOR_UNIT_TEST,
     popen_launch_server,
 )
 
 
-class TestEvalAccuracyLarge(unittest.TestCase):
+class TestEvalAccuracyLargeChunkedPrefill(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -20,7 +19,13 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=300,
-            other_args=["--log-level-http", "warning"],
+            other_args=[
+                "--log-level-http",
+                "warning",
+                "--chunked-prefill-size",
+                "256",
+                "--enable-mixed-chunk",
+            ],
         )
 
     @classmethod

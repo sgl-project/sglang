@@ -84,13 +84,20 @@ def set_torch_compile_config():
 
 
 class CudaGraphRunner:
-    def __init__(self, model_runner, max_batch_size_to_capture, use_torch_compile):
+    def __init__(
+        self,
+        model_runner,
+        max_batch_size_to_capture: int,
+        use_torch_compile: bool,
+        disable_padding: bool,
+    ):
         self.model_runner = model_runner
         self.graphs = {}
         self.input_buffers = {}
         self.output_buffers = {}
         self.flashinfer_handlers = {}
         self.graph_memory_pool = None
+        self.disable_padding = disable_padding
 
         # Common inputs
         self.max_bs = max_batch_size_to_capture
@@ -142,7 +149,10 @@ class CudaGraphRunner:
             set_torch_compile_config()
 
     def can_run(self, batch_size):
-        return batch_size < self.max_bs
+        if self.disable_padding:
+            return batch_size in self.graphs
+        else:
+            return batch_size <= self.max_bs
 
     def capture(self, batch_size_list):
         self.batch_size_list = batch_size_list
@@ -239,12 +249,23 @@ class CudaGraphRunner:
             return forward(input_ids, input_metadata.positions, input_metadata)
 
         for _ in range(2):
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+
             run_once()
 
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+
         torch.cuda.synchronize()
+        self.model_runner.tp_group.barrier()
+
         with torch.cuda.graph(graph, pool=self.graph_memory_pool, stream=stream):
             out = run_once()
+
         torch.cuda.synchronize()
+        self.model_runner.tp_group.barrier()
+
         self.graph_memory_pool = graph.pool()
         return graph, None, out, flashinfer_decode_wrapper
 
@@ -278,7 +299,9 @@ class CudaGraphRunner:
         )
 
         # Replay
+        torch.cuda.synchronize()
         self.graphs[bs].replay()
+        torch.cuda.synchronize()
         output = self.output_buffers[bs]
 
         # Unpad

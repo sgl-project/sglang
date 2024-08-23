@@ -32,12 +32,15 @@ class RMSNorm(CustomOp):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.is_lower_sm80 = torch.cuda.get_device_capability()[0] < 8
 
     def forward_cuda(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.is_lower_sm80:
+            return self.forward_native(x, residual)
 
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)

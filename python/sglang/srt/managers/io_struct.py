@@ -22,10 +22,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
-import torch
-
 from sglang.srt.managers.schedule_batch import BaseFinishReason
-from sglang.srt.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 @dataclass
@@ -43,9 +41,9 @@ class GenerateReqInput:
     rid: Optional[Union[List[str], str]] = None
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
-    # The start location of the prompt for return_logprob.
+    # If return logprobs, the start location in the prompt for returning logprobs.
     logprob_start_len: Optional[Union[List[int], int]] = None
-    # The number of top logprobs to return.
+    # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
@@ -77,7 +75,7 @@ class GenerateReqInput:
             if self.return_logprob is None:
                 self.return_logprob = False
             if self.logprob_start_len is None:
-                self.logprob_start_len = 0
+                self.logprob_start_len = -1
             if self.top_logprobs_num is None:
                 self.top_logprobs_num = 0
         else:
@@ -143,7 +141,7 @@ class GenerateReqInput:
                 self.return_logprob = [self.return_logprob] * num
 
             if self.logprob_start_len is None:
-                self.logprob_start_len = [0] * num
+                self.logprob_start_len = [-1] * num
             elif not isinstance(self.logprob_start_len, list):
                 self.logprob_start_len = [self.logprob_start_len] * num
 
@@ -155,16 +153,27 @@ class GenerateReqInput:
 
 @dataclass
 class TokenizedGenerateReqInput:
+    # The request id
     rid: str
+    # The input text
     input_text: str
+    # The input token ids
     input_ids: List[int]
+    # The pixel values for input images
     pixel_values: List[float]
+    # The hash of input images
     image_hash: int
+    # The image size
     image_size: List[int]
+    # The sampling parameters
     sampling_params: SamplingParams
+    # Whether to return the logprobs
     return_logprob: bool
+    # If return logprobs, the start location in the prompt for returning logprobs.
     logprob_start_len: int
+    # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: int
+    # Whether to stream output
     stream: bool
 
 
@@ -215,15 +224,21 @@ class EmbeddingReqInput:
 
 @dataclass
 class TokenizedEmbeddingReqInput:
+    # The request id
     rid: str
+    # The input text
     input_text: str
+    # The input token ids
     input_ids: List[int]
+    # Dummy sampling params for compatibility
     sampling_params: SamplingParams
 
 
 @dataclass
 class BatchTokenIDOut:
+    # The request id
     rids: List[str]
+    # The version id to sync decode status with in detokenizer_manager
     vids: List[int]
     decoded_texts: List[str]
     decode_ids: List[int]
@@ -236,17 +251,25 @@ class BatchTokenIDOut:
 
 @dataclass
 class BatchStrOut:
+    # The request id
     rids: List[str]
+    # The output decoded strings
     output_strs: List[str]
+    # The meta info
     meta_info: List[Dict]
+    # The finish reason
     finished_reason: List[BaseFinishReason]
 
 
 @dataclass
 class BatchEmbeddingOut:
+    # The request id
     rids: List[str]
+    # The output embedding
     embeddings: List[List[float]]
+    # The meta info
     meta_info: List[Dict]
+    # The finish reason
     finished_reason: List[BaseFinishReason]
 
 
@@ -256,10 +279,20 @@ class FlushCacheReq:
 
 
 @dataclass
-class AbortReq:
-    rid: str
+class UpdateWeightReqInput:
+    # The model path with the new weights
+    model_path: str
+    # The format to load the weights
+    load_format: Optional[str] = None
 
 
 @dataclass
-class DetokenizeReqInput:
-    input_ids: List[int]
+class UpdateWeightReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class AbortReq:
+    # The request id
+    rid: str

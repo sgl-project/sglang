@@ -16,20 +16,18 @@ limitations under the License.
 """Meta data for requests and batches"""
 
 import logging
-import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
-from flashinfer.sampling import top_k_top_p_sampling_from_probs
 
-import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -268,7 +266,7 @@ class Req:
 
         if all_ids[prompt_tokens - 1] != self.origin_input_ids_unpadded[-1]:
             # TODO(lsyin): fix token fusion
-            warnings.warn(
+            logger.warning(
                 "Token fusion between input and output, try to avoid this by removing the space at the end of the input."
             )
             return False
@@ -327,16 +325,12 @@ class ScheduleBatch:
     out_cache_loc: torch.Tensor = None
     extend_num_tokens: int = None
 
+    # For mixed chunekd prefill
+    prefix_lens_cpu: List[int] = None
+
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
-
-    # Batched sampling params
-    temperatures: torch.Tensor = None
-    top_ps: torch.Tensor = None
-    top_ks: torch.Tensor = None
-    penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
-    logit_bias: torch.Tensor = None
 
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
@@ -385,43 +379,6 @@ class ScheduleBatch:
 
         return out_cache_loc
 
-    def batch_sampling_params(self, vocab_size):
-        device = "cuda"
-        bs, reqs = self.batch_size(), self.reqs
-        self.temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
-        self.top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        )
-        self.top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
-        )
-
-        # Each penalizers will do nothing if they evaluate themselves as not required by looking at
-        # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
-        # should not add hefty computation overhead other than simple checks.
-        #
-        # While we choose not to even create the class instances if they are not required, this
-        # could add additional complexity to the {ScheduleBatch} class, especially we need to
-        # handle {filter_batch()} and {merge()} cases as well.
-        self.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
-            vocab_size=vocab_size,
-            batch=self,
-            device=device,
-            Penalizers={
-                penaltylib.BatchedFrequencyPenalizer,
-                penaltylib.BatchedMinNewTokensPenalizer,
-                penaltylib.BatchedPresencePenalizer,
-                penaltylib.BatchedRepetitionPenalizer,
-            },
-        )
-
-        # Handle logit bias but only allocate when needed
-        self.logit_bias = None
-
     def prepare_for_extend(self, vocab_size: int):
         bs = self.batch_size()
         reqs = self.reqs
@@ -460,8 +417,32 @@ class ScheduleBatch:
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+        self.prefix_lens_cpu = [len(r.prefix_indices) for r in reqs]
 
-        self.batch_sampling_params(vocab_size)
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
+
+    def mix_with_running(self, running_batch: "ScheduleBatch"):
+        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+        prefix_lens_cpu = [len(r.prefix_indices) for r in self.reqs]
+        prefix_lens_cpu.extend(
+            [
+                len(r.origin_input_ids) + len(r.output_ids) - 1
+                for r in running_batch.reqs
+            ]
+        )
+
+        for req in running_batch.reqs:
+            req.fill_ids = req.origin_input_ids + req.output_ids
+            req.extend_input_len = 1
+
+        input_ids = torch.cat([self.input_ids, running_batch.input_ids])
+        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        extend_num_tokens = self.extend_num_tokens + running_batch.batch_size()
+        self.merge(running_batch)
+        self.input_ids = input_ids
+        self.out_cache_loc = out_cache_loc
+        self.extend_num_tokens = extend_num_tokens
+        self.prefix_lens_cpu = prefix_lens_cpu
 
     def check_decode_mem(self):
         bs = self.batch_size()
@@ -634,7 +615,7 @@ class ScheduleBatch:
                 for r in self.reqs
             ]
         else:
-            self.penalizer_orchestrator.cumulate_input_tokens(input_ids)
+            self.sampling_info.penalizer_orchestrator.cumulate_input_tokens(input_ids)
 
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
@@ -646,6 +627,8 @@ class ScheduleBatch:
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
+
+        self.sampling_info.update_regex_vocab_mask(self)
 
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:
@@ -667,23 +650,13 @@ class ScheduleBatch:
         self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
-        self.penalizer_orchestrator.filter(unfinished_indices, new_indices)
-
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "logit_bias",
-        ]:
-            self_val = getattr(self, item, None)
-            if self_val is not None:  # logit_bias can be None
-                setattr(self, item, self_val[new_indices])
+        self.sampling_info.filter(unfinished_indices, new_indices)
 
     def merge(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
-        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+        self.sampling_info.merge(other.sampling_info)
 
         self.reqs.extend(other.reqs)
 
@@ -698,111 +671,11 @@ class ScheduleBatch:
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-        ]:
-            self_val = getattr(self, item, None)
-            other_val = getattr(other, item, None)
-            setattr(self, item, torch.concat([self_val, other_val]))
-
-        # logit_bias can be None
-        if self.logit_bias is not None or other.logit_bias is not None:
-            vocab_size = (
-                self.logit_bias.shape[1]
-                if self.logit_bias is not None
-                else other.logit_bias.shape[1]
-            )
-            if self.logit_bias is None:
-                self.logit_bias = torch.zeros(
-                    (len(self.reqs), vocab_size), dtype=torch.float32, device="cuda"
-                )
-            if other.logit_bias is None:
-                other.logit_bias = torch.zeros(
-                    (len(other.reqs), vocab_size), dtype=torch.float32, device="cuda"
-                )
-            self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
-
     def sample(self, logits: torch.Tensor):
-        # TODO(lsyin): move this into a part of layer and run with CUDA Graph
-        # Post process logits
-        logits = logits.contiguous()
-        logits.div_(self.temperatures)
-        if self.logit_bias is not None:
-            logits.add_(self.logit_bias)
+        from sglang.srt.layers.sampler import Sampler
 
-        has_regex = any(req.regex_fsm is not None for req in self.reqs)
-        if has_regex:
-            allowed_mask = torch.empty_like(logits[0], dtype=torch.bool)
-            for i, req in enumerate(self.reqs):
-                if req.regex_fsm is not None:
-                    allowed_mask.zero_()
-                    allowed_mask[
-                        req.regex_fsm.get_next_instruction(req.regex_fsm_state).tokens
-                    ] = 1
-                    logits[i].masked_fill_(~allowed_mask, float("-inf"))
+        sampler = Sampler()
 
-        logits = self.penalizer_orchestrator.apply(logits)
-
-        probs = torch.softmax(logits, dim=-1)
-
-        if not global_server_args_dict["disable_flashinfer_sampling"]:
-            max_top_k_round, batch_size = 32, probs.shape[0]
-            uniform_samples = torch.rand(
-                (max_top_k_round, batch_size), device=probs.device
-            )
-            batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
-                probs, uniform_samples, self.top_ks, self.top_ps
-            )
-        else:
-            # Here we provide a slower fallback implementation.
-            batch_next_token_ids, success = top_k_top_p_sampling_from_probs_torch(
-                probs, self.top_ks, self.top_ps
-            )
-
-        if not torch.all(success):
-            warnings.warn("Sampling failed, fallback to top_k=1 strategy")
-            probs = probs.masked_fill(torch.isnan(probs), 0.0)
-            argmax_ids = torch.argmax(probs, dim=-1)
-            batch_next_token_ids = torch.where(
-                success, batch_next_token_ids, argmax_ids
-            )
-
-        if has_regex:
-            batch_next_token_ids_cpu = batch_next_token_ids.cpu().numpy()
-            for i, req in enumerate(self.reqs):
-                if req.regex_fsm is not None:
-                    req.regex_fsm_state = req.regex_fsm.get_next_state(
-                        req.regex_fsm_state, batch_next_token_ids_cpu[i]
-                    )
-
-        self.penalizer_orchestrator.cumulate_output_tokens(batch_next_token_ids)
+        batch_next_token_ids = sampler(logits, self.sampling_info)
 
         return batch_next_token_ids
-
-
-def top_k_top_p_sampling_from_probs_torch(
-    probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor
-):
-    """A top-k and top-k sampling implementation with native pytorch operations."""
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
-    try:
-        sampled_index = torch.multinomial(probs_sort, num_samples=1)
-    except RuntimeError:
-        batch_next_token_ids = torch.zeros(
-            (probs_sort.shape[0],), dtype=torch.int32, device=probs.device
-        )
-        success = torch.zeros(probs.shape[0], dtype=torch.bool, device=probs.device)
-        return batch_next_token_ids, success
-
-    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
-    success = torch.ones(probs.shape[0], dtype=torch.bool, device=probs.device)
-    return batch_next_token_ids, success

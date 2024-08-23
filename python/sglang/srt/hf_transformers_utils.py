@@ -30,14 +30,19 @@ from transformers import (
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
-from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
+
+try:
+    from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
+
+    _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
+        ChatGLMConfig.model_type: ChatGLMConfig,
+        DbrxConfig.model_type: DbrxConfig,
+    }
+except ImportError:
+    # We want this file to run without vllm dependency
+    _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {}
 
 from sglang.srt.utils import is_multimodal_model
-
-_CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
-    ChatGLMConfig.model_type: ChatGLMConfig,
-    DbrxConfig.model_type: DbrxConfig,
-}
 
 
 def download_from_hf(model_path: str):
@@ -142,13 +147,12 @@ def get_tokenizer(
         and kwargs.get("use_fast", True)
         and tokenizer_name != _FAST_LLAMA_TOKENIZER
     ):
-        pass
-        # warnings.warn(
-        #    "For some LLaMA V1 models, initializing the fast tokenizer may "
-        #    "take a long time. To reduce the initialization time, consider "
-        #    f"using '{_FAST_LLAMA_TOKENIZER}' instead of the original "
-        #    "tokenizer."
-        # )
+        warnings.warn(
+            "For some LLaMA V1 models, initializing the fast tokenizer may "
+            "take a long time. To reduce the initialization time, consider "
+            f"using '{_FAST_LLAMA_TOKENIZER}' instead of the original "
+            "tokenizer."
+        )
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
@@ -229,6 +233,8 @@ class TiktokenTokenizer:
         }
         assert tok_dict["word_split"] == "V1"
 
+        default_allowed_special = None
+
         kwargs = {
             "name": name,
             "pat_str": tok_dict.get("pat_str", PAT_STR_B),
@@ -242,14 +248,18 @@ class TiktokenTokenizer:
                     for bytes_list in tok_dict["default_allowed_special"]
                 ]
             )
-        else:
-            default_allowed_special = None
         if "vocab_size" in tok_dict:
             kwargs["explicit_n_vocab"] = tok_dict["vocab_size"]
 
+        PAD = "<|pad|>"
+        EOS = "<|eos|>"
+        SEP = "<|separator|>"
+
+        DEFAULT_CONTROL_TOKENS = {"pad": PAD, "sep": EOS, "eos": SEP}
+
         tokenizer = tiktoken.Encoding(**kwargs)
         tokenizer._default_allowed_special = default_allowed_special or set()
-        tokenizer._default_allowed_special |= {"<|separator|>"}
+        tokenizer._control_tokens = DEFAULT_CONTROL_TOKENS
 
         def encode_patched(
             self,
@@ -266,14 +276,14 @@ class TiktokenTokenizer:
                 self,
                 text,
                 allowed_special=allowed_special,
-                disallowed_special=disallowed_special,
+                disallowed_special=(),
             )
 
         tokenizer.encode = functools.partial(encode_patched, tokenizer)
 
         # Convert to HF interface
         self.tokenizer = tokenizer
-        self.eos_token_id = tokenizer._special_tokens["<|eos|>"]
+        self.eos_token_id = tokenizer._special_tokens[EOS]
         self.vocab_size = tokenizer.n_vocab
         self.chat_template = Template(
             "{% for message in messages %}{% if message['role'] == 'user' %}{{ 'Human: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'system' %}{{ 'System: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'assistant' %}{{ 'Assistant: '  + message['content'] + '<|separator|>\n\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"

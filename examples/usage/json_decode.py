@@ -35,6 +35,9 @@ def character_gen(s, name):
         name
         + " is a character in Harry Potter. Please fill in the following information about this character.\n"
     )
+    s += "The constrained regex is:\n"
+    s += character_regex + "\n"
+    s += "The JSON output is:\n"
     s += sgl.gen("json_output", max_tokens=256, regex=character_regex)
 
 
