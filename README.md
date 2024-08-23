@@ -231,8 +231,13 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
   - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
   - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.6-vicuna-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000`
   - `python -m sglang.launch_server --model-path liuhaotian/llava-v1.6-34b --tokenizer-path liuhaotian/llava-v1.6-34b-tokenizer --port 30000`
+  - `python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --port=30000 --host=127.0.0.1 --tp-size=1 --chat-template=llava_llama_3`
+  - `python -m sglang.launch_server --model-path lmms-lab/llava-next-72b --port=30000 --host="127.0.0.1" --tp-size=8 --chat-template=chatml-llava`
 - LLaVA-NeXT-Video
   - see [examples/usage/llava_video](examples/usage/llava_video)
+- [LLaVA-OneVision](https://arxiv.org/abs/2408.03326)
+  - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --host=127.0.0.1 --tp-size=8 --chat-template=chatml-llava --chunked-prefill-size=16384`
+  - see [test/srt/test_llava_onevision_openai_server.py](test/srt/test_llava_onevision_openai_server.py)
 - Yi-VL
   - see [srt_example_yi_vl.py](examples/quick_start/srt_example_yi_vl.py).
 - StableLM
