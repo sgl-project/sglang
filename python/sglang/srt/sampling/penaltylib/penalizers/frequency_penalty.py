@@ -54,9 +54,7 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
         pass
 
     def _cumulate_output_tokens(self, output_ids: _TokenIDs):
-        self.cumulated_frequency_penalties += (
-            self.frequency_penalties * output_ids.occurrence_count()
-        )
+        pass
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         logits -= self.cumulated_frequency_penalties

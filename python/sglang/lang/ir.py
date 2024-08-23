@@ -25,6 +25,11 @@ class SglSamplingParams:
     min_p: float = 0.0
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
+    dry_multiplier: float = 0.0
+    dry_base: float = 0.0
+    dry_allowed_length: int = 2
+    dry_penalty_last_n: int = 0
+    dry_sequence_breakers: Optional[List[str]] = ()
     ignore_eos: bool = False
     return_logprob: Optional[bool] = None
     logprob_start_len: Optional[int] = (None,)
@@ -46,6 +51,11 @@ class SglSamplingParams:
             self.min_p,
             self.frequency_penalty,
             self.presence_penalty,
+            self.dry_multiplier,
+            self.dry_base,
+            self.dry_allowed_length,
+            self.dry_penalty_last_n,
+            self.dry_sequence_breakers,
             self.ignore_eos,
             self.return_logprob,
             self.logprob_start_len,
@@ -62,8 +72,15 @@ class SglSamplingParams:
             "stop": self.stop or None,
             "temperature": self.temperature,
             "top_p": self.top_p,
+            "min_p": self.min_p,
+            "top_k": self.top_k,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
+            "dry_multiplier": self.dry_multiplier,
+            "dry_base": self.dry_base,
+            "dry_allowed_length": self.dry_allowed_length,
+            "dry_penalty_last_n": self.dry_penalty_last_n,
+            "dry_sequence_breakers": self.dry_sequence_breakers,
         }
 
     def to_vertexai_kwargs(self):
@@ -78,6 +95,12 @@ class SglSamplingParams:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k if self.top_k > 0 else None,
+            "min_p": self.min_p,
+            "dry_multiplier": self.dry_multiplier,
+            "dry_base": self.dry_base,
+            "dry_allowed_length": self.dry_allowed_length,
+            "dry_penalty_last_n": self.dry_penalty_last_n,
+            "dry_sequence_breakers": self.dry_sequence_breakers,
         }
 
     def to_anthropic_kwargs(self):
@@ -106,6 +129,11 @@ class SglSamplingParams:
             "top_p": self.top_p,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
+            "dry_multiplier": self.dry_multiplier,
+            "dry_base": self.dry_base,
+            "dry_allowed_length": self.dry_allowed_length,
+            "dry_penalty_last_n": self.dry_penalty_last_n,
+            "dry_sequence_breakers": self.dry_sequence_breakers,
         }
 
     def to_srt_kwargs(self):
@@ -119,6 +147,11 @@ class SglSamplingParams:
             "min_p": self.min_p,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
+            "dry_multiplier": self.dry_multiplier,
+            "dry_base": self.dry_base,
+            "dry_allowed_length": self.dry_allowed_length,
+            "dry_penalty_last_n": self.dry_penalty_last_n,
+            "dry_sequence_breakers": self.dry_sequence_breakers,
             "ignore_eos": self.ignore_eos,
             "regex": self.regex,
         }
@@ -155,6 +188,11 @@ class SglFunction:
         min_p: float = 0.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        dry_multiplier: float = 0.0,
+        dry_base: float = 0.0,
+        dry_allowed_length: int = 2,
+        dry_penalty_last_n: int = 0,
+        dry_sequence_breakers: Optional[List[str]] = [],
         ignore_eos: bool = False,
         return_logprob: Optional[bool] = None,
         logprob_start_len: Optional[int] = None,
@@ -176,6 +214,11 @@ class SglFunction:
             min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            dry_multiplier=dry_multiplier,
+            dry_base=dry_base,
+            dry_allowed_length=dry_allowed_length,
+            dry_penalty_last_n=dry_penalty_last_n,
+            dry_sequence_breakers=dry_sequence_breakers,
             ignore_eos=ignore_eos,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
@@ -198,6 +241,11 @@ class SglFunction:
         min_p: float = 0.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        dry_multiplier: float = 0.0,
+        dry_base: float = 0.0,
+        dry_allowed_length: int = 2,
+        dry_penalty_last_n: int = 0,
+        dry_sequence_breakers: Optional[List[str]] = [],
         ignore_eos: bool = False,
         return_logprob: Optional[bool] = None,
         logprob_start_len: Optional[int] = None,
@@ -237,6 +285,11 @@ class SglFunction:
             min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            dry_multiplier=dry_multiplier,
+            dry_base=dry_base,
+            dry_allowed_length=dry_allowed_length,
+            dry_penalty_last_n=dry_penalty_last_n,
+            dry_sequence_breakers=dry_sequence_breakers,
             ignore_eos=ignore_eos,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
@@ -418,6 +471,11 @@ class SglGen(SglExpr):
         min_p: Optional[float] = None,
         frequency_penalty: Optional[float] = None,
         presence_penalty: Optional[float] = None,
+        dry_multiplier: float = 0.0,
+        dry_base: float = 0.0,
+        dry_allowed_length: int = 2,
+        dry_penalty_last_n: int = 0,
+        dry_sequence_breakers: Optional[List[str]] = [],
         ignore_eos: Optional[bool] = None,
         return_logprob: Optional[bool] = None,
         logprob_start_len: Optional[int] = None,
@@ -439,6 +497,11 @@ class SglGen(SglExpr):
             min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            dry_multiplier=dry_multiplier,
+            dry_base=dry_base,
+            dry_allowed_length=dry_allowed_length,
+            dry_penalty_last_n=dry_penalty_last_n,
+            dry_sequence_breakers=dry_sequence_breakers,
             ignore_eos=ignore_eos,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,

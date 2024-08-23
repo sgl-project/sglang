@@ -29,7 +29,6 @@ class Sampler(CustomOp):
 
         if sampling_info.vocab_mask is not None:
             logits = logits.masked_fill(~sampling_info.vocab_mask, float("-inf"))
-
         logits = sampling_info.penalizer_orchestrator.apply(logits)
 
         probs = torch.softmax(logits, dim=-1)

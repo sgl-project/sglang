@@ -47,6 +47,12 @@ top_p: float = 1.0,
 top_k: int = -1,
 # Min-p sampling
 min_p: float = 0.0,
+# DRY sampling
+dry_multiplier: float = 0.0,
+dry_base: float = 0.0,
+dry_allowed_length: int = 2,
+dry_penalty_last_n: int = 0,
+dry_sequence_breakers: Optional[List[str]] = [],
 # Whether to ignore EOS token.
 ignore_eos: bool = False,
 # Whether to skip the special tokens during detokenization.

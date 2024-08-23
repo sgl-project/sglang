@@ -1,7 +1,7 @@
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
-from typing import List, Union
+from typing import List, Union, Optional
 
 from sglang.global_config import global_config
 from sglang.lang.interpreter import ProgramState, StreamExecutor, cache_program
@@ -133,6 +133,11 @@ class CompiledFunction:
         min_p: float = 0.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        dry_multiplier: float = 0.0,
+        dry_base: float = 0.0,
+        dry_allowed_length: int = 2,
+        dry_penalty_last_n: int = 0,
+        dry_sequence_breakers: Optional[List[str]] = [],
         backend=None,
         **kwargs,
     ):
@@ -149,6 +154,11 @@ class CompiledFunction:
             min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            dry_multiplier=dry_multiplier,
+            dry_base=dry_base,
+            dry_allowed_length=dry_allowed_length,
+            dry_penalty_last_n=dry_penalty_last_n,
+            dry_sequence_breakers=dry_sequence_breakers,
         )
 
         return self.run_internal(backend, kwargs, default_sampling_para)
@@ -165,6 +175,11 @@ class CompiledFunction:
         min_p: float = 0.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        dry_multiplier: float = 0.0,
+        dry_base: float = 0.0,
+        dry_allowed_length: int = 2,
+        dry_penalty_last_n: int = 0,
+        dry_sequence_breakers: Optional[List[str]] = [],
         backend=None,
         num_threads: Union[str, int] = "auto",
     ):
@@ -184,6 +199,11 @@ class CompiledFunction:
             min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            dry_multiplier=dry_multiplier,
+            dry_base=dry_base,
+            dry_allowed_length=dry_allowed_length,
+            dry_penalty_last_n=dry_penalty_last_n,
+            dry_sequence_breakers=dry_sequence_breakers,
         )
 
         # Extract prefix by tracing and cache it

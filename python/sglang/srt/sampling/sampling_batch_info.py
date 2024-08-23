@@ -30,7 +30,7 @@ class SamplingBatchInfo:
         device = "cuda"
         reqs = batch.reqs
         ret = cls(vocab_size=vocab_size)
-
+        print(vars(reqs[0].tokenizer))
         ret.temperatures = torch.tensor(
             [r.sampling_params.temperature for r in reqs],
             dtype=torch.float,
@@ -62,6 +62,7 @@ class SamplingBatchInfo:
                 penaltylib.BatchedMinNewTokensPenalizer,
                 penaltylib.BatchedPresencePenalizer,
                 penaltylib.BatchedRepetitionPenalizer,
+                penaltylib.BatchedDryPenalizer,
             },
         )
 
