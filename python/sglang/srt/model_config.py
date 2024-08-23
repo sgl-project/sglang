@@ -52,6 +52,12 @@ class ModelConfig:
             self.context_len = get_context_length(self.hf_config)
 
         # Unify the config keys for hf_config
+        if "OpenVLAForActionPrediction" in self.hf_config.architectures:
+            self.hf_config.hidden_size = 4096
+            self.hf_config.num_attention_heads = 32
+            self.hf_config.num_hidden_layers = 32
+            self.hf_config.vocab_size = 32064
+        
         self.head_dim = getattr(
             self.hf_config,
             "head_dim",

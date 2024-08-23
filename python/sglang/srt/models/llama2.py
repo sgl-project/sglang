@@ -302,6 +302,7 @@ class LlamaForCausalLM(nn.Module):
         self.model = LlamaModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
+        print("===== Using LlamaForCausalLM =====")
 
     @torch.no_grad()
     def forward(
