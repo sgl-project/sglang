@@ -472,9 +472,9 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         # print(input_ids.shape if input_ids is not None else None)
         # print(attention_mask.shape if attention_mask  is not None else None)
         # print(inputs_embeds.shape if inputs_embeds  is not None else None)
-        if input_ids is not None:
-            input_ids = input_ids.unsqueeze(0)
-        print(input_ids)
+        # if input_ids is not None:
+        #     input_ids = input_ids.unsqueeze(0)
+        # print(input_ids)
         language_model_output = self.language_model(
                 input_ids=input_ids,
                 # attention_mask=attention_mask,
