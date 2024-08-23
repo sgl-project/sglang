@@ -21,7 +21,7 @@ The core features include:
 - **Flexible Frontend Language**: Enables easy programming of LLM applications with chained generation calls, advanced prompting, control flow, multiple modalities, parallelism, and external interactions.
 
 ## News
-- [2024/08] 🔥 SGLang has supported xAI's [Grok 2](https://x.ai/blog/grok-2) inference serving [twitter](https://x.com/ibab/status/1827047684714463603)
+- [2024/08] 🔥 SGLang has supported xAI's [Grok 2](https://x.ai/blog/grok-2) inference serving ([twitter](https://x.com/ibab/status/1827047684714463603)).
 - [2024/07] 🔥 Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
 - [2024/04] SGLang is used by the official **LLaVA-NeXT (video)** release ([blog](https://llava-vl.github.io/blog/2024-04-30-llava-next-video/)).
 - [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
