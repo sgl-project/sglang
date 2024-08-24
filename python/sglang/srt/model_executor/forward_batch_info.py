@@ -194,6 +194,8 @@ class InputMetadata:
             top_logprobs_nums=batch.top_logprobs_nums,
         )
 
+        ret.sampling_info.prepare_penalties()
+
         ret.compute_positions(batch)
 
         ret.compute_extend_infos(batch)

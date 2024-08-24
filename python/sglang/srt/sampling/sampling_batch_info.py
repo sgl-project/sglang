@@ -21,9 +21,13 @@ class SamplingBatchInfo:
     top_ps: torch.Tensor = None
     top_ks: torch.Tensor = None
     min_ps: torch.Tensor = None
-    penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
     logit_bias: torch.Tensor = None
     vocab_mask: torch.Tensor = None
+
+    # Penalizer
+    penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
+    linear_penalties: torch.Tensor = None
+    scaling_penalties: torch.Tensor = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -71,6 +75,25 @@ class SamplingBatchInfo:
         ret.update_regex_vocab_mask(batch)
 
         return ret
+
+    def prepare_penalties(self):
+        self.scaling_penalties = None
+        self.linear_penalties = None
+
+        for penalizer in self.penalizer_orchestrator.penalizers.values():
+            if isinstance(penalizer, penaltylib.BatchedRepetitionPenalizer):
+                if penalizer.is_prepared():
+                    self.scaling_penalties = penalizer.cumulated_repetition_penalties
+            else:
+                if penalizer.is_prepared():
+                    if self.linear_penalties is None:
+                        bs = self.penalizer_orchestrator.batch.batch_size()
+                        self.linear_penalties = torch.zeros(
+                            (bs, self.vocab_size),
+                            dtype=torch.float32,
+                            device="cuda",
+                        )
+                    self.linear_penalties = penalizer.apply(self.linear_penalties)
 
     def update_regex_vocab_mask(self, batch: ScheduleBatch):
         bs, reqs = batch.batch_size(), batch.reqs

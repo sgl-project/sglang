@@ -20,6 +20,21 @@ class Sampler(CustomOp):
     def __init__(self):
         super().__init__()
 
+    def _apply_penalties(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
+        # min-token, presence, frequency
+        if sampling_info.linear_penalties is not None:
+            logits += sampling_info.linear_penalties
+
+        # repetition
+        if sampling_info.scaling_penalties is not None:
+            logits = torch.where(
+                logits > 0,
+                logits / sampling_info.scaling_penalties,
+                logits * sampling_info.scaling_penalties,
+            )
+
+        return logits
+
     def forward_cuda(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
         # Post process logits
         logits = logits.contiguous()
@@ -30,7 +45,7 @@ class Sampler(CustomOp):
         if sampling_info.vocab_mask is not None:
             logits = logits.masked_fill(~sampling_info.vocab_mask, float("-inf"))
 
-        logits = sampling_info.penalizer_orchestrator.apply(logits)
+        logits = self._apply_penalties(logits, sampling_info)
 
         probs = torch.softmax(logits, dim=-1)
 
