@@ -1,5 +1,5 @@
 """
-Usage: python3 srt_example_llava.py
+Usage: python3 local_example_llava.py
 """
 
 import sglang as sgl

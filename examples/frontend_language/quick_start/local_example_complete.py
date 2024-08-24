@@ -1,6 +1,6 @@
 """
 Usage:
-python3 srt_example_complete.py
+python3 local_example_complete.py
 """
 
 import sglang as sgl

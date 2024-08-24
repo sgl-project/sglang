@@ -1,5 +1,5 @@
 """
-Usage: python3 srt_example_llava.py
+Usage: python3 local_example_llava_next.py
 """
 
 from PIL import ImageFile
@@ -46,7 +46,7 @@ def batch():
     states = image_qa.run_batch(
         [
             {"image": pil_image, "question": "What is this?"},
-            {"image": pil_image, "question": "What is this?"},
+            {"image": pil_image, "question": "How many people?"},
         ],
         max_new_tokens=512,
     )
@@ -58,16 +58,15 @@ if __name__ == "__main__":
     import multiprocessing as mp
 
     mp.set_start_method("spawn", force=True)
-    runtime = sgl.Runtime(
-        model_path="lmms-lab/llama3-llava-next-8b",
-        tokenizer_path="lmms-lab/llama3-llava-next-8b-tokenizer",
-    )
+    runtime = sgl.Runtime(model_path="lmms-lab/llama3-llava-next-8b")
     runtime.endpoint.chat_template = get_chat_template("llama-3-instruct")
+
     # runtime = sgl.Runtime(
     #     model_path="lmms-lab/llava-next-72b",
     #     tokenizer_path="lmms-lab/llavanext-qwen-tokenizer",
     # )
     # runtime.endpoint.chat_template = get_chat_template("chatml-llava")
+
     sgl.set_default_backend(runtime)
     print(f"chat template: {runtime.endpoint.chat_template.name}")
 
