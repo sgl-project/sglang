@@ -17,7 +17,7 @@ SGLang is a fast serving framework for large language models and vision language
 It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
 
 The core features include:
-- **Fast Backend Runtime**: Efficient serving with RadixAttention for prefix caching, jump-forward constrained decoding, continuous batching, token attention (paged attention), tensor parallelism, flashinfer kernels, and quantization (AWQ/FP8/GPTQ/Marlin).
+- **Fast Backend Runtime**: Efficient serving with RadixAttention for prefix caching, jump-forward constrained decoding, continuous batching, token attention (paged attention), tensor parallelism, FlashInfer kernels, and quantization (AWQ/FP8/GPTQ/Marlin).
 - **Flexible Frontend Language**: Enables easy programming of LLM applications with chained generation calls, advanced prompting, control flow, multiple modalities, parallelism, and external interactions.
 
 ## News
@@ -248,17 +248,19 @@ Instructions for supporting a new model are [here](https://github.com/sgl-projec
 #### Use Models From ModelScope
 <details>
 
-To use model from [ModelScope](https://www.modelscope.cn), setting environment variable SGLANG_USE_MODELSCOPE.
+To use a model from [ModelScope](https://www.modelscope.cn), set the environment variable SGLANG_USE_MODELSCOPE.
 ```
 export SGLANG_USE_MODELSCOPE=true
 ```
 Launch [Qwen2-7B-Instruct](https://www.modelscope.cn/models/qwen/qwen2-7b-instruct) Server
 ```
 SGLANG_USE_MODELSCOPE=true python -m sglang.launch_server --model-path qwen/Qwen2-7B-Instruct --port 30000
-```    
+```
+  
 </details>
 
 #### Run Llama 3.1 405B
+<details>
 
 ```bash
 # Run 405B (fp8) on a single node
@@ -271,6 +273,8 @@ GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/
 ## on the first node, replace the `172.16.4.52:20000` with your own first node ip address and port
 GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 1 --disable-cuda-graph
 ```
+
+</details>
 
 ### Benchmark Performance
 
@@ -407,7 +411,7 @@ def tip_suggestion(s):
     s += "In summary" + sgl.gen("summary")
 ```
 
-#### Multi Modality
+#### Multi-Modality
 Use `sgl.image` to pass an image as input.
 
 ```python
@@ -461,7 +465,7 @@ def character_gen(s, name):
     s += sgl.gen("json_output", max_tokens=256, regex=character_regex)
 ```
 
-See also [json_decode.py](examples/usage/json_decode.py) for an additional example on specifying formats with Pydantic models.
+See also [json_decode.py](examples/usage/json_decode.py) for an additional example of specifying formats with Pydantic models.
 
 #### Batching
 Use `run_batch` to run a batch of requests with continuous batching.
@@ -522,7 +526,6 @@ def chat_example(s):
 #### Tips and Implementation Details
 - The `choices` argument in `sgl.gen` is implemented by computing the [token-length normalized log probabilities](https://blog.eleuther.ai/multiple-choice-normalization/) of all choices and selecting the one with the highest probability.
 - The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex. It is compatible with `temperature=0` and `temperature != 0`.
-
 
 ## Benchmark And Performance
 ![8b_throughput](https://lmsys.org/images/blog/sglang_llama3/8b_throughput.svg)
