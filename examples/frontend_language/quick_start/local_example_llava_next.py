@@ -1,8 +1,14 @@
 """
-Usage: python3 local_example_llava.py
+Usage: python3 local_example_llava_next.py
 """
 
+from PIL import ImageFile
+
 import sglang as sgl
+from sglang.lang.chat_template import get_chat_template
+from sglang.srt.utils import load_image
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # Allow loading of truncated images
 
 
 @sgl.function
@@ -44,10 +50,17 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(
-        model_path="liuhaotian/llava-v1.6-vicuna-7b",
-        tokenizer_path="llava-hf/llava-1.5-7b-hf",
-    )
+    import multiprocessing as mp
+
+    mp.set_start_method("spawn", force=True)
+
+    runtime = sgl.Runtime(model_path="lmms-lab/llama3-llava-next-8b")
+    runtime.endpoint.chat_template = get_chat_template("llama-3-instruct")
+
+    # Or you can use the 72B model
+    # runtime = sgl.Runtime(model_path="lmms-lab/llava-next-72b", tp_size=8)
+    # runtime.endpoint.chat_template = get_chat_template("chatml-llava")
+
     sgl.set_default_backend(runtime)
     print(f"chat template: {runtime.endpoint.chat_template.name}")
 
