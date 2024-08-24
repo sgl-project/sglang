@@ -14,7 +14,7 @@ suites = {
         "test_torch_compile.py",
         "test_triton_attn_backend.py",
         "test_vision_openai_server.py",
-        "test_large_max_new_tokens.py",
+        "test_update_weights.py",
         "models/test_generation_models.py",
         "models/test_embedding_models.py",
         "sampling/penaltylib",
