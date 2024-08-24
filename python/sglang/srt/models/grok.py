@@ -300,6 +300,9 @@ class Grok1ModelForCausalLM(nn.Module):
 
         # Monkey patch _prepare_weights to load pre-sharded weights
         setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
+
+        self.use_presharded_weights = True
+
         warnings.filterwarnings("ignore", category=FutureWarning)
 
     def forward(
