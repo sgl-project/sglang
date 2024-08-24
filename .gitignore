@@ -183,3 +183,5 @@ work_dirs/
 *.csv
 
 !logo.png
+
+**/embedding_layer.pt

@@ -41,30 +41,6 @@ from transformers.modeling_outputs import ModelOutput, CausalLMOutputWithPast
 
 import time
 
-VISION_BACKBONE_TO_RESOLUTION: Dict[str, List[int]] = {
-    "clip-vit-l": [224], "siglip-vit-so400m": [224], "dinov2-vit-l": [224], "in1k-vit-l": [224],
-
-    "clip-vit-l-336px": [336],
-    "siglip-vit-so400m-384px": [384],
-
-    "dinoclip-vit-l-336px": [336, 336],
-    "dinosiglip-vit-so-224px": [224, 224],
-    "dinosiglip-vit-so-384px": [384, 384],
-}
-VISION_BACKBONE_TO_TIMM_ID: Dict[str, List[str]] = {
-    "clip-vit-l": ["vit_large_patch14_clip_224.openai"],
-    "clip-vit-l-336px": ["vit_large_patch14_clip_336.openai"],
-
-    "dinov2-vit-l": ["vit_large_patch14_reg4_dinov2.lvd142m"],
-    "in1k-vit-l": ["vit_large_patch16_224.augreg_in21k_ft_in1k"],
-
-    "siglip-vit-so400m": ["vit_so400m_patch14_siglip_224"],
-    "siglip-vit-so400m-384px": ["vit_so400m_patch14_siglip_384"],
-
-    "dinoclip-vit-l-336px": ["vit_large_patch14_reg4_dinov2.lvd142m", "vit_large_patch14_clip_336.openai"],
-    "dinosiglip-vit-so-224px": ["vit_large_patch14_reg4_dinov2.lvd142m", "vit_so400m_patch14_siglip_224"],
-    "dinosiglip-vit-so-384px": ["vit_large_patch14_reg4_dinov2.lvd142m", "vit_so400m_patch14_siglip_384"],
-}
 TIMM_OVERRIDE_ACT_LAYER: Dict[str, List[Optional[str]]] = {
     "clip-vit-l": ["quick_gelu"], "clip-vit-l-336px": ["quick_gelu"],
     "dinov2-vit-l": [None], "in1k-vit-l": [None],
@@ -73,28 +49,7 @@ TIMM_OVERRIDE_ACT_LAYER: Dict[str, List[Optional[str]]] = {
     "dinosiglip-vit-so-224px": [None, None], "dinosiglip-vit-so-384px": [None, None]
 }
 
-LLM_BACKBONE_TO_HF_PATH = {
-    "llama2-7b-pure": "meta-llama/Llama-2-7b-hf", "llama2-13b-pure": "meta-llama/Llama-2-13b-hf",
-    "llama2-7b-chat": "meta-llama/Llama-2-7b-chat-hf", "llama2-13b-chat": "meta-llama/Llama-2-13b-chat-hf",
-
-    "vicuna-v15-7b": "lmsys/vicuna-7b-v1.5", "vicuna-v15-13b": "lmsys/vicuna-13b-v1.5",
-
-    "mistral-v0.1-7b-pure": "mistralai/Mistral-7B-v0.1",
-    "mistral-v0.1-7b-instruct": "mistralai/Mistral-7B-Instruct-v0.1",
-
-    "phi-2-3b": "microsoft/phi-2",
-}
-LLM_BACKBONE_TO_HF_METACLASS = {
-    "llama2-7b-pure": "llama", "llama2-13b-pure": "llama", "llama2-7b-chat": "llama", "llama2-13b-chat": "llama",
-    "vicuna-v15-7b": "llama", "vicuna-v15-13b": "llama",
-
-    "mistral-v0.1-7b-pure": "mistral", "mistral-v0.1-7b-instruct": "mistral",
-
-    "phi-2-3b": "phi",
-}
-
-VALID_VISION_BACKBONES = set(VISION_BACKBONE_TO_RESOLUTION.keys())
-VALID_LLM_BACKBONES = set(LLM_BACKBONE_TO_HF_PATH)
+LLM_BACKBONE_TO_HF_METACLASS = {"llama2-7b-pure": "llama",}
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +129,9 @@ class PrismaticVisionBackbone(nn.Module):
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Run image (`pixel_values`) through featurizer; if channel-stacked, then dispatch and sequence stack."""
+        print("===== pixel values =====")
+        print(type(pixel_values))
+        pixel_values = torch.from_numpy(pixel_values).unsqueeze(0).to(torch.bfloat16).to('cuda')
         if not self.use_fused_vision_backbone:
             return self.featurizer(pixel_values)
 
@@ -252,12 +210,6 @@ class OpenVLAConfig(PretrainedConfig):
     ) -> None:
         self.norm_stats, self.n_action_bins = norm_stats, n_action_bins
 
-        if vision_backbone_id not in VALID_VISION_BACKBONES:
-            raise ValueError(f"Vision backbone `{vision_backbone_id}` not in {VALID_VISION_BACKBONES = }")
-
-        if llm_backbone_id not in VALID_LLM_BACKBONES:
-            raise ValueError(f"LLM backbone `{llm_backbone_id}` not in {VALID_LLM_BACKBONES = }")
-
         # Set Prismatic Configuration Fields
         self.vision_backbone_id = vision_backbone_id
         self.llm_backbone_id = llm_backbone_id
@@ -271,12 +223,12 @@ class OpenVLAConfig(PretrainedConfig):
             else any(self.vision_backbone_id.startswith(v) for v in ["dinoclip", "dinosiglip"])
         )
 
-        self.timm_model_ids = VISION_BACKBONE_TO_TIMM_ID[self.vision_backbone_id]
+        self.timm_model_ids = ["vit_large_patch14_reg4_dinov2.lvd142m", "vit_so400m_patch14_siglip_224"]
         self.timm_override_act_layers = TIMM_OVERRIDE_ACT_LAYER[self.vision_backbone_id]
-        self.image_sizes = VISION_BACKBONE_TO_RESOLUTION[self.vision_backbone_id]
+        self.image_sizes = [224, 224]
         self.image_resize_strategy = image_resize_strategy
 
-        self.hf_llm_id = LLM_BACKBONE_TO_HF_PATH[self.llm_backbone_id]
+        self.hf_llm_id = "meta-llama/Llama-2-7b-hf"
         self.llm_max_length = llm_max_length
         self.pad_token_id, self.pad_to_multiple_of = pad_token_id, pad_to_multiple_of
 
@@ -360,51 +312,8 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         print("===== Using OpenVLAForActionPrediction =====")
 
     def pad_input_ids(self, input_ids, pad_value, pt_shape=None, image_size=None):
-        new_image_feature_len = self.image_feature_len
-        # now only support spatial_unpad + anyres
-        if self.mm_patch_merge_type.startswith("spatial"):
-            height = width = self.num_patches_per_side
-            if pt_shape[0] > 1:
-                if self.image_aspect_ratio == "anyres":
-                    num_patch_width, num_patch_height = get_anyres_image_grid_shape(
-                        image_size,
-                        self.image_grid_pinpoints,
-                        self.vision_tower.config.image_size,
-                    )
-                if "unpad" in self.mm_patch_merge_type:
-                    h = num_patch_height * height
-                    w = num_patch_width * width
-                    new_h, new_w = unpad_image_shape(h, w, image_size)
-                    new_image_feature_len += new_h * (new_w + 1)
-
-        pad_ids = pad_value * (
-            (new_image_feature_len + len(pad_value)) // len(pad_value)
-        )
-        offset = input_ids.index(self.config.image_token_index)
-        # old_len + pad_len - 1, because we need to remove image_token_id
-        new_input_ids = (
-            input_ids[:offset]
-            + pad_ids[:new_image_feature_len]
-            + input_ids[offset + 1 :]
-        )
-        return new_input_ids, offset
-
-    def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-        # NOTE: This is not memory efficient. (output_hidden_states=True) will save all the hidden stated.
-
-        selected_image_feature = image_outputs.hidden_states[self.vision_feature_layer]
-        if self.vision_feature_select_strategy in ["default", "patch"]:
-            selected_image_feature = selected_image_feature[:, 1:]
-        elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
-        else:
-            raise ValueError(
-                f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
-            )
-        image_features = self.multi_modal_projector(selected_image_feature)
-
-        return image_features
+        print("===== pad_input_ids =====")
+        return input_ids, [0]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         print("===== Load Weights =====")
@@ -450,30 +359,7 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         return_dict: Optional[bool] = None,):
          
         t0 = time.time()
-
-        # batch_size = 8
-        # if input_ids is not None:
-        #     input_ids = input_ids.repeat(batch_size, 1)
-        # if attention_mask is not None:
-        #     attention_mask = attention_mask.repeat(batch_size, 1)
-        # if labels is not None:
-        #     labels = labels.repeat(batch_size, 1)
-        # if inputs_embeds is not None:
-        #     inputs_embeds = inputs_embeds.repeat(batch_size, 1, 1)  # Repeat along the batch dimension
-    
-        # if past_key_values is not None:
-        #     past_key_values = [
-        #         (
-        #             k.repeat(batch_size, 1, 1, 1),  # Repeat keys along the batch dimension
-        #             v.repeat(batch_size, 1, 1, 1)   # Repeat values along the batch dimension
-        #         ) for (k, v) in past_key_values
-        #     ]
-        # print("====")
-        # print(input_ids.shape if input_ids is not None else None)
-        # print(attention_mask.shape if attention_mask  is not None else None)
-        # print(inputs_embeds.shape if inputs_embeds  is not None else None)
-        # if input_ids is not None:
-        #     input_ids = input_ids.unsqueeze(0)
+        
         # print(input_ids)
         language_model_output = self.language_model(
                 input_ids=input_ids,
@@ -488,15 +374,7 @@ class OpenVLAForActionPrediction(PreTrainedModel):
                 # output_hidden_states=output_hidden_states,
                 # return_dict=return_dict
             )
-        # language_model_output = CausalLMOutputWithPast(
-        #     loss=language_model_output.loss,  # Assuming loss is a scalar
-        #     logits=language_model_output.logits[:1],  # Keep only the first batch element
-        #     past_key_values=[(k[:1], v[:1]) for k, v in language_model_output.past_key_values],
-        #     hidden_states=language_model_output.hidden_states[:1] if language_model_output.hidden_states is not None else None,
-        #     attentions=language_model_output.attentions[:1] if language_model_output.attentions is not None else None
-        # )
-
-        # print(time.time()-t0)
+        
         print("===== Inference finished =====")
         return language_model_output
    
@@ -550,15 +428,8 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         #   => Multimodal Forward :: (pixel_values is not None) and (input_ids/embeds.shape[0] == pixel_values.shape[0])
 
         # === Handle Generation with Cache (`input_ids.shape[1] == 1`) =>> requires `past_keys_values` ===
-        # input_ids = input_ids.unsqueeze(0)
-        print(type(input_ids))
-        print(input_ids.shape)
-        print(pixel_values)
-        print(type(pixel_values))
-        if pixel_values != None:
-            pixel_values = pixel_values.pixel_values[0]
-        # input_ids = input_ids.unsqueeze(0)
-
+        if pixel_values is not None:
+            pixel_values = pixel_values[0]
         if len(input_ids.shape)>1 and input_ids.shape[1] == 1 and past_key_values:
             # print("===== Cached generation =====")
             assert input_ids.shape[0] == 1, "Generation is only currently supported for batch size of 1!"
@@ -582,8 +453,6 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         elif pixel_values is None:
             assert (input_ids is not None) and (inputs_embeds is None), "Missing `input_ids` in language-only forward!"
             assert past_key_values is None, "Unexpected key `past_key_values` provided during language-only forward!"
-            print(input_ids)
-            print(input_ids.shape)
             language_model_output = self.inference(
                 input_ids=input_ids,
                 input_metadata=input_metadata,
@@ -599,7 +468,7 @@ class OpenVLAForActionPrediction(PreTrainedModel):
             )
 
         # === Handle Multimodal Forward ===
-        elif (input_ids.shape[0] == pixel_values.shape[0]) or (inputs_embeds.shape[0] == pixel_values.shape[0]):
+        else:
             # print("===== Multimodal generation =====")
             assert past_key_values is None, "Unexpected key `past_key_values` provided during language-only forward!"
             # Visual Feature Extraction
@@ -618,6 +487,7 @@ class OpenVLAForActionPrediction(PreTrainedModel):
 
             # Get Input Embeddings (from Language Model Embeddings)
             input_embeddings = self.get_input_embeddings()(input_ids)
+            input_embeddings = input_embeddings.unsqueeze(0)
 
             # Build Multimodal Embeddings & Attention Mask =>> Prismatic defaults to inserting after <BOS> token (1:)
             multimodal_embeddings = torch.cat(
@@ -653,22 +523,6 @@ class OpenVLAForActionPrediction(PreTrainedModel):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
-            )
-
-        # === Otherwise =>> Assume Invalid! ===
-        elif (input_ids.shape[0] != pixel_values.shape[0]) or (inputs_embeds.shape[0] != pixel_values.shape[0]):
-            raise ValueError("Non-homogenous batch of (text, image) input -- forward() does not support mixed batches!")
-
-        else:
-            raise ValueError(
-                "Invalid PrismaticForConditionalGeneration `forward()` call with provided arguments:\n"
-                f"=> `input_ids` = {input_ids is not None}\n"
-                f"=> `attention_mask` = {attention_mask is not None}\n"
-                f"=> `pixel_values` = {pixel_values is not None}\n"
-                f"=> `labels` = {labels is not None}\n"
-                f"=> `input_embeds` = {inputs_embeds is not None}\n"
-                f"=> `past_key_values` = {past_key_values is not None}\n"
-                f"=> `use_cache` = {use_cache}"
             )
 
         # Unpack `language_model_output` and return PrismaticCausalLMOutputWithPast (or tuple if not `return_dict`)

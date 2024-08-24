@@ -94,6 +94,8 @@ class TokenizerManager:
             trust_remote_code=server_args.trust_remote_code,
             model_overide_args=model_overide_args,
         )
+        if("OpenVLAForActionPrediction" in self.hf_config.architectures):
+            self.hf_config.image_aspect_ratio = "pad"
         self.is_generation = is_generation_model(self.hf_config.architectures)
 
         if server_args.context_length is not None:
@@ -737,10 +739,10 @@ def get_pixel_values(
         else:
             image_hash = hash(image_data)
             if image_aspect_ratio == "pad":
-                image = expand2square(
-                    image,
-                    tuple(int(x * 255) for x in processor.image_processor.image_mean),
-                )
+                # image = expand2square(
+                #     image,
+                #     tuple(int(x * 255) for x in processor.image_processor.image_mean),
+                # )
                 pixel_values = processor.image_processor(image)["pixel_values"][0]
             elif image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
                 pixel_values = process_anyres_image(
