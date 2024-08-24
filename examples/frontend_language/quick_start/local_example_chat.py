@@ -1,6 +1,6 @@
 """
 Usage:
-python3 srt_example_chat.py
+python3 local_example_chat.py
 """
 
 import sglang as sgl

@@ -180,7 +180,7 @@ class LogitsProcessor(nn.Module):
 
         if hasattr(self.config, "final_logit_softcapping"):
             last_logits.div_(self.config.final_logit_softcapping)
-            last_logits = torch.tanh(last_logits)
+            torch.tanh(last_logits, out=last_logits)
             last_logits.mul_(self.config.final_logit_softcapping)
 
         # Return only last_logits if logprob is not requested
@@ -241,7 +241,7 @@ class LogitsProcessor(nn.Module):
 
                 if hasattr(self.config, "final_logit_softcapping"):
                     all_logits.div_(self.config.final_logit_softcapping)
-                    all_logits = torch.tanh(all_logits)
+                    torch.tanh(all_logits, out=all_logits)
                     all_logits.mul_(self.config.final_logit_softcapping)
 
                 all_logprobs = all_logits
