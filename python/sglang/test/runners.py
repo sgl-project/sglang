@@ -24,7 +24,6 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.server import Runtime
-from sglang.srt.utils import is_generation_model
 
 DEFAULT_PROMPTS = [
     # the output of gemma-2-2b from SRT is unstable on the commented prompt
@@ -63,8 +62,8 @@ class HFRunner:
     def __init__(
         self,
         model_path,
-        torch_dtype=torch.float16,
-        is_generation_model=None,
+        torch_dtype,
+        is_generation_model,
     ):
         self.in_queue = multiprocessing.Queue()
         self.out_queue = multiprocessing.Queue()
@@ -90,11 +89,8 @@ class HFRunner:
             trust_remote_code=True,
         )
 
-        self.is_generation_model = (
-            is_generation_model(model_path)
-            if is_generation_model is None
-            else is_generation_model
-        )
+        self.is_generation_model = is_generation_model
+
         if self.is_generation_model:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
@@ -176,16 +172,12 @@ class SRTRunner:
     def __init__(
         self,
         model_path,
+        torch_dtype,
+        is_generation_model,
         tp_size=1,
-        torch_dtype=torch.float16,
-        is_generation_model=None,
         port=5157,
     ):
-        self.is_generation_model = (
-            is_generation_model(model_path)
-            if is_generation_model is None
-            else is_generation_model
-        )
+        self.is_generation_model = is_generation_model
         self.runtime = Runtime(
             model_path=model_path,
             tp_size=tp_size,

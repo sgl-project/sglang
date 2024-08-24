@@ -59,7 +59,7 @@ class TestGenerationModels(unittest.TestCase):
                 tolerance = 3e-2
                 assert torch.all(
                     abs(hf_logprobs - srt_logprobs) < tolerance
-                ), f"prefill logprobs not all close"
+                ), "prefill logprobs are not all close"
 
         print(hf_outputs.output_strs)
         print(srt_outputs.output_strs)
