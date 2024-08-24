@@ -351,7 +351,7 @@ class RadixAttention(nn.Module):
                 )
             q_shard = qs[sid]
             k_shard, v_shard = kv_shards[sid]
-            # Ragged attention computation for self attention within the shard.
+            # Self attention within the SP shard.
             attn_wrapper = (  # Only the last SP shard needs a mask.
                 input_metadata.flashinfer_prefill_wrapper_sp_causal
                 if sid == sp_size - 1
@@ -366,7 +366,7 @@ class RadixAttention(nn.Module):
                 logits_soft_cap=self.logit_cap,
             )
             append_merge_shard(output_shards[sid], o, s)
-            # Paged attention computation for cross shard attention.
+            # Cross SP shard attention.
             # NOTE: below schedule is for load balancing. Basically, at iteration i,
             # (i starting from 0), each SP worker will run i paged attentions.
             for existing_sid in owned_sids:
@@ -437,7 +437,7 @@ class RadixAttention(nn.Module):
 
         o, s = input_metadata.flashinfer_decode_wrapper.forward_return_lse(
             q.contiguous().view(-1, total_num_heads, self.head_dim),
-            input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+            input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
             sm_scale=self.scaling,
             logits_soft_cap=self.logit_cap,
         )
