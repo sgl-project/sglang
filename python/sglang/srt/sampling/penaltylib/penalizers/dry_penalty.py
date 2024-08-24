@@ -40,8 +40,8 @@ class BatchedDryPenalizer(_BatchedPenalizer):
             device=self.orchestrator.device
         )
         self.sequence_breakers = [
-            [token_id for prompt in req.sampling_params.dry_sequence_breakers
-                for token_id in req.tokenizer.encode(prompt, add_special_tokens=False)]
+            [req.tokenizer.encode(f'a{prompt}', add_special_tokens=False)[-1] 
+            for prompt in req.sampling_params.dry_sequence_breakers]
             for req in self.orchestrator.reqs()
         ]
         self.ranges = torch.tensor(
@@ -71,6 +71,7 @@ class BatchedDryPenalizer(_BatchedPenalizer):
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         batch_size, seq_length = logits.shape[0], logits.shape[1]
+        max_back_length = 50  # Limit the backward match to 50 to prevent overflow
         for i in range(batch_size):
             if self.output_ids is not None:
                 input_ids = self.input_ids[i] = torch.cat(
@@ -78,36 +79,33 @@ class BatchedDryPenalizer(_BatchedPenalizer):
                 )
             else:
                 input_ids = self.input_ids[i]
-            if self.ranges[i] > 0:
-                input_ids_row = input_ids[-self.ranges[i]:]
-            else:
-                input_ids_row = input_ids
-            last_token = input_ids_row[-1].item()
+            input_ids = input_ids.tolist()
+            range_limit = min(self.ranges[i].item(), len(input_ids))
+            input_ids = input_ids[-range_limit:] if range_limit > 0 else input_ids
+            last_token = input_ids[-1]
             if last_token in self.sequence_breakers[i]:
                 continue
 
-            match_indices = (input_ids_row[:-1] == last_token).nonzero()
-            match_lengths = {}
+            match_indices = [idx for idx, val in enumerate(input_ids[:-1]) if val == last_token]
+            match_lengths = defaultdict(int)
 
             for idx in match_indices:
-                idx = idx.item()
-                next_token = input_ids_row[idx+1].item()
-
+                next_token = input_ids[idx + 1]
                 if next_token in self.sequence_breakers[i]:
                     continue
-
                 match_length = 1
-                while idx - match_length >= 0:
-                    previous_token = input_ids_row[-(match_length+1)].item()
-                    if input_ids_row[idx - match_length] != previous_token or previous_token in self.sequence_breakers[i]:
+                while match_length < max_back_length and idx - match_length >= 0:
+                    previous_token = input_ids[-(match_length + 1)]
+                    if input_ids[idx - match_length] != previous_token:
+                        break
+                    if previous_token in self.sequence_breakers[i]:
                         break
                     match_length += 1
-
-                match_lengths[next_token] = max(match_length, match_lengths.get(next_token, 0))
+                match_lengths[next_token] = max(match_length, match_lengths[next_token])
 
             for token, match_length in match_lengths.items():
-                if match_length >= self.allowed_lengths[i]:
-                    penalty = self.multipliers[i] * self.bases[i] ** (match_length - self.allowed_lengths[i])
+                if match_length >= self.allowed_lengths[i].item():
+                    penalty = self.multipliers[i].item() * self.bases[i].item() ** (match_length - self.allowed_lengths[i].item())
                     logits[i, token] -= penalty
 
         return logits
