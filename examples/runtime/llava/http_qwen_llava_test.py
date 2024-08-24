@@ -4,7 +4,7 @@ Usage:
 # Installing latest sglang.
 
 # Endpoint Service CLI: 
-# python -m sglang.launch_server --model-path lmms-lab/llava-next-72b --tokenizer-path lmms-lab/llavanext-qwen-tokenizer --port=30000 --host="127.0.0.1" --tp-size=4
+python -m sglang.launch_server --model-path lmms-lab/llava-next-72b --port=30000 --tp-size=8
 
 python3 http_qwen_llava_test.py
 
@@ -16,7 +16,6 @@ import argparse
 import asyncio
 import copy
 import json
-import time
 
 import aiohttp
 import requests

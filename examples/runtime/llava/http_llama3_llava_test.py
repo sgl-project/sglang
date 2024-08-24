@@ -4,7 +4,7 @@ Usage:
 # Installing latest sglang.
 
 # Endpoint Service CLI: 
-# python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --tokenizer-path lmms-lab/llama3-llava-next-8b-tokenizer --port=30000 --host="127.0.0.1" --tp-size=4
+python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --port=30000
 
 python3 http_llama3_llava_test.py
 
@@ -16,7 +16,6 @@ import argparse
 import asyncio
 import copy
 import json
-import time
 
 import aiohttp
 import requests
