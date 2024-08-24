@@ -303,13 +303,13 @@ def update_flashinfer_indices(
         else:
             paged_kernel_lens = seq_lens
 
-        extend_lens = seq_lens - prefix_lens
         sp_size = model_runner.sp_size
         if forward_mode == ForwardMode.DECODE:
             # With SP, reqs may have been reordered so we track them here.
             req_ids = normal_to_sp_indices.tolist()
             paged_kernel_lens = seq_lens if sp_size == 1 else sp_decode_local_lens
         else:
+            extend_lens = seq_lens - prefix_lens
             # With SP, we use different kernels for sequences that are not evenly partitioned
             # across SP workers. Here seq_lens works for most SP workers that do not need
             # masks, and we initiaize kernels with masks separately below.
