@@ -3,7 +3,6 @@ import io
 import json
 import os
 import sys
-import time
 import unittest
 
 import numpy as np
@@ -137,15 +136,14 @@ class TestOpenAIVisionServer(unittest.TestCase):
             max_tokens=1024,
             stream=True,
         )
+
         print("-" * 30)
         video_response = ""
-
         for chunk in video_request:
             if chunk.choices[0].delta.content is not None:
                 content = chunk.choices[0].delta.content
                 video_response += content
-                sys.stdout.write(content)
-                sys.stdout.flush()
+                print(content, flush=True)
         print("-" * 30)
 
         # Add assertions to validate the video response
