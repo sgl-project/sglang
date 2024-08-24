@@ -131,11 +131,49 @@ class TokenizerManager:
         self.model_update_lock = asyncio.Lock()
         self.model_update_result = None
 
-    async def get_pixel_values(self, image_data):
-        aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
-        grid_pinpoints = (
-            self.hf_config.image_grid_pinpoints if aspect_ratio == "anyres" else None
+    async def get_pixel_values(self, image_data, aspect_ratio=None):
+        aspect_ratio = (
+            getattr(self.hf_config, "image_aspect_ratio", None)
+            if aspect_ratio is None
+            else aspect_ratio
         )
+        grid_pinpoints = (
+            self.hf_config.image_grid_pinpoints
+            if hasattr(self.hf_config, "image_grid_pinpoints")
+            and "anyres" in aspect_ratio
+            else None
+        )
+
+        if isinstance(image_data, list) and len(image_data) > 0:
+            pixel_values, image_hash, image_size = [], [], []
+            if len(image_data) > 1:
+                aspect_ratio = "pad"  # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
+                for img_data in image_data:
+                    pixel_v, image_h, image_s = await self._process_single_image(
+                        img_data, aspect_ratio, grid_pinpoints
+                    )
+                    pixel_values.append(pixel_v)
+                    image_hash.append(image_h)
+                    image_size.append(image_s)
+                pixel_values = np.stack(pixel_values, axis=0)
+            else:
+                pixel_values, image_hash, image_size = await self._process_single_image(
+                    image_data[0], aspect_ratio, grid_pinpoints
+                )
+                image_hash = [image_hash]
+                image_size = [image_size]
+        elif isinstance(image_data, str):
+            pixel_values, image_hash, image_size = await self._process_single_image(
+                image_data, aspect_ratio, grid_pinpoints
+            )
+            image_hash = [image_hash]
+            image_size = [image_size]
+        else:
+            pixel_values, image_hash, image_size = None, None, None
+
+        return pixel_values, image_hash, image_size
+
+    async def _process_single_image(self, image_data, aspect_ratio, grid_pinpoints):
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
@@ -194,8 +232,8 @@ class TokenizerManager:
             )
 
             if self.is_generation:
-                pixel_values, image_hash, image_size = await self._get_pixel_values(
-                    obj.image_data if not_use_index else obj.image_data[index]
+                pixel_values, image_hash, image_size = await self.get_pixel_values(
+                    obj.image_data
                 )
                 return_logprob = (
                     obj.return_logprob if not_use_index else obj.return_logprob[index]
@@ -704,7 +742,7 @@ def get_pixel_values(
                     tuple(int(x * 255) for x in processor.image_processor.image_mean),
                 )
                 pixel_values = processor.image_processor(image)["pixel_values"][0]
-            elif image_aspect_ratio == "anyres":
+            elif image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
                 pixel_values = process_anyres_image(
                     image, processor.image_processor, image_grid_pinpoints
                 )
