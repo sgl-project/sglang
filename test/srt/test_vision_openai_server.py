@@ -2,8 +2,6 @@ import base64
 import io
 import json
 import os
-import sys
-import time
 import unittest
 
 import numpy as np
@@ -12,12 +10,10 @@ import requests
 from decord import VideoReader, cpu
 from PIL import Image
 
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import DEFAULT_URL_FOR_UNIT_TEST, popen_launch_server
 
 
-# python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --tokenizer-path lmms-lab/llavanext-qwen-siglip-tokenizer --port=30000 --host=127.0.0.1 --tp-size=8 --chat-template=chatml-llava --chunked-prefill-size=16384
 class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -32,11 +28,9 @@ class TestOpenAIVisionServer(unittest.TestCase):
             other_args=[
                 "--chat-template",
                 "chatml-llava",
-                "--tokenizer-path",
-                "lmms-lab/llavanext-qwen-siglip-tokenizer",
                 "--chunked-prefill-size",
                 "16384",
-                "--log-requests",
+                # "--log-requests",
             ],
         )
         cls.base_url += "/v1"
@@ -132,7 +126,6 @@ class TestOpenAIVisionServer(unittest.TestCase):
 
         messages = self.prepare_video_messages(file_path)
 
-        start_time = time.time()
         video_request = client.chat.completions.create(
             model="default",
             messages=messages,
@@ -140,15 +133,14 @@ class TestOpenAIVisionServer(unittest.TestCase):
             max_tokens=1024,
             stream=True,
         )
+
         print("-" * 30)
         video_response = ""
-
         for chunk in video_request:
             if chunk.choices[0].delta.content is not None:
                 content = chunk.choices[0].delta.content
                 video_response += content
-                sys.stdout.write(content)
-                sys.stdout.flush()
+                print(content, end="", flush=True)
         print("-" * 30)
 
         # Add assertions to validate the video response

@@ -59,7 +59,7 @@ class TestEmbeddingModels(unittest.TestCase):
                 tolerance = 1e-2
                 assert torch.all(
                     abs(similarities - 1) < tolerance
-                ), f"embeddings not all close"
+                ), "embeddings are not all close"
 
     def test_prefill_logits(self):
         for model, tp_size in MODELS:

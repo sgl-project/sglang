@@ -35,7 +35,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 global_server_args_dict = {
     "disable_flashinfer": False,
     "disable_flashinfer_sampling": False,
-    "attention_reduce_in_fp32": False,
+    "triton_attention_reduce_in_fp32": False,
     "enable_mla": False,
 }
 

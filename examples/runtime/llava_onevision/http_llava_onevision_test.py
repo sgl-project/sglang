@@ -1,3 +1,11 @@
+"""
+Usage:
+
+python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8 --chat-template=chatml-llava --chunked-prefill-size=16384
+
+python3 http_llava_onevision_test.py
+"""
+
 import base64
 import io
 import os
@@ -74,7 +82,6 @@ def video_stream_request_test(client, video_path):
     print("------------------------Video Stream Request Test----------------------")
     messages = prepare_video_messages(video_path)
 
-    start_time = time.time()
     video_request = client.chat.completions.create(
         model="default",
         messages=messages,
