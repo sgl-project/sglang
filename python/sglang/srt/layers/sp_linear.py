@@ -72,6 +72,7 @@ class QKVParallelLinear(torch.nn.Module):
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         # q projection can be naively tensor parallelized. However, to adapt to
@@ -86,6 +87,7 @@ class QKVParallelLinear(torch.nn.Module):
             skip_bias_add,
             params_dtype,
             quant_config,
+            f"{prefix}.q_proj",
         )
         # kv projection needs both tensor and sequence parallelization
         self.kv_proj = KVSeqParallelLinear(
@@ -97,6 +99,7 @@ class QKVParallelLinear(torch.nn.Module):
             skip_bias_add,
             params_dtype,
             quant_config,
+            f"{prefix}.kv_proj",
         )
         self.hidden_size = hidden_size
         self.kv_size = self.kv_proj.num_kv_heads * self.kv_proj.head_size
@@ -122,6 +125,7 @@ class ColumnSeqParallelLinear(ColumnParallelLinear):
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -155,6 +159,7 @@ class ColumnSeqParallelLinear(ColumnParallelLinear):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             quant_config=quant_config,
+            prefix=prefix,
         )
 
     def weight_loader(
@@ -240,6 +245,7 @@ class KVSeqParallelLinear(ColumnParallelLinear):
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -272,6 +278,7 @@ class KVSeqParallelLinear(ColumnParallelLinear):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             quant_config=quant_config,
+            prefix=prefix,
         )
 
     def weight_loader(
@@ -291,7 +298,9 @@ class KVSeqParallelLinear(ColumnParallelLinear):
         if loaded_shard_id is None:
             # Loaded weight is already fused on disk (qkv/mlp).
             if get_sequence_parallel_world_size() > 1:
-                raise NotImplementedError("Fused weight loading is not supported.")
+                raise NotImplementedError(
+                    "Fused weight loading is not supported in SP."
+                )
             if output_dim is None:
                 assert param_data.shape == loaded_weight.shape
                 param_data.copy_(loaded_weight)
@@ -409,6 +418,7 @@ class RowSeqParallelLinear(RowParallelLinear):
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__(
             input_size,
@@ -419,6 +429,7 @@ class RowSeqParallelLinear(RowParallelLinear):
             params_dtype,
             reduce_results,
             quant_config,
+            prefix,
         )
         self.total_num_heads = total_num_heads
         self.num_kv_heads = num_kv_heads

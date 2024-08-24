@@ -337,9 +337,8 @@ class LlamaForCausalLM(nn.Module):
     def get_module_name(self, name):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id, num_shard)
-            ("qkv_proj", "q_proj", "q", 3),
-            ("qkv_proj", "k_proj", "k", 3),
-            ("qkv_proj", "v_proj", "v", 3),
+            ("qkv_proj.kv_proj", "k_proj", "k", 2),
+            ("qkv_proj.kv_proj", "v_proj", "v", 2),
             ("gate_up_proj", "gate_proj", 0, 2),
             ("gate_up_proj", "up_proj", 1, 2),
         ]
@@ -399,8 +398,9 @@ class LlamaForCausalLM(nn.Module):
                     return
                 for param_name, weight_name in renamed_params_mapping:
                     if weight_name not in name:
-                        return
+                        continue
                     name = name.replace(weight_name, param_name)
+                    break
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
