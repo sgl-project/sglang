@@ -81,13 +81,12 @@ class ServerArgs:
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     disable_disk_cache: bool = False
+    disable_custom_all_reduce: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     enable_p2p_check: bool = False
     enable_mla: bool = False
-    attention_reduce_in_fp32: bool = False
-    efficient_weight_load: bool = False
-    disable_custom_all_reduce: bool = False
+    triton_attention_reduce_in_fp32: bool = False
 
     # Distributed args
     nccl_init_addr: Optional[str] = None
@@ -405,6 +404,12 @@ class ServerArgs:
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
         )
         parser.add_argument(
+            "--disable-custom-all-reduce",
+            action="store_true",
+            default=False,
+            help="Disable the custom all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a chunked batch.",
@@ -425,7 +430,7 @@ class ServerArgs:
             help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
-            "--attention-reduce-in-fp32",
+            "--triton-attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
@@ -434,12 +439,6 @@ class ServerArgs:
             "--efficient-weight-load",
             action="store_true",
             help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
-        )
-        parser.add_argument(
-            "--disable-custom-all-reduce",
-            action="store_true",
-            default=False,
-            help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
 
     @classmethod

@@ -46,7 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
-def get_window_size(config):
+def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
 
@@ -213,7 +213,11 @@ class Gemma2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_idx,
-            sliding_window_size=get_window_size(config) if use_sliding_window else None,
+            sliding_window_size=(
+                get_attention_sliding_window_size(config)
+                if use_sliding_window
+                else None
+            ),
             logit_cap=self.config.attn_logit_softcapping,
         )
 
@@ -406,8 +410,8 @@ class Gemma2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.model.embed_tokens.weight, input_metadata
         )
 
-    def get_window_size(self):
-        return get_window_size(self.config)
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

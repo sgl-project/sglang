@@ -606,6 +606,9 @@ class TokenizerManager:
         return background_tasks
 
     def create_handle_loop(self):
+        if not self.to_create_loop:
+            return
+
         self.to_create_loop = False
         loop = asyncio.get_event_loop()
         loop.create_task(self.handle_loop())
