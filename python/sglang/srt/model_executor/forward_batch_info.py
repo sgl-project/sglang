@@ -88,14 +88,19 @@ class InputMetadata:
         reqs = batch.reqs
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_size for r in reqs]
-        self.image_offsets = [
-            (
-                (r.image_offset - batch.prefix_lens_cpu[i])
-                if r.image_offset is not None
-                else 0
-            )
-            for i, r in enumerate(reqs)
-        ]
+        self.image_offsets = []
+        for r in reqs:
+            if isinstance(r.image_offset, list):
+                self.image_offsets.append(
+                    [
+                        (image_offset - len(r.prefix_indices))
+                        for image_offset in r.image_offset
+                    ]
+                )
+            elif isinstance(r.image_offset, int):
+                self.image_offsets.append(r.image_offset - len(r.prefix_indices))
+            elif r.image_offset is None:
+                self.image_offsets.append(0)
 
     def compute_positions(self, batch: ScheduleBatch):
         position_ids_offsets = batch.position_ids_offsets
