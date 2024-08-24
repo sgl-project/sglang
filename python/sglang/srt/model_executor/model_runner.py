@@ -480,7 +480,7 @@ class ModelRunner:
         if self.server_args.disable_cuda_graph_padding:
             batch_size_list = list(range(1, 32)) + [64, 128]
         else:
-            batch_size_list = [1, 2, 4] + [i * 8 for i in range(1, 25)]
+            batch_size_list = [1, 2, 4] + [i * 8 for i in range(1, 21)]
 
         self.cuda_graph_runner = CudaGraphRunner(
             self,

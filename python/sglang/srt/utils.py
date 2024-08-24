@@ -347,7 +347,7 @@ def suppress_other_loggers():
         logging.WARN
     )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
-    logging.getLogger("vllm.utils").setLevel(logging.WARN)
+    logging.getLogger("vllm.utils").setLevel(logging.ERROR)
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
