@@ -251,6 +251,8 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/en/model_support.md).
 
 #### Use Models From ModelScope
+<details>
+
 To use model from [ModelScope](https://www.modelscope.cn), setting environment variable SGLANG_USE_MODELSCOPE.
 ```
 export SGLANG_USE_MODELSCOPE=true
@@ -259,21 +261,20 @@ Launch [Qwen2-7B-Instruct](https://www.modelscope.cn/models/qwen/qwen2-7b-instru
 ```
 SGLANG_USE_MODELSCOPE=true python -m sglang.launch_server --model-path qwen/Qwen2-7B-Instruct --port 30000
 ```    
+</details>
 
 #### Run Llama 3.1 405B
 
 ```bash
-## Run 405B (fp8) on a single node
+# Run 405B (fp8) on a single node
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct-FP8 --tp 8
 
-## Run 405B (fp16) on two nodes
-# replace the `172.16.4.52:20000` with your own first node ip address and port, disable CUDA Graph temporarily
+# Run 405B (fp16) on two nodes
+## on the first node, replace the `172.16.4.52:20000` with your own first node ip address and port
+GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 0
 
-# on the first node
-GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 0 --disable-cuda-graph --mem-frac 0.75
-
-# on the second
-GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 1 --disable-cuda-graph --mem-frac 0.75
+## on the first node, replace the `172.16.4.52:20000` with your own first node ip address and port
+GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 1
 ```
 
 ### Benchmark Performance
