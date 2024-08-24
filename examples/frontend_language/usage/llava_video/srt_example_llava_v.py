@@ -9,6 +9,8 @@ import csv
 import os
 import time
 
+import requests
+
 import sglang as sgl
 
 

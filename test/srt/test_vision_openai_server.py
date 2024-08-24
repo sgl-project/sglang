@@ -13,8 +13,6 @@ from PIL import Image
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import DEFAULT_URL_FOR_UNIT_TEST, popen_launch_server
 
-# python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8 --chat-template=chatml-llava --chunked-prefill-size=16384
-
 
 class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
