@@ -2,7 +2,6 @@ import base64
 import io
 import json
 import os
-import sys
 import unittest
 
 import numpy as np
@@ -33,7 +32,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                 "chatml-llava",
                 "--chunked-prefill-size",
                 "16384",
-                "--log-requests",
+                # "--log-requests",
             ],
         )
         cls.base_url += "/v1"
@@ -143,7 +142,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
             if chunk.choices[0].delta.content is not None:
                 content = chunk.choices[0].delta.content
                 video_response += content
-                print(content, flush=True)
+                print(content, end="", flush=True)
         print("-" * 30)
 
         # Add assertions to validate the video response
