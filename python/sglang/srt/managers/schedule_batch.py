@@ -670,12 +670,3 @@ class ScheduleBatch:
         self.out_cache_loc = None
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
-
-    def sample(self, logits: torch.Tensor):
-        from sglang.srt.layers.sampler import Sampler
-
-        sampler = Sampler()
-
-        batch_next_token_ids = sampler(logits, self.sampling_info)
-
-        return batch_next_token_ids
