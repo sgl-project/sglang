@@ -43,7 +43,7 @@ class Sampler(CustomOp):
 
         return logits
 
-    def forward_cuda(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
+    def _get_probs(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
         # Post process logits
         logits = logits.contiguous()
         logits.div_(sampling_info.temperatures)
@@ -55,7 +55,10 @@ class Sampler(CustomOp):
 
         logits = self._apply_penalties(logits, sampling_info)
 
-        probs = torch.softmax(logits, dim=-1)
+        return torch.softmax(logits, dim=-1)
+
+    def forward_cuda(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
+        probs = self._get_probs(logits, sampling_info)
 
         if not global_server_args_dict["disable_flashinfer_sampling"]:
             max_top_k_round, batch_size = 32, probs.shape[0]
@@ -80,8 +83,14 @@ class Sampler(CustomOp):
 
         return SamplerOutput(success, probs, batch_next_token_ids)
 
-    def forward_native():
-        raise NotImplementedError("Native forward is not implemented yet.")
+    def forward_native(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
+        probs = self._get_probs(logits, sampling_info)
+
+        batch_next_token_ids, success = top_k_top_p_min_p_sampling_from_probs_torch(
+            probs, sampling_info.top_ks, sampling_info.top_ps, sampling_info.min_ps
+        )
+
+        return SamplerOutput(success, probs, batch_next_token_ids)
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
@@ -102,7 +111,10 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
     try:
-        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+        # FIXME: torch.multiomial does not support num_samples = 1
+        sampled_index = torch.multinomial(probs_sort, num_samples=2, replacement=True)[
+            :, :1
+        ]
     except RuntimeError as e:
         logger.warning(f"Sampling error: {e}")
         batch_next_token_ids = torch.zeros(

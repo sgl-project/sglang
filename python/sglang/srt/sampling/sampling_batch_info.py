@@ -35,20 +35,20 @@ class SamplingBatchInfo:
     @classmethod
     def dummy_one(cls, max_bs: int, vocab_size: int):
         ret = cls(vocab_size=vocab_size)
-        ret.temperatures = torch.zeros((max_bs, 1), dtype=torch.float, device="cuda")
-        ret.top_ps = torch.zeros((max_bs,), dtype=torch.float, device="cuda")
-        ret.top_ks = torch.zeros((max_bs,), dtype=torch.int, device="cuda")
+        ret.temperatures = torch.ones((max_bs, 1), dtype=torch.float, device="cuda")
+        ret.top_ps = torch.ones((max_bs,), dtype=torch.float, device="cuda")
+        ret.top_ks = torch.ones((max_bs,), dtype=torch.int, device="cuda")
         ret.min_ps = torch.zeros((max_bs,), dtype=torch.float, device="cuda")
         ret.logit_bias = torch.zeros(
             (max_bs, vocab_size), dtype=torch.float, device="cuda"
         )
-        ret.vocab_mask = torch.zeros(
+        ret.vocab_mask = torch.ones(
             (max_bs, vocab_size), dtype=torch.bool, device="cuda"
         )
         ret.linear_penalties = torch.zeros(
             (max_bs, vocab_size), dtype=torch.float, device="cuda"
         )
-        ret.scaling_penalties = torch.zeros(
+        ret.scaling_penalties = torch.ones(
             (max_bs, vocab_size), dtype=torch.float, device="cuda"
         )
 
