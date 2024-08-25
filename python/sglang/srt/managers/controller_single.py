@@ -52,7 +52,7 @@ class ControllerSingle:
         self.dp_worker_id = dp_worker_id
         self.mp_queue = mp_queue
 
-        # Init communication
+        # Init inter-process communication
         context = zmq.Context(2)
 
         if not self.is_dp_worker:

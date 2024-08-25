@@ -278,7 +278,7 @@ def launch_server(
     server_args.check_server_args()
     _set_envs_and_config(server_args)
 
-    # Allocate ports
+    # Allocate ports for inter-process communications
     server_args.port, server_args.additional_ports = allocate_init_ports(
         server_args.port,
         server_args.additional_ports,
