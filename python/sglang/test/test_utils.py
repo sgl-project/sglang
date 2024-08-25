@@ -25,6 +25,7 @@ DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
 if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 5157
     DEFAULT_URL_FOR_MOE_TEST = "http://127.0.0.1:6157"
     DEFAULT_URL_FOR_ACCURACY_TEST = "http://127.0.0.1:7157"
     DEFAULT_URL_FOR_UNIT_TEST = "http://127.0.0.1:8157"
