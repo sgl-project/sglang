@@ -81,20 +81,25 @@ class TestOpenAIVisionServer(unittest.TestCase):
             model="default",
             messages=[
                 {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
-                    },
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
-                    },
-                },
-                {
-                    "type": "text",
-                    "text": "I have shown you two images. Please describe the two images to me.",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
+                            },
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "I have shown you two images. Please describe the two images to me.",
+                        },
+                    ],
                 },
             ],
             temperature=0,
