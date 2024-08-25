@@ -418,7 +418,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
-            help="Enabling mixing prefill and decode in a chunked batch.",
+            help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
         )
         parser.add_argument(
             "--enable-torch-compile",
