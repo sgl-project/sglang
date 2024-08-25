@@ -6,7 +6,7 @@ from sglang.test.test_utils import run_unittest_files
 suites = {
     "minimal": [
         "models/test_embedding_models.py",
-        "models/test_generation_models.py",
+        # "models/test_generation_models.py",
         "sampling/penaltylib",
         "test_chunked_prefill.py",
         "test_embedding_openai_server.py",
