@@ -122,7 +122,7 @@ class BaseTokenToKVPool(ABC):
 
     @abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @abstractmethod
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
