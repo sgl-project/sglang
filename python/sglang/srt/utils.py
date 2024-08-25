@@ -224,13 +224,18 @@ def is_multimodal_model(model):
     raise ValueError("unrecognized type")
 
 
-def is_generation_model(model_architectures):
+def is_generation_model(model_architectures, is_embedding: bool = False):
+    # We have two ways to determine whether a model is a generative model.
+    # 1. Check the model architectue
+    # 2. check the `is_embedding` server args
+
     if (
         "LlamaEmbeddingModel" in model_architectures
         or "MistralModel" in model_architectures
     ):
         return False
-    return True
+    else:
+        return not is_embedding
 
 
 def decode_video_base64(video_base64):

@@ -204,7 +204,7 @@ class ModelRunner:
             else None
         )
         self.is_generation = is_generation_model(
-            self.model_config.hf_config.architectures
+            self.model_config.hf_config.architectures, self.server_args.is_embedding
         )
 
         logger.info(
@@ -537,9 +537,18 @@ class ModelRunner:
             batch,
             forward_mode=ForwardMode.EXTEND,
         )
-        return self.model.forward(
-            batch.input_ids, input_metadata.positions, input_metadata
-        )
+        if self.is_generation:
+            return self.model.forward(
+                batch.input_ids, input_metadata.positions, input_metadata
+            )
+        else:
+            # Only embedding models have get_embedding parameter
+            return self.model.forward(
+                batch.input_ids,
+                input_metadata.positions,
+                input_metadata,
+                get_embedding=True,
+            )
 
     @torch.inference_mode()
     def forward_extend_multi_modal(self, batch: ScheduleBatch):

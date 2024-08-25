@@ -5,6 +5,9 @@ from sglang.test.test_utils import run_unittest_files
 
 suites = {
     "minimal": [
+        "models/test_embedding_models.py",
+        "models/test_generation_models.py",
+        "sampling/penaltylib",
         "test_chunked_prefill.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
@@ -13,11 +16,8 @@ suites = {
         "test_skip_tokenizer_init.py",
         "test_torch_compile.py",
         "test_triton_attn_backend.py",
-        "test_vision_openai_server.py",
         "test_update_weights.py",
-        "models/test_generation_models.py",
-        "models/test_embedding_models.py",
-        "sampling/penaltylib",
+        "test_vision_openai_server.py",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True
