@@ -24,6 +24,9 @@ class SamplingBatchInfo:
     logit_bias: torch.Tensor = None
     vocab_mask: torch.Tensor = None
 
+    # Dispatch in CUDA graph
+    need_min_p_sampling: bool = False
+
     # Penalizer
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
     linear_penalties: torch.Tensor = None
@@ -49,6 +52,7 @@ class SamplingBatchInfo:
         ret.min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
         )
+        ret.need_min_p_sampling = any(r.sampling_params.min_p > 0 for r in reqs)
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this

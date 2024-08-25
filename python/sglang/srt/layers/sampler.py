@@ -62,7 +62,7 @@ class Sampler(CustomOp):
             uniform_samples = torch.rand(
                 (max_top_k_round, batch_size), device=probs.device
             )
-            if sampling_info.min_ps.any():
+            if sampling_info.need_min_p_sampling:
                 probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                 probs = top_p_renorm_prob(probs, sampling_info.top_ps)
                 batch_next_token_ids, success = min_p_sampling_from_probs(
