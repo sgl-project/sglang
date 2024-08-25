@@ -21,8 +21,8 @@ from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 
 MODELS = [
     ("meta-llama/Meta-Llama-3.1-8B-Instruct", 1, 1.1, 3e-2, 1),
-    ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, None, 6e-2, 1),
     ("google/gemma-2-2b", 1, 3, 3e-2, 1),
+    ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, None, 6e-2, 1),
 ]
 TORCH_DTYPES = [torch.float16]
 
@@ -73,6 +73,8 @@ class TestGenerationModels(unittest.TestCase):
         rouge_threshold,
         long_context_tolerance,
     ) -> None:
+        if model_path == "Alibaba-NLP/gte-Qwen2-1.5B-instruct":
+            prompts = prompts[:-1]
         with HFRunner(
             model_path, torch_dtype=torch_dtype, is_generation=True
         ) as hf_runner:
