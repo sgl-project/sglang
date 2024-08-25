@@ -86,7 +86,6 @@ class HFRunner:
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             torch_dtype=torch_dtype,
-            trust_remote_code=True,
         )
 
         self.is_generation_model = is_generation_model
@@ -96,7 +95,6 @@ class HFRunner:
                 model_path,
                 torch_dtype=torch_dtype,
                 low_cpu_mem_usage=True,
-                trust_remote_code=True,
             ).cuda()
         else:
             from sentence_transformers import SentenceTransformer
