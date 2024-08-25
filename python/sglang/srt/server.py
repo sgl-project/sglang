@@ -333,11 +333,13 @@ def launch_server(
         start_process = start_controller_process_single
     else:
         start_process = start_controller_process_multi
+
     proc_controller = mp.Process(
         target=start_process,
         args=(server_args, port_args, pipe_controller_writer, model_overide_args),
     )
     proc_controller.start()
+
     proc_detoken = mp.Process(
         target=start_detokenizer_process,
         args=(
@@ -515,6 +517,7 @@ class Runtime:
 
         self.pid = None
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
+
         proc = mp.Process(
             target=launch_server,
             args=(self.server_args, model_overide_args, pipe_writer),

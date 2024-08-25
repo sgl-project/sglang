@@ -187,6 +187,13 @@ response = client.chat.completions.create(
     max_tokens=64,
 )
 print(response)
+
+# Text embedding
+response = client.embeddings.create(
+    model="default",
+    input="How are you today",
+)
+print(response)
 ```
 
 It supports streaming, vision, and most features of the Chat/Completions/Models/Batch endpoints specified by the [OpenAI API Reference](https://platform.openai.com/docs/api-reference/).
@@ -223,6 +230,8 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
  
 ### Supported Models
 
+**Generative Models**
+
 - Llama / Llama 2 / Llama 3 / Llama 3.1
 - Mistral / Mixtral / Mistral NeMo
 - Gemma / Gemma 2
@@ -242,6 +251,12 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - Grok
 - ChatGLM
 - InternLM 2
+
+**Embedding Models**
+
+- e5-mistral
+- gte-Qwen2
+  - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
 
 Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/en/model_support.md).
 

@@ -20,7 +20,10 @@ import torch
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import get_similarities
 
-MODELS = [("intfloat/e5-mistral-7b-instruct", 1, 0.2)]
+MODELS = [
+    ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, 1e-5),
+    ("intfloat/e5-mistral-7b-instruct", 1, 1e-5),
+]
 TORCH_DTYPES = [torch.float16]
 
 
@@ -32,10 +35,10 @@ class TestEmbeddingModels(unittest.TestCase):
         model_path,
         tp_size,
         torch_dtype,
-        long_context_tolerance,
+        prefill_tolerance,
     ) -> None:
         with HFRunner(
-            model_path, torch_dtype=torch_dtype, is_generation_model=False
+            model_path, torch_dtype=torch_dtype, is_generation=False
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts)
 
@@ -43,11 +46,9 @@ class TestEmbeddingModels(unittest.TestCase):
             model_path,
             tp_size=tp_size,
             torch_dtype=torch_dtype,
-            is_generation_model=False,
+            is_generation=False,
         ) as srt_runner:
-            srt_outputs = srt_runner.forward(
-                prompts,
-            )
+            srt_outputs = srt_runner.forward(prompts)
 
         for i in range(len(prompts)):
             hf_logits = torch.Tensor(hf_outputs.embed_logits[i])
@@ -57,18 +58,15 @@ class TestEmbeddingModels(unittest.TestCase):
             print("similarity diff", abs(similarity - 1))
 
             if len(prompts[i]) <= 1000:
-                tolerance = 1e-5
-            else:
-                tolerance = long_context_tolerance
-            assert torch.all(
-                abs(similarity - 1) < tolerance
-            ), "embeddings are not all close"
+                assert torch.all(
+                    abs(similarity - 1) < prefill_tolerance
+                ), "embeddings are not all close"
 
     def test_prefill_logits(self):
-        for model, tp_size, long_context_tolerance in MODELS:
+        for model, tp_size, prefill_tolerance in MODELS:
             for torch_dtype in TORCH_DTYPES:
                 self.assert_close_prefill_logits(
-                    DEFAULT_PROMPTS, model, tp_size, torch_dtype, long_context_tolerance
+                    DEFAULT_PROMPTS, model, tp_size, torch_dtype, prefill_tolerance
                 )
 
 
