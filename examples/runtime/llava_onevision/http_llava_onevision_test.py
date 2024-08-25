@@ -78,6 +78,51 @@ def image_stream_request_test(client):
     print("-" * 30)
 
 
+def multi_image_stream_request_test(client):
+    print(
+        "----------------------Multi-Images Stream Request Test----------------------"
+    )
+    stream_request = client.chat.completions.create(
+        model="default",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
+                        },
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": "I have shown you two images. Please describe the two images to me.",
+                    },
+                ],
+            },
+        ],
+        temperature=0.7,
+        max_tokens=1024,
+        stream=True,
+    )
+    stream_response = ""
+
+    for chunk in stream_request:
+        if chunk.choices[0].delta.content is not None:
+            content = chunk.choices[0].delta.content
+            stream_response += content
+            sys.stdout.write(content)
+            sys.stdout.flush()
+
+    print("-" * 30)
+
+
 def video_stream_request_test(client, video_path):
     print("------------------------Video Stream Request Test----------------------")
     messages = prepare_video_messages(video_path)
@@ -209,6 +254,7 @@ def main():
     client = create_openai_client("http://127.0.0.1:30000/v1")
 
     image_stream_request_test(client)
+    multi_image_stream_request_test(client)
     video_stream_request_test(client, video_path)
     image_speed_test(client)
     video_speed_test(client, video_path)
