@@ -38,6 +38,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
+    is_embedding: bool = False
 
     # Port
     host: str = "127.0.0.1"
@@ -199,6 +200,11 @@ class ServerArgs:
             "--trust-remote-code",
             action="store_true",
             help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+        )
+        parser.add_argument(
+            "--is-embedding",
+            action="store_true",
+            help="Whether to use a CausalLM as an embedding model.",
         )
         parser.add_argument(
             "--context-length",
@@ -458,6 +464,11 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
+        if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
+            logger.info(
+                "Not sure why, the tokenizer will add an additional token at the end of the prompt when trust_remote_mode=True"
+            )
+            self.trust_remote_code = False
         if "gemma-2" in self.model_path.lower():
             logger.info("When using sliding window in gemma-2, turn on flashinfer.")
             self.disable_flashinfer = False

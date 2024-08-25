@@ -94,7 +94,10 @@ class TokenizerManager:
             trust_remote_code=server_args.trust_remote_code,
             model_overide_args=model_overide_args,
         )
-        self.is_generation = is_generation_model(self.hf_config.architectures)
+
+        self.is_generation = is_generation_model(
+            self.hf_config.architectures, self.server_args.is_embedding
+        )
 
         if server_args.context_length is not None:
             self.context_len = server_args.context_length
