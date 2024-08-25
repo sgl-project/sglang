@@ -24,15 +24,14 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.server import Runtime
-from sglang.srt.utils import is_generation_model
 
 DEFAULT_PROMPTS = [
     # the output of gemma-2-2b from SRT is unstable on the commented prompt
     # "The capital of France is",
+    "Apple is red. Banana is Yellow. " * 800 + "Apple is",
     "The capital of the United Kindom is",
     "Today is a sunny day and I like",
     "AI is a field of computer science focused on",
-    "Apple is red. Banana is Yellow. " * 800 + "Apple is",
 ]
 
 dirpath = os.path.dirname(__file__)
@@ -63,8 +62,8 @@ class HFRunner:
     def __init__(
         self,
         model_path,
-        torch_dtype=torch.float16,
-        is_generation_model=None,
+        torch_dtype,
+        is_generation_model,
     ):
         self.in_queue = multiprocessing.Queue()
         self.out_queue = multiprocessing.Queue()
@@ -87,20 +86,15 @@ class HFRunner:
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             torch_dtype=torch_dtype,
-            trust_remote_code=True,
         )
 
-        self.is_generation_model = (
-            is_generation_model(model_path)
-            if is_generation_model is None
-            else is_generation_model
-        )
+        self.is_generation_model = is_generation_model
+
         if self.is_generation_model:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
                 low_cpu_mem_usage=True,
-                trust_remote_code=True,
             ).cuda()
         else:
             from sentence_transformers import SentenceTransformer
@@ -176,16 +170,12 @@ class SRTRunner:
     def __init__(
         self,
         model_path,
+        torch_dtype,
+        is_generation_model,
         tp_size=1,
-        torch_dtype=torch.float16,
-        is_generation_model=None,
         port=5157,
     ):
-        self.is_generation_model = (
-            is_generation_model(model_path)
-            if is_generation_model is None
-            else is_generation_model
-        )
+        self.is_generation_model = is_generation_model
         self.runtime = Runtime(
             model_path=model_path,
             tp_size=tp_size,

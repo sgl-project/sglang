@@ -25,7 +25,6 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 
 # FIXME: temporary solution, remove after next vllm release
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.activation import GeluAndMul
 
 # from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
@@ -39,6 +38,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
@@ -46,7 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
-def get_window_size(config):
+def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
 
@@ -135,7 +135,7 @@ class Gemma2MLP(nn.Module):
                 "function. Please set `hidden_act` and `hidden_activation` to "
                 "`gelu_pytorch_tanh`."
             )
-        self.act_fn = GeluAndMul(approximate="tanh")
+        self.act_fn = GeluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
@@ -213,7 +213,11 @@ class Gemma2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_idx,
-            sliding_window_size=get_window_size(config) if use_sliding_window else None,
+            sliding_window_size=(
+                get_attention_sliding_window_size(config)
+                if use_sliding_window
+                else None
+            ),
             logit_cap=self.config.attn_logit_softcapping,
         )
 
@@ -406,8 +410,8 @@ class Gemma2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.model.embed_tokens.weight, input_metadata
         )
 
-    def get_window_size(self):
-        return get_window_size(self.config)
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

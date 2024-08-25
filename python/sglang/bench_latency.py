@@ -111,7 +111,11 @@ def load_model(server_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
-    model_config = ModelConfig(path=server_args.model_path)
+    model_config = ModelConfig(
+        server_args.model_path,
+        server_args.trust_remote_code,
+        context_length=server_args.context_length,
+    )
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
