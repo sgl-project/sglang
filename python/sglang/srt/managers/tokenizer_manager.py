@@ -437,13 +437,13 @@ class TokenizerManager:
         is_stream = hasattr(obj, "stream") and obj.stream
 
         tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
-        output_list = []
+        output_list = [None] * len(tasks)
 
         while tasks:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
             for task in done:
-                gen_index = tasks.index(task)
+                cur_index = tasks.index(task)
 
                 try:
                     result = task.result()
@@ -451,14 +451,14 @@ class TokenizerManager:
                     if is_stream:
                         yield result
                     else:
-                        output_list.append(result)
+                        output_list[result["index"]] = result
 
-                    tasks[gen_index] = asyncio.create_task(
-                        generators[gen_index].__anext__()
+                    tasks[cur_index] = asyncio.create_task(
+                        generators[cur_index].__anext__()
                     )
                 except StopAsyncIteration:
-                    del generators[gen_index]
-                    del tasks[gen_index]
+                    del generators[cur_index]
+                    del tasks[cur_index]
 
         if not is_stream:
             yield output_list
