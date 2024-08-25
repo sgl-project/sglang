@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +19,7 @@ limitations under the License.
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 
@@ -28,6 +30,10 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.sampler import SamplerOutput
+
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -670,3 +676,18 @@ class ScheduleBatch:
         self.out_cache_loc = None
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
+
+    def check_sample_results(self, sampler_output: SamplerOutput):
+        if not torch.all(sampler_output.success):
+            probs = sampler_output.probs
+            batch_next_token_ids = sampler_output.batch_next_token_ids
+            logging.warning("Sampling failed, fallback to top_k=1 strategy")
+            probs = probs.masked_fill(torch.isnan(probs), 0.0)
+            argmax_ids = torch.argmax(probs, dim=-1)
+            batch_next_token_ids = torch.where(
+                sampler_output.success, batch_next_token_ids, argmax_ids
+            )
+            sampler_output.probs = probs
+            sampler_output.batch_next_token_ids = batch_next_token_ids
+
+        return sampler_output.batch_next_token_ids

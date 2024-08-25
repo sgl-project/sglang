@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 
 import torch
@@ -14,6 +15,13 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class SamplerOutput:
+    success: torch.Tensor
+    probs: torch.Tensor
+    batch_next_token_ids: torch.Tensor
 
 
 class Sampler(CustomOp):
@@ -70,15 +78,7 @@ class Sampler(CustomOp):
                 probs, sampling_info.top_ks, sampling_info.top_ps, sampling_info.min_ps
             )
 
-        if not torch.all(success):
-            logging.warning("Sampling failed, fallback to top_k=1 strategy")
-            probs = probs.masked_fill(torch.isnan(probs), 0.0)
-            argmax_ids = torch.argmax(probs, dim=-1)
-            batch_next_token_ids = torch.where(
-                success, batch_next_token_ids, argmax_ids
-            )
-
-        return batch_next_token_ids
+        return SamplerOutput(success, probs, batch_next_token_ids)
 
     def forward_native():
         raise NotImplementedError("Native forward is not implemented yet.")

@@ -21,7 +21,7 @@ import importlib.resources
 import logging
 import pkgutil
 from functools import lru_cache
-from typing import Optional, Type
+from typing import Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -44,6 +44,8 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
+from sglang.srt.layers.logits_processor import LogitProcessorOutput
+from sglang.srt.layers.sampler import SamplerOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -542,7 +544,9 @@ class ModelRunner:
             input_metadata.image_offsets,
         )
 
-    def forward(self, batch: ScheduleBatch, forward_mode: ForwardMode):
+    def forward(
+        self, batch: ScheduleBatch, forward_mode: ForwardMode
+    ) -> Tuple[SamplerOutput, LogitProcessorOutput]:
         if self.is_multimodal_model and forward_mode == ForwardMode.EXTEND:
             return self.forward_extend_multi_modal(batch)
         elif forward_mode == ForwardMode.DECODE:

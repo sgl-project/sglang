@@ -317,10 +317,10 @@ class LlamaForCausalLM(nn.Module):
         logit_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
-        next_token_ids = self.sampler(
+        sampler_output = self.sampler(
             logit_output.next_token_logits, input_metadata.sampling_info
         )
-        return next_token_ids, logit_output
+        return sampler_output, logit_output
 
     def get_module_name(self, name):
         stacked_params_mapping = [
