@@ -591,7 +591,7 @@ class Runtime:
 
     def generate(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         sampling_params: Optional[Dict] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
@@ -612,7 +612,7 @@ class Runtime:
 
     def encode(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
     ):
         json_data = {
             "text": prompt,
