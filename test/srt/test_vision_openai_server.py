@@ -74,6 +74,48 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
+    def test_mult_images_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
+                            },
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "I have shown you two images. Please describe the two images to me.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+        )
+
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+        assert "man" in text or "cab" in text, text
+        assert "logo" in text, text
+        assert response.id
+        assert response.created
+        assert response.usage.prompt_tokens > 0
+        assert response.usage.completion_tokens > 0
+        assert response.usage.total_tokens > 0
+
     def prepare_video_messages(self, video_path):
         max_frames_num = 32
         vr = VideoReader(video_path, ctx=cpu(0))

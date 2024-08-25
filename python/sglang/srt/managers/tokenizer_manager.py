@@ -744,7 +744,9 @@ def get_pixel_values(
                     image,
                     tuple(int(x * 255) for x in processor.image_processor.image_mean),
                 )
-                pixel_values = processor.image_processor(image)["pixel_values"][0]
+                pixel_values = processor.image_processor(image.convert("RGB"))[
+                    "pixel_values"
+                ][0]
             elif image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
                 pixel_values = process_anyres_image(
                     image, processor.image_processor, image_grid_pinpoints
