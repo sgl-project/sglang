@@ -33,6 +33,7 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     dtype: str = "auto"
+    kv_cache_dtype: str = "auto"
     trust_remote_code: bool = True
     context_length: Optional[int] = None
     quantization: Optional[str] = None
@@ -195,6 +196,13 @@ class ServerArgs:
             '* "bfloat16" for a balance between precision and range.\n'
             '* "float" is shorthand for FP32 precision.\n'
             '* "float32" for FP32 precision.',
+        )
+        parser.add_argument(
+            "--kv-cache-dtype",
+            type=str,
+            default=ServerArgs.kv_cache_dtype,
+            choices=["auto", "fp8_e5m2"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" is supported for CUDA 11.8+.',
         )
         parser.add_argument(
             "--trust-remote-code",
