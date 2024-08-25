@@ -6,7 +6,7 @@ Achieving a large batch size is the most important thing for attaining high thro
 
 When the server is running at full load, look for the following in the log:
 
-```[gpu=0] Decode batch. #running-req: 233, #token: 370959, token usage: 0.82, gen throughput (token/s): 4594.01, #queue-req: 417```
+```Decode batch. #running-req: 233, #token: 370959, token usage: 0.82, gen throughput (token/s): 4594.01, #queue-req: 417```
 
 ### Tune Your Request Submission Speed
 `#queue-req` indicates the number of requests in the queue. If you frequently see `#queue-req == 0`, it suggests you are bottlenecked by the request submission speed.

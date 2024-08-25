@@ -849,7 +849,7 @@ def run_tp_server(
     model_overide_args: dict,
 ):
     """Run a tensor parallel model server."""
-    configure_logger(server_args, prefix=f"TP{tp_rank}")
+    configure_logger(server_args, prefix=f" TP{tp_rank}")
 
     try:
         model_server = ModelTpServer(

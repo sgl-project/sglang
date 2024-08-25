@@ -133,8 +133,11 @@ def start_controller_process(
     queue: multiprocessing.connection.Connection = None,
 ):
     """Start a controller process."""
-
-    configure_logger(server_args, prefix="TP0")
+    if is_data_parallel_worker:
+        logger_prefix = f" DP{dp_worker_id} TP0"
+    else:
+        logger_prefix = " TP0"
+    configure_logger(server_args, prefix=logger_prefix)
 
     if not is_data_parallel_worker:
         tp_size_local = server_args.tp_size // server_args.nnodes
