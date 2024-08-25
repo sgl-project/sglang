@@ -182,7 +182,7 @@ class TokenizerManager:
             )
 
             if self.is_generation:
-                pixel_values, image_hash, image_size = await self.get_pixel_values(
+                pixel_values, image_hash, image_size = await self._get_pixel_values(
                     obj.image_data
                 )
                 return_logprob = (
@@ -765,4 +765,4 @@ def _process_single_image_task(
             pixel_values = pixel_values.astype(np.float16)
             return pixel_values, image_hash, image.size
     except Exception:
-        print("Exception in TokenizerManager:\n" + get_exception_traceback())
+        logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())

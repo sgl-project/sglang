@@ -74,6 +74,7 @@ from sglang.srt.utils import (
     add_api_key_middleware,
     allocate_init_ports,
     assert_pkg_version,
+    configure_logger,
     enable_show_time_cost,
     kill_child_process,
     maybe_set_triton_cache_manager,
@@ -270,10 +271,7 @@ def launch_server(
     """Launch an HTTP server."""
     global tokenizer_manager
 
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format="%(message)s",
-    )
+    configure_logger(server_args)
 
     server_args.check_server_args()
     _set_envs_and_config(server_args)
