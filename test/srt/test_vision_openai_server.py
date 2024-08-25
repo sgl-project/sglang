@@ -67,7 +67,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert "car" in text or "taxi" in text, text
+        assert "logo" in text, text
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
