@@ -460,24 +460,25 @@ def run_with_timeout(
     return ret_value[0]
 
 
+def run_one_file(filename, out_queue):
+    print(f"\n\nRun {filename}\n\n")
+    ret = unittest.main(module=None, argv=["", "-vb"] + [filename])
+
+
 def run_unittest_files(files: List[str], timeout_per_file: float):
     tic = time.time()
     success = True
 
     for filename in files:
+        out_queue = multiprocessing.Queue()
+        p = multiprocessing.Process(target=run_one_file, args=(filename, out_queue))
 
-        def func():
-            print(f"\n\nRun {filename}\n\n")
-            ret = unittest.main(module=None, argv=["", "-vb"] + [filename])
-
-        p = multiprocessing.Process(target=func)
-
-        def run_one_file():
+        def run_process():
             p.start()
             p.join()
 
         try:
-            run_with_timeout(run_one_file, timeout=timeout_per_file)
+            run_with_timeout(run_process, timeout=timeout_per_file)
             if p.exitcode != 0:
                 success = False
                 break
