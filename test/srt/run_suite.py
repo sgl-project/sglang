@@ -1,5 +1,6 @@
 import argparse
 import glob
+import multiprocessing as mp
 
 from sglang.test.test_utils import run_unittest_files
 
@@ -53,6 +54,11 @@ if __name__ == "__main__":
         files = glob.glob("**/test_*.py", recursive=True)
     else:
         files = suites[args.suite]
+
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
 
     exit_code = run_unittest_files(files, args.timeout_per_file)
     exit(exit_code)

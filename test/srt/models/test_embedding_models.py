@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import multiprocessing as mp
 import unittest
 
 import torch
@@ -63,13 +64,6 @@ class TestEmbeddingModels(unittest.TestCase):
                 ), "embeddings are not all close"
 
     def test_prefill_logits(self):
-        import multiprocessing as mp
-
-        try:
-            mp.set_start_method("spawn")
-        except RuntimeError:
-            pass
-
         for model, tp_size, prefill_tolerance in MODELS:
             for torch_dtype in TORCH_DTYPES:
                 self.assert_close_prefill_logits(
@@ -78,4 +72,9 @@ class TestEmbeddingModels(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
     unittest.main(warnings="ignore")
