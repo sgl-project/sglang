@@ -269,7 +269,7 @@ def init_sequence_parallel_args(
             # exist in the last SP shard to slot 0 (reserved for dummy output).
             if sp_rank == sp_size - 1:
                 out_cache_loc = seq_parallel_pad_zeros(
-                    out_cache_loc, extend_seq_lens_cpu, sp_size, True
+                    batch.out_cache_loc, extend_seq_lens_cpu, sp_size, True
                 )
     else:
         sp_to_normal_indices = np.arange(num_tokens)

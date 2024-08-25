@@ -484,6 +484,9 @@ class ScheduleBatch:
 
             if self.sp_size > 1:
                 ext_len = extend_local_token_nums[i]
+                # Prefix are stored elsewhere and not affected by the layout of
+                # **this** request.
+                seq_len = pre_len + ext_len
             self.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
                 out_cache_loc[pt : pt + ext_len]
             )
