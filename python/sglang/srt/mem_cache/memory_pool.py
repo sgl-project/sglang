@@ -126,11 +126,11 @@ class BaseTokenToKVPool(ABC):
 
     @abstractmethod
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @abstractmethod
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @abstractmethod
     def set_kv_buffer(
@@ -140,7 +140,7 @@ class BaseTokenToKVPool(ABC):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ) -> None:
-        raise NotImplementedError
+        raise NotImplementedError()
 
 
 class MHATokenToKVPool(BaseTokenToKVPool):
