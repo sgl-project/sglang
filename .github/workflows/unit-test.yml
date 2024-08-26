@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit-test:
+  unit-test-jobs:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
     strategy:
@@ -47,3 +47,7 @@ jobs:
             cd test/srt
             python3 run_suite.py --suite minimal --range-begin 8
           fi
+
+  unit-test:
+    needs: unit-test
+    runs-on: ubuntu-latest
