@@ -197,6 +197,16 @@ class ModelTpServer:
                     "trust_remote_code": server_args.trust_remote_code,
                 },
                 skip_tokenizer_init=server_args.skip_tokenizer_init,
+                json_schema_mode=False,
+            )
+            self.json_fsm_cache = FSMCache(
+                server_args.tokenizer_path,
+                {
+                    "tokenizer_mode": server_args.tokenizer_mode,
+                    "trust_remote_code": server_args.trust_remote_code,
+                },
+                skip_tokenizer_init=server_args.skip_tokenizer_init,
+                json_schema_mode=True,
             )
         self.jump_forward_cache = JumpForwardCache()
 
@@ -349,8 +359,17 @@ class ModelTpServer:
             req.top_logprobs_num = recv_req.top_logprobs_num
             req.stream = recv_req.stream
 
+            # Init regex fsm fron json
+            if req.sampling_params.json_schema is not None:
+                req.regex_fsm, computed_regex_string = self.json_fsm_cache.query(
+                    req.sampling_params.json_schema
+                )
+                if not self.disable_regex_jump_forward:
+                    req.jump_forward_map = self.jump_forward_cache.query(
+                        computed_regex_string
+                    )
             # Init regex fsm
-            if req.sampling_params.regex is not None:
+            elif req.sampling_params.regex is not None:
                 req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)
                 if not self.disable_regex_jump_forward:
                     req.jump_forward_map = self.jump_forward_cache.query(
