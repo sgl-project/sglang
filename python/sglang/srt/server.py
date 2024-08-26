@@ -59,6 +59,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_batches,
+    v1_cancel_batch,
     v1_chat_completions,
     v1_completions,
     v1_delete_file,
@@ -244,6 +245,12 @@ async def delete_file(file_id: str):
 @app.post("/v1/batches")
 async def openai_v1_batches(raw_request: Request):
     return await v1_batches(tokenizer_manager, raw_request)
+
+
+@app.post("/v1/batches/{batch_id}/cancel")
+async def cancel_batches(batch_id: str):
+    # https://platform.openai.com/docs/api-reference/batch/cancel
+    return await v1_cancel_batch(tokenizer_manager, batch_id)
 
 
 @app.get("/v1/batches/{batch_id}")
