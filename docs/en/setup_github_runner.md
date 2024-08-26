@@ -2,7 +2,7 @@
 
 ## Add a Runner
 
-1. Start a docker container.
+### Step 1: Start a docker container.
 
 You can mount a folder for the shared huggingface model weights cache. The command below uses `/tmp/huggingface` as an example.
 
@@ -11,7 +11,7 @@ docker pull nvidia/cuda:12.1.1-devel-ubuntu22.04
 docker run --shm-size 64g -it -v /tmp/huggingface:/hf_home --gpus all nvidia/cuda:12.1.1-devel-ubuntu22.04 /bin/bash
 ```
 
-2. Configure the runner by `config.sh`
+### Step 2: Configure the runner by `config.sh`
 
 Run these commands inside the container.
 
@@ -27,7 +27,7 @@ Then follow https://github.com/sgl-project/sglang/settings/actions/runners/new?a
 - Give it a name (e.g., `test-sgl-gpu-0`) and some labels (e.g., `unit-test`). The labels can be editted later in Github Settings.
 - Do not need to change the work folder.
 
-3. Run the runner by `run.sh`
+### Step 3: Run the runner by `run.sh`
 
 - Set up environment variables
 ```
