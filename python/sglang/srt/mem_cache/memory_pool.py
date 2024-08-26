@@ -17,8 +17,8 @@ limitations under the License.
 
 import logging
 import threading
-from functools import wraps
 from abc import ABC, abstractmethod
+from functools import wraps
 from typing import List, Tuple, Union
 
 import torch
