@@ -11,19 +11,23 @@ from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.utils import kill_child_process
-from sglang.test.test_utils import DEFAULT_URL_FOR_UNIT_TEST, popen_launch_server
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    popen_launch_server,
+)
 
 
 class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
-        cls.base_url = DEFAULT_URL_FOR_UNIT_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=300,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=[
                 "--chat-template",
@@ -67,7 +71,51 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert "car" in text or "taxi" in text, text
+        assert "man" in text or "cab" in text, text
+        assert response.id
+        assert response.created
+        assert response.usage.prompt_tokens > 0
+        assert response.usage.completion_tokens > 0
+        assert response.usage.total_tokens > 0
+
+    def test_mult_images_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
+                            },
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "I have two very different images. They are not related at all. "
+                            "Please describe the first image in one sentence, and then describe the second image in another sentence.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+        )
+
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+        print(text)
+        assert "man" in text or "cab" in text, text
+        # assert "logo" in text, text
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0

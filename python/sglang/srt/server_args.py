@@ -33,11 +33,13 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     dtype: str = "auto"
+    kv_cache_dtype: str = "auto"
     trust_remote_code: bool = True
     context_length: Optional[int] = None
     quantization: Optional[str] = None
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
+    is_embedding: bool = False
 
     # Port
     host: str = "127.0.0.1"
@@ -196,9 +198,21 @@ class ServerArgs:
             '* "float32" for FP32 precision.',
         )
         parser.add_argument(
+            "--kv-cache-dtype",
+            type=str,
+            default=ServerArgs.kv_cache_dtype,
+            choices=["auto", "fp8_e5m2"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" is supported for CUDA 11.8+.',
+        )
+        parser.add_argument(
             "--trust-remote-code",
             action="store_true",
             help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+        )
+        parser.add_argument(
+            "--is-embedding",
+            action="store_true",
+            help="Whether to use a CausalLM as an embedding model.",
         )
         parser.add_argument(
             "--context-length",
@@ -412,7 +426,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
-            help="Enabling mixing prefill and decode in a chunked batch.",
+            help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
         )
         parser.add_argument(
             "--enable-torch-compile",
@@ -458,6 +472,11 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
+        if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
+            logger.info(
+                "Not sure why, the tokenizer will add an additional token at the end of the prompt when trust_remote_mode=True"
+            )
+            self.trust_remote_code = False
         if "gemma-2" in self.model_path.lower():
             logger.info("When using sliding window in gemma-2, turn on flashinfer.")
             self.disable_flashinfer = False

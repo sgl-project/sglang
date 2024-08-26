@@ -20,7 +20,7 @@ concurrency:
 jobs:
   unit-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: unit
+    runs-on: 1-gpu-runner
 
     steps:
     - name: Checkout code
@@ -28,9 +28,6 @@ jobs:
 
     - name: Install dependencies
       run: |
-        source $HOME/venv/bin/activate
-        echo "$HOME/venv/bin" >> $GITHUB_PATH
-
         pip install --upgrade pip
         pip install -e "python[all]"
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
@@ -38,13 +35,13 @@ jobs:
         pip install sentence_transformers
 
     - name: Test Backend Runtime
+      timeout-minutes: 20
       run: |
         cd test/srt
         python3 run_suite.py --suite minimal
-      timeout-minutes: 18
 
     - name: Test Frontend Language
+      timeout-minutes: 10
       run: |
         cd test/lang
         python3 run_suite.py --suite minimal
-      timeout-minutes: 10

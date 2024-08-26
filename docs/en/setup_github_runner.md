@@ -1,89 +1,44 @@
-# Set up self hosted runner for GitHub Action
+# Set Up Self-hosted Runners for GitHub Action
 
-## Config Runner
+## Add a Runner
 
-```bash
-# https://github.com/sgl-project/sglang/settings/actions/runners/new?arch=x64&os=linux
-# Involves some TOKEN and other private information, click the link to view specific steps.
+### Step 1: Start a docker container.
+
+You can mount a folder for the shared huggingface model weights cache. The command below uses `/tmp/huggingface` as an example.
+
+```
+docker pull nvidia/cuda:12.1.1-devel-ubuntu22.04
+docker run --shm-size 64g -it -v /tmp/huggingface:/hf_home --gpus all nvidia/cuda:12.1.1-devel-ubuntu22.04 /bin/bash
 ```
 
-## Start Runner
+### Step 2: Configure the runner by `config.sh`
 
-add `/lib/systemd/system/e2e.service`
+Run these commands inside the container.
+
 ```
-[Unit]
-StartLimitIntervalSec=0
-[Service]
-Environment="CUDA_VISIBLE_DEVICES=7"
-Environment="XDG_CACHE_HOME=/data/.cache"
-Environment="HF_TOKEN=hf_xx"
-Environment="OPENAI_API_KEY=sk-xx"
-Environment="HOME=/data/zhyncs/runner-v1"
-Environment="SGLANG_IS_IN_CI=true"
-Restart=always
-RestartSec=1
-ExecStart=/data/zhyncs/runner-v1/actions-runner/run.sh
-[Install]
-WantedBy=multi-user.target
+apt update && apt install -y curl python3-pip git
+export RUNNER_ALLOW_RUNASROOT=1
 ```
 
-add `/lib/systemd/system/unit.service`
-```
-[Unit]
-StartLimitIntervalSec=0
-[Service]
-Environment="CUDA_VISIBLE_DEVICES=6"
-Environment="XDG_CACHE_HOME=/data/.cache"
-Environment="HF_TOKEN=hf_xx"
-Environment="OPENAI_API_KEY=sk-xx"
-Environment="HOME=/data/zhyncs/runner-v2"
-Environment="SGLANG_IS_IN_CI=true"
-Restart=always
-RestartSec=1
-ExecStart=/data/zhyncs/runner-v2/actions-runner/run.sh
-[Install]
-WantedBy=multi-user.target
-```
+Then follow https://github.com/sgl-project/sglang/settings/actions/runners/new?arch=x64&os=linux to run `config.sh`
 
-add `/lib/systemd/system/accuracy.service`
+**Notes**
+- Do not need to specify the runner group
+- Give it a name (e.g., `test-sgl-gpu-0`) and some labels (e.g., `1-gpu-runner`). The labels can be editted later in Github Settings.
+- Do not need to change the work folder.
+
+### Step 3: Run the runner by `run.sh`
+
+- Set up environment variables
 ```
-[Unit]
-StartLimitIntervalSec=0
-[Service]
-Environment="CUDA_VISIBLE_DEVICES=5"
-Environment="XDG_CACHE_HOME=/data/.cache"
-Environment="HF_TOKEN=hf_xx"
-Environment="OPENAI_API_KEY=sk-xx"
-Environment="HOME=/data/zhyncs/runner-v3"
-Environment="SGLANG_IS_IN_CI=true"
-Restart=always
-RestartSec=1
-ExecStart=/data/zhyncs/runner-v3/actions-runner/run.sh
-[Install]
-WantedBy=multi-user.target
+export HF_HOME=/hf_home
+export SGLANG_IS_IN_CI=true
+export HF_TOKEN=hf_xxx
+export OPENAI_API_KEY=sk-xxx
+export CUDA_VISIBLE_DEVICES=0
 ```
 
-```bash
-cd /data/zhyncs/runner-v1
-python3 -m venv venv
-
-cd /data/zhyncs/runner-v2
-python3 -m venv venv
-
-cd /data/zhyncs/runner-v3
-python3 -m venv venv
-
-sudo systemctl daemon-reload
-
-sudo systemctl start e2e
-sudo systemctl enable e2e
-sudo systemctl status e2e
-
-sudo systemctl start unit
-sudo systemctl enable unit
-sudo systemctl status unit
-
-sudo systemctl start accuracy
-sudo systemctl enable accuracy
-sudo systemctl status accuracy
+- Run it forever
+```
+while true; do ./run.sh; echo "Restarting..."; sleep 2; done
 ```

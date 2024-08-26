@@ -224,13 +224,18 @@ def is_multimodal_model(model):
     raise ValueError("unrecognized type")
 
 
-def is_generation_model(model_architectures):
+def is_generation_model(model_architectures, is_embedding: bool = False):
+    # We have two ways to determine whether a model is a generative model.
+    # 1. Check the model architectue
+    # 2. check the `is_embedding` server args
+
     if (
         "LlamaEmbeddingModel" in model_architectures
         or "MistralModel" in model_architectures
     ):
         return False
-    return True
+    else:
+        return not is_embedding
 
 
 def decode_video_base64(video_base64):
@@ -687,7 +692,7 @@ def monkey_patch_vllm_qvk_linear_loader():
     setattr(QKVParallelLinear, "weight_loader", weight_loader_srt)
 
 
-def add_api_key_middleware(app, api_key):
+def add_api_key_middleware(app, api_key: str):
     @app.middleware("http")
     async def authentication(request, call_next):
         if request.method == "OPTIONS":
@@ -699,7 +704,7 @@ def add_api_key_middleware(app, api_key):
         return await call_next(request)
 
 
-def prepare_model(model_path):
+def prepare_model(model_path: str):
     if "SGLANG_USE_MODELSCOPE" in os.environ:
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
@@ -708,7 +713,7 @@ def prepare_model(model_path):
     return model_path
 
 
-def prepare_tokenizer(tokenizer_path):
+def prepare_tokenizer(tokenizer_path: str):
     if "SGLANG_USE_MODELSCOPE" in os.environ:
         if not os.path.exists(tokenizer_path):
             from modelscope import snapshot_download
@@ -717,3 +722,13 @@ def prepare_tokenizer(tokenizer_path):
                 tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
             )
     return tokenizer_path
+
+
+def configure_logger(server_args, prefix: str = ""):
+    format = f"[%(asctime)s{prefix}] %(message)s"
+    logging.basicConfig(
+        level=getattr(logging, server_args.log_level.upper()),
+        format=format,
+        datefmt="%H:%M:%S",
+        force=True,
+    )
