@@ -58,7 +58,9 @@ class TestTorchCompile(unittest.TestCase):
         torch.cuda.synchronize()
         tok = time.time()
         print(res)
-        print(f"Throughput: {256 / (tok - tic)} tokens/s")
+        throughput = 256 / (tok - tic)
+        assert throughput >= 152
+        print(f"Throughput: {throughput} tokens/s")
 
 
 if __name__ == "__main__":
