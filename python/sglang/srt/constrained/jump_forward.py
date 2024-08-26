@@ -23,6 +23,7 @@ from collections import defaultdict
 
 import interegular
 import outlines.caching
+from outlines.fsm.json_schema import build_regex_from_schema
 
 from sglang.srt.constrained import (
     FSMInfo,

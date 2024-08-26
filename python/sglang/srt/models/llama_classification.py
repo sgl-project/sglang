@@ -24,7 +24,7 @@ from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.logits_processor import LogitProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama2 import LlamaModel
 
@@ -65,7 +65,7 @@ class LlamaForClassification(nn.Module):
                 (input_metadata.batch_size, self.config.classification_out_size)
             ).to(input_ids.device)
 
-        return LogitProcessorOutput(
+        return LogitsProcessorOutput(
             next_token_logits=scores,
             next_token_logprobs=scores,
             normalized_prompt_logprobs=scores,
