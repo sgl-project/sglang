@@ -109,9 +109,7 @@ class SamplingParams:
                     f"{self.min_new_tokens}."
                 )
         if self.regex is not None and self.json_schema is not None:
-            raise ValueError(
-                "regex and json_schema cannot be both set."
-            )
+            raise ValueError("regex and json_schema cannot be both set.")
 
     def normalize(self, tokenizer):
         # Process stop strings
