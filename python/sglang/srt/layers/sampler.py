@@ -46,10 +46,19 @@ class Sampler(CustomOp):
 
         return logits
 
-    def _get_probs(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
+    def _get_probs(
+        self,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        is_torch_compile: bool = False,
+    ):
         # Post process logits
         logits = logits.contiguous()
         logits.div_(sampling_info.temperatures)
+        if is_torch_compile:
+            # FIXME: Temporary workaround for unknown bugs in torch.compile
+            logits.add_(0)
+
         if sampling_info.logit_bias is not None:
             logits.add_(sampling_info.logit_bias)
 
@@ -101,7 +110,7 @@ class Sampler(CustomOp):
         if isinstance(logits, LogitsProcessorOutput):
             logits = logits.next_token_logits
 
-        probs = self._get_probs(logits, sampling_info)
+        probs = self._get_probs(logits, sampling_info, is_torch_compile=True)
 
         batch_next_token_ids, success = top_k_top_p_min_p_sampling_from_probs_torch(
             probs, sampling_info.top_ks, sampling_info.top_ps, sampling_info.min_ps
