@@ -2,12 +2,10 @@
 
 import argparse
 import asyncio
-import multiprocessing
 import os
 import subprocess
 import threading
 import time
-import unittest
 from functools import partial
 from typing import Callable, List, Optional
 
@@ -19,6 +17,7 @@ import torch.nn.functional as F
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.srt.utils import kill_child_process
 from sglang.utils import get_exception_traceback
 
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
@@ -457,35 +456,35 @@ def run_with_timeout(
     return ret_value[0]
 
 
-def run_one_file(filename, out_queue):
-    print(f"\n\nRun {filename}\n\n")
-    ret = unittest.main(module=None, argv=["", "-vb"] + [filename])
-
-
 def run_unittest_files(files: List[str], timeout_per_file: float):
     tic = time.time()
     success = True
 
     for filename in files:
-        out_queue = multiprocessing.Queue()
-        p = multiprocessing.Process(target=run_one_file, args=(filename, out_queue))
+        global process
 
-        def run_process():
-            p.start()
-            p.join()
+        def run_one_file(filename):
+            filename = os.path.join(os.getcwd(), filename)
+            print(f"\n\nRun {filename}\n\n")
+            process = subprocess.Popen(
+                ["python3", filename], stdout=None, stderr=None, env=os.environ
+            )
+            process.wait()
+            return process.returncode
 
         try:
-            run_with_timeout(run_process, timeout=timeout_per_file)
-            if p.exitcode != 0:
-                success = False
-                break
+            ret_code = run_with_timeout(
+                run_one_file, args=(filename,), timeout=timeout_per_file
+            )
+            assert ret_code == 0
         except TimeoutError:
-            p.terminate()
+            kill_child_process(process.pid)
             time.sleep(5)
             print(
                 f"\nTimeout after {timeout_per_file} seconds when running {filename}\n"
             )
-            return False
+            success = False
+            break
 
     if success:
         print(f"Success. Time elapsed: {time.time() - tic:.2f}s")
