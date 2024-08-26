@@ -17,7 +17,6 @@ from sglang.test.test_utils import (
 class TestOpenAIServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        DEFAULT_MODEL_NAME_FOR_TEST = "/data/publish-data/pretrain_models/Meta-Llama-3-8B-Instruct"
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
