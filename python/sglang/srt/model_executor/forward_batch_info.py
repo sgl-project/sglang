@@ -315,6 +315,8 @@ def update_flashinfer_indices(
                 num_kv_heads,
                 head_dim,
                 1,
+                data_type=model_runner.kv_cache_dtype,
+                q_data_type=model_runner.dtype,
             )
         else:
             # extend part
@@ -393,6 +395,8 @@ def update_flashinfer_indices(
                     num_kv_heads,
                     head_dim,
                     1,
+                    data_type=model_runner.kv_cache_dtype,
+                    q_data_type=model_runner.dtype,
                 )
             else:
                 # extend part
