@@ -20,7 +20,7 @@ class TestTorchCompile(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile"],
+            other_args=["--enable-torch-compile", "--disable-radix-cache"],
         )
 
     @classmethod
@@ -38,6 +38,27 @@ class TestTorchCompile(unittest.TestCase):
 
         metrics = run_eval(args)
         assert metrics["score"] >= 0.6
+
+    def test_throughput(self):
+        import time
+
+        import torch
+
+        import sglang as sgl
+
+        @sgl.function
+        def test_gen(s):
+            s += "Hello, my name is"
+            s += sgl.gen("res", temperature=0, ignore_eos=True, max_tokens=256)
+
+        sgl.set_default_backend(sgl.RuntimeEndpoint(self.base_url))
+        torch.cuda.synchronize()
+        tic = time.time()
+        res = test_gen.run()
+        torch.cuda.synchronize()
+        tok = time.time()
+        print(res["res"])
+        print(f"Throughput: {256 / (tok - tic)} tokens/s")
 
 
 if __name__ == "__main__":
