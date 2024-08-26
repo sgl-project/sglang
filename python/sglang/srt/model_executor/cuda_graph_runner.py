@@ -25,11 +25,11 @@ from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
 from sglang.srt.layers.logits_processor import (
-    LogitProcessorOutput,
     LogitsMetadata,
     LogitsProcessor,
+    LogitsProcessorOutput,
 )
-from sglang.srt.layers.sampler import SamplerOutput
+from sglang.srt.layers.sampler import SampleOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
@@ -312,11 +312,11 @@ class CudaGraphRunner:
         torch.cuda.synchronize()
         self.graphs[bs].replay()
         torch.cuda.synchronize()
-        sampler_output, logits_output = self.output_buffers[bs]
+        sample_output, logits_output = self.output_buffers[bs]
 
         # Unpad
         if bs != raw_bs:
-            logits_output = LogitProcessorOutput(
+            logits_output = LogitsProcessorOutput(
                 next_token_logits=logits_output.next_token_logits[:raw_bs],
                 next_token_logprobs=None,
                 normalized_prompt_logprobs=None,
@@ -324,10 +324,10 @@ class CudaGraphRunner:
                 input_top_logprobs=None,
                 output_top_logprobs=None,
             )
-            sampler_output = SamplerOutput(
-                sampler_output.success[:raw_bs],
-                sampler_output.probs[:raw_bs],
-                sampler_output.batch_next_token_ids[:raw_bs],
+            sample_output = SampleOutput(
+                sample_output.success[:raw_bs],
+                sample_output.probs[:raw_bs],
+                sample_output.batch_next_token_ids[:raw_bs],
             )
 
         # Extract logprobs
@@ -345,4 +345,4 @@ class CudaGraphRunner:
                     logits_output.next_token_logprobs, logits_metadata
                 )[1]
 
-        return sampler_output, logits_output
+        return sample_output, logits_output

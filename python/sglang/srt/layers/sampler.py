@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+from typing import Union
 
 import torch
 from flashinfer.sampling import (
@@ -10,6 +11,8 @@ from flashinfer.sampling import (
 )
 from vllm.model_executor.custom_op import CustomOp
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
 # TODO: move this dict to another place
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -18,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class SamplerOutput:
+class SampleOutput:
     success: torch.Tensor
     probs: torch.Tensor
     batch_next_token_ids: torch.Tensor
@@ -57,7 +60,14 @@ class Sampler(CustomOp):
 
         return torch.softmax(logits, dim=-1)
 
-    def forward_cuda(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
+    def forward_cuda(
+        self,
+        logits: Union[torch.Tensor, LogitsProcessorOutput],
+        sampling_info: SamplingBatchInfo,
+    ):
+        if isinstance(logits, LogitsProcessorOutput):
+            logits = logits.next_token_logits
+
         probs = self._get_probs(logits, sampling_info)
 
         if not global_server_args_dict["disable_flashinfer_sampling"]:
@@ -81,16 +91,23 @@ class Sampler(CustomOp):
                 probs, sampling_info.top_ks, sampling_info.top_ps, sampling_info.min_ps
             )
 
-        return SamplerOutput(success, probs, batch_next_token_ids)
+        return SampleOutput(success, probs, batch_next_token_ids)
 
-    def forward_native(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
+    def forward_native(
+        self,
+        logits: Union[torch.Tensor, LogitsProcessorOutput],
+        sampling_info: SamplingBatchInfo,
+    ):
+        if isinstance(logits, LogitsProcessorOutput):
+            logits = logits.next_token_logits
+
         probs = self._get_probs(logits, sampling_info)
 
         batch_next_token_ids, success = top_k_top_p_min_p_sampling_from_probs_torch(
             probs, sampling_info.top_ks, sampling_info.top_ps, sampling_info.min_ps
         )
 
-        return SamplerOutput(success, probs, batch_next_token_ids)
+        return SampleOutput(success, probs, batch_next_token_ids)
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(

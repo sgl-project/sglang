@@ -31,7 +31,7 @@ from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.layers.logits_processor import LogitProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -486,10 +486,10 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
-                sampler_output, logits_output = self.model_runner.forward(
+                sample_output, logits_output = self.model_runner.forward(
                     batch, ForwardMode.EXTEND
                 )
-                next_token_ids = batch.check_sample_results(sampler_output)
+                next_token_ids = batch.check_sample_results(sample_output)
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     next_token_ids
                 )
@@ -582,7 +582,7 @@ class ModelTpServer:
         req: Req,
         pt: int,
         next_token_ids: List[int],
-        output: LogitProcessorOutput,
+        output: LogitsProcessorOutput,
     ):
         if req.normalized_prompt_logprob is None:
             req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
@@ -664,10 +664,10 @@ class ModelTpServer:
         batch.prepare_for_decode()
 
         # Forward and sample the next tokens
-        sampler_output, logits_output = self.model_runner.forward(
+        sample_output, logits_output = self.model_runner.forward(
             batch, ForwardMode.DECODE
         )
-        next_token_ids = batch.check_sample_results(sampler_output)
+        next_token_ids = batch.check_sample_results(sample_output)
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
         )
