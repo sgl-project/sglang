@@ -20,7 +20,7 @@ concurrency:
 jobs:
   moe-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: moe-test
+    runs-on: 2-gpu-runner
 
     steps:
     - name: Checkout code
