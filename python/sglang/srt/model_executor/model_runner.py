@@ -191,12 +191,11 @@ class ModelRunner:
 
         self.model = get_model(
             model_config=self.vllm_model_config,
-            device_config=self.device_config,
             load_config=self.load_config,
-            lora_config=None,
-            multimodal_config=None,
+            device_config=self.device_config,
             parallel_config=None,
             scheduler_config=None,
+            lora_config=None,
             cache_config=None,
         )
         self.sliding_window_size = (
@@ -627,4 +626,4 @@ def load_model_cls_srt(model_arch: str) -> Optional[Type[nn.Module]]:
 
 
 # Monkey patch model loader
-setattr(ModelRegistry, "load_model_cls", load_model_cls_srt)
+setattr(ModelRegistry, "_try_load_model_cls", load_model_cls_srt)
