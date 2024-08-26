@@ -54,10 +54,10 @@ class TestTorchCompile(unittest.TestCase):
         sgl.set_default_backend(sgl.RuntimeEndpoint(self.base_url))
         torch.cuda.synchronize()
         tic = time.time()
-        res = test_gen.run()
+        res = test_gen.run()["res"]
         torch.cuda.synchronize()
         tok = time.time()
-        print(res["res"])
+        print(res)
         print(f"Throughput: {256 / (tok - tic)} tokens/s")
 
 
