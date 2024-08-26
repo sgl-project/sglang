@@ -427,12 +427,10 @@ class TokenizerManager:
         return sampling_params
 
     async def _get_pixel_values(self, image_data):
-        if isinstance(image_data, list) and len(image_data) > 0:
-            return await self._get_pixel_values_internal(image_data)
-        elif isinstance(image_data, str):
-            return await self._get_pixel_values_internal(image_data)
-        else:
+        if image_data is None:
             return None, None, None
+        else:
+            return await self._get_pixel_values_internal(image_data)
 
     async def _wait_for_response(
         self,

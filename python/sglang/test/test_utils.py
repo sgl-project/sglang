@@ -465,7 +465,7 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
 
         def run_one_file(filename):
             filename = os.path.join(os.getcwd(), filename)
-            print(f"\n\nRun {filename}\n\n")
+            print(f"\n\nRun {filename}\n\n", flush=True)
             process = subprocess.Popen(
                 ["python3", filename], stdout=None, stderr=None, env=os.environ
             )
@@ -481,15 +481,16 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
             kill_child_process(process.pid)
             time.sleep(5)
             print(
-                f"\nTimeout after {timeout_per_file} seconds when running {filename}\n"
+                f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
+                flush=True,
             )
             success = False
             break
 
     if success:
-        print(f"Success. Time elapsed: {time.time() - tic:.2f}s")
+        print(f"Success. Time elapsed: {time.time() - tic:.2f}s", flush=True)
     else:
-        print(f"Fail. Time elapsed: {time.time() - tic:.2f}s")
+        print(f"Fail. Time elapsed: {time.time() - tic:.2f}s", flush=True)
 
     return 0 if success else -1
 
