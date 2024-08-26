@@ -73,8 +73,9 @@ crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
 
 class Phase(enum.Enum):
     IDLE = 0
-    PREFILLing = 1
+    PREFILLING = 1
     DECODING = 2
+    PREPARE_PREFILL = 3
 
 
 class ModelTpServer:
@@ -224,16 +225,18 @@ class ModelTpServer:
         self.finished_requests = queue.Queue()
         self.retracted_requests = queue.Queue()
 
-        self.phase_indicator = Phase.IDLE
+        self.phase_indicator = Phase.PREPARE_PREFILL
         self.compute_loop_thread = threading.Thread(target=self.compute_loop)
         self.compute_loop_thread.daemon = True
 
     def exposed_step(self, recv_reqs: List):
         try:
             # Forward
-            self.control_loop(recv_reqs)
+            self.forward_pre_post_process(recv_reqs)
         except Exception:
-            logger.error("Exception in ModelTpServer:\n" + get_exception_traceback())
+            logger.error(
+                "Exception in ModelTpServer.exposed_step:\n" + get_exception_traceback()
+            )
             raise
 
         # Return results
@@ -245,8 +248,7 @@ class ModelTpServer:
                 break
         return ret
 
-    def control_loop(self, recv_reqs: List):
-
+    def forward_pre_post_process(self, recv_reqs: List):
         # cache finished requests and send output to detokenizer
         finished_requests = []
         while not self.finished_requests.empty():
@@ -281,7 +283,7 @@ class ModelTpServer:
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 
-        if self.phase_indicator is not Phase.PREFILLing:
+        if self.phase_indicator == Phase.PREPARE_PREFILL:
             if self.ready_prefill_batch.empty():
                 new_batch = self.get_new_prefill_batch()
                 if new_batch is not None:
@@ -300,7 +302,7 @@ class ModelTpServer:
 
         if new_batch is not None:
             # Run a new prefill batch
-            self.phase_indicator = Phase.PREFILLing
+            self.phase_indicator = Phase.PREFILLING
             self.forward_prefill_batch(new_batch)
 
             if not new_batch.is_empty():
@@ -313,7 +315,7 @@ class ModelTpServer:
             # Run a decode batch
             if self.running_batch is not None:
                 # Run a few decode batches continuously for reducing overhead
-                for _ in range(global_config.num_continue_decode_steps):
+                for i in range(global_config.num_continue_decode_steps):
                     self.num_generated_tokens += len(self.running_batch.reqs)
                     self.forward_decode_batch(self.running_batch)
 
@@ -323,15 +325,20 @@ class ModelTpServer:
 
                     if self.running_batch.is_empty():
                         self.running_batch = None
+                        self.phase_indicator = Phase.PREPARE_PREFILL
                         break
+
+                    if i == global_config.num_continue_decode_steps - 2:
+                        # start preparing prefill batch only before the last decode iteration
+                        self.phase_indicator = Phase.PREPARE_PREFILL
             else:
                 self.new_token_ratio = global_config.init_new_token_ratio
-                self.phase_indicator = Phase.IDLE
+                self.phase_indicator = Phase.PREPARE_PREFILL
                 # avoid busy waiting, could be adjusted
                 time.sleep(0.01)
 
     def compute_loop(self):
-        # synchrnoize the gpu id to the compute thread
+        # synchronize the gpu id to the compute thread
         torch.cuda.set_device(self.gpu_id)
         while True:
             try:
