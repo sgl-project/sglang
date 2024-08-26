@@ -20,7 +20,7 @@ concurrency:
 jobs:
   accuracy-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: accuracy-test
+    runs-on: 1-gpu-runner
 
     steps:
     - name: Checkout code
