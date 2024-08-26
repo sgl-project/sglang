@@ -49,7 +49,7 @@ jobs:
           fi
 
   unit-test:
-    needs: unit-test
+    needs: unit-test-jobs
     runs-on: ubuntu-latest
     steps:
       - name: Merge step
