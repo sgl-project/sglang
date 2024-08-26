@@ -59,13 +59,13 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_batches,
+    v1_cancel_batch,
     v1_chat_completions,
     v1_completions,
     v1_delete_file,
     v1_embeddings,
     v1_files_create,
     v1_retrieve_batch,
-    v1_cancel_batch,
     v1_retrieve_file,
     v1_retrieve_file_content,
 )

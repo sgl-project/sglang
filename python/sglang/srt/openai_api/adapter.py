@@ -298,7 +298,8 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
             )
         elif end_point == "/v1/completions":
             adapted_request, request = v1_generate_request(
-                all_requests, request_ids=request_ids)
+                all_requests, request_ids=request_ids
+            )
 
         try:
             ret = await tokenizer_manager.generate_request(adapted_request).__anext__()
@@ -387,17 +388,23 @@ async def v1_cancel_batch(tokenizer_manager, batch_id: str):
     # Only do cancal when status is "validating" or "in_progress"
     if batch_response.status in ["validating", "in_progress"]:
         # Start cancelling the batch asynchronously
-        asyncio.create_task(cancel_batch(tokenizer_manager=tokenizer_manager, 
-                                        batch_id=batch_id,
-                                        input_file_id=batch_response.input_file_id,
-                                        ))
-        
+        asyncio.create_task(
+            cancel_batch(
+                tokenizer_manager=tokenizer_manager,
+                batch_id=batch_id,
+                input_file_id=batch_response.input_file_id,
+            )
+        )
+
         # Update batch status to "cancelling"
         batch_response.status = "cancelling"
 
         return batch_response
     else:
-        raise HTTPException(status_code=500, detail=f"Current status is {batch_response.status}, no need to cancel")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Current status is {batch_response.status}, no need to cancel",
+        )
 
 
 async def cancel_batch(tokenizer_manager, batch_id: str, input_file_id: str):
@@ -458,7 +465,9 @@ async def v1_retrieve_file_content(file_id: str):
     return StreamingResponse(iter_file(), media_type="application/octet-stream")
 
 
-def v1_generate_request(all_requests: List[CompletionRequest], request_ids: List[str] = None):
+def v1_generate_request(
+    all_requests: List[CompletionRequest], request_ids: List[str] = None
+):
     prompts = []
     sampling_params_list = []
     return_logprobs = []
@@ -812,7 +821,9 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
 
 def v1_chat_generate_request(
-    all_requests: List[ChatCompletionRequest], tokenizer_manager, request_ids: List[str] = None
+    all_requests: List[ChatCompletionRequest],
+    tokenizer_manager,
+    request_ids: List[str] = None,
 ):
     input_ids = []
     sampling_params_list = []

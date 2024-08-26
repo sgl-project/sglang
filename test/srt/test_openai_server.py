@@ -351,7 +351,7 @@ class TestOpenAIServer(unittest.TestCase):
         )
 
         return batch_job, content
-    
+
     def run_batch(self, mode):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         batch_job, content = self._create_batch(mode=mode, client=client)
