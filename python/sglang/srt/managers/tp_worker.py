@@ -317,6 +317,10 @@ class ModelTpServer:
             if self.running_batch is not None:
                 # Run a few decode batches continuously for reducing overhead
                 for i in range(global_config.num_continue_decode_steps):
+                    if i == global_config.num_continue_decode_steps - 1:
+                        # start preparing prefill batch only before the last decode iteration
+                        self.phase_indicator = Phase.PREPARE_PREFILL
+
                     self.num_generated_tokens += len(self.running_batch.reqs)
                     self.forward_decode_batch(self.running_batch)
 
@@ -328,10 +332,6 @@ class ModelTpServer:
                         self.running_batch = None
                         self.phase_indicator = Phase.PREPARE_PREFILL
                         break
-
-                    if i == global_config.num_continue_decode_steps - 2:
-                        # start preparing prefill batch only before the last decode iteration
-                        self.phase_indicator = Phase.PREPARE_PREFILL
             else:
                 self.new_token_ratio = global_config.init_new_token_ratio
                 self.phase_indicator = Phase.PREPARE_PREFILL
