@@ -239,7 +239,7 @@ class FusedMoE(torch.nn.Module):
         weight_name: str,
         shard_id: int,
         expert_id: int,
-        pre_sharded: bool,
+        use_presharded_weights: bool = False,
     ):
         param_data = param.data
 
@@ -273,7 +273,7 @@ class FusedMoE(torch.nn.Module):
         else:
             tp_rank = get_tensor_model_parallel_rank()
             shard_size = self.intermediate_size_per_partition
-            if pre_sharded:
+            if use_presharded_weights:
                 shard = slice(None)
             else:
                 shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)

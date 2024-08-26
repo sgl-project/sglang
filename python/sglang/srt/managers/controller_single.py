@@ -27,7 +27,7 @@ from sglang.srt.managers.tp_worker import (
     launch_tp_servers,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import kill_parent_process
+from sglang.srt.utils import configure_logger, kill_parent_process
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ class ControllerSingle:
         self.dp_worker_id = dp_worker_id
         self.mp_queue = mp_queue
 
-        # Init communication
+        # Init inter-process communication
         context = zmq.Context(2)
 
         if not self.is_dp_worker:
@@ -133,11 +133,11 @@ def start_controller_process(
     queue: multiprocessing.connection.Connection = None,
 ):
     """Start a controller process."""
-
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format="%(message)s",
-    )
+    if is_data_parallel_worker:
+        logger_prefix = f" DP{dp_worker_id} TP0"
+    else:
+        logger_prefix = " TP0"
+    configure_logger(server_args, prefix=logger_prefix)
 
     if not is_data_parallel_worker:
         tp_size_local = server_args.tp_size // server_args.nnodes

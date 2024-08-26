@@ -7,7 +7,8 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_URL_FOR_E2E_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
 
@@ -23,9 +24,12 @@ class TestServingThroughput(unittest.TestCase):
         other_args.extend(["--chunked-prefill-size", str(chunked_prefill_size)])
 
         model = DEFAULT_MODEL_NAME_FOR_TEST
-        base_url = DEFAULT_URL_FOR_E2E_TEST
+        base_url = DEFAULT_URL_FOR_TEST
         process = popen_launch_server(
-            model, base_url, timeout=300, other_args=other_args
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
         )
 
         # Run benchmark
@@ -70,8 +74,8 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE) performance
-            assert res["output_throughput"] > 1400
+            # A100 (PCIE): 1450, H100 (SMX): 2550
+            assert res["output_throughput"] > 2500
 
     def test_default_without_radix_cache(self):
         res = self.run_test(
@@ -81,8 +85,8 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE) performance
-            assert res["output_throughput"] > 1450
+            # A100 (PCIE): 1500, H100 (SMX): 2850
+            assert res["output_throughput"] > 2800
 
     def test_default_without_chunked_prefill(self):
         res = self.run_test(
@@ -92,8 +96,8 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE) performance
-            assert res["output_throughput"] > 1400
+            # A100 (PCIE): 1450, H100 (SMX): 2550
+            assert res["output_throughput"] > 2500
 
     def test_all_cases(self):
         for disable_radix_cache in [False, True]:

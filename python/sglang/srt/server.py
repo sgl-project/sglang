@@ -74,6 +74,7 @@ from sglang.srt.utils import (
     add_api_key_middleware,
     allocate_init_ports,
     assert_pkg_version,
+    configure_logger,
     enable_show_time_cost,
     kill_child_process,
     maybe_set_triton_cache_manager,
@@ -270,15 +271,12 @@ def launch_server(
     """Launch an HTTP server."""
     global tokenizer_manager
 
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format="%(message)s",
-    )
+    configure_logger(server_args)
 
     server_args.check_server_args()
     _set_envs_and_config(server_args)
 
-    # Allocate ports
+    # Allocate ports for inter-process communications
     server_args.port, server_args.additional_ports = allocate_init_ports(
         server_args.port,
         server_args.additional_ports,
@@ -333,11 +331,13 @@ def launch_server(
         start_process = start_controller_process_single
     else:
         start_process = start_controller_process_multi
+
     proc_controller = mp.Process(
         target=start_process,
         args=(server_args, port_args, pipe_controller_writer, model_overide_args),
     )
     proc_controller.start()
+
     proc_detoken = mp.Process(
         target=start_detokenizer_process,
         args=(
@@ -515,6 +515,7 @@ class Runtime:
 
         self.pid = None
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
+
         proc = mp.Process(
             target=launch_server,
             args=(self.server_args, model_overide_args, pipe_writer),
@@ -591,7 +592,7 @@ class Runtime:
 
     def generate(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         sampling_params: Optional[Dict] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
@@ -612,7 +613,7 @@ class Runtime:
 
     def encode(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
     ):
         json_data = {
             "text": prompt,
