@@ -1,22 +1,22 @@
 # Set Up Self-hosted Runners for GitHub Action
 
-## Config Runner
+## Add a Runner
 
 1. Start a docker container.
 
 You can mount a folder for the shared huggingface cache. The command below uses `/tmp/huggingface` as an example.
 
 ```
-docker pull nvidia/cuda:12.1.1-devel-ubuntu20.04
-docker run --shm-size 64g -it -v /tmp/huggingface/:/hf_home --gpus all nvidia/cuda:12.1.1-devel-ubuntu20.04 /bin/bash
+docker pull nvidia/cuda:12.1.1-devel-ubuntu22.04
+docker run --shm-size 64g -it -v /tmp/huggingface:/hf_home --gpus all nvidia/cuda:12.1.1-devel-ubuntu22.04 /bin/bash
 ```
 
 2. Configure the runner by `config.sh`
 
-Run these command inside the container.
+Run these commands inside the container.
 
 ```
-apt update && apt install -y curl
+apt update && apt install -y curl python3-pip
 export RUNNER_ALLOW_RUNASROOT=1
 ```
 
