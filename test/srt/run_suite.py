@@ -7,7 +7,7 @@ from sglang.test.test_utils import run_unittest_files
 suites = {
     "minimal": [
         "models/test_embedding_models.py",
-        # "models/test_generation_models.py",
+        "models/test_generation_models.py",
         "sampling/penaltylib",
         "test_chunked_prefill.py",
         "test_embedding_openai_server.py",
@@ -33,6 +33,7 @@ for target_suite_name, target_tests in suites.items():
             tests.remove(target_suite_name)
             tests.extend(target_tests)
 
+
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument(
@@ -54,11 +55,6 @@ if __name__ == "__main__":
         files = glob.glob("**/test_*.py", recursive=True)
     else:
         files = suites[args.suite]
-
-    try:
-        mp.set_start_method("spawn")
-    except RuntimeError:
-        pass
 
     exit_code = run_unittest_files(files, args.timeout_per_file)
     exit(exit_code)

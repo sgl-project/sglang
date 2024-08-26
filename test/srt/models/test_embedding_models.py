@@ -77,4 +77,4 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
 
-    unittest.main(warnings="ignore")
+    unittest.main()
