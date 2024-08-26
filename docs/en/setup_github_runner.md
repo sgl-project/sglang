@@ -16,7 +16,7 @@ docker run --shm-size 64g -it -v /tmp/huggingface:/hf_home --gpus all nvidia/cud
 Run these commands inside the container.
 
 ```
-apt update && apt install -y curl python3-pip
+apt update && apt install -y curl python3-pip git
 export RUNNER_ALLOW_RUNASROOT=1
 ```
 
