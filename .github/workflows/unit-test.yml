@@ -52,4 +52,5 @@ jobs:
     needs: unit-test
     runs-on: ubuntu-latest
     steps:
-      # Intentionally left empty
+      - name: Merge step
+        run: echo "This is an empty merge step"
