@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.bench_serving import run_benchmark
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.serving.engine_args import EngineArgs
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
@@ -69,9 +69,9 @@ class TestServingThroughput(unittest.TestCase):
 
     def test_default(self):
         res = self.run_test(
-            disable_radix_cache=ServerArgs.disable_radix_cache,
-            disable_flashinfer=ServerArgs.disable_flashinfer,
-            chunked_prefill_size=ServerArgs.chunked_prefill_size,
+            disable_radix_cache=EngineArgs.disable_radix_cache,
+            disable_flashinfer=EngineArgs.disable_flashinfer,
+            chunked_prefill_size=EngineArgs.chunked_prefill_size,
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
@@ -80,8 +80,8 @@ class TestServingThroughput(unittest.TestCase):
     def test_default_without_radix_cache(self):
         res = self.run_test(
             disable_radix_cache=True,
-            disable_flashinfer=ServerArgs.disable_flashinfer,
-            chunked_prefill_size=ServerArgs.chunked_prefill_size,
+            disable_flashinfer=EngineArgs.disable_flashinfer,
+            chunked_prefill_size=EngineArgs.chunked_prefill_size,
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":

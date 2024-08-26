@@ -84,13 +84,10 @@ class TokenizerManager:
         self.recv_from_detokenizer = context.socket(zmq.PULL)
         self.recv_from_detokenizer.bind(f"tcp://127.0.0.1:{engine_args.tokenizer_port}")
 
-<<<<<<< HEAD
         self.send_to_controller = context.socket(zmq.PUSH)
-        self.send_to_controller.connect(f"tcp://127.0.0.1:{port_args.controller_port}")
-=======
-        self.send_to_router = context.socket(zmq.PUSH)
-        self.send_to_router.connect(f"tcp://127.0.0.1:{engine_args.controller_port}")
->>>>>>> 7b5d19c (Add LLM Engine)
+        self.send_to_controller.connect(
+            f"tcp://127.0.0.1:{engine_args.controller_port}"
+        )
 
         # Read model args
         self.model_path = engine_args.model_path
