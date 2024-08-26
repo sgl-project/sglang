@@ -61,7 +61,7 @@ regex: Optional[str] = None,
 # Do parallel sampling and return `n` outputs.
 n: int = 1,
 # Constrains the output to follow a given JSON schema.
-# If both `regex` and `json_schema` are provided, `regex` will be ignored.
+# `regex` and `json_schema` cannot be set at the same time.
 json_schema: Optional[str] = None,
 
 ## Penalties. See [Performance Implications on Penalties] section below for more informations.

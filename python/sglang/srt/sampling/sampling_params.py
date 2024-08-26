@@ -108,6 +108,10 @@ class SamplingParams:
                     f"min_new_tokens must be in (0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
+        if self.regex is not None and self.json_schema is not None:
+            raise ValueError(
+                "regex and json_schema cannot be both set."
+            )
 
     def normalize(self, tokenizer):
         # Process stop strings

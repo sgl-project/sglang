@@ -197,14 +197,16 @@ class ModelTpServer:
                     "trust_remote_code": server_args.trust_remote_code,
                 },
                 skip_tokenizer_init=server_args.skip_tokenizer_init,
+                json_schema_mode=False,
             )
-            self.json_fsm_cache = FSMJsonCache(
+            self.json_fsm_cache = FSMCache(
                 server_args.tokenizer_path,
                 {
                     "tokenizer_mode": server_args.tokenizer_mode,
                     "trust_remote_code": server_args.trust_remote_code,
                 },
                 skip_tokenizer_init=server_args.skip_tokenizer_init,
+                json_schema_mode=True,
             )
         self.jump_forward_cache = JumpForwardCache()
 
