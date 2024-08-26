@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import multiprocessing as mp
 import unittest
 
 import torch
@@ -108,13 +109,6 @@ class TestGenerationModels(unittest.TestCase):
         ), f"Not all ROUGE-L scores are greater than {rouge_threshold}"
 
     def test_prefill_logits_and_output_strs(self):
-        import multiprocessing as mp
-
-        try:
-            mp.set_start_method("spawn")
-        except RuntimeError:
-            pass
-
         for (
             model,
             tp_size,
@@ -137,4 +131,9 @@ class TestGenerationModels(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
+    unittest.main()

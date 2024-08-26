@@ -20,7 +20,7 @@ concurrency:
 jobs:
   e2e-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: e2e
+    runs-on: 1-gpu-runner
 
     steps:
     - name: Checkout code
@@ -28,27 +28,24 @@ jobs:
 
     - name: Install dependencies
       run: |
-        source $HOME/venv/bin/activate
-        echo "$HOME/venv/bin" >> $GITHUB_PATH
-
         pip install --upgrade pip
         pip install -e "python[all]"
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
     - name: Benchmark Serving Throughput
+      timeout-minutes: 10
       run: |
         cd test/srt
         python3 -m unittest test_serving_throughput.TestServingThroughput.test_default
-      timeout-minutes: 10
 
     - name: Benchmark Serving Throughput (w/o RadixAttention)
+      timeout-minutes: 10
       run: |
         cd test/srt
         python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_radix_cache
-      timeout-minutes: 10
 
     - name: Benchmark Serving Throughput (w/o ChunkedPrefill)
+      timeout-minutes: 10
       run: |
         cd test/srt
         python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_chunked_prefill
-      timeout-minutes: 10

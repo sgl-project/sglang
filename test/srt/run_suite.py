@@ -1,5 +1,6 @@
 import argparse
 import glob
+import multiprocessing as mp
 
 from sglang.test.test_utils import run_unittest_files
 
@@ -31,6 +32,7 @@ for target_suite_name, target_tests in suites.items():
         if target_suite_name in tests:
             tests.remove(target_suite_name)
             tests.extend(target_tests)
+
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
