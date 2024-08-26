@@ -51,3 +51,5 @@ jobs:
   unit-test:
     needs: unit-test
     runs-on: ubuntu-latest
+    steps:
+      # Intentionally left empty
