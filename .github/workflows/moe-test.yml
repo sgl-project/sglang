@@ -33,13 +33,13 @@ jobs:
         pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
     - name: Benchmark MoE Serving Throughput
-      timeout_minutes: 10
+      timeout-minutes: 10
       run: |
         cd test/srt
         python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default
 
     - name: Benchmark MoE Serving Throughput (w/o RadixAttention)
-      timeout_minutes: 10
+      timeout-minutes: 10
       run: |
         cd test/srt
         python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default_without_radix_cache
