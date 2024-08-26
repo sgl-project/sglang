@@ -11,19 +11,23 @@ from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.utils import kill_child_process
-from sglang.test.test_utils import DEFAULT_URL_FOR_UNIT_TEST, popen_launch_server
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    popen_launch_server,
+)
 
 
 class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
-        cls.base_url = DEFAULT_URL_FOR_UNIT_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=300,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=[
                 "--chat-template",

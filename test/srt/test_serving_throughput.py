@@ -7,7 +7,8 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_URL_FOR_E2E_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
 
@@ -23,9 +24,12 @@ class TestServingThroughput(unittest.TestCase):
         other_args.extend(["--chunked-prefill-size", str(chunked_prefill_size)])
 
         model = DEFAULT_MODEL_NAME_FOR_TEST
-        base_url = DEFAULT_URL_FOR_E2E_TEST
+        base_url = DEFAULT_URL_FOR_TEST
         process = popen_launch_server(
-            model, base_url, timeout=300, other_args=other_args
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
         )
 
         # Run benchmark
