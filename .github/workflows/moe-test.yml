@@ -23,23 +23,23 @@ jobs:
     runs-on: 2-gpu-runner
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Install dependencies
-      run: |
-        pip install --upgrade pip
-        pip install -e "python[all]"
-        pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
-    - name: Benchmark MoE Serving Throughput
-      timeout-minutes: 10
-      run: |
-        cd test/srt
-        python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default
+      - name: Benchmark MoE Serving Throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default
 
-    - name: Benchmark MoE Serving Throughput (w/o RadixAttention)
-      timeout-minutes: 10
-      run: |
-        cd test/srt
-        python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default_without_radix_cache
+      - name: Benchmark MoE Serving Throughput (w/o RadixAttention)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default_without_radix_cache
