@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import requests
+
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -39,28 +41,32 @@ class TestTorchCompile(unittest.TestCase):
         metrics = run_eval(args)
         assert metrics["score"] >= 0.6
 
+    def run_decode(self, max_new_tokens):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                },
+                "ignore_eos": True,
+            },
+        )
+        return response.json()
+
     def test_throughput(self):
         import time
 
-        import torch
+        max_tokens = 256
 
-        import sglang as sgl
-
-        @sgl.function
-        def test_gen(s):
-            s += "Hello, my name is"
-            s += sgl.gen("res", temperature=0, ignore_eos=True, max_tokens=256)
-
-        sgl.set_default_backend(sgl.RuntimeEndpoint(self.base_url))
-        torch.cuda.synchronize()
         tic = time.time()
-        res = test_gen.run()["res"]
-        torch.cuda.synchronize()
+        res = self.run_decode(max_tokens)
         tok = time.time()
-        print(res)
-        throughput = 256 / (tok - tic)
-        assert throughput >= 152
+        print(res["text"])
+        throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
+        assert throughput >= 152
 
 
 if __name__ == "__main__":
