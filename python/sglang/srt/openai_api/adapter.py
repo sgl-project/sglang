@@ -312,7 +312,6 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                 )
 
         except Exception as e:
-            logger.exception(e)
             error_json = {
                 "id": f"batch_req_{uuid.uuid4()}",
                 "custom_id": request_data.get("custom_id"),
@@ -459,7 +458,7 @@ async def v1_retrieve_file_content(file_id: str):
     return StreamingResponse(iter_file(), media_type="application/octet-stream")
 
 
-def v1_generate_request(all_requests: List[CompletionRequest], request_id: str = None):
+def v1_generate_request(all_requests: List[CompletionRequest], request_ids: List[str] = None):
     prompts = []
     sampling_params_list = []
     return_logprobs = []
@@ -530,7 +529,7 @@ def v1_generate_request(all_requests: List[CompletionRequest], request_id: str =
         logprob_start_len=logprob_start_lens,
         return_text_in_logprobs=True,
         stream=all_requests[0].stream,
-        rid=request_id,
+        rid=request_ids,
     )
 
     if len(all_requests) == 1:
