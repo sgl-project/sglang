@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.server import Runtime
+from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_RUNNER
 
 DEFAULT_PROMPTS = [
     # the output of gemma-2-2b from SRT is unstable on the commented prompt
@@ -171,7 +172,7 @@ class SRTRunner:
         torch_dtype,
         is_generation,
         tp_size=1,
-        port=5157,
+        port=DEFAULT_PORT_FOR_SRT_RUNNER,
     ):
         self.is_generation = is_generation
         self.runtime = Runtime(
