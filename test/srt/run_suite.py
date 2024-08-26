@@ -13,6 +13,7 @@ suites = {
         "test_eval_accuracy_mini.py",
         "test_large_max_new_tokens.py",
         "test_openai_server.py",
+        "test_json_constrained.py",
         "test_skip_tokenizer_init.py",
         "test_torch_compile.py",
         "test_triton_attn_backend.py",

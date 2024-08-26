@@ -39,6 +39,7 @@ class SamplingParams:
         spaces_between_special_tokens: bool = True,
         regex: Optional[str] = None,
         n: int = 1,
+        json_schema: Optional[str] = None,
     ) -> None:
         self.temperature = temperature
         self.top_p = top_p
@@ -56,6 +57,7 @@ class SamplingParams:
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self.regex = regex
         self.n = n
+        self.json_schema = json_schema
 
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:
@@ -106,6 +108,8 @@ class SamplingParams:
                     f"min_new_tokens must be in (0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
+        if self.regex is not None and self.json_schema is not None:
+            raise ValueError("regex and json_schema cannot be both set.")
 
     def normalize(self, tokenizer):
         # Process stop strings

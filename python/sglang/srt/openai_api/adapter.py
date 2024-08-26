@@ -509,6 +509,7 @@ def v1_generate_request(
                 "frequency_penalty": request.frequency_penalty,
                 "repetition_penalty": request.repetition_penalty,
                 "regex": request.regex,
+                "json_schema": request.json_schema,
                 "n": request.n,
                 "ignore_eos": request.ignore_eos,
             }
@@ -880,6 +881,7 @@ def v1_chat_generate_request(
                 "frequency_penalty": request.frequency_penalty,
                 "repetition_penalty": request.repetition_penalty,
                 "regex": request.regex,
+                "json_schema": request.json_schema,
                 "n": request.n,
             }
         )
