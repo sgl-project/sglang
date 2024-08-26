@@ -21,16 +21,26 @@ class SamplingBatchInfo:
     top_ps: torch.Tensor = None
     top_ks: torch.Tensor = None
     min_ps: torch.Tensor = None
-    logit_bias: torch.Tensor = None
-    vocab_mask: torch.Tensor = None
 
     # Dispatch in CUDA graph
     need_min_p_sampling: bool = False
+
+    # Bias Tensors
+    logit_bias: torch.Tensor = None
+    vocab_mask: torch.Tensor = None
 
     # Penalizer
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
     linear_penalties: torch.Tensor = None
     scaling_penalties: torch.Tensor = None
+
+    def has_bias(self):
+        return (
+            self.logit_bias is not None
+            or self.vocab_mask is not None
+            or self.linear_penalties is not None
+            or self.scaling_penalties is not None
+        )
 
     @classmethod
     def dummy_one(cls, max_bs: int, vocab_size: int):
@@ -39,23 +49,12 @@ class SamplingBatchInfo:
         ret.top_ps = torch.ones((max_bs,), dtype=torch.float, device="cuda")
         ret.top_ks = torch.ones((max_bs,), dtype=torch.int, device="cuda")
         ret.min_ps = torch.zeros((max_bs,), dtype=torch.float, device="cuda")
-        ret.logit_bias = torch.zeros(
-            (max_bs, vocab_size), dtype=torch.float, device="cuda"
-        )
-        ret.vocab_mask = torch.ones(
-            (max_bs, vocab_size), dtype=torch.bool, device="cuda"
-        )
-        ret.linear_penalties = torch.zeros(
-            (max_bs, vocab_size), dtype=torch.float, device="cuda"
-        )
-        ret.scaling_penalties = torch.ones(
-            (max_bs, vocab_size), dtype=torch.float, device="cuda"
-        )
-
         return ret
 
     def __getitem__(self, key):
         if isinstance(key, slice):
+            # NOTE: We do not use cuda graph when there is bias tensors
+            assert not self.has_bias()
             return SamplingBatchInfo(
                 vocab_size=self.vocab_size,
                 temperatures=self.temperatures[key],
@@ -63,15 +62,14 @@ class SamplingBatchInfo:
                 top_ks=self.top_ks[key],
                 min_ps=self.min_ps[key],
                 need_min_p_sampling=self.need_min_p_sampling,
-                logit_bias=self.logit_bias[key],
-                vocab_mask=self.vocab_mask[key],
-                linear_penalties=self.linear_penalties[key],
-                scaling_penalties=self.scaling_penalties[key],
             )
         else:
             raise NotImplementedError
 
     def inplace_assign(self, bs: int, other: SamplingBatchInfo):
+        # NOTE: We do not use cuda graph when there is bias tensors
+        assert not self.has_bias()
+
         self.vocab_size = other.vocab_size
         self.need_min_p_sampling = other.need_min_p_sampling
 
@@ -79,26 +77,6 @@ class SamplingBatchInfo:
         self.top_ps[:bs] = other.top_ps
         self.top_ks[:bs] = other.top_ks
         self.min_ps[:bs] = other.min_ps
-
-        if other.logit_bias is not None:
-            self.logit_bias[:bs] = other.logit_bias
-        else:
-            self.logit_bias.fill_(0)
-
-        if other.vocab_mask is not None:
-            self.vocab_mask[:bs] = other.vocab_mask
-        else:
-            self.vocab_mask.fill_(1)
-
-        if other.linear_penalties is not None:
-            self.linear_penalties[:bs] = other.linear_penalties
-        else:
-            self.linear_penalties.fill_(0)
-
-        if other.scaling_penalties is not None:
-            self.scaling_penalties[:bs] = other.scaling_penalties
-        else:
-            self.scaling_penalties.fill_(1)
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):

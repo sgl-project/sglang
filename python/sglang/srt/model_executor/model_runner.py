@@ -516,7 +516,11 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward_decode(self, batch: ScheduleBatch):
-        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(len(batch.reqs)):
+        if (
+            self.cuda_graph_runner
+            and self.cuda_graph_runner.can_run(len(batch.reqs))
+            and not batch.sampling_info.has_bias()
+        ):
             return self.cuda_graph_runner.replay(batch)
 
         input_metadata = InputMetadata.from_schedule_batch(
