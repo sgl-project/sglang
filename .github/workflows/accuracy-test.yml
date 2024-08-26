@@ -23,21 +23,21 @@ jobs:
     runs-on: 1-gpu-runner
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Install dependencies
-      run: |
-        pip install --upgrade pip
-        pip install -e "python[all]"
-        pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
-        git clone https://github.com/merrymercy/human-eval.git
-        cd human-eval
-        pip install -e .
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
 
-    - name: Evaluate Accuracy
-      timeout-minutes: 20
-      run: |
-        cd test/srt
-        python3 test_eval_accuracy_large.py
+      - name: Evaluate Accuracy
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_eval_accuracy_large.py

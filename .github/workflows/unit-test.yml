@@ -18,30 +18,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit-test:
+  unit-test-jobs:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
-
+    strategy:
+      matrix:
+        test_type: ['backend-0', 'backend-1', 'frontend']
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Install dependencies
-      run: |
-        pip install --upgrade pip
-        pip install -e "python[all]"
-        pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
-        pip install accelerate
-        pip install sentence_transformers
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[dev]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
-    - name: Test Backend Runtime
-      timeout-minutes: 20
-      run: |
-        cd test/srt
-        python3 run_suite.py --suite minimal
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          if [ "${{ matrix.test_type }}" = "frontend" ]; then
+            cd test/lang
+            python3 run_suite.py --suite minimal
+          elif [ "${{ matrix.test_type }}" = "backend-0" ]; then
+            cd test/srt
+            python3 run_suite.py --suite minimal --range-begin 0 --range-end 8
+          elif [ "${{ matrix.test_type }}" = "backend-1" ]; then
+            cd test/srt
+            python3 run_suite.py --suite minimal --range-begin 8
+          fi
 
-    - name: Test Frontend Language
-      timeout-minutes: 10
-      run: |
-        cd test/lang
-        python3 run_suite.py --suite minimal
+  unit-test:
+    needs: unit-test-jobs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge step
+        run: echo "This is an empty merge step"

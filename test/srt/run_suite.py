@@ -1,13 +1,12 @@
 import argparse
 import glob
-import multiprocessing as mp
 
 from sglang.test.test_utils import run_unittest_files
 
 suites = {
     "minimal": [
         "models/test_embedding_models.py",
-        # "models/test_generation_models.py",
+        "models/test_generation_models.py",
         "sampling/penaltylib",
         "test_chunked_prefill.py",
         "test_embedding_openai_server.py",
@@ -33,6 +32,7 @@ for target_suite_name, target_tests in suites.items():
             tests.remove(target_suite_name)
             tests.extend(target_tests)
 
+
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument(
@@ -48,6 +48,18 @@ if __name__ == "__main__":
         choices=list(suites.keys()) + ["all"],
         help="The suite to run",
     )
+    arg_parser.add_argument(
+        "--range-begin",
+        type=int,
+        default=0,
+        help="The begin index of the range of the files to run.",
+    )
+    arg_parser.add_argument(
+        "--range-end",
+        type=int,
+        default=None,
+        help="The end index of the range of the files to run.",
+    )
     args = arg_parser.parse_args()
 
     if args.suite == "all":
@@ -55,10 +67,7 @@ if __name__ == "__main__":
     else:
         files = suites[args.suite]
 
-    try:
-        mp.set_start_method("spawn")
-    except RuntimeError:
-        pass
+    files = files[args.range_begin : args.range_end]
 
     exit_code = run_unittest_files(files, args.timeout_per_file)
     exit(exit_code)
