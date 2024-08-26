@@ -4,7 +4,7 @@
 
 1. Start a docker container.
 
-You can mount a folder for the shared huggingface cache. The command below uses `/tmp/huggingface` as an example.
+You can mount a folder for the shared huggingface model weights cache. The command below uses `/tmp/huggingface` as an example.
 
 ```
 docker pull nvidia/cuda:12.1.1-devel-ubuntu22.04
@@ -22,7 +22,7 @@ export RUNNER_ALLOW_RUNASROOT=1
 
 Then follow https://github.com/sgl-project/sglang/settings/actions/runners/new?arch=x64&os=linux to run `config.sh`
 
-Notes
+**Notes**
 - Do not need to specify the runner group
 - Give it a name (e.g., `test-sgl-gpu-0`) and some labels (e.g., `unit-test`). The labels can be editted later in Github Settings.
 - Do not need to change the work folder.
