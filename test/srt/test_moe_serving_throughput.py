@@ -7,7 +7,8 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
-    DEFAULT_URL_FOR_MOE_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
 
@@ -25,9 +26,12 @@ class TestServingThroughput(unittest.TestCase):
         other_args.append("--enable-p2p-check")
 
         model = DEFAULT_MOE_MODEL_NAME_FOR_TEST
-        base_url = DEFAULT_URL_FOR_MOE_TEST
+        base_url = DEFAULT_URL_FOR_TEST
         process = popen_launch_server(
-            model, base_url, timeout=300, other_args=other_args
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
         )
 
         # Run benchmark
@@ -72,8 +76,8 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE) performance
-            assert res["output_throughput"] > 930
+            # A100 (PCIE): 950, H100 (SMX): 1800
+            assert res["output_throughput"] > 1750
 
     def test_default_without_radix_cache(self):
         res = self.run_test(
@@ -83,19 +87,8 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE) performance
-            assert res["output_throughput"] > 930
-
-    def test_default_without_chunked_prefill(self):
-        res = self.run_test(
-            disable_radix_cache=ServerArgs.disable_radix_cache,
-            disable_flashinfer=ServerArgs.disable_flashinfer,
-            chunked_prefill_size=-1,
-        )
-
-        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE) performance
-            print(res["output_throughput"])
+            # A100 (PCIE): 950, H100 (SMX): 1900
+            assert res["output_throughput"] > 1850
 
     def test_all_cases(self):
         for disable_radix_cache in [False, True]:

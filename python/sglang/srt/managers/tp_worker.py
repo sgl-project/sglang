@@ -56,6 +56,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    configure_logger,
     is_multimodal_model,
     set_random_seed,
     suppress_other_loggers,
@@ -94,6 +95,7 @@ class ModelTpServer:
             context_length=server_args.context_length,
             model_overide_args=model_overide_args,
         )
+
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -144,7 +146,6 @@ class ModelTpServer:
 
         # Print info
         logger.info(
-            f"[gpu={self.gpu_id}] "
             f"max_total_num_tokens={self.max_total_num_tokens}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
             f"max_running_requests={self.max_running_requests}, "
@@ -283,7 +284,7 @@ class ModelTpServer:
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
         logger.info(
-            f"[gpu={self.gpu_id}] Decode batch. "
+            f"Decode batch. "
             f"#running-req: {len(self.running_batch.reqs)}, "
             f"#token: {num_used}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -442,7 +443,7 @@ class ModelTpServer:
 
             if num_mixed_running > 0:
                 logger.info(
-                    f"[gpu={self.gpu_id}] Prefill batch"
+                    f"Prefill batch"
                     f"(mixed #running-req: {num_mixed_running}). "
                     f"#new-seq: {len(can_run_list)}, "
                     f"#new-token: {adder.log_input_tokens}, "
@@ -452,7 +453,7 @@ class ModelTpServer:
                 )
             else:
                 logger.info(
-                    f"[gpu={self.gpu_id}] Prefill batch. "
+                    f"Prefill batch. "
                     f"#new-seq: {len(can_run_list)}, "
                     f"#new-token: {adder.log_input_tokens}, "
                     f"#cached-token: {adder.log_hit_tokens}, "
@@ -630,7 +631,7 @@ class ModelTpServer:
             self.new_token_ratio = new_token_ratio
 
             logger.info(
-                "decode out of memory happened, "
+                "Decode out of memory happened. "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
@@ -847,7 +848,9 @@ def run_tp_server(
     nccl_port: int,
     model_overide_args: dict,
 ):
-    """Run a tensor parallel server."""
+    """Run a tensor parallel model server."""
+    configure_logger(server_args, prefix=f" TP{tp_rank}")
+
     try:
         model_server = ModelTpServer(
             gpu_id,

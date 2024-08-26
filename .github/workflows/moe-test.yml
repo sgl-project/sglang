@@ -18,30 +18,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-    moe-test:
-        if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-        runs-on: accuracy
-    
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v3
-        
-            - name: Install dependencies
-              run: |
-                source $HOME/venv/bin/activate
-                echo "$HOME/venv/bin" >> $GITHUB_PATH
-        
-                pip install --upgrade pip
-                pip install -e "python[all]"
-                pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+  moe-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 2-gpu-runner
 
-            - name: Benchmark MOE Serving Throughput
-              uses: nick-fields/retry@v3
-              with:
-                timeout_minutes: 15
-                max_attempts: 2
-                retry_on: error
-                command: |
-                  cd test/srt
-                  python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default
-                  python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default_without_radix_cache
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Benchmark MoE Serving Throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default
+
+      - name: Benchmark MoE Serving Throughput (w/o RadixAttention)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default_without_radix_cache

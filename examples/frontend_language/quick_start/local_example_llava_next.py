@@ -1,5 +1,5 @@
 """
-Usage: python3 srt_example_llava.py
+Usage: python3 local_example_llava_next.py
 """
 
 from PIL import ImageFile
@@ -12,26 +12,23 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True  # Allow loading of truncated images
 
 
 @sgl.function
-def image_qa(s, image, question):
-    s += sgl.user(sgl.image(image) + question)
+def image_qa(s, image_path, question):
+    s += sgl.user(sgl.image(image_path) + question)
     s += sgl.assistant(sgl.gen("answer"))
 
 
 def single():
-    image_url = "https://farm4.staticflickr.com/3175/2653711032_804ff86d81_z.jpg"
-    pil_image, _ = load_image(image_url)
-    state = image_qa.run(image=pil_image, question="What is this?", max_new_tokens=512)
+    state = image_qa.run(
+        image_path="images/cat.jpeg", question="What is this?", max_new_tokens=128
+    )
     print(state["answer"], "\n")
 
 
 def stream():
-    image_url = "https://farm4.staticflickr.com/3175/2653711032_804ff86d81_z.jpg"
-    pil_image, _ = load_image(image_url)
     state = image_qa.run(
-        image=pil_image,
-        question="Please generate short caption for this image.",
-        max_new_tokens=512,
-        temperature=0,
+        image_path="images/cat.jpeg",
+        question="What is this?",
+        max_new_tokens=64,
         stream=True,
     )
 
@@ -41,14 +38,12 @@ def stream():
 
 
 def batch():
-    image_url = "https://farm4.staticflickr.com/3175/2653711032_804ff86d81_z.jpg"
-    pil_image, _ = load_image(image_url)
     states = image_qa.run_batch(
         [
-            {"image": pil_image, "question": "What is this?"},
-            {"image": pil_image, "question": "What is this?"},
+            {"image_path": "images/cat.jpeg", "question": "What is this?"},
+            {"image_path": "images/dog.jpeg", "question": "What is this?"},
         ],
-        max_new_tokens=512,
+        max_new_tokens=128,
     )
     for s in states:
         print(s["answer"], "\n")
@@ -58,16 +53,14 @@ if __name__ == "__main__":
     import multiprocessing as mp
 
     mp.set_start_method("spawn", force=True)
-    runtime = sgl.Runtime(
-        model_path="lmms-lab/llama3-llava-next-8b",
-        tokenizer_path="lmms-lab/llama3-llava-next-8b-tokenizer",
-    )
+
+    runtime = sgl.Runtime(model_path="lmms-lab/llama3-llava-next-8b")
     runtime.endpoint.chat_template = get_chat_template("llama-3-instruct")
-    # runtime = sgl.Runtime(
-    #     model_path="lmms-lab/llava-next-72b",
-    #     tokenizer_path="lmms-lab/llavanext-qwen-tokenizer",
-    # )
+
+    # Or you can use the 72B model
+    # runtime = sgl.Runtime(model_path="lmms-lab/llava-next-72b", tp_size=8)
     # runtime.endpoint.chat_template = get_chat_template("chatml-llava")
+
     sgl.set_default_backend(runtime)
     print(f"chat template: {runtime.endpoint.chat_template.name}")
 

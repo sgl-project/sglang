@@ -56,6 +56,7 @@ class DetokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_router = context.socket(zmq.PULL)
         self.recv_from_router.bind(f"tcp://127.0.0.1:{port_args.detokenizer_port}")
@@ -75,10 +76,13 @@ class DetokenizerManager:
         self.decode_status = {}
 
     async def handle_loop(self):
+        """The event loop that handles requests"""
+
         while True:
-            recv_obj: BatchTokenIDOut = await self.recv_from_router.recv_pyobj()
+            recv_obj = await self.recv_from_router.recv_pyobj()
 
             if isinstance(recv_obj, BatchEmbeddingOut):
+                # If it is embedding model, no detokenization is needed.
                 self.send_to_tokenizer.send_pyobj(
                     BatchEmbeddingOut(
                         rids=recv_obj.rids,
@@ -88,18 +92,17 @@ class DetokenizerManager:
                     )
                 )
                 continue
-
-            if isinstance(recv_obj, UpdateWeightReqOutput):
+            elif isinstance(recv_obj, UpdateWeightReqOutput):
+                # If it is a weight update request, no detokenization is needed.
+                self.send_to_tokenizer.send_pyobj(recv_obj)
+                continue
+            elif self.tokenizer is None:
+                # If the tokenizer is skipped, no detokenization is needed
                 self.send_to_tokenizer.send_pyobj(recv_obj)
                 continue
 
             assert isinstance(recv_obj, BatchTokenIDOut)
             bs = len(recv_obj.rids)
-
-            if self.tokenizer is None:
-                # Send BatchTokenIDOut if no tokenizer init'ed.
-                self.send_to_tokenizer.send_pyobj(recv_obj)
-                continue
 
             # Initialize decode status
             read_ids, surr_ids = [], []
@@ -134,6 +137,7 @@ class DetokenizerManager:
                 spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
             )
 
+            # Incremental decoding
             output_strs = []
             for i in range(bs):
                 s = self.decode_status[recv_obj.rids[i]]
