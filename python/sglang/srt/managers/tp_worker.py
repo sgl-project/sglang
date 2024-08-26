@@ -28,7 +28,7 @@ import torch.distributed
 import torch.distributed as dist
 
 from sglang.global_config import global_config
-from sglang.srt.constrained.fsm_cache import FSMCache, FSMJsonCache
+from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
