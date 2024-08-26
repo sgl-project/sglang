@@ -428,7 +428,7 @@ class TokenizerManager:
 
     async def _get_pixel_values(self, image_data):
         if isinstance(image_data, list) and len(image_data) > 0:
-            return await self._get_pixel_values_internal(image_data[0])
+            return await self._get_pixel_values_internal(image_data)
         elif isinstance(image_data, str):
             return await self._get_pixel_values_internal(image_data)
         else:
