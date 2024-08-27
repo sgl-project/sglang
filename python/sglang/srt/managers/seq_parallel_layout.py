@@ -268,7 +268,7 @@ def init_sequence_parallel_args(
             # Add padding zeros to out_cache_loc and write KV of padded tokens that may
             # exist in the last SP shard to slot 0 (reserved for dummy output).
             if sp_rank == sp_size - 1:
-                out_cache_loc = seq_parallel_pad_zeros(
+                batch.out_cache_loc = seq_parallel_pad_zeros(
                     batch.out_cache_loc, extend_seq_lens_cpu, sp_size, True
                 )
     else:
