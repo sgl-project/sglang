@@ -350,11 +350,11 @@ class TestOpenAIServer(unittest.TestCase):
             completion_window=completion_window,
         )
 
-        return batch_job, content
+        return batch_job, content, uploaded_file
 
     def run_batch(self, mode):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        batch_job, content = self._create_batch(mode=mode, client=client)
+        batch_job, content, uploaded_file = self._create_batch(mode=mode, client=client)
 
         while batch_job.status not in ["completed", "failed", "cancelled"]:
             time.sleep(3)
@@ -378,10 +378,13 @@ class TestOpenAIServer(unittest.TestCase):
             if line.strip() != ""
         ]
         assert len(results) == len(content)
+        for delete_fid in [uploaded_file.id, result_file_id]:
+            del_pesponse = client.files.delete(delete_fid)
+            assert del_pesponse.deleted
 
     def run_cancel_batch(self, mode):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        batch_job, _ = self._create_batch(mode=mode, client=client)
+        batch_job, _, uploaded_file = self._create_batch(mode=mode, client=client)
 
         assert batch_job.status not in ["cancelling", "cancelled"]
 
@@ -396,6 +399,8 @@ class TestOpenAIServer(unittest.TestCase):
             time.sleep(3)
 
         assert batch_job.status == "cancelled"
+        del_response = client.files.delete(uploaded_file.id)
+        assert del_response.deleted
 
     def test_completion(self):
         for echo in [False, True]:
