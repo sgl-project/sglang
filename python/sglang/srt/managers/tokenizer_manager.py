@@ -375,7 +375,6 @@ class TokenizerManager:
 
                 generators.append(
                     self._wait_for_response(
-                        event,
                         state,
                         obj,
                         rid,
