@@ -117,7 +117,7 @@ class TestGenerationModels(unittest.TestCase):
             rouge_threshold,
         ) in MODELS:
             for torch_dtype in TORCH_DTYPES:
-                max_new_tokens = 8
+                max_new_tokens = 32
                 self.assert_close_prefill_logits_and_output_strs(
                     DEFAULT_PROMPTS,
                     model,
