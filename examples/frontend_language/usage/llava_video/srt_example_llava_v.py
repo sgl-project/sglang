@@ -184,13 +184,9 @@ if __name__ == "__main__":
 
     # Parse the arguments
     args = parser.parse_args()
-
     cur_port = args.port
-
     cur_chunk = args.chunk_idx
-
     num_chunks = args.num_chunks
-
     num_frames = args.num_frames
 
     if "34b" in args.model_path.lower():
@@ -202,7 +198,6 @@ if __name__ == "__main__":
         exit()
 
     model_overide_args = {}
-
     model_overide_args["mm_spatial_pool_stride"] = args.mm_spatial_pool_stride
     model_overide_args["architectures"] = ["LlavaVidForCausalLM"]
     model_overide_args["num_frames"] = args.num_frames
@@ -235,7 +230,6 @@ if __name__ == "__main__":
     print(f"chat template: {runtime.endpoint.chat_template.name}")
 
     # Run a single request
-    # try:
     print("\n========== single ==========\n")
     root = args.video_dir
     if os.path.isfile(root):
@@ -257,13 +251,10 @@ if __name__ == "__main__":
     )  # Calculate the average processing time
     print(f"Average processing time per video: {average_time:.2f} seconds")
     runtime.shutdown()
-    # except Exception as e:
-    #     print(e)
-    runtime.shutdown()
 
-    # # # Run a batch of requests
+    # # Run a batch of requests
     # print("\n========== batch ==========\n")
     # if not os.path.exists(args.save_dir):
     #     os.makedirs(args.save_dir)
-    # batch(args.video_dir,args.save_dir,cur_chunk, num_chunks, num_frames, num_chunks)
+    # batch(args.video_dir, args.save_dir, cur_chunk, num_chunks, num_frames, num_chunks)
     # runtime.shutdown()

@@ -55,6 +55,7 @@ class GenerateReqInput:
             self.text is not None and self.input_ids is not None
         ):
             raise ValueError("Either text or input_ids should be provided.")
+
         if (
             isinstance(self.sampling_params, dict)
             and self.sampling_params.get("n", 1) != 1
@@ -161,10 +162,10 @@ class TokenizedGenerateReqInput:
     input_ids: List[int]
     # The pixel values for input images
     pixel_values: List[float]
-    # The hash of input images
-    image_hash: int
-    # The image size
-    image_size: List[int]
+    # The hash values of input images
+    image_hashes: List[int]
+    # The image sizes
+    image_sizes: List[List[int]]
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the logprobs

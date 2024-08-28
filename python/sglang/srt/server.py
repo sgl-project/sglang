@@ -335,12 +335,12 @@ def launch_server(
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
     if server_args.dp_size == 1:
-        start_process = start_controller_process_single
+        start_controller_process = start_controller_process_single
     else:
-        start_process = start_controller_process_multi
+        start_controller_process = start_controller_process_multi
 
     proc_controller = mp.Process(
-        target=start_process,
+        target=start_controller_process,
         args=(server_args, port_args, pipe_controller_writer, model_overide_args),
     )
     proc_controller.start()
@@ -421,7 +421,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.1.6",
+            "0.1.5",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",

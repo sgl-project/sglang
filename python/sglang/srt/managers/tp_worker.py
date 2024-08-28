@@ -108,7 +108,7 @@ class ModelTpServer:
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            if is_multimodal_model(server_args.model_path):
+            if is_multimodal_model(self.model_config.hf_config.architectures):
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
@@ -333,26 +333,24 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             req.pixel_values = recv_req.pixel_values
             if req.pixel_values is not None:
-                image_hash = (
-                    hash(tuple(recv_req.image_hash))
-                    if isinstance(recv_req.image_hash, list)
-                    else recv_req.image_hash
-                )
+                # Use image hash as fake token_ids, which is then used
+                # for prefix matching
+                image_hash = hash(tuple(recv_req.image_hashes))
                 req.pad_value = [
                     (image_hash) % self.model_config.vocab_size,
                     (image_hash >> 16) % self.model_config.vocab_size,
                     (image_hash >> 32) % self.model_config.vocab_size,
                     (image_hash >> 64) % self.model_config.vocab_size,
                 ]
-                req.image_size = recv_req.image_size
+                req.image_sizes = recv_req.image_sizes
                 (
                     req.origin_input_ids,
-                    req.image_offset,
+                    req.image_offsets,
                 ) = self.model_runner.model.pad_input_ids(
                     req.origin_input_ids_unpadded,
                     req.pad_value,
-                    req.pixel_values.shape,
-                    req.image_size,
+                    req.pixel_values,
+                    req.image_sizes,
                 )
             req.return_logprob = recv_req.return_logprob
             req.logprob_start_len = recv_req.logprob_start_len
@@ -368,6 +366,7 @@ class ModelTpServer:
                     req.jump_forward_map = self.jump_forward_cache.query(
                         computed_regex_string
                     )
+
             # Init regex fsm
             elif req.sampling_params.regex is not None:
                 req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)

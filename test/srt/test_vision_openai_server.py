@@ -32,8 +32,6 @@ class TestOpenAIVisionServer(unittest.TestCase):
             other_args=[
                 "--chat-template",
                 "chatml-llava",
-                "--chunked-prefill-size",
-                "16384",
                 # "--log-requests",
             ],
         )
