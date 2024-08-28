@@ -22,9 +22,6 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-
-# FIXME: temporary solution, remove after next vllm release
-from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
