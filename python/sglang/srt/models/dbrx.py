@@ -45,7 +45,6 @@ from vllm.transformers_utils.configs.dbrx import DbrxConfig
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
@@ -383,7 +382,6 @@ class DbrxForCausalLM(nn.Module):
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
         )
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
 
     @torch.no_grad()
     def forward(
@@ -393,11 +391,9 @@ class DbrxForCausalLM(nn.Module):
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
         hidden_states = self.transformer(input_ids, positions, input_metadata)
-        logits_output = self.logits_processor(
+        return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
-        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-        return sample_output, logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = [
