@@ -96,7 +96,7 @@ class TestGenerationModels(unittest.TestCase):
             if hf_logprobs.shape[0] <= 100:
                 assert torch.all(
                     abs(hf_logprobs - srt_logprobs) < prefill_tolerance
-                ), "prefill logprobs are not all close"
+                ), f"prefill logprobs are not all close with model_path={model_path} prompts={prompts} prefill_tolerance={prefill_tolerance}"
 
         print(f"hf_outputs.output_strs={hf_outputs.output_strs}")
         print(f"srt_outputs.output_strs={srt_outputs.output_strs}")
