@@ -516,9 +516,9 @@ class ModelRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n"
                 "Possible solutions:\n"
-                "1. disable torch compile by not using --enable-torch-compile\n"
-                "2. disable cuda graph by --disable-cuda-graph\n"
-                "3. set --mem-fraction-static to a smaller value\n"
+                "1. disable cuda graph by --disable-cuda-graph\n"
+                "2. set --mem-fraction-static to a smaller value\n"
+                "3. disable torch compile by not using --enable-torch-compile\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
