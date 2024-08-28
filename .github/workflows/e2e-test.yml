@@ -38,6 +38,11 @@ jobs:
           cd test/srt
           python3 -m unittest test_serving_throughput.TestServingThroughput.test_default
 
+      - name: Benchmark Serving Latency
+        timeout-minutes: 10
+        run: |
+          python3 -m sglang.bench_latency --model meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 1 --input 128 --output 8
+
       - name: Benchmark Serving Throughput (w/o RadixAttention)
         timeout-minutes: 10
         run: |
