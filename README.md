@@ -299,7 +299,7 @@ GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/
 
 - Benchmark a single static batch by running the following command without launching a server. The arguments are the same as for `launch_server.py`.
   Note that this is not a dynamic batching server, so it may run out of memory for a batch size that a real server can handle.
-  A real server truncates the prefill into several batches, while this unit test does not. For accurate large batch testing, please use `sglang.bench_serving`.
+  A real server truncates the prefill into several batches, while this unit test does not. For accurate large batch testing, please use `sglang.bench_serving` instead.
   ```
   python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 32 --input-len 256 --output-len 32
   ```
