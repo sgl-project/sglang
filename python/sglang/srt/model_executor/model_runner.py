@@ -161,6 +161,8 @@ class ModelRunner:
                 "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
             )
             self.server_args.dtype = "float16"
+            if torch.cuda.get_device_capability()[1] < 5:
+                raise RuntimeError("SGLang only supports sm75 and above.")
 
         monkey_patch_vllm_dummy_weight_loader()
         self.device_config = DeviceConfig()
