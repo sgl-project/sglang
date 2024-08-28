@@ -26,11 +26,6 @@ from vllm.config import CacheConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.mm_utils import (
-    get_anyres_image_grid_shape,
-    unpad_image,
-    unpad_image_shape,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.models.llama2 import LlamaForCausalLM
 
@@ -59,23 +54,14 @@ class LlavaVidForCausalLM(nn.Module):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def pad_input_ids(self, input_ids, pad_value, pt_shape=None, image_size=None):
+    def pad_input_ids(
+        self,
+        input_ids: List[int],
+        pad_value: List[int],
+        pixel_values: List,
+        image_sizes: List[List[int]],
+    ):
         new_image_feature_len = self.image_feature_len
-        # now only support spatial_unpad + anyres
-        # if self.mm_patch_merge_type.startswith("spatial"):
-        #     height = width = self.num_patches_per_side
-        #     if pt_shape[0] > 1:
-        #         if self.image_aspect_ratio == "anyres":
-        #             num_patch_width, num_patch_height = get_anyres_image_grid_shape(
-        #                 image_size,
-        #                 self.image_grid_pinpoints,
-        #                 self.vision_tower.config.image_size,
-        #             )
-        #         if "unpad" in self.mm_patch_merge_type:
-        #             h = num_patch_height * height
-        #             w = num_patch_width * width
-        #             new_h, new_w = unpad_image_shape(h, w, image_size)
-        #             new_image_feature_len += new_h * (new_w + 1)
 
         pad_ids = pad_value * (
             (new_image_feature_len + len(pad_value)) // len(pad_value)
@@ -87,7 +73,7 @@ class LlavaVidForCausalLM(nn.Module):
             + pad_ids[:new_image_feature_len]
             + input_ids[offset + 1 :]
         )
-        return new_input_ids, offset
+        return new_input_ids, [offset]
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
@@ -133,22 +119,18 @@ class LlavaVidForCausalLM(nn.Module):
         if input_metadata.forward_mode == ForwardMode.EXTEND:
             bs = input_metadata.batch_size
 
-            # Embed text input
+            # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
-            # Embed vision input
-            need_vision = (
-                (positions[input_metadata.extend_start_loc] < self.image_feature_len)
-                .cpu()
-                .numpy()
+            # Whether the requests need vision inputs
+            max_image_offset = np.array(
+                [max(image_offsets[i]) if image_offsets[i] else -1 for i in range(bs)]
             )
-            # FIXME: We need to substract the length of the system prompt
-            has_pixel = np.array([pixel_values[i] is not None for i in range(bs)])
-            need_vision = need_vision & has_pixel
+            start_positions = positions[input_metadata.extend_start_loc].cpu().numpy()
+            need_vision = start_positions <= max_image_offset
 
             if need_vision.any():
                 pixel_values = [pixel_values[i] for i in range(bs) if need_vision[i]]
-                image_sizes = [image_sizes[i] for i in range(bs) if need_vision[i]]
 
                 ########## Encode Image ########
 
@@ -183,31 +165,36 @@ class LlavaVidForCausalLM(nn.Module):
                     new_image_features.append(image_feature.flatten(0, 1))
                 image_features = new_image_features
 
+                # Fill in the placeholder for the image
                 extend_start_loc_cpu = input_metadata.extend_start_loc.cpu().numpy()
+                prefix_lens_cpu = input_metadata.extend_prefix_lens.cpu().numpy()
                 pt = 0
                 for i in range(bs):
                     if not need_vision[i]:
                         continue
 
                     start_idx = extend_start_loc_cpu[i]
-                    pad_len, pad_dim = image_features[pt].shape  # 576, 4096
-                    dim = input_embeds.shape[1]
-                    assert (
-                        pad_dim == dim
-                    ), "invalid pad_dim={}, input_embed_dim={}!".format(pad_dim, dim)
-                    # Fill in the placeholder for the image
-                    try:
-                        input_embeds[
-                            start_idx
-                            + image_offsets[i] : start_idx
-                            + image_offsets[i]
-                            + pad_len
-                        ] = image_features[pt]
-                    except RuntimeError as e:
-                        print(f"RuntimeError in llava image encoding: {e}")
-                        print(input_embeds.shape)
-                        print(start_idx, image_offsets[i])
-                    pt += 1
+                    prefix_len = prefix_lens_cpu[i]
+
+                    # Multiple images
+                    for image_offset in image_offsets[i]:
+                        if image_offset < prefix_len:
+                            continue
+
+                        tmp_image_feature = image_features[pt]
+                        pad_len = tmp_image_feature.shape[0]
+
+                        left_idx = start_idx + (image_offset - prefix_len)
+                        right_idx = start_idx + (image_offset - prefix_len) + pad_len
+                        try:
+                            input_embeds[left_idx:right_idx] = tmp_image_feature
+                        except RuntimeError as e:
+                            print(f"RuntimeError in image encoding: {e}")
+                            print(f"{input_embeds.shape=}, {tmp_image_feature.shape=}")
+                            print(
+                                f"{start_idx=}, {image_offset=}, {prefix_len=}, {pad_len=}"
+                            )
+                        pt += 1
 
             return self.language_model(
                 input_ids, positions, input_metadata, input_embeds=input_embeds
@@ -216,8 +203,9 @@ class LlavaVidForCausalLM(nn.Module):
             return self.language_model(input_ids, positions, input_metadata)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # load clip vision model by cfg['mm_vision_tower']:
-        #   huggingface_name or path_of_clip_relative_to_llava_model_dir
+        # Load clip vision model by cfg['mm_vision_tower']:
+        # huggingface_name or path_of_clip_relative_to_llava_model_dir
+        # We put the initialization here instead of __init__ to allow it being reused by other subclasses.
         vision_path = self.config.mm_vision_tower
         self.vision_tower = CLIPVisionModel.from_pretrained(
             vision_path, torch_dtype=torch.float16
@@ -271,43 +259,9 @@ class LlavaVidForCausalLM(nn.Module):
         # load language model
         self.language_model.load_weights(weights)
 
-        monkey_path_clip_vision_embed_forward()
-
     @property
     def num_patches_per_side(self):
         return self.image_size // self.patch_size
-
-
-first_call = True
-
-
-def clip_vision_embed_forward(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
-    batch_size = pixel_values.shape[0]
-
-    # Move this conv layer to CPU to avoid a bug in torch >= 2.1 on A10G.
-    global first_call
-    if first_call:
-        self.patch_embedding.cpu().float()
-        first_call = False
-    pixel_values = pixel_values.to(dtype=torch.float32, device="cpu")
-    patch_embeds = self.patch_embedding(pixel_values).cuda().half()
-
-    patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
-
-    class_embeds = self.class_embedding.expand(batch_size, 1, -1)
-    embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
-    embeddings = embeddings + self.position_embedding(self.position_ids)
-    return embeddings
-
-
-def monkey_path_clip_vision_embed_forward():
-    import transformers
-
-    setattr(
-        transformers.models.clip.modeling_clip.CLIPVisionEmbeddings,
-        "forward",
-        clip_vision_embed_forward,
-    )
 
 
 EntryClass = LlavaVidForCausalLM
