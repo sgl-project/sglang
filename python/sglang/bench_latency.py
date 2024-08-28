@@ -201,13 +201,15 @@ def extend(reqs, model_runner):
     )
     batch.prepare_for_extend(model_runner.model_config.vocab_size)
     sample_output, logits_output = model_runner.forward(batch, ForwardMode.EXTEND)
-    return sample_output.batch_next_token_ids, logits_output.next_token_logits, batch
+    next_token_ids = sample_output.batch_next_token_ids.tolist()
+    return next_token_ids, logits_output.next_token_logits, batch
 
 
 def decode(input_token_ids, batch, model_runner):
-    batch.prepare_for_decode(input_token_ids.cpu().numpy())
+    batch.prepare_for_decode(input_token_ids)
     sample_output, logits_output = model_runner.forward(batch, ForwardMode.DECODE)
-    return sample_output.batch_next_token_ids, logits_output.next_token_logits
+    next_token_ids = sample_output.batch_next_token_ids.tolist()
+    return next_token_ids, logits_output.next_token_logits
 
 
 @torch.inference_mode()
