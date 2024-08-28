@@ -1,6 +1,5 @@
 import argparse
 import glob
-import multiprocessing as mp
 
 from sglang.test.test_utils import run_unittest_files
 
@@ -14,6 +13,7 @@ suites = {
         "test_eval_accuracy_mini.py",
         "test_large_max_new_tokens.py",
         "test_openai_server.py",
+        "test_json_constrained.py",
         "test_skip_tokenizer_init.py",
         "test_torch_compile.py",
         "test_triton_attn_backend.py",
@@ -49,12 +49,26 @@ if __name__ == "__main__":
         choices=list(suites.keys()) + ["all"],
         help="The suite to run",
     )
+    arg_parser.add_argument(
+        "--range-begin",
+        type=int,
+        default=0,
+        help="The begin index of the range of the files to run.",
+    )
+    arg_parser.add_argument(
+        "--range-end",
+        type=int,
+        default=None,
+        help="The end index of the range of the files to run.",
+    )
     args = arg_parser.parse_args()
 
     if args.suite == "all":
         files = glob.glob("**/test_*.py", recursive=True)
     else:
         files = suites[args.suite]
+
+    files = files[args.range_begin : args.range_end]
 
     exit_code = run_unittest_files(files, args.timeout_per_file)
     exit(exit_code)

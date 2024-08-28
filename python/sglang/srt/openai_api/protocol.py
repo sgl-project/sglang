@@ -161,6 +161,7 @@ class CompletionRequest(BaseModel):
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
+    json_schema: Optional[str] = None
     ignore_eos: Optional[bool] = False
     min_tokens: Optional[int] = 0
     repetition_penalty: Optional[float] = 1.0
@@ -262,6 +263,7 @@ class ChatCompletionRequest(BaseModel):
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
+    json_schema: Optional[str] = None
     min_tokens: Optional[int] = 0
     repetition_penalty: Optional[float] = 1.0
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)

@@ -56,7 +56,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.2.13 https://github.com/sgl-project/sglang.git
+git clone -b v0.2.14.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -83,6 +83,7 @@ docker run --gpus all \
 ### Method 4: Using docker compose
 
 <details>
+<summary>More</summary>
 
 > This method is recommended if you plan to serve it as a service.
 > A better approach is to use the [k8s-sglang-service.yaml](./docker/k8s-sglang-service.yaml).
@@ -94,6 +95,7 @@ docker run --gpus all \
 ### Method 5: Run on Kubernetes or Clouds with SkyPilot
 
 <details>
+<summary>More</summary>
 
 To deploy on Kubernetes or 12+ clouds, you can use [SkyPilot](https://github.com/skypilot-org/skypilot).
 
@@ -133,7 +135,7 @@ sky status --endpoint 30000 sglang
 
 
 ### Common Notes
-- [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is currently one of the dependencies that must be installed for SGLang. If you are using NVIDIA GPU devices below sm80, such as T4, you can't use SGLang for the time being. We expect to resolve this issue soon, so please stay tuned. If you encounter any FlashInfer-related issues on sm80+ devices (e.g., A100, L40S, H100), consider using Triton's kernel by `--disable-flashinfer --disable-flashinfer-sampling` and raise a issue.
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is currently one of the dependencies that must be installed for SGLang. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), consider using Triton's kernel by `--disable-flashinfer --disable-flashinfer-sampling` and raise an issue.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
 
 ## Backend: SGLang Runtime (SRT)
@@ -238,7 +240,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - Qwen / Qwen 2 / Qwen 2 MoE
 - DeepSeek / DeepSeek 2
 - [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
-  - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8 --chat-template=chatml-llava --chunked-prefill-size=16384`
+  - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8 --chat-template=chatml-llava`
   - Query the server with the [OpenAI Vision API](https://platform.openai.com/docs/guides/vision). See examples at [test/srt/test_vision_openai_server.py](test/srt/test_vision_openai_server.py)
 - LLaVA 1.5 / 1.6 / NeXT
   - `python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --port=30000 --tp-size=1 --chat-template=llava_llama_3`
@@ -262,6 +264,7 @@ Instructions for supporting a new model are [here](https://github.com/sgl-projec
 
 #### Use Models From ModelScope
 <details>
+<summary>More</summary>
 
 To use a model from [ModelScope](https://www.modelscope.cn), set the environment variable SGLANG_USE_MODELSCOPE.
 ```
@@ -276,6 +279,7 @@ SGLANG_USE_MODELSCOPE=true python -m sglang.launch_server --model-path qwen/Qwen
 
 #### Run Llama 3.1 405B
 <details>
+<summary>More</summary>
 
 ```bash
 # Run 405B (fp8) on a single node
@@ -293,7 +297,9 @@ GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/
 
 ### Benchmark Performance
 
-- Benchmark a single static batch by running the following command without launching a server. The arguments are the same as for `launch_server.py`. Note that this is not a dynamic batching server, so it may run out of memory for a batch size that a real server can handle. A real server truncates the prefill into several batches, while this unit test does not. For accurate large batch testing, consider using `sglang.bench_serving`.
+- Benchmark a single static batch by running the following command without launching a server. The arguments are the same as for `launch_server.py`.
+  Note that this is not a dynamic batching server, so it may run out of memory for a batch size that a real server can handle.
+  A real server truncates the prefill into several batches, while this unit test does not. For accurate large batch testing, please use `sglang.bench_serving` instead.
   ```
   python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 32 --input-len 256 --output-len 32
   ```

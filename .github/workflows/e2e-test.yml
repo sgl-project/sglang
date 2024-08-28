@@ -23,29 +23,34 @@ jobs:
     runs-on: 1-gpu-runner
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Install dependencies
-      run: |
-        pip install --upgrade pip
-        pip install -e "python[all]"
-        pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
-    - name: Benchmark Serving Throughput
-      timeout-minutes: 10
-      run: |
-        cd test/srt
-        python3 -m unittest test_serving_throughput.TestServingThroughput.test_default
+      - name: Benchmark Serving Throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_serving_throughput.TestServingThroughput.test_default
 
-    - name: Benchmark Serving Throughput (w/o RadixAttention)
-      timeout-minutes: 10
-      run: |
-        cd test/srt
-        python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_radix_cache
+      - name: Benchmark Serving Latency
+        timeout-minutes: 10
+        run: |
+          python3 -m sglang.bench_latency --model meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 1 --input 128 --output 8
 
-    - name: Benchmark Serving Throughput (w/o ChunkedPrefill)
-      timeout-minutes: 10
-      run: |
-        cd test/srt
-        python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_chunked_prefill
+      - name: Benchmark Serving Throughput (w/o RadixAttention)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_radix_cache
+
+      - name: Benchmark Serving Throughput (w/o ChunkedPrefill)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_chunked_prefill
