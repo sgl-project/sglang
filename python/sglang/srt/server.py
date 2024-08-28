@@ -421,7 +421,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.1.5",
+            "0.1.6",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
