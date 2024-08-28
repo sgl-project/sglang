@@ -83,6 +83,7 @@ docker run --gpus all \
 ### Method 4: Using docker compose
 
 <details>
+<summary>More</summary>
 
 > This method is recommended if you plan to serve it as a service.
 > A better approach is to use the [k8s-sglang-service.yaml](./docker/k8s-sglang-service.yaml).
@@ -94,6 +95,7 @@ docker run --gpus all \
 ### Method 5: Run on Kubernetes or Clouds with SkyPilot
 
 <details>
+<summary>More</summary>
 
 To deploy on Kubernetes or 12+ clouds, you can use [SkyPilot](https://github.com/skypilot-org/skypilot).
 
@@ -262,6 +264,7 @@ Instructions for supporting a new model are [here](https://github.com/sgl-projec
 
 #### Use Models From ModelScope
 <details>
+<summary>More</summary>
 
 To use a model from [ModelScope](https://www.modelscope.cn), set the environment variable SGLANG_USE_MODELSCOPE.
 ```
@@ -276,6 +279,7 @@ SGLANG_USE_MODELSCOPE=true python -m sglang.launch_server --model-path qwen/Qwen
 
 #### Run Llama 3.1 405B
 <details>
+<summary>More</summary>
 
 ```bash
 # Run 405B (fp8) on a single node
