@@ -389,7 +389,10 @@ def generate_chat_conv(
             if isinstance(message.content, str):
                 conv.system_message = message.content
             elif isinstance(message.content, list):
-                if len(message.content) != 1 or message.content.get("type", None) != "text":
+                if (
+                    len(message.content) != 1
+                    or message.content.get("type", None) != "text"
+                ):
                     raise ValueError("The system message should be a single text.")
                 else:
                     conv.system_message = message.content[0].get("text", "")
@@ -424,8 +427,13 @@ def generate_chat_conv(
             if isinstance(message.content, str):
                 parsed_content = message.content
             elif isinstance(message.content, list):
-                if len(message.content) != 1 or message.content.get("type", None) != "text":
-                    raise ValueError("The assistant's response should be a single text.")
+                if (
+                    len(message.content) != 1
+                    or message.content.get("type", None) != "text"
+                ):
+                    raise ValueError(
+                        "The assistant's response should be a single text."
+                    )
                 else:
                     parsed_content = message.content[0].get("text", "")
             conv.append_message(conv.roles[1], parsed_content)
