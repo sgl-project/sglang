@@ -328,12 +328,11 @@ class ModelTpServer:
             if self.running_batch is not None:
                 # Run a few decode batches continuously for reducing overhead
                 for i in range(global_config.num_continue_decode_steps):
-                    if i == global_config.num_continue_decode_steps - 1:
-                        # start preparing prefill batch only before the last decode iteration
-                        self.phase_indicator = Phase.PREPARE_PREFILL
-
                     self.num_generated_tokens += len(self.running_batch.reqs)
-                    self.forward_decode_batch(self.running_batch)
+                    self.forward_decode_batch(
+                        self.running_batch,
+                        i == global_config.num_continue_decode_steps - 1,
+                    )
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
@@ -725,7 +724,7 @@ class ModelTpServer:
                 )
             req.output_top_logprobs.append(output.output_top_logprobs[i])
 
-    def forward_decode_batch(self, batch: ScheduleBatch):
+    def forward_decode_batch(self, batch: ScheduleBatch, is_last_decode: bool):
         # Check if decode out of memory
         if not batch.check_decode_mem():
             old_ratio = self.new_token_ratio
@@ -757,6 +756,10 @@ class ModelTpServer:
         # Update batch tensors
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         batch.prepare_for_decode()
+
+        if is_last_decode:
+            # start preparing prefill batch only before the last decode iteration
+            self.phase_indicator = Phase.PREPARE_PREFILL
 
         # Forward and sample the next tokens
         sample_output, logits_output = self.model_runner.forward(
