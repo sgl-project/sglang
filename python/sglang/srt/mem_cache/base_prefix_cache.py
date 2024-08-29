@@ -14,6 +14,10 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
+    def match_prefix_lock(self, **kwargs):
+        pass
+
+    @abstractmethod
     def insert(self, **kwargs):
         pass
 

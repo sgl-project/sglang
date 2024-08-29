@@ -177,16 +177,6 @@ class PrefillAdder:
         return req if truncated else None
 
     @contextmanager
-    def _lock_node(self, last_node: TreeNode):
-        try:
-            delta = self.tree_cache.inc_lock_ref(last_node)
-            self.rem_total_tokens += delta
-            yield None
-        finally:
-            delta = self.tree_cache.dec_lock_ref(last_node)
-            self.rem_total_tokens += delta
-
-    @contextmanager
     def _lock_req(self, req: Req):
         # match prefix again and lock the last node to prevent data racing
         req.fill_ids = req.origin_input_ids + req.output_ids

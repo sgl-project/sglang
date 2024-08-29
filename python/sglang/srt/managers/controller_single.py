@@ -99,7 +99,7 @@ class ControllerSingle:
             if self.tp_size > 1:
                 broadcast_recv_input(recv_reqs, 0, self.tp_cpu_group)
 
-            out_pyobjs = self.tp_server.exposed_step(recv_reqs)
+            out_pyobjs = self.tp_server.control_step(recv_reqs)
 
             for obj in out_pyobjs:
                 self.send_to_detokenizer.send_pyobj(obj)

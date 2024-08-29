@@ -241,7 +241,7 @@ class ModelTpServer:
         self.compute_loop_thread = threading.Thread(target=self.compute_loop)
         self.compute_loop_thread.daemon = True
 
-    def exposed_step(self, recv_reqs: List):
+    def control_step(self, recv_reqs: List):
         try:
             # Forward
             self.forward_pre_post_process(recv_reqs)
@@ -305,7 +305,7 @@ class ModelTpServer:
         time.sleep(0.01)
 
     @torch.inference_mode()
-    def forward_step(self):
+    def compute_step(self):
         new_batch = None
         try:
             new_batch = self.ready_prefill_batch.get_nowait()
@@ -354,7 +354,7 @@ class ModelTpServer:
         torch.cuda.set_device(self.gpu_id)
         while True:
             try:
-                self.forward_step()
+                self.compute_step()
             except Exception:
                 logger.error(
                     "Exception in ModelTpServer.compute_loop:\n"
@@ -975,7 +975,7 @@ def run_tp_server(
         model_server.compute_loop_thread.start()
         while True:
             recv_reqs = broadcast_recv_input(None, tp_rank, tp_cpu_group)
-            model_server.exposed_step(recv_reqs)
+            model_server.control_step(recv_reqs)
     except Exception:
         logger.error("Exception in run_tp_server:\n" + get_exception_traceback())
         raise
