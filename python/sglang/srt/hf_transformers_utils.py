@@ -33,10 +33,12 @@ from transformers import (
 
 try:
     from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
+    from sglang.srt.configs import ExaoneConfig
 
     _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         ChatGLMConfig.model_type: ChatGLMConfig,
         DbrxConfig.model_type: DbrxConfig,
+        ExaoneConfig.model_type: ExaoneConfig,
     }
 except ImportError:
     # We want this file to run without vllm dependency
@@ -53,7 +55,7 @@ def download_from_hf(model_path: str):
 
 
 def get_config_json(model_path: str):
-    with open(os.path.join(model_path, "config.json")) as f:
+    with open(os.path.join(model_path, "configs.json")) as f:
         config = json.load(f)
     return config
 
@@ -89,7 +91,7 @@ CONTEXT_LENGTH_KEYS = [
 
 
 def get_context_length(config):
-    """Get the context length of a model from a huggingface model config."""
+    """Get the context length of a model from a huggingface model configs."""
     rope_scaling = getattr(config, "rope_scaling", None)
     if rope_scaling:
         rope_scaling_factor = config.rope_scaling["factor"]
