@@ -199,6 +199,7 @@ class CompletionStreamResponse(BaseModel):
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
 
+
 class ChatCompletionMessageContentTextPart(BaseModel):
     type: Literal["text"]
     text: str
@@ -222,6 +223,7 @@ ChatCompletionMessageContentPart = Union[
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant"]
     content: Union[str, List[ChatCompletionMessageContentTextPart]]
+
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
