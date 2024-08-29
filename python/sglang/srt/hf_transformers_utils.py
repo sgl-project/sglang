@@ -45,9 +45,9 @@ except ImportError:
     # We want this file to run without vllm dependency
     _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {}
 
-for name, cls in _CONFIG_REGISTRY.items():
-    with contextlib.suppress(ValueError):
-        AutoConfig.register(name, cls)
+# for name, cls in _CONFIG_REGISTRY.items():
+#     with contextlib.suppress(ValueError):
+#         AutoConfig.register(name, cls)
         
 from sglang.srt.utils import is_multimodal_model
 
