@@ -62,6 +62,7 @@ class InputMetadata:
 
     # For extend
     extend_seq_lens: torch.Tensor = None
+    extend_prefix_lens: torch.Tensor = None
     extend_start_loc: torch.Tensor = None
     extend_no_prefix: bool = None
 
@@ -73,8 +74,8 @@ class InputMetadata:
 
     # For multimodal
     pixel_values: List[torch.Tensor] = None
-    image_sizes: List[List[int]] = None
-    image_offsets: List[int] = None
+    image_sizes: List[List[List[int]]] = None
+    image_offsets: List[List[int]] = None
 
     # Trition attention backend
     triton_max_seq_len: int = 0
@@ -91,20 +92,8 @@ class InputMetadata:
     def init_multimuldal_info(self, batch: ScheduleBatch):
         reqs = batch.reqs
         self.pixel_values = [r.pixel_values for r in reqs]
-        self.image_sizes = [r.image_size for r in reqs]
-        self.image_offsets = []
-        for r in reqs:
-            if isinstance(r.image_offset, list):
-                self.image_offsets.append(
-                    [
-                        (image_offset - len(r.prefix_indices))
-                        for image_offset in r.image_offset
-                    ]
-                )
-            elif isinstance(r.image_offset, int):
-                self.image_offsets.append(r.image_offset - len(r.prefix_indices))
-            elif r.image_offset is None:
-                self.image_offsets.append(0)
+        self.image_sizes = [r.image_sizes for r in reqs]
+        self.image_offsets = [r.image_offsets for r in reqs]
 
     def compute_positions(self, batch: ScheduleBatch):
         position_ids_offsets = batch.position_ids_offsets
@@ -157,6 +146,7 @@ class InputMetadata:
                 for i, r in enumerate(batch.reqs)
             ]
             self.extend_seq_lens = torch.tensor(extend_lens_cpu, device="cuda")
+            self.extend_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
             self.extend_start_loc = torch.zeros_like(self.seq_lens)
             self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
             self.extend_no_prefix = all(l == 0 for l in batch.prefix_lens_cpu)
@@ -245,10 +235,10 @@ class InputMetadata:
         prefix_lens_cpu,
         flashinfer_use_ragged,
     ):
-        if self.forward_mode != ForwardMode.DECODE:
-            prefix_lens = torch.tensor(prefix_lens_cpu, device="cuda")
-        else:
+        if self.forward_mode == ForwardMode.DECODE:
             prefix_lens = None
+        else:
+            prefix_lens = self.extend_prefix_lens
 
         update_flashinfer_indices(
             self.forward_mode,

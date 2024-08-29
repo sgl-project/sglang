@@ -127,8 +127,8 @@ class Req:
 
         # For vision input
         self.pixel_values = None
-        self.image_size = None
-        self.image_offset = None
+        self.image_sizes = None
+        self.image_offsets = None
         self.pad_value = None
 
         # Prefix info
@@ -269,12 +269,12 @@ class Req:
         all_text = self.origin_input_text + self.decoded_text + jump_forward_str
         all_ids = self.tokenizer.encode(all_text)
         if not all_ids:
-            warnings.warn("Encoded all_text resulted in empty all_ids")
+            logger.warning("Encoded all_text resulted in empty all_ids")
             return False
 
         prompt_tokens = len(self.origin_input_ids_unpadded)
         if prompt_tokens > len(all_ids):
-            warnings.warn("prompt_tokens is larger than encoded all_ids")
+            logger.warning("prompt_tokens is larger than encoded all_ids")
             return False
 
         if all_ids[prompt_tokens - 1] != self.origin_input_ids_unpadded[-1]:
@@ -606,12 +606,12 @@ class ScheduleBatch:
                     if req.pixel_values is not None:
                         (
                             req.origin_input_ids,
-                            req.image_offset,
+                            req.image_offsets,
                         ) = model_runner.model.pad_input_ids(
                             req.origin_input_ids_unpadded,
                             req.pad_value,
-                            req.pixel_values.shape,
-                            req.image_size,
+                            req.pixel_values,
+                            req.image_sizes,
                         )
 
                     jump_forward_reqs.append(req)

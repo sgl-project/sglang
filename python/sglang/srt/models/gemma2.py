@@ -22,11 +22,6 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-
-# FIXME: temporary solution, remove after next vllm release
-from vllm.model_executor.custom_op import CustomOp
-
-# from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -39,6 +34,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.sampler import Sampler
@@ -49,52 +45,6 @@ from sglang.srt.model_executor.forward_batch_info import InputMetadata
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
-
-
-class GemmaRMSNorm(CustomOp):
-    """RMS normalization for Gemma.
-
-    Two differences from the above RMSNorm:
-        1. x * (1 + w) instead of x * w.
-        2. (x * w).to(orig_dtype) instead of x.to(orig_dtype) * w.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward_native(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """PyTorch-native implementation equivalent to forward()."""
-        orig_dtype = x.dtype
-        if residual is not None:
-            x = x + residual
-            residual = x
-
-        x = x.float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-        # Llama does x.to(float16) * w whilst Gemma is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
-        x = x * (1.0 + self.weight.float())
-        x = x.to(orig_dtype)
-        return x if residual is None else (x, residual)
-
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # from vLLM: TODO(woosuk): Implement an optimized kernel for GemmaRMSNorm.
-        return self.forward_native(x, residual)
 
 
 # FIXME: temporary solution, remove after next vllm release

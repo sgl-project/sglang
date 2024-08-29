@@ -19,7 +19,12 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from flashinfer.norm import fused_add_rmsnorm, rmsnorm
+from flashinfer.norm import (
+    fused_add_rmsnorm,
+    gemma_fused_add_rmsnorm,
+    gemma_rmsnorm,
+    rmsnorm,
+)
 from vllm.model_executor.custom_op import CustomOp
 
 
@@ -32,15 +37,12 @@ class RMSNorm(CustomOp):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.is_lower_sm80 = torch.cuda.get_device_capability()[0] < 8
 
     def forward_cuda(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.is_lower_sm80:
-            return self.forward_native(x, residual)
 
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
@@ -66,3 +68,44 @@ class RMSNorm(CustomOp):
             return x
         else:
             return x, residual
+
+
+class GemmaRMSNorm(CustomOp):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        orig_dtype = x.dtype
+        if residual is not None:
+            x = x + residual
+            residual = x
+
+        x = x.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        x = x * (1.0 + self.weight.float())
+        x = x.to(orig_dtype)
+        return x if residual is None else (x, residual)
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            gemma_fused_add_rmsnorm(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
+            return x, residual
+        out = gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
+        return out

@@ -59,6 +59,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_batches,
+    v1_cancel_batch,
     v1_chat_completions,
     v1_completions,
     v1_delete_file,
@@ -246,6 +247,12 @@ async def openai_v1_batches(raw_request: Request):
     return await v1_batches(tokenizer_manager, raw_request)
 
 
+@app.post("/v1/batches/{batch_id}/cancel")
+async def cancel_batches(batch_id: str):
+    # https://platform.openai.com/docs/api-reference/batch/cancel
+    return await v1_cancel_batch(tokenizer_manager, batch_id)
+
+
 @app.get("/v1/batches/{batch_id}")
 async def retrieve_batch(batch_id: str):
     return await v1_retrieve_batch(batch_id)
@@ -328,12 +335,12 @@ def launch_server(
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
     if server_args.dp_size == 1:
-        start_process = start_controller_process_single
+        start_controller_process = start_controller_process_single
     else:
-        start_process = start_controller_process_multi
+        start_controller_process = start_controller_process_multi
 
     proc_controller = mp.Process(
-        target=start_process,
+        target=start_controller_process,
         args=(server_args, port_args, pipe_controller_writer, model_overide_args),
     )
     proc_controller.start()
@@ -414,7 +421,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.1.5",
+            "0.1.6",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
