@@ -18,8 +18,9 @@ The definition of objects transfered between different
 processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
+import copy
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -238,16 +239,21 @@ class TokenizedEmbeddingReqInput:
 @dataclass
 class BatchTokenIDOut:
     # The request id
-    rids: List[str]
+    rids: List[str] = field(default_factory=list)
     # The version id to sync decode status with in detokenizer_manager
-    vids: List[int]
-    decoded_texts: List[str]
-    decode_ids: List[int]
-    read_offsets: List[int]
-    skip_special_tokens: List[bool]
-    spaces_between_special_tokens: List[bool]
-    meta_info: List[Dict]
-    finished_reason: List[BaseFinishReason]
+    vids: List[int] = field(default_factory=list)
+    decoded_texts: List[str] = field(default_factory=list)
+    decode_ids: List[int] = field(default_factory=list)
+    read_offsets: List[int] = field(default_factory=list)
+    skip_special_tokens: List[bool] = field(default_factory=list)
+    spaces_between_special_tokens: List[bool] = field(default_factory=list)
+    meta_info: List[Dict] = field(default_factory=list)
+    finished_reason: List[BaseFinishReason] = field(default_factory=list)
+
+    def __post_init__(self):
+        # deepcopy the mutable references
+        self.meta_info = copy.deepcopy(self.meta_info)
+        self.finished_reason = copy.deepcopy(self.finished_reason)
 
 
 @dataclass
@@ -265,13 +271,19 @@ class BatchStrOut:
 @dataclass
 class BatchEmbeddingOut:
     # The request id
-    rids: List[str]
+    rids: List[str] = field(default_factory=list)
     # The output embedding
-    embeddings: List[List[float]]
+    embeddings: List[List[float]] = field(default_factory=list)
     # The meta info
-    meta_info: List[Dict]
+    meta_info: List[Dict] = field(default_factory=list)
     # The finish reason
-    finished_reason: List[BaseFinishReason]
+    finished_reason: List[BaseFinishReason] = field(default_factory=list)
+
+    def __post_init__(self):
+        # deepcopy the mutable references
+        self.embeddings = copy.deepcopy(self.embeddings)
+        self.meta_info = copy.deepcopy(self.meta_info)
+        self.finished_reason = copy.deepcopy(self.finished_reason)
 
 
 @dataclass
