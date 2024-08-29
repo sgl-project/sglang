@@ -386,7 +386,13 @@ def generate_chat_conv(
     for message in request.messages:
         msg_role = message.role
         if msg_role == "system":
-            conv.system_message = message.content
+            if isinstance(message.content, str):
+                conv.system_message = message.content
+            elif isinstance(message.content, list):
+                if len(message.content) != 1 or message.content.get("type", None) != "text":
+                    raise ValueError("The system message should be a single text.")
+                else:
+                    conv.system_message = message.content[0].get("text", "")
         elif msg_role == "user":
             # Handle the various types of Chat Request content types here.
             role = conv.roles[0]
@@ -414,7 +420,15 @@ def generate_chat_conv(
                         conv.append_image(content.image_url.url)
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
-            conv.append_message(conv.roles[1], message.content)
+            parsed_content = ""
+            if isinstance(message.content, str):
+                parsed_content = message.content
+            elif isinstance(message.content, list):
+                if len(message.content) != 1 or message.content.get("type", None) != "text":
+                    raise ValueError("The assistant's response should be a single text.")
+                else:
+                    parsed_content = message.content[0].get("text", "")
+            conv.append_message(conv.roles[1], parsed_content)
         else:
             raise ValueError(f"Unknown role: {msg_role}")
 
