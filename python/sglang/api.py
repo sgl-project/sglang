@@ -78,6 +78,7 @@ def gen(
     choices: Optional[List[str]] = None,
     choices_method: Optional[ChoicesSamplingMethod] = None,
     regex: Optional[str] = None,
+    json_schema: Optional[str] = None,
 ):
     """Call the model to generate. See the meaning of the arguments in docs/en/sampling_params.md"""
 
@@ -114,6 +115,7 @@ def gen(
         return_text_in_logprobs,
         dtype,
         regex,
+        json_schema,
     )
 
 
