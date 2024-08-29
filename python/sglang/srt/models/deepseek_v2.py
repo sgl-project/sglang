@@ -417,12 +417,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             v_head_dim=self.kv_lora_rank,
         )
 
-        kv_b_proj = self.kv_b_proj
-        w_kc, w_vc = kv_b_proj.weight.unflatten(
-            0, (-1, qk_nope_head_dim + v_head_dim)
-        ).split([qk_nope_head_dim, v_head_dim], dim=1)
-        self.w_kc = w_kc
-        self.w_vc = w_vc
+        self.w_kc = None
+        self.w_vc = None
 
     def forward(
         self,
@@ -464,7 +460,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         torch.bmm(
             attn_output.transpose(0, 1),
-            self.w_vc.transpose(1, 2).contiguous(),
+            self.w_vc,
             out=attn_bmm_output.transpose(0, 1),
         )
 
@@ -714,6 +710,16 @@ class DeepseekV2ForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+        if global_server_args_dict["enable_mla"]:
+            for layer_id in range(self.config.num_hidden_layers):
+                self_attn = self.model.layers[layer_id].self_attn
+                w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
+                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                self_attn.w_kc = w_kc.contiguous()
+                self_attn.w_vc = w_vc.transpose(1, 2).contiguous()
+                del self_attn.kv_b_proj
 
 
 EntryClass = DeepseekV2ForCausalLM
