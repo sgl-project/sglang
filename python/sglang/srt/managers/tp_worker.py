@@ -15,6 +15,7 @@ limitations under the License.
 
 """A tensor parallel worker."""
 
+import copy
 import enum
 import logging
 import multiprocessing
@@ -796,7 +797,7 @@ class ModelTpServer:
 
         self.handle_finished_requests(batch)
 
-    def send_to_detokenizer(self, requests: List[Req]):
+    def send_to_detokenizer(self, requests: List[Req], streaming=False):
         output_rids = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
@@ -865,7 +866,11 @@ class ModelTpServer:
                         output_read_offsets,
                         output_skip_special_tokens,
                         output_spaces_between_special_tokens,
-                        output_meta_info,
+                        (
+                            output_meta_info
+                            if not streaming
+                            else copy.deepcopy(output_meta_info)
+                        ),
                         output_finished_reason,
                     )
                 )
@@ -896,7 +901,7 @@ class ModelTpServer:
                 streaming_requests.append(req)
 
         # Send streaming output to detokenizer
-        self.send_to_detokenizer(streaming_requests)
+        self.send_to_detokenizer(streaming_requests, streaming=True)
         # Remove finished reqs: update batch tensors
         batch.filter_batch(unfinished_indices)
 
