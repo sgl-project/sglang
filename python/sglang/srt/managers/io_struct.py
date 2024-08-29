@@ -239,21 +239,20 @@ class TokenizedEmbeddingReqInput:
 @dataclass
 class BatchTokenIDOut:
     # The request id
-    rids: List[str] = field(default_factory=list)
+    rids: List[str]
     # The version id to sync decode status with in detokenizer_manager
-    vids: List[int] = field(default_factory=list)
-    decoded_texts: List[str] = field(default_factory=list)
-    decode_ids: List[int] = field(default_factory=list)
-    read_offsets: List[int] = field(default_factory=list)
-    skip_special_tokens: List[bool] = field(default_factory=list)
-    spaces_between_special_tokens: List[bool] = field(default_factory=list)
-    meta_info: List[Dict] = field(default_factory=list)
-    finished_reason: List[BaseFinishReason] = field(default_factory=list)
+    vids: List[int]
+    decoded_texts: List[str]
+    decode_ids: List[int]
+    read_offsets: List[int]
+    skip_special_tokens: List[bool]
+    spaces_between_special_tokens: List[bool]
+    meta_info: List[Dict]
+    finished_reason: List[BaseFinishReason]
 
     def __post_init__(self):
-        # deepcopy the mutable references
+        # deepcopy meta_info to avoid modification in place
         self.meta_info = copy.deepcopy(self.meta_info)
-        self.finished_reason = copy.deepcopy(self.finished_reason)
 
 
 @dataclass
@@ -271,19 +270,13 @@ class BatchStrOut:
 @dataclass
 class BatchEmbeddingOut:
     # The request id
-    rids: List[str] = field(default_factory=list)
+    rids: List[str]
     # The output embedding
-    embeddings: List[List[float]] = field(default_factory=list)
+    embeddings: List[List[float]]
     # The meta info
-    meta_info: List[Dict] = field(default_factory=list)
+    meta_info: List[Dict]
     # The finish reason
-    finished_reason: List[BaseFinishReason] = field(default_factory=list)
-
-    def __post_init__(self):
-        # deepcopy the mutable references
-        self.embeddings = copy.deepcopy(self.embeddings)
-        self.meta_info = copy.deepcopy(self.meta_info)
-        self.finished_reason = copy.deepcopy(self.finished_reason)
+    finished_reason: List[BaseFinishReason]
 
 
 @dataclass
