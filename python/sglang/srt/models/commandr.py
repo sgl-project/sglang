@@ -64,6 +64,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.sampler import Sampler
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
@@ -326,6 +327,7 @@ class CohereForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.logits_processor = LogitsProcessor(config)
+        self.sampler = Sampler()
         self.model = CohereModel(config, quant_config)
 
     @torch.no_grad()
@@ -340,9 +342,11 @@ class CohereForCausalLM(nn.Module):
             positions,
             input_metadata,
         )
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens.weight, input_metadata
         )
+        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
+        return sample_output, logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

@@ -31,7 +31,7 @@ from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.layers.logits_processor import LogitProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -504,21 +504,29 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
-                output = self.model_runner.forward(batch, ForwardMode.EXTEND)
-                next_token_ids = batch.sample(output.next_token_logits)
+                sample_output, logits_output = self.model_runner.forward(
+                    batch, ForwardMode.EXTEND
+                )
+                next_token_ids = batch.check_sample_results(sample_output)
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     next_token_ids
                 )
 
                 # Move logprobs to cpu
-                if output.next_token_logprobs is not None:
-                    output.next_token_logprobs = output.next_token_logprobs[
-                        torch.arange(len(next_token_ids), device=next_token_ids.device),
-                        next_token_ids,
-                    ].tolist()
-                    output.input_token_logprobs = output.input_token_logprobs.tolist()
-                    output.normalized_prompt_logprobs = (
-                        output.normalized_prompt_logprobs.tolist()
+                if logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs[
+                            torch.arange(
+                                len(next_token_ids), device=next_token_ids.device
+                            ),
+                            next_token_ids,
+                        ].tolist()
+                    )
+                    logits_output.input_token_logprobs = (
+                        logits_output.input_token_logprobs.tolist()
+                    )
+                    logits_output.normalized_prompt_logprobs = (
+                        logits_output.normalized_prompt_logprobs.tolist()
                     )
 
                 next_token_ids = next_token_ids.tolist()
@@ -557,12 +565,14 @@ class ModelTpServer:
                     self.req_to_token_pool.free(req.req_pool_idx)
 
                 if req.return_logprob:
-                    self.add_logprob_return_values(i, req, pt, next_token_ids, output)
+                    self.add_logprob_return_values(
+                        i, req, pt, next_token_ids, logits_output
+                    )
                     pt += req.extend_input_len
         else:
             assert batch.extend_num_tokens != 0
-            output = self.model_runner.forward(batch, ForwardMode.EXTEND)
-            embeddings = output.embeddings.tolist()
+            logits_output = self.model_runner.forward(batch, ForwardMode.EXTEND)
+            embeddings = logits_output.embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -590,7 +600,7 @@ class ModelTpServer:
         req: Req,
         pt: int,
         next_token_ids: List[int],
-        output: LogitProcessorOutput,
+        output: LogitsProcessorOutput,
     ):
         if req.normalized_prompt_logprob is None:
             req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
@@ -672,15 +682,17 @@ class ModelTpServer:
         batch.prepare_for_decode()
 
         # Forward and sample the next tokens
-        output = self.model_runner.forward(batch, ForwardMode.DECODE)
-        next_token_ids = batch.sample(output.next_token_logits)
+        sample_output, logits_output = self.model_runner.forward(
+            batch, ForwardMode.DECODE
+        )
+        next_token_ids = batch.check_sample_results(sample_output)
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
         )
 
         # Move logprobs to cpu
-        if output.next_token_logprobs is not None:
-            next_token_logprobs = output.next_token_logprobs[
+        if logits_output.next_token_logprobs is not None:
+            next_token_logprobs = logits_output.next_token_logprobs[
                 torch.arange(len(next_token_ids), device=next_token_ids.device),
                 next_token_ids,
             ].tolist()
@@ -706,7 +718,7 @@ class ModelTpServer:
                     (next_token_logprobs[i], next_token_id)
                 )
                 if req.top_logprobs_num > 0:
-                    req.output_top_logprobs.append(output.output_top_logprobs[i])
+                    req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
 
         self.handle_finished_requests(batch)
 
