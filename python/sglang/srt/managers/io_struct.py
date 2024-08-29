@@ -18,8 +18,9 @@ The definition of objects transfered between different
 processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
+import copy
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -248,6 +249,10 @@ class BatchTokenIDOut:
     spaces_between_special_tokens: List[bool]
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
+
+    def __post_init__(self):
+        # deepcopy meta_info to avoid modification in place
+        self.meta_info = copy.deepcopy(self.meta_info)
 
 
 @dataclass
