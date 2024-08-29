@@ -133,30 +133,33 @@ class ExaoneConfig(PretrainedConfig):
             >>> # Accessing the model configuration
             >>> configuration = model.configs
     """
+
     model_type = "exaone"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {"num_hidden_layers": "num_layers"}
 
-    def __init__(self,
-                 vocab_size=102400,
-                 max_position_embeddings=2048,
-                 hidden_size=2048,
-                 num_layers=32,
-                 num_attention_heads=32,
-                 num_key_value_heads=None,
-                 intermediate_size=None,
-                 activation_function="silu",
-                 rope_theta=10000.0,
-                 rope_scaling=None,
-                 embed_dropout=0.0,
-                 attention_dropout=0.0,
-                 layer_norm_epsilon=1e-5,
-                 initializer_range=0.02,
-                 use_cache=True,
-                 bos_token_id=0,
-                 eos_token_id=2,
-                 tie_word_embeddings=True,
-                 **kwargs):
+    def __init__(
+        self,
+        vocab_size=102400,
+        max_position_embeddings=2048,
+        hidden_size=2048,
+        num_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=None,
+        intermediate_size=None,
+        activation_function="silu",
+        rope_theta=10000.0,
+        rope_scaling=None,
+        embed_dropout=0.0,
+        attention_dropout=0.0,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        use_cache=True,
+        bos_token_id=0,
+        eos_token_id=2,
+        tie_word_embeddings=True,
+        **kwargs
+    ):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -182,7 +185,9 @@ class ExaoneConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
-        super().__init__(bos_token_id=bos_token_id,
-                         eos_token_id=eos_token_id,
-                         tie_word_embeddings=tie_word_embeddings,
-                         **kwargs)
+        super().__init__(
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs
+        )

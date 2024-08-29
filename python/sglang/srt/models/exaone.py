@@ -114,10 +114,12 @@ class ExaoneAttention(nn.Module):
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
-        self.head_dim = getattr(config, "head_dim",
-                                self.hidden_size // self.total_num_heads)
-        self.rotary_dim = int(self.head_dim *
-                              getattr(config, "partial_rotary_factor", 1))
+        self.head_dim = getattr(
+            config, "head_dim", self.hidden_size // self.total_num_heads
+        )
+        self.rotary_dim = int(
+            self.head_dim * getattr(config, "partial_rotary_factor", 1)
+        )
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -313,7 +315,9 @@ class ExaoneForCausalLM(nn.Module):
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
     ) -> LogitsProcessorOutput:
-        hidden_states = self.transformer(input_ids, positions, input_metadata, input_embeds)
+        hidden_states = self.transformer(
+            input_ids, positions, input_metadata, input_embeds
+        )
         logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )

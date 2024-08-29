@@ -34,6 +34,7 @@ from transformers import (
 
 try:
     from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
+
     from sglang.srt.configs import ExaoneConfig
 
     _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
@@ -48,8 +49,9 @@ except ImportError:
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
-        
+
 from sglang.srt.utils import is_multimodal_model
+
 
 def download_from_hf(model_path: str):
     if os.path.exists(model_path):
