@@ -769,7 +769,7 @@ class ModelTpServer:
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         batch.prepare_for_decode()
 
-        if is_last_decode:
+        if is_last_decode and not self.serialized_memory_access:
             # start preparing prefill batch only before the last decode iteration
             self.phase_indicator = Phase.PREPARE_PREFILL
 
