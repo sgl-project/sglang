@@ -292,6 +292,7 @@ def latency_test_run_once(
     measurement_results["prefill_throughput"] = throughput
 
     # Decode
+    decode_latencies = []
     for i in range(output_len):
         torch.cuda.synchronize()
         tic = time.time()
@@ -300,17 +301,18 @@ def latency_test_run_once(
         latency = time.time() - tic
         tot_latency += latency
         throughput = batch_size / latency
+        decode_latencies.append(latency)
         if i < 5:
             rank_print(
                 f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
-    avg_decode_latency = (tot_latency - prefill_latency) / output_len
-    avg_decode_throughput = batch_size / avg_decode_latency
+    med_decode_latency = np.median(decode_latencies)
+    med_decode_throughput = batch_size / med_decode_latency
     rank_print(
-        f"Decode.  avg latency: {avg_decode_latency:6.5f} s, avg throughput: {avg_decode_throughput:9.2f} token/s"
+        f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
     )
-    measurement_results["avg_decode_latency"] = avg_decode_latency
-    measurement_results["avg_decode_throughput"] = avg_decode_throughput
+    measurement_results["median_decode_latency"] = med_decode_latency
+    measurement_results["median_decode_throughput"] = med_decode_throughput
 
     throughput = (input_len + output_len) * batch_size / tot_latency
     rank_print(

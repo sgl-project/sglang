@@ -15,6 +15,7 @@ limitations under the License.
 
 """Utilities for Huggingface Transformers."""
 
+import contextlib
 import functools
 import json
 import os
@@ -34,15 +35,20 @@ from transformers import (
 try:
     from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
 
+    from sglang.srt.configs import ExaoneConfig
+
     _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         ChatGLMConfig.model_type: ChatGLMConfig,
         DbrxConfig.model_type: DbrxConfig,
+        ExaoneConfig.model_type: ExaoneConfig,
     }
 except ImportError:
     # We want this file to run without vllm dependency
     _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {}
 
-from sglang.srt.utils import is_multimodal_model
+for name, cls in _CONFIG_REGISTRY.items():
+    with contextlib.suppress(ValueError):
+        AutoConfig.register(name, cls)
 
 
 def download_from_hf(model_path: str):
@@ -50,12 +56,6 @@ def download_from_hf(model_path: str):
         return model_path
 
     return snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
-
-
-def get_config_json(model_path: str):
-    with open(os.path.join(model_path, "config.json")) as f:
-        config = json.load(f)
-    return config
 
 
 def get_config(
@@ -89,7 +89,7 @@ CONTEXT_LENGTH_KEYS = [
 
 
 def get_context_length(config):
-    """Get the context length of a model from a huggingface model config."""
+    """Get the context length of a model from a huggingface model configs."""
     rope_scaling = getattr(config, "rope_scaling", None)
     if rope_scaling:
         rope_scaling_factor = config.rope_scaling["factor"]
