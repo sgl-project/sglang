@@ -22,7 +22,8 @@ import asyncio
 import dataclasses
 import json
 import logging
-import multiprocessing as mp
+import torch.multiprocessing as mp
+import multiprocessing
 import os
 import threading
 import time
@@ -273,7 +274,7 @@ async def retrieve_file_content(file_id: str):
 def launch_server(
     server_args: ServerArgs,
     model_overide_args: Optional[dict] = None,
-    pipe_finish_writer: Optional[mp.connection.Connection] = None,
+    pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
 ):
     """Launch an HTTP server."""
     global tokenizer_manager
@@ -288,6 +289,7 @@ def launch_server(
         server_args.port,
         server_args.additional_ports,
         server_args.dp_size,
+        server_args.speculative_algorithm is not None
     )
     ports = server_args.additional_ports
     port_args = PortArgs(

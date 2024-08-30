@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 class ServerArgs:
     # Model and tokenizer
     model_path: str
+    draft_model_path: str = None
+    speculative_algorithm: str = None
+    draft_mem_fraction: float = 0.1
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
@@ -134,6 +137,26 @@ class ServerArgs:
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
             required=True,
         )
+        parser.add_argument(
+            "--draft-model-path",
+            type=str,
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+            required=False,
+        )
+        parser.add_argument(
+            "--speculative-algorithm",
+            type=str,
+            choices=["EAGLE"],
+            help="Speculative algorithm.",
+            required=False,
+        )
+        parser.add_argument(
+            "--draft-mem-fraction",
+            type=float,
+            help="The fraction of the memory used for static allocation of draft model in Speculative Decoding.",
+            required=False,
+        )
+        
         parser.add_argument(
             "--tokenizer-path",
             type=str,

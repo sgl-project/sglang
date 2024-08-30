@@ -16,7 +16,8 @@ limitations under the License.
 """A controller that manages a group of tensor parallel workers."""
 
 import logging
-import multiprocessing
+import torch.multiprocessing as multiprocessing
+import multiprocessing as mp
 from typing import List
 
 import zmq
@@ -29,6 +30,9 @@ from sglang.srt.managers.tp_worker import (
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, kill_parent_process
 from sglang.utils import get_exception_traceback
+from sglang.srt.managers.speculative_utils import SpecInfoPipline
+from sglang.srt.managers.speculative_worker import SpecDraftServer
+from sglang.srt.managers.speculative_utils import SpecInfoPipline
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,7 @@ class ControllerSingle:
         is_data_parallel_worker: bool,
         dp_worker_id: int,
         mp_queue: multiprocessing.Queue,
+        spec_queue: SpecInfoPipline,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -86,6 +91,7 @@ class ControllerSingle:
             server_args,
             port_args.nccl_ports[dp_worker_id],
             model_overide_args,
+            spec_queue
         )
         self.tp_cpu_group = self.tp_server.model_runner.tp_group.cpu_group
 
@@ -125,12 +131,12 @@ class ControllerSingle:
 def start_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
-    pipe_writer: multiprocessing.connection.Connection,
+    pipe_writer: mp.connection.Connection,
     model_overide_args: dict,
     is_data_parallel_worker: bool = False,
     gpu_ids: List[int] = None,
     dp_worker_id: int = None,
-    queue: multiprocessing.connection.Connection = None,
+    queue: mp.connection.Connection = None,
 ):
     """Start a controller process."""
     if is_data_parallel_worker:
@@ -146,6 +152,24 @@ def start_controller_process(
         queue = None
 
     try:
+        spec_queue = None
+        if server_args.speculative_algorithm is not None:
+            spec_queue = SpecInfoPipline()
+            proc = multiprocessing.Process(
+                target=start_spec_controller_process,
+                args=(
+                    server_args,
+                    port_args,
+                    pipe_writer,
+                    model_overide_args,
+                    True,
+                    gpu_ids,
+                    dp_worker_id,
+                    queue,
+                    spec_queue,
+                ),
+            )
+            proc.start()
         controller = ControllerSingle(
             server_args,
             port_args,
@@ -154,6 +178,92 @@ def start_controller_process(
             is_data_parallel_worker,
             dp_worker_id,
             queue,
+            spec_queue,
+        )
+    except Exception:
+        pipe_writer.send(get_exception_traceback())
+        raise
+
+    pipe_writer.send("init ok")
+
+    try:
+        controller.loop_for_forward()
+    except Exception:
+        logger.error("Exception in ControllerSingle:\n" + get_exception_traceback())
+    finally:
+        kill_parent_process()
+
+
+class ControllerSingleSpecDraft(ControllerSingle):
+    """A controller that manages a group of tensor parallel workers."""
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        model_overide_args: dict,
+        gpu_ids: List[int],
+        is_data_parallel_worker: bool,
+        dp_worker_id: int,
+        mp_queue: multiprocessing.Queue,
+        spec_queue: SpecInfoPipline,
+    ):
+        # Parse args
+        self.tp_size = server_args.tp_size
+        self.is_dp_worker = is_data_parallel_worker
+        self.dp_worker_id = dp_worker_id
+
+        self.mp_queue = spec_queue.draft_input_queue
+        self.spec_server = SpecDraftServer(
+            gpu_ids[0],
+            0,
+            server_args,
+            port_args.nccl_ports[dp_worker_id*2+1],
+            model_overide_args,
+            spec_queue
+        )
+
+    def loop_for_forward(self):
+        while True:
+            recv_reqs = self.recv_requests_from_mp_queue()
+            self.tp_server.exposed_step(recv_reqs)
+
+
+    def recv_requests_from_mp_queue(self):
+        recv_reqs = []
+        while not self.mp_queue.empty():
+            recv_reqs.append(self.mp_queue.get())
+        return recv_reqs
+
+
+def start_spec_controller_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    pipe_writer: mp.connection.Connection,
+    model_overide_args: dict,
+    is_data_parallel_worker: bool = False,
+    gpu_ids: List[int] = None,
+    dp_worker_id: int = None,
+    queue: mp.connection.Connection = None,
+    spec_queue: SpecInfoPipline = None
+):
+    """Start a controller process."""
+    if is_data_parallel_worker:
+        logger_prefix = f" Spec {dp_worker_id} TP0"
+    else:
+        logger_prefix = " Spec "
+    configure_logger(server_args, prefix=logger_prefix)
+
+    try:
+        controller = ControllerSingleSpecDraft(
+            server_args,
+            port_args,
+            model_overide_args,
+            gpu_ids,
+            is_data_parallel_worker,
+            dp_worker_id,
+            queue,
+            spec_queue,
         )
     except Exception:
         pipe_writer.send(get_exception_traceback())

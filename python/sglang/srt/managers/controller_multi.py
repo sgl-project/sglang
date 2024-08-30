@@ -20,7 +20,7 @@ Each data parallel worker can manage multiple tensor parallel workers.
 
 import dataclasses
 import logging
-import multiprocessing
+import torch.multiprocessing as multiprocessing
 from enum import Enum, auto
 
 import numpy as np

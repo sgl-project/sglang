@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.managers.speculative_utils import SpecDraftInfo
 
 if TYPE_CHECKING:
     from sglang.srt.layers.sampler import SampleOutput
@@ -344,6 +345,9 @@ class ScheduleBatch:
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
+    
+    # For speculative decoding
+    spec_draft_info: SpecDraftInfo = None
 
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):

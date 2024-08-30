@@ -16,7 +16,7 @@ limitations under the License.
 """A tensor parallel worker."""
 
 import logging
-import multiprocessing
+import torch.multiprocessing as multiprocessing
 import os
 import pickle
 import time
@@ -62,6 +62,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
+from sglang.srt.managers.speculative_utils import SpecInfoPipline
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,7 @@ class ModelTpServer:
         server_args: ServerArgs,
         nccl_port: int,
         model_overide_args: dict,
+        spec_queue: SpecInfoPipline
     ):
         suppress_other_loggers()
 
@@ -87,6 +89,7 @@ class ModelTpServer:
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
+        self.is_spec_worker = False
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -98,7 +101,7 @@ class ModelTpServer:
 
         self.model_runner = ModelRunner(
             model_config=self.model_config,
-            mem_fraction_static=server_args.mem_fraction_static,
+            mem_fraction_static= server_args.draft_mem_fraction if self.is_spec_worker else server_args.mem_fraction_static ,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,

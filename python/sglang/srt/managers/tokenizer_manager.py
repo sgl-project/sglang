@@ -19,7 +19,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
-import multiprocessing as mp
+import torch.multiprocessing as mp
 import os
 from typing import Dict, List, Optional, Tuple, Union
 

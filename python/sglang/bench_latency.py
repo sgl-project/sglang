@@ -38,7 +38,7 @@ import argparse
 import dataclasses
 import itertools
 import logging
-import multiprocessing
+import torch.multiprocessing as multiprocessing
 import os
 import sqlite3
 import time

@@ -25,6 +25,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+from sglang.srt.managers.speculative_utils import SpecDraftInfo
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -38,6 +39,11 @@ class ForwardMode(IntEnum):
     EXTEND = auto()
     # Decode one token.
     DECODE = auto()
+    # Speculative Extend.
+    SPECEXTEND = auto()
+    # Speculative verify.
+    SPECVERIFY = auto()
+    
 
 
 @dataclass
@@ -88,6 +94,9 @@ class InputMetadata:
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
     flashinfer_use_ragged: bool = False
+    
+    # Information used for speculative decoding
+    draft_info : SpecDraftInfo = None
 
     def init_multimuldal_info(self, batch: ScheduleBatch):
         reqs = batch.reqs
