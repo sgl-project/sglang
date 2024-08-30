@@ -99,6 +99,9 @@ class ModelTpServer:
         self.schedule_policy = server_args.schedule_policy
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
 
+        # FIXME: temp workaround
+        self.serialized_memory_access = self.tp_size > 1
+
         # Init model and tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,
@@ -271,6 +274,7 @@ class ModelTpServer:
         self.send_to_detokenizer(finished_requests)
         for req in finished_requests:
             self.tree_cache.cache_finished_req(req)
+            self.finished_requests.task_done()
 
         # put retracted requests back to waiting queue
         while not self.retracted_requests.empty():
@@ -565,6 +569,10 @@ class ModelTpServer:
         return new_batch
 
     def forward_prefill_batch(self, batch: ScheduleBatch):
+        # Sync memory access
+        if self.serialized_memory_access:
+            self.finished_requests.join()
+
         # Build batch tensors
         batch.prepare_for_extend(self.model_config.vocab_size)
 
@@ -752,6 +760,10 @@ class ModelTpServer:
                 self.retracted_requests.put(req)
             if batch.is_empty():
                 return
+
+        # Sync memory access
+        if self.serialized_memory_access:
+            self.finished_requests.join()
 
         # Update batch tensors
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
