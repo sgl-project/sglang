@@ -306,7 +306,7 @@ def latency_test_run_once(
             rank_print(
                 f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
-    med_decode_latency = np.mean(decode_latencies)
+    med_decode_latency = np.median(decode_latencies)
     med_decode_throughput = batch_size / med_decode_latency
     rank_print(
         f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
