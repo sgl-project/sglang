@@ -847,20 +847,20 @@ def v1_chat_generate_request(
                 openai_compatible_messages = []
                 for message in request.messages:
                     if isinstance(message.content, str):
-                        openai_compatible_messages.append({
-                            "role": message.role,
-                            "content": message.content
-                        })
+                        openai_compatible_messages.append(
+                            {"role": message.role, "content": message.content}
+                        )
                     else:
-                        content_list = message.dict()['content']
+                        content_list = message.dict()["content"]
                         for content in content_list:
-                            if content['type'] == 'text':
-                                openai_compatible_messages.append({
-                                    "role": message.role,
-                                    "content": content['text']
-                                })
+                            if content["type"] == "text":
+                                openai_compatible_messages.append(
+                                    {"role": message.role, "content": content["text"]}
+                                )
                 prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
-                    openai_compatible_messages, tokenize=True, add_generation_prompt=True
+                    openai_compatible_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
                 )
                 stop = request.stop
                 image_data = None
