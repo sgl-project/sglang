@@ -102,18 +102,15 @@ class TestOpenAIVisionServer(unittest.TestCase):
                     "content": [
                         {
                             "type": "text",
-                            "text": "There is a man at the back of a yellow cab ironing his clothes."
+                            "text": "There is a man at the back of a yellow cab ironing his clothes.",
                         }
-                    ]
+                    ],
                 },
-                 {
+                {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": "Repeat your previous answer."
-                        }
-                    ]
+                        {"type": "text", "text": "Repeat your previous answer."}
+                    ],
                 },
             ],
             temperature=0,
