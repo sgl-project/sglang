@@ -76,6 +76,56 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
+    def test_multi_turn_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this image in a very short sentence.",
+                        },
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "There is a man at the back of a yellow cab ironing his clothes.",
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Repeat your previous answer."}
+                    ],
+                },
+            ],
+            temperature=0,
+        )
+
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+        assert "man" in text or "cab" in text, text
+        assert response.id
+        assert response.created
+        assert response.usage.prompt_tokens > 0
+        assert response.usage.completion_tokens > 0
+        assert response.usage.total_tokens > 0
+
     def test_mult_images_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
