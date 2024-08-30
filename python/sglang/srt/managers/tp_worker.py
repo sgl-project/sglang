@@ -337,6 +337,8 @@ class ModelTpServer:
                         self.running_batch,
                         i == global_config.num_continue_decode_steps - 1,
                     )
+                    if i == global_config.num_continue_decode_steps - 1:
+                        self.phase_indicator = Phase.PREPARE_PREFILL
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
