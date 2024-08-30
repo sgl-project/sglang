@@ -407,7 +407,6 @@ def monkey_patch_vllm_dummy_weight_loader():
         DummyModelLoader,
         LoRAConfig,
         ModelConfig,
-        MultiModalConfig,
         ParallelConfig,
         SchedulerConfig,
         _initialize_model,
@@ -422,7 +421,6 @@ def monkey_patch_vllm_dummy_weight_loader():
         model_config: ModelConfig,
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
-        multimodal_config: Optional[MultiModalConfig],
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
         cache_config: CacheConfig,
@@ -433,7 +431,6 @@ def monkey_patch_vllm_dummy_weight_loader():
                     model_config,
                     self.load_config,
                     lora_config,
-                    multimodal_config,
                     cache_config,
                 )
 
