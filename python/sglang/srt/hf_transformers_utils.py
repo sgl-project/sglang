@@ -50,20 +50,12 @@ for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
 
-from sglang.srt.utils import is_multimodal_model
-
 
 def download_from_hf(model_path: str):
     if os.path.exists(model_path):
         return model_path
 
     return snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
-
-
-def get_config_json(model_path: str):
-    with open(os.path.join(model_path, "configs.json")) as f:
-        config = json.load(f)
-    return config
 
 
 def get_config(
