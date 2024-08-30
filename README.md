@@ -233,7 +233,6 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ### Supported Models
 
 **Generative Models**
-
 - Llama / Llama 2 / Llama 3 / Llama 3.1
 - Mistral / Mixtral / Mistral NeMo
 - Gemma / Gemma 2
@@ -253,6 +252,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - Grok
 - ChatGLM
 - InternLM 2
+- Exaone 3
 
 **Embedding Models**
 
