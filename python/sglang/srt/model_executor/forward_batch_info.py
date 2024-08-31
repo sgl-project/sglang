@@ -215,11 +215,10 @@ class InputMetadata:
 
         flashinfer_use_ragged = False
         if not model_runner.server_args.disable_flashinfer:
-            if (
-                forward_mode != ForwardMode.DECODE
-                and int(torch.sum(ret.seq_lens)) > 4096
-                and ret.sp_size == 1
-            ):
+            if forward_mode != ForwardMode.DECODE and (
+                (int(torch.sum(ret.seq_lens)) > 4096 and ret.sp_size == 1)
+                or ret.sp_size > 1
+            ):  # NOTE: SP requires the ragged kernel regardless of the sequence length.
                 flashinfer_use_ragged = True
             ret.init_flashinfer_handlers(
                 model_runner,
