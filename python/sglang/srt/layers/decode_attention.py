@@ -129,7 +129,7 @@ def _fwd_kernel_stage2(
     kv_group_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    Lv: tl.constexpr
+    Lv: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -172,14 +172,16 @@ def _fwd_kernel_stage2(
         old_scale = tl.exp(e_max - n_e_max)
         p = tl.exp(qk - n_e_max)
         e_sum = e_sum * old_scale + tl.sum(p, 0)
-        v = tl.load(v_ptrs + v_index[:, None] * stride_buf_vbs, mask=(offs_d[None, :] < Lv))
+        v = tl.load(
+            v_ptrs + v_index[:, None] * stride_buf_vbs, mask=(offs_d[None, :] < Lv)
+        )
         acc = acc * old_scale + tl.sum(p[:, None] * v, 0)
         e_max = n_e_max
 
     acc = acc / e_sum
     off_o = cur_batch * stride_obs + cur_head * stride_oh + offs_d
     out_ptrs = Out + off_o
-    tl.store(out_ptrs, acc, mask=(offs_d<Lv))
+    tl.store(out_ptrs, acc, mask=(offs_d < Lv))
 
 
 def _decode_att_m_fwd(
@@ -209,7 +211,7 @@ def _decode_att_m_fwd(
         num_warps = 4
     else:
         num_warps = 2
-    
+
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
 
     _fwd_kernel_stage1[grid](
@@ -233,7 +235,7 @@ def _decode_att_m_fwd(
         logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=1,
-        Lk=Lk
+        Lk=Lk,
     )
 
 
@@ -275,7 +277,7 @@ def _decode_softmax_reducev_fwd(
         BLOCK_N=BLOCK,
         num_warps=num_warps,
         num_stages=3,
-        Lv=Lv
+        Lv=Lv,
     )
 
 

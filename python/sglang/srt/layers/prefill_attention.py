@@ -48,7 +48,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    Lk: tl.constexpr
+    Lk: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -75,7 +75,9 @@ def _fwd_kernel(
 
     mask_d = offs_d < Lk
 
-    q = tl.load(Q + off_q, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d), other=0.0)
+    q = tl.load(
+        Q + off_q, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d), other=0.0
+    )
 
     k_ptrs = K + off_k
     v_ptrs = V + off_v
@@ -137,7 +139,9 @@ def _fwd_kernel(
         + offs_d[None, :]
     )
     out_ptrs = Out + off_o
-    tl.store(out_ptrs, acc, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :]))
+    tl.store(
+        out_ptrs, acc, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :])
+    )
 
 
 def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
