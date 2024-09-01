@@ -250,9 +250,6 @@ class BatchTokenIDOut:
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
 
-    # def __post_init__(self):
-    #     # deepcopy meta_info to avoid modification in place
-    #     self.meta_info = copy.deepcopy(self.meta_info)
 
 
 @dataclass
