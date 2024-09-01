@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit-test-jobs:
+  run-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
     strategy:
@@ -48,9 +48,9 @@ jobs:
             python3 run_suite.py --suite minimal --range-begin 8
           fi
 
-  unit-test:
-    needs: unit-test-jobs
+  finish:
+    needs: [run-test]
     runs-on: ubuntu-latest
     steps:
-      - name: Merge step
-        run: echo "This is an empty merge step"
+      - name: Finish
+        run: echo "This is an empty step to ensure that all jobs are completed."
