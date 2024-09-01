@@ -21,6 +21,8 @@ Each data parallel worker can manage multiple tensor parallel workers.
 import dataclasses
 import logging
 import multiprocessing
+import multiprocessing.shared_memory
+import os
 from enum import Enum, auto
 
 import numpy as np
@@ -31,10 +33,13 @@ from sglang.srt.managers.controller_single import (
 )
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ControllerInfo,
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import kill_parent_process
+from sglang.utils import get_cache_info, get_exception_traceback
 from sglang.srt.utils import configure_logger, kill_parent_process
 from sglang.utils import get_exception_traceback
 
@@ -46,6 +51,7 @@ class LoadBalanceMethod(Enum):
 
     ROUND_ROBIN = auto()
     SHORTEST_QUEUE = auto()
+    RESOURCES_AWARE = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -64,7 +70,11 @@ class WorkerHandle:
     queue: multiprocessing.Queue
 
 
-class ControllerMulti:
+# class FlexScheduler:
+#     """A scheduler which dispatch """
+
+
+class ControllerMultiFlex:
     """A controller that manages multiple data parallel workers."""
 
     def __init__(
@@ -91,11 +101,13 @@ class ControllerMulti:
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
             LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
+            LoadBalanceMethod.RESOURCES_AWARE: self.resources_aware_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
         # Start data parallel workers
         self.workers = []
+        self.controller_info = ControllerInfo(server_args, model_overide_args)
         for i in range(server_args.dp_size):
             self.start_dp_worker(i)
 
@@ -119,6 +131,7 @@ class ControllerMulti:
                 gpu_ids,
                 dp_worker_id,
                 queue,
+                self.controller_info,
             ),
         )
         proc.start()
@@ -134,6 +147,41 @@ class ControllerMulti:
                 queue=queue,
             )
         )
+
+    def resources_aware_scheduler(self, input_requests):
+        if len(input_requests) == 0:
+            return
+        available_mem = [k.value for k in self.controller_info.available_kv_cache]
+        num_reqs_waiting = [k.value for k in self.controller_info.waiting_reqs]
+        # print(f"available_mem={available_mem}\nnum_reqs_waiting={num_reqs_waiting}\nnum_reqs_running={num_reqs_running}\n")
+
+        # check if all waitting
+        all_waitting = False
+        if min(num_reqs_waiting) > 0:
+            all_waitting = True
+        else:
+            all_waitting = False
+
+        #  select the no waitting nodes.
+        no_waiting = [1 if waiting == 0 else 0 for waiting in num_reqs_waiting]
+        for r in input_requests:
+            if all_waitting:
+                min_value = min(num_reqs_waiting)
+                min_indices = [
+                    i for i, x in enumerate(num_reqs_waiting) if x == min_value
+                ]
+
+                # find max available mem from waiting queue
+                index = max(min_indices, key=lambda i: available_mem[i])
+                self.workers[index].queue.put(r)
+                num_reqs_waiting[index] += 1
+                available_mem[index] -= len(r.input_ids)
+            else:
+                # find no waitting and max available mem node
+                filter_result = [a * b for a, b in zip(no_waiting, available_mem)]
+                index = filter_result.index(max(filter_result))
+                self.workers[index].queue.put(r)
+                available_mem[index] -= len(r.input_ids)
 
     def round_robin_scheduler(self, input_requests):
         for r in input_requests:
@@ -196,7 +244,7 @@ def start_controller_process(
     configure_logger(server_args)
 
     try:
-        controller = ControllerMulti(server_args, port_args, model_overide_args)
+        controller = ControllerMultiFlex(server_args, port_args, model_overide_args)
     except Exception:
         pipe_writer.send(get_exception_traceback())
         raise
@@ -206,6 +254,6 @@ def start_controller_process(
     try:
         controller.loop_for_forward()
     except Exception:
-        logger.error("Exception in ControllerMulti:\n" + get_exception_traceback())
+        logger.error("Exception in ControllerMultiFlex:\n" + get_exception_traceback())
     finally:
         kill_parent_process()

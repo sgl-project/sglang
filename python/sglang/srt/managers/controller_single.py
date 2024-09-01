@@ -19,8 +19,10 @@ import logging
 import multiprocessing
 from typing import List
 
+import numpy as np
 import zmq
 
+from sglang.srt.managers.io_struct import ControllerInfo
 from sglang.srt.managers.tp_worker import (
     ModelTpServer,
     broadcast_recv_input,
@@ -45,12 +47,15 @@ class ControllerSingle:
         is_data_parallel_worker: bool,
         dp_worker_id: int,
         mp_queue: multiprocessing.Queue,
+        controller_info: ControllerInfo = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
         self.is_dp_worker = is_data_parallel_worker
         self.dp_worker_id = dp_worker_id
         self.mp_queue = mp_queue
+        # Need by multi flex infer
+        self.controller_info = controller_info
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -86,6 +91,8 @@ class ControllerSingle:
             server_args,
             port_args.nccl_ports[dp_worker_id],
             model_overide_args,
+            controller_info,
+            dp_worker_id,
         )
         self.tp_cpu_group = self.tp_server.model_runner.tp_group.cpu_group
 
@@ -131,6 +138,7 @@ def start_controller_process(
     gpu_ids: List[int] = None,
     dp_worker_id: int = None,
     queue: multiprocessing.connection.Connection = None,
+    controller_info: ControllerInfo = None,
 ):
     """Start a controller process."""
     if is_data_parallel_worker:
@@ -154,6 +162,7 @@ def start_controller_process(
             is_data_parallel_worker,
             dp_worker_id,
             queue,
+            controller_info,
         )
     except Exception:
         pipe_writer.send(get_exception_traceback())

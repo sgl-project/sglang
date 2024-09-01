@@ -18,13 +18,20 @@ The definition of objects transfered between different
 processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
-import copy
+import multiprocessing
 import uuid
-from dataclasses import dataclass, field
+import copy
+from dataclasses import dataclass
+from multiprocessing import Value
 from typing import Dict, List, Optional, Union
 
+import numpy as np
+import torch
+
 from sglang.srt.managers.schedule_batch import BaseFinishReason
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling_params import SamplingParams
+from sglang.utils import get_cache_info
+
 
 
 @dataclass
@@ -293,6 +300,25 @@ class UpdateWeightReqInput:
 
 
 @dataclass
+class DetokenizeReqInput:
+    input_ids: List[int]
+
+
+class ControllerInfo:
+    def __init__(self, server_args, model_overide_args):
+        self.available_kv_cache = []
+        self.waiting_prefill_compute = []
+        self.running_reqs = []
+        self.waiting_reqs = []
+        self.swap_in_queue = []
+        self.lock = multiprocessing.Lock()
+        for i in range(server_args.dp_size):
+            self.available_kv_cache.append(Value("i", 0))
+            self.waiting_prefill_compute.append(Value("i", 0))
+            self.running_reqs.append(Value("i", 0))
+            self.waiting_reqs.append(Value("i", 0))
+            self.swap_in_queue.append(multiprocessing.Queue())
+
 class UpdateWeightReqOutput:
     success: bool
     message: str
@@ -302,3 +328,4 @@ class UpdateWeightReqOutput:
 class AbortReq:
     # The request id
     rid: str
+

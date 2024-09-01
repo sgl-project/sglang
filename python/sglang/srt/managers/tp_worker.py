@@ -21,6 +21,7 @@ import os
 import pickle
 import time
 import warnings
+from multiprocessing import shared_memory
 from typing import Any, List, Optional, Union
 
 import torch
@@ -36,6 +37,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
     BatchTokenIDOut,
+    ControllerInfo,
     FlushCacheReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -77,12 +79,17 @@ class ModelTpServer:
         server_args: ServerArgs,
         nccl_port: int,
         model_overide_args: dict,
+        controller_info: Optional[ControllerInfo] = None,
+        dp_worker_id: Optional[int] = None,
     ):
+
         suppress_other_loggers()
 
         # Copy arguments
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
+
+        self.dp_rank = dp_worker_id
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
@@ -105,6 +112,16 @@ class ModelTpServer:
             nccl_port=nccl_port,
             server_args=server_args,
         )
+
+        # Flex DP inference
+        if controller_info:
+            self.controller_info = controller_info
+            self.controller_info.available_kv_cache[self.dp_rank].value = (
+                self.model_runner.token_to_kv_pool.available_size()
+            )
+        else:
+            self.controller_info = None
+
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
@@ -177,6 +194,7 @@ class ModelTpServer:
         self.running_batch: ScheduleBatch = None
         self.out_pyobjs = []
         self.decode_forward_ct = 0
+        self.forward_ct = 0
         self.stream_interval = server_args.stream_interval
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
@@ -392,7 +410,6 @@ class ModelTpServer:
                 ),
                 self.max_req_input_len - 1 - len(req.origin_input_ids),
             )
-
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
@@ -500,6 +517,24 @@ class ModelTpServer:
             batch.mix_with_running(self.running_batch)
             decoding_reqs = self.running_batch.reqs
             self.running_batch = None
+
+        if self.controller_info:
+            num = 0
+            for req in batch.reqs:
+                num += len(req.origin_input_ids)
+            with self.controller_info.lock:
+                self.controller_info.waiting_prefill_compute[self.dp_rank].value -= num
+                self.controller_info.available_kv_cache[self.dp_rank].value = (
+                    self.token_to_kv_pool.available_size()
+                    + self.tree_cache.evictable_size()
+                )
+                self.controller_info.running_reqs[
+                    self.dp_rank
+                ].value = batch.batch_size() + (
+                    self.running_batch.batch_size()
+                    if self.running_batch is not None
+                    else 0
+                )
 
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
@@ -663,13 +698,21 @@ class ModelTpServer:
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
+
+            if self.controller_info:
+                num = 0
+                for req in retracted_reqs:
+                    num += len(req.fill_ids)
+                with self.controller_info.lock:
+                    self.controller_info.waiting_prefill_compute[
+                        self.dp_rank
+                    ].value += num
             self.waiting_queue.extend(retracted_reqs)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
-
         if not self.disable_regex_jump_forward:
             # Check for jump-forward
             jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
@@ -680,6 +723,16 @@ class ModelTpServer:
         # Update batch tensors
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         batch.prepare_for_decode()
+
+        if self.controller_info is not None and self.decode_forward_ct % 10 == 0:
+            with self.controller_info.lock:
+                self.controller_info.available_kv_cache[self.dp_rank].value = (
+                    self.token_to_kv_pool.available_size()
+                    + self.tree_cache.evictable_size()
+                )
+                self.controller_info.running_reqs[self.dp_rank].value = (
+                    batch.batch_size()
+                )
 
         # Forward and sample the next tokens
         sample_output, logits_output = self.model_runner.forward(

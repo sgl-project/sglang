@@ -16,6 +16,9 @@ from typing import Union
 import numpy as np
 import requests
 
+from sglang.srt.model_config import AttentionArch, ModelConfig
+from sglang.srt.server_args import ServerArgs
+
 logger = logging.getLogger(__name__)
 
 
@@ -226,6 +229,22 @@ def find_printable_text(text: str):
     # which may change with the subsequent token -- there are probably smarter ways to do this!)
     else:
         return text[: text.rfind(" ") + 1]
+
+
+def get_cache_info(server_args: ServerArgs, model_overide_args):
+    """Extract the kv cache infromation from ServerArgs."""
+    model_config = ModelConfig(
+        server_args.model_path,
+        server_args.trust_remote_code,
+        context_length=server_args.context_length,
+        model_overide_args=model_overide_args,
+    )
+    assert (
+        model_config.attention_arch == AttentionArch.MHA
+    ), "FlexController Only Support MHA Currently"
+    tp_size = server_args.tp_size
+    shape = (model_config.get_num_kv_heads(tp_size), model_config.head_dim)
+    return shape
 
 
 def graceful_registry(sub_module_name: str):
