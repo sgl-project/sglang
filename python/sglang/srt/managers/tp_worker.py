@@ -233,16 +233,40 @@ class ModelTpServer:
         self.new_token_ratio = self.min_new_token_ratio
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
 
-        self.ready_prefill_batch = queue.Queue()
-        self.finished_requests = queue.Queue()
-        self.retracted_requests = queue.Queue()
+        self._init_multi_threads()
+
+    def _init_multi_threads(self):
+        class ArrayQueue:
+            def __init__(self):
+                self.q = []
+
+            def put(self, item):
+                self.q.append(item)
+
+            def get_nowait(self):
+                if len(self.q) == 0:
+                    raise queue.Empty
+                return self.q.pop(0)
+
+            def empty(self):
+                return len(self.q) == 0
+
+        # FIXME: temp workaround
+        self.serialized_memory_access = self.tp_size > 1
+
+        if not self.serialized_memory_access:
+            self.ready_prefill_batch = queue.Queue()
+            self.finished_requests = queue.Queue()
+            self.retracted_requests = queue.Queue()
+        else:
+            self.ready_prefill_batch = ArrayQueue()
+            self.finished_requests = ArrayQueue()
+            self.retracted_requests = ArrayQueue()
 
         self.phase_indicator = Phase.PREPARE_PREFILL
         self.compute_loop_thread = threading.Thread(target=self.compute_loop)
         self.compute_loop_thread.daemon = True
 
-        # FIXME: temp workaround
-        self.serialized_memory_access = self.tp_size > 1
         # Start compute loop thread
         if not self.serialized_memory_access:
             self.compute_loop_thread.start()
