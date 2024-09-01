@@ -18,12 +18,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit-test-1-gpu:
+  unit-test-frontend:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
-    strategy:
-      matrix:
-        test_type: ['backend-0', 'backend-1', 'frontend']
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -37,21 +34,50 @@ jobs:
       - name: Run test
         timeout-minutes: 20
         run: |
-          if [ "${{ matrix.test_type }}" = "frontend" ]; then
-            cd test/lang
-            python3 run_suite.py --suite minimal
-          elif [ "${{ matrix.test_type }}" = "backend-0" ]; then
-            cd test/srt
-            python3 run_suite.py --suite minimal --range-begin 0 --range-end 8
-          elif [ "${{ matrix.test_type }}" = "backend-1" ]; then
-            cd test/srt
-            python3 run_suite.py --suite minimal --range-begin 8
-          fi
+          cd test/lang
+          python3 run_suite.py --suite minimal
+
+  unit-test-backend-part-0:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[dev]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite minimal --range-begin 0 --range-end 8
+
+  unit-test-backend-part-1:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[dev]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite minimal --range-begin 8
 
   performance-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -89,7 +115,6 @@ jobs:
   performance-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -121,7 +146,6 @@ jobs:
   accuracy-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -145,7 +169,6 @@ jobs:
   accuracy-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -168,7 +191,8 @@ jobs:
 
   finish:
     needs: [
-      unit-test-1-gpu, performance-test-1-gpu, performance-test-2-gpu,
+      unit-test-frontend, unit-test-backend-part-0, unit-test-backend-part-1,
+      performance-test-1-gpu, performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu
     ]
     runs-on: ubuntu-latest
