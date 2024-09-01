@@ -276,7 +276,10 @@ def extend_attention_fwd(
     BLOCK_DV = Lv
 
     if CUDA_CAPABILITY[0] >= 9:
-        BLOCK_M, BLOCK_N = (128, 64)
+        if Lq <= 256:
+            BLOCK_M, BLOCK_N = (128, 64)
+        else:
+            BLOCK_M, BLOCK_N = (32, 64)
     elif CUDA_CAPABILITY[0] >= 8:
         if Lq <= 128:
             BLOCK_M, BLOCK_N = (128, 128)
