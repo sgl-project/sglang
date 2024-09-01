@@ -74,7 +74,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            assert res["output_throughput"] > 2350
+            assert res["output_throughput"] > 2400
 
     def test_default_without_radix_cache(self):
         res = self.run_test(
