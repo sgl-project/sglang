@@ -162,7 +162,6 @@ def start_controller_process(
     pipe_writer.send("init ok")
 
     try:
-        controller.tp_server.compute_loop_thread.start()
         controller.control_loop()
     except Exception:
         logger.error("Exception in ControllerSingle:\n" + get_exception_traceback())

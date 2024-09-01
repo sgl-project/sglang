@@ -99,9 +99,6 @@ class ModelTpServer:
         self.schedule_policy = server_args.schedule_policy
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
 
-        # FIXME: temp workaround
-        self.serialized_memory_access = self.tp_size > 1
-
         # Init model and tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,
@@ -244,15 +241,24 @@ class ModelTpServer:
         self.compute_loop_thread = threading.Thread(target=self.compute_loop)
         self.compute_loop_thread.daemon = True
 
+        # FIXME: temp workaround
+        self.serialized_memory_access = self.tp_size > 1
+        # Start compute loop thread
+        if not self.serialized_memory_access:
+            self.compute_loop_thread.start()
+
     def control_step(self, recv_reqs: List):
         try:
             # Forward
             self.forward_pre_post_process(recv_reqs)
         except Exception:
             logger.error(
-                "Exception in ModelTpServer.exposed_step:\n" + get_exception_traceback()
+                "Exception in ModelTpServer.control_step:\n" + get_exception_traceback()
             )
             raise
+
+        if self.serialized_memory_access:
+            self.compute_step()
 
         # Return results
         ret = []
@@ -274,7 +280,6 @@ class ModelTpServer:
         self.send_to_detokenizer(finished_requests)
         for req in finished_requests:
             self.tree_cache.cache_finished_req(req)
-            self.finished_requests.task_done()
 
         # put retracted requests back to waiting queue
         while not self.retracted_requests.empty():
@@ -337,8 +342,6 @@ class ModelTpServer:
                         self.running_batch,
                         i == global_config.num_continue_decode_steps - 1,
                     )
-                    if i == global_config.num_continue_decode_steps - 1:
-                        self.phase_indicator = Phase.PREPARE_PREFILL
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
@@ -571,10 +574,6 @@ class ModelTpServer:
         return new_batch
 
     def forward_prefill_batch(self, batch: ScheduleBatch):
-        # Sync memory access
-        if self.serialized_memory_access:
-            self.finished_requests.join()
-
         # Build batch tensors
         batch.prepare_for_extend(self.model_config.vocab_size)
 
@@ -763,15 +762,11 @@ class ModelTpServer:
             if batch.is_empty():
                 return
 
-        # Sync memory access
-        if self.serialized_memory_access:
-            self.finished_requests.join()
-
         # Update batch tensors
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         batch.prepare_for_decode()
 
-        if is_last_decode and not self.serialized_memory_access:
+        if is_last_decode:
             # start preparing prefill batch only before the last decode iteration
             self.phase_indicator = Phase.PREPARE_PREFILL
 
@@ -989,7 +984,6 @@ def run_tp_server(
             model_override_args,
         )
         tp_cpu_group = model_server.model_runner.tp_group.cpu_group
-        model_server.compute_loop_thread.start()
         while True:
             recv_reqs = broadcast_recv_input(None, tp_rank, tp_cpu_group)
             model_server.control_step(recv_reqs)
