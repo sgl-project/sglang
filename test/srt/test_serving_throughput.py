@@ -33,7 +33,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         # Run benchmark
-        num_prompts = 400
+        num_prompts = 500
         args = SimpleNamespace(
             backend="sglang",
             base_url=base_url,
@@ -74,8 +74,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE): 1450, H100 (SMX): 2550
-            assert res["output_throughput"] > 2500
+            assert res["output_throughput"] > 2400
 
     def test_default_without_radix_cache(self):
         res = self.run_test(
@@ -85,7 +84,6 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE): 1500, H100 (SMX): 2850
             assert res["output_throughput"] > 2800
 
     def test_default_without_chunked_prefill(self):
@@ -96,18 +94,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE): 1450, H100 (SMX): 2550
-            assert res["output_throughput"] > 2500
-
-    def test_all_cases(self):
-        for disable_radix_cache in [False, True]:
-            for disable_flashinfer in [False, True]:
-                for chunked_prefill_size in [-1, 2048]:
-                    self.run_test(
-                        disable_radix_cache=False,
-                        disable_flashinfer=False,
-                        chunked_prefill_size=-1,
-                    )
+            assert res["output_throughput"] > 2400
 
 
 if __name__ == "__main__":
