@@ -71,12 +71,12 @@ class ControllerMulti:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        model_overide_args,
+        model_override_args,
     ):
         # Parse args
         self.server_args = server_args
         self.port_args = port_args
-        self.model_overide_args = model_overide_args
+        self.model_override_args = model_override_args
         self.load_balance_method = LoadBalanceMethod.from_str(
             server_args.load_balance_method
         )
@@ -114,7 +114,7 @@ class ControllerMulti:
                 self.server_args,
                 self.port_args,
                 pipe_controller_writer,
-                self.model_overide_args,
+                self.model_override_args,
                 True,
                 gpu_ids,
                 dp_worker_id,
@@ -189,14 +189,14 @@ def start_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer,
-    model_overide_args: dict,
+    model_override_args: dict,
 ):
     """Start a controller process."""
 
     configure_logger(server_args)
 
     try:
-        controller = ControllerMulti(server_args, port_args, model_overide_args)
+        controller = ControllerMulti(server_args, port_args, model_override_args)
     except Exception:
         pipe_writer.send(get_exception_traceback())
         raise

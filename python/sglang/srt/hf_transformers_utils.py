@@ -62,7 +62,7 @@ def get_config(
     model: str,
     trust_remote_code: bool,
     revision: Optional[str] = None,
-    model_overide_args: Optional[dict] = None,
+    model_override_args: Optional[dict] = None,
 ):
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision
@@ -70,8 +70,8 @@ def get_config(
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
         config = config_class.from_pretrained(model, revision=revision)
-    if model_overide_args:
-        config.update(model_overide_args)
+    if model_override_args:
+        config.update(model_override_args)
     return config
 
 

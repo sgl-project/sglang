@@ -77,7 +77,7 @@ class TokenizerManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        model_overide_args: dict = None,
+        model_override_args: dict = None,
     ):
         self.server_args = server_args
 
@@ -95,7 +95,7 @@ class TokenizerManager:
         self.hf_config = get_config(
             self.model_path,
             trust_remote_code=server_args.trust_remote_code,
-            model_overide_args=model_overide_args,
+            model_override_args=model_override_args,
         )
         self.is_generation = is_generation_model(
             self.hf_config.architectures, self.server_args.is_embedding
