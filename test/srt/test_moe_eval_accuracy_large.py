@@ -42,8 +42,6 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        print(metrics)
-
         assert metrics["score"] >= 0.63, f"{metrics}"
 
     def test_human_eval(self):
@@ -56,8 +54,6 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        print(metrics)
-
         assert metrics["score"] >= 0.43, f"{metrics}"
 
     def test_mgsm_en(self):
@@ -70,8 +66,6 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        print(metrics)
-
         assert metrics["score"] >= 0.64, f"{metrics}"
 
 
