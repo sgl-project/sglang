@@ -348,13 +348,7 @@ class ModelRunner:
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
-            if self.server_args.disable_flashinfer or self.server_args.enable_mla:
-                logger.warning(
-                    "FP8 KV cache is not supported for Triton kernel now, using auto kv cache dtype"
-                )
-                self.kv_cache_dtype = self.dtype
-            else:
-                self.kv_cache_dtype = torch.float8_e5m2
+            self.kv_cache_dtype = torch.float8_e5m2
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
