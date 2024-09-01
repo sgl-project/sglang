@@ -108,13 +108,16 @@ class PrefillAdder:
     def __init__(
         self,
         tree_cache: BasePrefixCache,
+        new_token_ratio: float,
         rem_total_tokens: int,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
     ):
         self.tree_cache = tree_cache
-        self.rem_total_tokens = rem_total_tokens - mixed_with_decode_tokens
+        self.new_token_ratio = new_token_ratio
+        self.rem_total_phy_tokens = rem_total_tokens - mixed_with_decode_tokens
+        self.rem_total_vir_tokens = rem_total_tokens - mixed_with_decode_tokens
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         if self.rem_chunk_tokens is not None:
@@ -127,7 +130,8 @@ class PrefillAdder:
 
     def no_remaining_tokens(self):
         return (
-            self.rem_total_tokens <= 0
+            self.rem_total_phy_tokens <= 0
+            or self.rem_total_vir_tokens <= 0
             or self.rem_input_tokens <= 0
             or (
                 self.rem_chunk_tokens <= 0
@@ -136,24 +140,19 @@ class PrefillAdder:
             )
         )
 
-    def remove_running_tokens(
-        self, running_batch: ScheduleBatch, new_token_ratio: float
-    ):
-        self.rem_total_tokens -= sum(
-            [
-                min(
-                    (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                    CLIP_MAX_NEW_TOKENS,
-                )
-                * new_token_ratio
-                for r in running_batch.reqs
-            ]
-        )
+    def remove_running_tokens(self, running_batch: ScheduleBatch):
+        for r in running_batch.reqs:
+            self.rem_total_vir_tokens += len(r.output_ids) - self.new_token_ratio * min(
+                r.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            )
 
     def _prefill_one_req(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
-        self.rem_total_tokens -= extend_input_len + max_new_tokens
+        self.rem_total_phy_tokens -= extend_input_len
+        self.rem_total_vir_tokens -= (
+            extend_input_len + max_new_tokens * self.new_token_ratio
+        )
         self.rem_input_tokens -= extend_input_len
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= extend_input_len
@@ -184,27 +183,38 @@ class PrefillAdder:
     def _lock_node(self, last_node: TreeNode):
         try:
             delta = self.tree_cache.inc_lock_ref(last_node)
-            self.rem_total_tokens += delta
+            self.rem_total_phy_tokens += delta
+            self.rem_total_vir_tokens += delta
             yield None
         finally:
             delta = self.tree_cache.dec_lock_ref(last_node)
-            self.rem_total_tokens += delta
+            self.rem_total_phy_tokens += delta
+            self.rem_total_vir_tokens += delta
 
     def add_one_req(self, req: Req):
-        total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+        phy_tokens = req.extend_input_len
+        vir_tokens = (
+            req.extend_input_len
+            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            * self.new_token_ratio
         )
         input_tokens = req.extend_input_len
         prefix_len = len(req.prefix_indices)
 
-        if total_tokens >= self.rem_total_tokens:
+        if phy_tokens >= self.rem_total_phy_tokens:
+            return False
+
+        if vir_tokens >= self.rem_total_vir_tokens:
             return False
 
         if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
             return False
 
         with self._lock_node(req.last_node):
-            if total_tokens > self.rem_total_tokens:
+            if phy_tokens > self.rem_total_phy_tokens:
+                return False
+
+            if vir_tokens > self.rem_total_vir_tokens:
                 return False
 
             if (

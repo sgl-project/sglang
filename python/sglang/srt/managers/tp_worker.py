@@ -409,6 +409,7 @@ class ModelTpServer:
 
         adder = PrefillAdder(
             self.tree_cache,
+            self.new_token_ratio,
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
             self.max_prefill_tokens,
             self.chunked_prefill_size,
@@ -416,7 +417,7 @@ class ModelTpServer:
         )
 
         if self.running_batch is not None:
-            adder.remove_running_tokens(self.running_batch, self.new_token_ratio)
+            adder.remove_running_tokens(self.running_batch)
 
         has_inflight = self.current_inflight_req is not None
         if self.current_inflight_req is not None:
