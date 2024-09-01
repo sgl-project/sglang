@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  single-gpu-test:
+  one-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
 
@@ -42,7 +42,7 @@ jobs:
           cd test/srt
           python3 test_eval_accuracy_large.py
 
-  two-gpu-test:
+  two-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner
 
@@ -67,7 +67,7 @@ jobs:
           python3 test_moe_eval_accuracy_large.py
 
   finish:
-    needs: [single-gpu-test, two-gpu-test]
+    needs: [one-gpu, two-gpu]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
