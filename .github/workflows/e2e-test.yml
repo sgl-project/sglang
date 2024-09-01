@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e2e-test:
+  1-gpu-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
 
@@ -54,3 +54,41 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_chunked_prefill
+
+  2-gpu-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 2-gpu-runner
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Benchmark Serving Throughput (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default
+
+      - name: Benchmark Serving Latency (TP=2)
+        timeout-minutes: 10
+        run: |
+          python3 -m sglang.bench_latency --model mistralai/Mixtral-8x7B-Instruct-v0.1 --tp 2 --batch-size 1 --input 128 --output 8
+
+      - name: Benchmark Serving Throughput (w/o RadixAttention) (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default_without_radix_cache
+
+  finish:
+    needs: [1-gpu-test, 2-gpu-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Finish
+        run: echo "This is an empty step to ensure that all jobs are completed."
