@@ -15,7 +15,7 @@ limitations under the License.
 
 """
 Memory-efficient attention for prefill.
-It supporst page size = 1 and prefill with KV cache (i.e. extend).
+It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
 import torch
@@ -67,6 +67,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     logit_cap: tl.constexpr,
+    Lq: tl.constexpr, Lv: tl.constexpr
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -86,13 +87,16 @@ def _fwd_kernel(
     offs_m = tl.arange(0, BLOCK_M)
     mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len_extend
 
+    mask_d = (offs_d < Lq)
+    mask_dv = (offs_dv < Lv)
+
     offs_q = (
         (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None])
         * stride_qbs
         + cur_head * stride_qh
         + offs_d[None, :]
     )
-    q = tl.load(Q_Extend + offs_q, mask=mask_m[:, None], other=0.0)
+    q = tl.load(Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0)
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
@@ -125,7 +129,7 @@ def _fwd_kernel(
             + cur_kv_head * stride_buf_kh
             + offs_d[:, None]
         )
-        k = tl.load(K_Buffer + offs_buf_k, mask=mask_n[None, :], other=0.0)
+        k = tl.load(K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
@@ -158,7 +162,7 @@ def _fwd_kernel(
             + cur_kv_head * stride_buf_vh
             + offs_dv[None, :]
         )
-        v = tl.load(V_Buffer + offs_buf_v, mask=mask_n[:, None], other=0.0)
+        v = tl.load(V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0)
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -177,7 +181,7 @@ def _fwd_kernel(
             + cur_kv_head * stride_kh
             + offs_d[:, None]
         )
-        k = tl.load(K_Extend + offs_k, mask=mask_n[None, :], other=0.0)
+        k = tl.load(K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
@@ -217,7 +221,7 @@ def _fwd_kernel(
             + cur_kv_head * stride_vh
             + offs_dv[None, :]
         )
-        v = tl.load(V_Extend + offs_v, mask=mask_n[:, None], other=0.0)
+        v = tl.load(V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0)
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -229,7 +233,7 @@ def _fwd_kernel(
         + cur_head * stride_oh
         + offs_dv[None, :]
     )
-    tl.store(O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None])
+    tl.store(O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None] & mask_dv[None, :])
 
 
 def extend_attention_fwd(
@@ -264,16 +268,18 @@ def extend_attention_fwd(
     )
 
     assert Lq == Lk and Lv == Lo
-    assert Lq in {16, 32, 64, 128, 256, 576}
-    assert Lv in {16, 32, 64, 128, 256, 512}
+
+    # TODO: is the assertion necessary?
+    assert Lq in {16, 32, 64, 96, 128, 256, 576}
+    assert Lv in {16, 32, 64, 96, 128, 256, 512}
 
     if Lq == 576:
         BLOCK_DMODEL = 512
         BLOCK_DPE = 64
     else:
-        BLOCK_DMODEL = Lq
+        BLOCK_DMODEL = triton.next_power_of_2(Lq)
         BLOCK_DPE = 0
-    BLOCK_DV = Lv
+    BLOCK_DV = triton.next_power_of_2(Lv)
 
     if CUDA_CAPABILITY[0] >= 9:
         BLOCK_M, BLOCK_N = (128, 64)
@@ -325,6 +331,8 @@ def extend_attention_fwd(
         num_warps=num_warps,
         num_stages=num_stages,
         logit_cap=logit_cap,
+        Lq=Lq,
+        Lv=Lv,
     )
 
 
@@ -371,7 +379,7 @@ def redundant_attention(
 def test():
     torch.manual_seed(0)
 
-    B, N_CTX, H_Q, H_KV, D = 19, 12331, 12, 4, 128
+    B, N_CTX, H_Q, H_KV, D = 19, 12331, 12, 4, 96 # 128
     dtype = torch.float16
 
     b_seq_len_prefix = torch.randint(
