@@ -33,17 +33,17 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
-        model_overide_args: Optional[dict] = None,
+        model_override_args: Optional[dict] = None,
     ) -> None:
         self.path = path
         self.trust_remote_code = trust_remote_code
         self.revision = revision
-        self.model_overide_args = model_overide_args
+        self.model_override_args = model_override_args
         self.hf_config = get_config(
             self.path,
             trust_remote_code,
             revision,
-            model_overide_args=model_overide_args,
+            model_override_args=model_override_args,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         if context_length is not None:
