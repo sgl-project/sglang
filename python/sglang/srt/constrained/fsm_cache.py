@@ -79,7 +79,7 @@ class FSMCache(BaseToolCache):
 
     def init_value(self, value):
         if self.json_schema_mode:
-            regex = build_regex_from_schema(value)
+            regex = build_regex_from_schema(value, whitespace_pattern=r"[\n\t ]*")
             return RegexGuide(regex, self.outlines_tokenizer), regex
         else:
             return RegexGuide(value, self.outlines_tokenizer)
