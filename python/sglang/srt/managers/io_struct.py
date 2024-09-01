@@ -251,7 +251,6 @@ class BatchTokenIDOut:
     finished_reason: List[BaseFinishReason]
 
 
-
 @dataclass
 class BatchStrOut:
     # The request id
