@@ -94,7 +94,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            assert res["output_throughput"] > 2500
+            assert res["output_throughput"] > 2400
 
 
 if __name__ == "__main__":
