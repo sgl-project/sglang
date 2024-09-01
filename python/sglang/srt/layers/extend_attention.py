@@ -136,8 +136,7 @@ def _fwd_kernel(
             K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
         )
 
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)
+        qk = tl.dot(q.to(k.dtype), k)
         if BLOCK_DPE > 0:
             offs_kpe = (
                 offs_kv_loc[None, :] * stride_buf_kbs
@@ -149,7 +148,7 @@ def _fwd_kernel(
                 mask=mask_n[None, :],
                 other=0.0,
             )
-            qk += tl.dot(qpe, kpe)
+            qk += tl.dot(qpe.to(kpe.dtype), kpe)
         qk *= sm_scale
 
         if logit_cap > 0:
@@ -192,9 +191,7 @@ def _fwd_kernel(
             K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
         )
 
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)
-
+        qk = tl.dot(q, k, out_dtype=tl.float32)
         if BLOCK_DPE > 0:
             offs_kpe = (
                 (cur_seq_extend_start_contiguous + start_n + offs_n[None, :])
@@ -295,9 +292,17 @@ def extend_attention_fwd(
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     if CUDA_CAPABILITY[0] >= 9:
-        BLOCK_M, BLOCK_N = (128, 64)
+        if Lq <= 256:
+            BLOCK_M, BLOCK_N = (128, 64)
+        else:
+            BLOCK_M, BLOCK_N = (32, 64)
     elif CUDA_CAPABILITY[0] >= 8:
-        BLOCK_M, BLOCK_N = (128, 128) if Lq <= 128 else (64, 64)
+        if Lq <= 128:
+            BLOCK_M, BLOCK_N = (128, 128)
+        elif Lq <= 256:
+            BLOCK_M, BLOCK_N = (64, 64)
+        else:
+            BLOCK_M, BLOCK_N = (32, 64)
     else:
         BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 

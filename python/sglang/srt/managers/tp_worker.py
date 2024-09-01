@@ -76,7 +76,7 @@ class ModelTpServer:
         tp_rank: int,
         server_args: ServerArgs,
         nccl_port: int,
-        model_overide_args: dict,
+        model_override_args: dict,
     ):
         suppress_other_loggers()
 
@@ -93,7 +93,7 @@ class ModelTpServer:
             server_args.model_path,
             server_args.trust_remote_code,
             context_length=server_args.context_length,
-            model_overide_args=model_overide_args,
+            model_override_args=model_override_args,
         )
 
         self.model_runner = ModelRunner(
@@ -876,7 +876,7 @@ def run_tp_server(
     tp_rank: int,
     server_args: ServerArgs,
     nccl_port: int,
-    model_overide_args: dict,
+    model_override_args: dict,
 ):
     """Run a tensor parallel model server."""
     configure_logger(server_args, prefix=f" TP{tp_rank}")
@@ -887,7 +887,7 @@ def run_tp_server(
             tp_rank,
             server_args,
             nccl_port,
-            model_overide_args,
+            model_override_args,
         )
         tp_cpu_group = model_server.model_runner.tp_group.cpu_group
 
@@ -904,14 +904,14 @@ def launch_tp_servers(
     tp_rank_range: List[int],
     server_args: ServerArgs,
     nccl_port: int,
-    model_overide_args: dict,
+    model_override_args: dict,
 ):
     """Launch multiple tensor parallel servers."""
     procs = []
     for i in tp_rank_range:
         proc = multiprocessing.Process(
             target=run_tp_server,
-            args=(gpu_ids[i], i, server_args, nccl_port, model_overide_args),
+            args=(gpu_ids[i], i, server_args, nccl_port, model_override_args),
         )
         proc.start()
         procs.append(proc)
