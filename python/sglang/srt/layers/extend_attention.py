@@ -375,11 +375,7 @@ def redundant_attention(
         o_extend[pt : pt + cur_seq_len_extend] = o_buffer[pl:pr]
         pt += cur_seq_len_extend
 
-
-def test():
-    torch.manual_seed(0)
-
-    B, N_CTX, H_Q, H_KV, D = 19, 12331, 12, 4, 96 # 128
+def test_once(B, N_CTX, H_Q, H_KV, D):
     dtype = torch.float16
 
     b_seq_len_prefix = torch.randint(
@@ -476,4 +472,5 @@ def test():
 
 
 if __name__ == "__main__":
-    test()
+    test_once(19, 12331, 12, 4, 128)
+    test_once(19, 12331, 12, 4, 96)
