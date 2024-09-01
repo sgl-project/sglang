@@ -1,4 +1,4 @@
-name: E2E Test
+name: Pull Request Test
 
 on:
   push:
@@ -14,11 +14,41 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: e2e-test-${{ github.ref }}
+  group: pr-test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  one-gpu:
+  unit-test-1-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    strategy:
+      matrix:
+        test_type: ['backend-0', 'backend-1', 'frontend']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[dev]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          if [ "${{ matrix.test_type }}" = "frontend" ]; then
+            cd test/lang
+            python3 run_suite.py --suite minimal
+          elif [ "${{ matrix.test_type }}" = "backend-0" ]; then
+            cd test/srt
+            python3 run_suite.py --suite minimal --range-begin 0 --range-end 8
+          elif [ "${{ matrix.test_type }}" = "backend-1" ]; then
+            cd test/srt
+            python3 run_suite.py --suite minimal --range-begin 8
+          fi
+
+  performance-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
 
@@ -56,7 +86,7 @@ jobs:
           cd test/srt
           python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_chunked_prefill
 
-  two-gpu:
+  performance-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner
 
@@ -88,8 +118,59 @@ jobs:
           cd test/srt
           python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default_without_radix_cache
 
+  accuracy-test-1-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Evaluate Accuracy
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_eval_accuracy_large.py
+
+  accuracy-test-2-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 2-gpu-runner
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Evaluate Accuracy
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_moe_eval_accuracy_large.py
+
   finish:
-    needs: [one-gpu, two-gpu]
+    needs: [
+      unit-test-1-gpu, performance-test-1-gpu, performance-test-2-gpu,
+      accuracy-test-1-gpu, accuracy-test-2-gpu
+    ]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
