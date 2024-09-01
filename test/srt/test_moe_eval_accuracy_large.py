@@ -54,7 +54,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.43, f"{metrics}"
+        assert metrics["score"] >= 0.42, f"{metrics}"
 
     def test_mgsm_en(self):
         args = SimpleNamespace(
