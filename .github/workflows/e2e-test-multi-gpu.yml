@@ -41,7 +41,7 @@ jobs:
       - name: Benchmark Serving Latency (TP=2)
         timeout-minutes: 10
         run: |
-          python3 -m sglang.bench_latency --model mistralai/Mixtral-8x7B-Instruct-v0.1 --batch-size 1 --input 128 --output 8
+          python3 -m sglang.bench_latency --model mistralai/Mixtral-8x7B-Instruct-v0.1 --tp 2 --batch-size 1 --input 128 --output 8
 
       - name: Benchmark Serving Throughput (w/o RadixAttention) (TP=2)
         timeout-minutes: 10
