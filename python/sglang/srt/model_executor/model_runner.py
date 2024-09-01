@@ -195,9 +195,9 @@ class ModelRunner:
             monkey_patch_vllm_qvk_linear_loader()
 
         self.dtype = self.vllm_model_config.dtype
-        if self.model_config.model_overide_args is not None:
+        if self.model_config.model_override_args is not None:
             self.vllm_model_config.hf_config.update(
-                self.model_config.model_overide_args
+                self.model_config.model_override_args
             )
 
         self.model = get_model(
