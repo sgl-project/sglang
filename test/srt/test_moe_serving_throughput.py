@@ -75,8 +75,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE): 950, H100 (SMX): 1800
-            assert res["output_throughput"] > 1750
+            assert res["output_throughput"] > 1800
 
     def test_default_without_radix_cache(self):
         res = self.run_test(
@@ -86,8 +85,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE): 950, H100 (SMX): 1900
-            assert res["output_throughput"] > 1850
+            assert res["output_throughput"] > 2000
 
 
 if __name__ == "__main__":
