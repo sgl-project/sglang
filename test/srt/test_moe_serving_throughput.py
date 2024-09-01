@@ -23,7 +23,6 @@ class TestServingThroughput(unittest.TestCase):
             other_args.append("--disable-flashinfer")
         other_args.extend(["--chunked-prefill-size", str(chunked_prefill_size)])
         other_args.extend(["--tensor-parallel-size", "2"])
-        other_args.append("--enable-p2p-check")
 
         model = DEFAULT_MOE_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
@@ -35,7 +34,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         # Run benchmark
-        num_prompts = 200
+        num_prompts = 300
         args = SimpleNamespace(
             backend="sglang",
             base_url=base_url,
@@ -76,8 +75,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE): 950, H100 (SMX): 1800
-            assert res["output_throughput"] > 1750
+            assert res["output_throughput"] > 1800
 
     def test_default_without_radix_cache(self):
         res = self.run_test(
@@ -87,18 +85,7 @@ class TestServingThroughput(unittest.TestCase):
         )
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-            # A100 (PCIE): 950, H100 (SMX): 1900
-            assert res["output_throughput"] > 1850
-
-    def test_all_cases(self):
-        for disable_radix_cache in [False, True]:
-            for disable_flashinfer in [False, True]:
-                for chunked_prefill_size in [-1, 2048]:
-                    self.run_test(
-                        disable_radix_cache=False,
-                        disable_flashinfer=False,
-                        chunked_prefill_size=-1,
-                    )
+            assert res["output_throughput"] > 1950
 
 
 if __name__ == "__main__":
