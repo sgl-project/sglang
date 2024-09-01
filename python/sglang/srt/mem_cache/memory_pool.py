@@ -93,7 +93,7 @@ class BaseTokenToKVPool(ABC):
         self.prefetch_chunk_size = 512
 
         self.can_use_mem_size = self.size
-        # serializes allocation and deallocation operations to the memory pool
+        # serialize allocation and deallocation operations to the memory pool
         self.lock = threading.Lock()
         self.clear()
 
