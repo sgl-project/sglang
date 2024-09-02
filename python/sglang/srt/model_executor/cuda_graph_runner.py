@@ -46,8 +46,10 @@ def _to_torch(model: torch.nn.Module, reverse: bool = False):
         if isinstance(sub, CustomOp):
             if reverse:
                 sub._forward_method = sub.forward_cuda
+                setattr(sub, "is_torch_compile", False)
             else:
                 sub._forward_method = sub.forward_native
+                setattr(sub, "is_torch_compile", True)
         if isinstance(sub, torch.nn.Module):
             _to_torch(sub, reverse)
 
