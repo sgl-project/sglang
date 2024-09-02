@@ -50,7 +50,6 @@ class SamplingBatchInfo:
         ret.temperatures = torch.ones((max_bs, 1), dtype=torch.float, device="cuda")
         ret.top_ps = torch.ones((max_bs,), dtype=torch.float, device="cuda")
         ret.top_ks = torch.ones((max_bs,), dtype=torch.int, device="cuda")
-        ret.min_ps = torch.zeros((max_bs,), dtype=torch.float, device="cuda")
         return ret
 
     def __getitem__(self, key):
@@ -62,7 +61,6 @@ class SamplingBatchInfo:
                 temperatures=self.temperatures[key],
                 top_ps=self.top_ps[key],
                 top_ks=self.top_ks[key],
-                min_ps=self.min_ps[key],
             )
         else:
             raise NotImplementedError
@@ -75,7 +73,6 @@ class SamplingBatchInfo:
         self.temperatures[:bs] = other.temperatures
         self.top_ps[:bs] = other.top_ps
         self.top_ks[:bs] = other.top_ks
-        self.min_ps[:bs] = other.min_ps
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -94,6 +91,7 @@ class SamplingBatchInfo:
         ret.top_ks = torch.tensor(
             [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
         )
+
         ret.min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
         )
