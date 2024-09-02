@@ -17,6 +17,7 @@ limitations under the License.
 
 import bisect
 from contextlib import contextmanager
+from typing import Callable, List
 
 import torch
 from flashinfer import BatchDecodeWithPagedKVCacheWrapper
@@ -25,16 +26,18 @@ from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
 from sglang.srt.layers.logits_processor import (
-    LogitProcessorOutput,
     LogitsMetadata,
     LogitsProcessor,
+    LogitsProcessorOutput,
 )
+from sglang.srt.layers.sampler import SampleOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     InputMetadata,
     update_flashinfer_indices,
 )
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import monkey_patch_vllm_all_gather
 
 
@@ -51,12 +54,12 @@ def _to_torch(model: torch.nn.Module, reverse: bool = False):
 
 @contextmanager
 def patch_model(
-    model: torch.nn.Module, use_compile: bool, tp_group: "GroupCoordinator"
+    model: torch.nn.Module, enable_compile: bool, tp_group: "GroupCoordinator"
 ):
     backup_ca_comm = None
 
     try:
-        if use_compile:
+        if enable_compile:
             _to_torch(model)
             monkey_patch_vllm_all_gather()
             backup_ca_comm = tp_group.ca_comm
@@ -65,7 +68,7 @@ def patch_model(
         else:
             yield model.forward
     finally:
-        if use_compile:
+        if enable_compile:
             _to_torch(model, reverse=True)
             monkey_patch_vllm_all_gather(reverse=True)
             tp_group.ca_comm = backup_ca_comm
@@ -84,13 +87,20 @@ def set_torch_compile_config():
 
 
 class CudaGraphRunner:
-    def __init__(self, model_runner, max_batch_size_to_capture, use_torch_compile):
+    def __init__(
+        self,
+        model_runner: "ModelRunner",
+        max_batch_size_to_capture: int,
+        use_torch_compile: bool,
+        disable_padding: bool,
+    ):
         self.model_runner = model_runner
         self.graphs = {}
         self.input_buffers = {}
         self.output_buffers = {}
         self.flashinfer_handlers = {}
         self.graph_memory_pool = None
+        self.disable_padding = disable_padding
 
         # Common inputs
         self.max_bs = max_batch_size_to_capture
@@ -120,13 +130,13 @@ class CudaGraphRunner:
         )
         if model_runner.sliding_window_size is None:
             self.flashinfer_workspace_buffer = (
-                self.model_runner.flashinfer_workspace_buffers[0]
+                self.model_runner.flashinfer_workspace_buffer
             )
         else:
-            self.flashinfer_workspace_buffers = [
-                self.model_runner.flashinfer_workspace_buffers[0],
-                self.model_runner.flashinfer_workspace_buffers[2],
-            ]
+            self.flashinfer_workspace_buffer = (
+                self.model_runner.flashinfer_workspace_buffer
+            )
+
             self.flashinfer_kv_indptr = [
                 self.flashinfer_kv_indptr,
                 self.flashinfer_kv_indptr.clone(),
@@ -136,15 +146,22 @@ class CudaGraphRunner:
                 self.flashinfer_kv_indices.clone(),
             ]
 
+        # Sampling inputs
+        vocab_size = model_runner.model_config.vocab_size
+        self.sampling_info = SamplingBatchInfo.dummy_one(self.max_bs, vocab_size)
+
         self.compile_bs = [1, 2, 4, 8, 16, 24, 32] if use_torch_compile else []
 
         if use_torch_compile:
             set_torch_compile_config()
 
-    def can_run(self, batch_size):
-        return batch_size < self.max_bs
+    def can_run(self, batch_size: int):
+        if self.disable_padding:
+            return batch_size in self.graphs
+        else:
+            return batch_size <= self.max_bs
 
-    def capture(self, batch_size_list):
+    def capture(self, batch_size_list: List[int]):
         self.batch_size_list = batch_size_list
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
@@ -165,7 +182,7 @@ class CudaGraphRunner:
                     self.output_buffers[bs] = output_buffers
                     self.flashinfer_handlers[bs] = flashinfer_handler
 
-    def capture_one_batch_size(self, bs, forward):
+    def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
 
@@ -207,7 +224,7 @@ class CudaGraphRunner:
             for i in range(2):
                 flashinfer_decode_wrapper.append(
                     BatchDecodeWithPagedKVCacheWrapper(
-                        self.flashinfer_workspace_buffers[i],
+                        self.flashinfer_workspace_buffer,
                         "NHD",
                         use_cuda_graph=True,
                         use_tensor_cores=use_tensor_cores,
@@ -233,6 +250,7 @@ class CudaGraphRunner:
         def run_once():
             input_metadata = InputMetadata(
                 forward_mode=ForwardMode.DECODE,
+                sampling_info=self.sampling_info[:bs],
                 batch_size=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -252,12 +270,23 @@ class CudaGraphRunner:
             return forward(input_ids, input_metadata.positions, input_metadata)
 
         for _ in range(2):
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+
             run_once()
 
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+
         torch.cuda.synchronize()
+        self.model_runner.tp_group.barrier()
+
         with torch.cuda.graph(graph, pool=self.graph_memory_pool, stream=stream):
             out = run_once()
+
         torch.cuda.synchronize()
+        self.model_runner.tp_group.barrier()
+
         self.graph_memory_pool = graph.pool()
         return graph, None, out, flashinfer_decode_wrapper
 
@@ -290,25 +319,35 @@ class CudaGraphRunner:
             self.flashinfer_handlers[bs],
         )
 
+        # Sampling inputs
+        self.sampling_info.inplace_assign(raw_bs, batch.sampling_info)
+
         # Replay
+        torch.cuda.synchronize()
         self.graphs[bs].replay()
-        output = self.output_buffers[bs]
+        torch.cuda.synchronize()
+        sample_output, logits_output = self.output_buffers[bs]
 
         # Unpad
         if bs != raw_bs:
-            output = LogitProcessorOutput(
-                next_token_logits=output.next_token_logits[:raw_bs],
+            logits_output = LogitsProcessorOutput(
+                next_token_logits=logits_output.next_token_logits[:raw_bs],
                 next_token_logprobs=None,
                 normalized_prompt_logprobs=None,
                 input_token_logprobs=None,
                 input_top_logprobs=None,
                 output_top_logprobs=None,
             )
+            sample_output = SampleOutput(
+                sample_output.success[:raw_bs],
+                sample_output.probs[:raw_bs],
+                sample_output.batch_next_token_ids[:raw_bs],
+            )
 
         # Extract logprobs
         if batch.return_logprob:
-            output.next_token_logprobs = torch.nn.functional.log_softmax(
-                output.next_token_logits, dim=-1
+            logits_output.next_token_logprobs = torch.nn.functional.log_softmax(
+                logits_output.next_token_logits, dim=-1
             )
             return_top_logprob = any(x > 0 for x in batch.top_logprobs_nums)
             if return_top_logprob:
@@ -316,8 +355,8 @@ class CudaGraphRunner:
                     forward_mode=ForwardMode.DECODE,
                     top_logprobs_nums=batch.top_logprobs_nums,
                 )
-                output.output_top_logprobs = LogitsProcessor.get_top_logprobs(
-                    output.next_token_logprobs, logits_metadata
+                logits_output.output_top_logprobs = LogitsProcessor.get_top_logprobs(
+                    logits_output.next_token_logprobs, logits_metadata
                 )[1]
 
-        return output
+        return sample_output, logits_output

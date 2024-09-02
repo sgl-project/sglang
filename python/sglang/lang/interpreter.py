@@ -20,7 +20,6 @@ from sglang.lang.ir import (
     SglConstantText,
     SglExpr,
     SglExprList,
-    SglFunction,
     SglGen,
     SglImage,
     SglRoleBegin,
@@ -181,8 +180,10 @@ class StreamExecutor:
         num_api_spec_tokens=None,
         use_thread=True,
     ):
+        from sglang.lang.backend.base_backend import BaseBackend
+
         self.sid = uuid.uuid4().hex
-        self.backend = backend
+        self.backend: BaseBackend = backend
         self.arguments: Dict[str, Any] = arguments
         self.default_sampling_para = default_sampling_para
         self.stream = stream
@@ -658,9 +659,11 @@ class StreamExecutor:
         for item in [
             "max_new_tokens",
             "stop",
+            "stop_token_ids",
             "temperature",
             "top_p",
             "top_k",
+            "min_p",
             "frequency_penalty",
             "presence_penalty",
             "ignore_eos",
@@ -670,6 +673,7 @@ class StreamExecutor:
             "return_text_in_logprobs",
             "dtype",
             "regex",
+            "json_schema",
         ]:
             value = getattr(sampling_params, item, None)
             if value is not None:
@@ -851,6 +855,8 @@ class ProgramState:
         return self.stream_executor.get_meta_info(name)
 
     def __iadd__(self, other):
+        if other is None:
+            raise ValueError("Tried to append None to state.")
         self.stream_executor.submit(other)
         return self
 

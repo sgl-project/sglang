@@ -1,13 +1,12 @@
 # Adapted from https://github.com/openai/simple-evals/
 
-import base64
 import os
 import resource
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import jinja2
@@ -44,8 +43,8 @@ class EvalResult:
     Result of running an evaluation (usually consisting of many samples)
     """
 
-    score: float | None  # top-line metric
-    metrics: Dict[str, float] | None  # other metrics
+    score: Optional[float]  # top-line metric
+    metrics: Optional[Dict[str, float]]  # other metrics
     htmls: List[str]  # strings of valid HTML
     convos: List[MessageList]  # sampled conversations
 
@@ -56,10 +55,10 @@ class SingleEvalResult:
     Result of evaluating a single sample
     """
 
-    score: float | None
+    score: Optional[float]
     metrics: Dict[str, float] = field(default_factory=dict)
-    html: str | None = None
-    convo: MessageList | None = None  # sampled conversation
+    html: Optional[str] = None
+    convo: Optional[MessageList] = None  # sampled conversation
 
 
 class Eval:
@@ -89,8 +88,8 @@ class ChatCompletionSampler(SamplerBase):
     def __init__(
         self,
         base_url: str = None,
-        model: str | None = None,
-        system_message: str | None = None,
+        model: Optional[str] = None,
+        system_message: Optional[str] = None,
         temperature: float = 0.0,
         max_tokens: int = 2048,
     ):
@@ -272,7 +271,7 @@ def _compute_stat(values: list, stat: str):
 def aggregate_results(
     single_eval_results: List[SingleEvalResult],
     default_stats: Tuple[str] = ("mean", "std"),
-    name2stats: Dict[str, Tuple[str]] | None = None,
+    name2stats: Optional[Dict[str, Tuple[str]]] = None,
 ) -> EvalResult:
     """
     Aggregate results from multiple evaluations into a single EvalResult.

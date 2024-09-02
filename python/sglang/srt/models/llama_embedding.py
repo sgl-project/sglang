@@ -29,7 +29,11 @@ class LlamaEmbeddingModel(nn.Module):
         positions: torch.Tensor,
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
+        get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
+        assert (
+            get_embedding
+        ), "LlamaEmbeddingModel / MistralModel is only used for embedding"
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
         return self.pooler(hidden_states, input_metadata)
 
@@ -53,14 +57,15 @@ class LlamaEmbeddingModel(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 return
+            if name.startswith("model.vision_tower") and name not in params_dict:
+                return
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name.startswith("model.vision_tower") and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -69,8 +74,6 @@ class LlamaEmbeddingModel(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    return
-                if name.startswith("model.vision_tower") and name not in params_dict:
                     return
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

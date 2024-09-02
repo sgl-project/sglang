@@ -26,7 +26,7 @@ import struct
 import time
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import psutil
@@ -193,44 +193,30 @@ def allocate_init_ports(
     return ret_ports[0], ret_ports[1:num_ports_needed]
 
 
-def get_int_token_logit_bias(tokenizer, vocab_size):
-    """Get the logit bias for integer-only tokens."""
-    # a bug when model's vocab size > tokenizer.vocab_size
-    if tokenizer == None:
-        return [-1e5] * vocab_size
-    vocab_size = tokenizer.vocab_size
-    logit_bias = np.zeros(vocab_size, dtype=np.float32)
-    for t_id in range(vocab_size):
-        ss = tokenizer.decode([t_id]).strip()
-        if not (ss.isdigit() or len(ss) == 0 or t_id == tokenizer.eos_token_id):
-            logit_bias[t_id] = -1e5
-
-    return logit_bias
+def is_multimodal_model(model_architectures):
+    if (
+        "LlavaLlamaForCausalLM" in model_architectures
+        or "LlavaQwenForCausalLM" in model_architectures
+        or "LlavaMistralForCausalLM" in model_architectures
+        or "LlavaVidForCausalLM" in model_architectures
+    ):
+        return True
+    else:
+        return False
 
 
-def is_multimodal_model(model):
-    from sglang.srt.model_config import ModelConfig
+def is_generation_model(model_architectures, is_embedding: bool = False):
+    # We have two ways to determine whether a model is a generative model.
+    # 1. Check the model architectue
+    # 2. check the `is_embedding` server args
 
-    if isinstance(model, str):
-        model = model.lower()
-        return "llava" in model or "yi-vl" in model or "llava-next" in model
-
-    if isinstance(model, ModelConfig):
-        model_path = model.path.lower()
-        return (
-            "llava" in model_path or "yi-vl" in model_path or "llava-next" in model_path
-        )
-
-    raise ValueError("unrecognized type")
-
-
-def is_generation_model(model_architectures):
     if (
         "LlamaEmbeddingModel" in model_architectures
         or "MistralModel" in model_architectures
     ):
         return False
-    return True
+    else:
+        return not is_embedding
 
 
 def decode_video_base64(video_base64):
@@ -312,12 +298,14 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_image(image_file):
+def load_image(image_file: Union[str, bytes]):
     from PIL import Image
 
     image = image_size = None
 
-    if image_file.startswith("http://") or image_file.startswith("https://"):
+    if isinstance(image_file, bytes):
+        image = Image.open(BytesIO(image_file))
+    elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
         image = Image.open(BytesIO(response.content))
@@ -329,8 +317,10 @@ def load_image(image_file):
     elif image_file.startswith("video:"):
         image_file = image_file.replace("video:", "")
         image, image_size = decode_video_base64(image_file)
-    else:
+    elif isinstance(image_file, str):
         image = Image.open(BytesIO(base64.b64decode(image_file)))
+    else:
+        raise ValueError(f"Invalid image: {image}")
 
     return image, image_size
 
@@ -347,7 +337,7 @@ def suppress_other_loggers():
         logging.WARN
     )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
-    logging.getLogger("vllm.utils").setLevel(logging.WARN)
+    logging.getLogger("vllm.utils").setLevel(logging.ERROR)
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
@@ -369,14 +359,11 @@ def kill_parent_process():
     """Kill the parent process and all children of the parent process."""
     current_process = psutil.Process()
     parent_process = current_process.parent()
-    children = parent_process.children(recursive=True)
-    for child in children:
-        if child.pid != current_process.pid:
-            os.kill(child.pid, 9)
-    os.kill(parent_process.pid, 9)
+    kill_child_process(parent_process.pid, skip_pid=current_process.pid)
 
 
-def kill_child_process(pid, including_parent=True):
+def kill_child_process(pid, including_parent=True, skip_pid=None):
+    """Kill the process and all its children process."""
     try:
         parent = psutil.Process(pid)
     except psutil.NoSuchProcess:
@@ -384,6 +371,8 @@ def kill_child_process(pid, including_parent=True):
 
     children = parent.children(recursive=True)
     for child in children:
+        if child.pid == skip_pid:
+            continue
         try:
             child.kill()
         except psutil.NoSuchProcess:
@@ -418,7 +407,6 @@ def monkey_patch_vllm_dummy_weight_loader():
         DummyModelLoader,
         LoRAConfig,
         ModelConfig,
-        MultiModalConfig,
         ParallelConfig,
         SchedulerConfig,
         _initialize_model,
@@ -433,7 +421,6 @@ def monkey_patch_vllm_dummy_weight_loader():
         model_config: ModelConfig,
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
-        multimodal_config: Optional[MultiModalConfig],
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
         cache_config: CacheConfig,
@@ -444,7 +431,6 @@ def monkey_patch_vllm_dummy_weight_loader():
                     model_config,
                     self.load_config,
                     lora_config,
-                    multimodal_config,
                     cache_config,
                 )
 
@@ -452,10 +438,6 @@ def monkey_patch_vllm_dummy_weight_loader():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     quant_method.process_weights_after_loading(module)
-                # FIXME: Remove this after Mixtral is updated
-                # to use quant_method.
-                if hasattr(module, "process_weights_after_loading"):
-                    module.process_weights_after_loading()
 
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
@@ -692,7 +674,7 @@ def monkey_patch_vllm_qvk_linear_loader():
     setattr(QKVParallelLinear, "weight_loader", weight_loader_srt)
 
 
-def add_api_key_middleware(app, api_key):
+def add_api_key_middleware(app, api_key: str):
     @app.middleware("http")
     async def authentication(request, call_next):
         if request.method == "OPTIONS":
@@ -704,7 +686,7 @@ def add_api_key_middleware(app, api_key):
         return await call_next(request)
 
 
-def prepare_model(model_path):
+def prepare_model(model_path: str):
     if "SGLANG_USE_MODELSCOPE" in os.environ:
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
@@ -713,7 +695,7 @@ def prepare_model(model_path):
     return model_path
 
 
-def prepare_tokenizer(tokenizer_path):
+def prepare_tokenizer(tokenizer_path: str):
     if "SGLANG_USE_MODELSCOPE" in os.environ:
         if not os.path.exists(tokenizer_path):
             from modelscope import snapshot_download
@@ -722,3 +704,13 @@ def prepare_tokenizer(tokenizer_path):
                 tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
             )
     return tokenizer_path
+
+
+def configure_logger(server_args, prefix: str = ""):
+    format = f"[%(asctime)s{prefix}] %(message)s"
+    logging.basicConfig(
+        level=getattr(logging, server_args.log_level.upper()),
+        format=format,
+        datefmt="%H:%M:%S",
+        force=True,
+    )

@@ -24,7 +24,7 @@ from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.logits_processor import LogitProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama2 import LlamaModel
 
@@ -65,7 +65,7 @@ class LlamaForClassification(nn.Module):
                 (input_metadata.batch_size, self.config.classification_out_size)
             ).to(input_ids.device)
 
-        return LogitProcessorOutput(
+        return LogitsProcessorOutput(
             next_token_logits=scores,
             next_token_logprobs=scores,
             normalized_prompt_logprobs=scores,
@@ -103,8 +103,6 @@ class LlamaForClassification(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                if name.startswith("model.vision_tower") and name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -112,8 +110,6 @@ class LlamaForClassification(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name.startswith("model.vision_tower") and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

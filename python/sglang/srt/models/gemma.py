@@ -23,7 +23,6 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import GeluAndMul
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -34,9 +33,11 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.sampler import Sampler
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
@@ -60,7 +61,7 @@ class GemmaMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
         )
-        self.act_fn = GeluAndMul()
+        self.act_fn = GeluAndMul("none")
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
@@ -287,6 +288,7 @@ class GemmaForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.model = GemmaModel(config, quant_config=quant_config)
         self.logits_processor = LogitsProcessor(config)
+        self.sampler = Sampler()
 
     @torch.no_grad()
     def forward(
@@ -297,9 +299,11 @@ class GemmaForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens.weight, input_metadata
         )
+        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
+        return (sample_output, logits_output)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

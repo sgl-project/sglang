@@ -130,6 +130,7 @@ class CompiledFunction:
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
+        min_p: float = 0.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         backend=None,
@@ -145,6 +146,7 @@ class CompiledFunction:
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
         )
@@ -160,6 +162,7 @@ class CompiledFunction:
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
+        min_p: float = 0.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         backend=None,
@@ -178,6 +181,7 @@ class CompiledFunction:
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
         )
