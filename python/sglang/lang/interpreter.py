@@ -855,6 +855,8 @@ class ProgramState:
         return self.stream_executor.get_meta_info(name)
 
     def __iadd__(self, other):
+        if other is None:
+            raise ValueError("Tried to append None to state.")
         self.stream_executor.submit(other)
         return self
 
