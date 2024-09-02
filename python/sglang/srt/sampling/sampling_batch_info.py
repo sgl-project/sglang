@@ -91,7 +91,6 @@ class SamplingBatchInfo:
         ret.top_ks = torch.tensor(
             [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
         )
-
         ret.min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
         )
