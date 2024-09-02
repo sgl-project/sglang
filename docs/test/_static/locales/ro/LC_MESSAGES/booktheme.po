@@ -1,0 +1,75 @@
+
+msgid ""
+msgstr ""
+"Project-Id-Version: Sphinx-Book-Theme\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: ro\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Print to PDF"
+msgstr "Imprimați în PDF"
+
+msgid "Theme by the"
+msgstr "Tema de"
+
+msgid "Download source file"
+msgstr "Descărcați fișierul sursă"
+
+msgid "open issue"
+msgstr "problema deschisă"
+
+msgid "Contents"
+msgstr "Cuprins"
+
+msgid "previous page"
+msgstr "pagina anterioară"
+
+msgid "Download notebook file"
+msgstr "Descărcați fișierul notebook"
+
+msgid "Copyright"
+msgstr "Drepturi de autor"
+
+msgid "Download this page"
+msgstr "Descarcă această pagină"
+
+msgid "Source repository"
+msgstr "Depozit sursă"
+
+msgid "By"
+msgstr "De"
+
+msgid "repository"
+msgstr "repertoriu"
+
+msgid "Last updated on"
+msgstr "Ultima actualizare la"
+
+msgid "Toggle navigation"
+msgstr "Comutare navigare"
+
+msgid "Sphinx Book Theme"
+msgstr "Tema Sphinx Book"
+
+msgid "suggest edit"
+msgstr "sugerează editare"
+
+msgid "Open an issue"
+msgstr "Deschideți o problemă"
+
+msgid "Launch"
+msgstr "Lansa"
+
+msgid "Fullscreen mode"
+msgstr "Modul ecran întreg"
+
+msgid "Edit this page"
+msgstr "Editați această pagină"
+
+msgid "By the"
+msgstr "Langa"
+
+msgid "next page"
+msgstr "pagina următoare"

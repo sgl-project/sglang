@@ -1,0 +1,75 @@
+
+msgid ""
+msgstr ""
+"Project-Id-Version: Sphinx-Book-Theme\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: sr\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Print to PDF"
+msgstr "Испис у ПДФ"
+
+msgid "Theme by the"
+msgstr "Тхеме би"
+
+msgid "Download source file"
+msgstr "Преузми изворну датотеку"
+
+msgid "open issue"
+msgstr "отворено издање"
+
+msgid "Contents"
+msgstr "Садржај"
+
+msgid "previous page"
+msgstr "Претходна страница"
+
+msgid "Download notebook file"
+msgstr "Преузмите датотеку бележнице"
+
+msgid "Copyright"
+msgstr "Ауторско право"
+
+msgid "Download this page"
+msgstr "Преузмите ову страницу"
+
+msgid "Source repository"
+msgstr "Изворно спремиште"
+
+msgid "By"
+msgstr "Од стране"
+
+msgid "repository"
+msgstr "спремиште"
+
+msgid "Last updated on"
+msgstr "Последње ажурирање"
+
+msgid "Toggle navigation"
+msgstr "Укључи / искључи навигацију"
+
+msgid "Sphinx Book Theme"
+msgstr "Тема књиге Спхинк"
+
+msgid "suggest edit"
+msgstr "предложи уређивање"
+
+msgid "Open an issue"
+msgstr "Отворите издање"
+
+msgid "Launch"
+msgstr "Лансирање"
+
+msgid "Fullscreen mode"
+msgstr "Режим целог екрана"
+
+msgid "Edit this page"
+msgstr "Уредите ову страницу"
+
+msgid "By the"
+msgstr "Од"
+
+msgid "next page"
+msgstr "Следећа страна"

@@ -1,0 +1,982 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Sampling Parameters in SGLang Runtime &#8212; SGLang</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/bootstrap.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+
+  
+  <link href="_static/vendor/fontawesome/6.5.2/css/all.min.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=fa44fd50" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/sphinx-book-theme.css?v=a3416100" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="_static/tabs.css?v=a5c4661c" />
+    <link rel="stylesheet" type="text/css" href="_static/css/readthedocs.css?v=73f7402e" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
+  <script src="_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+    <script src="_static/documentation_options.js?v=94fa8dad"></script>
+    <script src="_static/doctools.js?v=9a2dae69"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=ccdb6887"></script>
+    <script src="_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'sampling_params';</script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Benchmark and Profiling" href="benchmark_and_profiling.html" />
+    <link rel="prev" title="How to Support a New Model" href="model_support.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+    <meta name="docbuild:last-update" content="Sep 02, 2024"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-primary-sidebar-checkbox"/>
+  <label class="overlay overlay-primary" for="pst-primary-sidebar-checkbox"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-secondary-sidebar-checkbox"/>
+  <label class="overlay overlay-secondary" for="pst-secondary-sidebar-checkbox"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/logo.png" class="logo__image only-light" alt="SGLang - Home"/>
+    <script>document.write(`<img src="_static/logo.png" class="logo__image only-dark" alt="SGLang - Home"/>`);</script>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Hyperparameter Tuning</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="hyperparameter_tuning.html">Guide on Hyperparameter Tuning</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Custom Chat Template</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="custom_chat_template.html">Custom Chat Template in SGLang Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="test.html">Testing Your Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Support</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="model_support.html">How to Support a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Sampling Params</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Sampling Parameters in SGLang Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmark and Profilling</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="benchmark_and_profiling.html">Benchmark and Profiling</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sglang" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sglang/blob/main/docs/en/sampling_params.md?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sglang/edit/main/docs/en/sampling_params.md" target="_blank"
+   class="btn btn-sm btn-source-edit-button dropdown-item"
+   title="Suggest edit"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-pencil-alt"></i>
+  </span>
+<span class="btn__text-container">Suggest edit</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sglang/issues/new?title=Issue%20on%20page%20%2Fsampling_params.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="_sources/sampling_params.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script>
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm pst-navbar-icon search-button search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+  </button>
+`);
+</script>
+<button class="sidebar-toggle secondary-toggle btn btn-sm" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Sampling Parameters in SGLang Runtime</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#normal">Normal</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#streaming">Streaming</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-modal">Multi modal</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-implications-on-penalties">Performance Implications on Penalties</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#latency">Latency</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#memory">Memory</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmarks">Benchmarks</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#baseline">Baseline</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#all-together">All Together</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#frequency-penalty">Frequency Penalty</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#presence-penalty">Presence Penalty</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#repetition-penalty">Repetition Penalty</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#min-new-tokens">Min New Tokens</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="sampling-parameters-in-sglang-runtime">
+<h1>Sampling Parameters in SGLang Runtime<a class="headerlink" href="#sampling-parameters-in-sglang-runtime" title="Link to this heading">#</a></h1>
+<p>This doc describes the sampling parameters of the SGLang Runtime.
+It is the low-level endpoint of the runtime.
+If you want a high-level endpoint that can automatically handle chat templates, consider using the <a class="reference external" href="https://github.com/sgl-project/sglang?tab=readme-ov-file#openai-compatible-api">OpenAI Compatible API
+</a>.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">/generate</span></code> endpoint accepts the following arguments in the JSON format.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span> <span class="nc">GenerateReqInput</span><span class="p">:</span>
+    <span class="c1"># The input prompt. It can be a single prompt or a batch of prompts.</span>
+    <span class="n">text</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The token ids for text; one can either specify text or input_ids.</span>
+    <span class="n">input_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The image input. It can be a file name, a url, or base64 encoded string.</span>
+    <span class="c1"># See also python/sglang/srt/utils.py:load_image.</span>
+    <span class="n">image_data</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The sampling_params. See descriptions below.</span>
+    <span class="n">sampling_params</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">Dict</span><span class="p">],</span> <span class="n">Dict</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The request id.</span>
+    <span class="n">rid</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Whether to return logprobs.</span>
+    <span class="n">return_logprob</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">bool</span><span class="p">],</span> <span class="nb">bool</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The start location of the prompt for return_logprob.</span>
+    <span class="n">logprob_start_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The number of top logprobs to return.</span>
+    <span class="n">top_logprobs_num</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Whether to detokenize tokens in text in the returned logprobs.</span>
+    <span class="n">return_text_in_logprobs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Whether to stream output.</span>
+    <span class="n">stream</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">sampling_params</span></code> follows this format</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># The maximum number of output tokens</span>
+<span class="n">max_new_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128</span><span class="p">,</span>
+<span class="c1"># Stop when hitting any of the strings in this list.</span>
+<span class="n">stop</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="c1"># Stop when hitting any of the token_ids in this list. Could be useful when mixed with</span>
+<span class="c1"># `min_new_tokens`.</span>
+<span class="n">stop_token_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[],</span>
+<span class="c1"># Sampling temperature</span>
+<span class="n">temperature</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
+<span class="c1"># Top-p sampling</span>
+<span class="n">top_p</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
+<span class="c1"># Top-k sampling</span>
+<span class="n">top_k</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+<span class="c1"># Min-p sampling</span>
+<span class="n">min_p</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span>
+<span class="c1"># Whether to ignore EOS token.</span>
+<span class="n">ignore_eos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+<span class="c1"># Whether to skip the special tokens during detokenization.</span>
+<span class="n">skip_special_tokens</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+<span class="c1"># Whether to add spaces between special tokens during detokenization.</span>
+<span class="n">spaces_between_special_tokens</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+<span class="c1"># Constrains the output to follow a given regular expression.</span>
+<span class="n">regex</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="c1"># Do parallel sampling and return `n` outputs.</span>
+<span class="n">n</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+<span class="c1"># Constrains the output to follow a given JSON schema.</span>
+<span class="c1"># `regex` and `json_schema` cannot be set at the same time.</span>
+<span class="n">json_schema</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+
+<span class="c1">## Penalties. See [Performance Implications on Penalties] section below for more informations.</span>
+
+<span class="c1"># Float that penalizes new tokens based on their frequency in the generated text so far.</span>
+<span class="c1"># Values &gt; 0 encourage the model to use new tokens, while values &lt; 0 encourage the model to</span>
+<span class="c1"># repeat tokens. Must be -2 &lt;= value &lt;= 2. Setting to 0 (default) will disable this penalty.</span>
+<span class="n">frequency_penalty</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span>
+<span class="c1"># Float that penalizes new tokens based on whether they appear in the generated text so far.</span>
+<span class="c1"># Values &gt; 0 encourage the model to use new tokens, while values &lt; 0 encourage the model to repeat</span>
+<span class="c1"># tokens. Must be -2 &lt;= value &lt;= 2. Setting to 0 (default) will disable this penalty.</span>
+<span class="n">presence_penalty</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span>
+<span class="c1"># Float that penalizes new tokens based on whether they appear in the prompt and the generated text</span>
+<span class="c1"># so far. Values &gt; 1 encourage the model to use new tokens, while values &lt; 1 encourage the model to</span>
+<span class="c1"># repeat tokens. Must be 0 &lt;= value &lt;= 2. Setting to 1 (default) will disable this penalty.</span>
+<span class="n">repetition_penalty</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
+<span class="c1"># Guides inference to generate at least this number of tokens by penalizing logits of tokenizer&#39;s</span>
+<span class="c1"># EOS token and `stop_token_ids` to -inf, until the output token reaches given length.</span>
+<span class="c1"># Note that any of the `stop` string can be generated before reaching `min_new_tokens`, as it is</span>
+<span class="c1"># difficult to infer the correct token ID by given `stop` strings.</span>
+<span class="c1"># Must be 0 &lt;= value &lt; max_new_tokens. Setting to 0 (default) will disable this penalty.</span>
+<span class="n">min_new_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+</pre></div>
+</div>
+<section id="examples">
+<h2>Examples<a class="headerlink" href="#examples" title="Link to this heading">#</a></h2>
+<section id="normal">
+<h3>Normal<a class="headerlink" href="#normal" title="Link to this heading">#</a></h3>
+<p>Launch a server</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="o">-</span><span class="n">m</span> <span class="n">sglang</span><span class="o">.</span><span class="n">launch_server</span> <span class="o">--</span><span class="n">model</span><span class="o">-</span><span class="n">path</span> <span class="n">meta</span><span class="o">-</span><span class="n">llama</span><span class="o">/</span><span class="n">Meta</span><span class="o">-</span><span class="n">Llama</span><span class="o">-</span><span class="mi">3</span><span class="o">-</span><span class="mi">8</span><span class="n">B</span><span class="o">-</span><span class="n">Instruct</span> <span class="o">--</span><span class="n">port</span> <span class="mi">30000</span>
+</pre></div>
+</div>
+<p>Send a request</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">requests</span>
+
+<span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span>
+    <span class="s2">&quot;http://localhost:30000/generate&quot;</span><span class="p">,</span>
+    <span class="n">json</span><span class="o">=</span><span class="p">{</span>
+        <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;sampling_params&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;temperature&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+            <span class="s2">&quot;max_new_tokens&quot;</span><span class="p">:</span> <span class="mi">32</span><span class="p">,</span>
+        <span class="p">},</span>
+    <span class="p">},</span>
+<span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">json</span><span class="p">())</span>
+</pre></div>
+</div>
+</section>
+<section id="streaming">
+<h3>Streaming<a class="headerlink" href="#streaming" title="Link to this heading">#</a></h3>
+<p>Send a request and stream the output</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">requests</span><span class="o">,</span> <span class="nn">json</span>
+
+<span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span>
+    <span class="s2">&quot;http://localhost:30000/generate&quot;</span><span class="p">,</span>
+    <span class="n">json</span><span class="o">=</span><span class="p">{</span>
+        <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;sampling_params&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;temperature&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+            <span class="s2">&quot;max_new_tokens&quot;</span><span class="p">:</span> <span class="mi">32</span><span class="p">,</span>
+        <span class="p">},</span>
+        <span class="s2">&quot;stream&quot;</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="p">},</span>
+    <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="n">prev</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">iter_lines</span><span class="p">(</span><span class="n">decode_unicode</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+    <span class="n">chunk</span> <span class="o">=</span> <span class="n">chunk</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">&quot;utf-8&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">chunk</span> <span class="ow">and</span> <span class="n">chunk</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;data:&quot;</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">chunk</span> <span class="o">==</span> <span class="s2">&quot;data: [DONE]&quot;</span><span class="p">:</span>
+            <span class="k">break</span>
+        <span class="n">data</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">chunk</span><span class="p">[</span><span class="mi">5</span><span class="p">:]</span><span class="o">.</span><span class="n">strip</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">))</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="n">data</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+        <span class="nb">print</span><span class="p">(</span><span class="n">output</span><span class="p">[</span><span class="n">prev</span><span class="p">:],</span> <span class="n">end</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">prev</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="multi-modal">
+<h3>Multi modal<a class="headerlink" href="#multi-modal" title="Link to this heading">#</a></h3>
+<p>Launch a server</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">python3</span> <span class="o">-</span><span class="n">m</span> <span class="n">sglang</span><span class="o">.</span><span class="n">launch_server</span> <span class="o">--</span><span class="n">model</span><span class="o">-</span><span class="n">path</span> <span class="n">lmms</span><span class="o">-</span><span class="n">lab</span><span class="o">/</span><span class="n">llava</span><span class="o">-</span><span class="n">onevision</span><span class="o">-</span><span class="n">qwen2</span><span class="o">-</span><span class="mi">7</span><span class="n">b</span><span class="o">-</span><span class="n">ov</span> <span class="o">--</span><span class="n">chat</span><span class="o">-</span><span class="n">template</span> <span class="n">chatml</span><span class="o">-</span><span class="n">llava</span>
+</pre></div>
+</div>
+<p>Download an image</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>curl -o example_image.png -L https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true
+</pre></div>
+</div>
+<p>Send a request</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">requests</span>
+
+<span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span>
+    <span class="s2">&quot;http://localhost:30000/generate&quot;</span><span class="p">,</span>
+    <span class="n">json</span><span class="o">=</span><span class="p">{</span>
+        <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="s2">&quot;&lt;|im_start|&gt;system</span><span class="se">\n</span><span class="s2">You are a helpful assistant.&lt;|im_end|&gt;</span><span class="se">\n</span><span class="s2">&quot;</span>
+                <span class="s2">&quot;&lt;|im_start|&gt;user</span><span class="se">\n</span><span class="s2">&lt;image&gt;</span><span class="se">\n</span><span class="s2">Describe this image in a very short sentence.&lt;|im_end|&gt;</span><span class="se">\n</span><span class="s2">&quot;</span>
+                <span class="s2">&quot;&lt;|im_start|&gt;assistant</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;image_data&quot;</span><span class="p">:</span> <span class="s2">&quot;example_image.png&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;sampling_params&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;temperature&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+            <span class="s2">&quot;max_new_tokens&quot;</span><span class="p">:</span> <span class="mi">32</span><span class="p">,</span>
+        <span class="p">},</span>
+    <span class="p">},</span>
+<span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">json</span><span class="p">())</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">image_data</span></code> can be a file name, a URL, or a base64 encoded string. See also <code class="docutils literal notranslate"><span class="pre">python/sglang/srt/utils.py:load_image</span></code>.
+Streaming is supported in a similar manner as <a class="reference internal" href="#streaming">above</a>.</p>
+</section>
+</section>
+<section id="performance-implications-on-penalties">
+<h2>Performance Implications on Penalties<a class="headerlink" href="#performance-implications-on-penalties" title="Link to this heading">#</a></h2>
+<p>While you can apply penalties by supplying relevant <code class="docutils literal notranslate"><span class="pre">sampling_params</span></code>, this comes with some drawbacks.</p>
+<p>These drawbacks will be applied to every single requests in the same batch, as penalizers also applies in batch.</p>
+<section id="latency">
+<h3>Latency<a class="headerlink" href="#latency" title="Link to this heading">#</a></h3>
+<p>While we try to compute penalty algorithms through CUDA, it is still additional computation on top of the basic sampling logic. For detailed overhead, we recommend you to run your own benchmarks, but you can find samples below to get a glimpse.</p>
+</section>
+<section id="memory">
+<h3>Memory<a class="headerlink" href="#memory" title="Link to this heading">#</a></h3>
+<p>Since we compute penalty algorithms through CUDA, the logic stores relevant parameters on GPU. This is usually in a scale of <code class="docutils literal notranslate"><span class="pre">vocab_size</span></code> multiplied by <code class="docutils literal notranslate"><span class="pre">running_requests</span></code>.</p>
+<p>You can run your own benchmark with desired parameters on your own hardware to make sure it’s not OOMing before using.</p>
+<p>Tuning <code class="docutils literal notranslate"><span class="pre">--mem-fraction-static</span></code> and/or <code class="docutils literal notranslate"><span class="pre">--max-running-requests</span></code> will help. See <a class="reference internal" href="hyperparameter_tuning.html#minor-tune---max-prefill-tokens---mem-fraction-static---max-running-requests"><span class="std std-ref">here</span></a> for more information.</p>
+</section>
+<section id="benchmarks">
+<h3>Benchmarks<a class="headerlink" href="#benchmarks" title="Link to this heading">#</a></h3>
+<p>All the benchmarks below were ran on NVIDIA H100 SXM5.</p>
+<details>
+<section id="baseline">
+<h4>Baseline<a class="headerlink" href="#baseline" title="Link to this heading">#</a></h4>
+<p>Measured at <a class="reference external" href="https://github.com/sgl-project/sglang/commit/dc9d06d886151707f97d0b78095df9de262fd3c9">dc9d06d886151707f97d0b78095df9de262fd3c9</a>.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Successful requests:                     3000
+Benchmark duration (s):                  66.11
+Total input tokens:                      378633
+Total generated tokens:                  775651
+Total generated tokens (retokenized):    775118
+Request throughput (req/s):              45.38
+Input token throughput (tok/s):          5727.04
+Output token throughput (tok/s):         11732.16
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   40881.94
+Median E2E Latency (ms):                 43967.10
+---------------Time to First Token----------------
+Mean TTFT (ms):                          19884.75
+Median TTFT (ms):                        14226.56
+P99 TTFT (ms):                           47738.97
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          91.96
+Median TPOT (ms):                        90.11
+P99 TPOT (ms):                           308.54
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           174.54
+Median ITL (ms):                         58.56
+P99 ITL (ms):                            440.18
+==================================================
+</pre></div>
+</div>
+</section>
+<section id="all-together">
+<h4>All Together<a class="headerlink" href="#all-together" title="Link to this heading">#</a></h4>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --extra-request-body &#39;{
+  &quot;frequency_penalty&quot;: 1.1,
+  &quot;presence_penalty&quot;: 1.1,
+  &quot;repetition_penalty&quot;: 0.1,
+  &quot;min_new_tokens&quot;: 5
+}&#39;
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Successful requests:                     3000
+Benchmark duration (s):                  78.35
+Total input tokens:                      378633
+Total generated tokens:                  775651
+Total generated tokens (retokenized):    774756
+Request throughput (req/s):              38.29
+Input token throughput (tok/s):          4832.86
+Output token throughput (tok/s):         9900.39
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   49017.68
+Median E2E Latency (ms):                 52825.70
+---------------Time to First Token----------------
+Mean TTFT (ms):                          23892.60
+Median TTFT (ms):                        18895.47
+P99 TTFT (ms):                           57426.01
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          114.54
+Median TPOT (ms):                        107.27
+P99 TPOT (ms):                           293.31
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           205.68
+Median ITL (ms):                         73.97
+P99 ITL (ms):                            453.86
+==================================================
+</pre></div>
+</div>
+</section>
+<section id="frequency-penalty">
+<h4>Frequency Penalty<a class="headerlink" href="#frequency-penalty" title="Link to this heading">#</a></h4>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --extra-request-body &#39;{
+    &quot;frequency_penalty&quot;: 1.1
+}&#39;
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Successful requests:                     3000
+Benchmark duration (s):                  72.72
+Total input tokens:                      378633
+Total generated tokens:                  775651
+Total generated tokens (retokenized):    774955
+Request throughput (req/s):              41.26
+Input token throughput (tok/s):          5206.84
+Output token throughput (tok/s):         10666.51
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   45445.56
+Median E2E Latency (ms):                 48960.39
+---------------Time to First Token----------------
+Mean TTFT (ms):                          22363.16
+Median TTFT (ms):                        17125.02
+P99 TTFT (ms):                           52920.95
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          104.71
+Median TPOT (ms):                        98.30
+P99 TPOT (ms):                           268.06
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           191.60
+Median ITL (ms):                         67.83
+P99 ITL (ms):                            455.46
+==================================================
+</pre></div>
+</div>
+</section>
+<section id="presence-penalty">
+<h4>Presence Penalty<a class="headerlink" href="#presence-penalty" title="Link to this heading">#</a></h4>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --extra-request-body &#39;{
+    &quot;presence_penalty&quot;: 1.1
+}&#39;
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Successful requests:                     3000
+Benchmark duration (s):                  72.04
+Total input tokens:                      378633
+Total generated tokens:                  775651
+Total generated tokens (retokenized):    775210
+Request throughput (req/s):              41.64
+Input token throughput (tok/s):          5255.98
+Output token throughput (tok/s):         10767.18
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   44926.61
+Median E2E Latency (ms):                 48302.88
+---------------Time to First Token----------------
+Mean TTFT (ms):                          22095.39
+Median TTFT (ms):                        16740.93
+P99 TTFT (ms):                           52554.03
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          103.54
+Median TPOT (ms):                        97.37
+P99 TPOT (ms):                           271.86
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           189.86
+Median ITL (ms):                         68.45
+P99 ITL (ms):                            447.11
+==================================================
+</pre></div>
+</div>
+</section>
+<section id="repetition-penalty">
+<h4>Repetition Penalty<a class="headerlink" href="#repetition-penalty" title="Link to this heading">#</a></h4>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --extra-request-body &#39;{
+    &quot;repetition_penalty&quot;: 0.1
+}&#39;
+
+============ Serving Benchmark Result ============
+Backend: sglang
+Traffic request rate: inf
+Successful requests: 3000
+Benchmark duration (s): 74.54
+Total input tokens: 378633
+Total generated tokens: 775651
+Total generated tokens (retokenized): 766008
+Request throughput (req/s): 40.24
+Input token throughput (tok/s): 5079.36
+Output token throughput (tok/s): 10405.35
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms): 46530.38
+Median E2E Latency (ms): 50302.65
+---------------Time to First Token----------------
+Mean TTFT (ms): 22603.47
+Median TTFT (ms): 17167.08
+P99 TTFT (ms): 54497.85
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms): 117.59
+Median TPOT (ms): 101.79
+P99 TPOT (ms): 320.04
+---------------Inter-token Latency----------------
+Mean ITL (ms): 195.26
+Median ITL (ms): 69.51
+P99 ITL (ms): 433.86
+==================================================
+</pre></div>
+</div>
+</section>
+<section id="min-new-tokens">
+<h4>Min New Tokens<a class="headerlink" href="#min-new-tokens" title="Link to this heading">#</a></h4>
+<p>The min new tokens penalizer computes until generation process reaches given <code class="docutils literal notranslate"><span class="pre">min_new_tokens</span></code>.</p>
+<p>Dislike other penalizers, setting this to higher value will have more latency implications.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ python3 -m sglang.bench_serving --backend sglang --port 8413 --dataset-name random --num-prompts 3000 --random-input 256 --random-output 512 --extra-request-body &#39;{
+    &quot;min_new_tokens&quot;: 5
+}&#39;
+
+============ Serving Benchmark Result ============
+Backend: sglang
+Traffic request rate: inf
+Successful requests: 3000
+Benchmark duration (s): 66.94
+Total input tokens: 378633
+Total generated tokens: 775651
+Total generated tokens (retokenized): 775220
+Request throughput (req/s): 44.81
+Input token throughput (tok/s): 5656.13
+Output token throughput (tok/s): 11586.90
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms): 41888.55
+Median E2E Latency (ms): 45354.16
+---------------Time to First Token----------------
+Mean TTFT (ms): 20866.91
+Median TTFT (ms): 16219.79
+P99 TTFT (ms): 49263.91
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms): 97.05
+Median TPOT (ms): 89.76
+P99 TPOT (ms): 233.50
+---------------Inter-token Latency----------------
+Mean ITL (ms): 179.17
+Median ITL (ms): 55.08
+P99 ITL (ms): 409.12
+==================================================
+</pre></div>
+</div>
+</details>
+</section>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="model_support.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">How to Support a New Model</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="benchmark_and_profiling.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Benchmark and Profiling</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#normal">Normal</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#streaming">Streaming</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-modal">Multi modal</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-implications-on-penalties">Performance Implications on Penalties</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#latency">Latency</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#memory">Memory</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmarks">Benchmarks</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#baseline">Baseline</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#all-together">All Together</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#frequency-penalty">Frequency Penalty</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#presence-penalty">Presence Penalty</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#repetition-penalty">Repetition Penalty</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#min-new-tokens">Min New Tokens</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By SGLang Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2023-2024, SGLang.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Sep 02, 2024.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b"></script>
+<script src="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

@@ -1,0 +1,75 @@
+
+msgid ""
+msgstr ""
+"Project-Id-Version: Sphinx-Book-Theme\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: ja\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Print to PDF"
+msgstr "PDFに印刷"
+
+msgid "Theme by the"
+msgstr "のテーマ"
+
+msgid "Download source file"
+msgstr "ソースファイルをダウンロード"
+
+msgid "open issue"
+msgstr "未解決の問題"
+
+msgid "Contents"
+msgstr "目次"
+
+msgid "previous page"
+msgstr "前のページ"
+
+msgid "Download notebook file"
+msgstr "ノートブックファイルをダウンロード"
+
+msgid "Copyright"
+msgstr "Copyright"
+
+msgid "Download this page"
+msgstr "このページをダウンロード"
+
+msgid "Source repository"
+msgstr "ソースリポジトリ"
+
+msgid "By"
+msgstr "著者"
+
+msgid "repository"
+msgstr "リポジトリ"
+
+msgid "Last updated on"
+msgstr "最終更新日"
+
+msgid "Toggle navigation"
+msgstr "ナビゲーションを切り替え"
+
+msgid "Sphinx Book Theme"
+msgstr "スフィンクスの本のテーマ"
+
+msgid "suggest edit"
+msgstr "編集を提案する"
+
+msgid "Open an issue"
+msgstr "問題を報告"
+
+msgid "Launch"
+msgstr "起動"
+
+msgid "Fullscreen mode"
+msgstr "全画面モード"
+
+msgid "Edit this page"
+msgstr "このページを編集"
+
+msgid "By the"
+msgstr "によって"
+
+msgid "next page"
+msgstr "次のページ"

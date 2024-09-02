@@ -1,0 +1,75 @@
+
+msgid ""
+msgstr ""
+"Project-Id-Version: Sphinx-Book-Theme\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: es\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Print to PDF"
+msgstr "Imprimir en PDF"
+
+msgid "Theme by the"
+msgstr "Tema por el"
+
+msgid "Download source file"
+msgstr "Descargar archivo fuente"
+
+msgid "open issue"
+msgstr "Tema abierto"
+
+msgid "Contents"
+msgstr "Contenido"
+
+msgid "previous page"
+msgstr "pagina anterior"
+
+msgid "Download notebook file"
+msgstr "Descargar archivo de cuaderno"
+
+msgid "Copyright"
+msgstr "Derechos de autor"
+
+msgid "Download this page"
+msgstr "Descarga esta pagina"
+
+msgid "Source repository"
+msgstr "Repositorio de origen"
+
+msgid "By"
+msgstr "Por"
+
+msgid "repository"
+msgstr "repositorio"
+
+msgid "Last updated on"
+msgstr "Ultima actualización en"
+
+msgid "Toggle navigation"
+msgstr "Navegación de palanca"
+
+msgid "Sphinx Book Theme"
+msgstr "Tema del libro de la esfinge"
+
+msgid "suggest edit"
+msgstr "sugerir editar"
+
+msgid "Open an issue"
+msgstr "Abrir un problema"
+
+msgid "Launch"
+msgstr "Lanzamiento"
+
+msgid "Fullscreen mode"
+msgstr "Modo de pantalla completa"
+
+msgid "Edit this page"
+msgstr "Edita esta página"
+
+msgid "By the"
+msgstr "Por el"
+
+msgid "next page"
+msgstr "siguiente página"

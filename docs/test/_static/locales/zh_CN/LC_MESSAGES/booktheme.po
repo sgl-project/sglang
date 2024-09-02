@@ -1,0 +1,75 @@
+
+msgid ""
+msgstr ""
+"Project-Id-Version: Sphinx-Book-Theme\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: zh_CN\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Print to PDF"
+msgstr "列印成 PDF"
+
+msgid "Theme by the"
+msgstr "主题作者："
+
+msgid "Download source file"
+msgstr "下载源文件"
+
+msgid "open issue"
+msgstr "创建议题"
+
+msgid "Contents"
+msgstr "目录"
+
+msgid "previous page"
+msgstr "上一页"
+
+msgid "Download notebook file"
+msgstr "下载笔记本文件"
+
+msgid "Copyright"
+msgstr "版权"
+
+msgid "Download this page"
+msgstr "下载此页面"
+
+msgid "Source repository"
+msgstr "源码库"
+
+msgid "By"
+msgstr "作者："
+
+msgid "repository"
+msgstr "仓库"
+
+msgid "Last updated on"
+msgstr "上次更新时间："
+
+msgid "Toggle navigation"
+msgstr "显示或隐藏导航栏"
+
+msgid "Sphinx Book Theme"
+msgstr "Sphinx Book 主题"
+
+msgid "suggest edit"
+msgstr "提出修改建议"
+
+msgid "Open an issue"
+msgstr "创建议题"
+
+msgid "Launch"
+msgstr "启动"
+
+msgid "Fullscreen mode"
+msgstr "全屏模式"
+
+msgid "Edit this page"
+msgstr "编辑此页面"
+
+msgid "By the"
+msgstr "作者："
+
+msgid "next page"
+msgstr "下一页"

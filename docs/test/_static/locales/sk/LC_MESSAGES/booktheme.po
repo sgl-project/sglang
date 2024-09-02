@@ -1,0 +1,75 @@
+
+msgid ""
+msgstr ""
+"Project-Id-Version: Sphinx-Book-Theme\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: sk\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Print to PDF"
+msgstr "Tlač do PDF"
+
+msgid "Theme by the"
+msgstr "Téma od"
+
+msgid "Download source file"
+msgstr "Stiahnite si zdrojový súbor"
+
+msgid "open issue"
+msgstr "otvorené vydanie"
+
+msgid "Contents"
+msgstr "Obsah"
+
+msgid "previous page"
+msgstr "predchádzajúca strana"
+
+msgid "Download notebook file"
+msgstr "Stiahnite si zošit"
+
+msgid "Copyright"
+msgstr "Autorské práva"
+
+msgid "Download this page"
+msgstr "Stiahnite si túto stránku"
+
+msgid "Source repository"
+msgstr "Zdrojové úložisko"
+
+msgid "By"
+msgstr "Autor:"
+
+msgid "repository"
+msgstr "Úložisko"
+
+msgid "Last updated on"
+msgstr "Posledná aktualizácia dňa"
+
+msgid "Toggle navigation"
+msgstr "Prepnúť navigáciu"
+
+msgid "Sphinx Book Theme"
+msgstr "Téma knihy Sfinga"
+
+msgid "suggest edit"
+msgstr "navrhnúť úpravu"
+
+msgid "Open an issue"
+msgstr "Otvorte problém"
+
+msgid "Launch"
+msgstr "Spustiť"
+
+msgid "Fullscreen mode"
+msgstr "Režim celej obrazovky"
+
+msgid "Edit this page"
+msgstr "Upraviť túto stránku"
+
+msgid "By the"
+msgstr "Podľa"
+
+msgid "next page"
+msgstr "ďalšia strana"

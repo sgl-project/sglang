@@ -1,0 +1,66 @@
+
+msgid ""
+msgstr ""
+"Project-Id-Version: Sphinx-Book-Theme\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: ca\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Print to PDF"
+msgstr "Imprimeix a PDF"
+
+msgid "Theme by the"
+msgstr "Tema del"
+
+msgid "Download source file"
+msgstr "Baixeu el fitxer font"
+
+msgid "open issue"
+msgstr "número obert"
+
+msgid "previous page"
+msgstr "Pàgina anterior"
+
+msgid "Download notebook file"
+msgstr "Descarregar fitxer de quadern"
+
+msgid "Copyright"
+msgstr "Copyright"
+
+msgid "Download this page"
+msgstr "Descarregueu aquesta pàgina"
+
+msgid "Source repository"
+msgstr "Dipòsit de fonts"
+
+msgid "By"
+msgstr "Per"
+
+msgid "Last updated on"
+msgstr "Darrera actualització el"
+
+msgid "Toggle navigation"
+msgstr "Commuta la navegació"
+
+msgid "Sphinx Book Theme"
+msgstr "Tema del llibre Esfinx"
+
+msgid "suggest edit"
+msgstr "suggerir edició"
+
+msgid "Open an issue"
+msgstr "Obriu un número"
+
+msgid "Launch"
+msgstr "Llançament"
+
+msgid "Edit this page"
+msgstr "Editeu aquesta pàgina"
+
+msgid "By the"
+msgstr "Per la"
+
+msgid "next page"
+msgstr "pàgina següent"
