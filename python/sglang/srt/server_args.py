@@ -17,6 +17,7 @@ limitations under the License.
 
 import argparse
 import dataclasses
+import json
 import logging
 import random
 from typing import List, Optional, Union
@@ -94,6 +95,9 @@ class ServerArgs:
     nccl_init_addr: Optional[str] = None
     nnodes: int = 1
     node_rank: Optional[int] = None
+
+    # Model override args
+    model_override_args: Optional[dict] = None
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -455,10 +459,20 @@ class ServerArgs:
             help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
         )
 
+        # Model override args
+        parser.add_argument(
+            "--model-override-args",
+            type=str,
+            help="A dictionary in JSON string format used to override default model configurations.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
+        args.model_override_args = (
+            json.loads(args.model_override_args) if args.model_override_args else None
+        )
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -480,6 +494,24 @@ class ServerArgs:
         if "gemma-2" in self.model_path.lower():
             logger.info("When using sliding window in gemma-2, turn on flashinfer.")
             self.disable_flashinfer = False
+
+
+def prepare_server_args(args: argparse.Namespace) -> ServerArgs:
+    """
+    Prepare the server arguments from the command line arguments.
+
+    Args:
+        args: The command line arguments. Typically, it should be `sys.argv[1:]`
+            to ensure compatibility with `parse_args` when no arguments are passed.
+
+    Returns:
+        The server arguments.
+    """
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    raw_args = parser.parse_args(args)
+    server_args = ServerArgs.from_cli_args(raw_args)
+    return server_args
 
 
 @dataclasses.dataclass
