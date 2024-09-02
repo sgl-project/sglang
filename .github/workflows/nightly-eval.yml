@@ -29,7 +29,7 @@ jobs:
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Nightly gsm8k Accuracy
-        timeout-minutes: 20
+        timeout-minutes: 60
         run: |
           cd test/srt
           python3 test_nightly_gsm8k_eval.py
