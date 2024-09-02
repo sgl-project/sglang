@@ -63,7 +63,8 @@ class Sampler(CustomOp):
             logits.add_(sampling_info.logit_bias)
 
         if sampling_info.vocab_mask is not None:
-            logits = logits.masked_fill(~sampling_info.vocab_mask, float("-inf"))
+            print(sampling_info.vocab_mask.shape)
+            logits = logits.masked_fill(sampling_info.vocab_mask, float("-inf"))
 
         logits = self._apply_penalties(logits, sampling_info)
 
