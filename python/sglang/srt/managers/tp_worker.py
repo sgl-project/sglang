@@ -381,6 +381,7 @@ class ModelTpServer:
                         and self.out_pyobjs_queue.qsize()
                         and self.running_batch.has_stream
                     ):
+                        self.phase_indicator = Phase.PREPARE_PREFILL
                         break
             else:
                 self.new_token_ratio = global_config.init_new_token_ratio
