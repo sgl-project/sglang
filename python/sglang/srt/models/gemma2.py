@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/56b325e977435af744f8b3dca7af0ca209663558/vllm/model_executor/models/gemma2.py
 from typing import Iterable, Optional, Set, Tuple, Union
@@ -23,11 +38,16 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 # from vllm.model_executor.layers.rotary_embedding import GemmaRotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.controller.model_runner import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
+
+
+# Aligned with HF's implementation, using sliding window inclusive with the last token
+# SGLang assumes exclusive
+def get_window_size(config):
+    return config.sliding_window - 1
 
 
 class GemmaRMSNorm(CustomOp):
@@ -186,17 +206,14 @@ class Gemma2Attention(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        # from vLLM: FIXME(woosuk): While Gemma 2 uses sliding window attention for every
-        # odd layer, vLLM currently ignores it and uses global attention for
-        # all layers.
-        use_sliding_window = layer_idx % 2 == 1 and config.sliding_window is not None
-        del use_sliding_window  # Unused.
+        use_sliding_window = layer_idx % 2 == 0 and hasattr(config, "sliding_window")
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_idx,
+            sliding_window_size=get_window_size(config) if use_sliding_window else -1,
             logit_cap=self.config.attn_logit_softcapping,
         )
 
@@ -388,6 +405,9 @@ class Gemma2ForCausalLM(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens.weight, input_metadata
         )
+
+    def get_window_size(self):
+        return get_window_size(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """DetokenizerManager is a process that detokenizes the token ids."""
 
 import asyncio
@@ -10,16 +25,21 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.managers.controller.infer_batch import FINISH_MATCHED_STR
-from sglang.srt.managers.io_struct import BatchStrOut, BatchTokenIDOut
+from sglang.srt.managers.io_struct import (
+    BatchEmbeddingOut,
+    BatchStrOut,
+    BatchTokenIDOut,
+)
+from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.utils import find_printable_text, get_exception_traceback, graceful_registry
+from sglang.utils import find_printable_text, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 @dataclasses.dataclass
 class DecodeStatus:
+    vid: int
     decoded_text: str
     decode_ids: List[int]
     surr_offset: int
@@ -39,27 +59,48 @@ class DetokenizerManager:
         self.send_to_tokenizer = context.socket(zmq.PUSH)
         self.send_to_tokenizer.connect(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
 
-        self.tokenizer = get_tokenizer(
-            server_args.tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
-            trust_remote_code=server_args.trust_remote_code,
-        )
+        if server_args.skip_tokenizer_init:
+            self.tokenizer = None
+        else:
+            self.tokenizer = get_tokenizer(
+                server_args.tokenizer_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+            )
 
         self.decode_status = {}
 
     async def handle_loop(self):
         while True:
             recv_obj: BatchTokenIDOut = await self.recv_from_router.recv_pyobj()
+
+            if isinstance(recv_obj, BatchEmbeddingOut):
+                self.send_to_tokenizer.send_pyobj(
+                    BatchEmbeddingOut(
+                        rids=recv_obj.rids,
+                        embeddings=recv_obj.embeddings,
+                        meta_info=recv_obj.meta_info,
+                        finished_reason=recv_obj.finished_reason,
+                    )
+                )
+                continue
+
             assert isinstance(recv_obj, BatchTokenIDOut)
             bs = len(recv_obj.rids)
 
-            # FIXME: incremental detokenize is not compatible with jump forward
+            if self.tokenizer is None:
+                # Send BatchTokenIDOut if no tokenizer init'ed.
+                self.send_to_tokenizer.send_pyobj(recv_obj)
+                continue
+
             # Initialize decode status
             read_ids, surr_ids = [], []
             for i in range(bs):
                 rid = recv_obj.rids[i]
-                if rid not in self.decode_status:
+                vid = recv_obj.vids[i]
+                if rid not in self.decode_status or self.decode_status[rid].vid != vid:
                     s = DecodeStatus(
+                        vid=vid,
                         decoded_text=recv_obj.decoded_texts[i],
                         decode_ids=recv_obj.decode_ids[i],
                         surr_offset=0,
@@ -123,8 +164,6 @@ def start_detokenizer_process(
     port_args: PortArgs,
     pipe_writer,
 ):
-    graceful_registry(inspect.currentframe().f_code.co_name)
-
     try:
         manager = DetokenizerManager(server_args, port_args)
     except Exception:

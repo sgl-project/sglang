@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """Radix attention."""
 
 import torch
@@ -6,11 +21,11 @@ from torch import nn
 from torch.distributed import P2POp, batch_isend_irecv, irecv, isend
 
 from sglang.global_config import global_config
+from sglang.srt.layers.decode_attention import decode_attention_fwd
 from sglang.srt.layers.extend_attention import extend_attention_fwd
 from sglang.srt.layers.parallel_utils import get_sp_group
-from sglang.srt.layers.token_attention import token_attention_fwd
-from sglang.srt.managers.controller.model_runner import ForwardMode, InputMetadata
-from sglang.srt.server import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.model_executor.model_runner import global_server_args_dict
 
 
 class RadixAttention(nn.Module):
@@ -21,17 +36,27 @@ class RadixAttention(nn.Module):
         scaling: float,
         num_kv_heads: int,
         layer_id: int,
+        reuse: bool = False,
+        sliding_window_size: int = -1,
         logit_cap: int = -1,
+        v_head_dim: int = -1,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
         self.tp_k_head_num = num_kv_heads
         self.tp_v_head_num = num_kv_heads
         self.head_dim = head_dim
+        self.qk_head_dim = head_dim
+        self.v_head_dim = v_head_dim if v_head_dim != -1 else head_dim
         self.scaling = scaling
         self.layer_id = layer_id
+        self.reuse = reuse
+        self.sliding_window_size = sliding_window_size
 
-        if not global_server_args_dict.get("disable_flashinfer", False):
+        if (
+            not global_server_args_dict.get("disable_flashinfer", False)
+            and self.qk_head_dim == self.v_head_dim
+        ):
             self.extend_forward = self.extend_forward_flashinfer
             self.decode_forward = self.decode_forward_flashinfer
         else:
@@ -46,13 +71,17 @@ class RadixAttention(nn.Module):
                 "Sequence parallel is not supported with Triton backend."
             )
 
-        o = torch.empty_like(q)
+        if self.qk_head_dim != self.v_head_dim:
+            o = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+        else:
+            o = torch.empty_like(q)
+
         self.store_kv_cache(k, v, input_metadata)
         extend_attention_fwd(
-            q.view(-1, self.tp_q_head_num, self.head_dim),
+            q.view(-1, self.tp_q_head_num, self.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
-            o.view(-1, self.tp_q_head_num, self.head_dim),
+            o.view(-1, self.tp_q_head_num, self.v_head_dim),
             input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id),
             input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id),
             input_metadata.req_to_token_pool.req_to_token,
@@ -76,14 +105,17 @@ class RadixAttention(nn.Module):
                 "Sequence parallel is not supported with Triton backend."
             )
 
-        o = torch.empty_like(q)
+        if self.qk_head_dim != self.v_head_dim:
+            o = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+        else:
+            o = torch.empty_like(q)
         self.store_kv_cache(k, v, input_metadata)
 
-        token_attention_fwd(
-            q.view(-1, self.tp_q_head_num, self.head_dim),
+        decode_attention_fwd(
+            q.view(-1, self.tp_q_head_num, self.qk_head_dim),
             input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id),
             input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id),
-            o.view(-1, self.tp_q_head_num, self.head_dim),
+            o.view(-1, self.tp_q_head_num, self.v_head_dim),
             input_metadata.req_to_token_pool.req_to_token,
             input_metadata.req_pool_indices,
             input_metadata.triton_start_loc,
@@ -99,45 +131,79 @@ class RadixAttention(nn.Module):
     def extend_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         if input_metadata.sp_size > 1:
             return self.seq_parallel_extend_forward_flashinfer(q, k, v, input_metadata)
-
-        o1, s1 = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
-            q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-            k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
-            v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
-            causal=True,
-            sm_scale=self.scaling,
-            logits_soft_cap=self.logit_cap,
-        )
-
-        if input_metadata.extend_no_prefix:
-            o = o1
+        # using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+        prefill_wrapper_ragged = input_metadata.flashinfer_prefill_wrapper_ragged
+        prefill_wrapper_paged = input_metadata.flashinfer_prefill_wrapper_paged
+        if self.sliding_window_size != -1:
+            prefill_wrapper_ragged = prefill_wrapper_ragged[0]
+            prefill_wrapper_paged = prefill_wrapper_paged[0]
         else:
-            o2, s2 = input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
+            if isinstance(prefill_wrapper_ragged, list):
+                prefill_wrapper_ragged = prefill_wrapper_ragged[1]
+            if isinstance(prefill_wrapper_paged, list):
+                prefill_wrapper_paged = prefill_wrapper_paged[1]
+
+        if not input_metadata.flashinfer_use_ragged or self.reuse:
+            if not self.reuse:
+                self.store_kv_cache(k, v, input_metadata)
+
+            o = prefill_wrapper_paged.forward(
                 q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-                input_metadata.token_to_kv_pool.kv_data[self.layer_id],
-                causal=False,
+                input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
+                causal=True,
                 sm_scale=self.scaling,
+                window_left=self.sliding_window_size,
+                logits_soft_cap=self.logit_cap,
+            )
+        else:
+            o1, s1 = prefill_wrapper_ragged.forward_return_lse(
+                q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+                k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
+                v.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
+                causal=True,
+                sm_scale=self.scaling,
+                window_left=self.sliding_window_size,
                 logits_soft_cap=self.logit_cap,
             )
 
-            o, _ = merge_state(o1, s1, o2, s2)
+            if input_metadata.extend_no_prefix:
+                o = o1
+            else:
+                # TODO window attention + radix attention will come up in next PR
+                assert self.sliding_window_size == -1
+                o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                    q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+                    input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
+                    causal=False,
+                    sm_scale=self.scaling,
+                    logits_soft_cap=self.logit_cap,
+                )
 
-        self.store_kv_cache(k, v, input_metadata)
+                o, _ = merge_state(o1, s1, o2, s2)
 
-        if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
-            torch.cuda.synchronize()
+            self.store_kv_cache(k, v, input_metadata)
+
+            if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
+                torch.cuda.synchronize()
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
     def decode_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
         if input_metadata.sp_size > 1:
             return self.seq_parallel_decode_forward_flashinfer(q, k, v, input_metadata)
+        decode_wrapper = input_metadata.flashinfer_decode_wrapper
+        if self.sliding_window_size != -1:
+            decode_wrapper = decode_wrapper[0]
+        else:
+            if isinstance(decode_wrapper, list):
+                decode_wrapper = decode_wrapper[1]
 
-        self.store_kv_cache(k, v, input_metadata)
+        if not self.reuse:
+            self.store_kv_cache(k, v, input_metadata)
 
-        o = input_metadata.flashinfer_decode_wrapper.forward(
+        o = decode_wrapper.forward(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-            input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+            input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
             sm_scale=self.scaling,
             logits_soft_cap=self.logit_cap,
         )
@@ -285,7 +351,7 @@ class RadixAttention(nn.Module):
                 )
             q_shard = qs[sid]
             k_shard, v_shard = kv_shards[sid]
-            # Ragged attention computation for self attention within the shard.
+            # Self attention within the SP shard.
             attn_wrapper = (  # Only the last SP shard needs a mask.
                 input_metadata.flashinfer_prefill_wrapper_sp_causal
                 if sid == sp_size - 1
@@ -300,7 +366,7 @@ class RadixAttention(nn.Module):
                 logits_soft_cap=self.logit_cap,
             )
             append_merge_shard(output_shards[sid], o, s)
-            # Paged attention computation for cross shard attention.
+            # Cross SP shard attention.
             # NOTE: below schedule is for load balancing. Basically, at iteration i,
             # (i starting from 0), each SP worker will run i paged attentions.
             for existing_sid in owned_sids:
@@ -344,6 +410,7 @@ class RadixAttention(nn.Module):
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
+    # TODO(yifan): check if flashinfer seq_parallel is broken after the rebase
     def seq_parallel_decode_forward_flashinfer(
         self, q, k, v, input_metadata: InputMetadata
     ):
@@ -370,7 +437,7 @@ class RadixAttention(nn.Module):
 
         o, s = input_metadata.flashinfer_decode_wrapper.forward_return_lse(
             q.contiguous().view(-1, total_num_heads, self.head_dim),
-            input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+            input_metadata.token_to_kv_pool.get_kv_buffer(self.layer_id),
             sm_scale=self.scaling,
             logits_soft_cap=self.logit_cap,
         )
@@ -395,8 +462,10 @@ class RadixAttention(nn.Module):
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
     def forward(self, q, k, v, input_metadata: InputMetadata):
-        k = k.view(-1, self.tp_k_head_num, self.head_dim)
-        v = v.view(-1, self.tp_v_head_num, self.head_dim)
+        if k is not None:
+            assert v is not None
+            k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
+            v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
 
         if input_metadata.forward_mode == ForwardMode.EXTEND:
             return self.extend_forward(q, k, v, input_metadata)
@@ -404,36 +473,10 @@ class RadixAttention(nn.Module):
             return self.decode_forward(q, k, v, input_metadata)
 
     def store_kv_cache(self, cache_k, cache_v, input_metadata: InputMetadata):
-        kv_cache = input_metadata.token_to_kv_pool.kv_data[self.layer_id]
-        _store_kv_cache(cache_k, cache_v, kv_cache, input_metadata.out_cache_loc)
-
-
-try:
-
-    @torch.library.custom_op("mylib::store_kv_cache", mutates_args={"kv_cache"})
-    def _store_kv_cache(
-        k: torch.Tensor,
-        v: torch.Tensor,
-        kv_cache: torch.Tensor,
-        cache_loc: torch.Tensor,
-    ) -> None:
-        kv_cache[cache_loc, 0] = k
-        kv_cache[cache_loc, 1] = v
-
-    @_store_kv_cache.register_fake
-    def _(k, v, kv_cache, cache_loc):
-        pass
-
-except:
-
-    def _store_kv_cache(
-        k: torch.Tensor,
-        v: torch.Tensor,
-        kv_cache: torch.Tensor,
-        cache_loc: torch.Tensor,
-    ) -> None:
-        kv_cache[cache_loc, 0] = k
-        kv_cache[cache_loc, 1] = v
+        k_cache = input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id)
+        v_cache = input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id)
+        k_cache[input_metadata.out_cache_loc] = cache_k
+        v_cache[input_metadata.out_cache_loc] = cache_v
 
 
 def _get_sequence_parallel_head_idxes(total_num_heads, num_kv_heads, sp_rank, sp_size):

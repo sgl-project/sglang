@@ -1,0 +1,91 @@
+name: Close Inactive Issues
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  close-inactive-issues:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check and close inactive issues
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const sixtyDaysAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+            
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            console.log(`Owner: ${owner}, Repo: ${repo}`);
+            
+            async function fetchIssues(page = 1) {
+              console.log(`Fetching issues for ${owner}/${repo}, page ${page}`);
+              return await github.rest.issues.listForRepo({
+                owner,
+                repo,
+                state: 'open',
+                sort: 'updated',
+                direction: 'asc',
+                per_page: 100,
+                page: page
+              });
+            }
+            
+            async function processIssues() {
+              console.log('Starting to process issues');
+              console.log(`Repository: ${owner}/${repo}`);
+              
+              let page = 1;
+              let hasMoreIssues = true;
+              while (hasMoreIssues) {
+                try {
+                  const issues = await fetchIssues(page);
+                  console.log(`Fetched ${issues.data.length} issues on page ${page}`);
+                  
+                  if (issues.data.length === 0) {
+                    hasMoreIssues = false;
+                    break;
+                  }
+                  
+                  for (const issue of issues.data) {
+                    if (new Date(issue.updated_at) < sixtyDaysAgo) {
+                      try {
+                        await github.rest.issues.update({
+                          owner,
+                          repo,
+                          issue_number: issue.number,
+                          state: 'closed',
+                          labels: [...issue.labels.map(l => l.name), 'inactive']
+                        });
+                        await github.rest.issues.createComment({
+                          owner,
+                          repo,
+                          issue_number: issue.number,
+                          body: 'This issue has been automatically closed due to inactivity. Please feel free to reopen it if needed.'
+                        });
+                        console.log(`Closed issue #${issue.number} due to inactivity.`);
+                      } catch (error) {
+                        console.error(`Failed to close issue #${issue.number}: ${error.message}`);
+                      }
+                    } else {
+                      console.log(`Issue #${issue.number} is still active. Stopping processing.`);
+                      hasMoreIssues = false;
+                      break;
+                    }
+                  }
+                  page += 1;
+                } catch (error) {
+                  console.error(`Error fetching issues on page ${page}: ${error.message}`);
+                  hasMoreIssues = false;
+                }
+              }
+              console.log('Finished processing issues');
+            }
+            
+            await processIssues();

@@ -6,16 +6,17 @@ import warnings
 from typing import List, Optional, Union
 
 from sglang.global_config import global_config
+from sglang.lang.choices import ChoicesSamplingMethod
 
-REGEX_INT = r"[-+]?[0-9]+"
-REGEX_FLOAT = r"[-+]?[0-9]*\.?[0-9]+"
+REGEX_INT = r"[-+]?[0-9]+[ \n]*"
+REGEX_FLOAT = r"[-+]?[0-9]*\.?[0-9]+[ \n]*"
 REGEX_BOOL = r"(True|False)"
-REGEX_STRING = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
+REGEX_STR = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
 
 
 @dataclasses.dataclass
 class SglSamplingParams:
-    max_new_tokens: int = 16
+    max_new_tokens: int = 128
     stop: Union[str, List[str]] = ()
     temperature: float = 1.0
     top_p: float = 1.0
@@ -99,7 +100,6 @@ class SglSamplingParams:
             "stop": self.stop or None,
             "temperature": self.temperature,
             "top_p": self.top_p,
-            "top_k": self.top_k,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
         }
@@ -140,7 +140,7 @@ class SglFunction:
     def run(
         self,
         *args,
-        max_new_tokens: int = 16,
+        max_new_tokens: int = 128,
         stop: Union[str, List[str]] = (),
         temperature: float = 1.0,
         top_p: float = 1.0,
@@ -179,7 +179,7 @@ class SglFunction:
         self,
         batch_kwargs,
         *,
-        max_new_tokens: int = 16,
+        max_new_tokens: int = 128,
         stop: Union[str, List[str]] = (),
         temperature: float = 1.0,
         top_p: float = 1.0,
@@ -410,7 +410,7 @@ class SglGen(SglExpr):
         dtype: Optional[type] = None,
         regex: Optional[str] = None,
     ):
-        """Call the model to generate. See the meaning of the arguments in docs/sampling_params.md"""
+        """Call the model to generate. See the meaning of the arguments in docs/en/sampling_params.md"""
         super().__init__()
         self.name = name
         self.sampling_params = SglSamplingParams(
@@ -462,14 +462,22 @@ class SglRoleEnd(SglExpr):
 
 
 class SglSelect(SglExpr):
-    def __init__(self, name: str, choices: List[str], temperature: float):
+
+    def __init__(
+        self,
+        name: str,
+        choices: List[str],
+        temperature: float,
+        choices_method: ChoicesSamplingMethod,
+    ):
         super().__init__()
         self.name = name
         self.choices = choices
         self.temperature = temperature
+        self.choices_method = choices_method
 
     def __repr__(self):
-        return f"Select({self.name}, choices={self.choices})"
+        return f"Select({self.name}, choices={self.choices}, choices_method={self.choices_method})"
 
 
 class SglFork(SglExpr):

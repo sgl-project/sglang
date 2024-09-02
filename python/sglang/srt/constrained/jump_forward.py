@@ -1,4 +1,19 @@
 """
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+"""
 Faster constrained decoding.
 Reference: https://lmsys.org/blog/2024-02-05-compressed-fsm/
 """
@@ -15,7 +30,7 @@ from sglang.srt.constrained import (
     make_byte_level_fsm,
     make_deterministic_fsm,
 )
-from sglang.srt.constrained.base_cache import BaseCache
+from sglang.srt.constrained.base_tool_cache import BaseToolCache
 
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
 
@@ -47,16 +62,22 @@ class JumpForwardMap:
                 id_to_symbol.setdefault(id_, []).append(symbol)
 
             transitions = fsm_info.transitions
-            outgoings_ct = defaultdict(int)
-            state_to_jump_forward = {}
 
+            outgoings_ct = defaultdict(int)
+            # NOTE(lsyin): Final states can lead to terminate, so they have one outgoing edge naturally
+            for s in fsm_info.finals:
+                outgoings_ct[s] = 1
+
+            state_to_jump_forward = {}
             for (state, id_), next_state in transitions.items():
                 if id_ == fsm_info.alphabet_anything_value:
+                    # Arbitrarily symbol cannot be recognized as jump forward
                     continue
+
                 symbols = id_to_symbol[id_]
                 for c in symbols:
                     if len(c) > 1:
-                        # Skip byte level transitions
+                        # Skip byte level transitions like c = "5E"
                         continue
 
                     outgoings_ct[state] += 1
@@ -72,6 +93,9 @@ class JumpForwardMap:
 
             # Process the byte level jump forward
             outgoings_ct = defaultdict(int)
+            for s in fsm_info.finals:
+                outgoings_ct[s] = 1
+
             for (state, id_), next_state in transitions.items():
                 if id_ == fsm_info.alphabet_anything_value:
                     continue
@@ -136,7 +160,7 @@ class JumpForwardMap:
         )
 
 
-class JumpForwardCache(BaseCache):
+class JumpForwardCache(BaseToolCache):
     def __init__(self):
         super().__init__()
 
@@ -162,3 +186,5 @@ if __name__ == "__main__":
     test_main(r"霍格沃茨特快列车|霍比特人比尔博")
     # 霍格: \xe9\x9c\x8d \xe6\xa0\xbc ...
     # 霍比: \xe9\x9c\x8d \xe6\xaf\x94 ...
+
+    test_main(r"[-+]?[0-9]+[ ]*")

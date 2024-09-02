@@ -1,9 +1,27 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """The arguments of the server."""
 
 import argparse
 import dataclasses
+import logging
 import random
 from typing import List, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -12,11 +30,13 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
+    skip_tokenizer_init: bool = False
     load_format: str = "auto"
     dtype: str = "auto"
     trust_remote_code: bool = True
     context_length: Optional[int] = None
     quantization: Optional[str] = None
+    served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
 
     # Port
@@ -26,15 +46,18 @@ class ServerArgs:
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
-    max_prefill_tokens: Optional[int] = None
     max_running_requests: Optional[int] = None
-    schedule_heuristic: str = "lpm"
-    schedule_conservativeness: float = 0.8
+    max_num_reqs: Optional[int] = None
+    max_total_tokens: Optional[int] = None
+    chunked_prefill_size: int = -1
+    max_prefill_tokens: int = 16384
+    schedule_policy: str = "lpm"
+    schedule_conservativeness: float = 1.0
 
     # Other runtime options
     tp_size: int = 1
     sp_size: int = 1
-    stream_interval: int = 8
+    stream_interval: int = 1
     random_seed: Optional[int] = None
 
     # Logging
@@ -44,7 +67,8 @@ class ServerArgs:
     show_time_cost: bool = False
 
     # Other
-    api_key: str = ""
+    api_key: Optional[str] = None
+    file_storage_pth: str = "SGLang_storage"
 
     # Data parallelism
     dp_size: int = 1
@@ -52,12 +76,16 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_flashinfer: bool = False
+    disable_flashinfer_sampling: bool = False
     disable_radix_cache: bool = False
     disable_regex_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_disk_cache: bool = False
-    attention_reduce_in_fp32: bool = False
+    enable_torch_compile: bool = False
     enable_p2p_check: bool = False
+    enable_mla: bool = False
+    attention_reduce_in_fp32: bool = False
+    efficient_weight_load: bool = False
 
     # Distributed args
     nccl_init_addr: Optional[str] = None
@@ -67,17 +95,26 @@ class ServerArgs:
     def __post_init__(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+
+        if self.served_model_name is None:
+            self.served_model_name = self.model_path
+
+        if self.chunked_prefill_size <= 0:
+            # Disable chunked prefill
+            self.chunked_prefill_size = None
+
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
-                self.mem_fraction_static = 0.74
+                self.mem_fraction_static = 0.79
             elif self.tp_size >= 8:
-                self.mem_fraction_static = 0.78
+                self.mem_fraction_static = 0.83
             elif self.tp_size >= 4:
-                self.mem_fraction_static = 0.82
-            elif self.tp_size >= 2:
                 self.mem_fraction_static = 0.85
+            elif self.tp_size >= 2:
+                self.mem_fraction_static = 0.87
             else:
                 self.mem_fraction_static = 0.88
+
         if isinstance(self.additional_ports, int):
             self.additional_ports = [self.additional_ports]
         elif self.additional_ports is None:
@@ -121,6 +158,11 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--skip-tokenizer-init",
+            action="store_true",
+            help="If set, skip init tokenizer and pass input_ids in generate request",
         )
         parser.add_argument(
             "--load-format",
@@ -167,7 +209,23 @@ class ServerArgs:
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
+            choices=[
+                "awq",
+                "fp8",
+                "gptq",
+                "marlin",
+                "gptq_marlin",
+                "awq_marlin",
+                "squeezellm",
+                "bitsandbytes",
+            ],
             help="The quantization method.",
+        )
+        parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=ServerArgs.served_model_name,
+            help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
         )
         parser.add_argument(
             "--chat-template",
@@ -182,23 +240,41 @@ class ServerArgs:
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
         )
         parser.add_argument(
-            "--max-prefill-tokens",
-            type=int,
-            default=ServerArgs.max_prefill_tokens,
-            help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
-        )
-        parser.add_argument(
             "--max-running-requests",
             type=int,
             default=ServerArgs.max_running_requests,
             help="The maximum number of running requests.",
         )
         parser.add_argument(
-            "--schedule-heuristic",
+            "--max-num-reqs",
+            type=int,
+            default=ServerArgs.max_num_reqs,
+            help="The maximum number of requests to serve in the memory pool. If the model have a large context length, you may need to decrease this value to avoid out-of-memory errors.",
+        )
+        parser.add_argument(
+            "--max-total-tokens",
+            type=int,
+            default=ServerArgs.max_total_tokens,
+            help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. This option is typically used for development and debugging purposes.",
+        )
+        parser.add_argument(
+            "--chunked-prefill-size",
+            type=int,
+            default=ServerArgs.chunked_prefill_size,
+            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill",
+        )
+        parser.add_argument(
+            "--max-prefill-tokens",
+            type=int,
+            default=ServerArgs.max_prefill_tokens,
+            help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
+        )
+        parser.add_argument(
+            "--schedule-policy",
             type=str,
-            default=ServerArgs.schedule_heuristic,
+            default=ServerArgs.schedule_policy,
             choices=["lpm", "random", "fcfs", "dfs-weight"],
-            help="The scheduling heuristic.",
+            help="The scheduling policy of the requests.",
         )
         parser.add_argument(
             "--schedule-conservativeness",
@@ -207,6 +283,7 @@ class ServerArgs:
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
         parser.add_argument(
+            "--tensor-parallel-size",
             "--tp-size",
             type=int,
             default=ServerArgs.tp_size,
@@ -250,17 +327,24 @@ class ServerArgs:
         parser.add_argument(
             "--show-time-cost",
             action="store_true",
-            help="Show time cost of custom marks",
+            help="Show time cost of custom marks.",
         )
         parser.add_argument(
             "--api-key",
             type=str,
             default=ServerArgs.api_key,
-            help="Set API key of the server",
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--file-storage-pth",
+            type=str,
+            default=ServerArgs.file_storage_pth,
+            help="The path of the file storage in backend.",
         )
 
         # Data parallelism
         parser.add_argument(
+            "--data-parallel-size",
             "--dp-size",
             type=int,
             default=ServerArgs.dp_size,
@@ -284,7 +368,7 @@ class ServerArgs:
             help="The nccl init address of multi-node server.",
         )
         parser.add_argument(
-            "--nnodes", type=int, default=1, help="The number of nodes."
+            "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
         )
         parser.add_argument("--node-rank", type=int, help="The node rank.")
 
@@ -292,17 +376,22 @@ class ServerArgs:
         parser.add_argument(
             "--disable-flashinfer",
             action="store_true",
-            help="Disable flashinfer inference kernels",
+            help="Disable flashinfer attention kernels.",
+        )
+        parser.add_argument(
+            "--disable-flashinfer-sampling",
+            action="store_true",
+            help="Disable flashinfer sampling kernels.",
         )
         parser.add_argument(
             "--disable-radix-cache",
             action="store_true",
-            help="Disable RadixAttention",
+            help="Disable RadixAttention for prefix caching.",
         )
         parser.add_argument(
             "--disable-regex-jump-forward",
             action="store_true",
-            help="Disable regex jump-forward",
+            help="Disable regex jump-forward.",
         )
         parser.add_argument(
             "--disable-cuda-graph",
@@ -315,19 +404,36 @@ class ServerArgs:
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
         )
         parser.add_argument(
-            "--attention-reduce-in-fp32",
+            "--enable-torch-compile",
             action="store_true",
-            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
-            "This only affects Triton attention kernels",
+            help="Optimize the model with torch.compile, experimental feature.",
         )
         parser.add_argument(
             "--enable-p2p-check",
             action="store_true",
             help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
         )
+        parser.add_argument(
+            "--enable-mla",
+            action="store_true",
+            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2",
+        )
+        parser.add_argument(
+            "--attention-reduce-in-fp32",
+            action="store_true",
+            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
+            "This only affects Triton attention kernels",
+        )
+        parser.add_argument(
+            "--efficient-weight-load",
+            action="store_true",
+            help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
+        args.tp_size = args.tensor_parallel_size
+        args.dp_size = args.data_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -342,6 +448,25 @@ class ServerArgs:
             f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
             f"disable_disk_cache={self.disable_disk_cache}, "
         )
+
+    def check_server_args(self):
+        assert (
+            self.tp_size % self.nnodes == 0
+        ), "tp_size must be divisible by number of nodes"
+        assert not (
+            self.dp_size > 1 and self.node_rank is not None
+        ), "multi-node data parallel is not supported"
+        if "gemma-2" in self.model_path.lower():
+            logger.info(
+                f"When using sliding window in gemma-2, disable radix_cache, regex_jump_forward, and turn on flashinfer."
+            )
+            # FIXME: compatibility with radix attention
+            self.disable_radix_cache = True
+            # FIXME: compatibility with jump forward
+            self.disable_regex_jump_forward = True
+            self.disable_flashinfer = False
+            # FIXME: compatibility with chunked prefill
+            self.chunked_prefill_size = None
 
 
 @dataclasses.dataclass

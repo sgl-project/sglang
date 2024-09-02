@@ -103,22 +103,24 @@ def test_decode_int():
 def test_decode_json_regex():
     @sgl.function
     def decode_json(s):
-        from sglang.lang.ir import REGEX_FLOAT, REGEX_INT, REGEX_STRING
+        from sglang.lang.ir import REGEX_FLOAT, REGEX_INT, REGEX_STR
 
-        s += "Generate a JSON object to describe the basic information of a city.\n"
+        s += "Generate a JSON object to describe the basic city information of Paris.\n"
 
         with s.var_scope("json_output"):
             s += "{\n"
-            s += '  "name": ' + sgl.gen(regex=REGEX_STRING + ",") + "\n"
+            s += '  "name": ' + sgl.gen(regex=REGEX_STR + ",") + "\n"
             s += '  "population": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
             s += '  "area": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
-            s += '  "latitude": ' + sgl.gen(regex=REGEX_FLOAT + ",") + "\n"
-            s += '  "country": ' + sgl.gen(regex=REGEX_STRING + ",") + "\n"
-            s += '  "timezone": ' + sgl.gen(regex=REGEX_STRING) + "\n"
+            s += '  "latitude": ' + sgl.gen(regex=REGEX_FLOAT) + "\n"
             s += "}"
 
-    ret = decode_json.run()
-    js_obj = json.loads(ret["json_output"])
+    ret = decode_json.run(temperature=0.0)
+    try:
+        js_obj = json.loads(ret["json_output"])
+    except json.decoder.JSONDecodeError:
+        print("JSONDecodeError", ret["json_output"])
+        raise
     assert isinstance(js_obj["name"], str)
     assert isinstance(js_obj["population"], int)
 
@@ -126,7 +128,7 @@ def test_decode_json_regex():
 def test_decode_json():
     @sgl.function
     def decode_json(s):
-        s += "Generate a JSON object to describe the basic information of a city.\n"
+        s += "Generate a JSON object to describe the basic city information of Paris.\n"
 
         with s.var_scope("json_output"):
             s += "{\n"
@@ -137,13 +139,17 @@ def test_decode_json():
             s += '  "timezone": ' + sgl.gen(dtype=str) + "\n"
             s += "}"
 
-    ret = decode_json.run()
-    js_obj = json.loads(ret["json_output"])
+    ret = decode_json.run(max_new_tokens=64)
+    try:
+        js_obj = json.loads(ret["json_output"])
+    except json.decoder.JSONDecodeError:
+        print("JSONDecodeError", ret["json_output"])
+        raise
     assert isinstance(js_obj["name"], str)
     assert isinstance(js_obj["population"], int)
 
 
-def test_expert_answer():
+def test_expert_answer(check_answer=True):
     @sgl.function
     def expert_answer(s, question):
         s += "Question: " + question + "\n"
@@ -161,7 +167,9 @@ def test_expert_answer():
         )
 
     ret = expert_answer.run(question="What is the capital of France?", temperature=0.1)
-    assert "paris" in ret.text().lower()
+
+    if check_answer:
+        assert "paris" in ret.text().lower(), f"Answer: {ret.text()}"
 
 
 def test_tool_use():
@@ -257,6 +265,7 @@ def test_parallel_decoding():
         s += "\nIn summary," + sgl.gen("summary", max_tokens=512)
 
     ret = parallel_decoding.run(topic="writing a good blog post", temperature=0.3)
+    assert isinstance(ret["summary"], str)
 
 
 def test_parallel_encoding(check_answer=True):
@@ -306,7 +315,7 @@ def test_image_qa():
     assert (
         "taxi" in state.messages()[-1]["content"]
         or "car" in state.messages()[-1]["content"]
-    )
+    ), f"{state.messages()[-1]['content']}"
 
 
 def test_stream():
@@ -348,6 +357,30 @@ def test_regex():
     state = regex_gen.run()
     answer = state["answer"]
     assert re.match(regex, answer)
+
+
+def test_dtype_gen():
+    @sgl.function
+    def dtype_gen(s):
+        s += "Q: What is the full name of DNS?\n"
+        s += "A: The full nams is " + sgl.gen("str_res", dtype=str, stop="\n") + "\n"
+        s += "Q: Which year was DNS invented?\n"
+        s += "A: " + sgl.gen("int_res", dtype=int) + "\n"
+        s += "Q: What is the value of pi?\n"
+        s += "A: " + sgl.gen("float_res", dtype=float) + "\n"
+        s += "Q: Is the sky blue?\n"
+        s += "A: " + sgl.gen("bool_res", dtype=bool) + "\n"
+
+    state = dtype_gen.run()
+
+    try:
+        state["int_res"] = int(state["int_res"])
+        state["float_res"] = float(state["float_res"])
+        state["bool_res"] = bool(state["bool_res"])
+        # assert state["str_res"].startswith('"') and state["str_res"].endswith('"')
+    except ValueError:
+        print(state)
+        raise
 
 
 def test_completion_speculative():

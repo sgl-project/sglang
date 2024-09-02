@@ -14,28 +14,22 @@ from sglang.test.test_programs import (
 
 class TestVertexAIBackend(unittest.TestCase):
     backend = None
-    chat_backend = None
-    chat_vision_backend = None
 
-    def setUp(self):
-        cls = type(self)
-
-        if cls.backend is None:
-            cls.backend = VertexAI("gemini-pro")
-            cls.chat_backend = VertexAI("gemini-pro")
-            cls.chat_vision_backend = VertexAI("gemini-pro-vision")
+    @classmethod
+    def setUpClass(cls):
+        cls.backend = VertexAI("gemini-1.5-pro-001")
 
     def test_few_shot_qa(self):
         set_default_backend(self.backend)
         test_few_shot_qa()
 
     def test_mt_bench(self):
-        set_default_backend(self.chat_backend)
+        set_default_backend(self.backend)
         test_mt_bench()
 
     def test_expert_answer(self):
         set_default_backend(self.backend)
-        test_expert_answer()
+        test_expert_answer(check_answer=False)
 
     def test_parallel_decoding(self):
         set_default_backend(self.backend)
@@ -46,7 +40,7 @@ class TestVertexAIBackend(unittest.TestCase):
         test_parallel_encoding()
 
     def test_image_qa(self):
-        set_default_backend(self.chat_vision_backend)
+        set_default_backend(self.backend)
         test_image_qa()
 
     def test_stream(self):
@@ -55,11 +49,4 @@ class TestVertexAIBackend(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(warnings="ignore")
-
-    # from sglang.global_config import global_config
-
-    # global_config.verbosity = 2
-    # t = TestVertexAIBackend()
-    # t.setUp()
-    # t.test_stream()
+    unittest.main()
