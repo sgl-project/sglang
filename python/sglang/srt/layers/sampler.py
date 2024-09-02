@@ -33,6 +33,7 @@ class Sampler(CustomOp):
         super().__init__()
         # FIXME: torch.multinomial has too many bugs
         self.forward_native = self.forward_cuda
+        self.is_torch_compile = False
 
     def _apply_penalties(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
         # min-token, presence, frequency
@@ -49,16 +50,11 @@ class Sampler(CustomOp):
 
         return logits
 
-    def _get_probs(
-        self,
-        logits: torch.Tensor,
-        sampling_info: SamplingBatchInfo,
-        is_torch_compile: bool = False,
-    ):
+    def _get_probs(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
         # Post process logits
         logits = logits.contiguous()
         logits.div_(sampling_info.temperatures)
-        if is_torch_compile:
+        if self.is_torch_compile:
             # FIXME: Temporary workaround for unknown bugs in torch.compile
             logits.add_(0)
 
@@ -80,7 +76,7 @@ class Sampler(CustomOp):
         if isinstance(logits, LogitsProcessorOutput):
             logits = logits.next_token_logits
 
-        probs = self._get_probs(logits, sampling_info, is_torch_compile=True)
+        probs = self._get_probs(logits, sampling_info)
 
         if not global_server_args_dict["disable_flashinfer_sampling"]:
             max_top_k_round, batch_size = 32, probs.shape[0]
@@ -113,7 +109,7 @@ class Sampler(CustomOp):
         if isinstance(logits, LogitsProcessorOutput):
             logits = logits.next_token_logits
 
-        probs = self._get_probs(logits, sampling_info, is_torch_compile=True)
+        probs = self._get_probs(logits, sampling_info)
 
         batch_next_token_ids, success = top_k_top_p_min_p_sampling_from_probs_torch(
             probs, sampling_info.top_ks, sampling_info.top_ps, sampling_info.min_ps
