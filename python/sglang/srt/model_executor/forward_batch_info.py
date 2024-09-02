@@ -305,7 +305,10 @@ def update_flashinfer_indices(
         sp_size = model_runner.sp_size
         if forward_mode == ForwardMode.DECODE:
             # With SP, reqs may have been reordered so we track them here.
-            req_ids = normal_to_sp_indices.tolist()
+            if normal_to_sp_indices is not None:
+                req_ids = normal_to_sp_indices.tolist()
+            else:
+                req_ids = list(range(batch_size))
             paged_kernel_lens = seq_lens if sp_size == 1 else sp_decode_local_lens
         else:
             extend_lens = seq_lens - prefix_lens
