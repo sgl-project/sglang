@@ -42,6 +42,9 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             if "Llama-3" in model or "gemma-2" in model:
                 # compressed-tensors
                 other_args.extend(["--kv-cache-dtype", "fp8_e5m2"])
+            elif "Qwen2-72B-Instruct-FP8" in model:
+                # bug
+                other_args.extend(["--quantization", "fp8"])
             else:
                 other_args.extend(
                     ["--quantization", "fp8", "--kv-cache-dtype", "fp8_e5m2"]
