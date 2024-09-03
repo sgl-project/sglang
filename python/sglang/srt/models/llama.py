@@ -303,6 +303,7 @@ class LlamaForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
         self.sampler = Sampler()
+
         self.param_dict = dict(self.named_parameters())
 
     @torch.no_grad()
