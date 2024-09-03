@@ -379,7 +379,7 @@ class ModelTpServer:
                     if (
                         self.serialized_memory_access
                         and self.out_pyobjs_queue.qsize()
-                        and self.running_batch.has_stream
+                        and self.running_batch.has_stream()
                     ):
                         self.phase_indicator = Phase.PREPARE_PREFILL
                         break
