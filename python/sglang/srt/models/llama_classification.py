@@ -21,10 +21,10 @@ from transformers import LlamaConfig
 from vllm.config import CacheConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from python.sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import SampleOutput
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 
 
 class LlamaForClassification(nn.Module):
