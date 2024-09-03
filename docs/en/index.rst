@@ -49,6 +49,9 @@ Documentation
    :caption: Backend
 
    backend_overview.md
+   quick_start.md
+   supported_model.md
+   add_new_model.md
 
 .. _hyperparameter_tuning:
 .. toctree::
@@ -63,13 +66,6 @@ Documentation
    :caption: Custom Chat Template
 
    custom_chat_template.md
-
-.. _model_support:
-.. toctree::
-   :maxdepth: 1
-   :caption: Model Support
-
-   model_support.md
 
 .. _sampling_params:
 .. toctree::

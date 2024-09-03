@@ -1,4 +1,4 @@
-# SGLang Installation Guide
+# Installation Guide
 
 SGLang consists of a frontend language (Structured Generation Language, SGLang) and a backend runtime (SGLang Runtime, SRT). The frontend can be used separately from the backend, allowing for a detached frontend-backend setup.
 
