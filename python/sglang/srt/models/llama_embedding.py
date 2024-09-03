@@ -85,6 +85,8 @@ class LlamaEmbeddingModel(nn.Module):
             load_weights_per_param(name, loaded_weight)
 
 
-EntryClass = LlamaEmbeddingModel
-# compat: e5-mistral model.config class == MistralModel
-EntryClassRemapping = [("MistralModel", LlamaEmbeddingModel)]
+class MistralModel(LlamaEmbeddingModel):
+    pass
+
+
+EntryClass = [LlamaEmbeddingModel, MistralModel]
