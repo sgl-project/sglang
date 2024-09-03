@@ -362,10 +362,16 @@ class ModelTpServer:
                 # Run a few decode batches continuously for reducing overhead
                 for i in range(global_config.num_continue_decode_steps):
                     self.num_generated_tokens += len(self.running_batch.reqs)
-                    self.forward_decode_batch(
-                        self.running_batch,
-                        i == global_config.num_continue_decode_steps - 1,
+
+                    is_last_decode = (
+                        i == global_config.num_continue_decode_steps - 1
+                        or (
+                            self.running_batch.has_stream()
+                            and (self.decode_forward_ct + 1) % self.stream_interval == 0
+                        )
                     )
+
+                    self.forward_decode_batch(self.running_batch, is_last_decode)
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
