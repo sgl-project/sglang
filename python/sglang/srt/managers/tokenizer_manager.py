@@ -86,8 +86,8 @@ class TokenizerManager:
         self.recv_from_detokenizer = context.socket(zmq.PULL)
         self.recv_from_detokenizer.bind(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
 
-        self.send_to_router = context.socket(zmq.PUSH)
-        self.send_to_router.connect(f"tcp://127.0.0.1:{port_args.controller_port}")
+        self.send_to_controller = context.socket(zmq.PUSH)
+        self.send_to_controller.connect(f"tcp://127.0.0.1:{port_args.controller_port}")
 
         # Read model args
         self.model_path = server_args.model_path
@@ -271,7 +271,7 @@ class TokenizerManager:
                 input_ids,
                 sampling_params,
             )
-        self.send_to_router.send_pyobj(tokenized_obj)
+        self.send_to_controller.send_pyobj(tokenized_obj)
 
         # Recv results
         event = asyncio.Event()
@@ -367,7 +367,7 @@ class TokenizerManager:
                         input_ids,
                         sampling_params,
                     )
-                self.send_to_router.send_pyobj(tokenized_obj)
+                self.send_to_controller.send_pyobj(tokenized_obj)
 
                 event = asyncio.Event()
                 state = ReqState([], False, event)
@@ -500,14 +500,14 @@ class TokenizerManager:
 
     def flush_cache(self):
         req = FlushCacheReq()
-        self.send_to_router.send_pyobj(req)
+        self.send_to_controller.send_pyobj(req)
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
             return
         del self.rid_to_state[rid]
         req = AbortReq(rid)
-        self.send_to_router.send_pyobj(req)
+        self.send_to_controller.send_pyobj(req)
 
     async def update_weights(
         self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
@@ -524,7 +524,7 @@ class TokenizerManager:
                 # wait for the previous generation requests to finish
                 while len(self.rid_to_state) > 0:
                     await asyncio.sleep(0)
-                self.send_to_router.send_pyobj(obj)
+                self.send_to_controller.send_pyobj(obj)
                 self.model_update_result = asyncio.Future()
                 result = await self.model_update_result
                 if result.success:
