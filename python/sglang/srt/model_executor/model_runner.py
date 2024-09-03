@@ -606,16 +606,6 @@ def import_model_classes():
                     assert entry.__name__ not in model_arch_name_to_cls
                     model_arch_name_to_cls[entry.__name__] = entry
 
-            # compat: some models such as chatglm has incorrect class set in config.json
-            # usage: [ tuple("From_Entry_Class_Name": EntryClass), ]
-            if hasattr(module, "EntryClassRemapping") and isinstance(
-                module.EntryClassRemapping, list
-            ):
-                for remap in module.EntryClassRemapping:
-                    if isinstance(remap, tuple) and len(remap) == 2:
-                        assert remap[0] not in model_arch_name_to_cls
-                        model_arch_name_to_cls[remap[0]] = remap[1]
-
     return model_arch_name_to_cls
 
 
