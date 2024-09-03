@@ -162,6 +162,7 @@ class ModelRunner:
         return min_per_gpu_memory
 
     def load_model(self):
+        torch.set_num_threads(1)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
