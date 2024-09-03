@@ -178,19 +178,22 @@ class Req:
     def adjust_max_prefix_ids(self):
         self.fill_ids = self.origin_input_ids + self.output_ids
         input_len = len(self.fill_ids)
-        max_prefix_len = input_len
+
+        # FIXME: To work around some bugs in logprob computation, we need to ensure each
+        # request has at least one token. Later, we can relax this requirement and use `input_len`.
+        max_prefix_len = input_len - 1
 
         if self.sampling_params.max_new_tokens > 0:
             # Need at least one token to compute logits
             max_prefix_len = min(max_prefix_len, input_len - 1)
 
         if self.return_logprob:
-            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
-
             if self.normalized_prompt_logprob is None:
                 # Need at least two tokens to compute normalized logprob
                 max_prefix_len = min(max_prefix_len, input_len - 2)
+            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
+        max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
