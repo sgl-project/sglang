@@ -64,9 +64,10 @@ class TestSRTBackend(unittest.TestCase):
         test_dtype_gen()
 
     def test_hellaswag_select(self):
-        accuracy, latency = test_hellaswag_select()
-
-        assert accuracy > 0.71
+        # Run twice to capture more bugs
+        for _ in range(2):
+            accuracy, latency = test_hellaswag_select()
+            assert accuracy > 0.71
 
 
 if __name__ == "__main__":

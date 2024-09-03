@@ -265,6 +265,8 @@ class LazyImport:
 
 
 def fetch_and_cache_jsonl(url, cache_file="cached_data.jsonl"):
+    """Read and cache a jsonl file from a url."""
+
     # Check if the cache file already exists
     if os.path.exists(cache_file):
         print("Loading data from cache...")

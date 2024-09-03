@@ -454,6 +454,8 @@ def test_chat_completion_speculative():
 
 
 def test_hellaswag_select():
+    """Benchmark the accuracy of sgl.select on the HellaSwag dataset."""
+
     url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
     lines = fetch_and_cache_jsonl(url)
 
