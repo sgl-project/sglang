@@ -28,8 +28,10 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ### 3. From Source (Latest version, Linux only for full installation)
 
 ```bash
-# Use the last release branch
-# At the time of this documentation, it's v0.2.15, but newer versions may be available
+# Use the latest release branch
+# As of this documentation, it's v0.2.15, but newer versions may be available
+# Do not clone the main branch directly; always use a specific release version
+# The main branch may contain unresolved bugs before a new release
 git clone -b v0.2.15 https://github.com/sgl-project/sglang.git
 cd sglang
 pip install -e "python[all]"
