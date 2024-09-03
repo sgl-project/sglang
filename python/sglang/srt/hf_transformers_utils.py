@@ -92,7 +92,7 @@ def get_context_length(config):
     """Get the context length of a model from a huggingface model configs."""
     rope_scaling = getattr(config, "rope_scaling", None)
     if rope_scaling:
-        rope_scaling_factor = config.rope_scaling["factor"]
+        rope_scaling_factor = config.rope_scaling.get("factor", 1)
         if "original_max_position_embeddings" in rope_scaling:
             rope_scaling_factor = 1
         if config.rope_scaling.get("rope_type", None) == "llama3":
