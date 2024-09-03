@@ -362,5 +362,8 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = LlamaForCausalLM
-EntryClassRemapping = [("Phi3ForCausalLM", LlamaForCausalLM)]
+class Phi3ForCausalLM(LlamaForCausalLM):
+    pass
+
+
+EntryClass = [LlamaForCausalLM, Phi3ForCausalLM]
