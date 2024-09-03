@@ -394,8 +394,8 @@ class LlavaBaseForCausalLM(nn.Module):
         projector_weights = {
             "model.mm_projector.0": "multi_modal_projector.linear_1",
             "model.mm_projector.2": "multi_modal_projector.linear_2",
-            "model.image_newline": "language_model.model.image_newline",
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
+            "model.image_newline": "language_model.model.image_newline",
         }
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
