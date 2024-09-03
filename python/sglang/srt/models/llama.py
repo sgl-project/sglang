@@ -324,11 +324,11 @@ class LlamaForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = self.param_dict
 
@@ -362,4 +362,8 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = LlamaForCausalLM
+class Phi3ForCausalLM(LlamaForCausalLM):
+    pass
+
+
+EntryClass = [LlamaForCausalLM, Phi3ForCausalLM]
