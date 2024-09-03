@@ -241,10 +241,9 @@ class LlavaVidForCausalLM(nn.Module):
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
         }
         params_dict = dict(self.named_parameters())
-        weights = list(weights)
         for name, loaded_weight in weights:
             # FIXME: why projector weights read two times?
-            if "projector" in name or "vision_tower" in name:
+            if "projector" in name or "vision_tower" in name or "image_newline" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
@@ -255,9 +254,8 @@ class LlavaVidForCausalLM(nn.Module):
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-        # load language model
-        self.language_model.load_weights(weights)
+            else:
+                self.language_model.load_weights([(name, loaded_weight)])
 
     @property
     def num_patches_per_side(self):
