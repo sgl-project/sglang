@@ -15,7 +15,7 @@ limitations under the License.
 
 """Inference-only Mistral model."""
 
-from sglang.srt.models.llama2 import LlamaForCausalLM
+from python.sglang.srt.models.llama import LlamaForCausalLM
 
 
 class MistralForCausalLM(LlamaForCausalLM):

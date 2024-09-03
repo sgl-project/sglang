@@ -1,13 +1,13 @@
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Tuple
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from python.sglang.srt.models.llama import LlamaModel
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.model_executor.model_runner import InputMetadata
-from sglang.srt.models.llama2 import LlamaForCausalLM, LlamaModel
 
 
 class LlamaEmbeddingModel(nn.Module):
@@ -16,7 +16,6 @@ class LlamaEmbeddingModel(nn.Module):
         config: LlamaConfig,
         quant_config=None,
         cache_config=None,
-        efficient_weight_load=False,
     ) -> None:
         super().__init__()
         self.model = LlamaModel(config, quant_config=quant_config)

@@ -26,8 +26,8 @@ from vllm.config import CacheConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from python.sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
-from sglang.srt.models.llama2 import LlamaForCausalLM
 
 
 class LlavaVidForCausalLM(nn.Module):
