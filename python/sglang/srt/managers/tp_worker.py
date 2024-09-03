@@ -334,8 +334,9 @@ class ModelTpServer:
                 if new_batch is not None:
                     self.ready_prefill_batch.put(new_batch)
 
-        # avoid busy waiting, could be adjusted
-        time.sleep(0.01)
+        if not self.serialized_memory_access:
+            # avoid busy waiting, could be adjusted
+            time.sleep(0.01)
 
     @torch.inference_mode()
     def compute_step(self):
