@@ -205,7 +205,7 @@ It supports streaming, vision, and most features of the Chat/Completions/Models/
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --tp 2
 ```
-- Add `--dp 2` to enable multi-GPU data parallelism. It can also be used together with tensor parallelism. Data parallelism is better for throughput if there is enough memory.
+- Add `--dp 2` to enable multi-GPU data parallelism. Data parallelism is better for throughput if there is enough memory. It can also be used together with tensor parallelism. The following command uses 4 GPUs in total.
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --dp 2 --tp 2
 ```
