@@ -24,6 +24,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import sys
 import threading
 import time
 from http import HTTPStatus
@@ -40,22 +41,12 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.constrained import disable_cache
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.managers.controller_multi import (
-    start_controller_process as start_controller_process_multi,
-)
-from sglang.srt.managers.controller_single import launch_tp_servers
-from sglang.srt.managers.controller_single import (
-    start_controller_process as start_controller_process_single,
-)
-from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     UpdateWeightReqInput,
 )
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_batches,
@@ -70,18 +61,12 @@ from sglang.srt.openai_api.adapter import (
     v1_retrieve_file_content,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.serving.engine import Engine, EngineArgs
+from sglang.srt.serving.server_args import ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
-    allocate_init_ports,
-    assert_pkg_version,
     configure_logger,
-    enable_show_time_cost,
     kill_child_process,
-    maybe_set_triton_cache_manager,
-    prepare_model,
-    prepare_tokenizer,
-    set_ulimit,
 )
 from sglang.utils import get_exception_traceback
 
@@ -91,7 +76,10 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 app = FastAPI()
-tokenizer_manager = None
+engine: Engine = None
+
+# for OpenAI files API
+file_storage_pth: str
 
 
 @app.get("/health")
@@ -107,7 +95,7 @@ async def health_generate(request: Request) -> Response:
         text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
     )
     try:
-        async for _ in tokenizer_manager.generate_request(gri, request):
+        async for _ in engine.tokenizer_manager.generate_request(gri, request):
             break
         return Response(status_code=200)
     except Exception as e:
@@ -118,20 +106,20 @@ async def health_generate(request: Request) -> Response:
 @app.get("/get_model_info")
 async def get_model_info():
     result = {
-        "model_path": tokenizer_manager.model_path,
-        "is_generation": tokenizer_manager.is_generation,
+        "model_path": engine.tokenizer_manager.model_path,
+        "is_generation": engine.tokenizer_manager.is_generation,
     }
     return result
 
 
 @app.get("/get_server_args")
 async def get_server_args():
-    return dataclasses.asdict(tokenizer_manager.server_args)
+    return dataclasses.asdict(engine.tokenizer_manager.server_args)
 
 
 @app.get("/flush_cache")
 async def flush_cache():
-    tokenizer_manager.flush_cache()
+    engine.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
@@ -142,7 +130,7 @@ async def flush_cache():
 @app.post("/update_weights")
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
 
-    success, message = await tokenizer_manager.update_weights(obj, request)
+    success, message = await engine.tokenizer_manager.update_weights(obj, request)
     content = {"message": message, "success": str(success)}
     if success:
         return JSONResponse(
@@ -162,7 +150,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
         async def stream_results():
             try:
-                async for out in tokenizer_manager.generate_request(obj, request):
+                async for out in engine.tokenizer_manager.generate_request(
+                    obj, request
+                ):
                     yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
@@ -172,11 +162,13 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
-            background=tokenizer_manager.create_abort_task(obj),
+            background=engine.tokenizer_manager.create_abort_task(obj),
         )
     else:
         try:
-            ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+            ret = await engine.tokenizer_manager.generate_request(
+                obj, request
+            ).__anext__()
             return ret
         except ValueError as e:
             return JSONResponse(
@@ -191,7 +183,7 @@ app.put("/generate")(generate_request)
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
-        ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+        ret = await engine.tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
         return JSONResponse(
@@ -205,24 +197,24 @@ app.put("/encode")(encode_request)
 
 @app.post("/v1/completions")
 async def openai_v1_completions(raw_request: Request):
-    return await v1_completions(tokenizer_manager, raw_request)
+    return await v1_completions(engine.tokenizer_manager, raw_request)
 
 
 @app.post("/v1/chat/completions")
 async def openai_v1_chat_completions(raw_request: Request):
-    return await v1_chat_completions(tokenizer_manager, raw_request)
+    return await v1_chat_completions(engine.tokenizer_manager, raw_request)
 
 
 @app.post("/v1/embeddings")
 async def openai_v1_embeddings(raw_request: Request):
-    response = await v1_embeddings(tokenizer_manager, raw_request)
+    response = await v1_embeddings(engine.tokenizer_manager, raw_request)
     return response
 
 
 @app.get("/v1/models")
 def available_models():
     """Show available models."""
-    served_model_names = [tokenizer_manager.served_model_name]
+    served_model_names = [engine.tokenizer_manager.served_model_name]
     model_cards = []
     for served_model_name in served_model_names:
         model_cards.append(ModelCard(id=served_model_name, root=served_model_name))
@@ -231,9 +223,7 @@ def available_models():
 
 @app.post("/v1/files")
 async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
-    return await v1_files_create(
-        file, purpose, tokenizer_manager.server_args.file_storage_pth
-    )
+    return await v1_files_create(file, purpose, file_storage_pth)
 
 
 @app.delete("/v1/files/{file_id}")
@@ -244,13 +234,13 @@ async def delete_file(file_id: str):
 
 @app.post("/v1/batches")
 async def openai_v1_batches(raw_request: Request):
-    return await v1_batches(tokenizer_manager, raw_request)
+    return await v1_batches(engine.tokenizer_manager, raw_request)
 
 
 @app.post("/v1/batches/{batch_id}/cancel")
 async def cancel_batches(batch_id: str):
     # https://platform.openai.com/docs/api-reference/batch/cancel
-    return await v1_cancel_batch(tokenizer_manager, batch_id)
+    return await v1_cancel_batch(engine.tokenizer_manager, batch_id)
 
 
 @app.get("/v1/batches/{batch_id}")
@@ -272,102 +262,23 @@ async def retrieve_file_content(file_id: str):
 
 def launch_server(
     server_args: ServerArgs,
-    model_override_args: Optional[dict] = None,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
     """Launch an HTTP server."""
-    global tokenizer_manager
 
-    configure_logger(server_args)
+    configure_logger(server_args.log_level)
 
-    server_args.check_server_args()
-    _set_envs_and_config(server_args)
+    global engine
+    engine = Engine(server_args.engine_args)
 
-    # Allocate ports for inter-process communications
-    server_args.port, server_args.additional_ports = allocate_init_ports(
-        server_args.port,
-        server_args.additional_ports,
-        server_args.dp_size,
-    )
-    ports = server_args.additional_ports
-    port_args = PortArgs(
-        tokenizer_port=ports[0],
-        controller_port=ports[1],
-        detokenizer_port=ports[2],
-        nccl_ports=ports[3:],
-    )
-    logger.info(f"{server_args=}")
-
-    # Use model from www.modelscope.cn, first download the model.
-    server_args.model_path = prepare_model(server_args.model_path)
-    server_args.tokenizer_path = prepare_tokenizer(server_args.tokenizer_path)
-
-    # Launch processes for multi-node tensor parallelism
-    if server_args.nnodes > 1 and server_args.node_rank != 0:
-        tp_size_local = server_args.tp_size // server_args.nnodes
-        gpu_ids = [i for _ in range(server_args.nnodes) for i in range(tp_size_local)]
-        tp_rank_range = list(
-            range(
-                server_args.node_rank * tp_size_local,
-                (server_args.node_rank + 1) * tp_size_local,
-            )
-        )
-        procs = launch_tp_servers(
-            gpu_ids,
-            tp_rank_range,
-            server_args,
-            ports[3],
-            model_override_args,
-        )
-
-        try:
-            for p in procs:
-                p.join()
-        finally:
-            kill_child_process(os.getpid(), including_parent=False)
-            return
-
-    # Launch processes
-    tokenizer_manager = TokenizerManager(server_args, port_args, model_override_args)
     if server_args.chat_template:
-        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
-    pipe_controller_reader, pipe_controller_writer = mp.Pipe(duplex=False)
-    pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
-
-    if server_args.dp_size == 1:
-        start_controller_process = start_controller_process_single
-    else:
-        start_controller_process = start_controller_process_multi
-
-    proc_controller = mp.Process(
-        target=start_controller_process,
-        args=(server_args, port_args, pipe_controller_writer, model_override_args),
-    )
-    proc_controller.start()
-
-    proc_detoken = mp.Process(
-        target=start_detokenizer_process,
-        args=(
-            server_args,
-            port_args,
-            pipe_detoken_writer,
-        ),
-    )
-    proc_detoken.start()
-
-    # Wait for the model to finish loading
-    controller_init_state = pipe_controller_reader.recv()
-    detoken_init_state = pipe_detoken_reader.recv()
-
-    if controller_init_state != "init ok" or detoken_init_state != "init ok":
-        proc_controller.kill()
-        proc_detoken.kill()
-        raise RuntimeError(
-            "Initialization failed. "
-            f"controller_init_state: {controller_init_state}, "
-            f"detoken_init_state: {detoken_init_state}"
+        load_chat_template_for_openai_api(
+            engine.tokenizer_manager, server_args.chat_template
         )
-    assert proc_controller.is_alive() and proc_detoken.is_alive()
+
+    if server_args.file_storage_pth:
+        global file_storage_pth
+        file_storage_pth = server_args.file_storage_pth
 
     # Add api key authorization
     if server_args.api_key:
@@ -391,41 +302,6 @@ def launch_server(
         )
     finally:
         t.join()
-
-
-def _set_envs_and_config(server_args: ServerArgs):
-    # Set global environments
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    os.environ["NCCL_NVLS_ENABLE"] = "0"
-    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-
-    # Set ulimit
-    set_ulimit()
-
-    # Enable show time cost for debugging
-    if server_args.show_time_cost:
-        enable_show_time_cost()
-
-    # Disable disk cache
-    if server_args.disable_disk_cache:
-        disable_cache()
-
-    # Fix triton bugs
-    if server_args.tp_size * server_args.dp_size > 1:
-        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
-        maybe_set_triton_cache_manager()
-
-    # Check flashinfer version
-    if not server_args.disable_flashinfer:
-        assert_pkg_version(
-            "flashinfer",
-            "0.1.6",
-            "Please uninstall the old version and "
-            "reinstall the latest version by following the instructions "
-            "at https://docs.flashinfer.ai/installation.html.",
-        )
 
 
 def _wait_and_warmup(server_args, pipe_finish_writer, pid):
@@ -506,13 +382,11 @@ class Runtime:
         **kwargs,
     ):
         """See the arguments in server_args.py::ServerArgs"""
-        self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
-
-        # Pre-allocate ports
-        self.server_args.port, self.server_args.additional_ports = allocate_init_ports(
-            self.server_args.port,
-            self.server_args.additional_ports,
-            self.server_args.dp_size,
+        self.server_args = ServerArgs.from_kwargs(
+            *args,
+            log_level=log_level,
+            model_override_args=model_override_args,
+            **kwargs,
         )
 
         self.url = self.server_args.url()
@@ -522,10 +396,9 @@ class Runtime:
 
         self.pid = None
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
-
         proc = mp.Process(
             target=launch_server,
-            args=(self.server_args, model_override_args, pipe_writer),
+            args=(self.server_args, pipe_writer),
         )
         proc.start()
         pipe_writer.close()

@@ -18,6 +18,8 @@ from sglang.lang.ir import (
     SglSelect,
     SglVideo,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.serving.engine import LLM
 
 
 def function(
@@ -35,7 +37,7 @@ def function(
 def Runtime(*args, **kwargs):
     # Avoid importing unnecessary dependency
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    from sglang.srt.server import Runtime
+    from sglang.srt.serving.server import Runtime
 
     return Runtime(*args, **kwargs)
 

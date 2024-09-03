@@ -1,7 +1,9 @@
 # SGL API Components
 
 from sglang.api import (
+    LLM,
     Runtime,
+    SamplingParams,
     assistant,
     assistant_begin,
     assistant_end,
@@ -30,6 +32,8 @@ from sglang.lang.choices import (
 
 # SGLang DSL APIs
 __all__ = [
+    "LLM",
+    "SamplingParams",
     "Runtime",
     "assistant",
     "assistant_begin",

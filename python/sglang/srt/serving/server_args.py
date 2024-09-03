@@ -18,113 +18,79 @@ limitations under the License.
 import argparse
 import dataclasses
 import logging
-import random
-from typing import List, Optional, Union
+from dataclasses import fields
+from typing import Dict, List, Optional
+
+from sglang.srt.serving.engine_args import EngineArgs
 
 logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
 class ServerArgs:
-    # Model and tokenizer
-    model_path: str
-    tokenizer_path: Optional[str] = None
-    tokenizer_mode: str = "auto"
-    skip_tokenizer_init: bool = False
-    load_format: str = "auto"
-    dtype: str = "auto"
-    kv_cache_dtype: str = "auto"
-    trust_remote_code: bool = True
-    context_length: Optional[int] = None
-    quantization: Optional[str] = None
-    served_model_name: Optional[str] = None
-    chat_template: Optional[str] = None
-    is_embedding: bool = False
+    # The core engine args
+    engine_args: EngineArgs  # = field(default_factory=EngineArgs)
 
-    # Port
+    #
+    #  The server specifc args
+    #
+    # Connection
     host: str = "127.0.0.1"
     port: int = 30000
-    additional_ports: Optional[Union[List[int], int]] = None
 
-    # Memory and scheduling
-    mem_fraction_static: Optional[float] = None
-    max_running_requests: Optional[int] = None
-    max_num_reqs: Optional[int] = None
-    max_total_tokens: Optional[int] = None
-    chunked_prefill_size: int = 8192
-    max_prefill_tokens: int = 16384
-    schedule_policy: str = "lpm"
-    schedule_conservativeness: float = 1.0
-
-    # Other runtime options
-    tp_size: int = 1
-    stream_interval: int = 1
-    random_seed: Optional[int] = None
-
-    # Logging
-    log_level: str = "info"
-    log_level_http: Optional[str] = None
-    log_requests: bool = False
-    show_time_cost: bool = False
-
-    # Other
-    api_key: Optional[str] = None
+    # OpenAI API
+    chat_template: Optional[str] = None
     file_storage_pth: str = "SGLang_storage"
 
-    # Data parallelism
-    dp_size: int = 1
-    load_balance_method: str = "round_robin"
+    # Authentication
+    api_key: Optional[str] = None
 
-    # Optimization/debug options
-    disable_flashinfer: bool = False
-    disable_flashinfer_sampling: bool = False
-    disable_radix_cache: bool = False
-    disable_regex_jump_forward: bool = False
-    disable_cuda_graph: bool = False
-    disable_cuda_graph_padding: bool = False
-    disable_disk_cache: bool = False
-    disable_custom_all_reduce: bool = False
-    enable_mixed_chunk: bool = False
-    enable_torch_compile: bool = False
-    enable_p2p_check: bool = False
-    enable_mla: bool = False
-    triton_attention_reduce_in_fp32: bool = False
+    def __post_init__(self): ...
 
-    # Distributed args
-    nccl_init_addr: Optional[str] = None
-    nnodes: int = 1
-    node_rank: Optional[int] = None
+    def __getattr__(self, item):
+        # Avoid recursion by checking if `engine_args` exists first
+        if item == "engine_args" or "engine_args" not in self.__dict__:
+            raise AttributeError(
+                f"'{self.__class__.__name__}' object has no attribute '{item}'"
+            )
 
-    def __post_init__(self):
-        if self.tokenizer_path is None:
-            self.tokenizer_path = self.model_path
+        # Forward attribute access to engine_args if not found in ServerArgs.
+        # For attribute in server_args, it will be found in ServerArgs's __dict__
+        # and no entry into this function.
+        if hasattr(self.engine_args, item):
+            return getattr(self.engine_args, item)
+        raise AttributeError(
+            f"'{self.__class__.__name__}' object has no attribute '{item}'"
+        )
 
-        if self.served_model_name is None:
-            self.served_model_name = self.model_path
+    def __setattr__(self, key, value):
+        # If the attribute exists in ServerArgs, set it directly
+        if key in {f.name for f in fields(ServerArgs)}:
+            super().__setattr__(key, value)
+        # If the attribute exists in EngineArgs, forward it to engine_args
+        elif hasattr(self.engine_args, key):
+            setattr(self.engine_args, key, value)
+        else:
+            raise AttributeError(
+                f"'{self.__class__.__name__}' object has no attribute '{key}'"
+            )
 
-        if self.chunked_prefill_size <= 0:
-            # Disable chunked prefill
-            self.chunked_prefill_size = None
+    @classmethod
+    def from_kwargs(
+        cls,
+        *args,
+        **kwargs: Dict[str, any],
+    ) -> "ServerArgs":
+        """Creates a ServerArgs instance by separating EngineArgs and ServerArgs parameters."""
+        engine_args_fields = {field.name for field in fields(EngineArgs)}
+        server_args_fields = {field.name for field in fields(cls)} - {"engine_args"}
 
-        if self.mem_fraction_static is None:
-            if self.tp_size >= 16:
-                self.mem_fraction_static = 0.79
-            elif self.tp_size >= 8:
-                self.mem_fraction_static = 0.83
-            elif self.tp_size >= 4:
-                self.mem_fraction_static = 0.85
-            elif self.tp_size >= 2:
-                self.mem_fraction_static = 0.87
-            else:
-                self.mem_fraction_static = 0.88
+        engine_args_dict = {k: v for k, v in kwargs.items() if k in engine_args_fields}
+        server_args_dict = {k: v for k, v in kwargs.items() if k in server_args_fields}
 
-        if isinstance(self.additional_ports, int):
-            self.additional_ports = [self.additional_ports]
-        elif self.additional_ports is None:
-            self.additional_ports = []
+        engine_args = EngineArgs(*args, **engine_args_dict)
 
-        if self.random_seed is None:
-            self.random_seed = random.randint(0, 1 << 30)
+        return cls(engine_args=engine_args, **server_args_dict)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -137,7 +103,7 @@ class ServerArgs:
         parser.add_argument(
             "--tokenizer-path",
             type=str,
-            default=ServerArgs.tokenizer_path,
+            default=EngineArgs.tokenizer_path,
             help="The path of the tokenizer.",
         )
         parser.add_argument(
@@ -156,7 +122,7 @@ class ServerArgs:
         parser.add_argument(
             "--tokenizer-mode",
             type=str,
-            default=ServerArgs.tokenizer_mode,
+            default=EngineArgs.tokenizer_mode,
             choices=["auto", "slow"],
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
@@ -170,7 +136,7 @@ class ServerArgs:
         parser.add_argument(
             "--load-format",
             type=str,
-            default=ServerArgs.load_format,
+            default=EngineArgs.load_format,
             choices=["auto", "pt", "safetensors", "npcache", "dummy"],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
@@ -186,7 +152,7 @@ class ServerArgs:
         parser.add_argument(
             "--dtype",
             type=str,
-            default=ServerArgs.dtype,
+            default=EngineArgs.dtype,
             choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
             help="Data type for model weights and activations.\n\n"
             '* "auto" will use FP16 precision for FP32 and FP16 models, and '
@@ -200,7 +166,7 @@ class ServerArgs:
         parser.add_argument(
             "--kv-cache-dtype",
             type=str,
-            default=ServerArgs.kv_cache_dtype,
+            default=EngineArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2"],
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" is supported for CUDA 11.8+.',
         )
@@ -217,13 +183,13 @@ class ServerArgs:
         parser.add_argument(
             "--context-length",
             type=int,
-            default=ServerArgs.context_length,
+            default=EngineArgs.context_length,
             help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
         )
         parser.add_argument(
             "--quantization",
             type=str,
-            default=ServerArgs.quantization,
+            default=EngineArgs.quantization,
             choices=[
                 "awq",
                 "fp8",
@@ -239,7 +205,7 @@ class ServerArgs:
         parser.add_argument(
             "--served-model-name",
             type=str,
-            default=ServerArgs.served_model_name,
+            default=EngineArgs.served_model_name,
             help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
         )
         parser.add_argument(
@@ -251,81 +217,81 @@ class ServerArgs:
         parser.add_argument(
             "--mem-fraction-static",
             type=float,
-            default=ServerArgs.mem_fraction_static,
+            default=EngineArgs.mem_fraction_static,
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
         )
         parser.add_argument(
             "--max-running-requests",
             type=int,
-            default=ServerArgs.max_running_requests,
+            default=EngineArgs.max_running_requests,
             help="The maximum number of running requests.",
         )
         parser.add_argument(
             "--max-num-reqs",
             type=int,
-            default=ServerArgs.max_num_reqs,
+            default=EngineArgs.max_num_reqs,
             help="The maximum number of requests to serve in the memory pool. If the model have a large context length, you may need to decrease this value to avoid out-of-memory errors.",
         )
         parser.add_argument(
             "--max-total-tokens",
             type=int,
-            default=ServerArgs.max_total_tokens,
+            default=EngineArgs.max_total_tokens,
             help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. This option is typically used for development and debugging purposes.",
         )
         parser.add_argument(
             "--chunked-prefill-size",
             type=int,
-            default=ServerArgs.chunked_prefill_size,
+            default=EngineArgs.chunked_prefill_size,
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill",
         )
         parser.add_argument(
             "--max-prefill-tokens",
             type=int,
-            default=ServerArgs.max_prefill_tokens,
+            default=EngineArgs.max_prefill_tokens,
             help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
         )
         parser.add_argument(
             "--schedule-policy",
             type=str,
-            default=ServerArgs.schedule_policy,
+            default=EngineArgs.schedule_policy,
             choices=["lpm", "random", "fcfs", "dfs-weight"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
             "--schedule-conservativeness",
             type=float,
-            default=ServerArgs.schedule_conservativeness,
+            default=EngineArgs.schedule_conservativeness,
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
             "--tp-size",
             type=int,
-            default=ServerArgs.tp_size,
+            default=EngineArgs.tp_size,
             help="The tensor parallelism size.",
         )
         parser.add_argument(
             "--stream-interval",
             type=int,
-            default=ServerArgs.stream_interval,
+            default=EngineArgs.stream_interval,
             help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
         )
         parser.add_argument(
             "--random-seed",
             type=int,
-            default=ServerArgs.random_seed,
+            default=EngineArgs.random_seed,
             help="The random seed.",
         )
         parser.add_argument(
             "--log-level",
             type=str,
-            default=ServerArgs.log_level,
+            default=EngineArgs.log_level,
             help="The logging level of all loggers.",
         )
         parser.add_argument(
             "--log-level-http",
             type=str,
-            default=ServerArgs.log_level_http,
+            default=EngineArgs.log_level_http,
             help="The logging level of HTTP server. If not set, reuse --log-level by default.",
         )
         parser.add_argument(
@@ -356,13 +322,13 @@ class ServerArgs:
             "--data-parallel-size",
             "--dp-size",
             type=int,
-            default=ServerArgs.dp_size,
+            default=EngineArgs.dp_size,
             help="The data parallelism size.",
         )
         parser.add_argument(
             "--load-balance-method",
             type=str,
-            default=ServerArgs.load_balance_method,
+            default=EngineArgs.load_balance_method,
             help="The load balancing strategy for data parallelism.",
             choices=[
                 "round_robin",
@@ -377,7 +343,7 @@ class ServerArgs:
             help="The nccl init address of multi-node server.",
         )
         parser.add_argument(
-            "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
+            "--nnodes", type=int, default=EngineArgs.nnodes, help="The number of nodes."
         )
         parser.add_argument("--node-rank", type=int, help="The node rank.")
 
@@ -441,13 +407,13 @@ class ServerArgs:
         parser.add_argument(
             "--enable-mla",
             action="store_true",
-            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
+            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2",
         )
         parser.add_argument(
-            "--triton-attention-reduce-in-fp32",
+            "--attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
-            "This only affects Triton attention kernels.",
+            "This only affects Triton attention kernels",
         )
         parser.add_argument(
             "--efficient-weight-load",
@@ -459,32 +425,23 @@ class ServerArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+
+        # Init EngineArgs
+        engine_args_fields = {field.name for field in dataclasses.fields(EngineArgs)}
+        engine_args_dict = {
+            key: getattr(args, key) for key in engine_args_fields if hasattr(args, key)
+        }
+        engine_args = EngineArgs(**engine_args_dict)
+
+        # Init ServerArgs with the remaining fields...
+        server_args_fields = {field.name for field in dataclasses.fields(cls)} - {
+            "engine_args"
+        }
+        server_args_dict = {
+            key: getattr(args, key) for key in server_args_fields if hasattr(args, key)
+        }
+
+        return cls(engine_args=engine_args, **server_args_dict)
 
     def url(self):
         return f"http://{self.host}:{self.port}"
-
-    def check_server_args(self):
-        assert (
-            self.tp_size % self.nnodes == 0
-        ), "tp_size must be divisible by number of nodes"
-        assert not (
-            self.dp_size > 1 and self.node_rank is not None
-        ), "multi-node data parallel is not supported"
-        if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
-            logger.info(
-                "Not sure why, the tokenizer will add an additional token at the end of the prompt when trust_remote_mode=True"
-            )
-            self.trust_remote_code = False
-        if "gemma-2" in self.model_path.lower():
-            logger.info("When using sliding window in gemma-2, turn on flashinfer.")
-            self.disable_flashinfer = False
-
-
-@dataclasses.dataclass
-class PortArgs:
-    tokenizer_port: int
-    controller_port: int
-    detokenizer_port: int
-    nccl_ports: List[int]

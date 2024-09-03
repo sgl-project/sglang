@@ -194,18 +194,18 @@ class InputMetadata:
 
         if (
             forward_mode != ForwardMode.DECODE
-            or model_runner.server_args.disable_flashinfer
+            or model_runner.engine_args.disable_flashinfer
         ):
             ret.total_num_tokens = int(torch.sum(ret.seq_lens))
 
         if forward_mode != ForwardMode.DECODE:
             ret.init_multimuldal_info(batch)
 
-        if model_runner.server_args.disable_flashinfer:
+        if model_runner.engine_args.disable_flashinfer:
             ret.init_triton_args(batch)
 
         flashinfer_use_ragged = False
-        if not model_runner.server_args.disable_flashinfer:
+        if not model_runner.engine_args.disable_flashinfer:
             if (
                 forward_mode != ForwardMode.DECODE
                 and int(torch.sum(ret.seq_lens)) > 4096

@@ -3,8 +3,8 @@
 import argparse
 import os
 
-from sglang.srt.server import launch_server
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.serving.server import launch_server
+from sglang.srt.serving.server_args import ServerArgs
 from sglang.srt.utils import kill_child_process
 
 if __name__ == "__main__":

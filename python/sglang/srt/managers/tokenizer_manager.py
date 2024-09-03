@@ -52,7 +52,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.serving.engine_args import EngineArgs
 from sglang.srt.utils import is_generation_model, is_multimodal_model, load_image
 from sglang.utils import get_exception_traceback
 
@@ -75,44 +75,47 @@ class TokenizerManager:
 
     def __init__(
         self,
-        server_args: ServerArgs,
-        port_args: PortArgs,
-        model_override_args: dict = None,
+        engine_args: EngineArgs,
     ):
-        self.server_args = server_args
+        self.engine_args = engine_args
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = context.socket(zmq.PULL)
-        self.recv_from_detokenizer.bind(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
+        self.recv_from_detokenizer.bind(f"tcp://127.0.0.1:{engine_args.tokenizer_port}")
 
+<<<<<<< HEAD
         self.send_to_controller = context.socket(zmq.PUSH)
         self.send_to_controller.connect(f"tcp://127.0.0.1:{port_args.controller_port}")
+=======
+        self.send_to_router = context.socket(zmq.PUSH)
+        self.send_to_router.connect(f"tcp://127.0.0.1:{engine_args.controller_port}")
+>>>>>>> 7b5d19c (Add LLM Engine)
 
         # Read model args
-        self.model_path = server_args.model_path
-        self.served_model_name = server_args.served_model_name
+        self.model_path = engine_args.model_path
+        self.served_model_name = engine_args.served_model_name
         self.hf_config = get_config(
             self.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            model_override_args=model_override_args,
+            trust_remote_code=engine_args.trust_remote_code,
+            model_override_args=engine_args.model_override_args,
         )
         self.is_generation = is_generation_model(
-            self.hf_config.architectures, self.server_args.is_embedding
+            self.hf_config.architectures, self.engine_args.is_embedding
         )
-        self.context_len = server_args.context_length or get_context_length(
+        self.context_len = engine_args.context_length or get_context_length(
             self.hf_config
         )
 
         # Create tokenizer
-        if server_args.skip_tokenizer_init:
+        if engine_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
             if is_multimodal_model(self.hf_config.architectures):
                 self.processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
+                    engine_args.tokenizer_path,
+                    tokenizer_mode=engine_args.tokenizer_mode,
+                    trust_remote_code=engine_args.trust_remote_code,
                 )
                 self.tokenizer = self.processor.tokenizer
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -122,17 +125,19 @@ class TokenizerManager:
                 self.executor = concurrent.futures.ProcessPoolExecutor(
                     initializer=init_global_processor,
                     mp_context=mp.get_context("fork"),
-                    initargs=(server_args,),
+                    initargs=(engine_args,),
                 )
             else:
                 self.tokenizer = get_tokenizer(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
+                    engine_args.tokenizer_path,
+                    tokenizer_mode=engine_args.tokenizer_mode,
+                    trust_remote_code=engine_args.trust_remote_code,
                 )
 
         # Store states
         self.to_create_loop = True
+        self.handle_loop_task = None
+        self.should_stop_loop = False
         self.rid_to_state: Dict[str, ReqState] = {}
 
         # For update model weights
@@ -465,7 +470,7 @@ class TokenizerManager:
             out["index"] = response_index
 
             # Log requests
-            if self.server_args.log_requests and state.finished:
+            if self.engine_args.log_requests and state.finished:
                 logger.info(f"in={obj}, out={out}")
 
             state.out_list = []
@@ -515,9 +520,9 @@ class TokenizerManager:
         if self.to_create_loop:
             self.create_handle_loop()
 
-        # default the load format to the server_args
+        # default the load format to the engine_args
         if obj.load_format is None:
-            obj.load_format = self.server_args.load_format
+            obj.load_format = self.engine_args.load_format
 
         if not self.model_update_lock.locked():
             async with self.model_update_lock:
@@ -528,8 +533,8 @@ class TokenizerManager:
                 self.model_update_result = asyncio.Future()
                 result = await self.model_update_result
                 if result.success:
-                    self.server_args.model_path = obj.model_path
-                    self.server_args.load_format = obj.load_format
+                    self.engine_args.model_path = obj.model_path
+                    self.engine_args.load_format = obj.load_format
                     self.model_path = obj.model_path
             return result.success, result.message
         else:
@@ -555,53 +560,74 @@ class TokenizerManager:
 
         self.to_create_loop = False
         loop = asyncio.get_event_loop()
-        loop.create_task(self.handle_loop())
+        self.handle_loop_task = loop.create_task(self.handle_loop())
 
     async def handle_loop(self):
         """The event loop that handles requests"""
+        poller = zmq.asyncio.Poller()
+        poller.register(self.recv_from_detokenizer, zmq.POLLIN)
 
-        while True:
-            recv_obj: Union[
-                BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, UpdateWeightReqOutput
-            ] = await self.recv_from_detokenizer.recv_pyobj()
+        try:
+            while True:
+                if self.should_stop_loop and not poller.poll(timeout=0):
+                    logger.info(
+                        "No more messages and shutdown requested, exiting loop."
+                    )
+                    break
 
-            if isinstance(recv_obj, UpdateWeightReqOutput):
-                self.model_update_result.set_result(recv_obj)
+                # any new events?
+                events = dict(await poller.poll(timeout=100))  # 100ms
+                if self.recv_from_detokenizer in events:
+                    # yes and process it
+                    recv_obj: Union[
+                        BatchStrOut,
+                        BatchEmbeddingOut,
+                        BatchTokenIDOut,
+                        UpdateWeightReqOutput,
+                    ] = await self.recv_from_detokenizer.recv_pyobj()
+
+                    if isinstance(recv_obj, UpdateWeightReqOutput):
+                        self.model_update_result.set_result(recv_obj)
+                        continue
+
+                    await self._process_recv_obj(recv_obj)
+        except Exception as e:
+            logger.error(f"Exception in handle_loop: {e}")
+
+    async def _process_recv_obj(self, recv_obj):
+        assert isinstance(
+            recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)
+        ), f"Unexpected obj received: {type(recv_obj)}"
+
+        for i, rid in enumerate(recv_obj.rids):
+            state = self.rid_to_state.get(rid, None)
+            if state is None:
                 continue
 
-            assert isinstance(
-                recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)
-            ), f"Unexpected obj received: {type(recv_obj)}"
+            recv_obj.meta_info[i]["id"] = rid
+            if isinstance(recv_obj, BatchStrOut):
+                out_dict = {
+                    "text": recv_obj.output_strs[i],
+                    "meta_info": recv_obj.meta_info[i],
+                }
+            elif isinstance(recv_obj, BatchTokenIDOut):
+                read_start = 0 if i == 0 else recv_obj.read_offsets[i - 1]
+                out_dict = {
+                    "token_ids": recv_obj.decode_ids[
+                        read_start : recv_obj.read_offsets[i]
+                    ],
+                    "meta_info": recv_obj.meta_info[i],
+                }
 
-            for i, rid in enumerate(recv_obj.rids):
-                state = self.rid_to_state.get(rid, None)
-                if state is None:
-                    continue
-
-                recv_obj.meta_info[i]["id"] = rid
-                if isinstance(recv_obj, BatchStrOut):
-                    out_dict = {
-                        "text": recv_obj.output_strs[i],
-                        "meta_info": recv_obj.meta_info[i],
-                    }
-                elif isinstance(recv_obj, BatchTokenIDOut):
-                    read_start = 0 if i == 0 else recv_obj.read_offsets[i - 1]
-                    out_dict = {
-                        "token_ids": recv_obj.decode_ids[
-                            read_start : recv_obj.read_offsets[i]
-                        ],
-                        "meta_info": recv_obj.meta_info[i],
-                    }
-
-                else:
-                    assert isinstance(recv_obj, BatchEmbeddingOut)
-                    out_dict = {
-                        "embedding": recv_obj.embeddings[i],
-                        "meta_info": recv_obj.meta_info[i],
-                    }
-                state.out_list.append(out_dict)
-                state.finished = recv_obj.finished_reason[i] is not None
-                state.event.set()
+            else:
+                assert isinstance(recv_obj, BatchEmbeddingOut)
+                out_dict = {
+                    "embedding": recv_obj.embeddings[i],
+                    "meta_info": recv_obj.meta_info[i],
+                }
+            state.out_list.append(out_dict)
+            state.finished = recv_obj.finished_reason[i] is not None
+            state.event.set()
 
     def convert_logprob_style(
         self,
@@ -655,6 +681,53 @@ class TokenizerManager:
                     token_top_logprobs, decode_to_text
                 )
         return top_logprobs
+
+    def shutdown(self):
+        """Synchronous API for TokenizerManager shutdown.
+
+        Note! This function is supposed to be called from Engine, and
+        we assume only one Engine instance is running, thus it is written
+        without synchronization prmitive.
+
+        This API is synchronous, it will set the should_stop_loop flag to
+        bring the event loop down, and closes the sockets and the ZMQ context
+        in a safe manner.
+        """
+        # This flags the handle_loop() to stop(when finishing its last job.)
+        self.should_stop_loop = True
+
+        asyncio.run(self._shutdown_async())
+
+        logger.info("TokenizerManager shutdown completed!")
+
+    async def _shutdown_async(self):
+        """Asynchronous part of shutdown logic.
+        This is not an exposed API. (Shall we do an async shutdown??)
+        """
+        # Wait for the handle_loop() is done, which means
+        # self.recv_from_detokenizer is finished with its job.
+        if self.handle_loop_task is not None:
+            try:
+                await self.handle_loop_task
+            except asyncio.CancelledError:
+                pass
+
+        # Close the sender socket first.
+        if not self.send_to_router.closed:
+            self.send_to_router.close()
+            logger.info("send_to_router socket closed.")
+
+        # Now close the receiver
+        if not self.recv_from_detokenizer.closed:
+            self.recv_from_detokenizer.close()
+            logger.info("recv_from_detokenizer socket closed.")
+
+        # Finally close the context, which is shared by
+        # recv_from_detokenizer and send_to_router, so we only
+        # close it once.
+        if not self.recv_from_detokenizer.context.closed:
+            self.recv_from_detokenizer.context.term()
+            logger.info("ZeroMQ context terminated.")
 
     async def _get_pixel_values(self, image_data: List[Union[str, bytes]]):
         if not image_data:
@@ -723,14 +796,14 @@ class TokenizerManager:
 global global_processor
 
 
-def init_global_processor(server_args: ServerArgs):
+def init_global_processor(engine_args: EngineArgs):
     """Init the global processor for multi modal models."""
     global global_processor
     transformers.logging.set_verbosity_error()
     global_processor = get_processor(
-        server_args.tokenizer_path,
-        tokenizer_mode=server_args.tokenizer_mode,
-        trust_remote_code=server_args.trust_remote_code,
+        engine_args.tokenizer_path,
+        tokenizer_mode=engine_args.tokenizer_mode,
+        trust_remote_code=engine_args.trust_remote_code,
     )
 
 

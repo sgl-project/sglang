@@ -54,7 +54,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_config import AttentionArch, ModelConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.serving.engine_args import EngineArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_generation_model,
@@ -77,7 +77,7 @@ class ModelRunner:
         tp_rank: int,
         tp_size: int,
         nccl_port: int,
-        server_args: ServerArgs,
+        engine_args: EngineArgs,
     ):
         # Parse args
         self.model_config = model_config
@@ -86,16 +86,16 @@ class ModelRunner:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.nccl_port = nccl_port
-        self.server_args = server_args
+        self.engine_args = engine_args
         self.is_multimodal_model = is_multimodal_model(
             self.model_config.hf_config.architectures
         )
         global_server_args_dict.update(
             {
-                "disable_flashinfer": server_args.disable_flashinfer,
-                "disable_flashinfer_sampling": server_args.disable_flashinfer_sampling,
-                "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                "enable_mla": server_args.enable_mla,
+                "disable_flashinfer": engine_args.disable_flashinfer,
+                "disable_flashinfer_sampling": engine_args.disable_flashinfer_sampling,
+                "triton_attention_reduce_in_fp32": engine_args.triton_attention_reduce_in_fp32,
+                "enable_mla": engine_args.enable_mla,
             }
         )
 
@@ -103,15 +103,15 @@ class ModelRunner:
             logger.info(
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
             )
-            server_args.chunked_prefill_size = None
-            server_args.mem_fraction_static *= 0.95
+            engine_args.chunked_prefill_size = None
+            engine_args.mem_fraction_static *= 0.95
 
         min_per_gpu_memory = self.init_torch_distributed()
         self.load_model()
         self.init_memory_pool(
             min_per_gpu_memory,
-            server_args.max_num_reqs,
-            server_args.max_total_tokens,
+            engine_args.max_num_reqs,
+            engine_args.max_total_tokens,
         )
         self.init_cublas()
         self.init_flashinfer()
@@ -122,14 +122,14 @@ class ModelRunner:
         torch.cuda.set_device(self.gpu_id)
         logger.info("Init nccl begin.")
 
-        if not self.server_args.enable_p2p_check:
+        if not self.engine_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
 
-        if self.server_args.nccl_init_addr:
-            nccl_init_method = f"tcp://{self.server_args.nccl_init_addr}"
+        if self.engine_args.nccl_init_addr:
+            nccl_init_method = f"tcp://{self.engine_args.nccl_init_addr}"
         else:
             nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port}"
-        set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+        set_custom_all_reduce(not self.engine_args.disable_custom_all_reduce)
         init_distributed_environment(
             backend="nccl",
             world_size=self.tp_size,
@@ -146,7 +146,7 @@ class ModelRunner:
         # Currently, there is a bug with mulit-node tensor parallelsim + padded cuda graph,
         # so we disable padding in cuda graph.
         if not all(in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)):
-            self.server_args.disable_cuda_graph_padding = True
+            self.engine_args.disable_cuda_graph_padding = True
             logger.info(
                 "Setting disable_cuda_graph_padding to True because of multi-node tensor parallelism."
             )
@@ -169,20 +169,20 @@ class ModelRunner:
             logger.info(
                 "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
             )
-            self.server_args.dtype = "float16"
+            self.engine_args.dtype = "float16"
             if torch.cuda.get_device_capability()[1] < 5:
                 raise RuntimeError("SGLang only supports sm75 and above.")
 
         monkey_patch_vllm_dummy_weight_loader()
         self.device_config = DeviceConfig()
-        self.load_config = LoadConfig(load_format=self.server_args.load_format)
+        self.load_config = LoadConfig(load_format=self.engine_args.load_format)
         self.vllm_model_config = VllmModelConfig(
-            model=self.server_args.model_path,
-            quantization=self.server_args.quantization,
+            model=self.engine_args.model_path,
+            quantization=self.engine_args.quantization,
             tokenizer=None,
             tokenizer_mode=None,
-            trust_remote_code=self.server_args.trust_remote_code,
-            dtype=self.server_args.dtype,
+            trust_remote_code=self.engine_args.trust_remote_code,
+            dtype=self.engine_args.dtype,
             seed=42,
             skip_tokenizer_init=True,
         )
@@ -215,7 +215,7 @@ class ModelRunner:
             else None
         )
         self.is_generation = is_generation_model(
-            self.model_config.hf_config.architectures, self.server_args.is_embedding
+            self.model_config.hf_config.architectures, self.engine_args.is_embedding
         )
 
         logger.info(
@@ -245,11 +245,11 @@ class ModelRunner:
             # TODO: Use a better method to check this
             vllm_model_config = VllmModelConfig(
                 model=model_path,
-                quantization=self.server_args.quantization,
+                quantization=self.engine_args.quantization,
                 tokenizer=None,
                 tokenizer_mode=None,
-                trust_remote_code=self.server_args.trust_remote_code,
-                dtype=self.server_args.dtype,
+                trust_remote_code=self.engine_args.trust_remote_code,
+                dtype=self.engine_args.dtype,
                 seed=42,
                 skip_tokenizer_init=True,
             )
@@ -303,8 +303,8 @@ class ModelRunner:
                 return False, message
 
         self.model = model
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
+        self.engine_args.model_path = model_path
+        self.engine_args.load_format = load_format
         self.vllm_model_config = vllm_model_config
         self.load_config = load_config
         self.model_config.path = model_path
@@ -318,7 +318,7 @@ class ModelRunner:
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
-            and self.server_args.enable_mla
+            and self.engine_args.enable_mla
         ):
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
@@ -345,13 +345,19 @@ class ModelRunner:
         max_num_reqs: int = None,
         max_total_tokens: int = None,
     ):
-        if self.server_args.kv_cache_dtype == "auto":
+        if self.engine_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
-        elif self.server_args.kv_cache_dtype == "fp8_e5m2":
-            self.kv_cache_dtype = torch.float8_e5m2
+        elif self.engine_args.kv_cache_dtype == "fp8_e5m2":
+            if self.engine_args.disable_flashinfer or self.engine_args.enable_mla:
+                logger.warning(
+                    "FP8 KV cache is not supported for Triton kernel now, using auto kv cache dtype"
+                )
+                self.kv_cache_dtype = self.dtype
+            else:
+                self.kv_cache_dtype = torch.float8_e5m2
         else:
             raise ValueError(
-                f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
+                f"Unsupported kv_cache_dtype: {self.engine_args.kv_cache_dtype}."
             )
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
@@ -386,7 +392,7 @@ class ModelRunner:
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
-            and self.server_args.enable_mla
+            and self.engine_args.enable_mla
         ):
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
@@ -397,7 +403,7 @@ class ModelRunner:
             )
             logger.info("using MLA Triton implementaion, flashinfer is disabled")
             # FIXME: temporarily only Triton MLA is supported
-            self.server_args.disable_flashinfer = True
+            self.engine_args.disable_flashinfer = True
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
@@ -422,7 +428,7 @@ class ModelRunner:
 
     def init_flashinfer(self):
         """Init flashinfer attention kernel wrappers."""
-        if self.server_args.disable_flashinfer:
+        if self.engine_args.disable_flashinfer:
             assert (
                 self.sliding_window_size is None
             ), "turn on flashinfer to support window attention"
@@ -489,13 +495,13 @@ class ModelRunner:
 
         from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
-        if self.server_args.disable_cuda_graph or self.server_args.disable_flashinfer:
+        if self.engine_args.disable_cuda_graph or self.engine_args.disable_flashinfer:
             self.cuda_graph_runner = None
             return
 
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
 
-        if self.server_args.disable_cuda_graph_padding:
+        if self.engine_args.disable_cuda_graph_padding:
             batch_size_list = list(range(1, 32)) + [64, 128]
         else:
             batch_size_list = [1, 2, 4] + [i * 8 for i in range(1, 21)]
@@ -503,8 +509,8 @@ class ModelRunner:
         self.cuda_graph_runner = CudaGraphRunner(
             self,
             max_batch_size_to_capture=max(batch_size_list),
-            use_torch_compile=self.server_args.enable_torch_compile,
-            disable_padding=self.server_args.disable_cuda_graph_padding,
+            use_torch_compile=self.engine_args.enable_torch_compile,
+            disable_padding=self.engine_args.disable_cuda_graph_padding,
         )
         try:
             self.cuda_graph_runner.capture(batch_size_list)

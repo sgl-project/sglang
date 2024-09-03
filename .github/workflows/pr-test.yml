@@ -88,6 +88,14 @@ jobs:
           pip install -e "python[all]"
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
+      - name: Set PYTHONPATH
+        run: |
+          echo "PYTHONPATH=$PYTHONPATH:$(pwd)/python" >> $GITHUB_ENV
+
+      - name: Verify import
+        run: |
+          python3 -c "import sglang.srt.serving"
+
       - name: Benchmark Serving Throughput
         timeout-minutes: 10
         run: |
@@ -124,6 +132,14 @@ jobs:
           pip install --upgrade pip
           pip install -e "python[all]"
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Set PYTHONPATH
+        run: |
+          echo "PYTHONPATH=$PYTHONPATH:$(pwd)/python" >> $GITHUB_ENV
+
+      - name: Verify import
+        run: |
+          python3 -c "import sglang.srt.serving"
 
       - name: Benchmark Serving Throughput (TP=2)
         timeout-minutes: 10

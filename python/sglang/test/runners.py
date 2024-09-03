@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sglang.srt.server import Runtime
+from sglang.srt.serving.server import Runtime
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 
 DEFAULT_PROMPTS = [

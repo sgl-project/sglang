@@ -34,7 +34,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.serving.engine_args import EngineArgs
 from sglang.srt.utils import configure_logger, kill_parent_process
 from sglang.utils import get_exception_traceback
 
@@ -69,22 +69,19 @@ class ControllerMulti:
 
     def __init__(
         self,
-        server_args: ServerArgs,
-        port_args: PortArgs,
-        model_override_args,
+        engine_args: EngineArgs,
     ):
         # Parse args
-        self.server_args = server_args
-        self.port_args = port_args
-        self.model_override_args = model_override_args
+        self.engine_args = engine_args
+        self.model_override_args = engine_args.model_override_args
         self.load_balance_method = LoadBalanceMethod.from_str(
-            server_args.load_balance_method
+            engine_args.load_balance_method
         )
 
         # Init communication
         context = zmq.Context()
         self.recv_from_tokenizer = context.socket(zmq.PULL)
-        self.recv_from_tokenizer.bind(f"tcp://127.0.0.1:{port_args.controller_port}")
+        self.recv_from_tokenizer.bind(f"tcp://127.0.0.1:{engine_args.controller_port}")
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -96,11 +93,11 @@ class ControllerMulti:
 
         # Start data parallel workers
         self.workers = []
-        for i in range(server_args.dp_size):
+        for i in range(engine_args.dp_size):
             self.start_dp_worker(i)
 
     def start_dp_worker(self, dp_worker_id: int):
-        tp_size = self.server_args.tp_size
+        tp_size = self.engine_args.tp_size
 
         pipe_controller_reader, pipe_controller_writer = multiprocessing.Pipe(
             duplex=False
@@ -111,7 +108,7 @@ class ControllerMulti:
         proc = multiprocessing.Process(
             target=start_controller_process_single,
             args=(
-                self.server_args,
+                self.engine_args,
                 self.port_args,
                 pipe_controller_writer,
                 self.model_override_args,
@@ -185,18 +182,13 @@ class ControllerMulti:
         return recv_reqs
 
 
-def start_controller_process(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-    pipe_writer,
-    model_override_args: dict,
-):
+def start_controller_process(engine_args: EngineArgs, pipe_writer):
     """Start a controller process."""
 
-    configure_logger(server_args)
+    configure_logger(engine_args.log_level)
 
     try:
-        controller = ControllerMulti(server_args, port_args, model_override_args)
+        controller = ControllerMulti(engine_args)
     except Exception:
         pipe_writer.send(get_exception_traceback())
         raise

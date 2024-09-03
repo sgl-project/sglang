@@ -31,7 +31,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightReqOutput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.serving.engine_args import EngineArgs
 from sglang.utils import find_printable_text, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -53,24 +53,23 @@ class DetokenizerManager:
 
     def __init__(
         self,
-        server_args: ServerArgs,
-        port_args: PortArgs,
+        engine_args: EngineArgs,
     ):
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_router = context.socket(zmq.PULL)
-        self.recv_from_router.bind(f"tcp://127.0.0.1:{port_args.detokenizer_port}")
+        self.recv_from_router.bind(f"tcp://127.0.0.1:{engine_args.detokenizer_port}")
 
         self.send_to_tokenizer = context.socket(zmq.PUSH)
-        self.send_to_tokenizer.connect(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
+        self.send_to_tokenizer.connect(f"tcp://127.0.0.1:{engine_args.tokenizer_port}")
 
-        if server_args.skip_tokenizer_init:
+        if engine_args.skip_tokenizer_init:
             self.tokenizer = None
         else:
             self.tokenizer = get_tokenizer(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
+                engine_args.tokenizer_path,
+                tokenizer_mode=engine_args.tokenizer_mode,
+                trust_remote_code=engine_args.trust_remote_code,
             )
 
         self.decode_status = {}
@@ -171,15 +170,17 @@ class DetokenizerManager:
 
 
 def start_detokenizer_process(
-    server_args: ServerArgs,
-    port_args: PortArgs,
+    engine_args: EngineArgs,
     pipe_writer,
 ):
     try:
-        manager = DetokenizerManager(server_args, port_args)
+        manager = DetokenizerManager(engine_args)
     except Exception:
         pipe_writer.send(get_exception_traceback())
         raise
     pipe_writer.send("init ok")
-    loop = asyncio.get_event_loop()
+    # Create a new event loop for this process because asyncio.get_event_loop()
+    # does not return a loop in a new thread or process in Python 3.10+.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     loop.run_until_complete(manager.handle_loop())

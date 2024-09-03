@@ -54,7 +54,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.serving.engine_args import EngineArgs
 from sglang.srt.utils import (
     configure_logger,
     is_multimodal_model,
@@ -74,60 +74,59 @@ class ModelTpServer:
         self,
         gpu_id: int,
         tp_rank: int,
-        server_args: ServerArgs,
         nccl_port: int,
-        model_override_args: dict,
+        engine_args: EngineArgs,
     ):
         suppress_other_loggers()
 
         # Copy arguments
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
-        self.tp_size = server_args.tp_size
-        self.dp_size = server_args.dp_size
-        self.schedule_policy = server_args.schedule_policy
-        self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
+        self.tp_size = engine_args.tp_size
+        self.dp_size = engine_args.dp_size
+        self.schedule_policy = engine_args.schedule_policy
+        self.disable_regex_jump_forward = engine_args.disable_regex_jump_forward
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
-            server_args.model_path,
-            server_args.trust_remote_code,
-            context_length=server_args.context_length,
-            model_override_args=model_override_args,
+            engine_args.model_path,
+            engine_args.trust_remote_code,
+            context_length=engine_args.context_length,
+            model_override_args=engine_args.model_override_args,
         )
 
         self.model_runner = ModelRunner(
             model_config=self.model_config,
-            mem_fraction_static=server_args.mem_fraction_static,
+            mem_fraction_static=engine_args.mem_fraction_static,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
+            tp_size=engine_args.tp_size,
             nccl_port=nccl_port,
-            server_args=server_args,
+            engine_args=engine_args,
         )
-        if server_args.skip_tokenizer_init:
+        if engine_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
             if is_multimodal_model(self.model_config.hf_config.architectures):
                 self.processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
+                    engine_args.tokenizer_path,
+                    tokenizer_mode=engine_args.tokenizer_mode,
+                    trust_remote_code=engine_args.trust_remote_code,
                 )
                 self.tokenizer = self.processor.tokenizer
             else:
                 self.tokenizer = get_tokenizer(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
+                    engine_args.tokenizer_path,
+                    tokenizer_mode=engine_args.tokenizer_mode,
+                    trust_remote_code=engine_args.trust_remote_code,
                 )
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
-        self.max_prefill_tokens = server_args.max_prefill_tokens
+        self.max_prefill_tokens = engine_args.max_prefill_tokens
         self.max_running_requests = min(
             (
                 self.max_total_num_tokens // 2
-                if server_args.max_running_requests is None
-                else server_args.max_running_requests
+                if engine_args.max_running_requests is None
+                else engine_args.max_running_requests
             ),
             self.model_runner.req_to_token_pool.size - 1,
         )
@@ -137,12 +136,12 @@ class ModelTpServer:
         )
 
         # Sync random seed
-        server_args.random_seed = broadcast_recv_input(
-            [server_args.random_seed],
+        engine_args.random_seed = broadcast_recv_input(
+            [engine_args.random_seed],
             self.tp_rank,
             self.model_runner.tp_group.cpu_group,
         )[0]
-        set_random_seed(server_args.random_seed)
+        set_random_seed(engine_args.random_seed)
 
         # Print info
         logger.info(
@@ -154,8 +153,8 @@ class ModelTpServer:
 
         # Init cache
         if (
-            server_args.chunked_prefill_size is not None
-            and server_args.disable_radix_cache
+            engine_args.chunked_prefill_size is not None
+            and engine_args.disable_radix_cache
         ):
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.model_runner.req_to_token_pool,
@@ -165,7 +164,7 @@ class ModelTpServer:
             self.tree_cache = RadixCache(
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
-                disable=server_args.disable_radix_cache,
+                disable=engine_args.disable_radix_cache,
             )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.scheduler = PolicyScheduler(self.schedule_policy, self.tree_cache)
@@ -177,46 +176,46 @@ class ModelTpServer:
         self.running_batch: ScheduleBatch = None
         self.out_pyobjs = []
         self.decode_forward_ct = 0
-        self.stream_interval = server_args.stream_interval
+        self.stream_interval = engine_args.stream_interval
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
 
         # Chunked prefill
-        self.chunked_prefill_size = server_args.chunked_prefill_size
+        self.chunked_prefill_size = engine_args.chunked_prefill_size
         self.current_inflight_req = None
         self.is_mixed_chunk = (
-            self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
+            self.chunked_prefill_size is not None and engine_args.enable_mixed_chunk
         )
 
         # Init the FSM cache for constrained generation
-        if not server_args.skip_tokenizer_init:
+        if not engine_args.skip_tokenizer_init:
             self.regex_fsm_cache = FSMCache(
-                server_args.tokenizer_path,
+                engine_args.tokenizer_path,
                 {
-                    "tokenizer_mode": server_args.tokenizer_mode,
-                    "trust_remote_code": server_args.trust_remote_code,
+                    "tokenizer_mode": engine_args.tokenizer_mode,
+                    "trust_remote_code": engine_args.trust_remote_code,
                 },
-                skip_tokenizer_init=server_args.skip_tokenizer_init,
+                skip_tokenizer_init=engine_args.skip_tokenizer_init,
                 json_schema_mode=False,
             )
             self.json_fsm_cache = FSMCache(
-                server_args.tokenizer_path,
+                engine_args.tokenizer_path,
                 {
-                    "tokenizer_mode": server_args.tokenizer_mode,
-                    "trust_remote_code": server_args.trust_remote_code,
+                    "tokenizer_mode": engine_args.tokenizer_mode,
+                    "trust_remote_code": engine_args.trust_remote_code,
                 },
-                skip_tokenizer_init=server_args.skip_tokenizer_init,
+                skip_tokenizer_init=engine_args.skip_tokenizer_init,
                 json_schema_mode=True,
             )
         self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
         assert (
-            server_args.schedule_conservativeness >= 0
+            engine_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
         self.min_new_token_ratio = min(
             global_config.base_min_new_token_ratio
-            * server_args.schedule_conservativeness,
+            * engine_args.schedule_conservativeness,
             1.0,
         )
         self.new_token_ratio = self.min_new_token_ratio
@@ -874,20 +873,18 @@ class ModelTpServer:
 def run_tp_server(
     gpu_id: int,
     tp_rank: int,
-    server_args: ServerArgs,
     nccl_port: int,
-    model_override_args: dict,
+    engine_args: EngineArgs,
 ):
     """Run a tensor parallel model server."""
-    configure_logger(server_args, prefix=f" TP{tp_rank}")
+    configure_logger(engine_args.log_level, prefix=f" TP{tp_rank}")
 
     try:
         model_server = ModelTpServer(
             gpu_id,
             tp_rank,
-            server_args,
             nccl_port,
-            model_override_args,
+            engine_args,
         )
         tp_cpu_group = model_server.model_runner.tp_group.cpu_group
 
@@ -902,16 +899,15 @@ def run_tp_server(
 def launch_tp_servers(
     gpu_ids: List[int],
     tp_rank_range: List[int],
-    server_args: ServerArgs,
     nccl_port: int,
-    model_override_args: dict,
+    engine_args: EngineArgs,
 ):
     """Launch multiple tensor parallel servers."""
     procs = []
     for i in tp_rank_range:
         proc = multiprocessing.Process(
             target=run_tp_server,
-            args=(gpu_ids[i], i, server_args, nccl_port, model_override_args),
+            args=(gpu_ids[i], i, nccl_port, engine_args),
         )
         proc.start()
         procs.append(proc)

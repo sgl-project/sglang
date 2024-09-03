@@ -63,7 +63,7 @@ from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.serving.server_args import ServerArgs
 from sglang.srt.utils import suppress_other_loggers
 
 
