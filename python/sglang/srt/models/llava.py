@@ -397,7 +397,6 @@ class LlavaBaseForCausalLM(nn.Module):
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
         }
         params_dict = dict(self.named_parameters())
-        weights = list(weights)
         for name, loaded_weight in weights:
             if "projector" in name or "vision_tower" in name:
                 for weight_name, param_name in projector_weights.items():
