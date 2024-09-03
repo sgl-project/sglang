@@ -406,7 +406,7 @@ class LlavaBaseForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             else:
-                self.language_model.load_weights((name, loaded_weight))
+                self.language_model.load_weights([(name, loaded_weight)])
 
     @property
     def num_patches_per_side(self):
