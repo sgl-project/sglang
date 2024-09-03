@@ -34,7 +34,7 @@ SGLang has the following core features:
 Documentation
 -------------
 
-.. In this documentation, we'll dive into these following areas to help you get the most out of SGLang.
+**In this documentation, we'll dive into these following areas to help you get the most out of SGLang.**
 
 .. _installation:
 .. toctree::
@@ -42,6 +42,13 @@ Documentation
    :caption: Installation
 
    install.md
+
+.. _backend:
+.. toctree::
+   :maxdepth: 1
+   :caption: Backend
+
+   backend.md
 
 .. _hyperparameter_tuning:
 .. toctree::
