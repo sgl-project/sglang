@@ -398,7 +398,7 @@ class LlavaBaseForCausalLM(nn.Module):
         }
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "projector" in name or "vision_tower" in name:
+            if "projector" in name or "vision_tower" in name or "image_newline" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
