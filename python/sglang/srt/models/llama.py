@@ -295,7 +295,6 @@ class LlamaForCausalLM(nn.Module):
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: Optional[CacheConfig] = None,
-        efficient_weight_load=False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -304,6 +303,8 @@ class LlamaForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
         self.sampler = Sampler()
+
+        self.param_dict = dict(self.named_parameters())
 
     @torch.no_grad()
     def forward(
@@ -320,49 +321,26 @@ class LlamaForCausalLM(nn.Module):
         sample_output = self.sampler(logits_output, input_metadata.sampling_info)
         return sample_output, logits_output
 
-    def get_module_name(self, name):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id, num_shard)
-            ("qkv_proj", "q_proj", "q", 3),
-            ("qkv_proj", "k_proj", "k", 3),
-            ("qkv_proj", "v_proj", "v", 3),
-            ("gate_up_proj", "gate_proj", 0, 2),
-            ("gate_up_proj", "up_proj", 1, 2),
-        ]
-        for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
-            if weight_name in name:
-                return (
-                    name.replace(weight_name, param_name)[: -len(".weight")],
-                    num_shard,
-                )
-        return name[: -len(".weight")], 1
-
-    def get_num_params(self):
-        params_dict = dict(self.named_parameters())
-        return len(params_dict)
-
-    def load_weights(
-        self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
         ]
-        params_dict = dict(self.named_parameters())
+        params_dict = self.param_dict
 
-        def load_weights_per_param(name, loaded_weight):
+        for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
-                return
+                continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
-                return
+                continue
             if name.startswith("model.vision_tower") and name not in params_dict:
-                return
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -378,16 +356,14 @@ class LlamaForCausalLM(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    return
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-        if name is None or loaded_weight is None:
-            for name, loaded_weight in weights:
-                load_weights_per_param(name, loaded_weight)
-        else:
-            load_weights_per_param(name, loaded_weight)
+
+class Phi3ForCausalLM(LlamaForCausalLM):
+    pass
 
 
-EntryClass = LlamaForCausalLM
+EntryClass = [LlamaForCausalLM, Phi3ForCausalLM]

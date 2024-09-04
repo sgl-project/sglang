@@ -162,6 +162,7 @@ class ModelRunner:
         return min_per_gpu_memory
 
     def load_model(self):
+        torch.set_num_threads(1)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
@@ -523,7 +524,7 @@ class ModelRunner:
         if (
             self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(len(batch.reqs))
-            and not batch.sampling_info.has_bias()
+            and batch.sampling_info.can_run_in_cuda_graph()
         ):
             return self.cuda_graph_runner.replay(batch)
 
@@ -605,16 +606,6 @@ def import_model_classes():
                 else:
                     assert entry.__name__ not in model_arch_name_to_cls
                     model_arch_name_to_cls[entry.__name__] = entry
-
-            # compat: some models such as chatglm has incorrect class set in config.json
-            # usage: [ tuple("From_Entry_Class_Name": EntryClass), ]
-            if hasattr(module, "EntryClassRemapping") and isinstance(
-                module.EntryClassRemapping, list
-            ):
-                for remap in module.EntryClassRemapping:
-                    if isinstance(remap, tuple) and len(remap) == 2:
-                        assert remap[0] not in model_arch_name_to_cls
-                        model_arch_name_to_cls[remap[0]] = remap[1]
 
     return model_arch_name_to_cls
 

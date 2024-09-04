@@ -7,6 +7,7 @@ from sglang.test.test_programs import (
     test_dtype_gen,
     test_expert_answer,
     test_few_shot_qa,
+    test_hellaswag_select,
     test_mt_bench,
     test_parallel_decoding,
     test_regex,
@@ -61,6 +62,12 @@ class TestSRTBackend(unittest.TestCase):
 
     def test_dtype_gen(self):
         test_dtype_gen()
+
+    def test_hellaswag_select(self):
+        # Run twice to capture more bugs
+        for _ in range(2):
+            accuracy, latency = test_hellaswag_select()
+            assert accuracy > 0.71
 
 
 if __name__ == "__main__":
