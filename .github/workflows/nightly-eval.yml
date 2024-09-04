@@ -36,7 +36,7 @@ jobs:
       - name: Run eval
         timeout-minutes: 20
         run: |
-            python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --disable-radix-cache &
+            python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --disable-radix-cache &
 
             echo "Waiting for server to start..."
             for i in {1..120}; do

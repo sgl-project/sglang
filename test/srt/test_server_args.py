@@ -9,13 +9,13 @@ class TestPrepareServerArgs(unittest.TestCase):
             [
                 "--model-path",
                 "model_path",
-                "--model-override-args",
+                "--json-model-override-args",
                 '{"rope_scaling": {"factor": 2.0, "type": "linear"}}',
             ]
         )
         self.assertEqual(server_args.model_path, "model_path")
         self.assertEqual(
-            server_args.model_override_args,
+            server_args.json_model_override_args,
             {"rope_scaling": {"factor": 2.0, "type": "linear"}},
         )
 

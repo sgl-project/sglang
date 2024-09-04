@@ -96,8 +96,8 @@ class ServerArgs:
     nnodes: int = 1
     node_rank: Optional[int] = None
 
-    # Model override args
-    model_override_args: Optional[dict] = None
+    # Model override args in JSON
+    json_model_override_args: Optional[dict] = None
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -461,7 +461,7 @@ class ServerArgs:
 
         # Model override args
         parser.add_argument(
-            "--model-override-args",
+            "--json-model-override-args",
             type=str,
             help="A dictionary in JSON string format used to override default model configurations.",
         )
@@ -470,8 +470,10 @@ class ServerArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
-        args.model_override_args = (
-            json.loads(args.model_override_args) if args.model_override_args else None
+        args.json_model_override_args = (
+            json.loads(args.json_model_override_args)
+            if args.json_model_override_args
+            else None
         )
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})

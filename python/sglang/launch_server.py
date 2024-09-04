@@ -9,7 +9,7 @@ from sglang.srt.utils import kill_child_process
 
 if __name__ == "__main__":
     server_args = prepare_server_args(sys.argv[1:])
-    model_override_args = server_args.model_override_args
+    model_override_args = server_args.json_model_override_args
 
     try:
         launch_server(server_args, model_override_args=model_override_args)
