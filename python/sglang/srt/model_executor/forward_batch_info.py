@@ -380,8 +380,10 @@ def update_flashinfer_indices(
         kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
         kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        req_pool_indices = req_pool_indices[req_ids]
-        paged_kernel_lens = paged_kernel_lens[req_ids]
+        if sp_size > 1:
+            req_pool_indices = req_pool_indices[req_ids].contiguous()
+            paged_kernel_lens = paged_kernel_lens[req_ids].contiguous()
+            paged_kernel_lens = paged_kernel_lens.to(req_pool_indices.device)
 
         kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
         create_flashinfer_kv_indices_triton[(batch_size,)](
