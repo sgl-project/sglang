@@ -9,17 +9,17 @@ This guide will help you quickly set up and run the SGLang server, and send test
 Run the following command to start the SGLang server with a generative model:
 
 ```bash
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --port 30000 --api-key sk-None-hello-world --host 0.0.0.0
 ```
 
-This command launches a server using the Meta-Llama-3-8B-Instruct model on port 30000.
+This command launches a server using the Llama-2-7b-chat-hf model on port 30000 with an authentication key `sk-None-hello-world` and host `0.0.0.0` to enable external access.
 
 ### For Embedding Models
 
 To launch an embedding model server:
 
 ```bash
-python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding --port 30000
+python -m sglang.launch_server --is-embedding --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --port 30000 --api-key sk-None-hello-world --host 0.0.0.0
 ```
 
 This command launches a server using the gte-Qwen2-7B-instruct model on port 30000.
@@ -33,7 +33,9 @@ Once the server is running, you can send test requests using curl.
 ```bash
 curl http://localhost:30000/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-None-hello-world" \
   -d '{
+    "model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
     "messages": [
       {
         "role": "system",
@@ -52,7 +54,9 @@ curl http://localhost:30000/v1/chat/completions \
 ```bash
 curl http://localhost:30000/v1/embeddings \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-None-hello-world" \
   -d '{
+    "model": "Alibaba-NLP/gte-Qwen2-7B-instruct",
     "input": "Once upon a time"
   }'
 ```
@@ -64,14 +68,14 @@ SGLang supports OpenAI-compatible APIs. Here's a Python example:
 ```python
 import openai
 
-client = openai.Client(
-    base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
-# You should assign an api_key even if you didn't specify this argument when initializing the server.
+# You should always assign an api_key even if you didn't specify this argument when initializing the server.
 # However, we strongly suggest setting an API key when serving.
+client = openai.Client(
+    base_url="http://127.0.0.1:30000/v1", api_key="sk-None-hello-world")
 
 # Chat completion example
 response = client.chat.completions.create(
-    model="default",
+    model="meta-llama/Meta-Llama-3.1-8B-Instruct",
     messages=[
         {"role": "system", "content": "You are a helpful AI assistant"},
         {"role": "user", "content": "List 3 countries and their capitals."},
@@ -83,7 +87,7 @@ print(response)
 
 # Text embedding
 response = client.embeddings.create(
-    model="default",
+    model="Alibaba-NLP/gte-Qwen2-7B-instruct",
     input="How are you today",
 )
 print(response)
