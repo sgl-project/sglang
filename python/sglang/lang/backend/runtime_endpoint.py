@@ -4,7 +4,7 @@ from typing import List, Optional
 
 from sglang.global_config import global_config
 from sglang.lang.backend.base_backend import BaseBackend
-from sglang.lang.chat_template import get_chat_template_by_model_path
+from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.lang.choices import ChoicesDecision, ChoicesSamplingMethod
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import (
@@ -23,6 +23,7 @@ class RuntimeEndpoint(BaseBackend):
         base_url: str,
         api_key: Optional[str] = None,
         verify: Optional[str] = None,
+        chat_template_name: Optional[str] = None,
     ):
         super().__init__()
         self.support_concate_and_append = True
@@ -39,9 +40,12 @@ class RuntimeEndpoint(BaseBackend):
         self._assert_success(res)
         self.model_info = res.json()
 
-        self.chat_template = get_chat_template_by_model_path(
-            self.model_info["model_path"]
-        )
+        if chat_template_name:
+            self.chat_template = get_chat_template(chat_template_name)
+        else:
+            self.chat_template = get_chat_template_by_model_path(
+                self.model_info["model_path"]
+            )
 
     def get_model_name(self):
         return self.model_info["model_path"]
