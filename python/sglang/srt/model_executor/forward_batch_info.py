@@ -377,13 +377,13 @@ def update_flashinfer_indices(
             prefix_lens = torch.ceil(prefix_lens / sp_size).to(torch.int32)
             req_ids = list(range(batch_size))
 
-        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
-        kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-
         if sp_size > 1:
             req_pool_indices = req_pool_indices[req_ids].contiguous()
             paged_kernel_lens = paged_kernel_lens[req_ids].contiguous()
             paged_kernel_lens = paged_kernel_lens.to(req_pool_indices.device)
+
+        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
+        kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
         create_flashinfer_kv_indices_triton[(batch_size,)](
