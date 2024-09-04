@@ -487,12 +487,12 @@ class ModelRunner:
             if self.sp_size > 1:  # Sequence parallel enabled.
                 self.flashinfer_prefill_wrapper_sp_full = (
                     BatchPrefillWithRaggedKVCacheWrapper(
-                        self.flashinfer_workspace_buffers[2], "NHD"
+                        self.flashinfer_workspace_buffer, "NHD"
                     )
                 )
                 self.flashinfer_prefill_wrapper_sp_causal = (
                     BatchPrefillWithRaggedKVCacheWrapper(
-                        self.flashinfer_workspace_buffers[3], "NHD"
+                        self.flashinfer_workspace_buffer, "NHD"
                     )
                 )
         else:

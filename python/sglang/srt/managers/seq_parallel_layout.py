@@ -213,15 +213,15 @@ def seq_parallel_input_ids_extend(
 def seq_parallel_input_ids_decode(
     input_ids: Sequence[int], sp_size: int, seq_lens: np.ndarray
 ):
-    input_ids_sp = [[] for _ in range(sp_size)]
+    input_indices_sp = [[] for _ in range(sp_size)]
     # NOTE: in the extend phase, we evenly do sequence partition on extended
     # tokens (extend_len). However, since prefix lens is cleaned, we instead
     # use the whole sequence length (seq_lens) for the round-robin KV-cache.
     for sp_rank in range(sp_size):
-        input_ids_sp[sp_rank].extend(
-            input_ids[seq_parallel_decode_indices(sp_rank, sp_size, seq_lens)]
-        )
-    flatten_input_ids = list(itertools.chain(*input_ids_sp))
+        indices = seq_parallel_decode_indices(sp_rank, sp_size, seq_lens)
+        input_indices_sp[sp_rank].extend(indices)
+    flatten_input_indices = list(itertools.chain(*input_indices_sp))
+    flatten_input_ids = np.asarray(input_ids)[flatten_input_indices]
     return flatten_input_ids
 
 
