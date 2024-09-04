@@ -2,13 +2,8 @@
 Usage: python3 local_example_llava_next.py
 """
 
-from PIL import ImageFile
-
 import sglang as sgl
 from sglang.lang.chat_template import get_chat_template
-from sglang.srt.utils import load_image
-
-ImageFile.LOAD_TRUNCATED_IMAGES = True  # Allow loading of truncated images
 
 
 @sgl.function

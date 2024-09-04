@@ -15,9 +15,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  meta-llama-31-8b-instruct:
+  nightly-eval-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 1-gpu-runner
+    runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -25,42 +25,11 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -e "python[dev]"
+          pip install -e "python[all]"
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
-          git clone https://github.com/EleutherAI/lm-evaluation-harness
-          pushd lm-evaluation-harness
-          pip install -e .
-          pip install lm_eval[api]
-          popd
 
-      - name: Run eval
-        timeout-minutes: 20
+      - name: Nightly gsm8k Accuracy
+        timeout-minutes: 60
         run: |
-            python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --disable-radix-cache &
-
-            echo "Waiting for server to start..."
-            for i in {1..120}; do
-              if curl -s http://127.0.0.1:30000/health; then
-                echo "Server is up!"
-                break
-              fi
-              if [ $i -eq 120 ]; then
-                echo "Server failed to start within 120 seconds"
-                exit 1
-              fi
-              sleep 1
-            done
-
-            lm_eval --model local-completions --tasks gsm8k --model_args model=meta-llama/Meta-Llama-3.1-8B-Instruct,base_url=http://127.0.0.1:30000/v1/completions,num_concurrent=128,max_retries=3,tokenized_requests=False
-
-            echo "Stopping server..."
-            kill -9 $(ps aux | grep sglang | grep Meta-Llama-3.1-8B-Instruct | grep -v grep | awk '{print $2}')
-
-  finish:
-    needs: [
-      meta-llama-31-8b-instruct
-    ]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Finish
-        run: echo "This is an empty step to ensure that all jobs are completed."
+          cd test/srt
+          python3 test_nightly_gsm8k_eval.py

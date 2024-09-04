@@ -56,7 +56,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.2.14.post2 https://github.com/sgl-project/sglang.git
+git clone -b v0.3.0 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -205,7 +205,7 @@ It supports streaming, vision, and most features of the Chat/Completions/Models/
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --tp 2
 ```
-- Add `--dp 2` to enable multi-GPU data parallelism. It can also be used together with tensor parallelism. Data parallelism is better for throughput if there is enough memory.
+- Add `--dp 2` to enable multi-GPU data parallelism. Data parallelism is better for throughput if there is enough memory. It can also be used together with tensor parallelism. The following command uses 4 GPUs in total.
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --dp 2 --tp 2
 ```
@@ -239,6 +239,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - Qwen / Qwen 2 / Qwen 2 MoE
 - DeepSeek / DeepSeek 2
 - [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
+  - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov --port=30000 --chat-template=chatml-llava`
   - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8 --chat-template=chatml-llava`
   - Query the server with the [OpenAI Vision API](https://platform.openai.com/docs/guides/vision). See examples at [test/srt/test_vision_openai_server.py](test/srt/test_vision_openai_server.py)
 - LLaVA 1.5 / 1.6 / NeXT
@@ -393,7 +394,7 @@ You can implement your prompt flow in a function decorated by `sgl.function`.
 You can then invoke the function with `run` or `run_batch`.
 The system will manage the state, chat template, parallelism and batching for you.
 
-The complete code for the examples below can be found at [readme_examples.py](examples/usage/readme_examples.py)
+The complete code for the examples below can be found at [readme_examples.py](examples/frontend_language/usage/readme_examples.py)
 
 #### Control Flow
 You can use any Python code within the function body, including control flow, nested function calls, and external libraries.
@@ -442,7 +443,7 @@ def image_qa(s, image_file, question):
     s += sgl.assistant(sgl.gen("answer", max_tokens=256)
 ```
 
-See also [srt_example_llava.py](examples/quick_start/srt_example_llava.py).
+See also [srt_example_llava.py](examples/frontend_language/quick_start/local_example_llava_next.py).
 
 #### Constrained Decoding
 Use `regex` to specify a regular expression as a decoding constraint.
@@ -486,7 +487,7 @@ def character_gen(s, name):
     s += sgl.gen("json_output", max_tokens=256, regex=character_regex)
 ```
 
-See also [json_decode.py](examples/usage/json_decode.py) for an additional example of specifying formats with Pydantic models.
+See also [json_decode.py](examples/frontend_language/usage/json_decode.py) for an additional example of specifying formats with Pydantic models.
 
 #### Batching
 Use `run_batch` to run a batch of requests with continuous batching.
