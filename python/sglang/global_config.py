@@ -11,10 +11,6 @@ class GlobalConfig:
         # Default backend of the language
         self.default_backend = None
 
-        # Runtime constants: Request dependency time due to network delay
-        self.request_dependency_delay = 0.02
-        self.wait_for_new_request_delay = 0.0006
-
         # Runtime constants: New generation token ratio estimation
         self.init_new_token_ratio = 0.7
         self.base_min_new_token_ratio = 0.1
