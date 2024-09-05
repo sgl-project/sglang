@@ -254,6 +254,9 @@ class ModelTpServer:
 
     @torch.inference_mode()
     def forward_step(self):
+        if self.current_inflight_req is not None:
+            self.do_not_get_new_batch = False
+
         new_batch = (
             self.get_new_prefill_batch() if not self.do_not_get_new_batch else None
         )
