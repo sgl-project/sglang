@@ -43,14 +43,12 @@ class PolicyScheduler:
 
     def calc_priority(self, waiting_queue: List[Req]):
         # Compute matched prefix length
-        prefix_computed = False
         if self.policy in ["lpm", "dfs-weight"]:
             for r in waiting_queue:
                 # NOTE: the prefix_indices must always be aligned with last_node
                 r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
                     rid=r.rid, key=r.adjust_max_prefix_ids()
                 )
-            prefix_computed = True
 
         if self.policy == "lpm":
             # Longest Prefix Match
@@ -82,8 +80,6 @@ class PolicyScheduler:
             )
         else:
             raise ValueError(f"Unknown schedule_policy: {self.policy}")
-
-        return prefix_computed
 
     def calc_weight(self, cur_node: TreeNode, node_to_weight: Dict):
         for child in cur_node.children.values():
@@ -181,30 +177,33 @@ class PrefillAdder:
         return req if truncated else None
 
     @contextmanager
-    def _lock_node(self, last_node: TreeNode):
+    def _lock_req(self, req: Req):
+        # match prefix again and lock the last node to prevent data racing
+        req.fill_ids = req.origin_input_ids + req.output_ids
+        req.prefix_indices, req.last_node, delta = self.tree_cache.match_prefix_lock(
+            rid=req.rid, key=req.adjust_max_prefix_ids()
+        )
+        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         try:
-            delta = self.tree_cache.inc_lock_ref(last_node)
             self.rem_total_tokens += delta
             yield None
         finally:
-            delta = self.tree_cache.dec_lock_ref(last_node)
+            delta = self.tree_cache.dec_lock_ref(req.last_node)
             self.rem_total_tokens += delta
 
     def add_one_req(self, req: Req):
-        total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
-        )
-        input_tokens = req.extend_input_len
-        prefix_len = len(req.prefix_indices)
 
-        if total_tokens >= self.rem_total_tokens:
-            return False
+        with self._lock_req(req):
+            total_tokens = req.extend_input_len + min(
+                req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            )
+            input_tokens = req.extend_input_len
+            prefix_len = len(req.prefix_indices)
 
-        if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
-            return False
+            if total_tokens >= self.rem_total_tokens:
+                return False
 
-        with self._lock_node(req.last_node):
-            if total_tokens > self.rem_total_tokens:
+            if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
                 return False
 
             if (

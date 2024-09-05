@@ -89,7 +89,7 @@ class ControllerSingle:
         )
         self.tp_cpu_group = self.tp_server.model_runner.tp_group.cpu_group
 
-    def loop_for_forward(self):
+    def control_loop(self):
         while True:
             if not self.is_dp_worker:
                 recv_reqs = self.recv_requests_from_zmq()
@@ -99,7 +99,7 @@ class ControllerSingle:
             if self.tp_size > 1:
                 broadcast_recv_input(recv_reqs, 0, self.tp_cpu_group)
 
-            out_pyobjs = self.tp_server.exposed_step(recv_reqs)
+            out_pyobjs = self.tp_server.control_step(recv_reqs)
 
             for obj in out_pyobjs:
                 self.send_to_detokenizer.send_pyobj(obj)
@@ -162,7 +162,7 @@ def start_controller_process(
     pipe_writer.send("init ok")
 
     try:
-        controller.loop_for_forward()
+        controller.control_loop()
     except Exception:
         logger.error("Exception in ControllerSingle:\n" + get_exception_traceback())
     finally:

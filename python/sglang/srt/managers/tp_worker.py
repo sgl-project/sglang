@@ -15,10 +15,14 @@ limitations under the License.
 
 """A tensor parallel worker."""
 
+import copy
+import enum
 import logging
 import multiprocessing
 import os
 import pickle
+import queue
+import threading
 import time
 import warnings
 from typing import Any, List, Optional, Union
@@ -67,6 +71,13 @@ logger = logging.getLogger(__name__)
 
 
 crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+
+
+class Phase(enum.Enum):
+    IDLE = 0
+    PREFILLING = 1
+    DECODING = 2
+    PREPARE_PREFILL = 3
 
 
 class ModelTpServer:
@@ -175,7 +186,7 @@ class ModelTpServer:
         # Init running status
         self.waiting_queue: List[Req] = []
         self.running_batch: ScheduleBatch = None
-        self.out_pyobjs = []
+        self.out_pyobjs_queue = queue.Queue()
         self.decode_forward_ct = 0
         self.stream_interval = server_args.stream_interval
         self.num_generated_tokens = 0
@@ -222,41 +233,122 @@ class ModelTpServer:
         self.new_token_ratio = self.min_new_token_ratio
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
 
-    def exposed_step(self, recv_reqs: List):
-        try:
-            # Recv requests
-            for recv_req in recv_reqs:
-                if isinstance(
-                    recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-                ):
-                    self.handle_generate_request(recv_req)
-                elif isinstance(recv_req, FlushCacheReq):
-                    self.flush_cache()
-                elif isinstance(recv_req, AbortReq):
-                    self.abort_request(recv_req)
-                elif isinstance(recv_req, UpdateWeightReqInput):
-                    success, message = self.update_weights(recv_req)
-                    self.out_pyobjs.append(UpdateWeightReqOutput(success, message))
-                else:
-                    raise ValueError(f"Invalid request: {recv_req}")
+        self._init_multi_threads()
 
+    def _init_multi_threads(self):
+        class ArrayQueue:
+            def __init__(self):
+                self.q = []
+
+            def put(self, item):
+                self.q.append(item)
+
+            def get_nowait(self):
+                if len(self.q) == 0:
+                    raise queue.Empty
+                return self.q.pop(0)
+
+            def empty(self):
+                return len(self.q) == 0
+
+        # FIXME: temp workaround
+        self.serialized_memory_access = self.tp_size > 1
+
+        if not self.serialized_memory_access:
+            self.ready_prefill_batch = queue.Queue()
+            self.finished_requests = queue.Queue()
+            self.retracted_requests = queue.Queue()
+        else:
+            self.ready_prefill_batch = ArrayQueue()
+            self.finished_requests = ArrayQueue()
+            self.retracted_requests = ArrayQueue()
+
+        self.phase_indicator = Phase.PREPARE_PREFILL
+        self.compute_loop_thread = threading.Thread(target=self.compute_loop)
+        self.compute_loop_thread.daemon = True
+
+        # Start compute loop thread
+        if not self.serialized_memory_access:
+            self.compute_loop_thread.start()
+
+    def control_step(self, recv_reqs: List):
+        try:
             # Forward
-            self.forward_step()
+            self.forward_pre_post_process(recv_reqs)
         except Exception:
-            logger.error("Exception in ModelTpServer:\n" + get_exception_traceback())
+            logger.error(
+                "Exception in ModelTpServer.control_step:\n" + get_exception_traceback()
+            )
             raise
 
+        if self.serialized_memory_access:
+            self.compute_step()
+
         # Return results
-        ret = self.out_pyobjs
-        self.out_pyobjs = []
+        ret = []
+        while not self.out_pyobjs_queue.empty():
+            try:
+                ret.append(self.out_pyobjs_queue.get_nowait())
+            except queue.Empty:
+                break
         return ret
 
+    def forward_pre_post_process(self, recv_reqs: List):
+        # cache finished requests and send output to detokenizer
+        finished_requests = []
+        while not self.finished_requests.empty():
+            try:
+                finished_requests.append(self.finished_requests.get_nowait())
+            except queue.Empty:
+                break
+        self.send_to_detokenizer(finished_requests)
+        for req in finished_requests:
+            self.tree_cache.cache_finished_req(req)
+
+        # put retracted requests back to waiting queue
+        while not self.retracted_requests.empty():
+            try:
+                self.waiting_queue.append(self.retracted_requests.get_nowait())
+            except queue.Empty:
+                break
+
+        # pool new requests
+        for recv_req in recv_reqs:
+            if isinstance(
+                recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+            ):
+                self.handle_generate_request(recv_req)
+            elif isinstance(recv_req, FlushCacheReq):
+                self.flush_cache()
+            elif isinstance(recv_req, AbortReq):
+                self.abort_request(recv_req)
+            elif isinstance(recv_req, UpdateWeightReqInput):
+                success, message = self.update_weights(recv_req)
+                self.out_pyobjs_queue.put(UpdateWeightReqOutput(success, message))
+            else:
+                raise ValueError(f"Invalid request: {recv_req}")
+
+        if self.phase_indicator == Phase.PREPARE_PREFILL:
+            if self.ready_prefill_batch.empty():
+                new_batch = self.get_new_prefill_batch()
+                if new_batch is not None:
+                    self.ready_prefill_batch.put(new_batch)
+
+        if not self.serialized_memory_access:
+            # avoid busy waiting, could be adjusted
+            time.sleep(0.01)
+
     @torch.inference_mode()
-    def forward_step(self):
-        new_batch = self.get_new_prefill_batch()
+    def compute_step(self):
+        new_batch = None
+        try:
+            new_batch = self.ready_prefill_batch.get_nowait()
+        except queue.Empty:
+            pass
 
         if new_batch is not None:
             # Run a new prefill batch
+            self.phase_indicator = Phase.PREFILLING
             self.forward_prefill_batch(new_batch)
 
             if not new_batch.is_empty():
@@ -264,13 +356,23 @@ class ModelTpServer:
                     self.running_batch = new_batch
                 else:
                     self.running_batch.merge(new_batch)
+            self.phase_indicator = Phase.DECODING
         else:
             # Run a decode batch
             if self.running_batch is not None:
                 # Run a few decode batches continuously for reducing overhead
-                for _ in range(global_config.num_continue_decode_steps):
+                for i in range(global_config.num_continue_decode_steps):
                     self.num_generated_tokens += len(self.running_batch.reqs)
-                    self.forward_decode_batch(self.running_batch)
+
+                    is_last_decode = (
+                        i == global_config.num_continue_decode_steps - 1
+                        or (
+                            self.running_batch.has_stream()
+                            and (self.decode_forward_ct + 1) % self.stream_interval == 0
+                        )
+                    )
+
+                    self.forward_decode_batch(self.running_batch, is_last_decode)
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
@@ -278,13 +380,34 @@ class ModelTpServer:
 
                     if self.running_batch.is_empty():
                         self.running_batch = None
+                        self.phase_indicator = Phase.PREPARE_PREFILL
                         break
 
-                    if self.out_pyobjs and self.running_batch.has_stream():
+                    if (
+                        self.serialized_memory_access
+                        and self.out_pyobjs_queue.qsize()
+                        and self.running_batch.has_stream()
+                    ):
+                        self.phase_indicator = Phase.PREPARE_PREFILL
                         break
             else:
-                self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
+                self.phase_indicator = Phase.PREPARE_PREFILL
+                # avoid busy waiting, could be adjusted
+                time.sleep(0.01)
+
+    def compute_loop(self):
+        # synchronize the gpu id to the compute thread
+        torch.cuda.set_device(self.gpu_id)
+        while True:
+            try:
+                self.compute_step()
+            except Exception:
+                logger.error(
+                    "Exception in ModelTpServer.compute_loop:\n"
+                    + get_exception_traceback()
+                )
+                raise
 
     def print_decode_stats(self):
         num_used = self.max_total_num_tokens - (
@@ -403,7 +526,7 @@ class ModelTpServer:
             return None
 
         # Get priority queue
-        prefix_computed = self.scheduler.calc_priority(self.waiting_queue)
+        self.scheduler.calc_priority(self.waiting_queue)
 
         num_mixed_running = running_bs if self.is_mixed_chunk else 0
 
@@ -415,20 +538,19 @@ class ModelTpServer:
             num_mixed_running,
         )
 
+        # todo: atomic global token counter
         if self.running_batch is not None:
             adder.remove_running_tokens(self.running_batch, self.new_token_ratio)
 
         has_inflight = self.current_inflight_req is not None
         if self.current_inflight_req is not None:
-            self.current_inflight_req.init_next_round_input(
-                None if prefix_computed else self.tree_cache
-            )
+            # info for inflight reqs is precomputed
+            self.current_inflight_req.init_next_round_input(None)
             self.current_inflight_req = adder.add_inflight_req(
                 self.current_inflight_req
             )
 
         for req in self.waiting_queue:
-            req.init_next_round_input(None if prefix_computed else self.tree_cache)
             res = adder.add_one_req(req)
             if (
                 not res
@@ -555,7 +677,7 @@ class ModelTpServer:
                     )
 
                 if req.finished():
-                    self.tree_cache.cache_finished_req(req)
+                    pass
                 elif req not in decoding_reqs:
                     # To reduce overhead, only cache prefill reqs
                     self.tree_cache.cache_unfinished_req(req)
@@ -584,7 +706,7 @@ class ModelTpServer:
                     req.check_finished()
 
                 if req.finished():
-                    self.tree_cache.cache_finished_req(req)
+                    pass
                 else:
                     self.tree_cache.cache_unfinished_req(req)
 
@@ -650,7 +772,7 @@ class ModelTpServer:
                 )
             req.output_top_logprobs.append(output.output_top_logprobs[i])
 
-    def forward_decode_batch(self, batch: ScheduleBatch):
+    def forward_decode_batch(self, batch: ScheduleBatch, is_last_decode: bool):
         # Check if decode out of memory
         if not batch.check_decode_mem():
             old_ratio = self.new_token_ratio
@@ -663,7 +785,8 @@ class ModelTpServer:
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
-            self.waiting_queue.extend(retracted_reqs)
+            for req in retracted_reqs:
+                self.retracted_requests.put(req)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -673,13 +796,18 @@ class ModelTpServer:
         if not self.disable_regex_jump_forward:
             # Check for jump-forward
             jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
-            self.waiting_queue.extend(jump_forward_reqs)
+            for req in jump_forward_reqs:
+                self.retracted_requests.put(req)
             if batch.is_empty():
                 return
 
         # Update batch tensors
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         batch.prepare_for_decode()
+
+        if is_last_decode:
+            # start preparing prefill batch only before the last decode iteration
+            self.phase_indicator = Phase.PREPARE_PREFILL
 
         # Forward and sample the next tokens
         sample_output, logits_output = self.model_runner.forward(
@@ -710,9 +838,6 @@ class ModelTpServer:
                     req.regex_fsm_state, next_token_id
                 )
 
-            if req.finished():
-                self.tree_cache.cache_finished_req(req)
-
             if req.return_logprob:
                 req.output_token_logprobs.append(
                     (next_token_logprobs[i], next_token_id)
@@ -722,7 +847,7 @@ class ModelTpServer:
 
         self.handle_finished_requests(batch)
 
-    def handle_finished_requests(self, batch: ScheduleBatch):
+    def send_to_detokenizer(self, requests: List[Req], streaming=False):
         output_rids = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
@@ -735,68 +860,54 @@ class ModelTpServer:
             output_spaces_between_special_tokens = []
         else:  # for embedding model
             output_embeddings = []
-        unfinished_indices = []
 
-        for i, req in enumerate(batch.reqs):
-            if not req.finished() and req is not self.current_inflight_req:
-                unfinished_indices.append(i)
-
-            if req.finished() or (
-                (
-                    req.stream
-                    and (
-                        self.decode_forward_ct % self.stream_interval == 0
-                        or len(req.output_ids) == 1
-                    )
+        for req in requests:
+            output_rids.append(req.rid)
+            output_finished_reason.append(req.finished_reason)
+            if self.model_runner.is_generation:
+                output_vids.append(req.vid)
+                decoded_texts.append(req.decoded_text)
+                read_ids, read_offset = req.init_incremental_detokenize()
+                output_read_ids.append(read_ids)
+                output_read_offsets.append(read_offset)
+                output_skip_special_tokens.append(
+                    req.sampling_params.skip_special_tokens
                 )
-            ):
-                output_rids.append(req.rid)
-                output_finished_reason.append(req.finished_reason)
-                if self.model_runner.is_generation:
-                    output_vids.append(req.vid)
-                    decoded_texts.append(req.decoded_text)
-                    read_ids, read_offset = req.init_incremental_detokenize()
-                    output_read_ids.append(read_ids)
-                    output_read_offsets.append(read_offset)
-                    output_skip_special_tokens.append(
-                        req.sampling_params.skip_special_tokens
-                    )
-                    output_spaces_between_special_tokens.append(
-                        req.sampling_params.spaces_between_special_tokens
-                    )
+                output_spaces_between_special_tokens.append(
+                    req.sampling_params.spaces_between_special_tokens
+                )
 
-                    meta_info = {
-                        "prompt_tokens": len(req.origin_input_ids),
-                        "completion_tokens": len(req.output_ids),
-                        "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
-                        "finish_reason": str(req.finished_reason),
-                    }
-                    if req.return_logprob:
-                        (
-                            meta_info["input_token_logprobs"],
-                            meta_info["output_token_logprobs"],
-                            meta_info["input_top_logprobs"],
-                            meta_info["output_top_logprobs"],
-                            meta_info["normalized_prompt_logprob"],
-                        ) = (
-                            req.input_token_logprobs,
-                            req.output_token_logprobs,
-                            req.input_top_logprobs,
-                            req.output_top_logprobs,
-                            req.normalized_prompt_logprob,
-                        )
-                    output_meta_info.append(meta_info)
-                else:  # for embedding model
-                    output_embeddings.append(req.embedding)
-                    meta_info = {
-                        "prompt_tokens": len(req.origin_input_ids),
-                    }
-                    output_meta_info.append(meta_info)
+                meta_info = {
+                    "prompt_tokens": len(req.origin_input_ids),
+                    "completion_tokens": len(req.output_ids),
+                    "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
+                    "finish_reason": str(req.finished_reason),
+                }
+                if req.return_logprob:
+                    (
+                        meta_info["input_token_logprobs"],
+                        meta_info["output_token_logprobs"],
+                        meta_info["input_top_logprobs"],
+                        meta_info["output_top_logprobs"],
+                        meta_info["normalized_prompt_logprob"],
+                    ) = (
+                        req.input_token_logprobs,
+                        req.output_token_logprobs,
+                        req.input_top_logprobs,
+                        req.output_top_logprobs,
+                        req.normalized_prompt_logprob,
+                    )
+                output_meta_info.append(meta_info)
+            else:  # for embedding model
+                output_embeddings.append(req.embedding)
+                meta_info = {
+                    "prompt_tokens": len(req.origin_input_ids),
+                }
+                output_meta_info.append(meta_info)
 
-        # Send to detokenizer
         if output_rids:
             if self.model_runner.is_generation:
-                self.out_pyobjs.append(
+                self.out_pyobjs_queue.put(
                     BatchTokenIDOut(
                         output_rids,
                         output_vids,
@@ -805,12 +916,16 @@ class ModelTpServer:
                         output_read_offsets,
                         output_skip_special_tokens,
                         output_spaces_between_special_tokens,
-                        output_meta_info,
+                        (
+                            output_meta_info
+                            if not streaming
+                            else copy.deepcopy(output_meta_info)
+                        ),
                         output_finished_reason,
                     )
                 )
             else:  # for embedding model
-                self.out_pyobjs.append(
+                self.out_pyobjs_queue.put(
                     BatchEmbeddingOut(
                         output_rids,
                         output_embeddings,
@@ -819,6 +934,24 @@ class ModelTpServer:
                     )
                 )
 
+    def handle_finished_requests(self, batch: ScheduleBatch):
+        unfinished_indices = []
+        streaming_requests = []
+
+        for i, req in enumerate(batch.reqs):
+            if not req.finished() and req is not self.current_inflight_req:
+                unfinished_indices.append(i)
+
+            if req.finished():
+                self.finished_requests.put(req)
+            elif req.stream and (
+                self.decode_forward_ct % self.stream_interval == 0
+                or len(req.output_ids) == 1
+            ):
+                streaming_requests.append(req)
+
+        # Send streaming output to detokenizer
+        self.send_to_detokenizer(streaming_requests, streaming=True)
         # Remove finished reqs: update batch tensors
         batch.filter_batch(unfinished_indices)
 
@@ -890,10 +1023,9 @@ def run_tp_server(
             model_override_args,
         )
         tp_cpu_group = model_server.model_runner.tp_group.cpu_group
-
         while True:
             recv_reqs = broadcast_recv_input(None, tp_rank, tp_cpu_group)
-            model_server.exposed_step(recv_reqs)
+            model_server.control_step(recv_reqs)
     except Exception:
         logger.error("Exception in run_tp_server:\n" + get_exception_traceback())
         raise

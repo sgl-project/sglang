@@ -16,12 +16,23 @@ limitations under the License.
 """Memory pool."""
 
 import logging
+import threading
 from abc import ABC, abstractmethod
+from functools import wraps
 from typing import List, Tuple, Union
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def synchronized(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with self.lock:
+            return func(self, *args, **kwargs)
+
+    return wrapper
 
 
 class ReqToTokenPool:
@@ -33,7 +44,10 @@ class ReqToTokenPool:
         self.req_to_token = torch.empty(
             (size, max_context_len), dtype=torch.int32, device="cuda"
         )
+        # serializes allocation and deallocation operations to the memory pool
+        self.lock = threading.Lock()
 
+    @synchronized
     def alloc(self, need_size: int) -> List[int]:
         if need_size > len(self.free_slots):
             return None
@@ -43,12 +57,14 @@ class ReqToTokenPool:
 
         return select_index
 
+    @synchronized
     def free(self, free_index: Union[int, List[int]]):
         if isinstance(free_index, (int,)):
             self.free_slots.append(free_index)
         else:
             self.free_slots.extend(free_index)
 
+    @synchronized
     def clear(self):
         self.free_slots = list(range(self.size))
 
@@ -77,11 +93,15 @@ class BaseTokenToKVPool(ABC):
         self.prefetch_chunk_size = 512
 
         self.can_use_mem_size = self.size
+        # serialize allocation and deallocation operations to the memory pool
+        self.lock = threading.Lock()
         self.clear()
 
+    @synchronized
     def available_size(self):
         return self.can_use_mem_size + len(self.prefetch_buffer)
 
+    @synchronized
     def alloc(self, need_size: int):
         buffer_len = len(self.prefetch_buffer)
         if need_size <= buffer_len:
@@ -107,10 +127,12 @@ class BaseTokenToKVPool(ABC):
 
         return ret_index
 
+    @synchronized
     def free(self, free_index: torch.Tensor):
         self.mem_state[free_index] = True
         self.can_use_mem_size += len(free_index)
 
+    @synchronized
     def clear(self):
         self.prefetch_buffer = torch.empty(0, device="cuda", dtype=torch.int32)
 
