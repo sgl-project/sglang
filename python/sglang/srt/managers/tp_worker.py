@@ -432,7 +432,6 @@ class ModelTpServer:
             res = adder.add_one_req(req)
             if (
                 not res
-                or adder.no_remaining_tokens()
                 or running_bs + len(adder.can_run_list) >= self.max_running_requests
             ):
                 break

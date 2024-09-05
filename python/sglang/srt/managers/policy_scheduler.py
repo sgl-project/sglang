@@ -233,4 +233,4 @@ class PrefillAdder:
                 self.tree_cache.inc_lock_ref(req.last_node)
                 self._prefill_one_req(prefix_len, trunc_len, 0)
 
-        return True
+        return True and not self.no_remaining_tokens()
