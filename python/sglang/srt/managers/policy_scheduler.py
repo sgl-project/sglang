@@ -125,6 +125,7 @@ class PrefillAdder:
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
 
+        self.req_states = None
         self.can_run_list = []
         self.new_inflight_req = None
         self.log_hit_tokens = 0
@@ -216,8 +217,6 @@ class PrefillAdder:
             self.rem_total_tokens += delta
 
     def add_one_req_ignore_eos(self, req: Req):
-        req_states = []
-
         def get_req_state(r):
             new_token_ratio = (
                 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
@@ -232,28 +231,40 @@ class PrefillAdder:
 
             return None
 
-        if self.running_batch is not None:
-            for r in self.running_batch.reqs:
+        if self.req_states is None:
+            self.req_states = []
+            if self.running_batch is not None:
+                for r in self.running_batch.reqs:
+                    state = get_req_state(r)
+                    if state is not None:
+                        self.req_states.append(state)
+            for r in self.can_run_list:
                 state = get_req_state(r)
                 if state is not None:
-                    req_states.append(state)
-
-        for r in self.can_run_list:
-            state = get_req_state(r)
+                    self.req_states.append(state)
+            state = get_req_state(req)
             if state is not None:
-                req_states.append(state)
+                self.req_states.append(state)
 
-        state = get_req_state(req)
-        if state is not None:
-            req_states.append(state)
+            self.req_states.sort(key=lambda x: x[0])
+        else:
+            state = get_req_state(req)
+            if state is not None:
+                for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
+                    if tokens_left >= state[0]:
+                        self.req_states.insert(i, state)
+                        break
+                else:
+                    self.req_states.append(state)
 
-        req_states.sort(key=lambda x: x[0])
         tokens_freed = 0
-        for i, (tokens_left, tokens_occupied) in enumerate(req_states):
+        for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
             decode_steps = (
-                req_states[i + 1][0] if i + 1 < len(req_states) else tokens_left
+                self.req_states[i + 1][0]
+                if i + 1 < len(self.req_states)
+                else tokens_left
             )
-            bs = len(req_states) - i
+            bs = len(self.req_states) - i
             if self.total_tokens + tokens_freed - decode_steps * bs <= 0:
                 return False
             tokens_freed += tokens_occupied
