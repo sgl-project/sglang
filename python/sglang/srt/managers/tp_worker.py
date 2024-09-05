@@ -221,6 +221,7 @@ class ModelTpServer:
         )
         self.new_token_ratio = self.min_new_token_ratio
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
+        self.do_not_get_new_batch = False
 
     def exposed_step(self, recv_reqs: List):
         try:
@@ -253,7 +254,10 @@ class ModelTpServer:
 
     @torch.inference_mode()
     def forward_step(self):
-        new_batch = self.get_new_prefill_batch()
+        new_batch = (
+            self.get_new_prefill_batch() if not self.do_not_get_new_batch else None
+        )
+        self.do_not_get_new_batch = False
 
         if new_batch is not None:
             # Run a new prefill batch
@@ -703,6 +707,7 @@ class ModelTpServer:
         next_token_ids = next_token_ids.tolist()
 
         # Check finish condition
+        has_finished = False
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
@@ -715,6 +720,7 @@ class ModelTpServer:
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
+                has_finished = True
 
             if req.return_logprob:
                 req.output_token_logprobs.append(
@@ -722,6 +728,9 @@ class ModelTpServer:
                 )
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
+
+        if not has_finished:
+            self.do_not_get_new_batch = True
 
         self.handle_finished_requests(batch)
 
