@@ -43,6 +43,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
+ENABLE_TORCHAO = True
 
 
 class LlamaMLP(nn.Module):
@@ -350,8 +351,17 @@ class LlamaForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if hasattr(param, "weight_loader"):
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    if ENABLE_TORCHAO and name.endswith("proj.weight") and param.ndim == 2:
+                        from torchao.quantization import quantize_, int4_weight_only
+                        dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
+                        dummy_linear.weight.data = param.data
+                        quantize_(dummy_linear, int4_weight_only())
+                        params_dict[name] = dummy_linear.weight
+
+                # TODO
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -360,6 +370,17 @@ class LlamaForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+                if ENABLE_TORCHAO and name.endswith("proj.weight") and param.ndim == 2:
+                    from torchao.quantization import quantize_, int4_weight_only
+                    dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
+                    dummy_linear.weight.data = param.data
+                    quantize_(dummy_linear, int4_weight_only())
+                    params_dict[name] = dummy_linear.weight
+
+        self.load_state_dict(params_dict, assign=True)
+
+
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):
