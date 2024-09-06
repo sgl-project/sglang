@@ -15,6 +15,8 @@ limitations under the License.
 
 """Cache for the compressed finite state machine."""
 
+from outlines.fsm.json_schema import build_regex_from_schema
+
 from sglang.srt.constrained import RegexGuide, TransformerTokenizer
 from sglang.srt.constrained.base_tool_cache import BaseToolCache
 
@@ -26,8 +28,11 @@ class FSMCache(BaseToolCache):
         tokenizer_args_dict,
         enable=True,
         skip_tokenizer_init=False,
+        json_schema_mode=False,
     ):
         super().__init__(enable=enable)
+
+        self.json_schema_mode = json_schema_mode
 
         if (
             skip_tokenizer_init
@@ -72,5 +77,9 @@ class FSMCache(BaseToolCache):
                 tokenizer_path, **tokenizer_args_dict
             )
 
-    def init_value(self, regex):
-        return RegexGuide(regex, self.outlines_tokenizer)
+    def init_value(self, value):
+        if self.json_schema_mode:
+            regex = build_regex_from_schema(value, whitespace_pattern=r"[\n\t ]*")
+            return RegexGuide(regex, self.outlines_tokenizer), regex
+        else:
+            return RegexGuide(value, self.outlines_tokenizer)

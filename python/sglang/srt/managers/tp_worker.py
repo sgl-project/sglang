@@ -31,7 +31,7 @@ from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.layers.logits_processor import LogitProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -39,6 +39,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateWeightReqInput,
+    UpdateWeightReqOutput,
 )
 from sglang.srt.managers.policy_scheduler import PolicyScheduler, PrefillAdder
 from sglang.srt.managers.schedule_batch import (
@@ -54,6 +56,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    configure_logger,
     is_multimodal_model,
     set_random_seed,
     suppress_other_loggers,
@@ -73,7 +76,7 @@ class ModelTpServer:
         tp_rank: int,
         server_args: ServerArgs,
         nccl_port: int,
-        model_overide_args: dict,
+        model_override_args: dict,
     ):
         suppress_other_loggers()
 
@@ -85,17 +88,14 @@ class ModelTpServer:
         self.schedule_policy = server_args.schedule_policy
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
 
-        # Chunked prefill
-        self.chunked_prefill_size = server_args.chunked_prefill_size
-        self.current_inflight_req = None
-
         # Init model and tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,
             server_args.trust_remote_code,
             context_length=server_args.context_length,
-            model_overide_args=model_overide_args,
+            model_override_args=model_override_args,
         )
+
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -108,7 +108,7 @@ class ModelTpServer:
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            if is_multimodal_model(server_args.model_path):
+            if is_multimodal_model(self.model_config.hf_config.architectures):
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
@@ -135,11 +135,17 @@ class ModelTpServer:
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
         )
+
+        # Sync random seed
+        server_args.random_seed = broadcast_recv_input(
+            [server_args.random_seed],
+            self.tp_rank,
+            self.model_runner.tp_group.cpu_group,
+        )[0]
         set_random_seed(server_args.random_seed)
 
         # Print info
         logger.info(
-            f"[gpu={self.gpu_id}] "
             f"max_total_num_tokens={self.max_total_num_tokens}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
             f"max_running_requests={self.max_running_requests}, "
@@ -175,6 +181,13 @@ class ModelTpServer:
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
 
+        # Chunked prefill
+        self.chunked_prefill_size = server_args.chunked_prefill_size
+        self.current_inflight_req = None
+        self.is_mixed_chunk = (
+            self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
+        )
+
         # Init the FSM cache for constrained generation
         if not server_args.skip_tokenizer_init:
             self.regex_fsm_cache = FSMCache(
@@ -184,6 +197,16 @@ class ModelTpServer:
                     "trust_remote_code": server_args.trust_remote_code,
                 },
                 skip_tokenizer_init=server_args.skip_tokenizer_init,
+                json_schema_mode=False,
+            )
+            self.json_fsm_cache = FSMCache(
+                server_args.tokenizer_path,
+                {
+                    "tokenizer_mode": server_args.tokenizer_mode,
+                    "trust_remote_code": server_args.trust_remote_code,
+                },
+                skip_tokenizer_init=server_args.skip_tokenizer_init,
+                json_schema_mode=True,
             )
         self.jump_forward_cache = JumpForwardCache()
 
@@ -211,6 +234,9 @@ class ModelTpServer:
                     self.flush_cache()
                 elif isinstance(recv_req, AbortReq):
                     self.abort_request(recv_req)
+                elif isinstance(recv_req, UpdateWeightReqInput):
+                    success, message = self.update_weights(recv_req)
+                    self.out_pyobjs.append(UpdateWeightReqOutput(success, message))
                 else:
                     raise ValueError(f"Invalid request: {recv_req}")
 
@@ -268,7 +294,7 @@ class ModelTpServer:
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
         logger.info(
-            f"[gpu={self.gpu_id}] Decode batch. "
+            f"Decode batch. "
             f"#running-req: {len(self.running_batch.reqs)}, "
             f"#token: {num_used}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -307,29 +333,42 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             req.pixel_values = recv_req.pixel_values
             if req.pixel_values is not None:
+                # Use image hash as fake token_ids, which is then used
+                # for prefix matching
+                image_hash = hash(tuple(recv_req.image_hashes))
                 req.pad_value = [
-                    (recv_req.image_hash) % self.model_config.vocab_size,
-                    (recv_req.image_hash >> 16) % self.model_config.vocab_size,
-                    (recv_req.image_hash >> 32) % self.model_config.vocab_size,
-                    (recv_req.image_hash >> 64) % self.model_config.vocab_size,
+                    (image_hash) % self.model_config.vocab_size,
+                    (image_hash >> 16) % self.model_config.vocab_size,
+                    (image_hash >> 32) % self.model_config.vocab_size,
+                    (image_hash >> 64) % self.model_config.vocab_size,
                 ]
-                req.image_size = recv_req.image_size
+                req.image_sizes = recv_req.image_sizes
                 (
                     req.origin_input_ids,
-                    req.image_offset,
+                    req.image_offsets,
                 ) = self.model_runner.model.pad_input_ids(
                     req.origin_input_ids_unpadded,
                     req.pad_value,
-                    req.pixel_values.shape,
-                    req.image_size,
+                    req.pixel_values,
+                    req.image_sizes,
                 )
             req.return_logprob = recv_req.return_logprob
             req.logprob_start_len = recv_req.logprob_start_len
             req.top_logprobs_num = recv_req.top_logprobs_num
             req.stream = recv_req.stream
 
+            # Init regex fsm fron json
+            if req.sampling_params.json_schema is not None:
+                req.regex_fsm, computed_regex_string = self.json_fsm_cache.query(
+                    req.sampling_params.json_schema
+                )
+                if not self.disable_regex_jump_forward:
+                    req.jump_forward_map = self.jump_forward_cache.query(
+                        computed_regex_string
+                    )
+
             # Init regex fsm
-            if req.sampling_params.regex is not None:
+            elif req.sampling_params.regex is not None:
                 req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)
                 if not self.disable_regex_jump_forward:
                     req.jump_forward_map = self.jump_forward_cache.query(
@@ -366,11 +405,14 @@ class ModelTpServer:
         # Get priority queue
         prefix_computed = self.scheduler.calc_priority(self.waiting_queue)
 
+        num_mixed_running = running_bs if self.is_mixed_chunk else 0
+
         adder = PrefillAdder(
             self.tree_cache,
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
             self.max_prefill_tokens,
             self.chunked_prefill_size,
+            num_mixed_running,
         )
 
         if self.running_batch is not None:
@@ -416,15 +458,27 @@ class ModelTpServer:
                 )
             else:
                 tree_cache_hit_rate = 0.0
-            logger.info(
-                f"[gpu={self.gpu_id}] Prefill batch. "
-                f"#new-seq: {len(can_run_list)}, "
-                f"#new-token: {adder.log_input_tokens}, "
-                f"#cached-token: {adder.log_hit_tokens}, "
-                f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
-                f"#running-req: {running_bs}, "
-                f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
-            )
+
+            if num_mixed_running > 0:
+                logger.info(
+                    f"Prefill batch"
+                    f"(mixed #running-req: {num_mixed_running}). "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
+                )
+            else:
+                logger.info(
+                    f"Prefill batch. "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"#running-req: {running_bs}, "
+                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
+                )
 
         # Return the new batch
         new_batch = ScheduleBatch.init_new(
@@ -440,21 +494,39 @@ class ModelTpServer:
         # Build batch tensors
         batch.prepare_for_extend(self.model_config.vocab_size)
 
+        decoding_reqs = []
+        if self.is_mixed_chunk and self.running_batch is not None:
+            self.running_batch.prepare_for_decode()
+            batch.mix_with_running(self.running_batch)
+            decoding_reqs = self.running_batch.reqs
+            self.running_batch = None
+
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
-                output = self.model_runner.forward(batch, ForwardMode.EXTEND)
-                next_token_ids = batch.sample(output.next_token_logits)
+                sample_output, logits_output = self.model_runner.forward(
+                    batch, ForwardMode.EXTEND
+                )
+                next_token_ids = batch.check_sample_results(sample_output)
+                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                    next_token_ids
+                )
 
                 # Move logprobs to cpu
-                if output.next_token_logprobs is not None:
-                    output.next_token_logprobs = output.next_token_logprobs[
-                        torch.arange(len(next_token_ids), device=next_token_ids.device),
-                        next_token_ids,
-                    ].tolist()
-                    output.input_token_logprobs = output.input_token_logprobs.tolist()
-                    output.normalized_prompt_logprobs = (
-                        output.normalized_prompt_logprobs.tolist()
+                if logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs[
+                            torch.arange(
+                                len(next_token_ids), device=next_token_ids.device
+                            ),
+                            next_token_ids,
+                        ].tolist()
+                    )
+                    logits_output.input_token_logprobs = (
+                        logits_output.input_token_logprobs.tolist()
+                    )
+                    logits_output.normalized_prompt_logprobs = (
+                        logits_output.normalized_prompt_logprobs.tolist()
                     )
 
                 next_token_ids = next_token_ids.tolist()
@@ -477,9 +549,15 @@ class ModelTpServer:
                     req.output_ids.append(next_token_ids[i])
                     req.check_finished()
 
+                if req.regex_fsm is not None:
+                    req.regex_fsm_state = req.regex_fsm.get_next_state(
+                        req.regex_fsm_state, next_token_ids[i]
+                    )
+
                 if req.finished():
                     self.tree_cache.cache_finished_req(req)
-                else:
+                elif req not in decoding_reqs:
+                    # To reduce overhead, only cache prefill reqs
                     self.tree_cache.cache_unfinished_req(req)
 
                 if req is self.current_inflight_req:
@@ -487,12 +565,14 @@ class ModelTpServer:
                     self.req_to_token_pool.free(req.req_pool_idx)
 
                 if req.return_logprob:
-                    self.add_logprob_return_values(i, req, pt, next_token_ids, output)
+                    self.add_logprob_return_values(
+                        i, req, pt, next_token_ids, logits_output
+                    )
                     pt += req.extend_input_len
         else:
             assert batch.extend_num_tokens != 0
-            output = self.model_runner.forward(batch, ForwardMode.EXTEND)
-            embeddings = output.embeddings.tolist()
+            logits_output = self.model_runner.forward(batch, ForwardMode.EXTEND)
+            embeddings = logits_output.embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -520,7 +600,7 @@ class ModelTpServer:
         req: Req,
         pt: int,
         next_token_ids: List[int],
-        output: LogitProcessorOutput,
+        output: LogitsProcessorOutput,
     ):
         if req.normalized_prompt_logprob is None:
             req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
@@ -579,7 +659,7 @@ class ModelTpServer:
             self.new_token_ratio = new_token_ratio
 
             logger.info(
-                "decode out of memory happened, "
+                "Decode out of memory happened. "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
@@ -602,12 +682,17 @@ class ModelTpServer:
         batch.prepare_for_decode()
 
         # Forward and sample the next tokens
-        output = self.model_runner.forward(batch, ForwardMode.DECODE)
-        next_token_ids = batch.sample(output.next_token_logits)
+        sample_output, logits_output = self.model_runner.forward(
+            batch, ForwardMode.DECODE
+        )
+        next_token_ids = batch.check_sample_results(sample_output)
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            next_token_ids
+        )
 
         # Move logprobs to cpu
-        if output.next_token_logprobs is not None:
-            next_token_logprobs = output.next_token_logprobs[
+        if logits_output.next_token_logprobs is not None:
+            next_token_logprobs = logits_output.next_token_logprobs[
                 torch.arange(len(next_token_ids), device=next_token_ids.device),
                 next_token_ids,
             ].tolist()
@@ -620,6 +705,11 @@ class ModelTpServer:
             req.output_ids.append(next_token_id)
             req.check_finished()
 
+            if req.regex_fsm is not None:
+                req.regex_fsm_state = req.regex_fsm.get_next_state(
+                    req.regex_fsm_state, next_token_id
+                )
+
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
 
@@ -628,7 +718,7 @@ class ModelTpServer:
                     (next_token_logprobs[i], next_token_id)
                 )
                 if req.top_logprobs_num > 0:
-                    req.output_top_logprobs.append(output.output_top_logprobs[i])
+                    req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
 
         self.handle_finished_requests(batch)
 
@@ -743,12 +833,15 @@ class ModelTpServer:
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
+            if_success = True
         else:
-            warnings.warn(
+            logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
                 f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
             )
+            if_success = False
+        return if_success
 
     def abort_request(self, recv_req):
         # Delete requests in the waiting queue
@@ -768,22 +861,33 @@ class ModelTpServer:
                     req.finished_reason = FINISH_ABORT()
                     break
 
+    def update_weights(self, recv_req):
+        success, message = self.model_runner.update_weights(
+            recv_req.model_path, recv_req.load_format
+        )
+        if success:
+            flash_cache_success = self.flush_cache()
+            assert flash_cache_success, "Cache flush failed after updating weights"
+        return success, message
+
 
 def run_tp_server(
     gpu_id: int,
     tp_rank: int,
     server_args: ServerArgs,
     nccl_port: int,
-    model_overide_args: dict,
+    model_override_args: dict,
 ):
-    """Run a tensor parallel server."""
+    """Run a tensor parallel model server."""
+    configure_logger(server_args, prefix=f" TP{tp_rank}")
+
     try:
         model_server = ModelTpServer(
             gpu_id,
             tp_rank,
             server_args,
             nccl_port,
-            model_overide_args,
+            model_override_args,
         )
         tp_cpu_group = model_server.model_runner.tp_group.cpu_group
 
@@ -800,14 +904,14 @@ def launch_tp_servers(
     tp_rank_range: List[int],
     server_args: ServerArgs,
     nccl_port: int,
-    model_overide_args: dict,
+    model_override_args: dict,
 ):
     """Launch multiple tensor parallel servers."""
     procs = []
     for i in tp_rank_range:
         proc = multiprocessing.Process(
             target=run_tp_server,
-            args=(gpu_ids[i], i, server_args, nccl_port, model_overide_args),
+            args=(gpu_ids[i], i, server_args, nccl_port, model_override_args),
         )
         proc.start()
         procs.append(proc)
@@ -832,6 +936,7 @@ def broadcast_recv_input(
 
             dist.broadcast(tensor_size, src=0, group=dist_group)
             dist.broadcast(tensor_data, src=0, group=dist_group)
+        return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
         dist.broadcast(tensor_size, src=0, group=dist_group)

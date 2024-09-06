@@ -65,10 +65,9 @@ def main(args):
         def get_one_answer(i):
             answer = call_generate(
                 prompt=few_shot_examples + questions[i],
-                # prompt="System: " + few_shot_examples + "<|separator|>\n\n" + questions[i],
                 temperature=0,
                 max_tokens=256,
-                stop="Question",
+                stop=["Question", "Assistant:", "<|separator|>"],
             )
             states[i] = answer
 

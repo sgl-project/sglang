@@ -24,7 +24,6 @@ import json
 import logging
 import multiprocessing as mp
 import os
-import sys
 import threading
 import time
 from http import HTTPStatus
@@ -34,7 +33,6 @@ from typing import Dict, List, Optional, Union
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
-import psutil
 import requests
 import uvicorn
 import uvloop
@@ -52,11 +50,16 @@ from sglang.srt.managers.controller_single import (
     start_controller_process as start_controller_process_single,
 )
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    UpdateWeightReqInput,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_batches,
+    v1_cancel_batch,
     v1_chat_completions,
     v1_completions,
     v1_delete_file,
@@ -72,6 +75,7 @@ from sglang.srt.utils import (
     add_api_key_middleware,
     allocate_init_ports,
     assert_pkg_version,
+    configure_logger,
     enable_show_time_cost,
     kill_child_process,
     maybe_set_triton_cache_manager,
@@ -92,8 +96,23 @@ tokenizer_manager = None
 
 @app.get("/health")
 async def health() -> Response:
-    """Health check."""
+    """Check the health of the http server."""
     return Response(status_code=200)
+
+
+@app.get("/health_generate")
+async def health_generate(request: Request) -> Response:
+    """Check the health of the inference server by generating one token."""
+    gri = GenerateReqInput(
+        text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+    )
+    try:
+        async for _ in tokenizer_manager.generate_request(gri, request):
+            break
+        return Response(status_code=200)
+    except Exception as e:
+        logger.exception(e)
+        return Response(status_code=503)
 
 
 @app.get("/get_model_info")
@@ -118,6 +137,23 @@ async def flush_cache():
         "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
+
+
+@app.post("/update_weights")
+async def update_weights(obj: UpdateWeightReqInput, request: Request):
+
+    success, message = await tokenizer_manager.update_weights(obj, request)
+    content = {"message": message, "success": str(success)}
+    if success:
+        return JSONResponse(
+            content,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return JSONResponse(
+            content,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 
 async def generate_request(obj: GenerateReqInput, request: Request):
@@ -211,6 +247,12 @@ async def openai_v1_batches(raw_request: Request):
     return await v1_batches(tokenizer_manager, raw_request)
 
 
+@app.post("/v1/batches/{batch_id}/cancel")
+async def cancel_batches(batch_id: str):
+    # https://platform.openai.com/docs/api-reference/batch/cancel
+    return await v1_cancel_batch(tokenizer_manager, batch_id)
+
+
 @app.get("/v1/batches/{batch_id}")
 async def retrieve_batch(batch_id: str):
     return await v1_retrieve_batch(batch_id)
@@ -230,21 +272,18 @@ async def retrieve_file_content(file_id: str):
 
 def launch_server(
     server_args: ServerArgs,
-    model_overide_args: Optional[dict] = None,
+    model_override_args: Optional[dict] = None,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
     """Launch an HTTP server."""
     global tokenizer_manager
 
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format="%(message)s",
-    )
+    configure_logger(server_args)
 
     server_args.check_server_args()
     _set_envs_and_config(server_args)
 
-    # Allocate ports
+    # Allocate ports for inter-process communications
     server_args.port, server_args.additional_ports = allocate_init_ports(
         server_args.port,
         server_args.additional_ports,
@@ -264,42 +303,48 @@ def launch_server(
     server_args.tokenizer_path = prepare_tokenizer(server_args.tokenizer_path)
 
     # Launch processes for multi-node tensor parallelism
-    if server_args.nnodes > 1:
-        if server_args.node_rank != 0:
-            tp_size_local = server_args.tp_size // server_args.nnodes
-            gpu_ids = [
-                i for _ in range(server_args.nnodes) for i in range(tp_size_local)
-            ]
-            tp_rank_range = list(
-                range(
-                    server_args.node_rank * tp_size_local,
-                    (server_args.node_rank + 1) * tp_size_local,
-                )
+    if server_args.nnodes > 1 and server_args.node_rank != 0:
+        tp_size_local = server_args.tp_size // server_args.nnodes
+        gpu_ids = [i for _ in range(server_args.nnodes) for i in range(tp_size_local)]
+        tp_rank_range = list(
+            range(
+                server_args.node_rank * tp_size_local,
+                (server_args.node_rank + 1) * tp_size_local,
             )
-            procs = launch_tp_servers(
-                gpu_ids,
-                tp_rank_range,
-                server_args,
-                ports[3],
-                model_overide_args,
-            )
-            while True:
-                pass
+        )
+        procs = launch_tp_servers(
+            gpu_ids,
+            tp_rank_range,
+            server_args,
+            ports[3],
+            model_override_args,
+        )
+
+        try:
+            for p in procs:
+                p.join()
+        finally:
+            kill_child_process(os.getpid(), including_parent=False)
+            return
 
     # Launch processes
-    tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
+    tokenizer_manager = TokenizerManager(server_args, port_args, model_override_args)
+    if server_args.chat_template:
+        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
     pipe_controller_reader, pipe_controller_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
     if server_args.dp_size == 1:
-        start_process = start_controller_process_single
+        start_controller_process = start_controller_process_single
     else:
-        start_process = start_controller_process_multi
+        start_controller_process = start_controller_process_multi
+
     proc_controller = mp.Process(
-        target=start_process,
-        args=(server_args, port_args, pipe_controller_writer, model_overide_args),
+        target=start_controller_process,
+        args=(server_args, port_args, pipe_controller_writer, model_override_args),
     )
     proc_controller.start()
+
     proc_detoken = mp.Process(
         target=start_detokenizer_process,
         args=(
@@ -317,15 +362,11 @@ def launch_server(
     if controller_init_state != "init ok" or detoken_init_state != "init ok":
         proc_controller.kill()
         proc_detoken.kill()
-        print(
-            f"Initialization failed. controller_init_state: {controller_init_state}",
-            flush=True,
+        raise RuntimeError(
+            "Initialization failed. "
+            f"controller_init_state: {controller_init_state}, "
+            f"detoken_init_state: {detoken_init_state}"
         )
-        print(
-            f"Initialization failed. detoken_init_state: {detoken_init_state}",
-            flush=True,
-        )
-        sys.exit(1)
     assert proc_controller.is_alive() and proc_detoken.is_alive()
 
     # Add api key authorization
@@ -334,12 +375,12 @@ def launch_server(
 
     # Send a warmup request
     t = threading.Thread(
-        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
+        target=_wait_and_warmup, args=(server_args, pipe_finish_writer, os.getpid())
     )
     t.start()
 
-    # Listen for requests
     try:
+        # Listen for requests
         uvicorn.run(
             app,
             host=server_args.host,
@@ -358,6 +399,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 
     # Set ulimit
     set_ulimit()
@@ -375,23 +417,18 @@ def _set_envs_and_config(server_args: ServerArgs):
         # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
         maybe_set_triton_cache_manager()
 
-    # Set global chat template
-    if server_args.chat_template:
-        # TODO: replace this with huggingface transformers template
-        load_chat_template_for_openai_api(server_args.chat_template)
-
     # Check flashinfer version
     if not server_args.disable_flashinfer:
         assert_pkg_version(
             "flashinfer",
-            "0.1.4",
+            "0.1.6",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
 
 
-def _wait_and_warmup(server_args, pipe_finish_writer):
+def _wait_and_warmup(server_args, pipe_finish_writer, pid):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
@@ -414,8 +451,9 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
     if not success:
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
-        print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
-        sys.exit(1)
+        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+        kill_child_process(pid, including_parent=False)
+        return
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
@@ -440,21 +478,13 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
-    except Exception as e:
+    except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
-        print(f"Initialization failed. warmup error: {last_traceback}", flush=True)
-        sys.exit(1)
-
-    # Print warnings here
-    if server_args.disable_radix_cache and server_args.chunked_prefill_size is not None:
-        logger.warning(
-            "You set both `--disable-radix-cache` and `--chunked-prefill-size`. "
-            "This combination is an experimental feature and we noticed it can lead to "
-            "wrong generation results. If you want to use chunked prefill, it is recommended "
-            "not using `--disable-radix-cache`."
-        )
+        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+        kill_child_process(pid, including_parent=False)
+        return
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
@@ -471,7 +501,7 @@ class Runtime:
     def __init__(
         self,
         log_level: str = "error",
-        model_overide_args: Optional[dict] = None,
+        model_override_args: Optional[dict] = None,
         *args,
         **kwargs,
     ):
@@ -492,9 +522,10 @@ class Runtime:
 
         self.pid = None
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
+
         proc = mp.Process(
             target=launch_server,
-            args=(self.server_args, model_overide_args, pipe_writer),
+            args=(self.server_args, model_override_args, pipe_writer),
         )
         proc.start()
         pipe_writer.close()
@@ -568,15 +599,17 @@ class Runtime:
 
     def generate(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         sampling_params: Optional[Dict] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
     ):
         json_data = {
             "text": prompt,
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
+            "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
         }
         response = requests.post(
@@ -587,7 +620,7 @@ class Runtime:
 
     def encode(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
     ):
         json_data = {
             "text": prompt,

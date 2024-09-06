@@ -1,5 +1,8 @@
 # Sampling Parameters in SGLang Runtime
 This doc describes the sampling parameters of the SGLang Runtime.
+It is the low-level endpoint of the runtime.
+If you want a high-level endpoint that can automatically handle chat templates, consider using the [OpenAI Compatible API
+](https://github.com/sgl-project/sglang?tab=readme-ov-file#openai-compatible-api).
 
 The `/generate` endpoint accepts the following arguments in the JSON format.
 
@@ -45,6 +48,8 @@ temperature: float = 1.0,
 top_p: float = 1.0,
 # Top-k sampling
 top_k: int = -1,
+# Min-p sampling
+min_p: float = 0.0,
 # Whether to ignore EOS token.
 ignore_eos: bool = False,
 # Whether to skip the special tokens during detokenization.
@@ -55,6 +60,9 @@ spaces_between_special_tokens: bool = True,
 regex: Optional[str] = None,
 # Do parallel sampling and return `n` outputs.
 n: int = 1,
+# Constrains the output to follow a given JSON schema.
+# `regex` and `json_schema` cannot be set at the same time.
+json_schema: Optional[str] = None,
 
 ## Penalties. See [Performance Implications on Penalties] section below for more informations.
 
@@ -138,7 +146,7 @@ print("")
 
 Launch a server
 ```
-python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.6-vicuna-7b --tokenizer-path llava-hf/llava-1.5-7b-hf --chat-template vicuna_v1.1 --port 30000
+python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov --chat-template chatml-llava
 ```
 
 Download an image
@@ -153,7 +161,9 @@ import requests
 response = requests.post(
     "http://localhost:30000/generate",
     json={
-        "text": "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER: <image>\nDescribe this picture ASSISTANT:",
+        "text": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+                "<|im_start|>user\n<image>\nDescribe this image in a very short sentence.<|im_end|>\n"
+                "<|im_start|>assistant\n",
         "image_data": "example_image.png",
         "sampling_params": {
             "temperature": 0,

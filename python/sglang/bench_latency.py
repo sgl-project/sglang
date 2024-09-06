@@ -11,26 +11,34 @@ python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ## plot the results in series of lines:
 python -m sglang.bench_latency --result-filename out.jsonl --graph-sql="select run_name, batch_size, prefill_throughput from results"
 
-
 # Usage (correctness test):
 python -m sglang.bench_latency --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
 
 ## Reference output (of the correctness test above, can be gpu dependent):
-prefill logits (first half) tensor([[-10.0312,  -9.5000,   0.8936,  ...,  -4.9414,  -3.2402,  -3.3633],
-        [-10.0312,  -9.5000,   0.8936,  ...,  -4.9414,  -3.2402,  -3.3633],
-        [ -9.1875, -10.2500,   2.7109,  ...,  -4.3359,  -4.0664,  -4.1328]],
-       device='cuda:0', dtype=torch.float16)
-prefill logits (final) tensor([[-8.3203, -7.1211,  3.3379,  ..., -4.9570, -4.1328, -3.4141],
-        [-8.9062, -9.0156,  4.1445,  ..., -4.9922, -4.4961, -4.0742],
-        [-9.6328, -9.0547,  4.0117,  ..., -5.3047, -4.7148, -4.4609]],
-       device='cuda:0', dtype=torch.float16)
-<s> The capital of France is.
+input_ids=[[1, 450, 7483, 310, 3444, 338], [1, 450, 7483, 310, 278, 3303, 13187, 290, 338], [1, 20628, 338, 263, 6575, 1460, 2462, 322, 306, 763]]
+
+prefill logits (first half): tensor([[-10.0312,  -9.5000,   0.8931,  ...,  -4.9414,  -3.2422,  -3.3633],
+        [-10.0312,  -9.5000,   0.8931,  ...,  -4.9414,  -3.2422,  -3.3633],
+        [ -9.1875, -10.2500,   2.7129,  ...,  -4.3359,  -4.0664,  -4.1328]],
+       device='cuda:0')
+
+prefill logits (final): tensor([[-8.3125, -7.1172,  3.3457,  ..., -4.9570, -4.1328, -3.4141],
+        [-8.9141, -9.0156,  4.1445,  ..., -4.9922, -4.4961, -4.0781],
+        [-9.6328, -9.0547,  4.0195,  ..., -5.3047, -4.7148, -4.4570]],
+       device='cuda:0')
+
+========== Prompt 0 ==========
+<s> The capital of France is Paris.
 The capital of the United States is Washington, D.C.
 
-<s> The capital of the United Kindom is.
+
+========== Prompt 1 ==========
+<s> The capital of the United Kindom is London.
 The capital of the United Kingdom is London.
 The capital of the
-<s> Today is a sunny day and I like go for a walk in the park.
+
+========== Prompt 2 ==========
+<s> Today is a sunny day and I like to go for a walk in the park.
 I'm going to the park
 """
 
@@ -54,7 +62,7 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import suppress_other_loggers
 
@@ -111,7 +119,11 @@ def load_model(server_args, tp_rank, sp_rank: int = 0):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
-    model_config = ModelConfig(path=server_args.model_path)
+    model_config = ModelConfig(
+        server_args.model_path,
+        server_args.trust_remote_code,
+        context_length=server_args.context_length,
+    )
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
@@ -200,16 +212,16 @@ def extend(reqs, model_runner):
         sp_rank=model_runner.sp_rank,
     )
     batch.prepare_for_extend(model_runner.model_config.vocab_size)
-    output = model_runner.forward(batch, ForwardMode.EXTEND)
-    next_token_ids = batch.sample(output.next_token_logits)
-    return next_token_ids, output.next_token_logits, batch
+    sample_output, logits_output = model_runner.forward(batch, ForwardMode.EXTEND)
+    next_token_ids = sample_output.batch_next_token_ids.tolist()
+    return next_token_ids, logits_output.next_token_logits, batch
 
 
 def decode(input_token_ids, batch, model_runner):
-    batch.prepare_for_decode(input_token_ids.cpu().numpy())
-    output = model_runner.forward(batch, ForwardMode.DECODE)
-    next_token_ids = batch.sample(output.next_token_logits)
-    return next_token_ids, output.next_token_logits
+    batch.prepare_for_decode(input_token_ids)
+    sample_output, logits_output = model_runner.forward(batch, ForwardMode.DECODE)
+    next_token_ids = sample_output.batch_next_token_ids.tolist()
+    return next_token_ids, logits_output.next_token_logits
 
 
 @torch.inference_mode()
@@ -226,12 +238,12 @@ def correctness_test(
 
     # Prepare inputs
     input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
-    rank_print(f"{input_ids=}")
+    rank_print(f"\n{input_ids=}\n")
 
     if bench_args.cut_len > 0:
         # Prefill
         next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-        rank_print("prefill logits (first half)", next_token_logits)
+        rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
     # Prepare extend inputs
     reqs = prepare_extend_inputs_for_correctness_test(
@@ -240,7 +252,7 @@ def correctness_test(
 
     # Extend
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-    rank_print("prefill logits (final)", next_token_logits)
+    rank_print(f"prefill logits (final): {next_token_logits} \n")
 
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
@@ -251,7 +263,8 @@ def correctness_test(
 
     # Print
     for i in range(len(reqs)):
-        rank_print(tokenizer.decode(output_ids[i]))
+        rank_print(f"========== Prompt {i} ==========")
+        rank_print(tokenizer.decode(output_ids[i]), "\n")
 
 
 @torch.inference_mode()
@@ -293,6 +306,7 @@ def latency_test_run_once(
     measurement_results["prefill_throughput"] = throughput
 
     # Decode
+    decode_latencies = []
     for i in range(output_len):
         torch.cuda.synchronize()
         tic = time.time()
@@ -301,17 +315,18 @@ def latency_test_run_once(
         latency = time.time() - tic
         tot_latency += latency
         throughput = batch_size / latency
+        decode_latencies.append(latency)
         if i < 5:
             rank_print(
                 f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
-    avg_decode_latency = (tot_latency - prefill_latency) / output_len
-    avg_decode_throughput = batch_size / avg_decode_latency
+    med_decode_latency = np.median(decode_latencies)
+    med_decode_throughput = batch_size / med_decode_latency
     rank_print(
-        f"Decode.  avg latency: {avg_decode_latency:6.5f} s, avg throughput: {avg_decode_throughput:9.2f} token/s"
+        f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
     )
-    measurement_results["avg_decode_latency"] = avg_decode_latency
-    measurement_results["avg_decode_throughput"] = avg_decode_throughput
+    measurement_results["median_decode_latency"] = med_decode_latency
+    measurement_results["median_decode_throughput"] = med_decode_throughput
 
     throughput = (input_len + output_len) * batch_size / tot_latency
     rank_print(
@@ -356,7 +371,7 @@ def latency_test(
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
-        req = prepare_synthetic_inputs_for_latency_test(bs, il)
+        reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
         ret = latency_test_run_once(
             bench_args.run_name, model_runner, rank_print, reqs, bs, il, ol
         )

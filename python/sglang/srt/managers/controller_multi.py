@@ -21,7 +21,6 @@ Each data parallel worker can manage multiple tensor parallel workers.
 import dataclasses
 import logging
 import multiprocessing
-import os
 from enum import Enum, auto
 
 import numpy as np
@@ -36,7 +35,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import kill_parent_process
+from sglang.srt.utils import configure_logger, kill_parent_process
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -72,12 +71,12 @@ class ControllerMulti:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        model_overide_args,
+        model_override_args,
     ):
         # Parse args
         self.server_args = server_args
         self.port_args = port_args
-        self.model_overide_args = model_overide_args
+        self.model_override_args = model_override_args
         self.load_balance_method = LoadBalanceMethod.from_str(
             server_args.load_balance_method
         )
@@ -115,7 +114,7 @@ class ControllerMulti:
                 self.server_args,
                 self.port_args,
                 pipe_controller_writer,
-                self.model_overide_args,
+                self.model_override_args,
                 True,
                 gpu_ids,
                 dp_worker_id,
@@ -190,17 +189,14 @@ def start_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer,
-    model_overide_args: dict,
+    model_override_args: dict,
 ):
     """Start a controller process."""
 
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format="%(message)s",
-    )
+    configure_logger(server_args)
 
     try:
-        controller = ControllerMulti(server_args, port_args, model_overide_args)
+        controller = ControllerMulti(server_args, port_args, model_override_args)
     except Exception:
         pipe_writer.send(get_exception_traceback())
         raise
@@ -212,6 +208,4 @@ def start_controller_process(
     except Exception:
         logger.error("Exception in ControllerMulti:\n" + get_exception_traceback())
     finally:
-        for w in controller.workers:
-            os.kill(w.proc.pid, 9)
         kill_parent_process()

@@ -17,7 +17,6 @@ limitations under the License.
 
 import logging
 import multiprocessing
-import os
 from typing import List
 
 import zmq
@@ -28,7 +27,7 @@ from sglang.srt.managers.tp_worker import (
     launch_tp_servers,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import kill_parent_process
+from sglang.srt.utils import configure_logger, kill_parent_process
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -41,7 +40,7 @@ class ControllerSingle:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        model_overide_args: dict,
+        model_override_args: dict,
         gpu_ids: List[int],
         is_data_parallel_worker: bool,
         dp_worker_id: int,
@@ -53,7 +52,7 @@ class ControllerSingle:
         self.dp_worker_id = dp_worker_id
         self.mp_queue = mp_queue
 
-        # Init communication
+        # Init inter-process communication
         context = zmq.Context(2)
 
         if not self.is_dp_worker:
@@ -77,7 +76,7 @@ class ControllerSingle:
                 tp_rank_range,
                 server_args,
                 port_args.nccl_ports[dp_worker_id],
-                model_overide_args,
+                model_override_args,
             )
 
         # Launch tp rank 0
@@ -86,7 +85,7 @@ class ControllerSingle:
             0,
             server_args,
             port_args.nccl_ports[dp_worker_id],
-            model_overide_args,
+            model_override_args,
         )
         self.tp_cpu_group = self.tp_server.model_runner.tp_group.cpu_group
 
@@ -127,18 +126,18 @@ def start_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer: multiprocessing.connection.Connection,
-    model_overide_args: dict,
+    model_override_args: dict,
     is_data_parallel_worker: bool = False,
     gpu_ids: List[int] = None,
     dp_worker_id: int = None,
     queue: multiprocessing.connection.Connection = None,
 ):
     """Start a controller process."""
-
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format="%(message)s",
-    )
+    if is_data_parallel_worker:
+        logger_prefix = f" DP{dp_worker_id} TP0"
+    else:
+        logger_prefix = " TP0"
+    configure_logger(server_args, prefix=logger_prefix)
 
     if not is_data_parallel_worker:
         tp_size_local = server_args.tp_size // server_args.nnodes
@@ -150,7 +149,7 @@ def start_controller_process(
         controller = ControllerSingle(
             server_args,
             port_args,
-            model_overide_args,
+            model_override_args,
             gpu_ids,
             is_data_parallel_worker,
             dp_worker_id,
@@ -167,6 +166,4 @@ def start_controller_process(
     except Exception:
         logger.error("Exception in ControllerSingle:\n" + get_exception_traceback())
     finally:
-        for t in controller.tp_procs:
-            os.kill(t.pid, 9)
         kill_parent_process()

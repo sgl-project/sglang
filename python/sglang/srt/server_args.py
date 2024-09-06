@@ -33,11 +33,13 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     dtype: str = "auto"
+    kv_cache_dtype: str = "auto"
     trust_remote_code: bool = True
     context_length: Optional[int] = None
     quantization: Optional[str] = None
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
+    is_embedding: bool = False
 
     # Port
     host: str = "127.0.0.1"
@@ -49,7 +51,7 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_num_reqs: Optional[int] = None
     max_total_tokens: Optional[int] = None
-    chunked_prefill_size: int = -1
+    chunked_prefill_size: int = 8192
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
@@ -80,12 +82,14 @@ class ServerArgs:
     disable_radix_cache: bool = False
     disable_regex_jump_forward: bool = False
     disable_cuda_graph: bool = False
+    disable_cuda_graph_padding: bool = False
     disable_disk_cache: bool = False
+    disable_custom_all_reduce: bool = False
+    enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     enable_p2p_check: bool = False
     enable_mla: bool = False
-    attention_reduce_in_fp32: bool = False
-    efficient_weight_load: bool = False
+    triton_attention_reduce_in_fp32: bool = False
 
     # Distributed args
     nccl_init_addr: Optional[str] = None
@@ -195,9 +199,21 @@ class ServerArgs:
             '* "float32" for FP32 precision.',
         )
         parser.add_argument(
+            "--kv-cache-dtype",
+            type=str,
+            default=ServerArgs.kv_cache_dtype,
+            choices=["auto", "fp8_e5m2"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" is supported for CUDA 11.8+.',
+        )
+        parser.add_argument(
             "--trust-remote-code",
             action="store_true",
             help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+        )
+        parser.add_argument(
+            "--is-embedding",
+            action="store_true",
+            help="Whether to use a CausalLM as an embedding model.",
         )
         parser.add_argument(
             "--context-length",
@@ -399,9 +415,25 @@ class ServerArgs:
             help="Disable cuda graph.",
         )
         parser.add_argument(
+            "--disable-cuda-graph-padding",
+            action="store_true",
+            help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
             "--disable-disk-cache",
             action="store_true",
             help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
+        )
+        parser.add_argument(
+            "--disable-custom-all-reduce",
+            action="store_true",
+            default=False,
+            help="Disable the custom all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
+            "--enable-mixed-chunk",
+            action="store_true",
+            help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
         )
         parser.add_argument(
             "--enable-torch-compile",
@@ -416,13 +448,13 @@ class ServerArgs:
         parser.add_argument(
             "--enable-mla",
             action="store_true",
-            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2",
+            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
-            "--attention-reduce-in-fp32",
+            "--triton-attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
-            "This only affects Triton attention kernels",
+            "This only affects Triton attention kernels.",
         )
         parser.add_argument(
             "--efficient-weight-load",
@@ -440,15 +472,6 @@ class ServerArgs:
     def url(self):
         return f"http://{self.host}:{self.port}"
 
-    def print_mode_args(self):
-        return (
-            f"disable_flashinfer={self.disable_flashinfer}, "
-            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}, "
-            f"disable_radix_cache={self.disable_radix_cache}, "
-            f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
-            f"disable_disk_cache={self.disable_disk_cache}, "
-        )
-
     def check_server_args(self):
         assert (
             self.tp_size % self.nnodes == 0
@@ -456,17 +479,14 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
-        if "gemma-2" in self.model_path.lower():
+        if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
             logger.info(
-                f"When using sliding window in gemma-2, disable radix_cache, regex_jump_forward, and turn on flashinfer."
+                "Not sure why, the tokenizer will add an additional token at the end of the prompt when trust_remote_mode=True"
             )
-            # FIXME: compatibility with radix attention
-            self.disable_radix_cache = True
-            # FIXME: compatibility with jump forward
-            self.disable_regex_jump_forward = True
+            self.trust_remote_code = False
+        if "gemma-2" in self.model_path.lower():
+            logger.info("When using sliding window in gemma-2, turn on flashinfer.")
             self.disable_flashinfer = False
-            # FIXME: compatibility with chunked prefill
-            self.chunked_prefill_size = None
 
 
 @dataclasses.dataclass
