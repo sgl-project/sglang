@@ -52,11 +52,12 @@ from torchao.quantization import (
     int8_dynamic_activation_int8_weight,
     int4_weight_only,
     fpx_weight_only,
+    float8_weight_only,
 )
 
 def _quantize_param_data(param, torchao_config):
     dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
-    dummy_linear.weight.data = param.data
+    dummy_linear.weight = param
     if "int8wo" in torchao_config:
         quantize_(dummy_linear, int8_weight_only())
     elif "int8dq" in torchao_config:
@@ -65,8 +66,10 @@ def _quantize_param_data(param, torchao_config):
         group_size=int(torchao_config.split("-")[-1])
         assert group_size in [32, 64, 128, 256], f"int4wo groupsize needs to be one of [32, 64, 128, 256] but got {group_size}"
         quantize_(dummy_linear, int4_weight_only(group_size=group_size))
-    elif "fp6" in torchao_config:
-        quantize_(dummy_linear, fpx_weight_only(3, 2))
+    elif "fp8wo" in torchao_config:
+        # this requires newer hardware
+        # [rank0]: AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
+        quantize_(dummy_linear, float8_weight_only())
     return dummy_linear.weight
 
 
