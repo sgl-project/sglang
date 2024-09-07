@@ -93,12 +93,14 @@ def multi_image_stream_request_test(client):
                         "image_url": {
                             "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
                         },
+                        "modalities": "multi-images",
                     },
                     {
                         "type": "image_url",
                         "image_url": {
                             "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
                         },
+                        "modalities": "multi-images",
                     },
                     {
                         "type": "text",
@@ -218,6 +220,7 @@ def prepare_video_messages(video_path):
     frame_format = {
         "type": "image_url",
         "image_url": {"url": "data:image/jpeg;base64,{}"},
+        "modalities": "video",
     }
 
     for base64_frame in base64_frames:
