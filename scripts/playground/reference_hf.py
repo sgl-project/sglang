@@ -3,23 +3,24 @@ Usage:
 python3 reference_hf.py --model TinyLlama/TinyLlama-1.1B-Chat-v0.4
 
 Reference output:
+========== Prompt 0 ==========
+prefill logits (final) tensor([-8.3125, -7.1172,  3.3398,  ..., -4.9531, -4.1328, -3.4141],
+       device='cuda:0')
 <s> The capital of France is Paris.
 The capital of the United States is Washington, D.C.
-The capital of Canada is Ottawa.
-The capital of Japan is Tokyo
-prefill logits tensor([-8.3125, -7.1172,  3.3398,  ..., -4.9570, -4.1328, -3.4141],
+
+========== Prompt 1 ==========
+prefill logits (final) tensor([-8.9062, -9.0156,  4.1484,  ..., -4.9922, -4.4961, -4.0742],
        device='cuda:0')
 <s> The capital of the United Kindom is London.
 The capital of the United Kingdom is London.
-The capital of the United Kingdom is London.
-The capital of the United Kingdom is London.
-prefill logits tensor([-8.9062, -9.0156,  4.1406,  ..., -4.9922, -4.4961, -4.0742],
+The capital of
+
+========== Prompt 2 ==========
+prefill logits (final) tensor([-9.6328, -9.0547,  4.0234,  ..., -5.3047, -4.7148, -4.4609],
        device='cuda:0')
 <s> Today is a sunny day and I like to go for a walk in the park.
-I'm going to the park to play in the grass and water.
-Today is a very
-prefill logits tensor([-9.6328, -9.0547,  4.0195,  ..., -5.3047, -4.7148, -4.4609],
-       device='cuda:0')
+I'm going to the
 """
 
 import argparse
@@ -47,7 +48,7 @@ def normal_text(args):
     ]
     max_new_tokens = 16
 
-    for p in prompts:
+    for i, p in enumerate(prompts):
         if isinstance(p, str):
             input_ids = t.encode(p, return_tensors="pt").cuda()
         else:
@@ -60,7 +61,8 @@ def normal_text(args):
 
         prefill_logits = m.forward(input_ids).logits[0][-1]
 
-        print("prefill logits", prefill_logits)
+        print(f"\n========== Prompt {i} ==========")
+        print("prefill logits (final)", prefill_logits)
         print(output_str)
 
 
