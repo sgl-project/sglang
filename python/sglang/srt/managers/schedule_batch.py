@@ -130,6 +130,7 @@ class Req:
         self.image_sizes = None
         self.image_offsets = None
         self.pad_value = None
+        self.modalities = None
 
         # Prefix info
         self.extend_input_len = 0
