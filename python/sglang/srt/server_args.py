@@ -86,6 +86,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
+    torchao_config: str = ""
     enable_p2p_check: bool = False
     enable_mla: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -432,6 +433,12 @@ class ServerArgs:
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile, experimental feature.",
+        )
+        parser.add_argument(
+            "--torchao-config",
+            type=str,
+            default=ServerArgs.torchao_config,
+            help="Optimize the model with torchao, experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>",
         )
         parser.add_argument(
             "--enable-p2p-check",

@@ -43,7 +43,31 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
-ENABLE_TORCHAO = True
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+# TODO: move quantization code to some util file
+from torchao.quantization import (
+    quantize_,
+    int8_weight_only,
+    int8_dynamic_activation_int8_weight,
+    int4_weight_only,
+    fpx_weight_only,
+)
+
+def _quantize_param_data(param, torchao_config):
+    dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
+    dummy_linear.weight.data = param.data
+    if "int8wo" in torchao_config:
+        quantize_(dummy_linear, int8_weight_only())
+    elif "int8dq" in torchao_config:
+        quantize_(dummy_linear, int8_dynamic_activation_int8_weight())
+    elif "int4wo" in torchao_config:
+        group_size=int(torchao_config.split("-")[-1])
+        assert group_size in [32, 64, 128, 256], f"int4wo groupsize needs to be one of [32, 64, 128, 256] but got {group_size}"
+        quantize_(dummy_linear, int4_weight_only(group_size=group_size))
+    elif "fp6" in torchao_config:
+        quantize_(dummy_linear, fpx_weight_only(3, 2))
+    return dummy_linear.weight
 
 
 class LlamaMLP(nn.Module):
@@ -300,6 +324,7 @@ class LlamaForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self.torchao_config = global_server_args_dict["torchao_config"]
         self.model = LlamaModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
@@ -351,17 +376,9 @@ class LlamaForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
-                if hasattr(param, "weight_loader"):
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    if ENABLE_TORCHAO and name.endswith("proj.weight") and param.ndim == 2:
-                        from torchao.quantization import quantize_, int4_weight_only
-                        dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
-                        dummy_linear.weight.data = param.data
-                        quantize_(dummy_linear, int4_weight_only())
-                        params_dict[name] = dummy_linear.weight
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
 
-                # TODO
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -371,12 +388,16 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-                if ENABLE_TORCHAO and name.endswith("proj.weight") and param.ndim == 2:
-                    from torchao.quantization import quantize_, int4_weight_only
-                    dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
-                    dummy_linear.weight.data = param.data
-                    quantize_(dummy_linear, int4_weight_only())
-                    params_dict[name] = dummy_linear.weight
+                if name.endswith("proj.weight") and param.ndim == 2:
+                    params_dict[name] = _quantize_param_data(param, self.torchao_config)
+
+        # quantizing the loaded, stacked params, e.g. "...qkv_proj"
+        stacked_params = set(entry[0] for entry in stacked_params_mapping)
+        for param_suffix in stacked_params:
+            for name in params_dict:
+                if param_suffix in name:
+                    param = params_dict[name]
+                    params_dict[name] = _quantize_param_data(param, self.torchao_config)
 
         self.load_state_dict(params_dict, assign=True)
 
