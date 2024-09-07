@@ -180,7 +180,7 @@ class TokenizedGenerateReqInput:
     # Whether to stream output
     stream: bool
     # Modalities of the input images
-    modalites: List[str]
+    modalites: Optional[List[str]] = None
 
 
 @dataclass

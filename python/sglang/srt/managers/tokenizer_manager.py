@@ -349,6 +349,7 @@ class TokenizerManager:
                     pixel_values, image_hashes, image_sizes = (
                         await self._get_pixel_values(obj.image_data[index])
                     )
+                    modalities = obj.modalities
 
                     tokenized_obj = TokenizedGenerateReqInput(
                         rid,
@@ -362,6 +363,7 @@ class TokenizerManager:
                         obj.logprob_start_len[index],
                         obj.top_logprobs_num[index],
                         obj.stream,
+                        modalities,
                     )
                 else:
                     tokenized_obj = TokenizedEmbeddingReqInput(
