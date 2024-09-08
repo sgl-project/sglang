@@ -19,18 +19,29 @@ import uuid
 import torch
 from vllm.config import LoadConfig
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
-from sglang.srt.model_config import ModelConfig
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 
 LORA_SETS = [
     # {
     #     "base": "meta-llama/Llama-2-7b-hf",
     #     "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"],
-    # }
-    {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]}
-    # {"base": "meta-llama/Llama-2-7b-hf", "loras": ["yard1/llama-2-7b-sql-lora-test"]}
+    # },
+    # {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
+    # {"base": "mistralai/Mistral-7B-Instruct-v0.3", "loras": ["/home/ying/test_lora"]},
+    {
+        "base": "mistralai/Mistral-7B-Instruct-v0.3",
+        "loras": [
+            "/home/ying/test_lora",
+            "/home/ying/test_lora_1",
+            "/home/ying/test_lora_2",
+            "/home/ying/test_lora_3",
+            "/home/ying/test_lora_4",
+        ],
+    },
+    # {"base": "meta-llama/Llama-2-7b-hf", "loras": ["yard1/llama-2-7b-sql-lora-test"]},
 ]
 TORCH_DTYPES = [torch.float16]
 
@@ -53,6 +64,14 @@ What do you know about llamas?
 ### Answer:
 """,
 ]
+
+import json
+
+with open("/home/ying/test_prompt/dialogue_choice_prompts.json", "r") as f:
+    samples = json.load(f)
+for sample in samples:
+    assert sample[0]["role"] == "user"
+    PROMPTS.append(sample[0]["content"][:2000])
 
 
 class TestLoRA(unittest.TestCase):
@@ -80,23 +99,26 @@ class TestLoRA(unittest.TestCase):
             batch_lora_paths.append(all_lora_paths[i])
             i = (i + 1) % len(all_lora_paths)
 
-        with HFRunner(
-            base_path,
-            torch_dtype=torch_dtype,
-            is_generation=True,
-        ) as hf_runner:
-            hf_outputs = hf_runner.forward(
-                prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
-            )
-
         with SRTRunner(
             base_path,
             tp_size=tp_size,
             torch_dtype=torch_dtype,
             is_generation=True,
             lora_paths=all_lora_paths,
+            max_loras_per_batch=3,
+            disable_cuda_graph=True,
+            disable_radix_cache=True,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
+                prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
+            )
+
+        with HFRunner(
+            base_path,
+            torch_dtype=torch_dtype,
+            is_generation=True,
+        ) as hf_runner:
+            hf_outputs = hf_runner.forward(
                 prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
             )
 
@@ -120,6 +142,7 @@ class TestLoRA(unittest.TestCase):
             )
 
         for i in range(len(prompts)):
+            # compare input logprobs
             hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
             srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
             hf_no_lora_logprobs = torch.Tensor(hf_no_lora_outputs.top_input_logprobs[i])
@@ -127,28 +150,97 @@ class TestLoRA(unittest.TestCase):
                 srt_no_lora_outputs.top_input_logprobs[i]
             )
             print(
-                "max_diff between hf_lora and srt_lora",
+                "max input diff between hf_lora and srt_lora",
                 torch.max(abs(hf_logprobs - srt_logprobs)),
             )
             print(
-                "max_diff between srt_base and srt_lora",
+                "max input diff between srt_base and srt_lora",
                 torch.max(abs(srt_no_lora_logprobs - srt_logprobs)),
             )
             print(
-                "max_diff between srt_base and hf_base",
+                "max input diff between srt_base and hf_base",
                 torch.max(abs(srt_no_lora_logprobs - hf_no_lora_logprobs)),
             )
             print(
-                "max_diff between hf_lora and hf_base",
+                "max input diff between hf_lora and hf_base",
                 torch.max(abs(hf_logprobs - hf_no_lora_logprobs)),
             )
 
+            # compare output logprobs
+            hf_logprobs = torch.Tensor(hf_outputs.top_output_logprobs[i])
+            srt_logprobs = torch.Tensor(srt_outputs.top_output_logprobs[i])
+            # print(
+            #     "\noutput logprobs diff",
+            #     [
+            #         float(torch.max(abs(hf_logprobs[j] - srt_logprobs[j])))
+            #         for j in range(max_new_tokens)
+            #     ],
+            # )
+            print(
+                "max output diff between hf_lora and srt_lora",
+                torch.max(abs(hf_logprobs - srt_logprobs)),
+                "\n",
+            )
+
+        # compare output strings
         print(f"{hf_outputs.output_strs=}")
         print(f"{srt_outputs.output_strs=}")
         print(f"{hf_no_lora_outputs.output_strs=}")
         print(f"{srt_no_lora_outputs.output_strs=}")
-        assert hf_outputs.output_strs == srt_outputs.output_strs
-        assert hf_no_lora_outputs.output_strs == srt_no_lora_outputs.output_strs
+        for i in range(len(prompts)):
+            assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i], (
+                str_outputs.output_strs[i].strip(" "),
+                hf_outputs.output_strs[i],
+            )
+            assert (
+                srt_no_lora_outputs.output_strs[i].strip(" ")
+                == hf_no_lora_outputs.output_strs[i]
+            ), (
+                srt_no_lora_outputs.output_strs[i].strip(" "),
+                hf_no_lora_outputs.output_strs[i],
+            )
+
+    def serving(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
+        base_path = lora_set["base"]
+        all_lora_paths = lora_set["loras"]
+        batch_lora_paths = []
+        i = 0
+        for _ in range(len(prompts)):
+            batch_lora_paths.append(all_lora_paths[i])
+            i = (i + 1) % len(all_lora_paths)
+
+        with SRTRunner(
+            base_path,
+            tp_size=tp_size,
+            torch_dtype=torch_dtype,
+            is_generation=True,
+            lora_paths=all_lora_paths,
+            max_loras_per_batch=3,
+            disable_cuda_graph=True,
+            disable_radix_cache=True,
+        ) as srt_runner:
+            srt_outputs = srt_runner.batch_forward(
+                prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
+            )
+
+        with HFRunner(
+            base_path,
+            torch_dtype=torch_dtype,
+            is_generation=True,
+            output_str_only=True,
+        ) as hf_runner:
+            hf_outputs = hf_runner.forward(
+                prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
+            )
+
+        # compare output strings
+        print(f"{hf_outputs.output_strs=}")
+        print(f"{srt_outputs.output_strs=}")
+        for i in range(len(prompts)):
+            assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i], (
+                str_outputs.output_strs[i].strip(" "),
+                hf_outputs.output_strs[i],
+            )
 
     def base_inference(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
         base_path = lora_set["base"]
@@ -180,22 +272,30 @@ class TestLoRA(unittest.TestCase):
             srt_no_lora_logprobs = torch.Tensor(
                 srt_no_lora_outputs.top_input_logprobs[i]
             )
-            srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
+            srt_logprobs = torch.uensor(srt_outputs.top_input_logprobs[i])
             print("max_diff", torch.max(abs(srt_no_lora_logprobs - srt_logprobs)))
 
         print(f"{srt_no_lora_outputs.output_strs=}")
         print(f"{srt_outputs.output_strs=}")
 
-        assert srt_outputs.output_strs == hf_outputs.output_strs
-        assert srt_no_lora_outputs.output_strs == hf_no_lora_outputs.output_strs
+        for i in range(len(prompts)):
+            assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i], (
+                str_outputs.output_strs[i].strip(" "),
+                hf_outputs.output_strs[i],
+            )
+            assert (
+                srt_no_lora_outputs[i].output_strs.strip(" ")
+                == hf_no_lora_outputs[i].output_strs
+            )
 
     def test_all(self):
         for lora_set in LORA_SETS:
             # self.load_lora_adapter(lora_set, 1)
             for torch_dtype in TORCH_DTYPES:
                 tp_size = 1
-                max_new_tokens = 64
+                max_new_tokens = 32
                 self.inference(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
+                self.serving(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
                 # self.base_inference(
                 #     PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens
                 # )

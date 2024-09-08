@@ -23,10 +23,29 @@ from dataclasses import dataclass
 import torch
 from flashinfer import SegmentGEMMWrapper
 
-from sglang.srt.lora.lora import LoRAAdapter, get_lora_layer, params_mapping
+from sglang.srt.lora.lora import LoRAAdapter, get_lora_layer
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import replace_submodule
+
+
+def get_stacked_name(name):
+    # origin name -> (name for A, name for B)
+    params_mapping = {
+        "q_proj": ("qkv_proj", "q_proj"),
+        "k_proj": ("qkv_proj", "kv_proj"),
+        "v_proj": ("qkv_proj", "kv_proj"),
+        "gate_proj": ("gate_up_proj", "gate_up_proj"),
+        "up_proj": ("gate_up_proj", "gate_up_proj"),
+    }
+    return params_mapping.get(name, (name, name))
+
+
+def get_layer_id(name):
+    match = re.search(r"layers\.(\d+)\.", name)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 class LoRAManager:
@@ -76,14 +95,20 @@ class LoRAManager:
     def init_loras(self):
         # get configs and target modules
         self.configs = {}
-        self.target_modules = set()
+        self.origin_target_modules = set()
         for path in self.lora_paths:
             self.configs[path] = LoRAConfig(path)
-            self.target_modules = set(self.target_modules) | set(
+            self.origin_target_modules = set(self.origin_target_modules) | set(
                 self.configs[path].target_modules
             )
         self.target_modules = set(
-            [params_mapping(module) for module in self.target_modules]
+            [
+                self.base_model.get_module_name(module)
+                for module in self.origin_target_modules
+            ]
+        )
+        self.target_weights = set(
+            [get_stacked_name(module) for module in self.origin_target_modules]
         )
 
         # load all weights to cpu
@@ -105,10 +130,9 @@ class LoRAManager:
         assert all(x.hf_config["r"] == self.max_lora_dim for x in self.configs.values())
         assert all(x.scaling == self.scaling for x in self.loras)
 
-        # monkey patch to use Lora version
-        modules = self.get_target_modules()
+        # monkey patch to use the LoRA version
         self.lora_modules = []
-        for module_name, module in modules:
+        for module_name, module in self.get_target_modules():
             self.lora_modules.append(
                 (module_name, self.set_lora_module(module_name, module))
             )
@@ -118,60 +142,64 @@ class LoRAManager:
         self.A_buffer = {}
         self.B_buffer = {}
         num_layer = self.base_hf_config.num_hidden_layers
-        for module in self.target_modules:
-            c = self.loras[-1].get_stacked_multiply(module)
-            hidden_dim_A, hidden_dim_B = self.base_model.get_hidden_dim(module)
+        for module_A, module_B in self.target_weights:
             # init A tensor, column_major=True
-            self.A_buffer[module] = [
-                torch.empty(
-                    (
-                        self.max_loras_per_batch,
-                        self.max_lora_dim * c,
-                        hidden_dim_A,
-                    ),
-                    dtype=self.dtype,
-                    device="cuda",
-                )
-                for i in range(num_layer)
-            ]
+            hidden_dim_A, _ = self.base_model.get_hidden_dim(module_A)
+            c = self.loras[-1].get_stacked_multiply(module_A)
+            if module_A not in self.A_buffer:
+                self.A_buffer[module_A] = [
+                    torch.empty(
+                        (
+                            self.max_loras_per_batch,
+                            self.max_lora_dim * c,
+                            hidden_dim_A,
+                        ),
+                        dtype=self.dtype,
+                        device="cuda",
+                    )
+                    for i in range(num_layer)
+                ]
             # init B tensor, column_major=True
-            self.B_buffer[module] = [
-                torch.empty(
-                    (
-                        self.max_loras_per_batch,
-                        hidden_dim_B,
-                        self.max_lora_dim * c,
-                    ),
-                    dtype=self.dtype,
-                    device="cuda",
-                )
-                for i in range(num_layer)
-            ]
+            _, hidden_dim_B = self.base_model.get_hidden_dim(module_B)
+            c = self.loras[-1].get_stacked_multiply(module_B)
+            if module_B not in self.B_buffer:
+                self.B_buffer[module_B] = [
+                    torch.empty(
+                        (
+                            self.max_loras_per_batch,
+                            hidden_dim_B * c,
+                            self.max_lora_dim,
+                        ),
+                        dtype=self.dtype,
+                        device="cuda",
+                    )
+                    for i in range(num_layer)
+                ]
 
     def init_lora_batch(self):
         self.active_uids = [None] * self.max_loras_per_batch  # list of active loras
         self.buffer_id = {}  # lora uid -> idx in memory pool
 
-    def get_target_module_name(self, module_name):
-        for module in self.target_modules:
-            if module in module_name:
-                return module
+    def get_weight_name(self, name, idx):
+        for target_weight_name in self.target_weights:
+            if target_weight_name[idx] in name:
+                return target_weight_name[idx]
 
     def load_lora(self, uid, buffer_id):
         num_layer = self.base_hf_config.num_hidden_layers
         for i in range(num_layer):
             layer_weights = self.loras[self.lora_id[uid]].layers[i].weights
-            for module_name, weights in layer_weights.items():
-                target_module_name = self.get_target_module_name(module_name)
-                if "lora_A" in module_name:
-                    self.A_buffer[target_module_name][i][buffer_id].copy_(weights)
+            for name, weights in layer_weights.items():
+                if "lora_A" in name:
+                    lora_weight_name = self.get_weight_name(name, 0)
+                    if lora_weight_name:
+                        self.A_buffer[lora_weight_name][i][buffer_id].copy_(weights)
                 else:
-                    assert "lora_B" in module_name
-                    self.B_buffer[target_module_name][i][buffer_id].copy_(weights)
+                    lora_weight_name = self.get_weight_name(name, 1)
+                    if lora_weight_name:
+                        self.B_buffer[lora_weight_name][i][buffer_id].copy_(weights)
 
-    def prepare_lora_batch(
-        self, batch, forward_mode: ForwardMode, extend_seq_lens=None
-    ):
+    def prepare_lora_batch(self, batch, extend_seq_lens=None):
         # load active loras into lora memory pool
         cur_uids = set([req.lora_path for req in batch.reqs])
         assert len(cur_uids) <= self.max_loras_per_batch
@@ -191,22 +219,29 @@ class LoRAManager:
 
         # setup lora in forward modules
         bs = len(batch.reqs)
-        if forward_mode == ForwardMode.EXTEND:
-            seg_lens = extend_seq_lens
-        else:
-            seg_lens = torch.ones(bs)
+        seg_lens = extend_seq_lens if batch.forward_mode.is_extend() else torch.ones(bs)
         weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
         for i, req in enumerate(batch.reqs):
             weight_indices[i] = self.buffer_id[req.lora_path]
 
         for module_name, module in self.lora_modules:
-            target_model_name = self.get_target_module_name(module_name)
-            match = re.search(r"layers\.(\d+)\.", module_name)
-            layer_id = int(match.group(1))
-            module.set_lora_info(
-                self.A_buffer[target_model_name][layer_id],
-                self.B_buffer[target_model_name][layer_id],
-                bs,
-                seg_lens,
-                weight_indices,
-            )
+            layer_id = get_layer_id(module_name)
+
+            if "qkv_proj" not in module_name:
+                weight_name = self.get_weight_name(module_name, 0)
+                module.set_lora_info(
+                    self.A_buffer[weight_name][layer_id],
+                    self.B_buffer[weight_name][layer_id],
+                    bs,
+                    seg_lens,
+                    weight_indices,
+                )
+            else:
+                module.set_lora_info(
+                    self.A_buffer["qkv_proj"][layer_id],
+                    self.B_buffer["q_proj"][layer_id],
+                    self.B_buffer["kv_proj"][layer_id],
+                    bs,
+                    seg_lens,
+                    weight_indices,
+                )

@@ -467,7 +467,7 @@ class ModelRunner:
     @torch.inference_mode()
     def forward_decode(self, batch: ScheduleBatch):
         if self.server_args.lora_paths is not None:
-            self.lora_manager.prepare_lora_batch(batch, ForwardMode.DECODE)
+            self.lora_manager.prepare_lora_batch(batch)
         if (
             self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(len(batch.reqs))
@@ -485,9 +485,7 @@ class ModelRunner:
     def forward_extend(self, batch: ScheduleBatch):
         input_metadata = InputMetadata.from_schedule_batch(self, batch)
         if self.server_args.lora_paths is not None:
-            self.lora_manager.prepare_lora_batch(
-                batch, ForwardMode.EXTEND, input_metadata.extend_seq_lens
-            )
+            self.lora_manager.prepare_lora_batch(batch, input_metadata.extend_seq_lens)
 
         if self.is_generation:
             return self.model.forward(

@@ -87,6 +87,7 @@ class ModelTpServer:
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
+        self.max_loras_per_batch = server_args.max_loras_per_batch
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -450,10 +451,25 @@ class ModelTpServer:
                 self.current_inflight_req
             )
 
+        lora_set = (
+            set([req.lora_path for req in self.running_batch.reqs])
+            if self.running_batch is not None
+            else set([])
+        )
+
         for req in self.waiting_queue:
             if adder.no_remaining_tokens():
                 break
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
+            if (
+                len(
+                    lora_set
+                    | set([req.lora_path for req in adder.can_run_list])
+                    | set([req.lora_path])
+                )
+                > self.max_loras_per_batch
+            ):
+                break
             res = adder.add_one_req(req)
             if (
                 not res

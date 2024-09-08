@@ -188,7 +188,7 @@ class TokenizedGenerateReqInput:
     modalites: Optional[List[str]] = None
 
     # LoRA related
-    lora_path: Optional[str]
+    lora_path: Optional[str] = None
 
 
 @dataclass

@@ -558,6 +558,11 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
+        assert (
+            # FIXME
+            (self.lora_paths is None or self.disable_cuda_graph)
+            and (self.lora_paths is None or self.disable_radix_cache)
+        ), "compatibility of lora and cuda graph and radix attention is in progress"
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:

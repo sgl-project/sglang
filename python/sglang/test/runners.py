@@ -53,6 +53,7 @@ def get_dtype_str(torch_dtype):
 
 def get_top_logprobs(logits, k):
     logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
+    del logits
     logprobs, top_indices = torch.topk(logprobs, k=k, dim=-1)
     return logprobs
 
@@ -72,8 +73,10 @@ class HFRunner:
         model_path,
         torch_dtype,
         is_generation,
+        output_str_only=False,
     ):
         self.is_generation = is_generation
+        self.output_str_only = output_str_only
 
         self.in_queue = mp.Queue()
         self.out_queue = mp.Queue()
@@ -138,7 +141,6 @@ class HFRunner:
                         else:
                             self.model = self.base_model
 
-
                         outputs = self.model.generate(
                             input_ids,
                             do_sample=False,
@@ -146,25 +148,30 @@ class HFRunner:
                             top_p=None,
                             max_new_tokens=max_new_tokens,
                             return_dict_in_generate=True,
-                            output_scores=True,
+                            output_scores=(not self.output_str_only),
                         )
                         output_strs.append(
                             self.tokenizer.decode(outputs[0][0][len(input_ids[0]) :])
                         )
-                        # outputs.scores: (num_token, 1, vocab_size)
-                        top_output_logprobs.append(
-                            [
-                                get_top_logprobs(logits[0], NUM_TOP_LOGPROBS).tolist()
-                                for logits in outputs.scores
-                            ]
-                        )
-                        del outputs
+                        if not self.output_str_only:
+                            # outputs.scores: (num_token, 1, vocab_size)
+                            top_output_logprobs.append(
+                                [
+                                    get_top_logprobs(
+                                        logits[0], NUM_TOP_LOGPROBS
+                                    ).tolist()
+                                    for logits in outputs.scores
+                                ]
+                            )
+                            del outputs
 
-                        input_logits = self.model.forward(input_ids).logits[0]
-                        top_input_logprobs.append(
-                            get_top_logprobs(input_logits, NUM_TOP_LOGPROBS).tolist()
-                        )
-                        del input_logits
+                            input_logits = self.model.forward(input_ids).logits[0]
+                            top_input_logprobs.append(
+                                get_top_logprobs(
+                                    input_logits, NUM_TOP_LOGPROBS
+                                ).tolist()
+                            )
+                            del input_logits
 
                     out_queue.put(
                         ModelOutput(
@@ -175,6 +182,7 @@ class HFRunner:
                     )
 
                 else:
+                    assert not self.output_str_only
                     logits = self.model.encode(prompts).tolist()
                     out_queue.put(ModelOutput(embed_logits=logits))
 
@@ -208,6 +216,9 @@ class SRTRunner:
         tp_size=1,
         port=DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
         lora_paths=None,
+        max_loras_per_batch=4,
+        disable_cuda_graph=False,
+        disable_radix_cache=False,
     ):
         self.is_generation = is_generation
         self.runtime = Runtime(
@@ -219,7 +230,9 @@ class SRTRunner:
             trust_remote_code=False,
             is_embedding=not self.is_generation,
             lora_paths=lora_paths,
-            disable_cuda_graph=True,
+            max_loras_per_batch=max_loras_per_batch,
+            disable_cuda_graph=disable_cuda_graph,
+            disable_radix_cache=disable_radix_cache,
         )
 
     def forward(
@@ -270,6 +283,40 @@ class SRTRunner:
                 output_strs=output_strs,
                 top_input_logprobs=top_input_logprobs,
                 top_output_logprobs=top_output_logprobs,
+            )
+        else:
+            response = self.runtime.encode(prompts)
+            response = json.loads(response)
+            logits = [x["embedding"] for x in response]
+            return ModelOutput(embed_logits=logits)
+
+    def batch_forward(
+        self,
+        prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
+        max_new_tokens=8,
+        lora_paths=None,
+    ):
+        """
+        testing serving by sending all prompts once
+        only return output strings and no logprobs
+        """
+        if self.is_generation:
+            # the return value contains logprobs from prefill
+            output_strs = []
+            sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
+            response = self.runtime.generate(
+                prompts,
+                lora_paths=lora_paths if lora_paths else None,
+                sampling_params=sampling_params,
+                return_logprob=True,
+                logprob_start_len=0,
+                top_logprobs_num=NUM_TOP_LOGPROBS,
+            )
+            response = json.loads(response)
+            output_strs = [r["text"] for r in response]
+
+            return ModelOutput(
+                output_strs=output_strs,
             )
         else:
             response = self.runtime.encode(prompts)
