@@ -30,7 +30,7 @@ This command launches a server using the gte-Qwen2-7B-instruct model on port 300
 
 Once the server is running, you can send test requests using curl.
 
-Note that for the `model` arguments, it is required but can be randomly set if you do not specify it with `served_model_name` when you launch the server.
+Note that for the `model` arguments, if you do not set `served_model_name` when you launch the server, it should be the same as the `model_path`. Otherwise, it’s the `served_model_name`.
 
 ### For Generative Models
 
