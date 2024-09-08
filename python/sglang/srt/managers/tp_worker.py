@@ -221,6 +221,7 @@ class ModelTpServer:
         )
         self.new_token_ratio = self.min_new_token_ratio
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
+        self.do_not_get_new_batch = False
 
     def exposed_step(self, recv_reqs: List):
         try:
@@ -230,6 +231,7 @@ class ModelTpServer:
                     recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
                 ):
                     self.handle_generate_request(recv_req)
+                    self.do_not_get_new_batch = False
                 elif isinstance(recv_req, FlushCacheReq):
                     self.flush_cache()
                 elif isinstance(recv_req, AbortReq):
@@ -253,7 +255,11 @@ class ModelTpServer:
 
     @torch.inference_mode()
     def forward_step(self):
-        new_batch = self.get_new_prefill_batch()
+        if self.do_not_get_new_batch and self.current_inflight_req is None:
+            new_batch = None
+        else:
+            new_batch = self.get_new_prefill_batch()
+        self.do_not_get_new_batch = False
 
         if new_batch is not None:
             # Run a new prefill batch
@@ -409,6 +415,8 @@ class ModelTpServer:
 
         adder = PrefillAdder(
             self.tree_cache,
+            self.running_batch,
+            self.new_token_ratio,
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
             self.max_prefill_tokens,
             self.chunked_prefill_size,
@@ -416,7 +424,7 @@ class ModelTpServer:
         )
 
         if self.running_batch is not None:
-            adder.remove_running_tokens(self.running_batch, self.new_token_ratio)
+            adder.remove_running_tokens(self.running_batch)
 
         has_inflight = self.current_inflight_req is not None
         if self.current_inflight_req is not None:
@@ -428,11 +436,12 @@ class ModelTpServer:
             )
 
         for req in self.waiting_queue:
+            if adder.no_remaining_tokens():
+                break
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
             res = adder.add_one_req(req)
             if (
                 not res
-                or adder.no_remaining_tokens()
                 or running_bs + len(adder.can_run_list) >= self.max_running_requests
             ):
                 break
@@ -700,6 +709,7 @@ class ModelTpServer:
         next_token_ids = next_token_ids.tolist()
 
         # Check finish condition
+        has_finished = False
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
@@ -712,6 +722,7 @@ class ModelTpServer:
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
+                has_finished = True
 
             if req.return_logprob:
                 req.output_token_logprobs.append(
@@ -719,6 +730,9 @@ class ModelTpServer:
                 )
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
+
+        if not has_finished:
+            self.do_not_get_new_batch = True
 
         self.handle_finished_requests(batch)
 
