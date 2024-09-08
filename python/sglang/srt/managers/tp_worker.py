@@ -231,6 +231,7 @@ class ModelTpServer:
                     recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
                 ):
                     self.handle_generate_request(recv_req)
+                    self.do_not_get_new_batch = False
                 elif isinstance(recv_req, FlushCacheReq):
                     self.flush_cache()
                 elif isinstance(recv_req, AbortReq):
@@ -254,12 +255,10 @@ class ModelTpServer:
 
     @torch.inference_mode()
     def forward_step(self):
-        if self.current_inflight_req is not None:
-            self.do_not_get_new_batch = False
-
-        new_batch = (
-            self.get_new_prefill_batch() if not self.do_not_get_new_batch else None
-        )
+        if self.do_not_get_new_batch and self.current_inflight_req is None:
+            new_batch = None
+        else:
+            new_batch = self.get_new_prefill_batch()
         self.do_not_get_new_batch = False
 
         if new_batch is not None:
