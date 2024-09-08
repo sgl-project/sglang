@@ -50,6 +50,7 @@ Documentation
 
    backend_overview.md
    quick_start.md
+   server_arguments.md
    supported_model.md
    add_new_model.md
 
