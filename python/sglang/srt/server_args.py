@@ -444,13 +444,13 @@ class ServerArgs:
         parser.add_argument(
             "--enable-torch-compile",
             action="store_true",
-            help="Optimize the model with torch.compile, experimental feature.",
+            help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
             "--torchao-config",
             type=str,
             default=ServerArgs.torchao_config,
-            help="Optimize the model with torchao, experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>",
+            help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo",
         )
         parser.add_argument(
             "--enable-p2p-check",

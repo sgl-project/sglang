@@ -21,16 +21,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-
-# TODO: move quantization code to some util file
-from torchao.quantization import (
-    float8_weight_only,
-    fpx_weight_only,
-    int4_weight_only,
-    int8_dynamic_activation_int8_weight,
-    int8_weight_only,
-    quantize_,
-)
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -52,31 +42,9 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.sampler import Sampler
+from sglang.srt.layers.torchao_utils import torchao_quantize_param_data
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
-
-
-def _quantize_param_data(param, torchao_config):
-    dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
-    dummy_linear.weight = param
-    if "int8wo" in torchao_config:
-        quantize_(dummy_linear, int8_weight_only())
-    elif "int8dq" in torchao_config:
-        quantize_(dummy_linear, int8_dynamic_activation_int8_weight())
-    elif "int4wo" in torchao_config:
-        group_size = int(torchao_config.split("-")[-1])
-        assert group_size in [
-            32,
-            64,
-            128,
-            256,
-        ], f"int4wo groupsize needs to be one of [32, 64, 128, 256] but got {group_size}"
-        quantize_(dummy_linear, int4_weight_only(group_size=group_size))
-    elif "fp8wo" in torchao_config:
-        # this requires newer hardware
-        # [rank0]: AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
-        quantize_(dummy_linear, float8_weight_only())
-    return dummy_linear.weight
 
 
 class LlamaMLP(nn.Module):
@@ -387,7 +355,6 @@ class LlamaForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -398,7 +365,9 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
                 if name.endswith("proj.weight") and param.ndim == 2:
-                    params_dict[name] = _quantize_param_data(param, self.torchao_config)
+                    params_dict[name] = torchao_quantize_param_data(
+                        param, self.torchao_config
+                    )
 
         # quantizing the loaded, stacked params, e.g. "...qkv_proj"
         stacked_params = set(entry[0] for entry in stacked_params_mapping)
@@ -406,7 +375,9 @@ class LlamaForCausalLM(nn.Module):
             for name in params_dict:
                 if param_suffix in name:
                     param = params_dict[name]
-                    params_dict[name] = _quantize_param_data(param, self.torchao_config)
+                    params_dict[name] = torchao_quantize_param_data(
+                        param, self.torchao_config
+                    )
 
         self.load_state_dict(params_dict, assign=True)
 
