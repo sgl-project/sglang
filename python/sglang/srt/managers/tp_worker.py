@@ -53,7 +53,6 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -521,9 +520,7 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
-                sample_output, logits_output = self.model_runner.forward(
-                    batch, ForwardMode.EXTEND
-                )
+                sample_output, logits_output = self.model_runner.forward(batch)
                 next_token_ids = batch.check_sample_results(sample_output)
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     next_token_ids
@@ -588,7 +585,7 @@ class ModelTpServer:
                     pt += req.extend_input_len
         else:
             assert batch.extend_num_tokens != 0
-            logits_output = self.model_runner.forward(batch, ForwardMode.EXTEND)
+            logits_output = self.model_runner.forward(batch)
             embeddings = logits_output.embeddings.tolist()
 
             # Check finish conditions
@@ -699,9 +696,7 @@ class ModelTpServer:
         batch.prepare_for_decode()
 
         # Forward and sample the next tokens
-        sample_output, logits_output = self.model_runner.forward(
-            batch, ForwardMode.DECODE
-        )
+        sample_output, logits_output = self.model_runner.forward(batch)
         next_token_ids = batch.check_sample_results(sample_output)
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
