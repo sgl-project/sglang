@@ -21,6 +21,16 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
+
+# TODO: move quantization code to some util file
+from torchao.quantization import (
+    float8_weight_only,
+    fpx_weight_only,
+    int4_weight_only,
+    int8_dynamic_activation_int8_weight,
+    int8_weight_only,
+    quantize_,
+)
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -42,18 +52,9 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.sampler import Sampler
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
-# TODO: move quantization code to some util file
-from torchao.quantization import (
-    quantize_,
-    int8_weight_only,
-    int8_dynamic_activation_int8_weight,
-    int4_weight_only,
-    fpx_weight_only,
-    float8_weight_only,
-)
 
 def _quantize_param_data(param, torchao_config):
     dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
@@ -63,8 +64,13 @@ def _quantize_param_data(param, torchao_config):
     elif "int8dq" in torchao_config:
         quantize_(dummy_linear, int8_dynamic_activation_int8_weight())
     elif "int4wo" in torchao_config:
-        group_size=int(torchao_config.split("-")[-1])
-        assert group_size in [32, 64, 128, 256], f"int4wo groupsize needs to be one of [32, 64, 128, 256] but got {group_size}"
+        group_size = int(torchao_config.split("-")[-1])
+        assert group_size in [
+            32,
+            64,
+            128,
+            256,
+        ], f"int4wo groupsize needs to be one of [32, 64, 128, 256] but got {group_size}"
         quantize_(dummy_linear, int4_weight_only(group_size=group_size))
     elif "fp8wo" in torchao_config:
         # this requires newer hardware
@@ -403,8 +409,6 @@ class LlamaForCausalLM(nn.Module):
                     params_dict[name] = _quantize_param_data(param, self.torchao_config)
 
         self.load_state_dict(params_dict, assign=True)
-
-
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):
