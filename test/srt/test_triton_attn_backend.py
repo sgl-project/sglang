@@ -32,12 +32,12 @@ class TestTritonAttnBackend(unittest.TestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=32,
+            num_examples=64,
             num_threads=32,
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.6
+        assert metrics["score"] >= 0.65
 
 
 if __name__ == "__main__":
