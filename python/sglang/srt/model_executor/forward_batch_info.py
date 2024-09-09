@@ -25,10 +25,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 

@@ -577,16 +577,18 @@ class ModelRunner:
         )
 
     def forward(
-        self, batch: ScheduleBatch, forward_mode: ForwardMode
+        self, batch: ScheduleBatch
     ) -> Tuple[SampleOutput, LogitsProcessorOutput]:
-        if self.is_multimodal_model and forward_mode == ForwardMode.EXTEND:
+        assert batch.forward_mode is not None
+
+        if self.is_multimodal_model and batch.forward_mode == ForwardMode.EXTEND:
             return self.forward_extend_multi_modal(batch)
-        elif forward_mode == ForwardMode.DECODE:
+        elif batch.forward_mode == ForwardMode.DECODE:
             return self.forward_decode(batch)
-        elif forward_mode == ForwardMode.EXTEND:
+        elif batch.forward_mode == ForwardMode.EXTEND:
             return self.forward_extend(batch)
         else:
-            raise ValueError(f"Invaid forward mode: {forward_mode}")
+            raise ValueError(f"Invaid forward mode: {batch.forward_mode}")
 
 
 @lru_cache()
