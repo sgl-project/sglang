@@ -106,3 +106,87 @@ All the arguments can be found in the [`server_args.py`](https://github.com/sgl-
 - **Default**: None
 - **Usage**: Can be either a single integer or a list of integers representing extra ports.
 - **Note**: If a single integer is provided, it will be converted to a list containing that integer. If None is provided, it will be treated as an empty list.
+
+## Memory Management
+
+# Server Configuration Documentation
+
+## Port Configuration
+
+### `host`: str
+- **Description**: The host address on which the server will run.
+- **Default**: "127.0.0.1"
+- **Usage**: Specifies the IP address or hostname for the server to bind to.
+- **Note**: Use host `0.0.0.0` to enable external access, allowing other clients from the same subnet to send requests to your server's IP address. Otherwise, the client and server should be on the same device and send requests only to the local host / 127.0.0.1.
+
+### `port`: int
+- **Description**: The primary port number on which the server will listen.
+- **Default**: 30000
+- **Usage**: Defines the main port for incoming connections to the server.
+
+### `additional_ports`: Optional[Union[List[int], int]]
+- **Description**: Additional port(s) that can be used by the server.
+- **Default**: None
+- **Usage**: Can be either a single integer or a list of integers representing extra ports.
+- **Note**: If a single integer is provided, it will be converted to a list containing that integer. If None is provided, it will be treated as an empty list.
+
+## Memory Management
+
+### `mem_fraction_static`: Optional[float]
+
+- **Description**: The fraction of memory used for static allocation, i.e., model weights, cached tokens, and running requests.
+- **Default**: None (automatically set based on tensor parallelism size)
+- **Usage**: Determines the proportion of GPU memory allocated for static elements.
+- **Note**: 
+  1. If not set, it's automatically determined based on the tensor parallelism size:
+     - 0.79 for tp_size >= 16
+     - 0.83 for tp_size >= 8
+     - 0.85 for tp_size >= 4
+     - 0.87 for tp_size >= 2
+     - 0.88 for tp_size < 2
+  2. SGLang does not preallocate a fixed-size memory pool as a cache. Instead, cached tokens and currently running requests share the same memory pool. The system dynamically allocates memory for cache and running requests. When enough waiting requests run, the system will evict all cached tokens in favor of a larger batch size. Thus, increasing the cache hit rate (the length of the shared prefix) would result in better latency and serving batch size.
+
+### `max_running_requests`: Optional[int]
+- **Description**: The maximum number of requests that can be processed simultaneously.
+- **Default**: None
+- **Usage**: Limits the number of concurrent requests the server can handle.
+
+### `max_num_reqs`: Optional[int]
+- **Description**: The maximum number of requests to serve in the memory pool.
+- **Default**: None
+- **Usage**: Sets an upper limit on the number of requests that can be held in memory.
+- **Note**: For models with large context lengths, you may need to decrease this value to avoid out-of-memory errors.
+
+### `max_total_tokens`: Optional[int]
+- **Description**: The maximum number of tokens allowed in the memory pool.
+- **Default**: None
+- **Usage**: Limits the total number of tokens across all requests in the memory pool.
+- **Note**: If not specified, it will be automatically calculated based on the memory usage fraction. This option is typically used for development and debugging purposes.
+
+## Prefill and Scheduling
+
+### `chunked_prefill_size`: int
+- **Description**: The maximum number of tokens in a chunk for chunked prefill.
+- **Default**: 8192
+- **Usage**: Determines the size of chunks when using chunked prefill for long contexts.
+- **Note**:
+  1. Setting this to -1 or a value <= 0 disables chunked prefill.
+  2. The chunk size should be a moderate value since short chunks allow to piggyback more decode requests but decrease the GPU utilization for the prefill requests. You can check the [original paper](https://arxiv.org/abs/2308.16369) on chunked prefill for more insights.
+
+### `max_prefill_tokens`: int
+- **Description**: The maximum number of tokens in a prefill batch.
+- **Default**: 16384
+- **Usage**: Sets an upper limit on the number of tokens processed in a single prefill operation.
+- **Note**: The actual limit will be the maximum of this value and the model's maximum context length.
+
+### `schedule_policy`: str
+- **Description**: The scheduling policy for request processing.
+- **Default**: "lpm"
+- **Options**: "lpm", "random", "fcfs", "dfs-weight"
+- **Usage**: Determines how requests are prioritized and scheduled for processing. "lpm" stands for "longest-shared-prefix-first", "fcfs" stands for "first-come-first-serve", and "dfs-weight" stands for "deep-first-search".
+
+### `schedule_conservativeness`: float
+- **Description**: How conservative the scheduling policy should be.
+- **Default**: 1.0
+- **Usage**: A larger value means more conservative scheduling.
+- **Note**: Use a larger value if you see requests being retracted frequently.
