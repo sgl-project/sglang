@@ -364,22 +364,24 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-                if name.endswith("proj.weight") and param.ndim == 2:
-                    params_dict[name] = torchao_quantize_param_data(
-                        param, self.torchao_config
-                    )
+                if self.torchao_config:
+                    if name.endswith("proj.weight") and param.ndim == 2:
+                        params_dict[name] = torchao_quantize_param_data(
+                            param, self.torchao_config
+                        )
 
-        # quantizing the loaded, stacked params, e.g. "...qkv_proj"
-        stacked_params = set(entry[0] for entry in stacked_params_mapping)
-        for param_suffix in stacked_params:
-            for name in params_dict:
-                if param_suffix in name:
-                    param = params_dict[name]
-                    params_dict[name] = torchao_quantize_param_data(
-                        param, self.torchao_config
-                    )
+        if self.torchao_config:
+            # quantizing the loaded, stacked params, e.g. "...qkv_proj"
+            stacked_params = set(entry[0] for entry in stacked_params_mapping)
+            for param_suffix in stacked_params:
+                for name in params_dict:
+                    if param_suffix in name:
+                        param = params_dict[name]
+                        params_dict[name] = torchao_quantize_param_data(
+                            param, self.torchao_config
+                        )
 
-        self.load_state_dict(params_dict, assign=True)
+            self.load_state_dict(params_dict, assign=True)
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):
