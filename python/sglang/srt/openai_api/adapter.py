@@ -832,6 +832,7 @@ def v1_chat_generate_request(
     return_logprobs = []
     logprob_start_lens = []
     top_logprobs_nums = []
+    modalities_list = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -864,10 +865,12 @@ def v1_chat_generate_request(
                 )
                 stop = request.stop
                 image_data = None
+                modalities = []
             else:
                 conv = generate_chat_conv(request, chat_template_name)
                 prompt = conv.get_prompt()
                 image_data = conv.image_data
+                modalities = conv.modalities
                 stop = conv.stop_str or []
                 if request.stop:
                     if isinstance(request.stop, str):
@@ -880,6 +883,7 @@ def v1_chat_generate_request(
             prompt_ids = request.messages
             stop = request.stop
             image_data = None
+            modalities = []
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
@@ -901,6 +905,7 @@ def v1_chat_generate_request(
             }
         )
         image_data_list.append(image_data)
+        modalities_list.extend(modalities)
     if len(all_requests) == 1:
         input_ids = input_ids[0]
         if isinstance(input_ids, str):
@@ -912,6 +917,7 @@ def v1_chat_generate_request(
         return_logprobs = return_logprobs[0]
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
+        modalities_list = modalities_list[:1]
     else:
         if isinstance(input_ids[0], str):
             prompt_kwargs = {"text": input_ids}
@@ -928,6 +934,7 @@ def v1_chat_generate_request(
         stream=all_requests[0].stream,
         return_text_in_logprobs=True,
         rid=request_ids,
+        modalities=modalities_list,
     )
     if len(all_requests) == 1:
         return adapted_request, all_requests[0]

@@ -358,6 +358,8 @@ class ModelTpServer:
                     req.pixel_values,
                     req.image_sizes,
                 )
+                # Only when pixel values is not None we have modalities
+                req.modalities = recv_req.modalites
             req.return_logprob = recv_req.return_logprob
             req.logprob_start_len = recv_req.logprob_start_len
             req.top_logprobs_num = recv_req.top_logprobs_num
