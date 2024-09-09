@@ -22,7 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 srt = ["aiohttp", "decord", "fastapi", "hf_transfer", "huggingface_hub", "interegular",
        "packaging", "pillow", "psutil", "pydantic", "python-multipart",
-       "torch", "uvicorn", "uvloop", "zmq",
+       "torch", "torchao", "uvicorn", "uvloop", "zmq",
        "vllm==0.5.5", "outlines>=0.0.44"]
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
