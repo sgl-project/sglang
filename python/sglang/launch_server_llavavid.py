@@ -1,14 +1,11 @@
 """Launch the inference server for Llava-video model."""
 
-import argparse
+import sys
 
-from sglang.srt.server import ServerArgs, launch_server
+from sglang.srt.server import launch_server, prepare_server_args
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
-    args = parser.parse_args()
-    server_args = ServerArgs.from_cli_args(args)
+    server_args = prepare_server_args(sys.argv[1:])
 
     model_override_args = {}
     model_override_args["mm_spatial_pool_stride"] = 2
@@ -20,7 +17,7 @@ if __name__ == "__main__":
         model_override_args["max_sequence_length"] = 4096 * 2
         model_override_args["tokenizer_model_max_length"] = 4096 * 2
         model_override_args["model_max_length"] = 4096 * 2
-    if "34b" in args.model_path.lower():
+    if "34b" in server_args.model_path.lower():
         model_override_args["image_token_index"] = 64002
 
     launch_server(server_args, model_override_args, None)
