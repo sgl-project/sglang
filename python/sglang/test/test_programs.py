@@ -7,7 +7,7 @@ import time
 import numpy as np
 
 import sglang as sgl
-from sglang.utils import fetch_and_cache_jsonl
+from sglang.utils import download_and_cache_file, read_jsonl
 
 
 def test_few_shot_qa():
@@ -456,10 +456,6 @@ def test_chat_completion_speculative():
 def test_hellaswag_select():
     """Benchmark the accuracy of sgl.select on the HellaSwag dataset."""
 
-    url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
-    lines = fetch_and_cache_jsonl(url)
-
-    # Construct prompts
     def get_one_example(lines, i, include_answer):
         ret = lines[i]["activity_label"] + ": " + lines[i]["ctx"] + " "
         if include_answer:
@@ -472,6 +468,12 @@ def test_hellaswag_select():
             ret += get_one_example(lines, i, True) + "\n\n"
         return ret
 
+    # Read data
+    url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
+    filename = download_and_cache_file(url)
+    lines = list(read_jsonl(filename))
+
+    # Construct prompts
     num_questions = 200
     num_shots = 20
     few_shot_examples = get_few_shot_examples(lines, num_shots)
