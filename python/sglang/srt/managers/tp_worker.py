@@ -66,6 +66,7 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+# Crash on warning if we are running CI tests
 crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
 
 
@@ -80,7 +81,7 @@ class ModelTpServer:
     ):
         suppress_other_loggers()
 
-        # Copy arguments
+        # Parse arguments
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
@@ -95,7 +96,6 @@ class ModelTpServer:
             context_length=server_args.context_length,
             model_override_args=model_override_args,
         )
-
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -136,7 +136,7 @@ class ModelTpServer:
             self.max_total_num_tokens - 1,
         )
 
-        # Sync random seed
+        # Sync random seed across TP workers
         server_args.random_seed = broadcast_recv_input(
             [server_args.random_seed],
             self.tp_rank,
@@ -144,7 +144,7 @@ class ModelTpServer:
         )[0]
         set_random_seed(server_args.random_seed)
 
-        # Print info
+        # Print debug info
         logger.info(
             f"max_total_num_tokens={self.max_total_num_tokens}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
@@ -181,7 +181,7 @@ class ModelTpServer:
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
 
-        # Chunked prefill
+        # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
         self.current_inflight_req = None
         self.is_mixed_chunk = (
@@ -197,16 +197,6 @@ class ModelTpServer:
                     "trust_remote_code": server_args.trust_remote_code,
                 },
                 skip_tokenizer_init=server_args.skip_tokenizer_init,
-                json_schema_mode=False,
-            )
-            self.json_fsm_cache = FSMCache(
-                server_args.tokenizer_path,
-                {
-                    "tokenizer_mode": server_args.tokenizer_mode,
-                    "trust_remote_code": server_args.trust_remote_code,
-                },
-                skip_tokenizer_init=server_args.skip_tokenizer_init,
-                json_schema_mode=True,
             )
         self.jump_forward_cache = JumpForwardCache()
 
@@ -227,10 +217,11 @@ class ModelTpServer:
         try:
             # Recv requests
             for recv_req in recv_reqs:
-                if isinstance(
-                    recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-                ):
+                if isinstance(recv_req, TokenizedGenerateReqInput):
                     self.handle_generate_request(recv_req)
+                    self.do_not_get_new_batch = False
+                elif isinstance(recv_req, TokenizedEmbeddingReqInput):
+                    self.handle_embedding_request(recv_req)
                     self.do_not_get_new_batch = False
                 elif isinstance(recv_req, FlushCacheReq):
                     self.flush_cache()
@@ -331,57 +322,56 @@ class ModelTpServer:
 
     def handle_generate_request(
         self,
-        recv_req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+        recv_req: TokenizedGenerateReqInput,
     ):
         req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.tokenizer = self.tokenizer
         req.sampling_params = recv_req.sampling_params
-        if self.model_runner.is_generation:
-            req.pixel_values = recv_req.pixel_values
-            if req.pixel_values is not None:
-                # Use image hash as fake token_ids, which is then used
-                # for prefix matching
-                image_hash = hash(tuple(recv_req.image_hashes))
-                req.pad_value = [
-                    (image_hash) % self.model_config.vocab_size,
-                    (image_hash >> 16) % self.model_config.vocab_size,
-                    (image_hash >> 32) % self.model_config.vocab_size,
-                    (image_hash >> 64) % self.model_config.vocab_size,
-                ]
-                req.image_sizes = recv_req.image_sizes
-                (
-                    req.origin_input_ids,
-                    req.image_offsets,
-                ) = self.model_runner.model.pad_input_ids(
-                    req.origin_input_ids_unpadded,
-                    req.pad_value,
-                    req.pixel_values,
-                    req.image_sizes,
-                )
-                # Only when pixel values is not None we have modalities
-                req.modalities = recv_req.modalites
-            req.return_logprob = recv_req.return_logprob
-            req.logprob_start_len = recv_req.logprob_start_len
-            req.top_logprobs_num = recv_req.top_logprobs_num
-            req.stream = recv_req.stream
+        req.pixel_values = recv_req.pixel_values
+        if req.pixel_values is not None:
+            # Use image hash as fake token_ids, which is then used
+            # for prefix matching
+            image_hash = hash(tuple(recv_req.image_hashes))
+            req.pad_value = [
+                (image_hash) % self.model_config.vocab_size,
+                (image_hash >> 16) % self.model_config.vocab_size,
+                (image_hash >> 32) % self.model_config.vocab_size,
+                (image_hash >> 64) % self.model_config.vocab_size,
+            ]
+            req.image_sizes = recv_req.image_sizes
+            (
+                req.origin_input_ids,
+                req.image_offsets,
+            ) = self.model_runner.model.pad_input_ids(
+                req.origin_input_ids_unpadded,
+                req.pad_value,
+                req.pixel_values,
+                req.image_sizes,
+            )
+            # Only when pixel values is not None we have modalities
+            req.modalities = recv_req.modalites
+        req.return_logprob = recv_req.return_logprob
+        req.logprob_start_len = recv_req.logprob_start_len
+        req.top_logprobs_num = recv_req.top_logprobs_num
+        req.stream = recv_req.stream
 
-            # Init regex fsm fron json
+        # Init regex FSM
+        if (
+            req.sampling_params.json_schema is not None
+            or req.sampling_params.regex is not None
+        ):
             if req.sampling_params.json_schema is not None:
-                req.regex_fsm, computed_regex_string = self.json_fsm_cache.query(
-                    req.sampling_params.json_schema
+                req.regex_fsm, computed_regex_string = self.regex_fsm_cache.query(
+                    ("json", req.sampling_params.json_schema)
                 )
-                if not self.disable_regex_jump_forward:
-                    req.jump_forward_map = self.jump_forward_cache.query(
-                        computed_regex_string
-                    )
-
-            # Init regex fsm
             elif req.sampling_params.regex is not None:
-                req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)
-                if not self.disable_regex_jump_forward:
-                    req.jump_forward_map = self.jump_forward_cache.query(
-                        req.sampling_params.regex
-                    )
+                req.regex_fsm, computed_regex_string = self.regex_fsm_cache.query(
+                    ("regex", req.sampling_params.regex)
+                )
+            if not self.disable_regex_jump_forward:
+                req.jump_forward_map = self.jump_forward_cache.query(
+                    computed_regex_string
+                )
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) >= self.max_req_input_len:
@@ -390,16 +380,32 @@ class ModelTpServer:
                 "the max context length. Truncated!!!"
             )
             req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
+        req.sampling_params.max_new_tokens = min(
+            (
+                req.sampling_params.max_new_tokens
+                if req.sampling_params.max_new_tokens is not None
+                else 1 << 30
+            ),
+            self.max_req_input_len - 1 - len(req.origin_input_ids),
+        )
 
-        if self.model_runner.is_generation:
-            req.sampling_params.max_new_tokens = min(
-                (
-                    req.sampling_params.max_new_tokens
-                    if req.sampling_params.max_new_tokens is not None
-                    else 1 << 30
-                ),
-                self.max_req_input_len - 1 - len(req.origin_input_ids),
+        self.waiting_queue.append(req)
+
+    def handle_embedding_request(
+        self,
+        recv_req: TokenizedEmbeddingReqInput,
+    ):
+        req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
+        req.tokenizer = self.tokenizer
+        req.sampling_params = recv_req.sampling_params
+
+        # Truncate prompts that are too long
+        if len(req.origin_input_ids) >= self.max_req_input_len:
+            logger.warn(
+                "Request length is longer than the KV cache pool size or "
+                "the max context length. Truncated!!!"
             )
+            req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
 
         self.waiting_queue.append(req)
 
