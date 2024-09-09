@@ -116,7 +116,7 @@ class LlavaVidForCausalLM(nn.Module):
         image_sizes: Optional[List[List[int]]] = None,
         image_offsets: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        if input_metadata.forward_mode == ForwardMode.EXTEND:
+        if input_metadata.forward_mode.is_extend():
             bs = input_metadata.batch_size
 
             # Embed text inputs
@@ -199,7 +199,7 @@ class LlavaVidForCausalLM(nn.Module):
             return self.language_model(
                 input_ids, positions, input_metadata, input_embeds=input_embeds
             )
-        elif input_metadata.forward_mode == ForwardMode.DECODE:
+        elif input_metadata.forward_mode.is_decode():
             return self.language_model(input_ids, positions, input_metadata)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

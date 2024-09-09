@@ -103,7 +103,7 @@ class LogitsProcessor(nn.Module):
 
     @staticmethod
     def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
-        if logits_metadata.forward_mode == ForwardMode.DECODE:
+        if logits_metadata.forward_mode.is_decode():
             output_top_logprobs = []
             max_k = max(logits_metadata.top_logprobs_nums)
             ret = all_logprobs.topk(max_k, dim=1)
@@ -163,7 +163,7 @@ class LogitsProcessor(nn.Module):
         assert isinstance(logits_metadata, LogitsMetadata)
 
         # Get the last hidden states and last logits for the next token prediction
-        if logits_metadata.forward_mode == ForwardMode.DECODE:
+        if logits_metadata.forward_mode.is_decode():
             last_index = None
             last_hidden = hidden_states
         else:
@@ -195,7 +195,7 @@ class LogitsProcessor(nn.Module):
             )
         else:
             # When logprob is requested, compute the logits for all tokens.
-            if logits_metadata.forward_mode == ForwardMode.DECODE:
+            if logits_metadata.forward_mode.is_decode():
                 last_logprobs = torch.nn.functional.log_softmax(last_logits, dim=-1)
 
                 # Get the logprob of top-k tokens
