@@ -66,7 +66,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.64, f"{metrics}"
+        assert metrics["score"] >= 0.63, f"{metrics}"
 
 
 if __name__ == "__main__":

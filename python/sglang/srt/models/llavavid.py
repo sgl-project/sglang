@@ -27,7 +27,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
-from sglang.srt.models.llama2 import LlamaForCausalLM
+from sglang.srt.models.llama import LlamaForCausalLM
 
 
 class LlavaVidForCausalLM(nn.Module):
@@ -239,12 +239,12 @@ class LlavaVidForCausalLM(nn.Module):
             "model.vision_resampler.mm_projector.0": "multi_modal_projector.linear_1",
             "model.vision_resampler.mm_projector.2": "multi_modal_projector.linear_2",
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
+            "model.image_newline": "language_model.model.image_newline",
         }
         params_dict = dict(self.named_parameters())
-        weights = list(weights)
         for name, loaded_weight in weights:
             # FIXME: why projector weights read two times?
-            if "projector" in name or "vision_tower" in name:
+            if "projector" in name or "vision_tower" in name or "image_newline" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
@@ -255,9 +255,8 @@ class LlavaVidForCausalLM(nn.Module):
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-        # load language model
-        self.language_model.load_weights(weights)
+            else:
+                self.language_model.load_weights([(name, loaded_weight)])
 
     @property
     def num_patches_per_side(self):
