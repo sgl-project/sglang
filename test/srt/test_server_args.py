@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from sglang.srt.server_args import prepare_server_args
@@ -15,7 +16,7 @@ class TestPrepareServerArgs(unittest.TestCase):
         )
         self.assertEqual(server_args.model_path, "model_path")
         self.assertEqual(
-            server_args.json_model_override_args,
+            json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "type": "linear"}},
         )
 
