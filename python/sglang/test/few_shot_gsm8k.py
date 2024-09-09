@@ -7,7 +7,6 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 
 import argparse
 import ast
-import json
 import re
 import time
 
