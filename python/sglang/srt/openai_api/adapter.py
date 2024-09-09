@@ -895,6 +895,7 @@ def v1_chat_generate_request(
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs)
+
         sampling_params = {
             "temperature": request.temperature,
             "max_new_tokens": request.max_tokens,
@@ -912,8 +913,8 @@ def v1_chat_generate_request(
             sampling_params["json_schema"] = convert_json_schema_to_str(
                 request.response_format.json_schema.schema_
             )
-
         sampling_params_list.append(sampling_params)
+
         image_data_list.append(image_data)
         modalities_list.extend(modalities)
     if len(all_requests) == 1:
