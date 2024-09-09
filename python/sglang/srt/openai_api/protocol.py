@@ -213,6 +213,7 @@ class ChatCompletionMessageContentImageURL(BaseModel):
 class ChatCompletionMessageContentImagePart(BaseModel):
     type: Literal["image_url"]
     image_url: ChatCompletionMessageContentImageURL
+    modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
 ChatCompletionMessageContentPart = Union[

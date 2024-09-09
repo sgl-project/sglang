@@ -18,6 +18,7 @@ limitations under the License.
 import gc
 import importlib
 import importlib.resources
+import json
 import logging
 import pkgutil
 from functools import lru_cache
@@ -96,6 +97,7 @@ class ModelRunner:
                 "disable_flashinfer_sampling": server_args.disable_flashinfer_sampling,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "enable_mla": server_args.enable_mla,
+                "torchao_config": server_args.torchao_config,
             }
         )
 

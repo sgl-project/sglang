@@ -48,6 +48,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    Lk: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -72,7 +73,11 @@ def _fwd_kernel(
     off_k = offs_n[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None]
     off_v = offs_n[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :]
 
-    q = tl.load(Q + off_q, mask=offs_m[:, None] < cur_batch_seq_len, other=0.0)
+    mask_d = offs_d < Lk
+
+    q = tl.load(
+        Q + off_q, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d), other=0.0
+    )
 
     k_ptrs = K + off_k
     v_ptrs = V + off_v
@@ -89,7 +94,7 @@ def _fwd_kernel(
         # -- compute qk ----
         k = tl.load(
             k_ptrs + (cur_batch_in_all_start_index + start_n) * stride_kbs,
-            mask=(start_n + offs_n[None, :]) < cur_batch_seq_len,
+            mask=((start_n + offs_n[None, :]) < cur_batch_seq_len) & (mask_d[:, None]),
             other=0.0,
         )
         # mask = tl.load(mask_ptrs + start_n, mask=start_n + offs_n < cur_batch_end_loc, other=0.0)
@@ -118,7 +123,7 @@ def _fwd_kernel(
         # update acc
         v = tl.load(
             v_ptrs + (cur_batch_in_all_start_index + start_n) * stride_vbs,
-            mask=(start_n + offs_n[:, None]) < cur_batch_seq_len,
+            mask=((start_n + offs_n[:, None]) < cur_batch_seq_len) & (mask_d[None, :]),
             other=0.0,
         )
 
@@ -134,7 +139,9 @@ def _fwd_kernel(
         + offs_d[None, :]
     )
     out_ptrs = Out + off_o
-    tl.store(out_ptrs, acc, mask=offs_m[:, None] < cur_batch_seq_len)
+    tl.store(
+        out_ptrs, acc, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :])
+    )
 
 
 def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
@@ -145,7 +152,7 @@ def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
 
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
-    assert Lk in {16, 32, 64, 128, 256}
+    assert Lk in {16, 32, 64, 96, 128, 256}
 
     sm_scale = 1.0 / (Lq**0.5)
     batch, head = b_seq_len.shape[0], q.shape[1]
@@ -172,8 +179,9 @@ def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
         o.stride(1),
         kv_group_num=kv_group_num,
         BLOCK_M=BLOCK,
-        BLOCK_DMODEL=Lk,
+        BLOCK_DMODEL=triton.next_power_of_2(Lk),
         BLOCK_N=BLOCK,
         num_warps=num_warps,
         num_stages=1,
+        Lk=Lk,
     )

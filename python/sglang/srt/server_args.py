@@ -17,6 +17,7 @@ limitations under the License.
 
 import argparse
 import dataclasses
+import json
 import logging
 import random
 from typing import List, Optional, Union
@@ -75,6 +76,14 @@ class ServerArgs:
     dp_size: int = 1
     load_balance_method: str = "round_robin"
 
+    # Distributed args
+    nccl_init_addr: Optional[str] = None
+    nnodes: int = 1
+    node_rank: Optional[int] = None
+
+    # Model override args in JSON
+    json_model_override_args: str = "{}"
+
     # Optimization/debug options
     disable_flashinfer: bool = False
     disable_flashinfer_sampling: bool = False
@@ -86,14 +95,10 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
+    torchao_config: str = ""
     enable_p2p_check: bool = False
     enable_mla: bool = False
     triton_attention_reduce_in_fp32: bool = False
-
-    # Distributed args
-    nccl_init_addr: Optional[str] = None
-    nnodes: int = 1
-    node_rank: Optional[int] = None
 
     def __post_init__(self):
         if self.tokenizer_path is None:
@@ -381,6 +386,14 @@ class ServerArgs:
         )
         parser.add_argument("--node-rank", type=int, help="The node rank.")
 
+        # Model override args
+        parser.add_argument(
+            "--json-model-override-args",
+            type=str,
+            help="A dictionary in JSON string format used to override default model configurations.",
+            default=ServerArgs.json_model_override_args,
+        )
+
         # Optimization/debug options
         parser.add_argument(
             "--disable-flashinfer",
@@ -431,7 +444,13 @@ class ServerArgs:
         parser.add_argument(
             "--enable-torch-compile",
             action="store_true",
-            help="Optimize the model with torch.compile, experimental feature.",
+            help="Optimize the model with torch.compile. Experimental feature.",
+        )
+        parser.add_argument(
+            "--torchao-config",
+            type=str,
+            default=ServerArgs.torchao_config,
+            help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo",
         )
         parser.add_argument(
             "--enable-p2p-check",
@@ -480,6 +499,24 @@ class ServerArgs:
         if "gemma-2" in self.model_path.lower():
             logger.info("When using sliding window in gemma-2, turn on flashinfer.")
             self.disable_flashinfer = False
+
+
+def prepare_server_args(argv: List[str]) -> ServerArgs:
+    """
+    Prepare the server arguments from the command line arguments.
+
+    Args:
+        args: The command line arguments. Typically, it should be `sys.argv[1:]`
+            to ensure compatibility with `parse_args` when no arguments are passed.
+
+    Returns:
+        The server arguments.
+    """
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    raw_args = parser.parse_args(argv)
+    server_args = ServerArgs.from_cli_args(raw_args)
+    return server_args
 
 
 @dataclasses.dataclass
