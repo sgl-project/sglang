@@ -1,16 +1,19 @@
+"""
+Run few-shot GSM-8K evaluation.
+
+Usage:
+python3 -m sglang.test.few_shot_gsm8k --num-questions 200
+"""
+
 import argparse
 import ast
-import json
 import re
 import time
 
 import numpy as np
 
 from sglang.api import set_default_backend
-from sglang.test.test_utils import (
-    add_common_sglang_args_and_parse,
-    select_sglang_backend,
-)
+from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
 
 INVALID = -9999999
@@ -43,7 +46,7 @@ def get_answer_value(answer_str):
 
 def main(args):
     # Select backend
-    set_default_backend(select_sglang_backend(args))
+    set_default_backend(RuntimeEndpoint(f"{args.host}:{args.port}"))
 
     # Read data
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
@@ -114,22 +117,7 @@ def main(args):
     print(f"Output throughput: {output_throughput:.3f} token/s")
 
     # Dump results
-    dump_state_text(f"tmp_output_{args.backend}.txt", states)
-
-    with open(args.result_file, "a") as fout:
-        value = {
-            "task": "gsm8k",
-            "backend": args.backend,
-            "num_gpus": 1,
-            "latency": round(latency, 3),
-            "accuracy": round(acc, 3),
-            "num_requests": args.num_questions,
-            "other": {
-                "num_questions": args.num_questions,
-                "parallel": args.parallel,
-            },
-        }
-        fout.write(json.dumps(value) + "\n")
+    dump_state_text("tmp_output_gsm8k.txt", states)
 
 
 if __name__ == "__main__":
@@ -137,5 +125,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--num-questions", type=int, default=200)
-    args = add_common_sglang_args_and_parse(parser)
+    parser.add_argument("--parallel", type=int, default=128)
+    parser.add_argument("--host", type=str, default="http://127.0.0.1")
+    parser.add_argument("--port", type=int, default=30000)
+    args = parser.parse_args()
     main(args)

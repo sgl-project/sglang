@@ -1,8 +1,3 @@
-## Download data
-```
-wget https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl
-```
-
 ## Run benchmark
 
 ### Benchmark sglang

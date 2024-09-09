@@ -7,6 +7,7 @@ python3 srt_example_llava_v.py
 
 import argparse
 import csv
+import json
 import os
 import time
 
@@ -223,7 +224,7 @@ if __name__ == "__main__":
         tokenizer_path=tokenizer_path,
         port=cur_port,
         additional_ports=[cur_port + 1, cur_port + 2, cur_port + 3, cur_port + 4],
-        model_override_args=model_override_args,
+        json_model_override_args=json.dumps(model_override_args),
         tp_size=1,
     )
     sgl.set_default_backend(runtime)
