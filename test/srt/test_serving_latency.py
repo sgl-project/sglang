@@ -12,7 +12,7 @@ class TestServingLatency(unittest.TestCase):
             "python3",
             "-m",
             "sglang.bench_latency",
-            "--model",
+            "--model-path",
             DEFAULT_MODEL_NAME_FOR_TEST,
             "--batch-size",
             "1",

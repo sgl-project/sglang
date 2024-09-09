@@ -12,7 +12,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import requests
@@ -38,13 +38,11 @@ def is_same_type(values: list):
 
 def read_jsonl(filename: str):
     """Read a JSONL file."""
-    rets = []
     with open(filename) as fin:
         for line in fin:
             if line.startswith("#"):
                 continue
-            rets.append(json.loads(line))
-    return rets
+            yield json.loads(line)
 
 
 def dump_state_text(filename: str, states: list, mode: str = "w"):
@@ -264,38 +262,35 @@ class LazyImport:
         return module(*args, **kwargs)
 
 
-def fetch_and_cache_jsonl(url, cache_file="cached_data.jsonl"):
-    """Read and cache a jsonl file from a url."""
+def download_and_cache_file(url: str, filename: Optional[str] = None):
+    """Read and cache a file from a url."""
+    if filename is None:
+        filename = os.path.join("/tmp", url.split("/")[-1])
 
     # Check if the cache file already exists
-    if os.path.exists(cache_file):
-        print("Loading data from cache...")
-        with open(cache_file, "r") as f:
-            data = [json.loads(line) for line in f]
-    else:
-        print("Downloading data from URL...")
-        # Stream the response to show the progress bar
-        response = requests.get(url, stream=True)
-        response.raise_for_status()  # Check for request errors
+    if os.path.exists(filename):
+        return filename
 
-        # Total size of the file in bytes
-        total_size = int(response.headers.get("content-length", 0))
-        chunk_size = 1024  # Download in chunks of 1KB
+    print(f"Downloading from {url} to {filename}")
 
-        # Use tqdm to display the progress bar
-        with open(cache_file, "wb") as f, tqdm(
-            desc=cache_file,
-            total=total_size,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as bar:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                f.write(chunk)
-                bar.update(len(chunk))
+    # Stream the response to show the progress bar
+    response = requests.get(url, stream=True)
+    response.raise_for_status()  # Check for request errors
 
-        # Convert the data to a list of dictionaries
-        with open(cache_file, "r") as f:
-            data = [json.loads(line) for line in f]
+    # Total size of the file in bytes
+    total_size = int(response.headers.get("content-length", 0))
+    chunk_size = 1024  # Download in chunks of 1KB
 
-    return data
+    # Use tqdm to display the progress bar
+    with open(filename, "wb") as f, tqdm(
+        desc=filename,
+        total=total_size,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as bar:
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            f.write(chunk)
+            bar.update(len(chunk))
+
+    return filename

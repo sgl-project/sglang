@@ -78,6 +78,7 @@ class InputMetadata:
     pixel_values: List[torch.Tensor] = None
     image_sizes: List[List[List[int]]] = None
     image_offsets: List[List[int]] = None
+    modalities: List[List[str]] = None
 
     # Trition attention backend
     triton_max_seq_len: int = 0
@@ -96,6 +97,7 @@ class InputMetadata:
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_sizes for r in reqs]
         self.image_offsets = [r.image_offsets for r in reqs]
+        self.modalities = [r.modalities for r in reqs]
 
     def compute_positions(self, batch: ScheduleBatch):
         position_ids_offsets = batch.position_ids_offsets

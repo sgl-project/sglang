@@ -19,6 +19,7 @@ suites = {
         "test_triton_attn_backend.py",
         "test_update_weights.py",
         "test_vision_openai_server.py",
+        "test_server_args.py",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True
