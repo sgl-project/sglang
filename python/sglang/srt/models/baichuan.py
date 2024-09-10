@@ -19,17 +19,16 @@
 # limitations under the License.
 """Inference-only BaiChuan model compatible with HuggingFace weights."""
 import math
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.config import CacheConfig, LoRAConfig
+from vllm.config import CacheConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -42,8 +41,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsLoRA
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -312,7 +309,7 @@ class BaiChuanModel(nn.Module):
         return hidden_states
 
 
-class BaiChuanBaseForCausalLM(nn.Module, SupportsLoRA):
+class BaiChuanBaseForCausalLM(nn.Module):
     packed_modules_mapping = {
         "W_pack": ["W_pack"],
         "gate_up_proj": [
@@ -336,12 +333,10 @@ class BaiChuanBaseForCausalLM(nn.Module, SupportsLoRA):
         position_embedding: str,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        lora_config: Optional[LoRAConfig] = None,
     ):
         super().__init__()
 
         self.config = config
-        self.lora_config = lora_config
 
         self.quant_config = quant_config
         self.model = BaiChuanModel(config, position_embedding, quant_config)
@@ -366,14 +361,6 @@ class BaiChuanBaseForCausalLM(nn.Module, SupportsLoRA):
         sample_output = self.sampler(logits_output, input_metadata.sampling_info)
 
         return sample_output, logits_output
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
-        return logits
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -424,12 +411,11 @@ class BaichuanForCausalLM(BaiChuanBaseForCausalLM):
         config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        lora_config: Optional[LoRAConfig] = None,
     ):
         if config.hidden_size == 4096:  # baichuan2 7b
-            super().__init__(config, "ROPE", cache_config, quant_config, lora_config)
+            super().__init__(config, "ROPE", cache_config, quant_config)
         else:  # baichuan 13b, baichuan2 13b
-            super().__init__(config, "ALIBI", cache_config, quant_config, lora_config)
+            super().__init__(config, "ALIBI", cache_config, quant_config)
 
 
 class BaiChuanForCausalLM(BaiChuanBaseForCausalLM):
@@ -440,9 +426,8 @@ class BaiChuanForCausalLM(BaiChuanBaseForCausalLM):
         config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        lora_config: Optional[LoRAConfig] = None,
     ):
-        super().__init__(config, "ROPE", cache_config, quant_config, lora_config)
+        super().__init__(config, "ROPE", cache_config, quant_config)
 
 
 EntryClass = [BaichuanForCausalLM]
