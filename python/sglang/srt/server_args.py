@@ -420,12 +420,14 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             choices=["flashinfer", "triton"],
+            default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
         parser.add_argument(
             "--sampling-backend",
             type=str,
             choices=["flashinfer", "pytorch"],
+            default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
         )
         parser.add_argument(
