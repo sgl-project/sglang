@@ -79,7 +79,10 @@ class TestJSONConstrained(unittest.TestCase):
             ],
             temperature=0,
             max_tokens=128,
-            extra_body={"json_schema": self.json_schema},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "foo", "schema": json.loads(self.json_schema)},
+            },
         )
         text = response.choices[0].message.content
 
