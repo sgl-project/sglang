@@ -22,7 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.prefill_attention import context_attention_fwd
+from sglang.srt.layers.triton_attention.prefill_attention import context_attention_fwd
 
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
