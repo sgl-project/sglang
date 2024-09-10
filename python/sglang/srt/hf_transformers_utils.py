@@ -16,11 +16,9 @@ limitations under the License.
 """Utilities for Huggingface Transformers."""
 
 import contextlib
-import functools
-import json
 import os
 import warnings
-from typing import AbstractSet, Collection, Dict, List, Literal, Optional, Type, Union
+from typing import Dict, Optional, Type, Union
 
 from huggingface_hub import snapshot_download
 from transformers import (
