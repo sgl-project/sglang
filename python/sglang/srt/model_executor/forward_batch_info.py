@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, List
 import numpy as np
 import torch
 
-from sglang.srt.model_executor.flashinfer_utils import update_flashinfer_indices
+from sglang.srt.layers.flashinfer_utils import update_flashinfer_indices
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
