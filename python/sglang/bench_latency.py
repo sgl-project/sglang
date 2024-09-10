@@ -60,7 +60,6 @@ import torch.distributed as dist
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_config import ModelConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -208,14 +207,14 @@ def extend(reqs, model_runner):
         tree_cache=None,
     )
     batch.prepare_for_extend(model_runner.model_config.vocab_size)
-    sample_output, logits_output = model_runner.forward(batch, ForwardMode.EXTEND)
+    sample_output, logits_output = model_runner.forward(batch)
     next_token_ids = sample_output.batch_next_token_ids.tolist()
     return next_token_ids, logits_output.next_token_logits, batch
 
 
 def decode(input_token_ids, batch, model_runner):
     batch.prepare_for_decode(input_token_ids)
-    sample_output, logits_output = model_runner.forward(batch, ForwardMode.DECODE)
+    sample_output, logits_output = model_runner.forward(batch)
     next_token_ids = sample_output.batch_next_token_ids.tolist()
     return next_token_ids, logits_output.next_token_logits
 
@@ -480,6 +479,7 @@ def main(server_args, bench_args):
 
 
 if __name__ == "__main__":
+    # TODO(kevin85421): Make the parser setup unit testable.
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)

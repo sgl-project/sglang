@@ -29,6 +29,7 @@ from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 if TYPE_CHECKING:
@@ -130,6 +131,7 @@ class Req:
         self.image_sizes = None
         self.image_offsets = None
         self.pad_value = None
+        self.modalities = None
 
         # Prefix info
         self.extend_input_len = 0
@@ -333,6 +335,8 @@ class ScheduleBatch:
     token_to_kv_pool: BaseTokenToKVPool
     tree_cache: BasePrefixCache
 
+    forward_mode: ForwardMode = None
+
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
@@ -396,6 +400,8 @@ class ScheduleBatch:
         return out_cache_loc
 
     def prepare_for_extend(self, vocab_size: int):
+        self.forward_mode = ForwardMode.EXTEND
+
         bs = self.batch_size()
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -625,6 +631,8 @@ class ScheduleBatch:
         return jump_forward_reqs
 
     def prepare_for_decode(self, input_ids=None):
+        self.forward_mode = ForwardMode.DECODE
+
         if input_ids is None:
             input_ids = [
                 r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]

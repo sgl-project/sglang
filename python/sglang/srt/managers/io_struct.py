@@ -50,6 +50,10 @@ class GenerateReqInput:
     return_text_in_logprobs: bool = False
     # Whether to stream output.
     stream: bool = False
+    # The modalities of the image data [image, multi-images, video]
+    modalities: Optional[List[str]] = None
+
+    is_single: bool = True
 
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (
@@ -177,6 +181,8 @@ class TokenizedGenerateReqInput:
     top_logprobs_num: int
     # Whether to stream output
     stream: bool
+    # Modalities of the input images
+    modalites: Optional[List[str]] = None
 
 
 @dataclass
@@ -189,6 +195,8 @@ class EmbeddingReqInput:
     rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
     sampling_params: Union[List[Dict], Dict] = None
+
+    is_single: bool = True
 
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (

@@ -1,64 +1,32 @@
-Welcome to SGLang's tutorials!
+SGLang Documentation
 ====================================
 
-.. figure:: ./_static/image/logo.png
-  :width: 50%
-  :align: center
-  :alt: SGLang
-  :class: no-scaled-link
+SGLang is a fast serving framework for large language models and vision language models.
+It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
+The core features include:
 
-.. raw:: html
+- **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, jump-forward constrained decoding, continuous batching, token attention (paged attention), tensor parallelism, FlashInfer kernels, chunked prefill, and quantization (INT4/FP8/AWQ/GPTQ).
+- **Flexible Frontend Language**: Offers an intuitive interface for programming LLM applications, including chained generation calls, advanced prompting, control flow, multi-modal inputs, parallelism, and external interactions.
+- **Extensive Model Support**: Supports a wide range of generative models (Llama 3, Gemma 2, Mistral, QWen, DeepSeek, LLaVA, etc.) and embedding models (e5-mistral), with easy extensibility for integrating new models.
+- **Active Community**: SGLang is open-source and backed by an active community with industry adoption, welcoming contributions to improve LLM and VLM serving.
 
-   <p style="text-align:center">
-   <strong>SGLang is yet another fast serving framework for large language models and vision language models.
-   </strong>
-   </p>
 
-   <p style="text-align:center">
-   <script async defer src="https://buttons.github.io/buttons.js"></script>
-   <a class="github-button" href="https://github.com/sgl-project/sglang" data-show-count="true" data-size="large" aria-label="Star">Star</a>
-   <a class="github-button" href="https://github.com/sgl-project/sglang/subscription" data-icon="octicon-eye" data-size="large" aria-label="Watch">Watch</a>
-   <a class="github-button" href="https://github.com/sgl-project/sglang/fork" data-icon="octicon-repo-forked" data-size="large" aria-label="Fork">Fork</a>
-   </p>
-
-SGLang has the following core features:
-
-* **Fast Backend Runtime**: Efficient serving with RadixAttention for prefix caching, jump-forward constrained decoding, continuous batching, token attention (paged attention), tensor parallelism, flashinfer kernels, and quantization (AWQ/FP8/GPTQ/Marlin).
-
-* **Flexible Frontend Language**: Enables easy programming of LLM applications with chained generation calls, advanced prompting, control flow, multiple modalities, parallelism, and external interactions.
-
-Documentation
--------------
-
-.. _hyperparameter_tuning:
 .. toctree::
    :maxdepth: 1
-   :caption: Hyperparameter Tuning
+   :caption: Getting Started
 
-   hyperparameter_tuning.md
+   install.md
+   backend.md
+   frontend.md
 
-.. _custom_chat_template:
 .. toctree::
    :maxdepth: 1
-   :caption: Custom Chat Template
-
-   custom_chat_template.md
-
-.. _model_support:
-.. toctree::
-   :maxdepth: 1
-   :caption: Model Support
-
-   model_support.md
-
-.. _sampling_params:
-.. toctree::
-   :maxdepth: 1
-   :caption: Sampling Params
+   :caption: References
 
    sampling_params.md
-
-Search Bar
-==================
-
-* :ref:`search`
+   hyperparameter_tuning.md
+   model_support.md
+   contributor_guide.md
+   choices_methods.md
+   benchmark_and_profiling.md
+   troubleshooting.md

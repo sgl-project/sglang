@@ -25,10 +25,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -40,6 +39,15 @@ class ForwardMode(IntEnum):
     EXTEND = auto()
     # Decode one token.
     DECODE = auto()
+
+    def is_prefill(self):
+        return self == ForwardMode.PREFILL
+
+    def is_extend(self):
+        return self == ForwardMode.EXTEND
+
+    def is_decode(self):
+        return self == ForwardMode.DECODE
 
 
 @dataclass
@@ -78,6 +86,7 @@ class InputMetadata:
     pixel_values: List[torch.Tensor] = None
     image_sizes: List[List[List[int]]] = None
     image_offsets: List[List[int]] = None
+    modalities: List[List[str]] = None
 
     # Trition attention backend
     triton_max_seq_len: int = 0
@@ -96,11 +105,12 @@ class InputMetadata:
         self.pixel_values = [r.pixel_values for r in reqs]
         self.image_sizes = [r.image_sizes for r in reqs]
         self.image_offsets = [r.image_offsets for r in reqs]
+        self.modalities = [r.modalities for r in reqs]
 
     def compute_positions(self, batch: ScheduleBatch):
         position_ids_offsets = batch.position_ids_offsets
 
-        if self.forward_mode == ForwardMode.DECODE:
+        if self.forward_mode.is_decode():
             if True:
                 self.positions = self.seq_lens - 1
             else:
@@ -139,7 +149,7 @@ class InputMetadata:
         self.positions = self.positions.to(torch.int64)
 
     def compute_extend_infos(self, batch: ScheduleBatch):
-        if self.forward_mode == ForwardMode.DECODE:
+        if self.forward_mode.is_decode():
             self.extend_seq_lens = self.extend_start_loc = self.extend_no_prefix = None
             self.extend_seq_lens_cpu = self.logprob_start_lens_cpu = None
         else:
@@ -171,10 +181,9 @@ class InputMetadata:
         cls,
         model_runner: "ModelRunner",
         batch: ScheduleBatch,
-        forward_mode: ForwardMode,
     ):
         ret = cls(
-            forward_mode=forward_mode,
+            forward_mode=batch.forward_mode,
             sampling_info=batch.sampling_info,
             batch_size=batch.batch_size(),
             req_pool_indices=batch.req_pool_indices,
@@ -192,13 +201,11 @@ class InputMetadata:
 
         ret.compute_extend_infos(batch)
 
-        if (
-            forward_mode != ForwardMode.DECODE
-            or model_runner.server_args.disable_flashinfer
-        ):
+        fm = batch.forward_mode
+        if not fm.is_decode() or model_runner.server_args.disable_flashinfer:
             ret.total_num_tokens = int(torch.sum(ret.seq_lens))
 
-        if forward_mode != ForwardMode.DECODE:
+        if not fm.is_decode():
             ret.init_multimuldal_info(batch)
 
         if model_runner.server_args.disable_flashinfer:
@@ -207,7 +214,7 @@ class InputMetadata:
         flashinfer_use_ragged = False
         if not model_runner.server_args.disable_flashinfer:
             if (
-                forward_mode != ForwardMode.DECODE
+                not fm.is_decode()
                 and int(torch.sum(ret.seq_lens)) > 4096
                 and model_runner.sliding_window_size is None
             ):
@@ -224,7 +231,7 @@ class InputMetadata:
         self.triton_start_loc = torch.zeros_like(self.seq_lens, dtype=torch.int32)
         self.triton_start_loc[1:] = torch.cumsum(self.seq_lens[:-1], dim=0)
 
-        if self.forward_mode == ForwardMode.DECODE:
+        if self.forward_mode.is_decode():
             self.triton_max_extend_len = None
         else:
             self.triton_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
@@ -237,7 +244,7 @@ class InputMetadata:
         prefix_lens_cpu,
         flashinfer_use_ragged,
     ):
-        if self.forward_mode == ForwardMode.DECODE:
+        if self.forward_mode.is_decode():
             prefix_lens = None
         else:
             prefix_lens = self.extend_prefix_lens
@@ -337,7 +344,7 @@ def update_flashinfer_indices(
 
         kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
 
-        if forward_mode == ForwardMode.DECODE:
+        if forward_mode.is_decode():
             # CUDA graph uses different flashinfer_decode_wrapper
             if flashinfer_decode_wrapper is None:
                 flashinfer_decode_wrapper = model_runner.flashinfer_decode_wrapper
@@ -386,7 +393,7 @@ def update_flashinfer_indices(
         kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
         for wrapper_id in range(2):
             if wrapper_id == 0:
-                if forward_mode == ForwardMode.DECODE:
+                if forward_mode.is_decode():
                     paged_kernel_lens = torch.minimum(
                         seq_lens, torch.tensor(model_runner.sliding_window_size + 1)
                     )
@@ -416,7 +423,7 @@ def update_flashinfer_indices(
                 kv_indices,
             )
 
-            if forward_mode == ForwardMode.DECODE:
+            if forward_mode.is_decode():
                 # CUDA graph uses different flashinfer_decode_wrapper
                 if flashinfer_decode_wrapper is None:
                     flashinfer_decode_wrapper = model_runner.flashinfer_decode_wrapper

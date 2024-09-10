@@ -28,6 +28,13 @@ from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
+try:
+    from outlines.fsm.json_schema import convert_json_schema_to_str
+except ImportError:
+    # Before outlines 0.0.47, convert_json_schema_to_str is under
+    # outlines.integrations.utils
+    from outlines.integrations.utils import convert_json_schema_to_str
+
 from sglang.srt.conversation import (
     Conversation,
     SeparatorStyle,
@@ -832,6 +839,7 @@ def v1_chat_generate_request(
     return_logprobs = []
     logprob_start_lens = []
     top_logprobs_nums = []
+    modalities_list = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -864,10 +872,12 @@ def v1_chat_generate_request(
                 )
                 stop = request.stop
                 image_data = None
+                modalities = []
             else:
                 conv = generate_chat_conv(request, chat_template_name)
                 prompt = conv.get_prompt()
                 image_data = conv.image_data
+                modalities = conv.modalities
                 stop = conv.stop_str or []
                 if request.stop:
                     if isinstance(request.stop, str):
@@ -880,27 +890,33 @@ def v1_chat_generate_request(
             prompt_ids = request.messages
             stop = request.stop
             image_data = None
+            modalities = []
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs)
-        sampling_params_list.append(
-            {
-                "temperature": request.temperature,
-                "max_new_tokens": request.max_tokens,
-                "min_new_tokens": request.min_tokens,
-                "stop": stop,
-                "stop_token_ids": request.stop_token_ids,
-                "top_p": request.top_p,
-                "presence_penalty": request.presence_penalty,
-                "frequency_penalty": request.frequency_penalty,
-                "repetition_penalty": request.repetition_penalty,
-                "regex": request.regex,
-                "json_schema": request.json_schema,
-                "n": request.n,
-            }
-        )
+
+        sampling_params = {
+            "temperature": request.temperature,
+            "max_new_tokens": request.max_tokens,
+            "min_new_tokens": request.min_tokens,
+            "stop": stop,
+            "stop_token_ids": request.stop_token_ids,
+            "top_p": request.top_p,
+            "presence_penalty": request.presence_penalty,
+            "frequency_penalty": request.frequency_penalty,
+            "repetition_penalty": request.repetition_penalty,
+            "regex": request.regex,
+            "n": request.n,
+        }
+        if request.response_format and request.response_format.type == "json_schema":
+            sampling_params["json_schema"] = convert_json_schema_to_str(
+                request.response_format.json_schema.schema_
+            )
+        sampling_params_list.append(sampling_params)
+
         image_data_list.append(image_data)
+        modalities_list.extend(modalities)
     if len(all_requests) == 1:
         input_ids = input_ids[0]
         if isinstance(input_ids, str):
@@ -912,6 +928,7 @@ def v1_chat_generate_request(
         return_logprobs = return_logprobs[0]
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
+        modalities_list = modalities_list[:1]
     else:
         if isinstance(input_ids[0], str):
             prompt_kwargs = {"text": input_ids}
@@ -928,6 +945,7 @@ def v1_chat_generate_request(
         stream=all_requests[0].stream,
         return_text_in_logprobs=True,
         rid=request_ids,
+        modalities=modalities_list,
     )
     if len(all_requests) == 1:
         return adapted_request, all_requests[0]

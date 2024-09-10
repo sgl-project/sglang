@@ -140,12 +140,14 @@ class TestOpenAIVisionServer(unittest.TestCase):
                             "image_url": {
                                 "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
                             },
+                            "modalities": "multi-images",
                         },
                         {
                             "type": "image_url",
                             "image_url": {
                                 "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
                             },
+                            "modalities": "multi-images",
                         },
                         {
                             "type": "text",
@@ -192,6 +194,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         frame_format = {
             "type": "image_url",
             "image_url": {"url": "data:image/jpeg;base64,{}"},
+            "modalities": "video",
         }
 
         for base64_frame in base64_frames:

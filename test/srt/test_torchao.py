@@ -22,7 +22,7 @@ class TestTorchCompile(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile"],
+            other_args=["--torchao-config", "int4wo-128"],
         )
 
     @classmethod
@@ -66,7 +66,7 @@ class TestTorchCompile(unittest.TestCase):
         print(res["text"])
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
-        assert throughput >= 152
+        assert throughput >= 210
 
 
 if __name__ == "__main__":
