@@ -379,7 +379,7 @@ class ModelRunner:
                     ),
                     2048,
                 ),
-                5120,
+                4096,
             )
 
         self.req_to_token_pool = ReqToTokenPool(
