@@ -261,12 +261,15 @@ def extend_attention_fwd(
     )
 
     assert Lq == Lk and Lv == Lo
-    assert Lq in {16, 32, 64, 128, 256, 576}
+    assert Lq in {16, 32, 64, 128, 256, 576, 288}
     assert Lv in {16, 32, 64, 128, 256, 512}
 
     if Lq == 576:
         BLOCK_DMODEL = 512
         BLOCK_DPE = 64
+    elif Lq == 288:
+        BLOCK_DMODEL = 256
+        BLOCK_DPE = 32
     else:
         BLOCK_DMODEL = Lq
         BLOCK_DPE = 0
