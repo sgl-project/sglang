@@ -53,6 +53,8 @@ class GenerateReqInput:
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
 
+    is_single: bool = True
+
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (
             self.text is not None and self.input_ids is not None
@@ -193,6 +195,8 @@ class EmbeddingReqInput:
     rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
     sampling_params: Union[List[Dict], Dict] = None
+
+    is_single: bool = True
 
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (

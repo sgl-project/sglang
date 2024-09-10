@@ -656,8 +656,6 @@ class ScheduleBatch:
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
 
-        self.sampling_info.update_regex_vocab_mask(self)
-
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:
             # Filter out all requests

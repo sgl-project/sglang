@@ -15,7 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""ModelRunner runs the forward passes of the models."""
+"""Meta data for a forward pass."""
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List
@@ -200,7 +200,8 @@ class InputMetadata:
             top_logprobs_nums=batch.top_logprobs_nums,
         )
 
-        ret.sampling_info.prepare_penalties()
+        ret.sampling_info.update_penalties()
+        ret.sampling_info.update_regex_vocab_mask(batch)
 
         ret.compute_positions(batch)
 
