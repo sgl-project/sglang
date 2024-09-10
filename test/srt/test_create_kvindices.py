@@ -4,7 +4,7 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import (
+from sglang.srt.model_executor.flashinfer_utils import (
     create_flashinfer_kv_indices_triton,
 )
 

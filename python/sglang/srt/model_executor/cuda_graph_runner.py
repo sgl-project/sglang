@@ -32,11 +32,8 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.layers.sampler import SampleOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardMode,
-    InputMetadata,
-    update_flashinfer_indices,
-)
+from sglang.srt.model_executor.flashinfer_utils import update_flashinfer_indices
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import monkey_patch_vllm_all_gather
 
