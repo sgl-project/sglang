@@ -10,7 +10,6 @@ from torchao.quantization import (
     quantize_,
 )
 
-
 def torchao_quantize_param_data(param, torchao_config):
     dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
     dummy_linear.weight = param
@@ -33,4 +32,5 @@ def torchao_quantize_param_data(param, torchao_config):
         # this requires newer hardware
         # [rank0]: AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
         quantize_(dummy_linear, float8_weight_only())
+
     return dummy_linear.weight

@@ -39,6 +39,28 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import monkey_patch_vllm_all_gather
+import torch.nn.utils.parametrize as parametrize
+from torchao.utils import TORCH_VERSION_AT_LEAST_2_5
+from torchao.utils import UnwrapTensorSubclass
+
+def _unwrap_tensor_subclass(model, filter_fn=None):
+    """Unwraps (nested) tensor subclass in the model to plain tensors
+    This is a workaround to make a model with tensor subclass to work with `torch.export.export`
+    and `torch.aot_compile`, we hope this can be integrated into compile stack soon
+    tracking issue: https://github.com/pytorch/ao/issues/345
+    """
+    for name, child in model.named_children():
+        # make sure child.weight is a tensor subclass
+        if (
+            hasattr(child, "weight") and
+            type(child.weight) is not torch.Tensor and
+            type(child.weight) is not torch.nn.Parameter and
+            isinstance(child.weight, torch.Tensor) and
+            issubclass(type(child.weight), torch.Tensor)
+        ):
+            parametrize.register_parametrization(child, "weight", UnwrapTensorSubclass())
+        _unwrap_tensor_subclass(child)
+    return model
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool = False):
@@ -56,7 +78,10 @@ def _to_torch(model: torch.nn.Module, reverse: bool = False):
 
 @contextmanager
 def patch_model(
-    model: torch.nn.Module, enable_compile: bool, tp_group: "GroupCoordinator"
+    model: torch.nn.Module,
+    enable_compile: bool,
+    torchao_config: str,
+    tp_group: "GroupCoordinator"
 ):
     backup_ca_comm = None
 
@@ -66,6 +91,12 @@ def patch_model(
             monkey_patch_vllm_all_gather()
             backup_ca_comm = tp_group.ca_comm
             tp_group.ca_comm = None
+            # workaround for torchao to be compatible with torch.compile
+            # not needed when torch is upgraded to 2.5+
+            # if torchao_config != "" and not TORCH_VERSION_AT_LEAST_2_5:
+            #     print("unwrapping")
+            #     _unwrap_tensor_subclass(model.model)
+            #     breakpoint()
             yield torch.compile(model.forward, mode="max-autotune-no-cudagraphs")
         else:
             yield model.forward
@@ -168,9 +199,15 @@ class CudaGraphRunner:
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
             for bs in batch_size_list:
+                if bs in self.compile_bs and self.model_runner.server_args.torchao_config != "" and not TORCH_VERSION_AT_LEAST_2_5:
+                    print("unwrapping")
+                    _unwrap_tensor_subclass(self.model_runner.model)
+                    breakpoint()
+
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
+                    self.model_runner.server_args.torchao_config,
                     self.model_runner.tp_group,
                 ) as forward:
                     (
@@ -256,6 +293,7 @@ class CudaGraphRunner:
                 flashinfer_decode_wrapper=flashinfer_decode_wrapper,
             )
 
+            breakpoint()
             return forward(input_ids, input_metadata.positions, input_metadata)
 
         for _ in range(2):
