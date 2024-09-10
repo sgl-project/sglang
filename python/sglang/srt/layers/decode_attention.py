@@ -483,11 +483,14 @@ def _decode_grouped_att_m_fwd(
     # shape constraints
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
     assert Lq == Lk
-    assert Lk in {16, 32, 64, 96, 128, 256, 576}
+    assert Lk in {16, 32, 64, 96, 128, 256, 576, 288}
 
     if Lk == 576:
         BLOCK_DMODEL = 512
         BLOCK_DPE = 64
+    elif Lk == 288:
+        BLOCK_DMODEL = 256
+        BLOCK_DPE = 32
     else:
         BLOCK_DMODEL = triton.next_power_of_2(Lk)
         BLOCK_DPE = 0
