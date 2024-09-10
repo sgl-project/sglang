@@ -1,80 +1,32 @@
-Welcome to SGLang!
+SGLang Documentation
 ====================================
 
-.. figure:: ./_static/image/logo.png
-  :width: 50%
-  :align: center
-  :alt: SGLang
-  :class: no-scaled-link
+SGLang is a fast serving framework for large language models and vision language models.
+It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
+The core features include:
 
-.. raw:: html
+- **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, jump-forward constrained decoding, continuous batching, token attention (paged attention), tensor parallelism, FlashInfer kernels, chunked prefill, and quantization (INT4/FP8/AWQ/GPTQ).
+- **Flexible Frontend Language**: Offers an intuitive interface for programming LLM applications, including chained generation calls, advanced prompting, control flow, multi-modal inputs, parallelism, and external interactions.
+- **Extensive Model Support**: Supports a wide range of generative models (Llama 3, Gemma 2, Mistral, QWen, DeepSeek, LLaVA, etc.) and embedding models (e5-mistral), with easy extensibility for integrating new models.
+- **Active Community**: SGLang is open-source and backed by an active community with industry adoption, welcoming contributions to improve LLM and VLM serving.
 
-   <p style="text-align:center">
-   <strong>SGLang is yet another fast serving framework for large language models and vision language models.
-   </strong>
-   </p>
 
-   <p style="text-align:center">
-   <script async defer src="https://buttons.github.io/buttons.js"></script>
-   <a class="github-button" href="https://github.com/sgl-project/sglang" data-show-count="true" data-size="large" aria-label="Star">Star</a>
-   <a class="github-button" href="https://github.com/sgl-project/sglang/subscription" data-icon="octicon-eye" data-size="large" aria-label="Watch">Watch</a>
-   <a class="github-button" href="https://github.com/sgl-project/sglang/fork" data-icon="octicon-repo-forked" data-size="large" aria-label="Fork">Fork</a>
-   </p>
-
-SGLang has the following core features:
-
-* **Fast Backend Runtime**: Efficient serving with RadixAttention for prefix caching, jump-forward constrained decoding, continuous batching, token attention (paged attention), tensor parallelism, flashinfer kernels, and quantization (AWQ/FP8/GPTQ/Marlin).
-
-* **Flexible Frontend Language**: Enables easy programming of LLM applications with chained generation calls, advanced prompting, control flow, multiple modalities, parallelism, and external interactions.
-
-* **Extensive Model Support**: SGLang supports a wide range of generative models including the Llama series (up to Llama 3.1), Mistral, Gemma, Qwen, DeepSeek, LLaVA, Yi-VL, StableLM, Command-R, DBRX, Grok, ChatGLM, InternLM 2 and Exaone 3. It also supports embedding models such as e5-mistral and gte-Qwen2. Easily extensible to support new models.
-
-* **Open Source Community**: SGLang is an open source project with a vibrant community of contributors. We welcome contributions from anyone interested in advancing the state of the art in LLM and VLM serving.
-
-Documentation
--------------
-
-.. In this documentation, we'll dive into these following areas to help you get the most out of SGLang.
-
-.. _installation:
 .. toctree::
    :maxdepth: 1
-   :caption: Installation
+   :caption: Getting Started
 
    install.md
+   backend.md
+   frontend.md
 
-.. _hyperparameter_tuning:
 .. toctree::
    :maxdepth: 1
-   :caption: Hyperparameter Tuning
-
-   hyperparameter_tuning.md
-
-.. _custom_chat_template:
-.. toctree::
-   :maxdepth: 1
-   :caption: Custom Chat Template
-
-   custom_chat_template.md
-
-.. _model_support:
-.. toctree::
-   :maxdepth: 1
-   :caption: Model Support
-
-   model_support.md
-
-.. _sampling_params:
-.. toctree::
-   :maxdepth: 1
-   :caption: Sampling Params
+   :caption: References
 
    sampling_params.md
-
-
-.. _benchmark_and_profilling:
-.. toctree::
-   :maxdepth: 1
-   :caption: Benchmark and Profilling
-
+   hyperparameter_tuning.md
+   model_support.md
+   contributor_guide.md
+   choices_methods.md
    benchmark_and_profiling.md
+   troubleshooting.md
