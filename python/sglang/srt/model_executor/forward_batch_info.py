@@ -203,17 +203,17 @@ class InputMetadata:
         ret.compute_extend_infos(batch)
 
         fm = batch.forward_mode
-        if not fm.is_decode() or model_runner.server_args.disable_flashinfer:
+        if not fm.is_decode() or model_runner.server_args.attention_backend == "triton":
             ret.total_num_tokens = int(torch.sum(ret.seq_lens))
 
         if not fm.is_decode():
             ret.init_multimuldal_info(batch)
 
-        if model_runner.server_args.disable_flashinfer:
+        if model_runner.server_args.attention_backend == "triton":
             ret.init_triton_args(batch)
 
         flashinfer_use_ragged = False
-        if not model_runner.server_args.disable_flashinfer:
+        if model_runner.server_args.attention_backend == "flashinfer":
             if (
                 not fm.is_decode()
                 and int(torch.sum(ret.seq_lens)) > 4096

@@ -425,7 +425,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         maybe_set_triton_cache_manager()
 
     # Check flashinfer version
-    if not server_args.disable_flashinfer:
+    if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer",
             "0.1.6",

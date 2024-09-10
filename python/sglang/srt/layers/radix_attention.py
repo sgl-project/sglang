@@ -61,14 +61,18 @@ class RadixAttention(nn.Module):
 
         # Choose backend
         if (
-            not global_server_args_dict.get("disable_flashinfer", False)
+            global_server_args_dict["attention_backend"] == "flashinfer"
             and self.qk_head_dim == self.v_head_dim
         ):
             self.extend_forward = self.extend_forward_flashinfer
             self.decode_forward = self.decode_forward_flashinfer
-        else:
+        elif global_server_args_dict["attention_backend"] == "triton":
             self.extend_forward = self.extend_forward_triton
             self.decode_forward = self.decode_forward_triton
+        else:
+            raise ValueError(
+                f"Invalid attention backend: {global_server_args_dict['attention_backend']}"
+            )
 
     def extend_forward_triton(self, q, k, v, input_metadata: InputMetadata):
         if self.qk_head_dim != self.v_head_dim:

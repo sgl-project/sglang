@@ -14,13 +14,12 @@ from sglang.test.test_utils import (
 
 
 class TestServingThroughput(unittest.TestCase):
-    def run_test(self, disable_radix_cache, disable_flashinfer, chunked_prefill_size):
+    def run_test(self, disable_radix_cache, attention_backend, chunked_prefill_size):
         # Launch the server
         other_args = []
         if disable_radix_cache:
             other_args.append("--disable-radix-cache")
-        if disable_flashinfer:
-            other_args.append("--disable-flashinfer")
+        other_args.extend(["--attention-backend", attention_backend])
         other_args.extend(["--chunked-prefill-size", str(chunked_prefill_size)])
 
         model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -69,7 +68,7 @@ class TestServingThroughput(unittest.TestCase):
     def test_default(self):
         res = self.run_test(
             disable_radix_cache=ServerArgs.disable_radix_cache,
-            disable_flashinfer=ServerArgs.disable_flashinfer,
+            attention_backend=ServerArgs.attention_backend,
             chunked_prefill_size=ServerArgs.chunked_prefill_size,
         )
 
@@ -79,7 +78,7 @@ class TestServingThroughput(unittest.TestCase):
     def test_default_without_radix_cache(self):
         res = self.run_test(
             disable_radix_cache=True,
-            disable_flashinfer=ServerArgs.disable_flashinfer,
+            attention_backend=ServerArgs.attention_backend,
             chunked_prefill_size=ServerArgs.chunked_prefill_size,
         )
 
@@ -89,7 +88,7 @@ class TestServingThroughput(unittest.TestCase):
     def test_default_without_chunked_prefill(self):
         res = self.run_test(
             disable_radix_cache=ServerArgs.disable_radix_cache,
-            disable_flashinfer=ServerArgs.disable_flashinfer,
+            attention_backend=ServerArgs.attention_backend,
             chunked_prefill_size=-1,
         )
 

@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.sampler import SampleOutput
@@ -40,10 +41,11 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 # Put some global args for easy access
 global_server_args_dict = {
-    "disable_flashinfer": False,
-    "disable_flashinfer_sampling": False,
-    "triton_attention_reduce_in_fp32": False,
-    "enable_mla": False,
+    "attention_backend": ServerArgs.attention_backend,
+    "sampling_backend": ServerArgs.sampling_backend,
+    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
+    "enable_mla": ServerArgs.enable_mla,
+    "torchao_config": ServerArgs.torchao_config,
 }
 
 
