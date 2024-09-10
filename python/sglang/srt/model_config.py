@@ -64,6 +64,11 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+        elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 128
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
 
