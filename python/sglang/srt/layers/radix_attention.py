@@ -22,8 +22,8 @@ from flashinfer.cascade import merge_state
 from torch import nn
 
 from sglang.global_config import global_config
-from sglang.srt.layers.decode_attention import decode_attention_fwd
-from sglang.srt.layers.extend_attention import extend_attention_fwd
+from sglang.srt.layers.triton_attention.decode_attention import decode_attention_fwd
+from sglang.srt.layers.triton_attention.extend_attention import extend_attention_fwd
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.model_executor.model_runner import global_server_args_dict
 

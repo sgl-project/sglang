@@ -57,9 +57,9 @@ import pandas as pd
 import torch
 import torch.distributed as dist
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs

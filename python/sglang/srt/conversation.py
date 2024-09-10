@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Conversation templates."""
+"""Conversation chat templates."""
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
