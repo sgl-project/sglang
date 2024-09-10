@@ -3,15 +3,17 @@ Common utilities for torchao.
 """
 
 import torch
-from torchao.quantization import (
-    int4_weight_only,
-    int8_dynamic_activation_int8_weight,
-    int8_weight_only,
-    quantize_,
-)
 
 
 def torchao_quantize_param_data(param, torchao_config):
+    # Lazy import to suppress some warnings
+    from torchao.quantization import (
+        int4_weight_only,
+        int8_dynamic_activation_int8_weight,
+        int8_weight_only,
+        quantize_,
+    )
+
     dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
     dummy_linear.weight = param
     if "int8wo" in torchao_config:
