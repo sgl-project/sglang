@@ -39,15 +39,20 @@ class ForwardMode(IntEnum):
     EXTEND = auto()
     # Decode one token.
     DECODE = auto()
+    # Contains both PREFILL and EXTEND.
+    MIXED = auto()
 
     def is_prefill(self):
         return self == ForwardMode.PREFILL
 
     def is_extend(self):
-        return self == ForwardMode.EXTEND
+        return self == ForwardMode.EXTEND or self == ForwardMode.MIXED
 
     def is_decode(self):
         return self == ForwardMode.DECODE
+
+    def is_mixed(self):
+        return self == ForwardMode.MIXED
 
 
 @dataclass
