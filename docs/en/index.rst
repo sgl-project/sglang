@@ -17,6 +17,7 @@ The core features include:
 
    install.md
    backend.md
+   frontend.md
 
 .. toctree::
    :maxdepth: 1
@@ -24,8 +25,8 @@ The core features include:
 
    sampling_params.md
    hyperparameter_tuning.md
+   model_support.md
    contributor_guide.md
    choices_methods.md
    benchmark_and_profiling.md
-   model_support.md
    troubleshooting.md
