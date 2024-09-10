@@ -210,7 +210,9 @@ class MiniCPM3Attention(nn.Module):
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
         original_shapes = [q_pe.shape, k_pe.shape]
-        q_pe, k_pe = self.rotary_emb(positions, q_pe.reshape(q_pe.shape[0], -1), k_pe.reshape(k_pe.shape[0], -1))
+        q_pe, k_pe = self.rotary_emb(
+            positions, q_pe.reshape(q_pe.shape[0], -1), k_pe.reshape(k_pe.shape[0], -1)
+        )
         q_pe, k_pe = q_pe.view(original_shapes[0]), k_pe.view(original_shapes[1])
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
@@ -371,7 +373,9 @@ class MiniCPM3AttentionMLA(nn.Module):
         k_pe = k_input[..., self.kv_lora_rank :]
 
         original_shapes = [q_pe.shape, k_pe.shape]
-        q_pe, k_pe = self.rotary_emb(positions, q_pe.reshape(q_pe.shape[0], -1), k_pe.reshape(k_pe.shape[0], -1))
+        q_pe, k_pe = self.rotary_emb(
+            positions, q_pe.reshape(q_pe.shape[0], -1), k_pe.reshape(k_pe.shape[0], -1)
+        )
         q_pe, k_pe = q_pe.view(original_shapes[0]), k_pe.view(original_shapes[1])
         q_input[..., self.kv_lora_rank :] = q_pe
         k_input[..., self.kv_lora_rank :] = k_pe
@@ -419,7 +423,7 @@ class MiniCPM3DecoderLayer(nn.Module):
                 num_heads=config.num_attention_heads,
                 qk_nope_head_dim=config.qk_nope_head_dim,
                 qk_rope_head_dim=config.qk_rope_head_dim,
-                v_head_dim=self.hidden_size//config.num_attention_heads,
+                v_head_dim=self.hidden_size // config.num_attention_heads,
                 q_lora_rank=(
                     config.q_lora_rank if hasattr(config, "q_lora_rank") else None
                 ),
@@ -438,7 +442,7 @@ class MiniCPM3DecoderLayer(nn.Module):
                 num_heads=config.num_attention_heads,
                 qk_nope_head_dim=config.qk_nope_head_dim,
                 qk_rope_head_dim=config.qk_rope_head_dim,
-                v_head_dim=self.hidden_size//config.num_attention_heads,
+                v_head_dim=self.hidden_size // config.num_attention_heads,
                 q_lora_rank=(
                     config.q_lora_rank if hasattr(config, "q_lora_rank") else None
                 ),
@@ -509,7 +513,9 @@ class MiniCPM3Model(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                MiniCPM3DecoderLayer(config, i, cache_config=cache_config, quant_config=quant_config)
+                MiniCPM3DecoderLayer(
+                    config, i, cache_config=cache_config, quant_config=quant_config
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -552,7 +558,9 @@ class MiniCPM3ForCausalLM(nn.Module):
 
         self.num_experts = getattr(self.config, "num_experts", 0)
         self.quant_config = quant_config
-        self.model = MiniCPM3Model(config, cache_config=cache_config, quant_config=quant_config)
+        self.model = MiniCPM3Model(
+            config, cache_config=cache_config, quant_config=quant_config
+        )
         # self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if not self.config.tie_word_embeddings:
             self.lm_head = ParallelLMHead(
