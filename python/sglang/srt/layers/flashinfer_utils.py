@@ -39,31 +39,6 @@ def create_flashinfer_kv_indices_triton(
         st_offset += BLOCK_SIZE
 
 
-def update_flashinfer_indices(
-    forward_mode,
-    model_runner,
-    req_pool_indices,
-    seq_lens,
-    prefix_lens,
-    flashinfer_decode_wrapper=None,
-    flashinfer_use_ragged=False,
-):
-    flashinfer_updater = FlashinferUpdater(
-        forward_mode,
-        model_runner,
-        req_pool_indices,
-        seq_lens,
-        prefix_lens,
-        flashinfer_decode_wrapper,
-        flashinfer_use_ragged,
-    )
-
-    if model_runner.sliding_window_size is None:
-        flashinfer_updater.update_indices_no_window()
-    else:
-        flashinfer_updater.update_indices_window()
-
-
 class FlashinferUpdater:
     def __init__(
         self,
@@ -235,3 +210,28 @@ class FlashinferUpdater:
                     None,
                     self.flashinfer_prefill_wrapper_paged[wrapper_id],
                 )
+
+
+def update_flashinfer_indices(
+    forward_mode,
+    model_runner,
+    req_pool_indices,
+    seq_lens,
+    prefix_lens,
+    flashinfer_decode_wrapper=None,
+    flashinfer_use_ragged=False,
+):
+    flashinfer_updater = FlashinferUpdater(
+        forward_mode,
+        model_runner,
+        req_pool_indices,
+        seq_lens,
+        prefix_lens,
+        flashinfer_decode_wrapper,
+        flashinfer_use_ragged,
+    )
+
+    if model_runner.sliding_window_size is None:
+        flashinfer_updater.update_indices_no_window()
+    else:
+        flashinfer_updater.update_indices_window()
