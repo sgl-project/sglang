@@ -418,16 +418,4 @@ class BaichuanForCausalLM(BaiChuanBaseForCausalLM):
             super().__init__(config, "ALIBI", cache_config, quant_config)
 
 
-class BaiChuanForCausalLM(BaiChuanBaseForCausalLM):
-    """Baichuan 7B."""
-
-    def __init__(
-        self,
-        config,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-    ):
-        super().__init__(config, "ROPE", cache_config, quant_config)
-
-
 EntryClass = [BaichuanForCausalLM]
