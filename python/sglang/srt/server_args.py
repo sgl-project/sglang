@@ -140,11 +140,13 @@ class ServerArgs:
                 "The option '--disable-flashinfer' will be deprecated in the next release. "
                 "Please use '--attention-backend triton' instead."
             )
+            self.attention_backend = "triton"
         if self.disable_flashinfer_sampling:
             logger.warning(
                 "The option '--disable-flashinfer-sampling' will be deprecated in the next release. "
                 "Please use '--sampling-backend pytorch' instead. "
             )
+            self.sampling_backend = "pytorch"
 
         # Model-specific patches
         if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
