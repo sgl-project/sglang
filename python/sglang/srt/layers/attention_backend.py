@@ -1,0 +1,295 @@
+from __future__ import annotations
+
+"""
+Support different attention backends.
+Now there are two backends: FlashInfer and Triton.
+FlashInfer is faster and Triton is easier to customize.
+Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
+"""
+
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
+
+import torch
+import torch.nn as nn
+from flashinfer import (
+    BatchDecodeWithPagedKVCacheWrapper,
+    BatchPrefillWithPagedKVCacheWrapper,
+    BatchPrefillWithRaggedKVCacheWrapper,
+)
+from flashinfer.cascade import merge_state
+from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
+
+from sglang.global_config import global_config
+from sglang.srt.layers.flashinfer_utils import update_flashinfer_indices
+from sglang.srt.layers.triton_attention.decode_attention import decode_attention_fwd
+from sglang.srt.layers.triton_attention.extend_attention import extend_attention_fwd
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.model_executor.forward_batch_info import InputMetadata
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+class AttentionBackend(ABC):
+    """The base class of attention backends"""
+
+    @abstractmethod
+    def init_forward_metadata(
+        self, batch: ScheduleBatch, input_metadata: InputMetadata
+    ):
+        pass
+
+    def forward(self, q, k, v, layer, input_metadata: InputMetadata):
+        if input_metadata.forward_mode.is_decode():
+            return self.forward_decode(q, k, v, layer, input_metadata)
+        else:
+            return self.forward_extend(q, k, v, layer, input_metadata)
+
+
+class FlashInferAttnBackend(AttentionBackend):
+    """Flashinfer attention kernels."""
+
+    def __init__(self, model_runner: ModelRunner):
+        super().__init__()
+        self.model_runner = model_runner
+
+        if not _grouped_size_compiled_for_decode_kernels(
+            model_runner.model_config.num_attention_heads // model_runner.tp_size,
+            model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
+        ):
+            decode_use_tensor_cores = True
+        else:
+            decode_use_tensor_cores = False
+
+        self.workspace_buffer = torch.empty(
+            global_config.flashinfer_workspace_size,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+
+        if model_runner.sliding_window_size is None:
+            self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer, "NHD"
+            )
+            self.prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer, "NHD"
+            )
+            self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                use_tensor_cores=decode_use_tensor_cores,
+            )
+        else:
+            # Two wrappers: one for sliding window attention and one for full attention.
+            # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+            self.prefill_wrapper_paged = []
+            self.decode_wrapper = []
+            for _ in range(2):
+                self.prefill_wrapper_paged.append(
+                    BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
+                )
+                self.decode_wrapper.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        use_tensor_cores=decode_use_tensor_cores,
+                    )
+                )
+
+        self.forward_metadata = None
+
+    def init_forward_metadata(
+        self, batch: ScheduleBatch, input_metadata: InputMetadata
+    ):
+        if input_metadata.forward_mode.is_decode():
+            prefix_lens = None
+            use_ragged = False
+        else:
+            prefix_lens = input_metadata.extend_prefix_lens
+
+            # Some heuristics to check whether to use ragged forward
+            use_ragged = False
+            if (
+                int(torch.sum(input_metadata.seq_lens)) > 4096
+                and self.model_runner.sliding_window_size is None
+            ):
+                use_ragged = True
+
+        update_flashinfer_indices(
+            input_metadata.forward_mode,
+            self.model_runner,
+            input_metadata.req_pool_indices,
+            input_metadata.seq_lens,
+            prefix_lens,
+            use_ragged=use_ragged,
+        )
+
+        self.forward_metadata = (use_ragged,)
+
+    def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        if not isinstance(self.prefill_wrapper_paged, list):
+            prefill_wrapper_paged = self.prefill_wrapper_paged
+        else:
+            if layer.sliding_window_size != -1:
+                prefill_wrapper_paged = self.prefill_wrapper_paged[0]
+            else:
+                prefill_wrapper_paged = self.prefill_wrapper_paged[1]
+
+        use_ragged = self.forward_metadata[0]
+
+        if not use_ragged:
+            if k is not None:
+                assert v is not None
+                input_metadata.token_to_kv_pool.set_kv_buffer(
+                    layer.layer_id, input_metadata.out_cache_loc, k, v
+                )
+            o = prefill_wrapper_paged.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                input_metadata.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                causal=True,
+                sm_scale=layer.scaling,
+                window_left=layer.sliding_window_size,
+                logits_soft_cap=layer.logit_cap,
+            )
+        else:
+            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
+                v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
+                causal=True,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+            )
+
+            if input_metadata.extend_no_prefix:
+                o = o1
+            else:
+                o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    input_metadata.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=False,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=layer.logit_cap,
+                )
+
+                o, _ = merge_state(o1, s1, o2, s2)
+
+            input_metadata.token_to_kv_pool.set_kv_buffer(
+                layer.layer_id, input_metadata.out_cache_loc, k, v
+            )
+
+            if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
+                torch.cuda.synchronize()
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def forward_decode(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        if not isinstance(self.decode_wrapper, list):
+            decode_wrapper = self.decode_wrapper
+        else:
+            if layer.sliding_window_size != -1:
+                decode_wrapper = self.decode_wrapper[0]
+            else:
+                decode_wrapper = self.decode_wrapper[1]
+
+        if k is not None:
+            assert v is not None
+            input_metadata.token_to_kv_pool.set_kv_buffer(
+                layer.layer_id, input_metadata.out_cache_loc, k, v
+            )
+
+        o = decode_wrapper.forward(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            input_metadata.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+        )
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+
+class TritonAttnBackend(AttentionBackend):
+    def __init__(self, model_runner: ModelRunner):
+        super().__init__()
+
+        self.forward_metadata = None
+
+    def init_forward_metadata(
+        self, batch: ScheduleBatch, input_metadata: InputMetadata
+    ):
+        """Init auxiliary variables for triton attention backend."""
+
+        if input_metadata.forward_mode.is_decode():
+            max_seq_len = torch.max(input_metadata.seq_lens).item()
+            start_loc = torch.zeros_like(input_metadata.seq_lens, dtype=torch.int32)
+            start_loc[1:] = torch.cumsum(input_metadata.seq_lens[:-1], dim=0)
+
+            input_metadata.total_num_tokens = torch.sum(input_metadata.seq_lens).item()
+            max_extend_len = None
+        else:
+            start_loc = max_seq_len = None
+            prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
+            max_extend_len = torch.max(input_metadata.seq_lens - prefix_lens).item()
+
+        self.forward_metadata = start_loc, max_seq_len, max_extend_len
+
+    def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        if layer.qk_head_dim != layer.v_head_dim:
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+        else:
+            o = torch.empty_like(q)
+
+        input_metadata.token_to_kv_pool.set_kv_buffer(
+            layer.layer_id, input_metadata.out_cache_loc, k, v
+        )
+
+        start_loc, max_seq_len, max_extend_len = self.forward_metadata
+
+        extend_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k.contiguous(),
+            v.contiguous(),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            input_metadata.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            input_metadata.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            input_metadata.req_to_token_pool.req_to_token,
+            input_metadata.req_pool_indices,
+            input_metadata.seq_lens,
+            input_metadata.extend_seq_lens,
+            input_metadata.extend_start_loc,
+            max_extend_len,
+            layer.scaling,
+            layer.logit_cap,
+        )
+
+        return o
+
+    def forward_decode(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        if layer.qk_head_dim != layer.v_head_dim:
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+        else:
+            o = torch.empty_like(q)
+
+        start_loc, max_seq_len, max_extend_len = self.forward_metadata
+
+        input_metadata.token_to_kv_pool.set_kv_buffer(
+            layer.layer_id, input_metadata.out_cache_loc, k, v
+        )
+
+        decode_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            input_metadata.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            input_metadata.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            input_metadata.req_to_token_pool.req_to_token,
+            input_metadata.req_pool_indices,
+            start_loc,
+            input_metadata.seq_lens,
+            max_seq_len,
+            input_metadata.total_num_tokens,
+            layer.scaling,
+            layer.logit_cap,
+        )
+
+        return o
