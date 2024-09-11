@@ -81,6 +81,7 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             # Two wrappers: one for sliding window attention and one for full attention.
             # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+            self.prefill_wrapper_ragged = None
             self.prefill_wrapper_paged = []
             self.decode_wrapper = []
             for _ in range(2):
@@ -115,6 +116,8 @@ class FlashInferAttnBackend(AttentionBackend):
             ):
                 use_ragged = True
 
+            total_num_tokens = torch.sum(input_metadata.seq_lens).item()
+
         update_flashinfer_indices(
             input_metadata.forward_mode,
             self.model_runner,
@@ -124,7 +127,7 @@ class FlashInferAttnBackend(AttentionBackend):
             use_ragged=use_ragged,
         )
 
-        self.forward_metadata = (use_ragged, self.decode_wrapper)
+        self.forward_metadata = (use_ragged, total_num_tokens, self.decode_wrapper)
 
     def init_cuda_graph_state(self, max_bs: int):
         self.cuda_graph_kv_indptr = torch.zeros(
@@ -188,7 +191,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.cuda_graph_metadata[bs] = decode_wrapper
 
-        self.forward_metadata = (False, decode_wrapper)
+        self.forward_metadata = (False, None, decode_wrapper)
 
     def replay_cuda_graph_init(self, bs: int, req_pool_indices, seq_lens):
         update_flashinfer_indices(
@@ -209,7 +212,7 @@ class FlashInferAttnBackend(AttentionBackend):
             else:
                 prefill_wrapper_paged = self.prefill_wrapper_paged[1]
 
-        use_ragged = self.forward_metadata[0]
+        use_ragged, total_num_tokens, decode_wrapper = self.forward_metadata
 
         if not use_ragged:
             if k is not None:
@@ -258,7 +261,7 @@ class FlashInferAttnBackend(AttentionBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
-        decode_wrapper = self.forward_metadata[1]
+        use_ragged, total_num_tokens, decode_wrapper = self.forward_metadata
 
         if isinstance(decode_wrapper, list):
             if layer.sliding_window_size != -1:
@@ -309,14 +312,14 @@ class TritonAttnBackend(AttentionBackend):
             start_loc = torch.zeros_like(input_metadata.seq_lens, dtype=torch.int32)
             start_loc[1:] = torch.cumsum(input_metadata.seq_lens[:-1], dim=0)
 
-            input_metadata.total_num_tokens = torch.sum(input_metadata.seq_lens).item()
+            total_num_tokens = torch.sum(input_metadata.seq_lens).item()
             max_extend_len = None
         else:
-            start_loc = max_seq_len = None
+            start_loc = max_seq_len = total_num_tokens = None
             prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
             max_extend_len = torch.max(input_metadata.seq_lens - prefix_lens).item()
 
-        self.forward_metadata = start_loc, max_seq_len, max_extend_len
+        self.forward_metadata = start_loc, max_seq_len, max_extend_len, total_num_tokens
 
     def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
         if layer.qk_head_dim != layer.v_head_dim:
@@ -328,7 +331,7 @@ class TritonAttnBackend(AttentionBackend):
             layer.layer_id, input_metadata.out_cache_loc, k, v
         )
 
-        start_loc, max_seq_len, max_extend_len = self.forward_metadata
+        start_loc, max_seq_len, max_extend_len, total_num_tokens = self.forward_metadata
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -355,7 +358,7 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        start_loc, max_seq_len, max_extend_len = self.forward_metadata
+        start_loc, max_seq_len, max_extend_len, total_num_tokens = self.forward_metadata
 
         input_metadata.token_to_kv_pool.set_kv_buffer(
             layer.layer_id, input_metadata.out_cache_loc, k, v
@@ -371,7 +374,7 @@ class TritonAttnBackend(AttentionBackend):
             start_loc,
             input_metadata.seq_lens,
             max_seq_len,
-            input_metadata.total_num_tokens,
+            total_num_tokens,
             layer.scaling,
             layer.logit_cap,
         )

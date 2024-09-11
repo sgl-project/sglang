@@ -73,9 +73,6 @@ class InputMetadata:
     # Position information
     positions: torch.Tensor = None
 
-    # Total number of tokens
-    total_num_tokens: int = None
-
     # For extend
     extend_seq_lens: torch.Tensor = None
     extend_prefix_lens: torch.Tensor = None
@@ -192,7 +189,6 @@ class InputMetadata:
         if not batch.forward_mode.is_decode():
             ret.init_multimuldal_info(batch)
             ret.compute_extend_infos(batch)
-            ret.total_num_tokens = int(torch.sum(ret.seq_lens))
 
         model_runner.attn_backend.init_forward_metadata(batch, ret)
 
