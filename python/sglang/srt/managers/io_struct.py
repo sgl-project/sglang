@@ -188,7 +188,7 @@ class TokenizedGenerateReqInput:
     modalites: Optional[List[str]] = None
 
     # LoRA related
-    lora_path: Optional[str] = None
+    lora_path: Optional[str] = None  # None means just use the base model
 
 
 @dataclass

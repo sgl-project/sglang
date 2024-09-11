@@ -87,6 +87,7 @@ class ModelTpServer:
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
+        self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
 
         # Init model and tokenizer
@@ -329,7 +330,7 @@ class ModelTpServer:
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
-                recv_req.lora_path,
+                lora_path=recv_req.lora_path,
             )
         else:
             req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
@@ -451,18 +452,20 @@ class ModelTpServer:
                 self.current_inflight_req
             )
 
-        lora_set = (
-            set([req.lora_path for req in self.running_batch.reqs])
-            if self.running_batch is not None
-            else set([])
-        )
+        if self.lora_paths is not None:
+            lora_set = (
+                set([req.lora_path for req in self.running_batch.reqs])
+                if self.running_batch is not None
+                else set([])
+            )
 
         for req in self.waiting_queue:
             if adder.no_remaining_tokens():
                 break
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
             if (
-                len(
+                self.lora_paths is not None
+                and len(
                     lora_set
                     | set([req.lora_path for req in adder.can_run_list])
                     | set([req.lora_path])

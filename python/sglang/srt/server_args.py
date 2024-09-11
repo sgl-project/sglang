@@ -103,7 +103,7 @@ class ServerArgs:
 
     # LoRA
     lora_paths: Optional[List[str]] = None
-    max_loras_per_batch: Optional[int] = 8
+    max_loras_per_batch: int = 8
 
     def __post_init__(self):
         # Set missing default values
@@ -538,7 +538,7 @@ class ServerArgs:
             "--max-loras-per-batch",
             type=int,
             default=8,
-            help="Maximum number of adapters for a running batch",
+            help="Maximum number of adapters for a running batch, include base-only request",
         )
 
     @classmethod
@@ -559,8 +559,9 @@ class ServerArgs:
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
         assert (
+            self.max_loras_per_batch > 0
             # FIXME
-            (self.lora_paths is None or self.disable_cuda_graph)
+            and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
 

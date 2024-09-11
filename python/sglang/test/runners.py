@@ -131,7 +131,7 @@ class HFRunner:
                         else:
                             input_ids = torch.tensor([p], device="cuda")
 
-                        if lora_paths is not None:
+                        if lora_paths is not None and lora_paths[i] is not None:
                             self.model = PeftModel.from_pretrained(
                                 self.base_model,
                                 lora_paths[i],
@@ -250,7 +250,7 @@ class SRTRunner:
             for i, prompt in enumerate(prompts):
                 response = self.runtime.generate(
                     prompt,
-                    lora_paths=lora_paths[i] if lora_paths else None,
+                    lora_path=lora_paths[i] if lora_paths else None,
                     sampling_params=sampling_params,
                     return_logprob=True,
                     logprob_start_len=0,
@@ -306,11 +306,8 @@ class SRTRunner:
             sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
             response = self.runtime.generate(
                 prompts,
-                lora_paths=lora_paths if lora_paths else None,
+                lora_path=lora_paths if lora_paths else None,
                 sampling_params=sampling_params,
-                return_logprob=True,
-                logprob_start_len=0,
-                top_logprobs_num=NUM_TOP_LOGPROBS,
             )
             response = json.loads(response)
             output_strs = [r["text"] for r in response]

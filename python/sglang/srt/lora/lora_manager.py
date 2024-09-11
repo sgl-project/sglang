@@ -177,7 +177,7 @@ class LoRAManager:
                 ]
 
     def init_lora_batch(self):
-        self.active_uids = [None] * self.max_loras_per_batch  # list of active loras
+        self.active_uids = set()  # set of active loras
         self.buffer_id = {}  # lora uid -> idx in memory pool
 
     def get_weight_name(self, name, idx):
@@ -187,6 +187,12 @@ class LoRAManager:
 
     def load_lora(self, uid, buffer_id):
         num_layer = self.base_hf_config.num_hidden_layers
+        if uid is None:
+            for i in range(num_layer):
+                for k in self.A_buffer.keys():
+                    self.A_buffer[k][i][buffer_id] *= 0
+            return
+
         for i in range(num_layer):
             layer_weights = self.loras[self.lora_id[uid]].layers[i].weights
             for name, weights in layer_weights.items():
@@ -204,17 +210,20 @@ class LoRAManager:
         cur_uids = set([req.lora_path for req in batch.reqs])
         assert len(cur_uids) <= self.max_loras_per_batch
         i = 0
+        evictable_uids = list(self.active_uids)
         for uid in cur_uids:
             if uid not in self.active_uids:
-                while self.active_uids[i] in cur_uids:
+                while i < len(evictable_uids) and evictable_uids[i] in cur_uids:
                     i += 1
+                if i < len(evictable_uids):
+                    self.active_uids.remove(evictable_uids[i])
+                    self.buffer_id.pop(evictable_uids[i])
                 self.load_lora(uid, i)
-                if self.active_uids[i] is not None:
-                    self.buffer_id.pop(self.active_uids[i])
-                self.active_uids[i] = uid
+                self.active_uids.add(uid)
                 self.buffer_id[uid] = i
+                i += 1
 
-        if None in cur_uids:
+        if cur_uids == set([None]):
             return
 
         # setup lora in forward modules

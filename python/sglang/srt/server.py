@@ -606,21 +606,22 @@ class Runtime:
 
     def generate(
         self,
-        prompts: Union[str, List[str]],
+        prompt: Union[str, List[str]],
         sampling_params: Optional[Dict] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
-        lora_paths: Optional[List[Optional[str]]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
     ):
         json_data = {
-            "text": prompts,
+            "text": prompt,
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
             "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
-            "lora_path": lora_paths,
+            "lora_path": lora_path,
         }
+        assert not isinstance(lora_path, list) or len(lora_path) == len(prompt)
         response = requests.post(
             self.url + "/generate",
             json=json_data,
@@ -629,10 +630,10 @@ class Runtime:
 
     def encode(
         self,
-        prompts: Union[str, List[str]],
+        prompt: Union[str, List[str]],
     ):
         json_data = {
-            "text": prompts,
+            "text": prompt,
         }
         response = requests.post(
             self.url + "/encode",

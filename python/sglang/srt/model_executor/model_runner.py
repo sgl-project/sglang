@@ -41,7 +41,6 @@ from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.layers.attention_backend import FlashInferAttnBackend, TritonAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import SampleOutput
-from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
@@ -76,7 +75,6 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
-        lora_config: Optional[LoRAConfig] = None,
     ):
         # Parse args
         self.model_config = model_config
