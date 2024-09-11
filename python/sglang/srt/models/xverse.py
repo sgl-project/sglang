@@ -191,7 +191,9 @@ class XverseDecoderLayer(nn.Module):
             )
         rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+        num_kv_heads = getattr(
+            config, "num_key_value_heads", config.num_attention_heads
+        )
         self.self_attn = XverseAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -306,7 +308,7 @@ class XverseForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
         self.sampler = Sampler()
-        
+
         self.param_dict = dict(self.named_parameters())
 
     @torch.no_grad()
