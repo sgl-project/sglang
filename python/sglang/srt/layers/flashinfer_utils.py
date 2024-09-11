@@ -10,8 +10,8 @@ def create_flashinfer_kv_indices_triton(
     page_kernel_lens_ptr,
     kv_indptr,
     kv_start_idx,
-    max_context_len,
     kv_indices_ptr,
+    max_context_len: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
@@ -103,8 +103,8 @@ class FlashinferUpdater:
             paged_kernel_lens,
             self.kv_indptr,
             None,
-            self.model_runner.req_to_token_pool.req_to_token.size(1),
             self.kv_indices,
+            self.model_runner.req_to_token_pool.req_to_token.size(1),
         )
 
     def _init_indices_window(self, wrapper_id):
@@ -139,8 +139,8 @@ class FlashinferUpdater:
             paged_kernel_lens,
             self.kv_indptr,
             kv_start_idx,
-            self.model_runner.req_to_token_pool.req_to_token.size(1),
             self.kv_indices,
+            self.model_runner.req_to_token_pool.req_to_token.size(1),
         )
 
     def _update_decode_indices(self, decode_wrapper):
