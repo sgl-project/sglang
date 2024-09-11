@@ -247,9 +247,7 @@ class CudaGraphRunner:
         self.sampling_info.inplace_assign(raw_bs, batch.sampling_info)
 
         # Replay
-        torch.cuda.synchronize()
         self.graphs[bs].replay()
-        torch.cuda.synchronize()
         sample_output, logits_output = self.output_buffers[bs]
 
         # Unpad
