@@ -349,6 +349,7 @@ class ScheduleBatch:
 
     # For mixed chunekd prefill
     prefix_lens_cpu: List[int] = None
+    running_bs: int = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -446,6 +447,9 @@ class ScheduleBatch:
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
+        self.forward_mode = ForwardMode.MIXED
+        self.running_bs = running_batch.batch_size()
+
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         prefix_lens_cpu = [len(r.prefix_indices) for r in self.reqs]
         prefix_lens_cpu.extend(
