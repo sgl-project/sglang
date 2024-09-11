@@ -24,10 +24,10 @@ from sglang.global_config import global_config
 from sglang.srt.layers.flashinfer_utils import update_flashinfer_indices
 from sglang.srt.layers.triton_attention.decode_attention import decode_attention_fwd
 from sglang.srt.layers.triton_attention.extend_attention import extend_attention_fwd
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.model_executor.forward_batch_info import InputMetadata
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -58,9 +58,9 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner.model_config.num_attention_heads // model_runner.tp_size,
             model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
         ):
-            decode_use_tensor_cores = True
+            self.decode_use_tensor_cores = True
         else:
-            decode_use_tensor_cores = False
+            self.decode_use_tensor_cores = False
 
         self.workspace_buffer = torch.empty(
             global_config.flashinfer_workspace_size,
@@ -78,7 +78,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self.workspace_buffer,
                 "NHD",
-                use_tensor_cores=decode_use_tensor_cores,
+                use_tensor_cores=self.decode_use_tensor_cores,
             )
         else:
             # Two wrappers: one for sliding window attention and one for full attention.
@@ -93,11 +93,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchDecodeWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        use_tensor_cores=decode_use_tensor_cores,
+                        use_tensor_cores=self.decode_use_tensor_cores,
                     )
                 )
 
         self.forward_metadata = None
+        self.cuda_graph_metadata = {}
 
     def init_forward_metadata(
         self, batch: ScheduleBatch, input_metadata: InputMetadata
@@ -125,7 +126,81 @@ class FlashInferAttnBackend(AttentionBackend):
             use_ragged=use_ragged,
         )
 
-        self.forward_metadata = (use_ragged,)
+        self.forward_metadata = (use_ragged, self.decode_wrapper)
+
+    def init_cuda_graph_state(self, max_bs: int):
+        self.cuda_graph_kv_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device="cuda"
+        )
+        self.cuda_graph_kv_indices = torch.zeros(
+            (max_bs * self.model_runner.model_config.context_len,),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.cuda_graph_kv_last_page_len = torch.ones(
+            (max_bs,), dtype=torch.int32, device="cuda"
+        )
+
+        if self.model_runner.sliding_window_size is not None:
+            self.cuda_graph_kv_indptr = [
+                self.cuda_graph__kv_indptr,
+                self.cuda_graph__kv_indptr.clone(),
+            ]
+            self.cuda_graph_kv_indices = [
+                self.cuda_graph_kv_indices,
+                self.cuda_graph_kv_indices.clone(),
+            ]
+
+    def capture_cuda_graph_init(self, bs: int, req_pool_indices, seq_lens):
+        if self.model_runner.sliding_window_size is None:
+            decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                use_cuda_graph=True,
+                use_tensor_cores=self.decode_use_tensor_cores,
+                paged_kv_indptr_buffer=self.cuda_graph_kv_indptr[: bs + 1],
+                paged_kv_indices_buffer=self.cuda_graph_kv_indices,
+                paged_kv_last_page_len_buffer=self.cuda_graph_kv_last_page_len[:bs],
+            )
+        else:
+            decode_wrapper = []
+            for i in range(2):
+                decode_wrapper.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        use_cuda_graph=True,
+                        use_tensor_cores=self.decode_use_tensor_cores,
+                        paged_kv_indptr_buffer=self.flashinfer_kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buffer=self.flashinfer_kv_indices[i],
+                        paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[
+                            :bs
+                        ],
+                    )
+                )
+
+        update_flashinfer_indices(
+            ForwardMode.DECODE,
+            self.model_runner,
+            req_pool_indices,
+            seq_lens,
+            None,
+            decode_wrapper,
+        )
+
+        self.cuda_graph_metadata[bs] = decode_wrapper
+
+        self.forward_metadata = (False, decode_wrapper)
+
+    def replay_cuda_graph_init(self, bs: int, req_pool_indices, seq_lens):
+        update_flashinfer_indices(
+            ForwardMode.DECODE,
+            self.model_runner,
+            req_pool_indices[:bs],
+            seq_lens[:bs],
+            None,
+            self.cuda_graph_metadata[bs],
+        )
 
     def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
         if not isinstance(self.prefill_wrapper_paged, list):
@@ -185,13 +260,13 @@ class FlashInferAttnBackend(AttentionBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
-        if not isinstance(self.decode_wrapper, list):
-            decode_wrapper = self.decode_wrapper
-        else:
+        decode_wrapper = self.forward_metadata[1]
+
+        if isinstance(decode_wrapper, list):
             if layer.sliding_window_size != -1:
-                decode_wrapper = self.decode_wrapper[0]
+                decode_wrapper = decode_wrapper[0]
             else:
-                decode_wrapper = self.decode_wrapper[1]
+                decode_wrapper = decode_wrapper[1]
 
         if k is not None:
             assert v is not None

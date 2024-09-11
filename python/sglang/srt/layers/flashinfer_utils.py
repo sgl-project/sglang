@@ -75,14 +75,10 @@ class FlashinferUpdater:
             self.prefill_wrapper_ragged,
             self.prefill_wrapper_paged,
         ) = (
-            decode_wrapper,
+            decode_wrapper or self.model_runner.attn_backend.decode_wrapper,
             self.model_runner.attn_backend.prefill_wrapper_ragged,
             self.model_runner.attn_backend.prefill_wrapper_paged,
         )
-
-        # CUDA graph uses a different flashinfer_decode_wrapper
-        if self.decode_wrapper is None:
-            self.decode_wrapper = self.model_runner.attn_backend.decode_wrapper
 
     def _init_indices_no_sliding_window(self):
         if self.use_ragged:
