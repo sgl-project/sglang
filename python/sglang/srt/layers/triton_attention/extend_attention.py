@@ -22,7 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.prefill_attention import context_attention_fwd
+from sglang.srt.layers.triton_attention.prefill_attention import context_attention_fwd
 
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
@@ -280,12 +280,15 @@ def extend_attention_fwd(
     assert Lq == Lk and Lv == Lo
 
     # TODO: is the assertion necessary?
-    assert Lq in {16, 32, 64, 96, 128, 256, 576}
+    assert Lq in {16, 32, 64, 96, 128, 256, 576, 288}
     assert Lv in {16, 32, 64, 96, 128, 256, 512}
 
     if Lq == 576:
         BLOCK_DMODEL = 512
         BLOCK_DPE = 64
+    elif Lq == 288:
+        BLOCK_DMODEL = 256
+        BLOCK_DPE = 32
     else:
         BLOCK_DMODEL = triton.next_power_of_2(Lq)
         BLOCK_DPE = 0

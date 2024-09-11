@@ -29,6 +29,7 @@ import torch.distributed
 import torch.distributed as dist
 
 from sglang.global_config import global_config
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -52,7 +53,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -128,7 +128,7 @@ class ModelTpServer:
                 if server_args.max_running_requests is None
                 else server_args.max_running_requests
             ),
-            self.model_runner.req_to_token_pool.size - 1,
+            self.model_runner.req_to_token_pool.size,
         )
         self.max_req_input_len = min(
             self.model_config.context_len - 1,
