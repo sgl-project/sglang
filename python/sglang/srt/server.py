@@ -447,13 +447,12 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         time.sleep(1)
         try:
             res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
-            assert res.status_code == 200, f"{res}"
+            assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
-        except (AssertionError, requests.exceptions.RequestException) as e:
+        except (AssertionError, requests.exceptions.RequestException):
             last_traceback = get_exception_traceback()
             pass
-    model_info = res.json()
 
     if not success:
         if pipe_finish_writer is not None:
@@ -461,6 +460,8 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_child_process(pid, including_parent=False)
         return
+
+    model_info = res.json()
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
