@@ -199,8 +199,6 @@ def _decode_att_m_fwd(
     BLOCK = 32
     # shape constraints
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
-    assert Lq == Lk
-    assert Lk in {16, 32, 64, 96, 128, 256}
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
 
@@ -482,8 +480,6 @@ def _decode_grouped_att_m_fwd(
     BLOCK = 32
     # shape constraints
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
-    assert Lq == Lk
-    assert Lk in {16, 32, 64, 96, 128, 256, 576, 288}
 
     if Lk == 576:
         BLOCK_DMODEL = 512
