@@ -143,8 +143,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if self.model_runner.sliding_window_size is not None:
             self.cuda_graph_kv_indptr = [
-                self.cuda_graph__kv_indptr,
-                self.cuda_graph__kv_indptr.clone(),
+                self.cuda_graph_kv_indptr,
+                self.cuda_graph_kv_indptr.clone(),
             ]
             self.cuda_graph_kv_indices = [
                 self.cuda_graph_kv_indices,
