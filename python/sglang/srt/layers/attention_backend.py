@@ -169,9 +169,9 @@ class FlashInferAttnBackend(AttentionBackend):
                         "NHD",
                         use_cuda_graph=True,
                         use_tensor_cores=self.decode_use_tensor_cores,
-                        paged_kv_indptr_buffer=self.flashinfer_kv_indptr[i][: bs + 1],
-                        paged_kv_indices_buffer=self.flashinfer_kv_indices[i],
-                        paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[
+                        paged_kv_indptr_buffer=self.cuda_graph_kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buffer=self.cuda_graph_kv_last_page_len[
                             :bs
                         ],
                     )
