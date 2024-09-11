@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from typing import Type
+
 import torch
 
 
@@ -20,6 +22,25 @@ class SpecDraftInfo:
     pass
 
 
+class SpecDraftInfoFactory:
+    def __init__(self):
+        self.factory = {}
+
+    def register(self, name: str) -> SpecDraftInfo:
+        def wrapper(info: Type[SpecDraftInfo]) -> Type[SpecDraftInfo]:
+            self.factory[name] = info
+            return info
+
+        return wrapper
+
+    def get(self, name):
+        return self.factory[name]
+
+
+DraftInfoFactory = SpecDraftInfoFactory()
+
+
+@DraftInfoFactory.register("EAGLE")
 class EAGLEDraftInfo(SpecDraftInfo):
     def __init__(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor, output_token
@@ -36,6 +57,3 @@ class SpecInfoPipline:
     def __init__(self):
         self.draft_input_queue = torch.multiprocessing.Queue()
         self.draft_output_queue = torch.multiprocessing.Queue()
-
-
-

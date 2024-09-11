@@ -78,6 +78,7 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        is_draft_runner: bool,
     ):
         # Parse args
         self.model_config = model_config
@@ -87,6 +88,7 @@ class ModelRunner:
         self.tp_size = tp_size
         self.nccl_port = nccl_port
         self.server_args = server_args
+        self.is_draft_runner = is_draft_runner
         self.is_multimodal_model = is_multimodal_model(
             self.model_config.hf_config.architectures
         )
@@ -177,7 +179,11 @@ class ModelRunner:
         self.device_config = DeviceConfig()
         self.load_config = LoadConfig(load_format=self.server_args.load_format)
         self.vllm_model_config = VllmModelConfig(
-            model=self.server_args.model_path,
+            model=(
+                self.server_args.draft_model_path
+                if self.is_draft_runner
+                else self.server_args.model_path
+            ),
             quantization=self.server_args.quantization,
             tokenizer=None,
             tokenizer_mode=None,
@@ -333,9 +339,22 @@ class ModelRunner:
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
-        rest_memory = available_gpu_memory - total_gpu_memory * (
-            1 - self.mem_fraction_static
-        )
+        if self.server_args.speculative_algorithm is not None:
+            if self.is_draft_runner:
+                rest_memory = available_gpu_memory - total_gpu_memory * (
+                    1
+                    - self.server_args.draft_mem_fraction
+                    - self.server_args.mem_fraction_static
+                )
+            else:
+                rest_memory = available_gpu_memory - total_gpu_memory * (
+                    1 - self.server_args.mem_fraction_static
+                )
+        else:
+            rest_memory = available_gpu_memory - total_gpu_memory * (
+                1 - self.mem_fraction_static
+            )
+
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
@@ -539,9 +558,11 @@ class ModelRunner:
             ForwardMode.DECODE,
         )
 
-        return self.model.forward(
+        ret = self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
         )
+        batch.spec_draft_info = input_metadata.spec_draft_info
+        return ret
 
     @torch.inference_mode()
     def forward_extend(self, batch: ScheduleBatch):
@@ -551,9 +572,11 @@ class ModelRunner:
             forward_mode=ForwardMode.EXTEND,
         )
         if self.is_generation:
-            return self.model.forward(
+            ret = self.model.forward(
                 batch.input_ids, input_metadata.positions, input_metadata
             )
+            batch.spec_draft_info = input_metadata.spec_draft_info
+            return ret
         else:
             # Only embedding models have get_embedding parameter
             return self.model.forward(

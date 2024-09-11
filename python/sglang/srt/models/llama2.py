@@ -42,6 +42,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.sampler import Sampler
+from sglang.srt.managers.speculative_utils import DraftInfoFactory
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
@@ -318,6 +319,10 @@ class LlamaForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
         sample_output = self.sampler(logits_output, input_metadata.sampling_info)
+        if input_metadata.forward_mode.is_spec_mode():
+            input_metadata.spec_draft_info = DraftInfoFactory.get(
+                input_metadata.spec_algorithm
+            )(hidden_states, sample_output)
         return sample_output, logits_output
 
     def get_module_name(self, name):

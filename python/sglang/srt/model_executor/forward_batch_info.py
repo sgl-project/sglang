@@ -24,8 +24,8 @@ import numpy as np
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.managers.speculative_utils import SpecDraftInfo
+from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -43,7 +43,9 @@ class ForwardMode(IntEnum):
     SPECEXTEND = auto()
     # Speculative verify.
     SPECVERIFY = auto()
-    
+
+    def is_spec_mode(self):
+        return self in (self.SPECEXTEND, self.SPECVERIFY)
 
 
 @dataclass
@@ -94,9 +96,10 @@ class InputMetadata:
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
     flashinfer_use_ragged: bool = False
-    
+
     # Information used for speculative decoding
-    draft_info : SpecDraftInfo = None
+    spec_draft_info: SpecDraftInfo = None
+    spec_algorithm: str = None
 
     def init_multimuldal_info(self, batch: ScheduleBatch):
         reqs = batch.reqs
@@ -222,7 +225,7 @@ class InputMetadata:
             ret.init_flashinfer_handlers(
                 model_runner, batch.prefix_lens_cpu, flashinfer_use_ragged
             )
-
+        ret.spec_algorithm = model_runner.server_args.speculative_algorithm
         return ret
 
     def init_triton_args(self, batch: ScheduleBatch):

@@ -30,7 +30,7 @@ class ServerArgs:
     model_path: str
     draft_model_path: str = None
     speculative_algorithm: str = None
-    draft_mem_fraction: float = 0.1
+    draft_mem_fraction: float = None
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
@@ -156,7 +156,7 @@ class ServerArgs:
             help="The fraction of the memory used for static allocation of draft model in Speculative Decoding.",
             required=False,
         )
-        
+
         parser.add_argument(
             "--tokenizer-path",
             type=str,

@@ -16,7 +16,6 @@ limitations under the License.
 """A tensor parallel worker."""
 
 import logging
-import torch.multiprocessing as multiprocessing
 import os
 import pickle
 import time
@@ -26,6 +25,7 @@ from typing import Any, List, Optional, Union
 import torch
 import torch.distributed
 import torch.distributed as dist
+import torch.multiprocessing as multiprocessing
 
 from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
@@ -49,6 +49,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.speculative_utils import SpecInfoPipline
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
@@ -62,7 +63,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
-from sglang.srt.managers.speculative_utils import SpecInfoPipline
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class ModelTpServer:
         server_args: ServerArgs,
         nccl_port: int,
         model_overide_args: dict,
-        spec_queue: SpecInfoPipline
+        spec_queue: SpecInfoPipline,
     ):
         suppress_other_loggers()
 
@@ -89,8 +89,9 @@ class ModelTpServer:
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
-        self.is_spec_worker = False
-
+        self.is_spec_worker = server_args.speculative_algorithm is not None
+        self.spec_queue = spec_queue
+        self.is_draft_worker = self.__class__.__name__ == "SpecDraftServer"
         # Init model and tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,
@@ -101,12 +102,17 @@ class ModelTpServer:
 
         self.model_runner = ModelRunner(
             model_config=self.model_config,
-            mem_fraction_static= server_args.draft_mem_fraction if self.is_spec_worker else server_args.mem_fraction_static ,
+            mem_fraction_static=(
+                server_args.draft_mem_fraction
+                if self.is_draft_worker
+                else server_args.mem_fraction_static
+            ),
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
+            is_draft_runner=self.is_draft_worker,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -261,12 +267,14 @@ class ModelTpServer:
         if new_batch is not None:
             # Run a new prefill batch
             self.forward_prefill_batch(new_batch)
-
-            if not new_batch.is_empty():
-                if self.running_batch is None:
-                    self.running_batch = new_batch
-                else:
-                    self.running_batch.merge(new_batch)
+            if self.is_spec_worker:
+                self.spec_queue.draft_input_queue.put(new_batch)
+            else:
+                if not new_batch.is_empty():
+                    if self.running_batch is None:
+                        self.running_batch = new_batch
+                    else:
+                        self.running_batch.merge(new_batch)
         else:
             # Run a decode batch
             if self.running_batch is not None:
@@ -285,6 +293,8 @@ class ModelTpServer:
 
                     if self.out_pyobjs and self.running_batch.has_stream():
                         break
+            elif self.is_spec_worker:
+                self.forward_verify_batch()
             else:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
@@ -724,6 +734,12 @@ class ModelTpServer:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
 
         self.handle_finished_requests(batch)
+
+    def forward_verify_batch(self):
+        recv_batch = []
+        while not self.spec_queue.draft_output_queue.empty():
+            recv_batch.append(self.spec_queue.draft_output_queue.get())
+        pass
 
     def handle_finished_requests(self, batch: ScheduleBatch):
         output_rids = []

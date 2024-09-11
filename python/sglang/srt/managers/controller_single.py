@@ -16,12 +16,14 @@ limitations under the License.
 """A controller that manages a group of tensor parallel workers."""
 
 import logging
-import torch.multiprocessing as multiprocessing
 import multiprocessing as mp
 from typing import List
 
+import torch.multiprocessing as multiprocessing
 import zmq
 
+from sglang.srt.managers.speculative_utils import SpecInfoPipline
+from sglang.srt.managers.speculative_worker import SpecDraftServer
 from sglang.srt.managers.tp_worker import (
     ModelTpServer,
     broadcast_recv_input,
@@ -30,9 +32,6 @@ from sglang.srt.managers.tp_worker import (
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, kill_parent_process
 from sglang.utils import get_exception_traceback
-from sglang.srt.managers.speculative_utils import SpecInfoPipline
-from sglang.srt.managers.speculative_worker import SpecDraftServer
-from sglang.srt.managers.speculative_utils import SpecInfoPipline
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +49,7 @@ class ControllerSingle:
         dp_worker_id: int,
         mp_queue: multiprocessing.Queue,
         spec_queue: SpecInfoPipline,
+        init_flag: multiprocessing.Event = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -91,9 +91,11 @@ class ControllerSingle:
             server_args,
             port_args.nccl_ports[dp_worker_id],
             model_overide_args,
-            spec_queue
+            spec_queue,
         )
         self.tp_cpu_group = self.tp_server.model_runner.tp_group.cpu_group
+        if init_flag is not None:
+            init_flag.set()
 
     def loop_for_forward(self):
         while True:
@@ -153,8 +155,26 @@ def start_controller_process(
 
     try:
         spec_queue = None
+        flag = None
         if server_args.speculative_algorithm is not None:
             spec_queue = SpecInfoPipline()
+            flag = multiprocessing.Event()
+
+        controller = ControllerSingle(
+            server_args,
+            port_args,
+            model_overide_args,
+            gpu_ids,
+            is_data_parallel_worker,
+            dp_worker_id,
+            queue,
+            spec_queue,
+            flag,
+        )
+
+        if server_args.speculative_algorithm is not None:
+            flag.wait()
+            # draft process should be launch after target process.
             proc = multiprocessing.Process(
                 target=start_spec_controller_process,
                 args=(
@@ -170,16 +190,6 @@ def start_controller_process(
                 ),
             )
             proc.start()
-        controller = ControllerSingle(
-            server_args,
-            port_args,
-            model_overide_args,
-            gpu_ids,
-            is_data_parallel_worker,
-            dp_worker_id,
-            queue,
-            spec_queue,
-        )
     except Exception:
         pipe_writer.send(get_exception_traceback())
         raise
@@ -218,16 +228,15 @@ class ControllerSingleSpecDraft(ControllerSingle):
             gpu_ids[0],
             0,
             server_args,
-            port_args.nccl_ports[dp_worker_id*2+1],
+            port_args.nccl_ports[dp_worker_id * 2 + 1],
             model_overide_args,
-            spec_queue
+            spec_queue,
         )
 
     def loop_for_forward(self):
         while True:
             recv_reqs = self.recv_requests_from_mp_queue()
-            self.tp_server.exposed_step(recv_reqs)
-
+            self.spec_server.exposed_step(recv_reqs)
 
     def recv_requests_from_mp_queue(self):
         recv_reqs = []
@@ -245,7 +254,7 @@ def start_spec_controller_process(
     gpu_ids: List[int] = None,
     dp_worker_id: int = None,
     queue: mp.connection.Connection = None,
-    spec_queue: SpecInfoPipline = None
+    spec_queue: SpecInfoPipline = None,
 ):
     """Start a controller process."""
     if is_data_parallel_worker:
@@ -268,8 +277,10 @@ def start_spec_controller_process(
     except Exception:
         pipe_writer.send(get_exception_traceback())
         raise
+    finally:
+        kill_parent_process()
 
-    pipe_writer.send("init ok")
+    pipe_writer.send("draft init ok")
 
     try:
         controller.loop_for_forward()

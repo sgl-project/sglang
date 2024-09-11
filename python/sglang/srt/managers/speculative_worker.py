@@ -13,10 +13,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""A tensor parallel worker."""
+"""A speculative draft worker."""
 
+from sglang.srt.managers.speculative_utils import SpecInfoPipline
 from sglang.srt.managers.tp_worker import ModelTpServer
+from sglang.srt.server_args import ServerArgs
 
 
 class SpecDraftServer(ModelTpServer):
-    is_spec_server=True
+    def __init__(
+        self,
+        gpu_id: int,
+        tp_rank: int,
+        server_args: ServerArgs,
+        nccl_port: int,
+        model_overide_args: dict,
+        spec_queue: SpecInfoPipline,
+    ):
+        super().__init__(
+            gpu_id, tp_rank, server_args, nccl_port, model_overide_args, spec_queue
+        )
