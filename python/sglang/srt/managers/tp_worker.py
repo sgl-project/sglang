@@ -128,7 +128,7 @@ class ModelTpServer:
                 if server_args.max_running_requests is None
                 else server_args.max_running_requests
             ),
-            self.model_runner.req_to_token_pool.size - 1,
+            self.model_runner.req_to_token_pool.size,
         )
         self.max_req_input_len = min(
             self.model_config.context_len - 1,

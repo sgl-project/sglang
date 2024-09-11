@@ -20,7 +20,7 @@ class TestTritonAttnBackend(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--disable-flashinfer"],
+            other_args=["--attention-backend", "triton"],
         )
 
     @classmethod
