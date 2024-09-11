@@ -19,7 +19,8 @@ class TestServingThroughput(unittest.TestCase):
         other_args = []
         if disable_radix_cache:
             other_args.append("--disable-radix-cache")
-        other_args.extend(["--attention-backend", attention_backend])
+        if attention_backend:
+            other_args.extend(["--attention-backend", attention_backend])
         other_args.extend(["--chunked-prefill-size", str(chunked_prefill_size)])
         other_args.extend(["--tensor-parallel-size", "2"])
 

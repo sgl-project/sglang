@@ -15,6 +15,7 @@ limitations under the License.
 
 """
 Memory-efficient attention for decoding.
+It supports page size = 1.
 """
 
 # Adapted from
@@ -197,7 +198,6 @@ def _decode_att_m_fwd(
     logit_cap,
 ):
     BLOCK = 32
-    # shape constraints
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
@@ -478,7 +478,6 @@ def _decode_grouped_att_m_fwd(
     logit_cap,
 ):
     BLOCK = 32
-    # shape constraints
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
 
     if Lk == 576:
@@ -570,9 +569,9 @@ def _decode_grouped_softmax_reducev_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_N=BLOCK,
         BLOCK_H=BLOCK_H,
+        Lv=Lv,
         num_warps=num_warps,
         num_stages=1,
-        Lv=Lv,
     )
 
 
@@ -588,7 +587,7 @@ def decode_attention_fwd(
     max_len_in_batch,
     total_num_tokens,
     sm_scale,
-    logit_cap=-1,
+    logit_cap=0.0,
     att_m=None,
 ):
     if att_m is None:
