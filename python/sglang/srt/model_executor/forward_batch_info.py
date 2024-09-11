@@ -67,6 +67,7 @@ class InputMetadata:
 
     # Output location of the KV cache
     out_cache_loc: torch.Tensor
+    running_bs: int = 0
 
     # Position information
     positions: torch.Tensor = None
@@ -175,6 +176,7 @@ class InputMetadata:
             token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,
             out_cache_loc=batch.out_cache_loc,
+            running_bs=batch.running_bs,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
         )

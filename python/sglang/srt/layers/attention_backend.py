@@ -60,10 +60,15 @@ class AttentionBackend(ABC):
 
     def forward(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
         """Run forward on an attention layer."""
-        if input_metadata.forward_mode.is_decode():
+        if input_metadata.forward_mode.is_mixed():
+            return self.forward_mixed(q, k, v, layer, input_metadata)
+        elif input_metadata.forward_mode.is_decode():
             return self.forward_decode(q, k, v, layer, input_metadata)
         else:
             return self.forward_extend(q, k, v, layer, input_metadata)
+
+    def forward_mixed(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        raise NotImplementedError()
 
     def forward_decode(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
         raise NotImplementedError()
@@ -161,6 +166,7 @@ class FlashInferAttnBackend(AttentionBackend):
             input_metadata.seq_lens,
             prefix_lens,
             use_ragged=use_ragged,
+            running_bs=input_metadata.running_bs,
         )
 
         self.forward_metadata = (use_ragged, total_num_tokens, self.decode_wrapper)
@@ -245,6 +251,24 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
+
+    def forward_mixed(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        out_cache_loc = input_metadata.out_cache_loc
+        bs0 = len(out_cache_loc) - input_metadata.running_bs
+        q0, q1 = q[:bs0], q[bs0:]
+        k0, k1 = k[:bs0], k[bs0:]
+        v0, v1 = v[:bs0], v[bs0:]
+        loc0, loc1 = out_cache_loc[:bs0], out_cache_loc[bs0:]
+
+        input_metadata.out_cache_loc = loc0
+        o0 = self.forward_extend(q0, k0, v0, layer, input_metadata)
+
+        input_metadata.out_cache_loc = loc1
+        o1 = self.forward_decode(q1, k1, v1, layer, input_metadata)
+
+        input_metadata.out_cache_loc = out_cache_loc
+
+        return torch.cat([o0, o1], dim=0)
 
     def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
         if not isinstance(self.prefill_wrapper_paged, list):

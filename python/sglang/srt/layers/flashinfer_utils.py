@@ -218,7 +218,16 @@ def update_flashinfer_indices(
     prefix_lens,
     decode_wrapper=None,
     use_ragged=False,
+    running_bs: int = 0,
 ):
+    if forward_mode.is_mixed():
+        bs0 = len(req_pool_indices) - running_bs
+        req_pool_indices1 = req_pool_indices[bs0:]
+        req_pool_indices = req_pool_indices[:bs0]
+        seq_lens1 = seq_lens[bs0:]
+        seq_lens = seq_lens[:bs0]
+        prefix_lens = prefix_lens[:bs0]
+
     updater = FlashinferUpdater(
         forward_mode,
         model_runner,
@@ -233,3 +242,21 @@ def update_flashinfer_indices(
         updater.update_indices_no_sliding_window()
     else:
         updater.update_indices_sliding_window()
+
+    if forward_mode.is_mixed():
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        flashinfer_updater1 = FlashinferUpdater(
+            ForwardMode.DECODE,
+            model_runner,
+            req_pool_indices1,
+            seq_lens1,
+            None,
+            decode_wrapper,
+            use_ragged,
+        )
+
+        if model_runner.sliding_window_size is None:
+            flashinfer_updater1.update_indices_no_sliding_window()
+        else:
+            flashinfer_updater1.update_indices_sliding_window()
