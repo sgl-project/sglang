@@ -277,10 +277,6 @@ def extend_attention_fwd(
         o_extend.shape[-1],
     )
 
-    # TODO: is the assertion necessary?
-    # assert Lq in {16, 32, 64, 96, 128, 256, 576, 288}
-    # assert Lv in {16, 32, 64, 96, 128, 256, 512}
-
     if Lq == 576:
         BLOCK_DMODEL = 512
         BLOCK_DPE = 64
