@@ -244,6 +244,7 @@ class CudaGraphRunner:
         )
 
         # Sampling inputs
+        batch.sampling_info.update_regex_vocab_mask(batch)
         self.sampling_info.inplace_assign(raw_bs, batch.sampling_info)
 
         # Replay
