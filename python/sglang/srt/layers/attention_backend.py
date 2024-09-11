@@ -105,6 +105,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if input_metadata.forward_mode.is_decode():
             prefix_lens = None
             use_ragged = False
+            total_num_tokens = None
         else:
             prefix_lens = input_metadata.extend_prefix_lens
 
