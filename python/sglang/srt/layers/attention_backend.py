@@ -22,8 +22,6 @@ from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
 from sglang.global_config import global_config
 from sglang.srt.layers.flashinfer_utils import update_flashinfer_indices
-from sglang.srt.layers.triton_attention.decode_attention import decode_attention_fwd
-from sglang.srt.layers.triton_attention.extend_attention import extend_attention_fwd
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 
@@ -286,7 +284,18 @@ class FlashInferAttnBackend(AttentionBackend):
 
 class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
+        # Lazy import to avoid the initialization of cuda context
+        from sglang.srt.layers.triton_attention.decode_attention import (
+            decode_attention_fwd,
+        )
+        from sglang.srt.layers.triton_attention.extend_attention import (
+            extend_attention_fwd,
+        )
+
         super().__init__()
+
+        self.decode_attention_fwd = decode_attention_fwd
+        self.extend_attention_fwd = extend_attention_fwd
 
         self.forward_metadata = None
 
@@ -321,7 +330,7 @@ class TritonAttnBackend(AttentionBackend):
 
         start_loc, max_seq_len, max_extend_len = self.forward_metadata
 
-        extend_attention_fwd(
+        self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
@@ -352,7 +361,7 @@ class TritonAttnBackend(AttentionBackend):
             layer.layer_id, input_metadata.out_cache_loc, k, v
         )
 
-        decode_attention_fwd(
+        self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             input_metadata.token_to_kv_pool.get_key_buffer(layer.layer_id),
             input_metadata.token_to_kv_pool.get_value_buffer(layer.layer_id),

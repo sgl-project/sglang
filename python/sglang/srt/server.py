@@ -335,23 +335,19 @@ def launch_server(
             return
 
     # Launch processes
-    tokenizer_manager = TokenizerManager(server_args, port_args)
-    if server_args.chat_template:
-        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
     pipe_controller_reader, pipe_controller_writer = mp.Pipe(duplex=False)
-    pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
     if server_args.dp_size == 1:
         start_controller_process = start_controller_process_single
     else:
         start_controller_process = start_controller_process_multi
-
     proc_controller = mp.Process(
         target=start_controller_process,
         args=(server_args, port_args, pipe_controller_writer),
     )
     proc_controller.start()
 
+    pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
     proc_detoken = mp.Process(
         target=start_detokenizer_process,
         args=(
@@ -361,6 +357,10 @@ def launch_server(
         ),
     )
     proc_detoken.start()
+
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+    if server_args.chat_template:
+        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
 
     # Wait for the model to finish loading
     controller_init_state = pipe_controller_reader.recv()
