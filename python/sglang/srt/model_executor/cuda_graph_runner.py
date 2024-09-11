@@ -25,6 +25,7 @@ from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
+from sglang.srt.layers.flashinfer_utils import update_flashinfer_indices
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
@@ -32,11 +33,7 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.layers.sampler import SampleOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardMode,
-    InputMetadata,
-    update_flashinfer_indices,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import monkey_patch_vllm_all_gather
 
