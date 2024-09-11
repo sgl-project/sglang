@@ -255,7 +255,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 layer.layer_id, input_metadata.out_cache_loc, k, v
             )
 
-            if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
+            if total_num_tokens >= global_config.layer_sync_threshold:
                 torch.cuda.synchronize()
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
