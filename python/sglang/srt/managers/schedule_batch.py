@@ -368,7 +368,7 @@ class ScheduleBatch:
         )
 
     def batch_size(self):
-        return len(self.reqs) if self.reqs is not None else 0
+        return len(self.reqs) if self.reqs else 0
 
     def is_empty(self):
         return len(self.reqs) == 0

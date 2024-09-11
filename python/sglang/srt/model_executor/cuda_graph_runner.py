@@ -13,15 +13,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Run the model with cuda graph."""
+"""Run the model with cuda graph and torch.compile."""
 
 import bisect
 from contextlib import contextmanager
-from typing import Callable, List
+from typing import Callable
 
 import torch
-from flashinfer import BatchDecodeWithPagedKVCacheWrapper
-from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
@@ -55,6 +53,7 @@ def _to_torch(model: torch.nn.Module, reverse: bool = False):
 def patch_model(
     model: torch.nn.Module, enable_compile: bool, tp_group: "GroupCoordinator"
 ):
+    """Patch the model to make it compatible with with torch.compile"""
     backup_ca_comm = None
 
     try:
@@ -86,23 +85,28 @@ def set_torch_compile_config():
 
 
 class CudaGraphRunner:
-    def __init__(
-        self,
-        model_runner: "ModelRunner",
-        max_batch_size_to_capture: int,
-        use_torch_compile: bool,
-        disable_padding: bool,
-    ):
+    """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
+
+    def __init__(self, model_runner: "ModelRunner"):
+        # Parse args
         self.model_runner = model_runner
         self.graphs = {}
         self.input_buffers = {}
         self.output_buffers = {}
         self.flashinfer_handlers = {}
         self.graph_memory_pool = None
-        self.disable_padding = disable_padding
+        self.use_torch_compile = model_runner.server_args.enable_torch_compile
+        self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+
+        # Batch sizes to capture
+        if self.model_runner.server_args.disable_cuda_graph_padding:
+            self.capture_bs = list(range(1, 32)) + [64, 128]
+        else:
+            self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+        self.compile_bs = [1, 2, 4, 8, 16, 24, 32] if self.use_torch_compile else []
 
         # Common inputs
-        self.max_bs = max_batch_size_to_capture
+        self.max_bs = max(self.capture_bs)
         self.input_ids = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
         self.req_pool_indices = torch.zeros(
             (self.max_bs,), dtype=torch.int32, device="cuda"
@@ -115,44 +119,28 @@ class CudaGraphRunner:
             (self.max_bs,), dtype=torch.int32, device="cuda"
         )
 
-        # FlashInfer inputs
-        self.flashinfer_kv_indptr = torch.zeros(
-            (self.max_bs + 1,), dtype=torch.int32, device="cuda"
-        )
-        self.flashinfer_kv_indices = torch.zeros(
-            (self.max_bs * model_runner.model_config.context_len,),
-            dtype=torch.int32,
-            device="cuda",
-        )
-        self.flashinfer_kv_last_page_len = torch.ones(
-            (self.max_bs,), dtype=torch.int32, device="cuda"
-        )
-        if model_runner.sliding_window_size is None:
-            self.flashinfer_workspace_buffer = (
-                self.model_runner.flashinfer_workspace_buffer
-            )
-        else:
-            self.flashinfer_workspace_buffer = (
-                self.model_runner.flashinfer_workspace_buffer
-            )
+        # Attention backend
+        self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
 
-            self.flashinfer_kv_indptr = [
-                self.flashinfer_kv_indptr,
-                self.flashinfer_kv_indptr.clone(),
-            ]
-            self.flashinfer_kv_indices = [
-                self.flashinfer_kv_indices,
-                self.flashinfer_kv_indices.clone(),
-            ]
-
-        # Sampling inputs
+        # Sampling info
         vocab_size = model_runner.model_config.vocab_size
         self.sampling_info = SamplingBatchInfo.dummy_one(self.max_bs, vocab_size)
 
-        self.compile_bs = [1, 2, 4, 8, 16, 24, 32] if use_torch_compile else []
-
-        if use_torch_compile:
+        if self.use_torch_compile:
             set_torch_compile_config()
+
+        # Capture
+        try:
+            self.capture()
+        except RuntimeError as e:
+            raise Exception(
+                f"Capture cuda graph failed: {e}\n"
+                "Possible solutions:\n"
+                "1. disable cuda graph by --disable-cuda-graph\n"
+                "2. set --mem-fraction-static to a smaller value\n"
+                "3. disable torch compile by not using --enable-torch-compile\n"
+                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+            )
 
     def can_run(self, batch_size: int):
         if self.disable_padding:
@@ -160,11 +148,10 @@ class CudaGraphRunner:
         else:
             return batch_size <= self.max_bs
 
-    def capture(self, batch_size_list: List[int]):
-        self.batch_size_list = batch_size_list
+    def capture(self):
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
-            for bs in batch_size_list:
+            for bs in self.capture_bs:
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
@@ -172,14 +159,10 @@ class CudaGraphRunner:
                 ) as forward:
                     (
                         graph,
-                        input_buffers,
                         output_buffers,
-                        flashinfer_handler,
                     ) = self.capture_one_batch_size(bs, forward)
                     self.graphs[bs] = graph
-                    self.input_buffers[bs] = input_buffers
                     self.output_buffers[bs] = output_buffers
-                    self.flashinfer_handlers[bs] = flashinfer_handler
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
@@ -192,48 +175,9 @@ class CudaGraphRunner:
         position_ids_offsets = self.position_ids_offsets[:bs]
         out_cache_loc = self.out_cache_loc[:bs]
 
-        # FlashInfer inputs
-        if not _grouped_size_compiled_for_decode_kernels(
-            self.model_runner.model_config.num_attention_heads
-            // self.model_runner.tp_size,
-            self.model_runner.model_config.get_num_kv_heads(self.model_runner.tp_size),
-        ):
-            use_tensor_cores = True
-        else:
-            use_tensor_cores = False
-        if self.model_runner.sliding_window_size is None:
-            flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                self.flashinfer_workspace_buffer,
-                "NHD",
-                use_cuda_graph=True,
-                use_tensor_cores=use_tensor_cores,
-                paged_kv_indptr_buffer=self.flashinfer_kv_indptr[: bs + 1],
-                paged_kv_indices_buffer=self.flashinfer_kv_indices,
-                paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[:bs],
-            )
-        else:
-            flashinfer_decode_wrapper = []
-            for i in range(2):
-                flashinfer_decode_wrapper.append(
-                    BatchDecodeWithPagedKVCacheWrapper(
-                        self.flashinfer_workspace_buffer,
-                        "NHD",
-                        use_cuda_graph=True,
-                        use_tensor_cores=use_tensor_cores,
-                        paged_kv_indptr_buffer=self.flashinfer_kv_indptr[i][: bs + 1],
-                        paged_kv_indices_buffer=self.flashinfer_kv_indices[i],
-                        paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[
-                            :bs
-                        ],
-                    )
-                )
-        update_flashinfer_indices(
-            ForwardMode.DECODE,
-            self.model_runner,
-            req_pool_indices,
-            seq_lens,
-            None,
-            flashinfer_decode_wrapper,
+        # Attention backend
+        self.model_runner.attn_backend.capture_cuda_graph_init(
+            bs, req_pool_indices, seq_lens
         )
 
         # Run and capture
@@ -246,13 +190,12 @@ class CudaGraphRunner:
                 seq_lens=seq_lens,
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
+                attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
                 return_logprob=False,
                 top_logprobs_nums=0,
                 positions=(seq_lens - 1 + position_ids_offsets).to(torch.int64),
-                flashinfer_decode_wrapper=flashinfer_decode_wrapper,
             )
-
             return forward(input_ids, input_metadata.positions, input_metadata)
 
         for _ in range(2):
@@ -274,15 +217,15 @@ class CudaGraphRunner:
         self.model_runner.tp_group.barrier()
 
         self.graph_memory_pool = graph.pool()
-        return graph, None, out, flashinfer_decode_wrapper
+        return graph, out
 
     def replay(self, batch: ScheduleBatch):
         assert batch.out_cache_loc is not None
         raw_bs = len(batch.reqs)
 
         # Pad
-        index = bisect.bisect_left(self.batch_size_list, raw_bs)
-        bs = self.batch_size_list[index]
+        index = bisect.bisect_left(self.capture_bs, raw_bs)
+        bs = self.capture_bs[index]
         if bs != raw_bs:
             self.seq_lens.zero_()
             self.position_ids_offsets.fill_(1)
@@ -295,14 +238,9 @@ class CudaGraphRunner:
         self.position_ids_offsets[:raw_bs] = batch.position_ids_offsets
         self.out_cache_loc[:raw_bs] = batch.out_cache_loc
 
-        # FlashInfer inputs
-        update_flashinfer_indices(
-            ForwardMode.DECODE,
-            self.model_runner,
-            self.req_pool_indices[:bs],
-            self.seq_lens[:bs],
-            None,
-            self.flashinfer_handlers[bs],
+        # Attention backend
+        self.model_runner.attn_backend.replay_cuda_graph_init(
+            bs, self.req_pool_indices, self.seq_lens
         )
 
         # Sampling inputs

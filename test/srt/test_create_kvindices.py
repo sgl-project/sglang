@@ -55,8 +55,8 @@ class TestCreateKvIndices(unittest.TestCase):
             paged_kernel_lens,
             kv_indptr,
             None,
-            req_to_token.size(1),
             kv_indices_triton,
+            req_to_token.size(1),
         )
 
         # Check
