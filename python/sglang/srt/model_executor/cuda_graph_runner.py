@@ -176,7 +176,7 @@ class CudaGraphRunner:
         out_cache_loc = self.out_cache_loc[:bs]
 
         # Attention backend
-        self.model_runner.attn_backend.capture_cuda_graph_init(
+        self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs, req_pool_indices, seq_lens
         )
 
@@ -239,7 +239,7 @@ class CudaGraphRunner:
         self.out_cache_loc[:raw_bs] = batch.out_cache_loc
 
         # Attention backend
-        self.model_runner.attn_backend.replay_cuda_graph_init(
+        self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs, self.req_pool_indices, self.seq_lens
         )
 

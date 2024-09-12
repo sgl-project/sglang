@@ -445,12 +445,6 @@ class ModelRunner:
         if self.server_args.disable_cuda_graph:
             return
 
-        if self.server_args.attention_backend != "flashinfer":
-            logger.warning(
-                f"Cuda graph is not supported for attention backend: {self.server_args.attention_backend}"
-            )
-            return
-
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
 
