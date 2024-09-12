@@ -55,6 +55,9 @@ class AttentionBackend(ABC):
         """Init the metadata for a forward pass for replying a cuda graph."""
         raise NotImplementedError()
 
+    def get_cuda_graph_seq_len_fill_value(self):
+        raise NotImplementedError()
+
     def forward(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
         """Run forward on an attention layer."""
         if input_metadata.forward_mode.is_decode():
@@ -232,6 +235,9 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_metadata[bs],
         )
 
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 0
+
     def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
         if not isinstance(self.prefill_wrapper_paged, list):
             prefill_wrapper_paged = self.prefill_wrapper_paged
@@ -395,6 +401,9 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_max_seq_len,
             None,
         )
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
 
     def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
         # TODO: reuse the buffer across layers

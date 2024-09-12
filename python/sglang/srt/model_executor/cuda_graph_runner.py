@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,13 +19,12 @@ limitations under the License.
 
 import bisect
 from contextlib import contextmanager
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import torch
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
-from sglang.srt.layers.flashinfer_utils import update_flashinfer_indices
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
@@ -34,6 +35,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import monkey_patch_vllm_all_gather
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool = False):
@@ -111,7 +115,7 @@ class CudaGraphRunner:
         self.req_pool_indices = torch.zeros(
             (self.max_bs,), dtype=torch.int32, device="cuda"
         )
-        self.seq_lens = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+        self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int32, device="cuda")
         self.position_ids_offsets = torch.ones(
             (self.max_bs,), dtype=torch.int32, device="cuda"
         )
@@ -121,6 +125,9 @@ class CudaGraphRunner:
 
         # Attention backend
         self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
+        self.seq_len_fill_value = (
+            self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+        )
 
         # Sampling info
         vocab_size = model_runner.model_config.vocab_size
@@ -227,7 +234,7 @@ class CudaGraphRunner:
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         if bs != raw_bs:
-            self.seq_lens.zero_()
+            self.seq_lens.fill_(self.seq_len_fill_value)
             self.position_ids_offsets.fill_(1)
             self.out_cache_loc.zero_()
 
