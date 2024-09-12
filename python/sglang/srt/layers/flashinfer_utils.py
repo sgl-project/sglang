@@ -66,18 +66,18 @@ class FlashinferUpdater:
         self.head_dim = model_runner.model_config.head_dim
         self.batch_size = len(req_pool_indices)
 
-        self.kv_last_page_len = torch.ones(
-            (self.batch_size,), dtype=torch.int32, device="cuda"
+        self.decode_wrapper = (
+            decode_wrapper or self.model_runner.attn_backend.decode_wrapper
+        )
+        self.prefill_wrapper_ragged = (
+            self.model_runner.attn_backend.prefill_wrapper_ragged
+        )
+        self.prefill_wrapper_paged = (
+            self.model_runner.attn_backend.prefill_wrapper_paged
         )
 
-        (
-            self.decode_wrapper,
-            self.prefill_wrapper_ragged,
-            self.prefill_wrapper_paged,
-        ) = (
-            decode_wrapper or self.model_runner.attn_backend.decode_wrapper,
-            self.model_runner.attn_backend.prefill_wrapper_ragged,
-            self.model_runner.attn_backend.prefill_wrapper_paged,
+        self.kv_last_page_len = torch.ones(
+            (self.batch_size,), dtype=torch.int32, device="cuda"
         )
 
     def _init_indices_no_sliding_window(self):
