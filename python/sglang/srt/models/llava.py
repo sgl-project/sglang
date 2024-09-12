@@ -189,7 +189,10 @@ class LlavaBaseForCausalLM(nn.Module):
                             image_aspect_ratio = (
                                 self.config.image_aspect_ratio
                             )  # single image
-                        elif modalities_list[image_idx] == "multi-images":
+                        elif (
+                            modalities_list[image_idx] == "multi-images"
+                            or modalities_list[image_idx] == "video"
+                        ):
                             image_aspect_ratio = "pad"  # multi image
                         # image_aspect_ratio = (
                         #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
