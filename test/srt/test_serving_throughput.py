@@ -96,6 +96,16 @@ class TestServingThroughput(unittest.TestCase):
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
             assert res["output_throughput"] > 2400
 
+    def test_default_with_triton_attention_backend(self):
+        res = self.run_test(
+            disable_radix_cache=ServerArgs.disable_radix_cache,
+            attention_backend="triton",
+            chunked_prefill_size=-1,
+        )
+
+        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+            assert res["output_throughput"] > 2400
+
 
 if __name__ == "__main__":
     unittest.main()
