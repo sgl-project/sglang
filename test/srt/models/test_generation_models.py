@@ -76,6 +76,7 @@ class TestGenerationModels(unittest.TestCase):
     ) -> None:
         if model_path == "Alibaba-NLP/gte-Qwen2-1.5B-instruct":
             prompts = prompts[:-1]
+
         with HFRunner(
             model_path, torch_dtype=torch_dtype, is_generation=True
         ) as hf_runner:
