@@ -185,11 +185,11 @@ class LlavaBaseForCausalLM(nn.Module):
                     new_image_features = []
                     height = width = self.num_patches_per_side
                     for image_idx, image_feature in enumerate(image_features):
-                        if modalities_list[image_idx] == 1:
+                        if modalities_list[image_idx] == "image":
                             image_aspect_ratio = (
                                 self.config.image_aspect_ratio
                             )  # single image
-                        else:
+                        elif modalities_list[image_idx] == "multi-images":
                             image_aspect_ratio = "pad"  # multi image
                         # image_aspect_ratio = (
                         #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
