@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 
 class ForwardMode(IntEnum):
@@ -59,7 +58,6 @@ class InputMetadata:
     """Store all inforamtion of a forward pass."""
 
     forward_mode: ForwardMode
-    sampling_info: SamplingBatchInfo
     batch_size: int
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
@@ -170,7 +168,6 @@ class InputMetadata:
     ):
         ret = cls(
             forward_mode=batch.forward_mode,
-            sampling_info=batch.sampling_info,
             batch_size=batch.batch_size(),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
@@ -182,8 +179,6 @@ class InputMetadata:
             top_logprobs_nums=batch.top_logprobs_nums,
         )
 
-        ret.sampling_info.update_penalties()
-        ret.sampling_info.update_regex_vocab_mask(batch)
         ret.compute_positions(batch)
 
         if not batch.forward_mode.is_decode():

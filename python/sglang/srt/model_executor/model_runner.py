@@ -40,7 +40,7 @@ from vllm.model_executor.models import ModelRegistry
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.layers.attention_backend import FlashInferAttnBackend, TritonAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import SampleOutput
+from sglang.srt.layers.sampler import SampleOutput, Sampler
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -106,6 +106,7 @@ class ModelRunner:
 
         # Init componnets
         min_per_gpu_memory = self.init_torch_distributed()
+        self.sampler = Sampler()
         self.load_model()
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -450,11 +451,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward_decode(self, batch: ScheduleBatch):
-        if (
-            self.cuda_graph_runner
-            and self.cuda_graph_runner.can_run(len(batch.reqs))
-            and batch.sampling_info.can_run_in_cuda_graph()
-        ):
+        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(len(batch.reqs)):
             return self.cuda_graph_runner.replay(batch)
 
         input_metadata = InputMetadata.from_schedule_batch(self, batch)
@@ -491,9 +488,7 @@ class ModelRunner:
             input_metadata.image_offsets,
         )
 
-    def forward(
-        self, batch: ScheduleBatch
-    ) -> Tuple[SampleOutput, LogitsProcessorOutput]:
+    def forward(self, batch: ScheduleBatch) -> Tuple[LogitsProcessorOutput]:
         assert batch.forward_mode is not None
 
         if self.is_multimodal_model and batch.forward_mode.is_extend():
@@ -504,6 +499,29 @@ class ModelRunner:
             return self.forward_extend(batch)
         else:
             raise ValueError(f"Invaid forward mode: {batch.forward_mode}")
+
+    def _check_sample_results(self, sample_output: SampleOutput):
+        if not torch.all(sample_output.success):
+            probs = sample_output.probs
+            batch_next_token_ids = sample_output.batch_next_token_ids
+            logging.warning("Sampling failed, fallback to top_k=1 strategy")
+            probs = probs.masked_fill(torch.isnan(probs), 0.0)
+            argmax_ids = torch.argmax(probs, dim=-1)
+            batch_next_token_ids = torch.where(
+                sample_output.success, batch_next_token_ids, argmax_ids
+            )
+            sample_output.probs = probs
+            sample_output.batch_next_token_ids = batch_next_token_ids
+
+        return sample_output.batch_next_token_ids
+
+    def sample(
+        self, logits_output: LogitsProcessorOutput, batch: ScheduleBatch
+    ) -> torch.Tensor:
+        batch.sampling_info.update_penalties()
+        batch.sampling_info.update_regex_vocab_mask(batch)
+        sample_output = self.sampler(logits_output, batch.sampling_info)
+        return self._check_sample_results(sample_output)
 
 
 @lru_cache()

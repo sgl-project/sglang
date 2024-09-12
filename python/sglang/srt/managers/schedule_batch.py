@@ -33,10 +33,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 
-if TYPE_CHECKING:
-    from sglang.srt.layers.sampler import SampleOutput
-
-
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 # Put some global args for easy access
@@ -698,18 +694,3 @@ class ScheduleBatch:
         self.out_cache_loc = None
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
-
-    def check_sample_results(self, sample_output: SampleOutput):
-        if not torch.all(sample_output.success):
-            probs = sample_output.probs
-            batch_next_token_ids = sample_output.batch_next_token_ids
-            logging.warning("Sampling failed, fallback to top_k=1 strategy")
-            probs = probs.masked_fill(torch.isnan(probs), 0.0)
-            argmax_ids = torch.argmax(probs, dim=-1)
-            batch_next_token_ids = torch.where(
-                sample_output.success, batch_next_token_ids, argmax_ids
-            )
-            sample_output.probs = probs
-            sample_output.batch_next_token_ids = batch_next_token_ids
-
-        return sample_output.batch_next_token_ids
