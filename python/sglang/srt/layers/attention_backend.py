@@ -36,13 +36,40 @@ class AttentionBackend(ABC):
     def init_forward_metadata(
         self, batch: ScheduleBatch, input_metadata: InputMetadata
     ):
-        pass
+        """Init the metadata for a forward pass."""
+        raise NotImplementedError()
 
-    def forward(self, q, k, v, layer, input_metadata: InputMetadata):
+    def init_cuda_graph_state(self, max_bs: int):
+        """Init the global shared states for cuda graph."""
+        raise NotImplementedError()
+
+    def init_forward_metadata_capture_cuda_graph(
+        self, bs: int, req_pool_indices, seq_lens
+    ):
+        """Init the metadata for a forward pass for capturing a cuda graph."""
+        raise NotImplementedError()
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, bs: int, req_pool_indices, seq_lens
+    ):
+        """Init the metadata for a forward pass for replying a cuda graph."""
+        raise NotImplementedError()
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        raise NotImplementedError()
+
+    def forward(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        """Run forward on an attention layer."""
         if input_metadata.forward_mode.is_decode():
             return self.forward_decode(q, k, v, layer, input_metadata)
         else:
             return self.forward_extend(q, k, v, layer, input_metadata)
+
+    def forward_decode(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        raise NotImplementedError()
+
+    def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        raise NotImplementedError()
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -52,9 +79,17 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
         self.model_runner = model_runner
 
-        if not _grouped_size_compiled_for_decode_kernels(
-            model_runner.model_config.num_attention_heads // model_runner.tp_size,
-            model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
+        local_num_qo_heads = (
+            model_runner.model_config.num_attention_heads // model_runner.tp_size
+        )
+        local_num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            model_runner.tp_size
+        )
+        if (
+            not _grouped_size_compiled_for_decode_kernels(
+                local_num_qo_heads, local_num_kv_heads
+            )
+            or local_num_qo_heads // local_num_kv_heads > 4
         ):
             self.decode_use_tensor_cores = True
         else:
@@ -153,7 +188,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices.clone(),
             ]
 
-    def capture_cuda_graph_init(self, bs: int, req_pool_indices, seq_lens):
+    def init_forward_metadata_capture_cuda_graph(
+        self, bs: int, req_pool_indices, seq_lens
+    ):
         if self.model_runner.sliding_window_size is None:
             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self.workspace_buffer,
@@ -194,7 +231,9 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.forward_metadata = (False, None, decode_wrapper)
 
-    def replay_cuda_graph_init(self, bs: int, req_pool_indices, seq_lens):
+    def init_forward_metadata_replay_cuda_graph(
+        self, bs: int, req_pool_indices, seq_lens
+    ):
         update_flashinfer_indices(
             ForwardMode.DECODE,
             self.model_runner,
@@ -203,6 +242,9 @@ class FlashInferAttnBackend(AttentionBackend):
             None,
             self.cuda_graph_metadata[bs],
         )
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 0
 
     def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
         if not isinstance(self.prefill_wrapper_paged, list):
@@ -290,6 +332,7 @@ class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.triton_attention.decode_attention import (
+            REDUCE_TORCH_TYPE,
             decode_attention_fwd,
         )
         from sglang.srt.layers.triton_attention.extend_attention import (
@@ -300,8 +343,12 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
+        self.REDUCE_TORCH_TYPE = REDUCE_TORCH_TYPE
+        self.num_head = model_runner.model_config.num_attention_heads
 
         self.forward_metadata = None
+
+        self.cuda_graph_max_seq_len = model_runner.model_config.context_len
 
     def init_forward_metadata(
         self, batch: ScheduleBatch, input_metadata: InputMetadata
@@ -309,20 +356,65 @@ class TritonAttnBackend(AttentionBackend):
         """Init auxiliary variables for triton attention backend."""
 
         if input_metadata.forward_mode.is_decode():
-            max_seq_len = torch.max(input_metadata.seq_lens).item()
             start_loc = torch.zeros_like(input_metadata.seq_lens, dtype=torch.int32)
             start_loc[1:] = torch.cumsum(input_metadata.seq_lens[:-1], dim=0)
 
             total_num_tokens = torch.sum(input_metadata.seq_lens).item()
+            attn_logits = torch.empty(
+                (self.num_head, total_num_tokens),
+                dtype=self.REDUCE_TORCH_TYPE,
+                device="cuda",
+            )
+
+            max_seq_len = torch.max(input_metadata.seq_lens).item()
             max_extend_len = None
         else:
-            start_loc = max_seq_len = total_num_tokens = None
+            start_loc = attn_logits = max_seq_len = None
             prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
             max_extend_len = torch.max(input_metadata.seq_lens - prefix_lens).item()
 
-        self.forward_metadata = start_loc, max_seq_len, max_extend_len, total_num_tokens
+        self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len
+
+    def init_cuda_graph_state(self, max_bs: int):
+        self.cuda_graph_max_total_num_tokens = max_bs * self.cuda_graph_max_seq_len
+
+        self.cuda_graph_start_loc = torch.zeros(
+            (max_bs,), dtype=torch.int32, device="cuda"
+        )
+        self.cuda_graph_attn_logits = torch.empty(
+            (self.num_head, self.cuda_graph_max_total_num_tokens),
+            dtype=self.REDUCE_TORCH_TYPE,
+            device="cuda",
+        )
+
+    def init_forward_metadata_capture_cuda_graph(
+        self, bs: int, req_pool_indices, seq_lens
+    ):
+        self.forward_metadata = (
+            self.cuda_graph_start_loc,
+            self.cuda_graph_attn_logits,
+            self.cuda_graph_max_seq_len,
+            None,
+        )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, bs: int, req_pool_indices, seq_lens
+    ):
+        self.cuda_graph_start_loc.zero_()
+        self.cuda_graph_start_loc[1:bs] = torch.cumsum(seq_lens[: bs - 1], dim=0)
+
+        self.forward_metadata = (
+            self.cuda_graph_start_loc,
+            self.cuda_graph_attn_logits,
+            self.cuda_graph_max_seq_len,
+            None,
+        )
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
 
     def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
@@ -332,8 +424,7 @@ class TritonAttnBackend(AttentionBackend):
             layer.layer_id, input_metadata.out_cache_loc, k, v
         )
 
-        start_loc, max_seq_len, max_extend_len, total_num_tokens = self.forward_metadata
-
+        start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -350,16 +441,16 @@ class TritonAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
         )
-
         return o
 
     def forward_decode(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
 
-        start_loc, max_seq_len, max_extend_len, total_num_tokens = self.forward_metadata
+        start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
 
         input_metadata.token_to_kv_pool.set_kv_buffer(
             layer.layer_id, input_metadata.out_cache_loc, k, v
@@ -374,10 +465,9 @@ class TritonAttnBackend(AttentionBackend):
             input_metadata.req_pool_indices,
             start_loc,
             input_metadata.seq_lens,
+            attn_logits,
             max_seq_len,
-            total_num_tokens,
             layer.scaling,
             layer.logit_cap,
         )
-
         return o
