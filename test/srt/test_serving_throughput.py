@@ -19,7 +19,8 @@ class TestServingThroughput(unittest.TestCase):
         other_args = []
         if disable_radix_cache:
             other_args.append("--disable-radix-cache")
-        other_args.extend(["--attention-backend", attention_backend])
+        if attention_backend:
+            other_args.extend(["--attention-backend", attention_backend])
         other_args.extend(["--chunked-prefill-size", str(chunked_prefill_size)])
 
         model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -89,6 +90,16 @@ class TestServingThroughput(unittest.TestCase):
         res = self.run_test(
             disable_radix_cache=ServerArgs.disable_radix_cache,
             attention_backend=ServerArgs.attention_backend,
+            chunked_prefill_size=-1,
+        )
+
+        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+            assert res["output_throughput"] > 2400
+
+    def test_default_with_triton_attention_backend(self):
+        res = self.run_test(
+            disable_radix_cache=ServerArgs.disable_radix_cache,
+            attention_backend="triton",
             chunked_prefill_size=-1,
         )
 

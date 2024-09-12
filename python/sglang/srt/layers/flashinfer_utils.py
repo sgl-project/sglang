@@ -10,8 +10,8 @@ def create_flashinfer_kv_indices_triton(
     page_kernel_lens_ptr,
     kv_indptr,
     kv_start_idx,
-    max_context_len,
     kv_indices_ptr,
+    max_context_len: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
@@ -47,15 +47,15 @@ class FlashinferUpdater:
         req_pool_indices,
         seq_lens,
         prefix_lens,
-        flashinfer_decode_wrapper=None,
-        flashinfer_use_ragged=False,
+        decode_wrapper=None,
+        use_ragged=False,
     ):
         self.forward_mode = forward_mode
         self.model_runner = model_runner
         self.req_pool_indices = req_pool_indices
         self.seq_lens = seq_lens
         self.prefix_lens = prefix_lens
-        self.flashinfer_use_ragged = flashinfer_use_ragged
+        self.use_ragged = use_ragged
 
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -66,25 +66,22 @@ class FlashinferUpdater:
         self.head_dim = model_runner.model_config.head_dim
         self.batch_size = len(req_pool_indices)
 
+        self.decode_wrapper = (
+            decode_wrapper or self.model_runner.attn_backend.decode_wrapper
+        )
+        self.prefill_wrapper_ragged = (
+            self.model_runner.attn_backend.prefill_wrapper_ragged
+        )
+        self.prefill_wrapper_paged = (
+            self.model_runner.attn_backend.prefill_wrapper_paged
+        )
+
         self.kv_last_page_len = torch.ones(
             (self.batch_size,), dtype=torch.int32, device="cuda"
         )
 
-        (
-            self.flashinfer_decode_wrapper,
-            self.flashinfer_prefill_wrapper_ragged,
-            self.flashinfer_prefill_wrapper_paged,
-        ) = (
-            flashinfer_decode_wrapper,
-            self.model_runner.flashinfer_prefill_wrapper_ragged,
-            self.model_runner.flashinfer_prefill_wrapper_paged,
-        )
-        # CUDA graph uses different flashinfer_decode_wrapper
-        if self.flashinfer_decode_wrapper is None:
-            self.flashinfer_decode_wrapper = self.model_runner.flashinfer_decode_wrapper
-
-    def _init_indices_no_window(self):
-        if self.flashinfer_use_ragged:
+    def _init_indices_no_sliding_window(self):
+        if self.use_ragged:
             paged_kernel_lens = self.prefix_lens
         else:
             paged_kernel_lens = self.seq_lens
@@ -103,13 +100,13 @@ class FlashinferUpdater:
             paged_kernel_lens,
             self.kv_indptr,
             None,
-            self.model_runner.req_to_token_pool.req_to_token.size(1),
             self.kv_indices,
+            self.model_runner.req_to_token_pool.req_to_token.size(1),
         )
 
-    def _init_indices_window(self, wrapper_id):
-        # window attention use paged only
+    def _init_indices_sliding_window(self, wrapper_id):
         if wrapper_id == 0:
+            # window attention use paged only
             if self.forward_mode.is_decode():
                 paged_kernel_lens = torch.minimum(
                     self.seq_lens,
@@ -123,6 +120,7 @@ class FlashinferUpdater:
                     - self.prefix_lens,
                 )
         else:
+            # full attention
             paged_kernel_lens = self.seq_lens
 
         kv_start_idx = self.seq_lens - paged_kernel_lens
@@ -139,8 +137,8 @@ class FlashinferUpdater:
             paged_kernel_lens,
             self.kv_indptr,
             kv_start_idx,
-            self.model_runner.req_to_token_pool.req_to_token.size(1),
             self.kv_indices,
+            self.model_runner.req_to_token_pool.req_to_token.size(1),
         )
 
     def _update_decode_indices(self, decode_wrapper):
@@ -164,7 +162,7 @@ class FlashinferUpdater:
         )
         qo_indptr[1:] = torch.cumsum(self.seq_lens - self.prefix_lens, dim=0)
 
-        if self.flashinfer_use_ragged:
+        if self.use_ragged:
             ragged_wrapper.end_forward()
             ragged_wrapper.begin_forward(
                 qo_indptr,
@@ -187,28 +185,28 @@ class FlashinferUpdater:
             1,
         )
 
-    def update_indices_no_window(self):
-        self._init_indices_no_window()
+    def update_indices_no_sliding_window(self):
+        self._init_indices_no_sliding_window()
 
         if self.forward_mode.is_decode():
-            self._update_decode_indices(self.flashinfer_decode_wrapper)
+            self._update_decode_indices(self.decode_wrapper)
         else:
             self._update_extend_indices(
-                self.flashinfer_prefill_wrapper_ragged,
-                self.flashinfer_prefill_wrapper_paged,
+                self.prefill_wrapper_ragged,
+                self.prefill_wrapper_paged,
             )
 
-    def update_indices_window(self):
-        assert self.flashinfer_use_ragged is False
+    def update_indices_sliding_window(self):
+        assert self.use_ragged is False
 
         for wrapper_id in range(2):
-            self._init_indices_window(wrapper_id)
+            self._init_indices_sliding_window(wrapper_id)
             if self.forward_mode.is_decode():
-                self._update_decode_indices(self.flashinfer_decode_wrapper[wrapper_id])
+                self._update_decode_indices(self.decode_wrapper[wrapper_id])
             else:
                 self._update_extend_indices(
                     None,
-                    self.flashinfer_prefill_wrapper_paged[wrapper_id],
+                    self.prefill_wrapper_paged[wrapper_id],
                 )
 
 
@@ -218,20 +216,20 @@ def update_flashinfer_indices(
     req_pool_indices,
     seq_lens,
     prefix_lens,
-    flashinfer_decode_wrapper=None,
-    flashinfer_use_ragged=False,
+    decode_wrapper=None,
+    use_ragged=False,
 ):
-    flashinfer_updater = FlashinferUpdater(
+    updater = FlashinferUpdater(
         forward_mode,
         model_runner,
         req_pool_indices,
         seq_lens,
         prefix_lens,
-        flashinfer_decode_wrapper,
-        flashinfer_use_ragged,
+        decode_wrapper,
+        use_ragged,
     )
 
     if model_runner.sliding_window_size is None:
-        flashinfer_updater.update_indices_no_window()
+        updater.update_indices_no_sliding_window()
     else:
-        flashinfer_updater.update_indices_window()
+        updater.update_indices_sliding_window()

@@ -15,6 +15,7 @@ limitations under the License.
 
 """
 Memory-efficient attention for decoding.
+It supports page size = 1.
 """
 
 # Adapted from
@@ -113,7 +114,7 @@ def _fwd_kernel_stage1(
 
 @triton.jit
 def _fwd_kernel_stage2(
-    Logics,
+    logits,
     V_Buffer,
     Out,
     Req_to_tokens,
@@ -161,7 +162,7 @@ def _fwd_kernel_stage2(
         )
 
         qk = tl.load(
-            Logics
+            logits
             + cur_head * stride_logic_h
             + (cur_batch_start_loc + start_n + offs_n),
             mask=start_n + offs_n < cur_batch_seq_len,
@@ -197,10 +198,7 @@ def _decode_att_m_fwd(
     logit_cap,
 ):
     BLOCK = 32
-    # shape constraints
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
-    assert Lq == Lk
-    assert Lk in {16, 32, 64, 96, 128, 256}
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
 
@@ -240,7 +238,7 @@ def _decode_att_m_fwd(
 
 
 def _decode_softmax_reducev_fwd(
-    logics,
+    logits,
     v_buffer,
     o,
     req_to_tokens,
@@ -249,9 +247,9 @@ def _decode_softmax_reducev_fwd(
     b_seq_len,
 ):
     BLOCK = 64
-    batch, head = b_seq_len.shape[0], logics.shape[0]
+    batch, head = b_seq_len.shape[0], logits.shape[0]
     grid = (batch, head, 1)
-    kv_group_num = logics.shape[0] // v_buffer.shape[1]
+    kv_group_num = logits.shape[0] // v_buffer.shape[1]
 
     num_warps = 1
 
@@ -259,14 +257,14 @@ def _decode_softmax_reducev_fwd(
     BLOCK_DMODEL = triton.next_power_of_2(Lv)
 
     _fwd_kernel_stage2[grid](
-        logics,
+        logits,
         v_buffer,
         o,
         req_to_tokens,
         b_req_idx,
         b_start_loc,
         b_seq_len,
-        logics.stride(0),
+        logits.stride(0),
         v_buffer.stride(0),
         v_buffer.stride(1),
         o.stride(0),
@@ -389,7 +387,7 @@ def _fwd_grouped_kernel_stage1(
 
 @triton.jit
 def _fwd_grouped_kernel_stage2(
-    Logics,
+    logits,
     V_Buffer,
     Out,
     Req_to_tokens,
@@ -445,7 +443,7 @@ def _fwd_grouped_kernel_stage2(
         )
 
         qk = tl.load(
-            Logics + offs_qk,
+            logits + offs_qk,
             mask=mask_h[:, None] & (start_n + offs_n[None, :] < cur_batch_seq_len),
             other=float("-inf"),
         )
@@ -480,10 +478,7 @@ def _decode_grouped_att_m_fwd(
     logit_cap,
 ):
     BLOCK = 32
-    # shape constraints
     Lq, Lk = q.shape[-1], k_buffer.shape[-1]
-    assert Lq == Lk
-    assert Lk in {16, 32, 64, 96, 128, 256, 576, 288}
 
     if Lk == 576:
         BLOCK_DMODEL = 512
@@ -536,7 +531,7 @@ def _decode_grouped_att_m_fwd(
 
 
 def _decode_grouped_softmax_reducev_fwd(
-    logics,
+    logits,
     v_buffer,
     o,
     req_to_tokens,
@@ -545,8 +540,8 @@ def _decode_grouped_softmax_reducev_fwd(
     b_seq_len,
 ):
     BLOCK = 128
-    batch, head_num = b_seq_len.shape[0], logics.shape[0]
-    kv_group_num = logics.shape[0] // v_buffer.shape[1]
+    batch, head_num = b_seq_len.shape[0], logits.shape[0]
+    kv_group_num = logits.shape[0] // v_buffer.shape[1]
     BLOCK_H = max(16, triton.next_power_of_2(kv_group_num))
     grid = (batch, triton.cdiv(head_num, min(BLOCK_H, kv_group_num)), 1)
 
@@ -556,14 +551,14 @@ def _decode_grouped_softmax_reducev_fwd(
     BLOCK_DMODEL = triton.next_power_of_2(Lv)
 
     _fwd_grouped_kernel_stage2[grid](
-        logics,
+        logits,
         v_buffer,
         o,
         req_to_tokens,
         b_req_idx,
         b_start_loc,
         b_seq_len,
-        logics.stride(0),
+        logits.stride(0),
         v_buffer.stride(0),
         v_buffer.stride(1),
         o.stride(0),
@@ -574,9 +569,9 @@ def _decode_grouped_softmax_reducev_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_N=BLOCK,
         BLOCK_H=BLOCK_H,
+        Lv=Lv,
         num_warps=num_warps,
         num_stages=1,
-        Lv=Lv,
     )
 
 
@@ -589,17 +584,11 @@ def decode_attention_fwd(
     b_req_idx,
     b_start_loc,
     b_seq_len,
+    attn_logits,
     max_len_in_batch,
-    total_num_tokens,
     sm_scale,
-    logit_cap=-1,
-    att_m=None,
+    logit_cap=0.0,
 ):
-    if att_m is None:
-        att_m = torch.empty(
-            (q.shape[-2], total_num_tokens), dtype=REDUCE_TORCH_TYPE, device="cuda"
-        )
-
     kv_group_num = q.shape[1] // v_buffer.shape[1]
 
     if kv_group_num == 1:
@@ -607,7 +596,7 @@ def decode_attention_fwd(
         _decode_att_m_fwd(
             q,
             k_buffer,
-            att_m,
+            attn_logits,
             req_to_token,
             b_req_idx,
             b_start_loc,
@@ -617,7 +606,7 @@ def decode_attention_fwd(
             logit_cap,
         )
         _decode_softmax_reducev_fwd(
-            att_m,
+            attn_logits,
             v_buffer,
             o,
             req_to_token,
@@ -630,7 +619,7 @@ def decode_attention_fwd(
         _decode_grouped_att_m_fwd(
             q,
             k_buffer,
-            att_m,
+            attn_logits,
             req_to_token,
             b_req_idx,
             b_start_loc,
@@ -640,7 +629,7 @@ def decode_attention_fwd(
             logit_cap,
         )
         _decode_grouped_softmax_reducev_fwd(
-            att_m,
+            attn_logits,
             v_buffer,
             o,
             req_to_token,
