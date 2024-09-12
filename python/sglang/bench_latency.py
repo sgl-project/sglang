@@ -207,15 +207,15 @@ def extend(reqs, model_runner):
         tree_cache=None,
     )
     batch.prepare_for_extend(model_runner.model_config.vocab_size)
-    sample_output, logits_output = model_runner.forward(batch)
-    next_token_ids = sample_output.batch_next_token_ids.tolist()
+    logits_output = model_runner.forward(batch)
+    next_token_ids = model_runner.sample(logits_output, batch).tolist()
     return next_token_ids, logits_output.next_token_logits, batch
 
 
 def decode(input_token_ids, batch, model_runner):
     batch.prepare_for_decode(input_token_ids)
-    sample_output, logits_output = model_runner.forward(batch)
-    next_token_ids = sample_output.batch_next_token_ids.tolist()
+    logits_output = model_runner.forward(batch)
+    next_token_ids = model_runner.sample(logits_output, batch).tolist()
     return next_token_ids, logits_output.next_token_logits
 
 
