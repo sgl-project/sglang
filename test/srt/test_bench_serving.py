@@ -55,8 +55,8 @@ class TestBenchServing(unittest.TestCase):
     def test_online_latency_default(self):
         res = run_bench_serving(
             model=DEFAULT_MODEL_NAME_FOR_TEST,
-            num_prompts=500,
-            request_rate=float("inf"),
+            num_prompts=100,
+            request_rate=1,
             other_server_args=[],
         )
 

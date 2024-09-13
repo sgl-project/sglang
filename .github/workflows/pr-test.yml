@@ -125,11 +125,17 @@ jobs:
           pip install -e "python[all]"
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
-      - name: Benchmark Latency
+      - name: Benchmark Single Latency
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_latency.TestBenchLatency.test_default
+
+      - name: Benchmark Online Latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
 
   performance-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -144,23 +150,24 @@ jobs:
           pip install -e "python[all]"
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
-      - name: Benchmark Serving Throughput (TP=2)
+      - name: Benchmark Offline Throughput (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
 
-      - name: Benchmark Serving Latency (TP=2)
+      - name: Benchmark Offline Throughput (w/o RadixAttention) (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_moe_serving_latency.TestServingLatency.test_default
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
-      - name: Benchmark Serving Throughput (w/o RadixAttention) (TP=2)
+      - name: Benchmark Single Latency (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default_without_radix_cache
+          python3 -m unittest test_bench_latency.TestBenchLatency.test_moe_default
+
 
   accuracy-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
