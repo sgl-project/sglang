@@ -37,7 +37,7 @@ jobs:
           cd test/lang
           python3 run_suite.py --suite minimal
 
-  unit-test-backend-part-0:
+  unit-test-backend-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
     steps:
@@ -56,7 +56,7 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite minimal --range-begin 0 --range-end 8
 
-  unit-test-backend-part-1:
+  unit-test-backend-part-2:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
     steps:
