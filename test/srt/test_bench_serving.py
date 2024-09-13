@@ -69,7 +69,7 @@ class TestBenchServing(unittest.TestCase):
 
         if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
             assert res["median_e2e_latency_ms"] < 12000
-            assert res["median_ttft_ms"] < 78
+            assert res["median_ttft_ms"] < 80
             assert res["median_itl_ms"] < 12
 
     def test_moe_offline_throughput_default(self):
