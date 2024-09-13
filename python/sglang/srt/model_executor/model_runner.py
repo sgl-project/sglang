@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -535,12 +536,42 @@ class ModelRunner:
 
         return sample_output.batch_next_token_ids
 
+    def _apply_logits_bias(
+        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
+    ):
+        # Apply logit_bias
+        if sampling_info.logit_bias is not None:
+            logits.add_(sampling_info.logit_bias)
+
+        # min-token, presence, frequency
+        if sampling_info.linear_penalties is not None:
+            logits += sampling_info.linear_penalties
+
+        # repetition
+        if sampling_info.scaling_penalties is not None:
+            logits = torch.where(
+                logits > 0,
+                logits / sampling_info.scaling_penalties,
+                logits * sampling_info.scaling_penalties,
+            )
+
+        # Apply regex vocab_mask
+        if sampling_info.vocab_mask is not None:
+            logits = logits.masked_fill(sampling_info.vocab_mask, float("-inf"))
+
+        return logits
+
     def sample(
         self, logits_output: LogitsProcessorOutput, batch: ScheduleBatch
     ) -> torch.Tensor:
-        batch.sampling_info.update_penalties()
         batch.sampling_info.update_regex_vocab_mask(batch)
-        sample_output = self.sampler(logits_output, batch.sampling_info)
+        batch.sampling_info.update_penalties()
+        logits_output.next_token_logits = self._apply_logits_bias(
+            logits_output.next_token_logits, batch.sampling_info
+        )
+        sample_output = self.sampler(
+            logits_output.next_token_logits, batch.sampling_info
+        )
         return self._check_sample_results(sample_output)
 
 
