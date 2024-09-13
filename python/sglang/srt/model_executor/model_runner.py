@@ -566,12 +566,10 @@ class ModelRunner:
     ) -> torch.Tensor:
         batch.sampling_info.update_regex_vocab_mask(batch)
         batch.sampling_info.update_penalties()
-        logits_output.next_token_logits = self._apply_logits_bias(
+        logits = self._apply_logits_bias(
             logits_output.next_token_logits, batch.sampling_info
         )
-        sample_output = self.sampler(
-            logits_output.next_token_logits, batch.sampling_info
-        )
+        sample_output = self.sampler(logits, batch.sampling_info)
         return self._check_sample_results(sample_output)
 
 
