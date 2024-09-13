@@ -140,8 +140,12 @@ class ControllerMulti:
             )
 
     def shortest_queue_scheduler(self, input_requests):
-        for r in input_requests:
+        for i, r in enumerate(input_requests):
             queue_sizes = [worker.queue.qsize() for worker in self.workers]
+            if not np.any(queue_sizes):
+                # If all queues are empty, fallback to round robin scheduler for
+                # remaining requests to avoid selecting the same worker repeatedly
+                return self.round_robin_scheduler(input_requests[i:])
             wid = np.argmin(queue_sizes)
             self.workers[wid].queue.put(r)
 
