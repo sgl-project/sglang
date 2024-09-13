@@ -1,3 +1,3 @@
 raise Exception(
-    "SGLang was imported from the wrong directory 'sglang', but it should be imported from 'sglang/python/sglang' instead. Please do not place your SGL program in the same directory as 'sglang'."
+    "You imported 'sglang' from the git repo root directory 'sglang', which is incorrect. You should import it from 'sglang/python/sglang'. Please do not run your scripts adjacent to the git repo root directory."
 )
