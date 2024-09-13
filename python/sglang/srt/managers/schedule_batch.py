@@ -91,7 +91,7 @@ class FINISH_LENGTH(BaseFinishReason):
 
     def to_json(self):
         return {
-            "type": "stop",  # to match OpenAI API's return value
+            "type": "length",  # to match OpenAI API's return value
             "length": self.length,
         }
 
