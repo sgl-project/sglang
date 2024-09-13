@@ -92,6 +92,9 @@ class ModelTpServer:
         self.is_spec_worker = server_args.speculative_algorithm is not None
         self.spec_queue = spec_queue
         self.is_draft_worker = self.__class__.__name__ == "SpecDraftServer"
+        self.server_args = server_args
+        # hold the batches to avoid torch release the torch.Tensor in ScheduleBatch
+        self.spec_running_batches = {}
         # Init model and tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,

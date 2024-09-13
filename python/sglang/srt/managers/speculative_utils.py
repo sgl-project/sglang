@@ -42,18 +42,15 @@ DraftInfoFactory = SpecDraftInfoFactory()
 
 @DraftInfoFactory.register("EAGLE")
 class EAGLEDraftInfo(SpecDraftInfo):
-    def __init__(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor, output_token
-    ):
-        hidden_states: torch.Tensor = hidden_states
-        input_ids: torch.Tensor = input_ids
+    def __init__(self, hidden_states: torch.Tensor):
+        self.hidden_states: torch.Tensor = hidden_states
 
     def update_input(self, info: "EAGLEDraftInfo"):
         self.hidden_states = info.hidden_states
-        self.input_ids = info.input_ids
 
 
 class SpecInfoPipline:
     def __init__(self):
-        self.draft_input_queue = torch.multiprocessing.Queue()
-        self.draft_output_queue = torch.multiprocessing.Queue()
+        ctx = torch.multiprocessing.get_context("forkserver")
+        self.draft_input_queue = ctx.Queue()
+        self.draft_output_queue = ctx.Queue()

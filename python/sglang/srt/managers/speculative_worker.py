@@ -14,9 +14,12 @@ limitations under the License.
 """
 
 """A speculative draft worker."""
+from typing import List
 
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.speculative_utils import SpecInfoPipline
 from sglang.srt.managers.tp_worker import ModelTpServer
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 
 
@@ -33,3 +36,13 @@ class SpecDraftServer(ModelTpServer):
         super().__init__(
             gpu_id, tp_rank, server_args, nccl_port, model_overide_args, spec_queue
         )
+
+    def exposed_step(self, recv_batches: List[ScheduleBatch]):
+        for batch in recv_batches:
+            self.forward_speculative_batch(batch)
+
+    def forward_speculative_batch(self, batch: ScheduleBatch):
+        for step in range(self.server_args.num_speculative_tokens):
+            sample_output, logits_output = self.model_runner.forward(
+                batch, ForwardMode.DECODE
+            )

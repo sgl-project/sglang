@@ -322,7 +322,7 @@ class LlamaForCausalLM(nn.Module):
         if input_metadata.forward_mode.is_spec_mode():
             input_metadata.spec_draft_info = DraftInfoFactory.get(
                 input_metadata.spec_algorithm
-            )(hidden_states, sample_output)
+            )(hidden_states)
         return sample_output, logits_output
 
     def get_module_name(self, name):

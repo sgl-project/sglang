@@ -18,6 +18,7 @@ limitations under the License.
 """Meta data for requests and batches"""
 
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -26,11 +27,11 @@ import torch
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
+from sglang.srt.managers.speculative_utils import SpecDraftInfo
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.managers.speculative_utils import SpecDraftInfo
 
 if TYPE_CHECKING:
     from sglang.srt.layers.sampler import SampleOutput
@@ -330,6 +331,7 @@ class ScheduleBatch:
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: BaseTokenToKVPool
     tree_cache: BasePrefixCache
+    bid: str
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
@@ -345,7 +347,7 @@ class ScheduleBatch:
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
-    
+
     # For speculative decoding
     spec_draft_info: SpecDraftInfo = None
 
@@ -359,6 +361,7 @@ class ScheduleBatch:
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
             return_logprob=return_logprob,
+            bid=uuid.uuid4().hex,
         )
 
     def batch_size(self):
