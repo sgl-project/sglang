@@ -95,13 +95,6 @@ file_id_storage: Dict[str, str] = {}
 storage_dir = None
 
 
-def format_finish_reason(finish_reason) -> Optional[str]:
-    if finish_reason is None:
-        return None
-    else:
-        return finish_reason["type"]
-
-
 def create_error_response(
     message: str,
     err_type: str = "BadRequestError",
@@ -612,8 +605,10 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 "index": 0,
                 "text": text,
                 "logprobs": logprobs,
-                "finish_reason": format_finish_reason(
-                    ret_item["meta_info"]["finish_reason"]
+                "finish_reason": (
+                    ret_item["meta_info"]["finish_reason"]["type"]
+                    if ret_item["meta_info"]["finish_reason"]
+                    else ""
                 ),
             }
         else:
@@ -621,8 +616,10 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 index=idx,
                 text=text,
                 logprobs=logprobs,
-                finish_reason=format_finish_reason(
-                    ret_item["meta_info"]["finish_reason"]
+                finish_reason=(
+                    ret_item["meta_info"]["finish_reason"]["type"]
+                    if ret_item["meta_info"]["finish_reason"]
+                    else ""
                 ),
             )
 
@@ -756,8 +753,10 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         index=index,
                         text=delta,
                         logprobs=logprobs,
-                        finish_reason=format_finish_reason(
-                            content["meta_info"]["finish_reason"]
+                        finish_reason=(
+                            content["meta_info"]["finish_reason"]["type"]
+                            if content["meta_info"]["finish_reason"]
+                            else ""
                         ),
                     )
                     chunk = CompletionStreamResponse(
@@ -993,8 +992,10 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 "index": 0,
                 "message": {"role": "assistant", "content": ret_item["text"]},
                 "logprobs": choice_logprobs,
-                "finish_reason": format_finish_reason(
-                    ret_item["meta_info"]["finish_reason"]
+                "finish_reason": (
+                    ret_item["meta_info"]["finish_reason"]["type"]
+                    if ret_item["meta_info"]["finish_reason"]
+                    else ""
                 ),
             }
         else:
@@ -1002,8 +1003,10 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 index=idx,
                 message=ChatMessage(role="assistant", content=ret_item["text"]),
                 logprobs=choice_logprobs,
-                finish_reason=format_finish_reason(
-                    ret_item["meta_info"]["finish_reason"]
+                finish_reason=(
+                    ret_item["meta_info"]["finish_reason"]["type"]
+                    if ret_item["meta_info"]["finish_reason"]
+                    else ""
                 ),
             )
 
@@ -1128,8 +1131,10 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(role="assistant"),
-                            finish_reason=format_finish_reason(
-                                content["meta_info"]["finish_reason"]
+                            finish_reason=(
+                                content["meta_info"]["finish_reason"]["type"]
+                                if content["meta_info"]["finish_reason"]
+                                else ""
                             ),
                             logprobs=choice_logprobs,
                         )
@@ -1146,8 +1151,10 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=index,
                         delta=DeltaMessage(content=delta),
-                        finish_reason=format_finish_reason(
-                            content["meta_info"]["finish_reason"]
+                        finish_reason=(
+                            content["meta_info"]["finish_reason"]["type"]
+                            if content["meta_info"]["finish_reason"]
+                            else ""
                         ),
                         logprobs=choice_logprobs,
                     )
