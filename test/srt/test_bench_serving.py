@@ -85,7 +85,7 @@ class TestBenchServing(unittest.TestCase):
 
     def test_moe_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
-            model=DEFAULT_MODEL_NAME_FOR_TEST,
+            model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
             num_prompts=300,
             request_rate=float("inf"),
             other_server_args=["--tp", "2", "--disable-radix-cache"],
