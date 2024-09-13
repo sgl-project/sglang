@@ -88,11 +88,36 @@ jobs:
           pip install -e "python[all]"
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
+      - name: Benchmark Single Latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_latency.TestBenchLatency.test_default
+
+      - name: Benchmark Online Latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
+
       - name: Benchmark Offline Throughput
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
+
+  performance-test-1-gpu-part-2:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Benchmark Offline Throughput (w/o RadixAttention)
         timeout-minutes: 10
@@ -111,31 +136,6 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
-
-  performance-test-1-gpu-part-2:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
-
-      - name: Benchmark Single Latency
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_latency.TestBenchLatency.test_default
-
-      - name: Benchmark Online Latency
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
 
   performance-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
