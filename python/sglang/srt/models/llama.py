@@ -416,8 +416,8 @@ class LlamaForCausalLM(nn.Module):
             stacked_params = set(entry[0] for entry in stacked_params_mapping)
             for param_suffix in stacked_params:
                 for name in params_dict:
-                    if param_suffix in name:
-                        param = params_dict[name]
+                    param = params_dict[name]
+                    if param_suffix in name and name.endswith("proj.weight") and param.ndim == 2:
                         params_dict[name] = torchao_quantize_param_data(
                             param, self.torchao_config
                         )
