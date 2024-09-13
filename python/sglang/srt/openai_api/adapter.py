@@ -96,16 +96,10 @@ storage_dir = None
 
 
 def format_finish_reason(finish_reason) -> Optional[str]:
-    if finish_reason.startswith("None"):
+    if finish_reason is None:
         return None
-    elif finish_reason.startswith("FINISH_MATCHED"):
-        return "stop"
-    elif finish_reason.startswith("FINISH_LENGTH"):
-        return "length"
-    elif finish_reason.startswith("FINISH_ABORT"):
-        return "abort"
     else:
-        return "unknown"
+        return finish_reason["type"]
 
 
 def create_error_response(

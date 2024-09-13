@@ -813,7 +813,7 @@ class ModelTpServer:
                         "prompt_tokens": len(req.origin_input_ids),
                         "completion_tokens": len(req.output_ids),
                         "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
-                        "finish_reason": str(req.finished_reason),
+                        "finish_reason": req.finished_reason.to_json(),
                     }
                     if req.return_logprob:
                         (
