@@ -217,7 +217,7 @@ jobs:
 
   finish:
     needs: [
-      unit-test-frontend, unit-test-backend-part-0, unit-test-backend-part-1,
+      unit-test-frontend, unit-test-backend-part-1, unit-test-backend-part-2,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu
     ]
