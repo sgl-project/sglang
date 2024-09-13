@@ -56,7 +56,7 @@ class BaseFinishReason:
     def __init__(self, is_error: bool = False):
         self.is_error = is_error
 
-    def __str__(self):
+    def to_json(self):
         raise NotImplementedError("Subclasses must implement this method")
 
 
@@ -65,17 +65,11 @@ class FINISH_MATCHED_TOKEN(BaseFinishReason):
         super().__init__()
         self.matched = matched
 
-    def __str__(self) -> str:
-        return f"FINISH_MATCHED_TOKEN: {self.matched}"
-
-
-class FINISH_LENGTH(BaseFinishReason):
-    def __init__(self, length: int):
-        super().__init__()
-        self.length = length
-
-    def __str__(self) -> str:
-        return f"FINISH_LENGTH: {self.length}"
+    def to_json(self):
+        return {
+            "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
 
 
 class FINISH_MATCHED_STR(BaseFinishReason):
@@ -83,16 +77,33 @@ class FINISH_MATCHED_STR(BaseFinishReason):
         super().__init__()
         self.matched = matched
 
-    def __str__(self) -> str:
-        return f"FINISH_MATCHED_STR: {self.matched}"
+    def to_json(self):
+        return {
+            "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
+
+
+class FINISH_LENGTH(BaseFinishReason):
+    def __init__(self, length: int):
+        super().__init__()
+        self.length = length
+
+    def to_json(self):
+        return {
+            "type": "length",  # to match OpenAI API's return value
+            "length": self.length,
+        }
 
 
 class FINISH_ABORT(BaseFinishReason):
     def __init__(self):
         super().__init__(is_error=True)
 
-    def __str__(self) -> str:
-        return "FINISH_ABORT"
+    def to_json(self):
+        return {
+            "type": "abort",
+        }
 
 
 class Req:
