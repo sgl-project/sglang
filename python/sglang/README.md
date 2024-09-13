@@ -7,5 +7,5 @@
 - `bench_latency.py`: Benchmark a single static batch.
 - `bench_serving.py`: Benchmark online serving with dynamic requests.
 - `global_config.py`: The global configs and constants.
-- `launch_server.py`: The entry point of launching local server.
+- `launch_server.py`: The entry point for launching the local server.
 - `utils.py`: Common utilities.
