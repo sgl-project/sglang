@@ -48,7 +48,7 @@ def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
     return dummy_linear.weight
 
 
-def quantize_params_with_suffixes_(
+def apply_torchao_config_(
     self: torch.nn.Module,
     params_dict: Dict[str, torch.Tensor],
     param_suffixes: Set[str],
