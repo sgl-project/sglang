@@ -2,8 +2,9 @@
 Common utilities for torchao.
 """
 
-import torch
 from typing import Dict, Set
+
+import torch
 
 
 def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
@@ -47,7 +48,9 @@ def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
     return dummy_linear.weight
 
 
-def quantize_params_with_suffixes_(params_dict: Dict[str, torch.Tensor], param_suffixes: Set[str], torchao_config: str) -> None:
+def quantize_params_with_suffixes_(
+    params_dict: Dict[str, torch.Tensor], param_suffixes: Set[str], torchao_config: str
+) -> None:
     """A util function used for quantizing the weight parameters after they are loaded
 
     Args:
@@ -61,6 +64,4 @@ def quantize_params_with_suffixes_(params_dict: Dict[str, torch.Tensor], param_s
         for name in params_dict:
             param = params_dict[name]
             if param_suffix in name and param.ndim == 2:
-                params_dict[name] = torchao_quantize_param_data(
-                    param, torchao_config
-                )
+                params_dict[name] = torchao_quantize_param_data(param, torchao_config)

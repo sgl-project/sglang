@@ -382,7 +382,9 @@ class MixtralForCausalLM(nn.Module):
         if self.torchao_config:
             param_suffixes = set(["proj.weight"])
             param_suffixes.union(set(entry[0] for entry in stacked_params_mapping))
-            quantize_params_with_suffixes_(params_dict, param_suffixes, self.torchao_config)
+            quantize_params_with_suffixes_(
+                params_dict, param_suffixes, self.torchao_config
+            )
             self.load_state_dict(params_dict, assign=True)
 
 
