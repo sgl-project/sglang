@@ -50,7 +50,7 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
-    chunked_prefill_size: int = 8192
+    chunked_prefill_size: int = 1024
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
@@ -491,6 +491,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
+            default=True,
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
         )
         parser.add_argument(

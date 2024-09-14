@@ -55,7 +55,7 @@ class FlashinferUpdater:
         self.req_pool_indices = req_pool_indices
         self.seq_lens = seq_lens
         self.prefix_lens = prefix_lens
-        self.use_ragged = use_ragged
+        self.use_ragged = False
 
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size

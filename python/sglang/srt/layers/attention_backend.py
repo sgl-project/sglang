@@ -155,7 +155,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 int(torch.sum(input_metadata.seq_lens)) > 4096
                 and self.model_runner.sliding_window_size is None
             ):
-                use_ragged = True
+                use_ragged = False
 
             total_num_tokens = torch.sum(input_metadata.seq_lens).item()
 
