@@ -390,13 +390,16 @@ class MixtralForCausalLM(nn.Module):
             for param_suffix in stacked_params:
                 for name in params_dict:
                     param = params_dict[name]
-                    if param_suffix in name and name.endswith("proj.weight") and param.ndim == 2:
+                    if (
+                        param_suffix in name
+                        and name.endswith("proj.weight")
+                        and param.ndim == 2
+                    ):
                         params_dict[name] = torchao_quantize_param_data(
                             param, self.torchao_config
                         )
 
             self.load_state_dict(params_dict, assign=True)
-
 
 
 EntryClass = MixtralForCausalLM
