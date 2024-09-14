@@ -63,8 +63,8 @@ class TestTritonAttnBackend(unittest.TestCase):
 
         try:
             args = SimpleNamespace(
-                base_url=self.base_url,
-                model=self.model,
+                base_url=base_url,
+                model=model,
                 eval_name="mmlu",
                 num_examples=64,
                 num_threads=32,
