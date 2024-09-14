@@ -52,7 +52,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         if is_tp2:
             other_args.extend(["--tp", "2"])
         if "DeepSeek" in model:
-            other_args.append("--enable-mla")
+            other_args.extend(["--enable-mla", "--mem-frac", "0.85"])
 
         self.process = popen_launch_server(
             model,
