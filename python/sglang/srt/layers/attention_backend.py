@@ -345,9 +345,9 @@ class TritonAttnBackend(AttentionBackend):
         self.num_head = model_runner.model_config.num_attention_heads
 
         if global_server_args_dict.get("triton_attention_reduce_in_fp32", False):
-            self.reduce_type = torch.float32
+            self.reduce_dtype = torch.float32
         else:
-            self.reduce_type = torch.float16
+            self.reduce_dtype = torch.float16
 
         self.forward_metadata = None
 
@@ -365,7 +365,7 @@ class TritonAttnBackend(AttentionBackend):
             total_num_tokens = torch.sum(input_metadata.seq_lens).item()
             attn_logits = torch.empty(
                 (self.num_head, total_num_tokens),
-                dtype=self.reduce_type,
+                dtype=self.reduce_dtype,
                 device="cuda",
             )
 
@@ -389,7 +389,7 @@ class TritonAttnBackend(AttentionBackend):
                 self.num_head,
                 self.cuda_graph_max_total_num_tokens,
             ),
-            dtype=self.reduce_type,
+            dtype=self.reduce_dtype,
             device="cuda",
         )
 
