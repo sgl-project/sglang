@@ -41,6 +41,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.torchao_utils import apply_torchao_config_
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
@@ -296,6 +298,7 @@ class MixtralForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self.torchao_config = global_server_args_dict["torchao_config"]
         self.model = MixtralModel(config, quant_config=quant_config, prefix="model")
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
@@ -375,6 +378,8 @@ class MixtralForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+        apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
 
 EntryClass = MixtralForCausalLM
