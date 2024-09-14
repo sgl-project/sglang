@@ -30,10 +30,8 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
 )
-from sglang.srt.layers.sampler import SampleOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import monkey_patch_vllm_all_gather
 
 if TYPE_CHECKING:
@@ -129,10 +127,6 @@ class CudaGraphRunner:
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
 
-        # Sampling info
-        vocab_size = model_runner.model_config.vocab_size
-        self.sampling_info = SamplingBatchInfo.dummy_one(self.max_bs, vocab_size)
-
         if self.use_torch_compile:
             set_torch_compile_config()
 
@@ -191,7 +185,6 @@ class CudaGraphRunner:
         def run_once():
             input_metadata = InputMetadata(
                 forward_mode=ForwardMode.DECODE,
-                sampling_info=self.sampling_info[:bs],
                 batch_size=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -250,14 +243,9 @@ class CudaGraphRunner:
             bs, self.req_pool_indices, self.seq_lens
         )
 
-        # Sampling inputs
-        self.sampling_info.inplace_assign(raw_bs, batch.sampling_info)
-
         # Replay
-        torch.cuda.synchronize()
         self.graphs[bs].replay()
-        torch.cuda.synchronize()
-        sample_output, logits_output = self.output_buffers[bs]
+        logits_output = self.output_buffers[bs]
 
         # Unpad
         if bs != raw_bs:
@@ -268,11 +256,6 @@ class CudaGraphRunner:
                 input_token_logprobs=None,
                 input_top_logprobs=None,
                 output_top_logprobs=None,
-            )
-            sample_output = SampleOutput(
-                sample_output.success[:raw_bs],
-                sample_output.probs[:raw_bs],
-                sample_output.batch_next_token_ids[:raw_bs],
             )
 
         # Extract logprobs
@@ -290,4 +273,4 @@ class CudaGraphRunner:
                     logits_output.next_token_logprobs, logits_metadata
                 )[1]
 
-        return sample_output, logits_output
+        return logits_output

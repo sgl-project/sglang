@@ -23,7 +23,6 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import SampleOutput
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 
@@ -75,25 +74,7 @@ class LlamaForClassification(nn.Module):
             output_top_logprobs=None,
         )
 
-        # A dummy to make this work
-        sample_output = SampleOutput(
-            success=torch.full(
-                size=(scores.shape[0],),
-                fill_value=True,
-                dtype=torch.bool,
-            ),
-            probs=torch.full(
-                size=(scores.shape[0], 1),
-                fill_value=1.0,
-                dtype=torch.float16,
-            ),
-            batch_next_token_ids=torch.full(
-                size=(scores.shape[0],),
-                fill_value=0,
-                dtype=torch.long,
-            ),
-        )
-        return sample_output, logits_output
+        return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = self.param_dict
