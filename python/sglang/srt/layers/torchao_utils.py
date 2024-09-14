@@ -49,19 +49,27 @@ def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
 
 
 def quantize_params_with_suffixes_(
-    params_dict: Dict[str, torch.Tensor], param_suffixes: Set[str], torchao_config: str
+    self: torch.nn.Module,
+    params_dict: Dict[str, torch.Tensor],
+    param_suffixes: Set[str],
 ) -> None:
-    """A util function used for quantizing the weight parameters after they are loaded
+    """A util function used for quantizing the weight parameters after they are loaded if
+       self.torchao_config is specified
 
     Args:
+      `self`: the model we want to quantize
       `params_dict`: dictionary mapping from param_name to the parameter Tensor
       `param_suffixes`: a set of suffixes, we'll quantize the Tensor matching these suffixes
 
     Returns:
-       None, the `params_dict` is modified inplace
+       None, the `params_dict` is modified inplace and the weights of `self` model are quantized
     """
-    for param_suffix in param_suffixes:
-        for name in params_dict:
-            param = params_dict[name]
-            if param_suffix in name and param.ndim == 2:
-                params_dict[name] = torchao_quantize_param_data(param, torchao_config)
+    if self.torchao_config:
+        for param_suffix in param_suffixes:
+            for name in params_dict:
+                param = params_dict[name]
+                if param_suffix in name and param.ndim == 2:
+                    params_dict[name] = torchao_quantize_param_data(
+                        param, self.torchao_config
+                    )
+        self.load_state_dict(params_dict, assign=True)

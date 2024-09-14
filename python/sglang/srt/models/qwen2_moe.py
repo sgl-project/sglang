@@ -454,11 +454,7 @@ class Qwen2MoeForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-        if self.torchao_config:
-            quantize_params_with_suffixes_(
-                params_dict, set(["proj.weight"]), self.torchao_config
-            )
-            self.load_state_dict(params_dict, assign=True)
+        quantize_params_with_suffixes_(self, params_dict, set(["proj.weight"]))
 
 
 EntryClass = Qwen2MoeForCausalLM
