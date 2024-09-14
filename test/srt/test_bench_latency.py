@@ -38,7 +38,7 @@ class TestBenchLatency(unittest.TestCase):
             lastline = output.split("\n")[-3]
             value = float(lastline.split(" ")[-2])
 
-            if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+            if is_in_ci():
                 assert value > 130
         finally:
             kill_child_process(process.pid)
@@ -73,7 +73,7 @@ class TestBenchLatency(unittest.TestCase):
             lastline = output.split("\n")[-3]
             value = float(lastline.split(" ")[-2])
 
-            if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+            if is_in_ci():
                 assert value > 125
         finally:
             kill_child_process(process.pid)
