@@ -41,7 +41,6 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import torchao_quantize_param_data
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
@@ -305,7 +304,6 @@ class LlamaForCausalLM(nn.Module):
         self.model = LlamaModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
 
         self.param_dict = dict(self.named_parameters())
 
@@ -318,11 +316,9 @@ class LlamaForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
-        logits_output = self.logits_processor(
+        return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
-        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-        return sample_output, logits_output
 
     def get_hidden_dim(self, module_name):
         if module_name in ["q_proj", "o_proj", "qkv_proj"]:

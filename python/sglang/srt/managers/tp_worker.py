@@ -547,8 +547,9 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
-                sample_output, logits_output = self.model_runner.forward(batch)
-                next_token_ids = batch.check_sample_results(sample_output)
+                logits_output = self.model_runner.forward(batch)
+                next_token_ids = self.model_runner.sample(logits_output, batch)
+
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     next_token_ids
                 )
@@ -723,8 +724,8 @@ class ModelTpServer:
         batch.prepare_for_decode()
 
         # Forward and sample the next tokens
-        sample_output, logits_output = self.model_runner.forward(batch)
-        next_token_ids = batch.check_sample_results(sample_output)
+        logits_output = self.model_runner.forward(batch)
+        next_token_ids = self.model_runner.sample(logits_output, batch)
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
         )
