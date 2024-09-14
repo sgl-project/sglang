@@ -332,7 +332,6 @@ class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.triton_attention.decode_attention import (
-            REDUCE_TORCH_TYPE,
             decode_attention_fwd,
         )
         from sglang.srt.layers.triton_attention.extend_attention import (
