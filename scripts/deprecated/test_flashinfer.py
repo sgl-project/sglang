@@ -1,16 +1,20 @@
 import pytest
 import torch
-from flashinfer import (
-    BatchDecodeWithPagedKVCacheWrapper,
-    BatchPrefillWithPagedKVCacheWrapper,
-)
-from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
 from sglang.srt.layers.token_attention import token_attention_fwd
 from sglang.srt.layers.triton_attention.extend_attention import (
     extend_attention_fwd,
     redundant_attention,
 )
+
+from vllm.utils import is_hip
+# ROCm: flashinfer available later
+if not is_hip():
+    from flashinfer import (
+        BatchDecodeWithPagedKVCacheWrapper,
+        BatchPrefillWithPagedKVCacheWrapper,
+    )
+    from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
 flashinfer_prefill_wrapper = None
 flashinfer_decode_wrapper = None

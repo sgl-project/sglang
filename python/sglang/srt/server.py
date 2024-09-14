@@ -434,6 +434,8 @@ def _set_envs_and_config(server_args: ServerArgs):
             "at https://docs.flashinfer.ai/installation.html.",
         )
 
+    mp.set_start_method("spawn", force=True)
+
 
 def _wait_and_warmup(server_args, pipe_finish_writer, pid):
     headers = {}

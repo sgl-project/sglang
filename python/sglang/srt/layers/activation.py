@@ -18,7 +18,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from flashinfer.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -27,41 +26,50 @@ from vllm.distributed import (
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.utils import is_hip
+
+# ROCm: flashinfer available later 
+if is_hip():
+    from vllm.model_executor.layers.activation import (
+        SiluAndMul,
+        GeluAndMul,
+    )
+else:
+    from flashinfer.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+
+    class SiluAndMul(CustomOp):
+        def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+            d = x.shape[-1] // 2
+            return F.silu(x[..., :d]) * x[..., d:]
+
+        def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            silu_and_mul(x, out)
+            return out
 
 
-class SiluAndMul(CustomOp):
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        return F.silu(x[..., :d]) * x[..., d:]
+    class GeluAndMul(CustomOp):
+        def __init__(self, approximate="tanh"):
+            super().__init__()
+            self.approximate = approximate
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
-        return out
+        def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+            d = x.shape[-1] // 2
+            return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
 
-
-class GeluAndMul(CustomOp):
-    def __init__(self, approximate="tanh"):
-        super().__init__()
-        self.approximate = approximate
-
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
-
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        if self.approximate == "tanh":
-            gelu_tanh_and_mul(x, out)
-        elif self.approximate == "none":
-            gelu_and_mul(x, out)
-        else:
-            raise RuntimeError("GeluAndMul only support tanh or none")
-        return out
+        def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            if self.approximate == "tanh":
+                gelu_tanh_and_mul(x, out)
+            elif self.approximate == "none":
+                gelu_and_mul(x, out)
+            else:
+                raise RuntimeError("GeluAndMul only support tanh or none")
+            return out
 
 
 class ScaledActivation(nn.Module):
