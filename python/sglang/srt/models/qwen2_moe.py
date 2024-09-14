@@ -455,7 +455,6 @@ class Qwen2MoeForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
 
         if self.torchao_config:
-            # quantizing the loaded, stacked params, e.g. "...qkv_proj"
             param_suffixes = set(["proj.weight"])
             param_suffixes.union(set(entry[0] for entry in stacked_params_mapping))
             param_suffixes.union(set(entry[0] for entry in expert_params_mapping))
