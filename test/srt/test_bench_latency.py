@@ -5,6 +5,7 @@ from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    is_in_ci,
 )
 
 
