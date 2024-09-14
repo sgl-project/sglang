@@ -55,6 +55,7 @@ def _fwd_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
 ):
+    global global_server_args_dict
     if global_server_args_dict.get("triton_attention_reduce_in_fp32", False):
         reduce_type = tl.float32
     else:
@@ -301,6 +302,8 @@ def _fwd_grouped_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
 ):
+    global global_server_args_dict
+
     if global_server_args_dict.get("triton_attention_reduce_in_fp32", False):
         reduce_type = tl.float32
     else:
