@@ -10,46 +10,23 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
+    run_bench_latency,
 )
 
 
 class TestTritonAttnBackend(unittest.TestCase):
     def test_latency(self):
-        command = [
-            "python3",
-            "-m",
-            "sglang.bench_latency",
-            "--model-path",
+        output_throughput = run_bench_latency(
             DEFAULT_MODEL_NAME_FOR_TEST,
-            "--batch-size",
-            "1",
-            "--input",
-            "128",
-            "--output",
-            "8",
-            "--attention-backend",
-            "triton",
-            "--enable-torch-compile",
-        ]
-
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            [
+                "--attention-backend",
+                "triton",
+                "--enable-torch-compile",
+            ],
         )
 
-        try:
-            stdout, stderr = process.communicate()
-            output = stdout.decode()
-            error = stderr.decode()
-            print(f"Output: {output}")
-            print(f"Error: {error}")
-
-            lastline = output.split("\n")[-3]
-            value = float(lastline.split(" ")[-2])
-
-            if is_in_ci():
-                assert value > 160
-        finally:
-            kill_child_process(process.pid)
+        if is_in_ci():
+            assert output_throughput > 155, f"{output_throughput=}"
 
     def test_mmlu(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST

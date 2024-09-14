@@ -553,3 +553,35 @@ def run_bench_serving(model, num_prompts, request_rate, other_server_args):
 
     assert res["completed"] == num_prompts
     return res
+
+
+def run_bench_latency(model, other_args):
+    command = [
+        "python3",
+        "-m",
+        "sglang.bench_latency",
+        "--model-path",
+        model,
+        "--batch-size",
+        "1",
+        "--input",
+        "128",
+        "--output",
+        "8",
+        *other_args,
+    ]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    try:
+        stdout, stderr = process.communicate()
+        output = stdout.decode()
+        error = stderr.decode()
+        print(f"Output: {output}", flush=True)
+        print(f"Error: {error}", flush=True)
+
+        lastline = output.split("\n")[-3]
+        output_throughput = float(lastline.split(" ")[-2])
+    finally:
+        kill_child_process(process.pid)
+
+    return output_throughput
