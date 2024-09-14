@@ -30,7 +30,13 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Meta-Llama-3.1-70B-Instruc
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8"
 
-if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+
+def is_in_ci():
+    """Return whether it is in CI runner."""
+    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+
+
+if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 5157
     DEFAULT_URL_FOR_TEST = "http://127.0.0.1:6157"
 else:
@@ -547,3 +553,35 @@ def run_bench_serving(model, num_prompts, request_rate, other_server_args):
 
     assert res["completed"] == num_prompts
     return res
+
+
+def run_bench_latency(model, other_args):
+    command = [
+        "python3",
+        "-m",
+        "sglang.bench_latency",
+        "--model-path",
+        model,
+        "--batch-size",
+        "1",
+        "--input",
+        "128",
+        "--output",
+        "8",
+        *other_args,
+    ]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    try:
+        stdout, stderr = process.communicate()
+        output = stdout.decode()
+        error = stderr.decode()
+        print(f"Output: {output}", flush=True)
+        print(f"Error: {error}", flush=True)
+
+        lastline = output.split("\n")[-3]
+        output_throughput = float(lastline.split(" ")[-2])
+    finally:
+        kill_child_process(process.pid)
+
+    return output_throughput

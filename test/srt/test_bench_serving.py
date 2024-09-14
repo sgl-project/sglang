@@ -1,9 +1,9 @@
-import os
 import unittest
 
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    is_in_ci,
     run_bench_serving,
 )
 
@@ -18,7 +18,7 @@ class TestBenchServing(unittest.TestCase):
             other_server_args=[],
         )
 
-        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+        if is_in_ci():
             assert res["output_throughput"] > 2600
 
     def test_offline_throughput_without_radix_cache(self):
@@ -29,7 +29,7 @@ class TestBenchServing(unittest.TestCase):
             other_server_args=["--disable-radix-cache"],
         )
 
-        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+        if is_in_ci():
             assert res["output_throughput"] > 2800
 
     def test_offline_throughput_without_chunked_prefill(self):
@@ -40,7 +40,7 @@ class TestBenchServing(unittest.TestCase):
             other_server_args=["--chunked-prefill-size", "-1"],
         )
 
-        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+        if is_in_ci():
             assert res["output_throughput"] > 2600
 
     def test_offline_throughput_with_triton_attention_backend(self):
@@ -56,7 +56,7 @@ class TestBenchServing(unittest.TestCase):
             ],
         )
 
-        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+        if is_in_ci():
             assert res["output_throughput"] > 2600
 
     def test_online_latency_default(self):
@@ -67,7 +67,7 @@ class TestBenchServing(unittest.TestCase):
             other_server_args=[],
         )
 
-        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+        if is_in_ci():
             assert res["median_e2e_latency_ms"] < 12000
             assert res["median_ttft_ms"] < 80
             assert res["median_itl_ms"] < 12
@@ -80,7 +80,7 @@ class TestBenchServing(unittest.TestCase):
             other_server_args=["--tp", "2"],
         )
 
-        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+        if is_in_ci():
             assert res["output_throughput"] > 1850
 
     def test_moe_offline_throughput_without_radix_cache(self):
@@ -91,7 +91,7 @@ class TestBenchServing(unittest.TestCase):
             other_server_args=["--tp", "2", "--disable-radix-cache"],
         )
 
-        if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+        if is_in_ci():
             assert res["output_throughput"] > 1950
 
 
