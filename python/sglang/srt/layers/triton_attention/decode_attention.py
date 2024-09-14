@@ -21,18 +21,8 @@ It supports page size = 1.
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/token_attention_nopad_att1.py
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/token_attention_softmax_and_reducev.py
-import torch
 import triton
 import triton.language as tl
-
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-if global_server_args_dict.get("triton_attention_reduce_in_fp32", False):
-    REDUCE_TRITON_TYPE = tl.float32
-    REDUCE_TORCH_TYPE = torch.float32
-else:
-    REDUCE_TRITON_TYPE = tl.float16
-    REDUCE_TORCH_TYPE = torch.float16
 
 
 @triton.jit
@@ -67,6 +57,7 @@ def _fwd_kernel_stage1(
     cur_head = tl.program_id(1)
     start_n = tl.program_id(2)
 
+    reduce_dtype = Att_Out.dtype.element_ty
     cur_kv_head = cur_head // kv_group_num
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
@@ -85,7 +76,7 @@ def _fwd_kernel_stage1(
     block_mask = tl.where(block_stard_index < cur_batch_seq_len, 1, 0)
 
     for start_mark in range(0, block_mask, 1):
-        q = tl.load(Q + off_q + start_mark).to(REDUCE_TRITON_TYPE)
+        q = tl.load(Q + off_q + start_mark).to(reduce_dtype)
         offs_n_new = cur_batch_start_index + offs_n
         k_loc = tl.load(
             Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + offs_n_new,
@@ -101,7 +92,7 @@ def _fwd_kernel_stage1(
             K_Buffer + offs_buf_k,
             mask=(offs_n_new[:, None] < cur_batch_end_index) & (offs_d[None, :] < Lk),
             other=0.0,
-        ).to(REDUCE_TRITON_TYPE)
+        ).to(reduce_dtype)
         att_value = tl.sum(q[None, :] * k, 1)
         att_value *= sm_scale
 
@@ -198,7 +189,7 @@ def _decode_att_m_fwd(
     logit_cap,
 ):
     BLOCK = 32
-    Lq, Lk = q.shape[-1], k_buffer.shape[-1]
+    Lk = k_buffer.shape[-1]
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
 
@@ -308,6 +299,7 @@ def _fwd_grouped_kernel_stage1(
     cur_kv_head = tl.program_id(1)
     start_n = tl.program_id(2)
 
+    reduce_dtype = Att_Out.dtype.element_ty
     cur_head = cur_kv_head * kv_group_num + tl.arange(0, BLOCK_H)
     mask_h = cur_head < (cur_kv_head + 1) * kv_group_num
     mask_h = mask_h & (cur_head < q_head_num)
@@ -336,7 +328,7 @@ def _fwd_grouped_kernel_stage1(
     for start_mark in range(0, block_mask, 1):
         q = tl.load(
             Q + offs_q + start_mark, mask=(mask_h[:, None]) & (offs_d[None, :] < Lk)
-        ).to(REDUCE_TRITON_TYPE)
+        ).to(reduce_dtype)
         offs_n_new = cur_batch_start_index + offs_n
         k_loc = tl.load(
             Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + offs_n_new,
@@ -352,11 +344,11 @@ def _fwd_grouped_kernel_stage1(
             K_Buffer + offs_buf_k,
             mask=(offs_n_new[None, :] < cur_batch_end_index) & (offs_d[:, None] < Lk),
             other=0.0,
-        ).to(REDUCE_TRITON_TYPE)
+        ).to(reduce_dtype)
         qk = tl.dot(q, k)
         if BLOCK_DPE > 0:
             qpe = tl.load(Q + off_qpe + start_mark, mask=mask_h[:, None]).to(
-                REDUCE_TRITON_TYPE
+                reduce_dtype
             )
             offs_buf_kpe = (
                 k_loc[None, :] * stride_buf_kbs
@@ -367,7 +359,7 @@ def _fwd_grouped_kernel_stage1(
                 K_Buffer + offs_buf_kpe,
                 mask=offs_n_new[None, :] < cur_batch_end_index,
                 other=0.0,
-            ).to(REDUCE_TRITON_TYPE)
+            ).to(reduce_dtype)
             qk += tl.dot(qpe, kpe)
         qk *= sm_scale
 
@@ -477,8 +469,8 @@ def _decode_grouped_att_m_fwd(
     sm_scale,
     logit_cap,
 ):
-    BLOCK = 32
-    Lq, Lk = q.shape[-1], k_buffer.shape[-1]
+    BLOCK = 64
+    Lk = k_buffer.shape[-1]
 
     if Lk == 576:
         BLOCK_DMODEL = 512
