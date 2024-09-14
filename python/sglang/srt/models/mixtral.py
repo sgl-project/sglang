@@ -41,7 +41,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.torchao_utils import torchao_quantize_param_data
+from sglang.srt.layers.torchao_utils import quantize_params_with_suffixes_
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
@@ -378,27 +378,12 @@ class MixtralForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    if self.torchao_config:
-                        if name.endswith("proj.weight") and param.ndim == 2:
-                            params_dict[name] = torchao_quantize_param_data(
-                                param, self.torchao_config
-                            )
 
         if self.torchao_config:
             # quantizing the loaded, stacked params, e.g. "...qkv_proj"
-            stacked_params = set(entry[0] for entry in stacked_params_mapping)
-            for param_suffix in stacked_params:
-                for name in params_dict:
-                    param = params_dict[name]
-                    if (
-                        param_suffix in name
-                        and name.endswith("proj.weight")
-                        and param.ndim == 2
-                    ):
-                        params_dict[name] = torchao_quantize_param_data(
-                            param, self.torchao_config
-                        )
-
+            param_suffixes = set(["proj.weight"])
+            param_suffixes.union(set(entry[0] for entry in stacked_params_mapping))
+            quantize_params_with_suffixes_(params_dict, param_suffixes, self.torchao_config)
             self.load_state_dict(params_dict, assign=True)
 
 
