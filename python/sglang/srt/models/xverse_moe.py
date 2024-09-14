@@ -13,22 +13,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# coding=utf-8
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
-"""Inference-only Qwen2MoE model compatible with HuggingFace weights."""
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+"""Inference-only XVERSE MoE model."""
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.fused_moe import fused_moe
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -43,14 +42,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
-class Qwen2MoeMLP(nn.Module):
+class XverseMLP(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -84,71 +82,98 @@ class Qwen2MoeMLP(nn.Module):
         return x
 
 
-class Qwen2MoeSparseMoeBlock(nn.Module):
+class XverseMoE(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
+        self.config = config
+        self.rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-
-        if self.tp_size > config.num_experts:
+        self.n_routed_experts = config.num_experts
+        self.top_k = config.moe_top_k
+        if self.tp_size > self.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}."
+                f"the number of experts {self.n_routed_experts}."
             )
 
-        self.experts = FusedMoE(
-            num_experts=config.num_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
-            renormalize=config.norm_topk_prob,
-            quant_config=quant_config,
+        self.experts = nn.ModuleList(
+            [
+                XverseMLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                )
+                for _ in range(self.n_routed_experts)
+            ]
+        )
+        self.pack_params()
+
+        self.router = ReplicatedLinear(
+            config.hidden_size, self.n_routed_experts, bias=False, quant_config=None
         )
 
-        self.gate = ReplicatedLinear(
-            config.hidden_size, config.num_experts, bias=False, quant_config=None
-        )
-        if config.shared_expert_intermediate_size > 0:
-            self.shared_expert = Qwen2MoeMLP(
+        if config.num_shared_experts is not None:
+            intermediate_size = config.intermediate_size * config.num_shared_experts
+            self.shared_experts = XverseMLP(
                 hidden_size=config.hidden_size,
-                intermediate_size=config.shared_expert_intermediate_size,
+                intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
             )
-        else:
-            self.shared_expert = None
-        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+
+    def pack_params(self):
+        w1 = []
+        w2 = []
+        for expert in self.experts:
+            w1.append(expert.gate_up_proj.weight)
+            w2.append(expert.down_proj.weight)
+        self.w1 = torch._utils._flatten_dense_tensors(w1)
+        w1s = torch._utils._unflatten_dense_tensors(self.w1, w1)
+        for data, param in zip(w1s, w1):
+            param.data = data
+        self.w1 = self.w1.view(len(w1), *w1s[0].shape)
+
+        self.w2 = torch._utils._flatten_dense_tensors(w2)
+        w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
+        for data, param in zip(w2s, w2):
+            param.data = data
+
+        self.w2 = self.w2.view(len(w2), *w2s[0].shape)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        shared_output = None
-        if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
-            if self.shared_expert_gate is not None:
-                shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-                )
-
+        if self.config.num_shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+        router_logits, _ = self.router(hidden_states)
+        final_hidden_states = fused_moe(
+            hidden_states,
+            self.w1,
+            self.w2,
+            router_logits,
+            self.top_k,
+            renormalize=getattr(self.config, "norm_topk_prob", False),
+            inplace=True,
         )
-        if shared_output is not None:
+
+        if self.config.num_shared_experts is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
-class Qwen2MoeAttention(nn.Module):
+class XverseAttention(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -189,7 +214,7 @@ class Qwen2MoeAttention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=True,
+            bias=False,
             quant_config=quant_config,
         )
 
@@ -229,7 +254,8 @@ class Qwen2MoeAttention(nn.Module):
         return output
 
 
-class Qwen2MoeDecoderLayer(nn.Module):
+class XverseDecoderLayer(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -242,10 +268,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = Qwen2MoeAttention(
+        num_key_value_heads = getattr(
+            config, "num_key_value_heads", config.num_attention_heads
+        )
+        self.self_attn = XverseAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
+            num_kv_heads=num_key_value_heads,
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
@@ -253,18 +282,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
         )
-
-        # Note: Qwen/Qwen2-57B-A14B-Instruct does not have
-        # `mlp_only_layers` in the config.
-        mlp_only_layers = (
-            [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
-        )
-        if (layer_id not in mlp_only_layers) and (
-            config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0
-        ):
-            self.mlp = Qwen2MoeSparseMoeBlock(config=config, quant_config=quant_config)
+        if config.num_experts is not None:
+            self.mlp = XverseMoE(config=config, quant_config=quant_config)
         else:
-            self.mlp = Qwen2MoeMLP(
+            self.mlp = XverseMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -300,7 +321,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen2MoeModel(nn.Module):
+class XverseModel(nn.Module):
+
+    fall_back_to_pt_during_load = False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -317,7 +341,7 @@ class Qwen2MoeModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                Qwen2MoeDecoderLayer(
+                XverseDecoderLayer(
                     config, layer_id, cache_config, quant_config=quant_config
                 )
                 for layer_id in range(config.num_hidden_layers)
@@ -330,12 +354,8 @@ class Qwen2MoeModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
-        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
+        hidden_states = self.embed_tokens(input_ids)
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -346,9 +366,7 @@ class Qwen2MoeModel(nn.Module):
         return hidden_states
 
 
-class Qwen2MoeForCausalLM(nn.Module):
-
-    fall_back_to_pt_during_load = False
+class XverseMoeForCausalLM(nn.Module):
 
     def __init__(
         self,
@@ -359,11 +377,13 @@ class Qwen2MoeForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2MoeModel(config, cache_config, quant_config)
+        self.model = XverseModel(config, cache_config, quant_config)
         self.lm_head = ParallelLMHead(
             config.vocab_size, config.hidden_size, quant_config=quant_config
         )
         self.logits_processor = LogitsProcessor(config)
+
+        self.param_dict = dict(self.named_parameters())
 
     @torch.no_grad()
     def forward(
@@ -371,9 +391,8 @@ class Qwen2MoeForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
-        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
+        hidden_states = self.model(input_ids, positions, input_metadata)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
@@ -388,68 +407,39 @@ class Qwen2MoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
+        params_dict = self.param_dict
 
-        params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
-                    continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                if name not in params_dict:
+                # Skip experts that are not assigned to this worker.
+                if (
+                    "mlp.experts." in name or "mlp.shared_experts." in name
+                ) and name not in params_dict:
                     continue
-
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if name not in params_dict:
-                        continue
-
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip experts that are not assigned to this worker.
+                if (
+                    "mlp.experts." in name or "mlp.shared_experts." in name
+                ) and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
 
 
-EntryClass = Qwen2MoeForCausalLM
+EntryClass = XverseMoeForCausalLM

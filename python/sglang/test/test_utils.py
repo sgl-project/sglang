@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from functools import partial
+from types import SimpleNamespace
 from typing import Callable, List, Optional
 
 import numpy as np
@@ -14,6 +15,7 @@ import requests
 import torch
 import torch.nn.functional as F
 
+from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
@@ -501,3 +503,47 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
 
 def get_similarities(vec1, vec2):
     return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)
+
+
+def run_bench_serving(model, num_prompts, request_rate, other_server_args):
+    # Launch the server
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+    )
+
+    # Run benchmark
+    args = SimpleNamespace(
+        backend="sglang",
+        base_url=base_url,
+        host=None,
+        port=None,
+        dataset_name="random",
+        dataset_path="",
+        model=None,
+        tokenizer=None,
+        num_prompts=num_prompts,
+        sharegpt_output_len=None,
+        random_input_len=4096,
+        random_output_len=2048,
+        random_range_ratio=0.0,
+        request_rate=request_rate,
+        multi=None,
+        seed=0,
+        output_file=None,
+        disable_tqdm=False,
+        disable_stream=False,
+        disable_ignore_eos=False,
+        extra_request_body=None,
+    )
+
+    try:
+        res = run_benchmark(args)
+    finally:
+        kill_child_process(process.pid)
+
+    assert res["completed"] == num_prompts
+    return res

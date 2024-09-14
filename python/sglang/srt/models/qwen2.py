@@ -40,7 +40,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 Qwen2Config = None
@@ -277,7 +276,6 @@ class Qwen2ForCausalLM(nn.Module):
         self.model = Qwen2Model(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
     @torch.no_grad()
@@ -291,11 +289,9 @@ class Qwen2ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
         if not get_embedding:
-            logits_output = self.logits_processor(
+            return self.logits_processor(
                 input_ids, hidden_states, self.lm_head.weight, input_metadata
             )
-            sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-            return sample_output, logits_output
         else:
             return self.pooler(hidden_states, input_metadata)
 

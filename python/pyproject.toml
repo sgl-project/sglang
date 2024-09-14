@@ -27,7 +27,7 @@ srt = ["aiohttp", "decord", "fastapi", "hf_transfer", "huggingface_hub", "intere
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
-test = ["jsonlines", "matplotlib", "pandas", "sentence_transformers", "accelerate"]
+test = ["jsonlines", "matplotlib", "pandas", "sentence_transformers", "accelerate", "peft"]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 dev = ["sglang[all]", "sglang[test]"]
 

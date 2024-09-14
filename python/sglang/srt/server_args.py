@@ -83,8 +83,8 @@ class ServerArgs:
     json_model_override_args: str = "{}"
 
     # Optimization/debug options
-    attention_backend: str = "flashinfer"
-    sampling_backend: str = "flashinfer"
+    attention_backend: Optional[str] = None
+    sampling_backend: Optional[str] = None
 
     disable_flashinfer: bool = False
     disable_flashinfer_sampling: bool = False
@@ -100,6 +100,10 @@ class ServerArgs:
     enable_p2p_check: bool = False
     enable_mla: bool = False
     triton_attention_reduce_in_fp32: bool = False
+
+    # LoRA
+    lora_paths: Optional[List[str]] = None
+    max_loras_per_batch: int = 8
 
     def __post_init__(self):
         # Set missing default values
@@ -140,11 +144,24 @@ class ServerArgs:
                 "The option '--disable-flashinfer' will be deprecated in the next release. "
                 "Please use '--attention-backend triton' instead."
             )
+            self.attention_backend = "triton"
         if self.disable_flashinfer_sampling:
             logger.warning(
                 "The option '--disable-flashinfer-sampling' will be deprecated in the next release. "
                 "Please use '--sampling-backend pytorch' instead. "
             )
+            self.sampling_backend = "pytorch"
+
+        # Default kernel backends
+        if self.enable_mla:
+            logger.info("MLA optimization is tunred on. Use triton backend.")
+            self.attention_backend = "triton"
+
+        if self.attention_backend is None:
+            self.attention_backend = "flashinfer"
+
+        if self.sampling_backend is None:
+            self.sampling_backend = "flashinfer"
 
         # Model-specific patches
         if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
@@ -509,6 +526,21 @@ class ServerArgs:
             help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
         )
 
+        # LoRA options
+        parser.add_argument(
+            "--lora-paths",
+            type=str,
+            nargs="*",
+            default=None,
+            help="The list of LoRA adapters.",
+        )
+        parser.add_argument(
+            "--max-loras-per-batch",
+            type=int,
+            default=8,
+            help="Maximum number of adapters for a running batch, include base-only request",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -526,6 +558,12 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.node_rank is not None
         ), "multi-node data parallel is not supported"
+        assert (
+            self.max_loras_per_batch > 0
+            # FIXME
+            and (self.lora_paths is None or self.disable_cuda_graph)
+            and (self.lora_paths is None or self.disable_radix_cache)
+        ), "compatibility of lora and cuda graph and radix attention is in progress"
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:

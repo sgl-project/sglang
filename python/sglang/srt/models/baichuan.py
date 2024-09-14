@@ -1,22 +1,25 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
-# Adapted from:
-# https://github.com/vllm-project/vllm/blob/14f91fe67c2342f2fe859dc6a5c40810df0e1c61/vllm/model_executor/models/deepseek.py
-"""Inference-only Deepseek model."""
-from typing import Any, Dict, Iterable, Optional, Tuple
+# coding=utf-8
+# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Inference-only BaiChuan model compatible with HuggingFace weights."""
+import math
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -25,13 +28,10 @@ from vllm.config import CacheConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -49,7 +49,31 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
-class DeepseekMLP(nn.Module):
+def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
+    closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
+    base = torch.tensor(
+        2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),
+        dtype=torch.float32,
+    )
+    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32)
+    slopes = torch.pow(base, powers)
+
+    if closest_power_of_2 != total_num_heads:
+        extra_base = torch.tensor(
+            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))),
+            dtype=torch.float32,
+        )
+        num_remaining_heads = min(
+            closest_power_of_2, total_num_heads - closest_power_of_2
+        )
+        extra_powers = torch.arange(
+            start=1, end=1 + 2 * num_remaining_heads, step=2, dtype=torch.int32
+        )
+        slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
+    return slopes
+
+
+class BaiChuanMLP(nn.Module):
 
     def __init__(
         self,
@@ -57,18 +81,13 @@ class DeepseekMLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
-        reduce_results: bool = True,
-    ) -> None:
+    ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
         )
         self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
+            intermediate_size, hidden_size, bias=False, quant_config=quant_config
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -84,117 +103,31 @@ class DeepseekMLP(nn.Module):
         return x
 
 
-class DeepseekMoE(nn.Module):
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.n_routed_experts = config.n_routed_experts
-        self.top_k = config.num_experts_per_tok
-        if self.tp_size > self.n_routed_experts:
-            raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {self.n_routed_experts}."
-            )
-
-        self.experts = nn.ModuleList(
-            [
-                DeepseekMLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.moe_intermediate_size,
-                    hidden_act=config.hidden_act,
-                    quant_config=quant_config,
-                    reduce_results=False,
-                )
-                for idx in range(self.n_routed_experts)
-            ]
-        )
-        self.pack_params()
-
-        self.gate = ReplicatedLinear(
-            config.hidden_size, self.n_routed_experts, bias=False, quant_config=None
-        )
-
-        if config.n_shared_experts is not None:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=False,
-            )
-
-    def pack_params(self):
-        w1 = []
-        w2 = []
-        for expert in self.experts:
-            w1.append(expert.gate_up_proj.weight)
-            w2.append(expert.down_proj.weight)
-        self.w1 = torch._utils._flatten_dense_tensors(w1)
-        w1s = torch._utils._unflatten_dense_tensors(self.w1, w1)
-        for data, param in zip(w1s, w1):
-            param.data = data
-        self.w1 = self.w1.view(len(w1), *w1s[0].shape)
-
-        self.w2 = torch._utils._flatten_dense_tensors(w2)
-        w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
-        for data, param in zip(w2s, w2):
-            param.data = data
-
-        self.w2 = self.w2.view(len(w2), *w2s[0].shape)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        if self.config.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = fused_moe(
-            hidden_states,
-            self.w1,
-            self.w2,
-            router_logits,
-            self.top_k,
-            renormalize=self.config.norm_topk_prob,
-            inplace=True,
-        )
-
-        if self.config.n_shared_experts is not None:
-            final_hidden_states = final_hidden_states + shared_output
-        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
-        return final_hidden_states.view(num_tokens, hidden_dim)
-
-
-class DeepseekAttention(nn.Module):
+class BaiChuanAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
-        num_kv_heads: int,
-        layer_id: int = 0,
+        position_embedding: str,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
+        layer_id: int = 0,
+    ):
         super().__init__()
         self.hidden_size = hidden_size
+        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
+        assert self.total_num_heads % tensor_model_parallel_world_size == 0
+        self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
+        self.head_dim = hidden_size // self.total_num_heads
+        self.postion_embedding = position_embedding
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+        self.total_num_kv_heads = self.num_heads
         if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
@@ -204,43 +137,53 @@ class DeepseekAttention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
-        self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = QKVParallelLinear(
+        # pylint: disable=invalid-name
+        self.W_pack = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
-            self.total_num_kv_heads,
+            self.total_num_heads,
             bias=False,
             quant_config=quant_config,
         )
-
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
         )
+        # Create the alibi slopes and slice them.
+        if self.postion_embedding == "ALIBI":
+            tp_rank = get_tensor_model_parallel_rank()
+            head_start = tp_rank * self.num_heads
+            head_end = (tp_rank + 1) * self.num_heads
+            alibi_slopes = _get_alibi_slopes(self.total_num_heads)
+            alibi_slopes = alibi_slopes[head_start:head_end].tolist()
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-        )
+            scaling = self.head_dim**-0.5
+            self.attn = RadixAttention(
+                self.num_heads,
+                self.head_dim,
+                scaling,
+                num_kv_heads=self.num_kv_heads,
+                layer_id=layer_id,
+            )
+        else:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=self.max_position_embeddings,
+                base=self.rope_theta,
+            )
+            self.scaling = self.head_dim**-0.5
+            self.attn = RadixAttention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                layer_id=layer_id,
+            )
 
     def forward(
         self,
@@ -248,52 +191,43 @@ class DeepseekAttention(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        qkv, _ = self.W_pack(hidden_states)
+        q, k, v = qkv.chunk(chunks=3, dim=-1)
+        if self.postion_embedding != "ALIBI":
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
         return output
 
 
-class DeepseekDecoderLayer(nn.Module):
+class BaiChuanDecoderLayer(nn.Module):
 
     def __init__(
         self,
         config: PretrainedConfig,
-        layer_id: int,
-        cache_config: Optional[CacheConfig] = None,
+        position_embedding: str,
+        layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = DeepseekAttention(
+        self.self_attn = BaiChuanAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
+            position_embedding=position_embedding,
             rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
+            layer_id=layer_id,
             max_position_embeddings=max_position_embeddings,
-            cache_config=cache_config,
             quant_config=quant_config,
         )
-        if (
-            config.n_routed_experts is not None
-            and layer_id >= config.first_k_dense_replace
-            and layer_id % config.moe_layer_freq == 0
-        ):
-            self.mlp = DeepseekMoE(config=config, quant_config=quant_config)
-        else:
-            self.mlp = DeepseekMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-            )
+        self.mlp = BaiChuanMLP(
+            hidden_size=self.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -305,7 +239,7 @@ class DeepseekDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
         residual: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -324,17 +258,16 @@ class DeepseekDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class DeepseekModel(nn.Module):
-
-    fall_back_to_pt_during_load = False
+class BaiChuanModel(nn.Module):
 
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        position_embedding: str,
         quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
+    ):
         super().__init__()
+        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -344,10 +277,13 @@ class DeepseekModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                DeepseekDecoderLayer(
-                    config, layer_id, cache_config, quant_config=quant_config
+                BaiChuanDecoderLayer(
+                    config,
+                    layer_id=i,
+                    position_embedding=position_embedding,
+                    quant_config=quant_config,
                 )
-                for layer_id in range(config.num_hidden_layers)
+                for i in range(config.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -363,30 +299,53 @@ class DeepseekModel(nn.Module):
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions, hidden_states, input_metadata, residual
+                positions,
+                hidden_states,
+                input_metadata,
+                residual,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
-class DeepseekForCausalLM(nn.Module):
+class BaiChuanBaseForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "W_pack": ["W_pack"],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+    # LoRA specific attributes
+    supported_lora_modules = [
+        "W_pack",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+    ]
+    embedding_modules = {}
+    embedding_padding_modules = []
 
     def __init__(
         self,
         config: PretrainedConfig,
+        position_embedding: str,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
+    ):
         super().__init__()
+
         self.config = config
+
         self.quant_config = quant_config
-        self.model = DeepseekModel(config, cache_config, quant_config)
+        self.model = BaiChuanModel(config, position_embedding, quant_config)
         self.lm_head = ParallelLMHead(
             config.vocab_size, config.hidden_size, quant_config=quant_config
         )
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -401,28 +360,30 @@ class DeepseekForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            if name == "lm_head.weight":
+                # Unlike Baichuan, Baichuan2 normalizes the head weights.
+                # Refer to:
+                # https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat/blob/84603cde5ebffb6084e476cfaeceaf0b8b91fe54/modeling_baichuan.py#L508
+                # Distinguish between Baichuan and Baichuan2 by checking the
+                # vocab size. This is suggested by
+                # https://github.com/vllm-project/vllm/pull/1022#discussion_r1325652704
+                is_baichuan2 = self.config.vocab_size == 125696
+                if is_baichuan2:
+                    loaded_weight = torch.nn.functional.normalize(loaded_weight)
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip experts that are not assigned to this worker.
-                if (
-                    "mlp.experts." in name or "mlp.shared_experts." in name
-                ) and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -432,14 +393,24 @@ class DeepseekForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip experts that are not assigned to this worker.
-                if (
-                    "mlp.experts." in name or "mlp.shared_experts." in name
-                ) and name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = DeepseekForCausalLM
+class BaichuanForCausalLM(BaiChuanBaseForCausalLM):
+    """Baichuan 13B and Baichuan2 7B/13B."""
+
+    def __init__(
+        self,
+        config,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        if config.hidden_size == 4096:  # baichuan2 7b
+            super().__init__(config, "ROPE", cache_config, quant_config)
+        else:  # baichuan 13b, baichuan2 13b
+            super().__init__(config, "ALIBI", cache_config, quant_config)
+
+
+EntryClass = [BaichuanForCausalLM]

@@ -335,23 +335,19 @@ def launch_server(
             return
 
     # Launch processes
-    tokenizer_manager = TokenizerManager(server_args, port_args)
-    if server_args.chat_template:
-        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
     pipe_controller_reader, pipe_controller_writer = mp.Pipe(duplex=False)
-    pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
     if server_args.dp_size == 1:
         start_controller_process = start_controller_process_single
     else:
         start_controller_process = start_controller_process_multi
-
     proc_controller = mp.Process(
         target=start_controller_process,
         args=(server_args, port_args, pipe_controller_writer),
     )
     proc_controller.start()
 
+    pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
     proc_detoken = mp.Process(
         target=start_detokenizer_process,
         args=(
@@ -361,6 +357,10 @@ def launch_server(
         ),
     )
     proc_detoken.start()
+
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+    if server_args.chat_template:
+        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
 
     # Wait for the model to finish loading
     controller_init_state = pipe_controller_reader.recv()
@@ -447,13 +447,12 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         time.sleep(1)
         try:
             res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
-            assert res.status_code == 200, f"{res}"
+            assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
-        except (AssertionError, requests.exceptions.RequestException) as e:
+        except (AssertionError, requests.exceptions.RequestException):
             last_traceback = get_exception_traceback()
             pass
-    model_info = res.json()
 
     if not success:
         if pipe_finish_writer is not None:
@@ -461,6 +460,8 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_child_process(pid, including_parent=False)
         return
+
+    model_info = res.json()
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
@@ -610,6 +611,7 @@ class Runtime:
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
     ):
         json_data = {
             "text": prompt,
@@ -617,7 +619,9 @@ class Runtime:
             "return_logprob": return_logprob,
             "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
+            "lora_path": lora_path,
         }
+        assert not isinstance(lora_path, list) or len(lora_path) == len(prompt)
         response = requests.post(
             self.url + "/generate",
             json=json_data,
