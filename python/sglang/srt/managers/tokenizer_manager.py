@@ -197,8 +197,6 @@ class TokenizerManager:
                     if not_use_index
                     else obj.logprob_start_len[index]
                 )
-                if return_logprob and logprob_start_len == -1:
-                    logprob_start_len = len(input_ids) - 1
                 top_logprobs_num = (
                     obj.top_logprobs_num
                     if not_use_index
@@ -251,8 +249,6 @@ class TokenizerManager:
 
         # Send to the controller
         if self.is_generation:
-            if return_logprob and logprob_start_len == -1:
-                logprob_start_len = len(input_ids) - 1
             tokenized_obj = TokenizedGenerateReqInput(
                 rid,
                 input_text,
@@ -349,8 +345,6 @@ class TokenizerManager:
                 sampling_params = self._get_sampling_params(obj.sampling_params[index])
 
                 if self.is_generation:
-                    if obj.return_logprob[index] and obj.logprob_start_len[index] == -1:
-                        obj.logprob_start_len[index] = len(input_ids) - 1
                     pixel_values, image_hashes, image_sizes = (
                         await self._get_pixel_values(obj.image_data[index])
                     )

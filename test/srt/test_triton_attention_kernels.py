@@ -127,7 +127,6 @@ class TestExtendAttention(unittest.TestCase):
 
     def _test_context_attention_once(self, head_dim):
         # Set up a simple test case
-        batch_size = 2
         num_heads = 4
         seq_lens = [8, 12]
         max_seq_len = max(seq_lens)

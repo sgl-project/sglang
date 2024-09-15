@@ -56,6 +56,7 @@ class AttentionBackend(ABC):
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):
+        """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
     def forward(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
@@ -66,9 +67,11 @@ class AttentionBackend(ABC):
             return self.forward_extend(q, k, v, layer, input_metadata)
 
     def forward_decode(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        """Run a forward for decode."""
         raise NotImplementedError()
 
     def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        """Run a forward for extend."""
         raise NotImplementedError()
 
 
@@ -299,6 +302,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
             if total_num_tokens >= global_config.layer_sync_threshold:
+                # TODO: Revisit this. Why is this synchronize needed?
                 torch.cuda.synchronize()
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
