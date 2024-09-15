@@ -17,7 +17,6 @@ class TestJSONConstrained(unittest.TestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
         cls.json_schema = json.dumps(
             {
                 "type": "object",
@@ -37,7 +36,6 @@ class TestJSONConstrained(unittest.TestCase):
         kill_child_process(cls.process.pid)
 
     def run_decode(self, return_logprob=False, top_logprobs_num=0, n=1):
-        headers = {"Authorization": f"Bearer {self.api_key}"}
         response = requests.post(
             self.base_url + "/generate",
             json={
@@ -54,7 +52,6 @@ class TestJSONConstrained(unittest.TestCase):
                 "top_logprobs_num": top_logprobs_num,
                 "logprob_start_len": 0,
             },
-            headers=headers,
         )
         print(json.dumps(response.json()))
         print("=" * 100)
@@ -69,7 +66,7 @@ class TestJSONConstrained(unittest.TestCase):
         self.run_decode()
 
     def test_json_openai(self):
-        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+        client = openai.Client(api_key="EMPTY", base_url=f"{self.base_url}/v1")
 
         response = client.chat.completions.create(
             model=self.model,

@@ -22,7 +22,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -472,7 +472,7 @@ def v1_generate_request(
     first_prompt_type = type(all_requests[0].prompt)
     for request in all_requests:
         assert (
-            type(request.prompt) == first_prompt_type
+            type(request.prompt) is first_prompt_type
         ), "All prompts must be of the same type in file input settings"
         if len(all_requests) > 1 and request.n > 1:
             raise ValueError(

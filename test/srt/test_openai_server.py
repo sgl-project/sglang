@@ -479,6 +479,22 @@ class TestOpenAIServer(unittest.TestCase):
         assert isinstance(js_obj["name"], str)
         assert isinstance(js_obj["population"], int)
 
+    def test_penalty(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant"},
+                {"role": "user", "content": "Introduce the capital of France."},
+            ],
+            temperature=0,
+            max_tokens=128,
+            frequency_penalty=1.0,
+        )
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+
 
 if __name__ == "__main__":
     unittest.main()
