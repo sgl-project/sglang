@@ -434,9 +434,6 @@ class StreamExecutor:
         self.cur_images.append((path, base64_data))
         self.text_ += self.chat_template.image_token
 
-        # if global_config.eager_fill_image:
-        #     self.backend.fill_image(self)
-
     def _spec_gen(self, sampling_params):
         stop = sampling_params.stop
         max_new_tokens = sampling_params.max_new_tokens

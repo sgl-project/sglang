@@ -304,7 +304,6 @@ def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
 def select_sglang_backend(args: argparse.Namespace):
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
-            global_config.enable_parallel_decoding = False
             global_config.enable_parallel_encoding = False
         backend = RuntimeEndpoint(f"{args.host}:{args.port}")
     elif args.backend.startswith("gpt-"):

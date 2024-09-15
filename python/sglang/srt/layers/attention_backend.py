@@ -150,7 +150,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # Some heuristics to check whether to use ragged forward
             use_ragged = False
             if (
-                int(torch.sum(input_metadata.seq_lens)) > 4096
+                torch.sum(input_metadata.seq_lens).item() >= 4096
                 and self.model_runner.sliding_window_size is None
             ):
                 use_ragged = True
@@ -300,10 +300,6 @@ class FlashInferAttnBackend(AttentionBackend):
             input_metadata.token_to_kv_pool.set_kv_buffer(
                 layer.layer_id, input_metadata.out_cache_loc, k, v
             )
-
-            if total_num_tokens >= global_config.layer_sync_threshold:
-                # TODO: Revisit this. Why is this synchronize needed?
-                torch.cuda.synchronize()
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
