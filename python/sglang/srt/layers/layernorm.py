@@ -20,14 +20,12 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from vllm.model_executor.custom_op import CustomOp
-from vllm.utils import is_hip
+
+from sglang.srt.utils import is_hip
 
 # ROCm: flashinfer available later
 if is_hip():
-    from vllm.model_executor.layers.layernorm import (
-        RMSNorm,
-        GemmaRMSNorm,
-    )
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 else:
     from flashinfer.norm import (
         fused_add_rmsnorm,
@@ -76,7 +74,6 @@ else:
                 return x
             else:
                 return x, residual
-
 
     class GemmaRMSNorm(CustomOp):
         def __init__(

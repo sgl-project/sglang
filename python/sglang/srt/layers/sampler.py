@@ -5,13 +5,13 @@ from typing import Tuple, Union
 import torch
 from torch.library import custom_op as torch_custom_op
 from vllm.model_executor.custom_op import CustomOp
-from vllm.utils import is_hip
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 # TODO: move this dict to another place
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils import is_hip
 
 # ROCm: flashinfer available later
 if not is_hip():
