@@ -82,19 +82,22 @@ class TestSRTEndpoint(unittest.TestCase):
 
     def test_logprob_start_len(self):
         logprob_start_len = 4
+        new_tokens = 4
+        prompts = [
+            "I have a very good idea on",
+            "Today is a sunndy day and",
+        ]
 
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": [
-                    "I have a very good idea on",
-                    "Today is a sunndy day and",
-                ],
+                "text": prompts,
                 "sampling_params": {
                     "temperature": 0,
-                    "max_new_tokens": 1,
+                    "max_new_tokens": new_tokens,
                 },
                 "return_logprob": True,
+                "top_logprobs_num": 5,
                 "return_text_in_logprobs": True,
                 "logprob_start_len": logprob_start_len,
             },
@@ -102,9 +105,18 @@ class TestSRTEndpoint(unittest.TestCase):
         response_json = response.json()
         print(json.dumps(response_json, indent=2))
 
-        for res in response_json:
-            res["meta_info"]["prompt_tokens"] == logprob_start_len + 1 + len(
+        for i, res in enumerate(response_json):
+            assert res["meta_info"]["prompt_tokens"] == logprob_start_len + 1 + len(
                 res["meta_info"]["input_token_logprobs"]
+            )
+            assert prompts[i].endswith(
+                "".join([x[-1] for x in res["meta_info"]["input_token_logprobs"]])
+            )
+
+            assert res["meta_info"]["completion_tokens"] == new_tokens
+            assert len(res["meta_info"]["output_token_logprobs"]) == new_tokens
+            res["text"] == "".join(
+                [x[-1] for x in res["meta_info"]["output_token_logprobs"]]
             )
 
 
