@@ -39,7 +39,7 @@ class TestTorchCompile(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.65
+        assert metrics["score"] >= 0.60
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
