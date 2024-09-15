@@ -13,18 +13,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Inference-only MiniCPM model compatible with HuggingFace weights."""
-
-import math
+"""Inference-only XVERSE MoE model."""
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 from vllm.config import CacheConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.fused_moe import fused_moe
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -35,33 +42,31 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
-class MiniCPMMLP(nn.Module):
+class XverseMLP(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
+            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -77,7 +82,98 @@ class MiniCPMMLP(nn.Module):
         return x
 
 
-class MiniCPMAttention(nn.Module):
+class XverseMoE(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.n_routed_experts = config.num_experts
+        self.top_k = config.moe_top_k
+        if self.tp_size > self.n_routed_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than "
+                f"the number of experts {self.n_routed_experts}."
+            )
+
+        self.experts = nn.ModuleList(
+            [
+                XverseMLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                )
+                for _ in range(self.n_routed_experts)
+            ]
+        )
+        self.pack_params()
+
+        self.router = ReplicatedLinear(
+            config.hidden_size, self.n_routed_experts, bias=False, quant_config=None
+        )
+
+        if config.num_shared_experts is not None:
+            intermediate_size = config.intermediate_size * config.num_shared_experts
+            self.shared_experts = XverseMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+            )
+
+    def pack_params(self):
+        w1 = []
+        w2 = []
+        for expert in self.experts:
+            w1.append(expert.gate_up_proj.weight)
+            w2.append(expert.down_proj.weight)
+        self.w1 = torch._utils._flatten_dense_tensors(w1)
+        w1s = torch._utils._unflatten_dense_tensors(self.w1, w1)
+        for data, param in zip(w1s, w1):
+            param.data = data
+        self.w1 = self.w1.view(len(w1), *w1s[0].shape)
+
+        self.w2 = torch._utils._flatten_dense_tensors(w2)
+        w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
+        for data, param in zip(w2s, w2):
+            param.data = data
+
+        self.w2 = self.w2.view(len(w2), *w2s[0].shape)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        if self.config.num_shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.router(hidden_states)
+        final_hidden_states = fused_moe(
+            hidden_states,
+            self.w1,
+            self.w2,
+            router_logits,
+            self.top_k,
+            renormalize=getattr(self.config, "norm_topk_prob", False),
+            inplace=True,
+        )
+
+        if self.config.num_shared_experts is not None:
+            final_hidden_states = final_hidden_states + shared_output
+        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+class XverseAttention(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -87,6 +183,7 @@ class MiniCPMAttention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
+        cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -120,6 +217,7 @@ class MiniCPMAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
         )
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -134,8 +232,6 @@ class MiniCPMAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        # set rope as fp32 instead of bf16
-        self.rotary_emb.cos_sin_cache = self.rotary_emb._compute_cos_sin_cache()
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -152,44 +248,49 @@ class MiniCPMAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        orig_dtype = q.dtype
-        q, k = q.float(), k.float()
         q, k = self.rotary_emb(positions, q, k)
-        q, k = q.to(orig_dtype), k.to(orig_dtype)
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
         return output
 
 
-class MiniCPMDecoderLayer(nn.Module):
+class XverseDecoderLayer(nn.Module):
+
     def __init__(
         self,
-        config,
-        layer_id: int = 0,
+        config: PretrainedConfig,
+        layer_id: int,
+        cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
-        self.config = config
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = MiniCPMAttention(
+        num_key_value_heads = getattr(
+            config, "num_key_value_heads", config.num_attention_heads
+        )
+        self.self_attn = XverseAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
+            num_kv_heads=num_key_value_heads,
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
+            cache_config=cache_config,
             quant_config=quant_config,
         )
-        self.mlp = MiniCPMMLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-        )
+        if config.num_experts is not None:
+            self.mlp = XverseMoE(config=config, quant_config=quant_config)
+        else:
+            self.mlp = XverseMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+            )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -201,49 +302,49 @@ class MiniCPMDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # Self Attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             input_metadata=input_metadata,
         )
-        hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
-        )
 
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
-        )
-
-        return hidden_states, None
+        return hidden_states, residual
 
 
-class MiniCPMModel(nn.Module):
+class XverseModel(nn.Module):
+
+    fall_back_to_pt_during_load = False
+
     def __init__(
         self,
-        config,
+        config: PretrainedConfig,
+        cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
-        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+
         self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
+            config.vocab_size,
             config.hidden_size,
-            org_num_embeddings=config.vocab_size,
         )
         self.layers = nn.ModuleList(
             [
-                MiniCPMDecoderLayer(config, i, quant_config=quant_config)
-                for i in range(config.num_hidden_layers)
+                XverseDecoderLayer(
+                    config, layer_id, cache_config, quant_config=quant_config
+                )
+                for layer_id in range(config.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -253,50 +354,36 @@ class MiniCPMModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
-        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids) * self.config.scale_emb
-        else:
-            hidden_states = input_embeds
+        hidden_states = self.embed_tokens(input_ids)
         residual = None
-
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                input_metadata,
-                residual,
+                positions, hidden_states, input_metadata, residual
             )
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
-class MiniCPMForCausalLM(nn.Module):
+class XverseMoeForCausalLM(nn.Module):
+
     def __init__(
         self,
-        config,
-        quant_config: Optional[QuantizationConfig] = None,
+        config: PretrainedConfig,
         cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
-
-        self.num_experts = getattr(self.config, "num_experts", 0)
         self.quant_config = quant_config
-        self.model = MiniCPMModel(config, quant_config=quant_config)
-        # self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if not self.config.tie_word_embeddings:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-            )
-
-        self.scale_width = self.config.hidden_size / self.config.dim_model_base
-
+        self.model = XverseModel(config, cache_config, quant_config)
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, quant_config=quant_config
+        )
         self.logits_processor = LogitsProcessor(config)
+
+        self.param_dict = dict(self.named_parameters())
 
     @torch.no_grad()
     def forward(
@@ -304,18 +391,10 @@ class MiniCPMForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
-        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is not None:
-            input_embeds = input_embeds * self.config.scale_emb
-        hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
-        hidden_states = hidden_states / self.scale_width
-        if self.config.tie_word_embeddings:
-            lm_head_weight = self.model.embed_tokens.weight
-        else:
-            lm_head_weight = self.lm_head.weight
+        hidden_states = self.model(input_ids, positions, input_metadata)
         return self.logits_processor(
-            input_ids, hidden_states, lm_head_weight, input_metadata
+            input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -327,25 +406,12 @@ class MiniCPMForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        expert_params_mapping = [
-            # (param_name, weight_name, expert_id)
-            (
-                "ws" if weight_name in ["w1", "w3"] else "w2s",
-                f"experts.{expert_id}.{weight_name}.weight",
-                expert_id,
-            )
-            for expert_id in range(self.num_experts)
-            for weight_name in ["w1", "w2", "w3"]
-        ]
-        params_dict = dict(self.named_parameters())
+
+        params_dict = self.param_dict
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -353,30 +419,27 @@ class MiniCPMForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                # Skip experts that are not assigned to this worker.
+                if (
+                    "mlp.experts." in name or "mlp.shared_experts." in name
+                ) and name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for param_name, weight_name, expert_id in expert_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param, loaded_weight, weight_name, expert_id=expert_id
-                    )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip experts that are not assigned to this worker.
+                if (
+                    "mlp.experts." in name or "mlp.shared_experts." in name
+                ) and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
 
 
-EntryClass = MiniCPMForCausalLM
+EntryClass = XverseMoeForCausalLM

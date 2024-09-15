@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from functools import partial
+from types import SimpleNamespace
 from typing import Callable, List, Optional
 
 import numpy as np
@@ -14,6 +15,7 @@ import requests
 import torch
 import torch.nn.functional as F
 
+from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
@@ -28,7 +30,13 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Meta-Llama-3.1-70B-Instruc
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8"
 
-if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
+
+def is_in_ci():
+    """Return whether it is in CI runner."""
+    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+
+
+if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 5157
     DEFAULT_URL_FOR_TEST = "http://127.0.0.1:6157"
 else:
@@ -501,3 +509,79 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
 
 def get_similarities(vec1, vec2):
     return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)
+
+
+def run_bench_serving(model, num_prompts, request_rate, other_server_args):
+    # Launch the server
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+    )
+
+    # Run benchmark
+    args = SimpleNamespace(
+        backend="sglang",
+        base_url=base_url,
+        host=None,
+        port=None,
+        dataset_name="random",
+        dataset_path="",
+        model=None,
+        tokenizer=None,
+        num_prompts=num_prompts,
+        sharegpt_output_len=None,
+        random_input_len=4096,
+        random_output_len=2048,
+        random_range_ratio=0.0,
+        request_rate=request_rate,
+        multi=None,
+        seed=0,
+        output_file=None,
+        disable_tqdm=False,
+        disable_stream=False,
+        disable_ignore_eos=False,
+        extra_request_body=None,
+    )
+
+    try:
+        res = run_benchmark(args)
+    finally:
+        kill_child_process(process.pid)
+
+    assert res["completed"] == num_prompts
+    return res
+
+
+def run_bench_latency(model, other_args):
+    command = [
+        "python3",
+        "-m",
+        "sglang.bench_latency",
+        "--model-path",
+        model,
+        "--batch-size",
+        "1",
+        "--input",
+        "128",
+        "--output",
+        "8",
+        *other_args,
+    ]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    try:
+        stdout, stderr = process.communicate()
+        output = stdout.decode()
+        error = stderr.decode()
+        print(f"Output: {output}", flush=True)
+        print(f"Error: {error}", flush=True)
+
+        lastline = output.split("\n")[-3]
+        output_throughput = float(lastline.split(" ")[-2])
+    finally:
+        kill_child_process(process.pid)
+
+    return output_throughput

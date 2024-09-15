@@ -37,7 +37,7 @@ jobs:
           cd test/lang
           python3 run_suite.py --suite minimal
 
-  unit-test-backend-part-0:
+  unit-test-backend-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
     steps:
@@ -56,7 +56,7 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite minimal --range-begin 0 --range-end 8
 
-  unit-test-backend-part-1:
+  unit-test-backend-part-2:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
     steps:
@@ -75,7 +75,7 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite minimal --range-begin 8
 
-  performance-test-1-gpu:
+  performance-test-1-gpu-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner
     steps:
@@ -88,29 +88,54 @@ jobs:
           pip install -e "python[all]"
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
-      - name: Benchmark Serving Throughput
+      - name: Benchmark Single Latency
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_serving_throughput.TestServingThroughput.test_default
+          python3 -m unittest test_bench_latency.TestBenchLatency.test_default
 
-      - name: Benchmark Serving Latency
+      - name: Benchmark Online Latency
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_serving_latency.TestServingLatency.test_default
+          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
 
-      - name: Benchmark Serving Throughput (w/o RadixAttention)
+      - name: Benchmark Offline Throughput
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_radix_cache
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
 
-      - name: Benchmark Serving Throughput (w/o ChunkedPrefill)
+  performance-test-1-gpu-part-2:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Benchmark Offline Throughput (w/o RadixAttention)
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_serving_throughput.TestServingThroughput.test_default_without_chunked_prefill
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
+
+      - name: Benchmark Offline Throughput (w/o ChunkedPrefill)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_chunked_prefill
+
+      - name: Benchmark Offline Throughput (w/ Triton)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
 
   performance-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -125,23 +150,24 @@ jobs:
           pip install -e "python[all]"
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
-      - name: Benchmark Serving Throughput (TP=2)
+      - name: Benchmark Offline Throughput (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
 
-      - name: Benchmark Serving Latency (TP=2)
+      - name: Benchmark Offline Throughput (w/o RadixAttention) (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_moe_serving_latency.TestServingLatency.test_default
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
-      - name: Benchmark Serving Throughput (w/o RadixAttention) (TP=2)
+      - name: Benchmark Single Latency (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_moe_serving_throughput.TestServingThroughput.test_default_without_radix_cache
+          python3 -m unittest test_bench_latency.TestBenchLatency.test_moe_default
+
 
   accuracy-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -191,8 +217,8 @@ jobs:
 
   finish:
     needs: [
-      unit-test-frontend, unit-test-backend-part-0, unit-test-backend-part-1,
-      performance-test-1-gpu, performance-test-2-gpu,
+      unit-test-frontend, unit-test-backend-part-1, unit-test-backend-part-2,
+      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu
     ]
     runs-on: ubuntu-latest
