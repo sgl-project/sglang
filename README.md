@@ -60,7 +60,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.3.0 https://github.com/sgl-project/sglang.git
+git clone -b v0.3.1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -139,7 +139,7 @@ sky status --endpoint 30000 sglang
 
 
 ### Common Notes
-- [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please disable it by adding `--disable-flashinfer --disable-flashinfer-sampling` and open an issue on GitHub.
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
 
 ## Backend: SGLang Runtime (SRT)
