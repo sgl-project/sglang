@@ -103,7 +103,7 @@ class TestSRTEndpoint(unittest.TestCase):
         print(json.dumps(response_json, indent=2))
 
         for res in response_json:
-            len(res["meta_info"]["prompt_tokens"]) == logprob_start_len + 1 + len(
+            res["meta_info"]["prompt_tokens"] == logprob_start_len + 1 + len(
                 res["meta_info"]["input_token_logprobs"]
             )
 
