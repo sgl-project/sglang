@@ -108,9 +108,6 @@ class LogitsProcessor(nn.Module):
         end = torch.clamp(
             start + pruned_lens - 2, min=0, max=logprobs_cumsum.shape[0] - 1
         )
-        print(
-            f"{start=}, {end=}, {logits_metadata.extend_seq_lens=}, {logits_metadata.extend_logprob_start_lens_cpu=}"
-        )
         sum_logp = (
             logprobs_cumsum[end] - logprobs_cumsum[start] + input_token_logprobs[start]
         )
@@ -256,7 +253,12 @@ class LogitsProcessor(nn.Module):
                 # Note that we pad a zero at the end for easy batching.
                 input_token_logprobs = all_logprobs[
                     torch.arange(all_logprobs.shape[0], device="cuda"),
-                    torch.cat(pruned_input_ids + [torch.tensor([0], device="cuda")]),
+                    torch.cat(
+                        [
+                            torch.cat(pruned_input_ids)[1:],
+                            torch.tensor([0], device="cuda"),
+                        ]
+                    ),
                 ]
                 normalized_prompt_logprobs = self._get_normalized_prompt_logprobs(
                     input_token_logprobs,
