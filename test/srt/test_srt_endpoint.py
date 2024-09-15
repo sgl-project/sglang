@@ -43,7 +43,7 @@ class TestSRTEndpoint(unittest.TestCase):
                 "text": "The capital of France is",
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
-                    "max_new_tokens": 32,
+                    "max_new_tokens": 16,
                     "n": n,
                 },
                 "stream": stream,
@@ -60,7 +60,8 @@ class TestSRTEndpoint(unittest.TestCase):
             for line in response.iter_lines():
                 if line.startswith(b"data: ") and line[6:] != b"[DONE]":
                     response_json.append(json.loads(line[6:]))
-        print(json.dumps(response_json))
+
+        print(json.dumps(response_json, indent=2))
         print("=" * 100)
 
     def test_simple_decode(self):
@@ -78,6 +79,33 @@ class TestSRTEndpoint(unittest.TestCase):
             top_logprobs_num=5,
             return_text=True,
         )
+
+    def test_logprob_start_len(self):
+        logprob_start_len = 4
+
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": [
+                    "I have a very good idea on",
+                    "Today is a sunndy day and",
+                ],
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 1,
+                },
+                "return_logprob": True,
+                "return_text_in_logprobs": True,
+                "logprob_start_len": logprob_start_len,
+            },
+        )
+        response_json = response.json()
+        print(json.dumps(response_json, indent=2))
+
+        for res in response_json:
+            len(res["meta_info"]["prompt_tokens"]) == logprob_start_len + 1 + len(
+                res["meta_info"]["input_token_logprobs"]
+            )
 
 
 if __name__ == "__main__":

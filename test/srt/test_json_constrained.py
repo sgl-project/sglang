@@ -27,9 +27,7 @@ class TestJSONConstrained(unittest.TestCase):
                 "required": ["name", "population"],
             }
         )
-        cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=300, api_key=cls.api_key
-        )
+        cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300)
 
     @classmethod
     def tearDownClass(cls):

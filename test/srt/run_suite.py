@@ -17,7 +17,7 @@ suites = {
         "test_pytorch_sampling_backend.py",
         "test_server_args.py",
         "test_skip_tokenizer_init.py",
-        "test_torch_compile.py",
+        "test_srt_endpoint.py" "test_torch_compile.py",
         "test_torchao.py",
         "test_triton_attn_backend.py",
         "test_update_weights.py",
