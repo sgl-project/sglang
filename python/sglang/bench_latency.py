@@ -63,7 +63,7 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import suppress_other_loggers
+from sglang.srt.utils import kill_child_process, suppress_other_loggers
 
 
 @dataclasses.dataclass
@@ -502,4 +502,9 @@ if __name__ == "__main__":
         format="%(message)s",
     )
 
-    main(server_args, bench_args)
+    try:
+        main(server_args, bench_args)
+    except Exception as e:
+        raise e
+    finally:
+        kill_child_process(os.getpid(), including_parent=False)
