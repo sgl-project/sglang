@@ -887,7 +887,7 @@ def v1_chat_generate_request(
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
-        top_logprobs_nums.append(request.top_logprobs)
+        top_logprobs_nums.append(request.top_logprobs or 0)
 
         sampling_params = {
             "temperature": request.temperature,
