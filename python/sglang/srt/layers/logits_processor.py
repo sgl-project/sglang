@@ -105,9 +105,12 @@ class LogitsProcessor(nn.Module):
 
         start = torch.zeros_like(pruned_lens)
         start[1:] = torch.cumsum(pruned_lens[:-1], dim=0)
-        end = start + pruned_lens - 2
-        start.clamp_(min=0, max=input_token_logprobs.shape[0] - 1)
-        end.clamp_(min=0, max=input_token_logprobs.shape[0] - 1)
+        end = torch.clamp(
+            start + pruned_lens - 2, min=0, max=logprobs_cumsum.shape[0] - 1
+        )
+        print(
+            f"{start=}, {end=}, {logits_metadata.extend_seq_lens=}, {logits_metadata.extend_logprob_start_lens_cpu=}"
+        )
         sum_logp = (
             logprobs_cumsum[end] - logprobs_cumsum[start] + input_token_logprobs[start]
         )
@@ -139,13 +142,12 @@ class LogitsProcessor(nn.Module):
                     output_top_logprobs.append([])
                     continue
 
-                if pruned_len > 1:
-                    input_top_logprobs.append(
-                        [
-                            list(zip(values[pt + j][:k], indices[pt + j][:k]))
-                            for j in range(pruned_len - 1)
-                        ]
-                    )
+                input_top_logprobs.append(
+                    [
+                        list(zip(values[pt + j][:k], indices[pt + j][:k]))
+                        for j in range(pruned_len - 1)
+                    ]
+                )
                 output_top_logprobs.append(
                     list(
                         zip(
@@ -251,9 +253,10 @@ class LogitsProcessor(nn.Module):
                     input_top_logprobs = output_top_logprobs = None
 
                 # Compute the normalized logprobs for the requested tokens.
+                # Note that we pad a zero at the end for easy batching.
                 input_token_logprobs = all_logprobs[
-                    torch.arange(all_logprobs.shape[0] - 1, device="cuda"),
-                    torch.cat(pruned_input_ids)[1:],
+                    torch.arange(all_logprobs.shape[0], device="cuda"),
+                    torch.cat(pruned_input_ids + [torch.tensor([0], device="cuda")]),
                 ]
                 normalized_prompt_logprobs = self._get_normalized_prompt_logprobs(
                     input_token_logprobs,
