@@ -96,10 +96,10 @@ class LoRAManager:
         # get configs and target modules
         self.configs = {}
         self.origin_target_modules = set()
-        for path in self.lora_paths:
-            self.configs[path] = LoRAConfig(path)
+        for name, path in self.lora_paths.items():
+            self.configs[name] = LoRAConfig(path)
             self.origin_target_modules = set(self.origin_target_modules) | set(
-                self.configs[path].target_modules
+                self.configs[name].target_modules
             )
         self.target_modules = set(
             [
@@ -114,11 +114,11 @@ class LoRAManager:
         # load all weights to cpu
         self.loras = []
         self.lora_id = {}
-        for path in self.lora_paths:
-            self.lora_id[path] = len(self.loras)
+        for name in self.lora_paths.keys():
+            self.lora_id[name] = len(self.loras)
             self.loras.append(
                 LoRAAdapter(
-                    path, self.configs[path], self.base_hf_config, self.load_config
+                    name, self.configs[name], self.base_hf_config, self.load_config
                 )
             )
             self.loras[-1].initialize_weights()
