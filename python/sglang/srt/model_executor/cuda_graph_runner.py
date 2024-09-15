@@ -193,7 +193,7 @@ class CudaGraphRunner:
                 attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
                 return_logprob=False,
-                top_logprobs_nums=0,
+                top_logprobs_nums=[0] * bs,
                 positions=(seq_lens - 1 + position_ids_offsets).to(torch.int64),
             )
             return forward(input_ids, input_metadata.positions, input_metadata)

@@ -75,11 +75,11 @@ class TestOpenAIServer(unittest.TestCase):
             assert isinstance(response.choices[0].logprobs.top_logprobs[1], dict)
             ret_num_top_logprobs = len(response.choices[0].logprobs.top_logprobs[1])
 
-            # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some out_put id maps to the same output token and duplicate in the map
+            # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some output id maps to the same output token and duplicate in the map
             # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
-
             assert ret_num_top_logprobs > 0
-            assert response.choices[0].logprobs.token_logprobs[0] != None
+
+            assert response.choices[0].logprobs.token_logprobs[0]
 
         assert response.id
         assert response.created
@@ -143,7 +143,7 @@ class TestOpenAIServer(unittest.TestCase):
                     ret_num_top_logprobs = len(
                         response.choices[0].logprobs.top_logprobs[0]
                     )
-                    # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some out_put id maps to the same output token and duplicate in the map
+                    # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some output id maps to the same output token and duplicate in the map
                     # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
                     assert ret_num_top_logprobs > 0
 
@@ -478,6 +478,22 @@ class TestOpenAIServer(unittest.TestCase):
             raise
         assert isinstance(js_obj["name"], str)
         assert isinstance(js_obj["population"], int)
+
+    def test_penalty(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant"},
+                {"role": "user", "content": "Introduce the capital of France."},
+            ],
+            temperature=0,
+            max_tokens=32,
+            frequency_penalty=1.0,
+        )
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
 
 
 if __name__ == "__main__":

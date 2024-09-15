@@ -33,13 +33,13 @@ class TestChunkedPrefill(unittest.TestCase):
             base_url=base_url,
             model=model,
             eval_name="mmlu",
-            num_examples=32,
+            num_examples=64,
             num_threads=32,
         )
 
         try:
             metrics = run_eval(args)
-            assert metrics["score"] >= 0.6
+            assert metrics["score"] >= 0.65
         finally:
             kill_child_process(process.pid)
 
