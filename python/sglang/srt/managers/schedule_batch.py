@@ -482,16 +482,7 @@ class ScheduleBatch:
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
-        self.running_bs = running_batch.batch_size()
-
-        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        prefix_lens_cpu = [len(r.prefix_indices) for r in self.reqs]
-        prefix_lens_cpu.extend(
-            [
-                len(r.origin_input_ids) + len(r.output_ids) - 1
-                for r in running_batch.reqs
-            ]
-        )
+        running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
             req.fill_ids = req.origin_input_ids + req.output_ids
@@ -499,14 +490,22 @@ class ScheduleBatch:
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
-        extend_num_tokens = self.extend_num_tokens + running_batch.batch_size()
+        extend_num_tokens = self.extend_num_tokens + running_bs
+
         self.merge(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
         self.extend_num_tokens = extend_num_tokens
-        self.prefix_lens_cpu = prefix_lens_cpu
 
-        # NOTE: Should we update extend_lens_cpu, extend_logprob_start_lens_cpu?
+        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+        self.prefix_lens_cpu.extend(
+            [
+                len(r.origin_input_ids) + len(r.output_ids) - 1
+                for r in running_batch.reqs
+            ]
+        )
+        self.extend_lens_cpu.extend([1] * running_bs)
+        self.extend_logprob_start_lens_cpu.extend([0] * running_bs)
 
     def check_decode_mem(self):
         bs = self.batch_size()
