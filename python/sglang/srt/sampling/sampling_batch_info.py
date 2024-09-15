@@ -86,24 +86,24 @@ class SamplingBatchInfo:
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        device = "cuda"
         reqs = batch.reqs
         ret = cls(vocab_size=vocab_size)
 
-        ret.temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
-        ret.top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        )
-        ret.top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
-        )
-        ret.min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
-        )
+        with torch.device("cuda"):
+            ret.temperatures = torch.tensor(
+                [r.sampling_params.temperature for r in reqs],
+                dtype=torch.float,
+            ).view(-1, 1)
+            ret.top_ps = torch.tensor(
+                [r.sampling_params.top_p for r in reqs], dtype=torch.float
+            )
+            ret.top_ks = torch.tensor(
+                [r.sampling_params.top_k for r in reqs], dtype=torch.int
+            )
+            ret.min_ps = torch.tensor(
+                [r.sampling_params.min_p for r in reqs], dtype=torch.float
+            )
+
         ret.need_min_p_sampling = any(r.sampling_params.min_p > 0 for r in reqs)
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
@@ -116,7 +116,7 @@ class SamplingBatchInfo:
         ret.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
             batch=batch,
-            device=device,
+            device="cuda",
             Penalizers={
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,

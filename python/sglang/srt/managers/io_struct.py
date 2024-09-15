@@ -20,7 +20,7 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 
 import copy
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -43,6 +43,7 @@ class GenerateReqInput:
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
+    # By default, this value is "-1", which means it will only return logprobs for output tokens.
     logprob_start_len: Optional[Union[List[int], int]] = None
     # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: Optional[Union[List[int], int]] = None
