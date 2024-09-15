@@ -140,7 +140,7 @@ class InputMetadata:
     def compute_extend_infos(self, batch: ScheduleBatch):
         self.extend_seq_lens = torch.tensor(batch.extend_lens_cpu, device="cuda")
         self.extend_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
-        self.extend_start_loc = torch.zeros_like(self.seq_lens)
+        self.extend_start_loc = torch.zeros_like(self.extend_seq_lens)
         self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
         self.extend_no_prefix = all(x == 0 for x in batch.prefix_lens_cpu)
         self.extend_seq_lens_cpu = batch.extend_lens_cpu

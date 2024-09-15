@@ -383,7 +383,7 @@ class ScheduleBatch:
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
         return_logprob = any(req.return_logprob for req in reqs)
-        has_stream = any(r.stream for r in reqs)
+        has_stream = any(req.stream for req in reqs)
 
         return cls(
             reqs=reqs,
@@ -398,7 +398,7 @@ class ScheduleBatch:
         return len(self.reqs)
 
     def is_empty(self):
-        return not self.reqs
+        return len(self.reqs) == 0
 
     def alloc_req_slots(self, num_reqs):
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
@@ -443,6 +443,7 @@ class ScheduleBatch:
             req.req_pool_idx = req_pool_indices_cpu[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
+            assert seq_len - pre_len == req.extend_input_len
 
             if pre_len > 0:
                 self.req_to_token_pool.req_to_token[req.req_pool_idx][
@@ -712,6 +713,7 @@ class ScheduleBatch:
         self.out_cache_loc = None
         self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
+        self.has_stream = any(req.stream for req in self.reqs)
 
         self.sampling_info.filter(unfinished_indices, new_indices)
 
@@ -732,3 +734,4 @@ class ScheduleBatch:
         self.out_cache_loc = None
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
+        self.has_stream = any(req.stream for req in self.reqs)
