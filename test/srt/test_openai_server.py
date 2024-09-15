@@ -489,7 +489,7 @@ class TestOpenAIServer(unittest.TestCase):
                 {"role": "user", "content": "Introduce the capital of France."},
             ],
             temperature=0,
-            max_tokens=128,
+            max_tokens=32,
             frequency_penalty=1.0,
         )
         text = response.choices[0].message.content

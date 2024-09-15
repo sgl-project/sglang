@@ -106,10 +106,6 @@ class LogitsProcessor(nn.Module):
         start = torch.zeros_like(pruned_lens)
         start[1:] = torch.cumsum(pruned_lens[:-1], dim=0)
         end = start + pruned_lens - 2
-        if False:
-            print(f"{input_token_logprobs=}")
-            print(f"{start=}")
-            print(f"{end=}")
         start.clamp_(min=0, max=input_token_logprobs.shape[0] - 1)
         end.clamp_(min=0, max=input_token_logprobs.shape[0] - 1)
         sum_logp = (
@@ -134,7 +130,7 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs, output_top_logprobs = [], []
 
             pt = 0
-            for k, pruned_len in enumerate(
+            for k, pruned_len in zip(
                 logits_metadata.top_logprobs_nums,
                 logits_metadata.extend_logprob_pruned_lens_cpu,
             ):
