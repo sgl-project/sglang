@@ -481,7 +481,6 @@ def main(server_args, bench_args):
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
 
-    # TODO(kevin85421): Make the parser setup unit testable.
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)

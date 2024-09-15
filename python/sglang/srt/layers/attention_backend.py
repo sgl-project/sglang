@@ -15,7 +15,7 @@ import torch.nn as nn
 
 from sglang.global_config import global_config
 from sglang.srt.layers.flashinfer_utils import update_flashinfer_indices
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 
 if TYPE_CHECKING:
@@ -335,7 +335,6 @@ class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.triton_attention.decode_attention import (
-            REDUCE_TORCH_TYPE,
             decode_attention_fwd,
         )
         from sglang.srt.layers.triton_attention.extend_attention import (
@@ -346,8 +345,12 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
-        self.REDUCE_TORCH_TYPE = REDUCE_TORCH_TYPE
         self.num_head = model_runner.model_config.num_attention_heads
+
+        if global_server_args_dict.get("triton_attention_reduce_in_fp32", False):
+            self.reduce_dtype = torch.float32
+        else:
+            self.reduce_dtype = torch.float16
 
         self.forward_metadata = None
 
@@ -365,7 +368,7 @@ class TritonAttnBackend(AttentionBackend):
             total_num_tokens = torch.sum(input_metadata.seq_lens).item()
             attn_logits = torch.empty(
                 (self.num_head, total_num_tokens),
-                dtype=self.REDUCE_TORCH_TYPE,
+                dtype=self.reduce_dtype,
                 device="cuda",
             )
 
@@ -385,8 +388,11 @@ class TritonAttnBackend(AttentionBackend):
             (max_bs,), dtype=torch.int32, device="cuda"
         )
         self.cuda_graph_attn_logits = torch.empty(
-            (self.num_head, self.cuda_graph_max_total_num_tokens),
-            dtype=self.REDUCE_TORCH_TYPE,
+            (
+                self.num_head,
+                self.cuda_graph_max_total_num_tokens,
+            ),
+            dtype=self.reduce_dtype,
             device="cuda",
         )
 
@@ -405,13 +411,6 @@ class TritonAttnBackend(AttentionBackend):
     ):
         self.cuda_graph_start_loc.zero_()
         self.cuda_graph_start_loc[1:bs] = torch.cumsum(seq_lens[: bs - 1], dim=0)
-
-        self.forward_metadata = (
-            self.cuda_graph_start_loc,
-            self.cuda_graph_attn_logits,
-            self.cuda_graph_max_seq_len,
-            None,
-        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -447,6 +446,10 @@ class TritonAttnBackend(AttentionBackend):
         return o
 
     def forward_decode(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        # During torch.compile, there is a bug in rotary_emb that causes the
+        # output value to have a 3D tensor shape. This reshapes the output correctly.
+        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
