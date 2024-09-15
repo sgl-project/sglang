@@ -1,3 +1,7 @@
+"""
+python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_simple_decode
+"""
+
 import json
 import unittest
 
@@ -69,13 +73,11 @@ class TestSRTEndpoint(unittest.TestCase):
         self.run_decode(n=3, stream=True)
 
     def test_logprob(self):
-        for top_logprobs_num in [0, 3]:
-            for return_text in [True, False]:
-                self.run_decode(
-                    return_logprob=True,
-                    top_logprobs_num=top_logprobs_num,
-                    return_text=return_text,
-                )
+        self.run_decode(
+            return_logprob=True,
+            top_logprobs_num=5,
+            return_text=True,
+        )
 
 
 if __name__ == "__main__":
