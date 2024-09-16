@@ -54,11 +54,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_generation_model,
-    is_llama3_405b_fp8_head_16,
     is_multimodal_model,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
-    monkey_patch_vllm_qvk_linear_loader,
 )
 
 logger = logging.getLogger(__name__)
