@@ -19,6 +19,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flashinfer.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -31,16 +32,6 @@ from vllm.model_executor.utils import set_weight_attrs
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
-
-try:
-    if is_hip():
-        raise ImportError("FlashInfer is not yet supported on AMD GPUs.")
-    from flashinfer.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
-except ImportError as e:
-    logger.warning(
-        "FlashInfer is not available. Fallback to other kernel libraries. Message: {e}"
-    )
-    from vllm._custom_ops import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 
 class SiluAndMul(CustomOp):
@@ -76,6 +67,13 @@ class GeluAndMul(CustomOp):
         else:
             raise RuntimeError("GeluAndMul only support tanh or none")
         return out
+
+
+if is_hip():
+    logger.info(
+        "FlashInfer is not available on AMD GPUs. Fallback to other kernel libraries."
+    )
+    from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
 
 
 class ScaledActivation(nn.Module):
