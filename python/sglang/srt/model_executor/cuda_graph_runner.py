@@ -194,6 +194,13 @@ class CudaGraphRunner:
         seq_lens = self.seq_lens[:bs]
         position_ids_offsets = self.position_ids_offsets[:bs]
         out_cache_loc = self.out_cache_loc[:bs]
+        # TODO (yonghao): fix parameter initialization below.
+        normal_to_sp_indices = None
+        sp_decode_local_lens = torch.ceil(seq_lens / self.model_runner.sp_size).to(
+            torch.int32
+        )
+        sp_local_token_offset = 0
+        sp_local_token_length = torch.sum(sp_decode_local_lens).to(torch.int32)
 
         # FlashInfer inputs
         if not _grouped_size_compiled_for_decode_kernels(
@@ -237,6 +244,8 @@ class CudaGraphRunner:
             seq_lens,
             None,
             flashinfer_decode_wrapper,
+            normal_to_sp_indices=normal_to_sp_indices,
+            sp_decode_local_lens=sp_decode_local_lens,
         )
 
         # Run and capture
@@ -254,6 +263,10 @@ class CudaGraphRunner:
                 top_logprobs_nums=0,
                 positions=(seq_lens - 1 + position_ids_offsets).to(torch.int64),
                 flashinfer_decode_wrapper=flashinfer_decode_wrapper,
+                sp_rank=self.model_runner.sp_rank,
+                sp_size=self.model_runner.sp_size,
+                sp_local_token_offset=sp_local_token_offset,
+                sp_local_token_length=sp_local_token_length,
             )
 
             return forward(input_ids, input_metadata.positions, input_metadata)

@@ -26,6 +26,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.seq_parallel_layout import (
+    init_sequence_parallel_args,
+    seq_parallel_local_len_extend,
+    seq_parallel_pad_zeros,
+)
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 
 if TYPE_CHECKING:
@@ -90,6 +95,18 @@ class InputMetadata:
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
     flashinfer_use_ragged: bool = False
+    # NOTE: for sequence parallel, we need dedicated kernels for cross-shard attn.
+    # Especially, we need custom masks for the last SP shard which may contain padding tokens.
+    flashinfer_prefill_wrapper_sp_full: "BatchPrefillWithRaggedKVCacheWrapper" = None
+    flashinfer_prefill_wrapper_sp_causal: "BatchPrefillWithRaggedKVCacheWrapper" = None
+
+    # For Sequence Parallel
+    sp_rank: int = None
+    sp_size: int = None
+    sp_to_normal_indices: np.ndarray = None
+    sp_local_token_length: int = None
+    sp_local_token_offset: int = None
+    _debug_normal_to_sp_metadata: Optional[List[np.ndarray]] = None
 
     def init_multimuldal_info(self, batch: ScheduleBatch):
         reqs = batch.reqs
@@ -97,7 +114,7 @@ class InputMetadata:
         self.image_sizes = [r.image_sizes for r in reqs]
         self.image_offsets = [r.image_offsets for r in reqs]
 
-    def compute_positions(self, batch: ScheduleBatch):
+    def compute_positions(self, batch: ScheduleBatch, normal_to_sp_indices):
         position_ids_offsets = batch.position_ids_offsets
 
         if self.forward_mode == ForwardMode.DECODE:
@@ -137,6 +154,9 @@ class InputMetadata:
 
         # Positions should be in long type
         self.positions = self.positions.to(torch.int64)
+        update_positions_for_seq_parallel(
+            self, normal_to_sp_indices, batch.prefill_extend_lens
+        )
 
     def compute_extend_infos(self, batch: ScheduleBatch):
         if self.forward_mode == ForwardMode.DECODE:
@@ -173,6 +193,9 @@ class InputMetadata:
         batch: ScheduleBatch,
         forward_mode: ForwardMode,
     ):
+        sp_args, aux_args = init_sequence_parallel_args(
+            model_runner, batch, forward_mode
+        )
         ret = cls(
             forward_mode=forward_mode,
             sampling_info=batch.sampling_info,
@@ -184,11 +207,12 @@ class InputMetadata:
             out_cache_loc=batch.out_cache_loc,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
+            **sp_args,
         )
 
         ret.sampling_info.prepare_penalties()
 
-        ret.compute_positions(batch)
+        ret.compute_positions(batch, aux_args["normal_to_sp_indices"])
 
         ret.compute_extend_infos(batch)
 
@@ -208,12 +232,17 @@ class InputMetadata:
         if not model_runner.server_args.disable_flashinfer:
             if (
                 forward_mode != ForwardMode.DECODE
-                and int(torch.sum(ret.seq_lens)) > 4096
+                and (int(torch.sum(ret.seq_lens)) > 4096 or ret.sp_size > 1)
                 and model_runner.sliding_window_size is None
             ):
+                # NOTE: SP requires the ragged kernel regardless of the sequence length.
                 flashinfer_use_ragged = True
             ret.init_flashinfer_handlers(
-                model_runner, batch.prefix_lens_cpu, flashinfer_use_ragged
+                model_runner,
+                batch.prefix_lens_cpu,
+                flashinfer_use_ragged,
+                aux_args["normal_to_sp_indices"],
+                batch.sp_decode_local_lens,
             )
 
         return ret
@@ -236,6 +265,8 @@ class InputMetadata:
         model_runner,
         prefix_lens_cpu,
         flashinfer_use_ragged,
+        normal_to_sp_indices,
+        sp_decode_local_lens,
     ):
         if self.forward_mode == ForwardMode.DECODE:
             prefix_lens = None
@@ -249,6 +280,8 @@ class InputMetadata:
             self.seq_lens,
             prefix_lens,
             flashinfer_use_ragged=flashinfer_use_ragged,
+            normal_to_sp_indices=normal_to_sp_indices,
+            sp_decode_local_lens=sp_decode_local_lens,
         )
 
         (
@@ -308,10 +341,16 @@ def update_flashinfer_indices(
     prefix_lens,
     flashinfer_decode_wrapper=None,
     flashinfer_use_ragged=False,
+    normal_to_sp_indices=None,
+    sp_decode_local_lens=None,
 ):
     """Init auxiliary variables for FlashInfer attention backend."""
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
-    num_kv_heads = model_runner.model_config.get_num_kv_heads(model_runner.tp_size)
+    # NOTE (yifan): we partitioned K and V along both TP and SP dimensions.
+    # And here tp_size represents KV-TP size * SP size.
+    num_kv_heads = model_runner.model_config.get_num_kv_heads(
+        model_runner.tp_size // model_runner.sp_size
+    )
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
 
@@ -320,6 +359,28 @@ def update_flashinfer_indices(
             paged_kernel_lens = prefix_lens
         else:
             paged_kernel_lens = seq_lens
+
+        sp_size = model_runner.sp_size
+        if forward_mode == ForwardMode.DECODE:
+            # With SP, reqs may have been reordered so we track them here.
+            if normal_to_sp_indices is not None:
+                req_ids = normal_to_sp_indices.tolist()
+            else:
+                req_ids = list(range(batch_size))
+            paged_kernel_lens = seq_lens if sp_size == 1 else sp_decode_local_lens
+        else:
+            extend_lens = seq_lens - prefix_lens
+            # With SP, we use different kernels for sequences that are not evenly partitioned
+            # across SP workers. Here seq_lens works for most SP workers that do not need
+            # masks, and we initiaize kernels with masks separately below.
+            seq_lens = torch.ceil(seq_lens / sp_size).to(torch.int32)
+            prefix_lens = torch.ceil(prefix_lens / sp_size).to(torch.int32)
+            req_ids = list(range(batch_size))
+
+        if sp_size > 1:
+            req_pool_indices = req_pool_indices[req_ids].contiguous()
+            paged_kernel_lens = paged_kernel_lens[req_ids].contiguous()
+            paged_kernel_lens = paged_kernel_lens.to(req_pool_indices.device)
 
         kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
         kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -338,6 +399,9 @@ def update_flashinfer_indices(
         kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
 
         if forward_mode == ForwardMode.DECODE:
+            # For decode, we replicate the current token across SP workers and hence
+            # each SP worker will have all q heads.
+            num_qo_heads *= model_runner.sp_size
             # CUDA graph uses different flashinfer_decode_wrapper
             if flashinfer_decode_wrapper is None:
                 flashinfer_decode_wrapper = model_runner.flashinfer_decode_wrapper
@@ -381,7 +445,63 @@ def update_flashinfer_indices(
                 head_dim,
                 1,
             )
+        if (
+            sp_size > 1 and forward_mode != ForwardMode.DECODE
+        ):  # Sequence parallel enabled, initialize SP kernels with custom masks.
+            # NOTE (yifan): here we assume that when sequence parallel is enabled,
+            # prefix_lens are always 0s, and we will use flashinfer paged attn kernel
+            # for cross-SP-shard attn computation. If later prefix_lens can be non-0s, (
+            # e.g., extend phases with SP), we will need a dedicate paged attn kernel
+            # wrapper for cross-SP-shard attn.
+            if torch.sum(prefix_lens) != 0:
+                raise ValueError(
+                    "Prefix caching with sequence parallelism is not supported."
+                )
+
+            # Prepare masks.
+            sp_size = sp_size
+            extend_lens_cpu = extend_lens.cpu().numpy()
+            padded_extend_lens = seq_parallel_local_len_extend(
+                0, sp_size, extend_lens_cpu
+            )
+            last_extend_lens = seq_parallel_local_len_extend(
+                sp_size - 1, sp_size, extend_lens_cpu
+            )
+            qo_len = (seq_lens - prefix_lens).cpu().tolist()
+            full_mask_arr = []
+            causal_mask_arr = []
+            for i in range(batch_size):
+                full_mask_i = torch.full((qo_len[i], qo_len[i]), False, device="cuda")
+                full_mask_i[: last_extend_lens[i], : padded_extend_lens[i]] = True
+                full_mask_arr.append(full_mask_i.flatten())
+                causal_mask_i = torch.tril(full_mask_i, diagonal=0)
+                causal_mask_arr.append(causal_mask_i.flatten())
+            full_mask = torch.cat(full_mask_arr, dim=0)
+            causal_mask = torch.cat(causal_mask_arr, dim=0)
+
+            # Cross-SP-shard extend part -- masked for the last SP shard which may have
+            # padding tokens. For the othe shards, we can simply use the ragged kernel.
+            model_runner.flashinfer_prefill_wrapper_sp_causal.end_forward()
+            model_runner.flashinfer_prefill_wrapper_sp_causal.begin_forward(
+                qo_indptr,
+                qo_indptr,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                custom_mask=causal_mask,
+            )
+
+            model_runner.flashinfer_prefill_wrapper_sp_full.end_forward()
+            model_runner.flashinfer_prefill_wrapper_sp_full.begin_forward(
+                qo_indptr,
+                qo_indptr,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                custom_mask=full_mask,
+            )
     else:
+        assert model_runner.sp_size == 1, "SP with sliding window not supported"
         # window attention use paged only
         kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
         for wrapper_id in range(2):
@@ -451,3 +571,20 @@ def update_flashinfer_indices(
                     head_dim,
                     1,
                 )
+
+
+def update_positions_for_seq_parallel(
+    input_metadata: InputMetadata, normal_to_sp_indices, extend_seq_lens
+):
+    sp_size = input_metadata.sp_size
+    if sp_size == 1:
+        return
+
+    positions = input_metadata.positions
+
+    if input_metadata.forward_mode == ForwardMode.DECODE:
+        positions = positions[normal_to_sp_indices]
+    else:
+        positions = positions[normal_to_sp_indices]
+        positions = seq_parallel_pad_zeros(positions, extend_seq_lens, sp_size)
+    input_metadata.positions = positions

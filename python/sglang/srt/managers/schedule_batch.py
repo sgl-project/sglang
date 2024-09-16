@@ -21,11 +21,18 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Union
 
+import numpy as np
 import torch
 
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
+from sglang.srt.managers.seq_parallel_layout import (
+    seq_parallel_decode_indices,
+    seq_parallel_input_ids_decode,
+    seq_parallel_input_ids_extend,
+    seq_parallel_local_len_extend,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -348,8 +355,22 @@ class ScheduleBatch:
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
 
+    # Sequence Parallel params
+    sp_size: int = None
+    sp_rank: int = None
+    prefill_extend_lens: np.ndarray = None
+    sp_decode_local_lens: np.ndarray = None
+
     @classmethod
-    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+    def init_new(
+        cls,
+        reqs,
+        req_to_token_pool,
+        token_to_kv_pool,
+        tree_cache,
+        sp_size: int = 1,
+        sp_rank: int = 0,
+    ):
         return_logprob = any(req.return_logprob for req in reqs)
 
         return cls(
@@ -358,6 +379,8 @@ class ScheduleBatch:
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
             return_logprob=return_logprob,
+            sp_size=sp_size,
+            sp_rank=sp_rank,
         )
 
     def batch_size(self):
@@ -402,8 +425,24 @@ class ScheduleBatch:
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = []
 
+        if self.sp_size == 1:
+            flatten_input_ids = sum(input_ids, [])
+        else:
+            flatten_input_ids = seq_parallel_input_ids_extend(
+                input_ids, self.sp_size, bs
+            )
+
         # Allocate memory
         req_pool_indices_cpu = self.alloc_req_slots(bs)
+        if self.sp_size > 1:
+            ext_lens = np.asarray(
+                [len(req.fill_ids) - len(req.prefix_indices) for req in reqs]
+            )
+            extend_local_token_nums = seq_parallel_local_len_extend(
+                self.sp_rank, self.sp_size, ext_lens
+            )
+            self.prefill_extend_lens = ext_lens
+            extend_num_tokens = int(np.sum(extend_local_token_nums))
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
         pt = 0
@@ -418,6 +457,11 @@ class ScheduleBatch:
                     :pre_len
                 ] = req.prefix_indices
 
+            if self.sp_size > 1:
+                ext_len = extend_local_token_nums[i]
+                # Prefix are stored elsewhere and not affected by the layout of
+                # **this** request.
+                seq_len = pre_len + ext_len
             self.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
                 out_cache_loc[pt : pt + ext_len]
             )
@@ -425,7 +469,7 @@ class ScheduleBatch:
 
         # Set fields
         with torch.device("cuda"):
-            self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
+            self.input_ids = torch.tensor(flatten_input_ids, dtype=torch.int32)
             self.req_pool_indices = torch.tensor(req_pool_indices_cpu)
             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
             self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int64)
@@ -636,13 +680,38 @@ class ScheduleBatch:
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
 
+        if self.sp_size > 1:
+            seq_lens_cpu = self.seq_lens.cpu().numpy()
+            input_ids = seq_parallel_input_ids_decode(
+                input_ids, self.sp_size, seq_lens_cpu
+            )
+        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
+
         # Alloc mem
         bs = self.batch_size()
+        if self.sp_size > 1:
+            sp_local_indices = seq_parallel_decode_indices(
+                self.sp_rank, self.sp_size, seq_lens_cpu
+            )
+            bs = len(sp_local_indices)
+
         self.out_cache_loc = self.alloc_token_slots(bs)
 
-        self.req_to_token_pool.req_to_token[
-            self.req_pool_indices, self.seq_lens - 1
-        ] = self.out_cache_loc
+        if self.sp_size > 1:
+            # With SP, reqs are partitioned across SP workers so we need to use
+            # decode_local_lens instead of seq_lens when preparing KV cache.
+            bs = self.batch_size()
+            sp_decode_local_lens = self._sp_decode_local_len(range(bs))
+            self.sp_decode_local_lens = torch.from_numpy(sp_decode_local_lens)
+            local_req_indices = self.req_pool_indices[sp_local_indices]
+            local_lens_cpu = sp_decode_local_lens[sp_local_indices]
+            self.req_to_token_pool.req_to_token[
+                local_req_indices, local_lens_cpu - 1
+            ] = self.out_cache_loc
+        else:
+            self.req_to_token_pool.req_to_token[
+                self.req_pool_indices, self.seq_lens - 1
+            ] = self.out_cache_loc
 
         self.sampling_info.update_regex_vocab_mask(self)
 
@@ -665,6 +734,8 @@ class ScheduleBatch:
         self.out_cache_loc = None
         self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
+        if self.sp_size > 1:
+            self.prefill_extend_lens = self.prefill_extend_lens[new_indices]
 
         self.sampling_info.filter(unfinished_indices, new_indices)
 
@@ -686,6 +757,10 @@ class ScheduleBatch:
         self.out_cache_loc = None
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
+        if self.sp_size > 1:
+            self.prefill_extend_lens = np.concatenate(
+                [self.prefill_extend_lens, other.prefill_extend_lens]
+            )
 
     def check_sample_results(self, sample_output: SampleOutput):
         if not torch.all(sample_output.success):
@@ -701,3 +776,36 @@ class ScheduleBatch:
             sample_output.batch_next_token_ids = batch_next_token_ids
 
         return sample_output.batch_next_token_ids
+
+    def _sp_decode_local_len(self, local_req_indices: np.ndarray):
+        """
+        Args:
+            local_req_indices(np.ndarray): 1D int array indexing selected
+            requests that stores KV-Cache on this SP rank.
+        Returns:
+            local_len(np.ndarray): 1D int array, describing the local KV cache
+            length on this SP rank, for selected request indices.
+        """
+        sp_size = self.sp_size
+
+        extend_lens = self.prefill_extend_lens[local_req_indices]
+        cur_lens = self.seq_lens.cpu().numpy()[local_req_indices]
+        decode_lens = cur_lens - extend_lens
+
+        extend_chunk_size = np.ceil(extend_lens / sp_size).astype(np.int32)
+        if self.sp_rank != sp_size - 1:
+            extend_size = extend_chunk_size
+        else:
+            extend_size = extend_lens - extend_chunk_size * (sp_size - 1)
+        # note that sp_len (as well as decode_lens) already increased 1.
+        # NOTE: for decoding tokens, assume there's no prefix, they are located:
+        # dec token 0 = all token [extend_lens] = stored at extend_lens % sp
+        # decode token i = stored at (extend_lens + i) % sp
+        # Hence, for the remainder tokens, they are stored at extend_lens % sp,
+        # extend_lens % sp + 1, ...
+        # For example, if sp = 4, extend lens = 6, the first decode remainder
+        # token is at rank 3 (7 % 4)
+        decode_extra_tok_offset = (self.sp_rank - extend_lens - 1) % sp_size
+        decode_extra_tok = decode_extra_tok_offset < (decode_lens % sp_size)
+        decode_size = decode_lens // sp_size + decode_extra_tok
+        return extend_size + decode_size
