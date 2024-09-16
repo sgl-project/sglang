@@ -375,7 +375,7 @@ class ServerArgs:
             "--constrained-json-whitespace-pattern",
             type=str,
             default=ServerArgs.constrained_json_whitespace_pattern,
-            help="Regex pattern for JSON constrained output syntactic whitespace.",
+            help=r"Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
         )
         parser.add_argument(
             "--log-level",
