@@ -63,7 +63,7 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import suppress_other_loggers
+from sglang.srt.utils import kill_child_process, suppress_other_loggers
 
 
 @dataclasses.dataclass
@@ -164,6 +164,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer):
         req.prefix_indices = []
         req.sampling_params = sampling_params
         req.fill_ids = req.origin_input_ids
+        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         reqs.append(req)
 
     return input_ids, reqs
@@ -178,6 +179,7 @@ def prepare_extend_inputs_for_correctness_test(
         req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
             i, : bench_args.cut_len
         ]
+        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
     return reqs
 
 
@@ -194,6 +196,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
         req.prefix_indices = []
         req.sampling_params = sampling_params
         req.fill_ids = req.origin_input_ids
+        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         reqs.append(req)
 
     return reqs
@@ -499,4 +502,9 @@ if __name__ == "__main__":
         format="%(message)s",
     )
 
-    main(server_args, bench_args)
+    try:
+        main(server_args, bench_args)
+    except Exception as e:
+        raise e
+    finally:
+        kill_child_process(os.getpid(), including_parent=False)

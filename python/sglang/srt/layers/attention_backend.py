@@ -60,6 +60,7 @@ class AttentionBackend(ABC):
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):
+        """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
     def forward(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
@@ -70,9 +71,11 @@ class AttentionBackend(ABC):
             return self.forward_extend(q, k, v, layer, input_metadata)
 
     def forward_decode(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        """Run a forward for decode."""
         raise NotImplementedError()
 
     def forward_extend(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
+        """Run a forward for extend."""
         raise NotImplementedError()
 
 
@@ -151,7 +154,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # Some heuristics to check whether to use ragged forward
             use_ragged = False
             if (
-                int(torch.sum(input_metadata.seq_lens)) > 4096
+                torch.sum(input_metadata.seq_lens).item() >= 4096
                 and self.model_runner.sliding_window_size is None
             ):
                 use_ragged = True
@@ -301,9 +304,6 @@ class FlashInferAttnBackend(AttentionBackend):
             input_metadata.token_to_kv_pool.set_kv_buffer(
                 layer.layer_id, input_metadata.out_cache_loc, k, v
             )
-
-            if total_num_tokens >= global_config.layer_sync_threshold:
-                torch.cuda.synchronize()
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
