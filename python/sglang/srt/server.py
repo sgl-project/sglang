@@ -152,7 +152,7 @@ async def flush_cache():
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
 
     success, message = await tokenizer_manager.update_weights(obj, request)
-    content = {"message": message, "success": str(success)}
+    content = {"success": success, "message": message}
     if success:
         return JSONResponse(
             content,
