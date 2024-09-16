@@ -29,6 +29,7 @@ class FSMCache(BaseToolCache):
         tokenizer_args_dict,
         enable=True,
         skip_tokenizer_init=False,
+        constrained_json_whitespace_pattern=None,
     ):
         super().__init__(enable=enable)
 
@@ -63,11 +64,14 @@ class FSMCache(BaseToolCache):
             self.outlines_tokenizer.vocabulary = (
                 self.outlines_tokenizer.tokenizer.get_vocab()
             )
+        self.constrained_json_whitespace_pattern = constrained_json_whitespace_pattern
 
     def init_value(self, key):
         key_type, key_string = key
         if key_type == "json":
-            regex = build_regex_from_schema(key_string, whitespace_pattern=r"[\n\t ]*")
+            regex = build_regex_from_schema(
+                key_string, whitespace_pattern=self.constrained_json_whitespace_pattern
+            )
         elif key_type == "regex":
             regex = key_string
         else:
