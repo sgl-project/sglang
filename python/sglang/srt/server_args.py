@@ -173,10 +173,6 @@ class ServerArgs:
             self.sampling_backend = "pytorch"
 
         # Default kernel backends
-        if not self.disable_mla:
-            logger.info("MLA optimization is tunred on. Use triton backend.")
-            self.attention_backend = "triton"
-
         if self.attention_backend is None:
             self.attention_backend = "flashinfer"
 
