@@ -505,6 +505,11 @@ class ModelTpServer:
             else:
                 tree_cache_hit_rate = 0.0
 
+            num_used = self.max_total_num_tokens - (
+                self.token_to_kv_pool.available_size()
+                + self.tree_cache.evictable_size()
+            )
+
             if num_mixed_running > 0:
                 logger.info(
                     f"Prefill batch"
@@ -513,6 +518,7 @@ class ModelTpServer:
                     f"#new-token: {adder.log_input_tokens}, "
                     f"#cached-token: {adder.log_hit_tokens}, "
                     f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                     f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
                 )
             else:
@@ -522,6 +528,7 @@ class ModelTpServer:
                     f"#new-token: {adder.log_input_tokens}, "
                     f"#cached-token: {adder.log_hit_tokens}, "
                     f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                     f"#running-req: {running_bs}, "
                     f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
                 )
