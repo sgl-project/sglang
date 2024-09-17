@@ -1,5 +1,5 @@
 import logging
-from typing import Tuple, Union
+from typing import Union
 
 import torch
 from flashinfer.sampling import (
