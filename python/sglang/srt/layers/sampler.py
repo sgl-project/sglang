@@ -2,17 +2,21 @@ import logging
 from typing import Union
 
 import torch
-from flashinfer.sampling import (
-    min_p_sampling_from_probs,
-    top_k_renorm_prob,
-    top_k_top_p_sampling_from_probs,
-    top_p_renorm_prob,
-)
 from torch import nn
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils import is_hip
+
+# ROCm: flashinfer available later
+if not is_hip():
+    from flashinfer.sampling import (
+        min_p_sampling_from_probs,
+        top_k_renorm_prob,
+        top_k_top_p_sampling_from_probs,
+        top_p_renorm_prob,
+    )
 
 logger = logging.getLogger(__name__)
 

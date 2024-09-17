@@ -13,6 +13,7 @@ limitations under the License.
 
 """Fused operators for activation layers."""
 
+import logging
 from typing import Optional
 
 import torch
@@ -27,6 +28,10 @@ from vllm.distributed import (
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
+
+from sglang.srt.utils import is_hip
+
+logger = logging.getLogger(__name__)
 
 
 class SiluAndMul(CustomOp):
@@ -135,3 +140,10 @@ def get_act_fn(
             act_fn, intermediate_size, input_is_parallel, params_dtype
         )
     return act_fn
+
+
+if is_hip():
+    logger.info(
+        "FlashInfer is not available on AMD GPUs. Fallback to other kernel libraries."
+    )
+    from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
