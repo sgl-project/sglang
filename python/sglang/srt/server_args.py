@@ -520,7 +520,6 @@ class ServerArgs:
         parser.add_argument(
             "--max-torch-compile-bs",
             type=int,
-            choices=[1, 2, 4, 8, 16, 24, 32],
             default=ServerArgs.max_torch_compile_bs,
             help="Set the maximum batch size when using torch compile.",
         )
