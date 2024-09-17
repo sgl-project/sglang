@@ -108,12 +108,12 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     disable_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    disable_mla: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     max_torch_compile_bs: int = 32
     torchao_config: str = ""
     enable_p2p_check: bool = False
-    enable_mla: bool = False
     triton_attention_reduce_in_fp32: bool = False
 
     # LoRA
@@ -173,7 +173,7 @@ class ServerArgs:
             self.sampling_backend = "pytorch"
 
         # Default kernel backends
-        if self.enable_mla:
+        if not self.disable_mla:
             logger.info("MLA optimization is tunred on. Use triton backend.")
             self.attention_backend = "triton"
 
@@ -515,6 +515,11 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
+            "--disable-mla",
+            action="store_true",
+            help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
+        )
+        parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
@@ -540,11 +545,6 @@ class ServerArgs:
             "--enable-p2p-check",
             action="store_true",
             help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
-        )
-        parser.add_argument(
-            "--enable-mla",
-            action="store_true",
-            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
             "--triton-attention-reduce-in-fp32",
