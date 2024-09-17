@@ -41,6 +41,9 @@ if TYPE_CHECKING:
 def _to_torch(model: torch.nn.Module, reverse: bool = False):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):
+            # NOTE: FusedMoE torch native implementaiton is not efficient
+            if "FusedMoE" in sub.__class__.__name__:
+                continue
             if reverse:
                 sub._forward_method = sub.forward_cuda
                 setattr(sub, "is_torch_compile", False)
@@ -105,7 +108,15 @@ class CudaGraphRunner:
             self.capture_bs = list(range(1, 32)) + [64, 128]
         else:
             self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
-        self.compile_bs = [1, 2, 4, 8, 16, 24, 32] if self.use_torch_compile else []
+        self.compile_bs = (
+            [
+                bs
+                for bs in self.capture_bs
+                if bs <= self.model_runner.server_args.max_torch_compile_bs
+            ]
+            if self.use_torch_compile
+            else []
+        )
 
         # Common inputs
         self.max_bs = max(self.capture_bs)

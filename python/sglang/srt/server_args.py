@@ -110,6 +110,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
+    max_torch_compile_bs: int = 32
     torchao_config: str = ""
     enable_p2p_check: bool = False
     enable_mla: bool = False
@@ -522,6 +523,12 @@ class ServerArgs:
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
+        )
+        parser.add_argument(
+            "--max-torch-compile-bs",
+            type=int,
+            default=ServerArgs.max_torch_compile_bs,
+            help="Set the maximum batch size when using torch compile.",
         )
         parser.add_argument(
             "--torchao-config",
