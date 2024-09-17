@@ -72,6 +72,7 @@ class ServerArgs:
     tp_size: int = 1
     stream_interval: int = 1
     random_seed: Optional[int] = None
+    constrained_json_whitespace_pattern: Optional[str] = None
 
     # Logging
     log_level: str = "info"
@@ -376,6 +377,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.random_seed,
             help="The random seed.",
+        )
+        parser.add_argument(
+            "--constrained-json-whitespace-pattern",
+            type=str,
+            default=ServerArgs.constrained_json_whitespace_pattern,
+            help=r"Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
         )
         parser.add_argument(
             "--log-level",

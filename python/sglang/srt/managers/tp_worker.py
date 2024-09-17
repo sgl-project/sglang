@@ -198,6 +198,7 @@ class ModelTpServer:
                     "trust_remote_code": server_args.trust_remote_code,
                 },
                 skip_tokenizer_init=server_args.skip_tokenizer_init,
+                constrained_json_whitespace_pattern=server_args.constrained_json_whitespace_pattern,
             )
         self.jump_forward_cache = JumpForwardCache()
 
@@ -414,7 +415,7 @@ class ModelTpServer:
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) >= self.max_req_input_len:
-            logger.warn(
+            logger.warning(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated!!!"
             )
@@ -807,12 +808,10 @@ class ModelTpServer:
                 unfinished_indices.append(i)
 
             if req.finished() or (
-                (
-                    req.stream
-                    and (
-                        self.decode_forward_ct % self.stream_interval == 0
-                        or len(req.output_ids) == 1
-                    )
+                req.stream
+                and (
+                    self.decode_forward_ct % self.stream_interval == 0
+                    or len(req.output_ids) == 1
                 )
             ):
                 output_rids.append(req.rid)
@@ -937,6 +936,8 @@ class ModelTpServer:
         if success:
             flash_cache_success = self.flush_cache()
             assert flash_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
         return success, message
 
 
