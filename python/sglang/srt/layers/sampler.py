@@ -57,7 +57,7 @@ class Sampler(nn.Module):
                 batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
         elif global_server_args_dict["sampling_backend"] == "pytorch":
             # Here we provide a slower fallback implementation.
-            batch_next_token_ids, success = top_k_top_p_min_p_sampling_from_probs_torch(
+            batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                 probs, sampling_info.top_ks, sampling_info.top_ps, sampling_info.min_ps
             )
         else:
