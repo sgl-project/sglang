@@ -69,13 +69,6 @@ class GeluAndMul(CustomOp):
         return out
 
 
-if is_hip():
-    logger.info(
-        "FlashInfer is not available on AMD GPUs. Fallback to other kernel libraries."
-    )
-    from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
-
-
 class ScaledActivation(nn.Module):
     """An activation function with post-scale parameters.
 
@@ -147,3 +140,10 @@ def get_act_fn(
             act_fn, intermediate_size, input_is_parallel, params_dtype
         )
     return act_fn
+
+
+if is_hip():
+    logger.info(
+        "FlashInfer is not available on AMD GPUs. Fallback to other kernel libraries."
+    )
+    from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
