@@ -445,9 +445,6 @@ class ModelTpServer:
             num_mixed_running,
         )
 
-        if self.running_batch is not None:
-            adder.remove_running_tokens(self.running_batch)
-
         has_inflight = self.current_inflight_req is not None
         if self.current_inflight_req is not None:
             self.current_inflight_req.init_next_round_input(
@@ -465,9 +462,6 @@ class ModelTpServer:
             )
 
         for req in self.waiting_queue:
-            if adder.no_remaining_tokens():
-                break
-            req.init_next_round_input(None if prefix_computed else self.tree_cache)
             if (
                 self.lora_paths is not None
                 and len(
@@ -478,6 +472,10 @@ class ModelTpServer:
                 > self.max_loras_per_batch
             ):
                 break
+
+            if adder.no_remaining_tokens():
+                break
+            req.init_next_round_input(None if prefix_computed else self.tree_cache)
             res = adder.add_one_req(req)
             if (
                 not res
@@ -507,6 +505,11 @@ class ModelTpServer:
             else:
                 tree_cache_hit_rate = 0.0
 
+            num_used = self.max_total_num_tokens - (
+                self.token_to_kv_pool.available_size()
+                + self.tree_cache.evictable_size()
+            )
+
             if num_mixed_running > 0:
                 logger.info(
                     f"Prefill batch"
@@ -515,6 +518,7 @@ class ModelTpServer:
                     f"#new-token: {adder.log_input_tokens}, "
                     f"#cached-token: {adder.log_hit_tokens}, "
                     f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                     f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
                 )
             else:
@@ -524,6 +528,7 @@ class ModelTpServer:
                     f"#new-token: {adder.log_input_tokens}, "
                     f"#cached-token: {adder.log_hit_tokens}, "
                     f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                     f"#running-req: {running_bs}, "
                     f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
                 )
