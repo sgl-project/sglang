@@ -40,7 +40,7 @@ global_server_args_dict = {
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-    "enable_mla": ServerArgs.enable_mla,
+    "disable_mla": ServerArgs.disable_mla,
     "torchao_config": ServerArgs.torchao_config,
 }
 
