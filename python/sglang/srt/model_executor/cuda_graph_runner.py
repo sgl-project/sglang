@@ -42,7 +42,9 @@ def _to_torch(model: torch.nn.Module, reverse: bool = False):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):
             # NOTE: FusedMoE torch native implementaiton is not efficient
-            if reverse or "FusedMoE" in sub.__class__.__name__:
+            if "FusedMoE" in sub.__class__.__name__:
+                continue
+            if reverse:
                 sub._forward_method = sub.forward_cuda
                 setattr(sub, "is_torch_compile", False)
             else:
