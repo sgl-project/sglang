@@ -360,6 +360,7 @@ class ScheduleBatch:
     tree_cache: BasePrefixCache
 
     forward_mode: ForwardMode = None
+    sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
