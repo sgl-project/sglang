@@ -21,12 +21,15 @@ import re
 from dataclasses import dataclass
 
 import torch
-from flashinfer import SegmentGEMMWrapper
 
 from sglang.srt.lora.lora import LoRAAdapter, get_lora_layer
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import replace_submodule
+from sglang.srt.utils import is_hip, replace_submodule
+
+# ROCm: flashinfer available later
+if not is_hip():
+    from flashinfer import SegmentGEMMWrapper
 
 
 def get_stacked_name(name):

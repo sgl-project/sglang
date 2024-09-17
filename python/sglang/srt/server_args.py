@@ -21,6 +21,8 @@ import logging
 import random
 from typing import List, Optional, Union
 
+from sglang.srt.utils import is_hip
+
 logger = logging.getLogger(__name__)
 
 
@@ -162,6 +164,11 @@ class ServerArgs:
                 "The option '--disable-flashinfer-sampling' will be deprecated in the next release. "
                 "Please use '--sampling-backend pytorch' instead. "
             )
+            self.sampling_backend = "pytorch"
+
+        # ROCm: flashinfer available later
+        if is_hip():
+            self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
 
         # Default kernel backends

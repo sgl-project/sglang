@@ -18,6 +18,8 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.utils import set_weight_attrs
 
+from sglang.srt.utils import is_hip
+
 logger = init_logger(__name__)
 
 
@@ -381,6 +383,7 @@ from torch.nn import Module
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     all_close_1d,
+    normalize_e4m3fn_to_e4m3fnuz,
     per_tensor_dequantize,
 )
 from vllm.utils import print_warning_once
@@ -479,14 +482,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: Module) -> None:
 
-        # If checkpoint is fp16, quantize in place.
+        # If checkpoint is fp16 or bfloat16, quantize in place.
         if not self.quant_config.is_checkpoint_fp8_serialized:
-            w13_weight = torch.empty_like(
-                layer.w13_weight.data, dtype=torch.float8_e4m3fn
-            )
-            w2_weight = torch.empty_like(
-                layer.w2_weight.data, dtype=torch.float8_e4m3fn
-            )
+            # If ROCm, use float8_e4m3fnuz instead (MI300x HW)
+            fp8_dtype = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
+            w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
+            w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
 
             # Re-initialize w13_scale because we directly quantize
             # merged w13 weights and generate a single scaling factor.
@@ -533,6 +534,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.a2_scale = torch.nn.Parameter(
                     layer.a2_scale.max(), requires_grad=False
                 )
+
+            # If ROCm, normalize the weights and scales to e4m3fnuz
+            if is_hip():
+                # Normalize the weights and scales
+                w13_weight, w13_scale, a13_scale = normalize_e4m3fn_to_e4m3fnuz(
+                    layer.w13_weight, layer.w13_scale, layer.a13_scale
+                )
+                w2_weight, w2_scale, a2_scale = normalize_e4m3fn_to_e4m3fnuz(
+                    layer.w2_weight, layer.w2_scale, layer.a2_scale
+                )
+                # Reset the parameters
+                layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+                layer.w13_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
+                if a13_scale is not None:
+                    layer.a13_scale = torch.nn.Parameter(a13_scale, requires_grad=False)
+                layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+                layer.w2_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
+                if a2_scale is not None:
+                    layer.a2_scale = torch.nn.Parameter(a2_scale, requires_grad=False)
 
             # Fp8 moe kernel needs single weight scale for w13 per expert.
             # We take the max then dequant and requant each expert.

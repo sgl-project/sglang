@@ -51,6 +51,11 @@ show_time_cost = False
 time_infos = {}
 
 
+# torch flag AMD GPU
+def is_hip() -> bool:
+    return torch.version.hip is not None
+
+
 def enable_show_time_cost():
     global show_time_cost
     show_time_cost = True
