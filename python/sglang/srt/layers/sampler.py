@@ -31,7 +31,7 @@ class Sampler(nn.Module):
         probs = logits[:] = torch.softmax(logits, dim=-1)
 
         if torch.any(torch.isnan(probs)):
-            logger.warning("Detected NaN in the probability!")
+            logger.warning("Detected errors during sampling! NaN in the probability.")
             probs = torch.where(
                 torch.isnan(probs), torch.full_like(probs, 1e-10), probs
             )
@@ -53,7 +53,7 @@ class Sampler(nn.Module):
                 )
 
             if not torch.all(success):
-                logger.warning("Sampling failed!")
+                logger.warning("Detected errors during sampling!")
                 batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
         elif global_server_args_dict["sampling_backend"] == "pytorch":
             # Here we provide a slower fallback implementation.
