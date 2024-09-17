@@ -415,7 +415,7 @@ class ModelTpServer:
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) >= self.max_req_input_len:
-            logger.warn(
+            logger.warning(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated!!!"
             )
@@ -936,6 +936,8 @@ class ModelTpServer:
         if success:
             flash_cache_success = self.flush_cache()
             assert flash_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
         return success, message
 
 
