@@ -80,6 +80,9 @@ class SamplingBatchInfo:
 
         return ret
 
+    def __len__(self):
+        return len(self.temperatures)
+
     def update_penalties(self):
         self.scaling_penalties = None
         self.linear_penalties = None
