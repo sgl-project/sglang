@@ -91,7 +91,7 @@ class ModelRunner:
                 "attention_backend": server_args.attention_backend,
                 "sampling_backend": server_args.sampling_backend,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                "enable_mla": server_args.enable_mla,
+                "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
             }
         )
@@ -329,7 +329,7 @@ class ModelRunner:
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
-            and self.server_args.enable_mla
+            and not self.server_args.disable_mla
         ):
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
@@ -397,7 +397,7 @@ class ModelRunner:
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
-            and self.server_args.enable_mla
+            and not self.server_args.disable_mla
         ):
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
