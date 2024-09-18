@@ -5,7 +5,7 @@ It accepts arguments similar to those of launch_server.py.
 
 Usage:
 
-python3 -m sglang.bench_latency --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
+python3 -m sglang.bench_server_latency --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
 """
 
 import argparse
