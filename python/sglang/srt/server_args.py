@@ -26,17 +26,6 @@ from sglang.srt.utils import is_hip
 logger = logging.getLogger(__name__)
 
 
-class LoRAPathAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        setattr(namespace, self.dest, {})
-        for lora_path in values:
-            if "=" in lora_path:
-                name, path = lora_path.split("=", 1)
-                getattr(namespace, self.dest)[name] = path
-            else:
-                getattr(namespace, self.dest)[lora_path] = lora_path
-
-
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
@@ -619,3 +608,14 @@ class PortArgs:
     controller_port: int
     detokenizer_port: int
     nccl_ports: List[int]
+
+
+class LoRAPathAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, {})
+        for lora_path in values:
+            if "=" in lora_path:
+                name, path = lora_path.split("=", 1)
+                getattr(namespace, self.dest)[name] = path
+            else:
+                getattr(namespace, self.dest)[lora_path] = lora_path
