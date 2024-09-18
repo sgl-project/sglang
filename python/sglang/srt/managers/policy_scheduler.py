@@ -229,6 +229,7 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
+        cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
         tokens_freed = 0
         for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
             decode_steps = (
@@ -237,7 +238,7 @@ class PrefillAdder:
                 else tokens_left
             )
             bs = len(self.req_states) - i
-            if self.cur_rem_tokens + tokens_freed - decode_steps * bs <= 0:
+            if cur_rem_tokens + tokens_freed - decode_steps * bs <= 0:
                 return False
             tokens_freed += tokens_occupied
 
