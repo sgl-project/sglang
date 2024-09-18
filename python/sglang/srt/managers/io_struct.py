@@ -133,6 +133,9 @@ class GenerateReqInput:
                 self.image_data = [None] * num
             elif not isinstance(self.image_data, list):
                 self.image_data = [self.image_data] * num
+            elif isinstance(self.image_data, list):
+                # multi-image with n > 1
+                self.image_data = self.image_data * num
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * num

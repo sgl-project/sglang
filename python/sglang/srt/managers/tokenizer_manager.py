@@ -346,7 +346,7 @@ class TokenizerManager:
 
                 if self.is_generation:
                     pixel_values, image_hashes, image_sizes = (
-                        await self._get_pixel_values(obj.image_data)
+                        await self._get_pixel_values(obj.image_data[index])
                     )
                     modalities = obj.modalities
 
