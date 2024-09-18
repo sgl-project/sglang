@@ -400,8 +400,8 @@ class ModelRunner:
             )
 
         self.req_to_token_pool = ReqToTokenPool(
-            max_num_reqs,
-            self.model_config.context_len + 8,
+            max_num_reqs + 1,
+            self.model_config.context_len + 4,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
