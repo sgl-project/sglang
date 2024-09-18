@@ -53,7 +53,11 @@ class Sampler(nn.Module):
                 )
             else:
                 batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
-                    probs, uniform_samples, sampling_info.top_ks, sampling_info.top_ps
+                    probs,
+                    uniform_samples,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    filter_apply_order="joint",
                 )
 
             if not torch.all(success):
