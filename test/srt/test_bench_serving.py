@@ -69,7 +69,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 3000
+            assert res["output_throughput"] > 3100
 
     def test_online_latency_default(self):
         res = run_bench_serving(
