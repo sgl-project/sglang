@@ -20,15 +20,18 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from flashinfer.norm import (
-    fused_add_rmsnorm,
-    gemma_fused_add_rmsnorm,
-    gemma_rmsnorm,
-    rmsnorm,
-)
-from vllm.model_executor.custom_op import CustomOp
 
 from sglang.srt.utils import is_hip
+
+if not is_hip():
+    from flashinfer.norm import (
+        fused_add_rmsnorm,
+        gemma_fused_add_rmsnorm,
+        gemma_rmsnorm,
+        rmsnorm,
+    )
+
+from vllm.model_executor.custom_op import CustomOp
 
 logger = logging.getLogger(__name__)
 
