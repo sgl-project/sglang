@@ -37,7 +37,7 @@ class Sampler(nn.Module):
         logits = None
         del logits
 
-        if False and torch.any(torch.isnan(probs)):
+        if torch.any(torch.isnan(probs)):
             logger.warning("Detected errors during sampling! NaN in the probability.")
             probs = torch.where(
                 torch.isnan(probs), torch.full_like(probs, 1e-10), probs
