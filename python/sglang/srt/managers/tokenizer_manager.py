@@ -123,6 +123,7 @@ class TokenizerManager:
                     initializer=init_global_processor,
                     mp_context=mp.get_context("fork"),
                     initargs=(server_args,),
+                    max_workers=server_args.image_processor_max_workers
                 )
             else:
                 self.tokenizer = get_tokenizer(
