@@ -44,7 +44,7 @@ def get_answer_value(answer_str):
         return INVALID
 
 
-def main(args):
+def run_eval(args):
     # Select backend
     set_default_backend(RuntimeEndpoint(f"{args.host}:{args.port}"))
 
@@ -119,6 +119,12 @@ def main(args):
     # Dump results
     dump_state_text("tmp_output_gsm8k.txt", states)
 
+    return {
+        "accuracy": acc,
+        "latency": latency,
+        "output_throughput": output_throughput,
+    }
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -129,4 +135,4 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     args = parser.parse_args()
-    main(args)
+    run_eval(args)
