@@ -44,8 +44,6 @@ class LlamaForClassification(nn.Module):
         )
         self.eos_token_id = config.eos_token_id
 
-        self.param_dict = dict(self.named_parameters())
-
     @torch.no_grad()
     def forward(
         self,
@@ -77,7 +75,7 @@ class LlamaForClassification(nn.Module):
         return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        params_dict = self.param_dict
+        params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             if "classification_head" in name:
