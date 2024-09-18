@@ -1,5 +1,7 @@
 """
-Benchmark the latency of a given model. It accepts arguments similar to those of launch_server.py.
+Benchmark the latency of running a single static batch.
+This script does not launch a server and uses the low-level APIs.
+It accepts arguments similar to those of launch_server.py.
 
 # Usage (latency test)
 ## with dummy weights:

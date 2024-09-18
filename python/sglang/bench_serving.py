@@ -2,7 +2,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/benchmark_serving.py
 
 """
-Benchmark online serving.
+Benchmark online serving with dynamic requests.
 
 Usage:
 python3 -m sglang.bench_serving --backend sglang --num-prompt 10
