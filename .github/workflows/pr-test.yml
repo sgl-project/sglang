@@ -144,17 +144,17 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
 
-      - name: Benchmark Offline Throughput (w/o ChunkedPrefill)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_chunked_prefill
-
       - name: Benchmark Offline Throughput (w/ Triton)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
+
+      - name: Benchmark Offline Throughput (w/ FP8)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
   performance-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'

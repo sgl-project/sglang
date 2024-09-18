@@ -1,6 +1,7 @@
 import unittest
 
 from sglang.test.test_utils import (
+    DEFAULT_FP8_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
     is_in_ci,
@@ -58,6 +59,17 @@ class TestBenchServing(unittest.TestCase):
 
         if is_in_ci():
             assert res["output_throughput"] > 2600
+
+    def test_offline_throughput_default_fp8(self):
+        res = run_bench_serving(
+            model=DEFAULT_FP8_MODEL_NAME_FOR_TEST,
+            num_prompts=500,
+            request_rate=float("inf"),
+            other_server_args=[],
+        )
+
+        if is_in_ci():
+            assert res["output_throughput"] > 3100
 
     def test_online_latency_default(self):
         res = run_bench_serving(

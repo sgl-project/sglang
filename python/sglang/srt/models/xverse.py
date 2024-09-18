@@ -307,8 +307,6 @@ class XverseForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
 
-        self.param_dict = dict(self.named_parameters())
-
     @torch.no_grad()
     def forward(
         self,
@@ -333,7 +331,7 @@ class XverseForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        params_dict = self.param_dict
+        params_dict = dict(self.named_parameters())
 
         def load_weights_per_param(name, loaded_weight):
             if "rotary_emb.inv_freq" in name or "projector" in name:
