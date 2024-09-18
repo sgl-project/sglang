@@ -31,8 +31,11 @@ class Sampler(nn.Module):
             logits = logits.next_token_logits
 
         # Post process logits
+        logits = logits.contiguous()
         logits.div_(sampling_info.temperatures)
-        probs = logits[:] = torch.softmax(logits, dim=-1)
+        probs = torch.softmax(logits, dim=-1)
+        logits = None
+        del logits
 
         if torch.any(torch.isnan(probs)):
             logger.warning("Detected errors during sampling! NaN in the probability.")
@@ -53,7 +56,11 @@ class Sampler(nn.Module):
                 )
             else:
                 batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
-                    probs, uniform_samples, sampling_info.top_ks, sampling_info.top_ps
+                    probs,
+                    uniform_samples,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    filter_apply_order="joint",
                 )
 
             if not torch.all(success):
