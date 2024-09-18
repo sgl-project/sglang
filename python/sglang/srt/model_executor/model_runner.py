@@ -47,6 +47,7 @@ from sglang.global_config import global_config
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import SampleOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.speculative_utils import SpecInfoPipline
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -78,6 +79,7 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        spec_info: SpecInfoPipline,
         is_draft_runner: bool,
     ):
         # Parse args
@@ -88,6 +90,7 @@ class ModelRunner:
         self.tp_size = tp_size
         self.nccl_port = nccl_port
         self.server_args = server_args
+        self.spec_info = spec_info
         self.is_draft_runner = is_draft_runner
         self.is_multimodal_model = is_multimodal_model(
             self.model_config.hf_config.architectures
@@ -378,8 +381,12 @@ class ModelRunner:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
-
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        if self.is_draft_runner:
+            self.max_total_num_tokens = self.spec_info.max_total_num_tokens.value
+        else:
+            self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+            if self.spec_info is not None:
+                self.spec_info.max_total_num_tokens.value = self.max_total_num_tokens
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(
@@ -544,7 +551,7 @@ class ModelRunner:
             )
 
     @torch.inference_mode()
-    def forward_decode(self, batch: ScheduleBatch):
+    def forward_decode(self, batch: ScheduleBatch, forward_mode: ForwardMode):
         if (
             self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(len(batch.reqs))
@@ -555,27 +562,27 @@ class ModelRunner:
         input_metadata = InputMetadata.from_schedule_batch(
             self,
             batch,
-            ForwardMode.DECODE,
+            forward_mode=forward_mode,
         )
 
         ret = self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
         )
-        batch.spec_draft_info = input_metadata.spec_draft_info
+        batch.spec_draft_input = input_metadata.spec_draft_input
         return ret
 
     @torch.inference_mode()
-    def forward_extend(self, batch: ScheduleBatch):
+    def forward_extend(self, batch: ScheduleBatch, forward_mode: ForwardMode):
         input_metadata = InputMetadata.from_schedule_batch(
             self,
             batch,
-            forward_mode=ForwardMode.EXTEND,
+            forward_mode=forward_mode,
         )
         if self.is_generation:
             ret = self.model.forward(
                 batch.input_ids, input_metadata.positions, input_metadata
             )
-            batch.spec_draft_info = input_metadata.spec_draft_info
+            batch.spec_draft_input = input_metadata.spec_draft_input
             return ret
         else:
             # Only embedding models have get_embedding parameter
@@ -607,10 +614,10 @@ class ModelRunner:
     ) -> Tuple[SampleOutput, LogitsProcessorOutput]:
         if self.is_multimodal_model and forward_mode == ForwardMode.EXTEND:
             return self.forward_extend_multi_modal(batch)
-        elif forward_mode == ForwardMode.DECODE:
-            return self.forward_decode(batch)
-        elif forward_mode == ForwardMode.EXTEND:
-            return self.forward_extend(batch)
+        elif forward_mode in (ForwardMode.DECODE, ForwardMode.SPECVERIFY):
+            return self.forward_decode(batch, forward_mode)
+        elif forward_mode in (ForwardMode.EXTEND, ForwardMode.SPECEXTEND):
+            return self.forward_extend(batch, forward_mode)
         else:
             raise ValueError(f"Invaid forward mode: {forward_mode}")
 

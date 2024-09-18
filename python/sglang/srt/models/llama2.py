@@ -314,15 +314,24 @@ class LlamaForCausalLM(nn.Module):
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
     ) -> LogitsProcessorOutput:
+        if input_metadata.forward_mode.is_spec_mode():
+            input_metadata.spec_draft_input = DraftInfoFactory.get(
+                input_metadata.spec_algorithm
+            )()
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
         logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
         sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-        if input_metadata.forward_mode.is_spec_mode():
-            input_metadata.spec_draft_info = DraftInfoFactory.get(
-                input_metadata.spec_algorithm
-            )(hidden_states)
+        if input_metadata.spec_draft_input is not None:
+            input_metadata.spec_draft_input.verified_id = (
+                sample_output.batch_next_token_ids
+            )
+            if hasattr(input_metadata.spec_draft_input, "hidden_states"):
+                input_metadata.spec_draft_input.hidden_states = hidden_states
+            input_metadata.spec_draft_input.verified_id = (
+                sample_output.batch_next_token_ids
+            )
         return sample_output, logits_output
 
     def get_module_name(self, name):

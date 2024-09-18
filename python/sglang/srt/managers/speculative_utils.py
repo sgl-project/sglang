@@ -18,7 +18,7 @@ from typing import Type
 import torch
 
 
-class SpecDraftInfo:
+class SpecDraftInput:
     pass
 
 
@@ -26,8 +26,8 @@ class SpecDraftInfoFactory:
     def __init__(self):
         self.factory = {}
 
-    def register(self, name: str) -> SpecDraftInfo:
-        def wrapper(info: Type[SpecDraftInfo]) -> Type[SpecDraftInfo]:
+    def register(self, name: str) -> SpecDraftInput:
+        def wrapper(info: Type[SpecDraftInput]) -> Type[SpecDraftInput]:
             self.factory[name] = info
             return info
 
@@ -41,12 +41,23 @@ DraftInfoFactory = SpecDraftInfoFactory()
 
 
 @DraftInfoFactory.register("EAGLE")
-class EAGLEDraftInfo(SpecDraftInfo):
-    def __init__(self, hidden_states: torch.Tensor):
-        self.hidden_states: torch.Tensor = hidden_states
+class EAGLEDraftInput(SpecDraftInput):
+    hidden_states: torch.Tensor = None
+    verified_id: torch.Tensor = None
 
-    def update_input(self, info: "EAGLEDraftInfo"):
-        self.hidden_states = info.hidden_states
+    def prepare_for_extend(self, batch):
+        seq_lens = [0] + batch.seq_lens.tolist()
+        input_ids = batch.input_ids.tolist()
+        verified_id = self.verified_id.tolist()
+        model_input_ids = []
+        for i in range(len(seq_lens) - 1):
+            model_input_ids.extend(
+                input_ids[seq_lens[i] + 1 : seq_lens[i + 1]] + [verified_id[i]]
+            )
+        batch.input_ids = torch.tensor(
+            model_input_ids, dtype=torch.int32, device="cuda"
+        )
+        del verified_id
 
 
 class SpecInfoPipline:
@@ -54,3 +65,4 @@ class SpecInfoPipline:
         ctx = torch.multiprocessing.get_context("forkserver")
         self.draft_input_queue = ctx.Queue()
         self.draft_output_queue = ctx.Queue()
+        self.max_total_num_tokens = ctx.Value("i", -1)

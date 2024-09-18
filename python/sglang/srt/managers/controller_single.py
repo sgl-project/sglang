@@ -56,6 +56,7 @@ class ControllerSingle:
         self.is_dp_worker = is_data_parallel_worker
         self.dp_worker_id = dp_worker_id
         self.mp_queue = mp_queue
+        self.spec_queue = spec_queue
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -104,7 +105,8 @@ class ControllerSingle:
 
             if self.tp_size > 1:
                 broadcast_recv_input(recv_reqs, 0, self.tp_cpu_group)
-
+            if self.spec_queue is not None and recv_reqs:
+                self.spec_queue.draft_input_queue.put_nowait(recv_reqs)
             out_pyobjs = self.tp_server.exposed_step(recv_reqs)
 
             for obj in out_pyobjs:
@@ -259,8 +261,8 @@ class ControllerSingleSpecDraft(ControllerSingle):
 
     def recv_requests_from_mp_queue(self):
         recv_reqs = []
-        while not self.mp_queue.empty():
-            recv_reqs.append(self.mp_queue.get())
+        if not self.mp_queue.empty():
+            recv_reqs = self.mp_queue.get()
         return recv_reqs
 
 

@@ -24,7 +24,7 @@ import numpy as np
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.speculative_utils import SpecDraftInfo
+from sglang.srt.managers.speculative_utils import SpecDraftInput
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 
 if TYPE_CHECKING:
@@ -39,9 +39,9 @@ class ForwardMode(IntEnum):
     EXTEND = auto()
     # Decode one token.
     DECODE = auto()
-    # Speculative Extend.
+    # Speculative Extend of draft model.
     SPECEXTEND = auto()
-    # Speculative verify.
+    # Speculative verify of target model.
     SPECVERIFY = auto()
 
     def is_spec_mode(self):
@@ -98,7 +98,7 @@ class InputMetadata:
     flashinfer_use_ragged: bool = False
 
     # Information used for speculative decoding
-    spec_draft_info: SpecDraftInfo = None
+    spec_draft_input: SpecDraftInput = None
     spec_algorithm: str = None
 
     def init_multimuldal_info(self, batch: ScheduleBatch):
@@ -116,7 +116,7 @@ class InputMetadata:
             else:
                 # Deprecated
                 self.positions = (self.seq_lens - 1) + position_ids_offsets
-        else:
+        elif self.forward_mode in (ForwardMode.EXTEND, ForwardMode.SPECEXTEND):
             if True:
                 self.positions = torch.tensor(
                     np.concatenate(
@@ -144,6 +144,9 @@ class InputMetadata:
                     ),
                     device="cuda",
                 )
+
+        elif self.forward_mode == ForwardMode.SPECVERIFY:
+            pass
 
         # Positions should be in long type
         self.positions = self.positions.to(torch.int64)
@@ -201,6 +204,8 @@ class InputMetadata:
         ret.compute_positions(batch)
 
         ret.compute_extend_infos(batch)
+
+        ret.spec_draft_input = batch.spec_draft_input
 
         if (
             forward_mode != ForwardMode.DECODE

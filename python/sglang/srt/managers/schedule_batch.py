@@ -27,7 +27,7 @@ import torch
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
-from sglang.srt.managers.speculative_utils import SpecDraftInfo
+from sglang.srt.managers.speculative_utils import SpecDraftInput
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -349,7 +349,7 @@ class ScheduleBatch:
     top_logprobs_nums: List[int] = None
 
     # For speculative decoding
-    spec_draft_info: SpecDraftInfo = None
+    spec_draft_input: SpecDraftInput = None
 
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
@@ -440,6 +440,8 @@ class ScheduleBatch:
         self.prefix_lens_cpu = [len(r.prefix_indices) for r in reqs]
 
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
+        if self.spec_draft_input:
+            self.spec_draft_input.prepare_for_extend(self)
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step

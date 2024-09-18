@@ -115,6 +115,7 @@ class ModelTpServer:
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
+            spec_info=spec_queue,
             is_draft_runner=self.is_draft_worker,
         )
         if server_args.skip_tokenizer_init:
@@ -271,7 +272,7 @@ class ModelTpServer:
             # Run a new prefill batch
             self.forward_prefill_batch(new_batch)
             if self.is_spec_worker:
-                self.spec_queue.draft_input_queue.put(new_batch)
+                self.spec_queue.draft_input_queue.put_nowait(new_batch.spec_draft_input)
             else:
                 if not new_batch.is_empty():
                     if self.running_batch is None:
@@ -521,7 +522,12 @@ class ModelTpServer:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
                 sample_output, logits_output = self.model_runner.forward(
-                    batch, ForwardMode.EXTEND
+                    batch,
+                    (
+                        ForwardMode.SPECEXTEND
+                        if self.is_spec_worker
+                        else ForwardMode.EXTEND
+                    ),
                 )
                 next_token_ids = batch.check_sample_results(sample_output)
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(

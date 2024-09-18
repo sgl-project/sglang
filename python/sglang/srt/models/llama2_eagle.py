@@ -264,6 +264,7 @@ class LlamaModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = torch.nn.Linear(config.hidden_size * 2, config.hidden_size)
 
     def forward(
         self,
@@ -276,6 +277,12 @@ class LlamaModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
+        hidden_states = self.fc(
+            torch.cat(
+                (hidden_states, input_metadata.spec_draft_input.hidden_states), dim=-1
+            )
+        )
+
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -304,7 +311,6 @@ class LlamaForCausalLMEagle(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
         self.sampler = Sampler()
-        self.fc = torch.nn.Linear(config.hidden_size*2, config.hidden_size)
 
     @torch.no_grad()
     def forward(
@@ -383,10 +389,11 @@ class LlamaForCausalLMEagle(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
         if name is None or loaded_weight is None:
             for name, loaded_weight in weights:
-                if 'fc' not in name and 'lm_head' not in name:
-                    name = 'model.' + name
+                if "lm_head" not in name:
+                    name = "model." + name
                 load_weights_per_param(name, loaded_weight)
         else:
             load_weights_per_param(name, loaded_weight)
