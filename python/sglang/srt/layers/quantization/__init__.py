@@ -1,9 +1,7 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
 
-from typing import Dict, Optional, Type
+from typing import Dict, Type
 
-import torch
-from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
@@ -14,11 +12,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.deepspeedfp import DeepSpeedFPConfig
 from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
 from vllm.model_executor.layers.quantization.fbgemm_fp8 import FBGEMMFp8Config
-from vllm.model_executor.layers.quantization.fp8 import (
-    Fp8Config,
-    Fp8LinearMethod,
-    Fp8MoEMethod,
-)
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.gguf import GGUFConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
@@ -27,14 +21,8 @@ from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.layers.quantization.qqq import QQQConfig
 from vllm.model_executor.layers.quantization.squeezellm import SqueezeLLMConfig
 from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
-from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
-from sglang.srt.layers.fused_moe.layer import FusedMoE
-from sglang.srt.layers.linear import UnquantizedLinearMethod
-from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,
@@ -71,7 +59,7 @@ __all__ = [
     "QUANTIZATION_METHODS",
 ]
 
-
+"""
 def fp8_get_quant_method(
     self, layer: torch.nn.Module, prefix: str
 ) -> Optional["QuantizeMethodBase"]:
@@ -85,3 +73,4 @@ def fp8_get_quant_method(
 
 
 setattr(Fp8Config, "get_quant_method", fp8_get_quant_method)
+"""
