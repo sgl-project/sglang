@@ -214,6 +214,7 @@ class ModelTpServer:
         self.new_token_ratio = self.min_new_token_ratio
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.do_not_get_new_batch = False
+        self.new_batch = None
 
     def exposed_step(self, recv_reqs: List):
         try:
@@ -248,13 +249,12 @@ class ModelTpServer:
 
     @torch.inference_mode()
     def forward_step(self):
-        if self.do_not_get_new_batch and self.current_inflight_req is None:
-            new_batch = None
-        else:
-            new_batch = self.get_new_prefill_batch()
-        self.do_not_get_new_batch = False
+        if self.new_batch is None and self.running_batch is None:
+            self.new_batch = self.get_new_prefill_batch()
 
-        if new_batch is not None:
+        if self.new_batch is not None:
+            new_batch = self.new_batch
+            self.new_batch = None
             # Run a new prefill batch
             self.forward_prefill_batch(new_batch)
 
@@ -541,12 +541,12 @@ class ModelTpServer:
             self.tree_cache,
         )
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
+
+        # Build batch tensors
+        new_batch.prepare_for_extend(self.model_config.vocab_size)
         return new_batch
 
     def forward_prefill_batch(self, batch: ScheduleBatch):
-        # Build batch tensors
-        batch.prepare_for_extend(self.model_config.vocab_size)
-
         decoding_reqs = []
         if self.is_mixed_chunk and self.running_batch is not None:
             self.running_batch.prepare_for_decode()
@@ -558,6 +558,8 @@ class ModelTpServer:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
                 logits_output = self.model_runner.forward(batch)
+                assert self.new_batch is None
+                self.new_batch = self.get_new_prefill_batch()
                 next_token_ids = self.model_runner.sample(logits_output, batch)
 
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
@@ -623,6 +625,8 @@ class ModelTpServer:
         else:
             assert batch.extend_num_tokens != 0
             logits_output = self.model_runner.forward(batch)
+            assert self.new_batch is None
+            self.new_batch = self.get_new_prefill_batch()
             embeddings = logits_output.embeddings.tolist()
 
             # Check finish conditions
@@ -751,6 +755,8 @@ class ModelTpServer:
 
         # Forward and sample the next tokens
         logits_output = self.model_runner.forward(batch)
+        assert self.new_batch is None
+        self.new_batch = self.get_new_prefill_batch()
         next_token_ids = self.model_runner.sample(logits_output, batch)
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
