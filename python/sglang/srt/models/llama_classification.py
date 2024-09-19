@@ -19,10 +19,10 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 
