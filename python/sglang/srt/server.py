@@ -25,8 +25,8 @@ import logging
 import multiprocessing as mp
 import os
 import re
-import threading
 import tempfile
+import threading
 import time
 from http import HTTPStatus
 from typing import Dict, List, Optional, Union
@@ -288,8 +288,7 @@ async def retrieve_file_content(file_id: str):
 
 def add_prometheus_middleware(app: FastAPI):
     # Adopted from https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/entrypoints/openai/api_server.py#L216
-    from prometheus_client import (CollectorRegistry, make_asgi_app,
-                                   multiprocess)
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
 
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
@@ -439,7 +438,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
         logger.debug(f"User set PROMETHEUS_MULTIPROC_DIR detected.")
         prometheus_multiproc_dir = tempfile.TemporaryDirectory(
-            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        )
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
