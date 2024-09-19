@@ -558,8 +558,8 @@ class ModelTpServer:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
                 logits_output = self.model_runner.forward(batch)
-                assert self.new_batch is None
-                self.new_batch = self.get_new_prefill_batch()
+                if self.new_batch is None:
+                    self.new_batch = self.get_new_prefill_batch()
                 next_token_ids = self.model_runner.sample(logits_output, batch)
 
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
@@ -625,8 +625,8 @@ class ModelTpServer:
         else:
             assert batch.extend_num_tokens != 0
             logits_output = self.model_runner.forward(batch)
-            assert self.new_batch is None
-            self.new_batch = self.get_new_prefill_batch()
+            if self.new_batch is None:
+                self.new_batch = self.get_new_prefill_batch()
             embeddings = logits_output.embeddings.tolist()
 
             # Check finish conditions
@@ -755,8 +755,8 @@ class ModelTpServer:
 
         # Forward and sample the next tokens
         logits_output = self.model_runner.forward(batch)
-        assert self.new_batch is None
-        self.new_batch = self.get_new_prefill_batch()
+        if self.new_batch is None:
+            self.new_batch = self.get_new_prefill_batch()
         next_token_ids = self.model_runner.sample(logits_output, batch)
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
