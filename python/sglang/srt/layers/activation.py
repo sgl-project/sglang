@@ -31,8 +31,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.utils import set_weight_attrs
+
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
