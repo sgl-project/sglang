@@ -251,6 +251,7 @@ class PrefillAdder:
             )
         else:
             # Chunked prefill
+            return False
             trunc_len = self.rem_chunk_tokens
             req.extend_input_len = trunc_len
             req.fill_ids = req.fill_ids[:trunc_len]
