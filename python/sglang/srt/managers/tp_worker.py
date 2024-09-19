@@ -53,6 +53,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.metrics.metrics_types import ConfigStats
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -137,6 +138,15 @@ class ModelTpServer:
             self.max_total_num_tokens - 1,
         )
 
+        # Lazy loading to ensure prometheus is initialized
+        from python.sglang.srt.metrics.metrics_collector import SGLangMetricsCollector
+        self.metrics_collector = SGLangMetricsCollector(
+            labels={
+                "model": self.model_config.path
+                # TODO: Add lora name/path in the future
+            }
+        )
+
         # Sync random seed across TP workers
         server_args.random_seed = broadcast_recv_input(
             [server_args.random_seed],
@@ -152,7 +162,14 @@ class ModelTpServer:
             f"max_running_requests={self.max_running_requests}, "
             f"context_len={self.model_config.context_len}"
         )
-
+        self.metrics_collector.log_config_stats(
+            ConfigStats(
+                max_total_num_tokens=self.max_total_num_tokens,
+                max_prefill_tokens=self.max_prefill_tokens,
+                max_running_requests=self.max_running_requests,
+                context_len=self.model_config.context_len,
+            )
+        )
         # Init cache
         if (
             server_args.chunked_prefill_size is not None
@@ -284,6 +301,8 @@ class ModelTpServer:
             else:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
+        
+
 
     def print_decode_stats(self):
         num_used = self.max_total_num_tokens - (
