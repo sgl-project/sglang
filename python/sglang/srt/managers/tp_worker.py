@@ -27,7 +27,6 @@ from typing import Any, List, Optional
 import torch
 import torch.distributed
 import torch.distributed as dist
-
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.fsm_cache import FSMCache
@@ -53,11 +52,12 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.metrics.metrics_types import ConfigStats
+from sglang.srt.metrics.metrics_types import ConfigStats, DecodeStats, PrefillStats, SystemStats
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     configure_logger,
+    get_available_gpu_memory,
     is_multimodal_model,
     set_random_seed,
     suppress_other_loggers,
@@ -90,8 +90,8 @@ class ModelTpServer:
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
-
-        # Init model and tokenizer
+        # Metrics 
+        self.log_stats = True
         self.model_config = ModelConfig(
             server_args.model_path,
             server_args.trust_remote_code,
@@ -139,12 +139,13 @@ class ModelTpServer:
         )
 
         # Lazy loading to ensure prometheus is initialized
-        from python.sglang.srt.metrics.metrics_collector import SGLangMetricsCollector
+        from sglang.srt.metrics.metrics_collector import SGLangMetricsCollector
         self.metrics_collector = SGLangMetricsCollector(
             labels={
-                "model": self.model_config.path
-                # TODO: Add lora name/path in the future
-            }
+                "model": self.model_config.path,
+                # TODO: Add lora name/path in the future,
+                },
+            max_model_len=self.max_total_num_tokens
         )
 
         # Sync random seed across TP workers
@@ -298,6 +299,8 @@ class ModelTpServer:
 
                     if self.out_pyobjs and self.running_batch.has_stream:
                         break
+                    # if self.tp_rank == 0 and self.log_stats:
+                    #     stats = 
             else:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
@@ -319,7 +322,14 @@ class ModelTpServer:
             f"gen throughput (token/s): {throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
+        self.metrics_collector.log_decode_stats(
+            DecodeStats(num_running_sys=len(self.running_batch.reqs),
+                        num_waiting_sys=len(self.waiting_queue),
+                        gen_throughput = throughput,
+                        token_usage = num_used / self.max_total_num_tokens,))
 
+    def _get_stats(self):
+        pass
     def check_memory(self):
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
@@ -546,6 +556,14 @@ class ModelTpServer:
                     f"#running-req: {running_bs}, "
                     f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
                 )
+            self.metrics_collector.log_system_stats(
+                SystemStats(new_seq=len(can_run_list),
+                             new_token=adder.log_input_tokens,
+                             cached_token=adder.log_hit_tokens,
+                             cache_hit_rate=100.0 * tree_cache_hit_rate,
+                             running_req = running_bs,
+                             queue_req=len(self.waiting_queue) - len(can_run_list) + has_inflight
+                             ))
 
         # Return the new batch
         new_batch = ScheduleBatch.init_new(
@@ -811,6 +829,9 @@ class ModelTpServer:
         output_rids = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
+        num_prompt_tokens_requests: List[int] = []
+        num_generation_tokens_requests: List[int] = []
+        finished_reason_requests: List[str] = []
         if self.model_runner.is_generation:
             output_vids = []
             decoded_texts = []
@@ -847,6 +868,14 @@ class ModelTpServer:
                     output_spaces_between_special_tokens.append(
                         req.sampling_params.spaces_between_special_tokens
                     )
+                    
+                    num_prompt_tokens_requests.append(len(req.origin_input_ids))
+                    num_generation_tokens_requests.append(len(req.output_ids))
+                    finished_reason_requests.append((
+                            req.finished_reason.to_json()
+                            if req.finished_reason is not None
+                            else None
+                        ))
 
                     meta_info = {
                         "prompt_tokens": len(req.origin_input_ids),
@@ -879,7 +908,7 @@ class ModelTpServer:
                         "prompt_tokens": len(req.origin_input_ids),
                     }
                     output_meta_info.append(meta_info)
-
+        self.metrics_collector.log_prefill_stats(PrefillStats(num_prompt_tokens_requests =num_prompt_tokens_requests,num_generation_tokens_requests= num_generation_tokens_requests,finished_reason_requests= finished_reason_requests))
         # Send to detokenizer
         if output_rids:
             if self.model_runner.is_generation:
