@@ -34,12 +34,16 @@ class SamplingBatchInfo:
     linear_penalties: torch.Tensor = None
     scaling_penalties: torch.Tensor = None
 
+    #Device
+    device:str ="cuda"
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         reqs = batch.reqs
         ret = cls(vocab_size=vocab_size)
+        ret.device = batch.device        
 
-        with torch.device("cuda"):
+        with torch.device(batch.device):
             ret.temperatures = torch.tensor(
                 [r.sampling_params.temperature for r in reqs],
                 dtype=torch.float,
@@ -66,7 +70,7 @@ class SamplingBatchInfo:
         ret.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
             batch=batch,
-            device="cuda",
+            device=batch.device,
             Penalizers={
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,
@@ -98,7 +102,7 @@ class SamplingBatchInfo:
                         self.linear_penalties = torch.zeros(
                             (bs, self.vocab_size),
                             dtype=torch.float32,
-                            device="cuda",
+                            device=self.device,
                         )
                     self.linear_penalties = penalizer.apply(self.linear_penalties)
 
@@ -110,7 +114,7 @@ class SamplingBatchInfo:
 
         if has_regex:
             self.vocab_mask = torch.zeros(
-                batch.batch_size(), self.vocab_size, dtype=torch.bool, device="cuda"
+                batch.batch_size(), self.vocab_size, dtype=torch.bool, device=self.device
             )
             for i, req in enumerate(batch.reqs):
                 if req.regex_fsm is not None:
@@ -135,7 +139,7 @@ class SamplingBatchInfo:
 
     @staticmethod
     def merge_bias_tensor(
-        lhs: torch.Tensor, rhs: torch.Tensor, bs1: int, bs2: int, default: int = 0
+        lhs: torch.Tensor, rhs: torch.Tensor, bs1: int, bs2: int, device: str, default: int = 0,
     ):
         # bias tensor can be None
         if lhs is not None or rhs is not None:
@@ -146,9 +150,9 @@ class SamplingBatchInfo:
                 shape, dtype = rhs.shape[1:], rhs.dtype
             with torch.dtype(dtype):
                 if lhs is None:
-                    lhs = torch.empty((bs1, *shape), device="cuda").fill_(default)
+                    lhs = torch.empty((bs1, *shape), device=device).fill_(default)
                 if rhs is None:
-                    rhs = torch.empty((bs2, *shape), device="cuda").fill_(default)
+                    rhs = torch.empty((bs2, *shape), device=device).fill_(default)
             return torch.cat([lhs, rhs])
 
         return None
@@ -167,5 +171,5 @@ class SamplingBatchInfo:
             setattr(self, item, torch.concat([self_val, other_val]))
 
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
-            self.logit_bias, other.logit_bias, len(self), len(other)
+            self.logit_bias, other.logit_bias, len(self), len(other), self.device
         )

@@ -133,6 +133,7 @@ def load_model(server_args, tp_rank):
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
+        device=server_args.device,
         gpu_id=tp_rank,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
@@ -270,10 +271,15 @@ def correctness_test(
         rank_print(f"========== Prompt {i} ==========")
         rank_print(tokenizer.decode(output_ids[i]), "\n")
 
+def synchronize(device):
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    elif device == 'xpu':
+        torch.xpu.synchronize()
 
 @torch.inference_mode()
 def latency_test_run_once(
-    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len
+    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
@@ -296,10 +302,10 @@ def latency_test_run_once(
     tot_latency = 0
 
     # Prefill
-    torch.cuda.synchronize()
+    synchronize(device)
     tic = time.time()
     next_token_ids, _, batch = extend(reqs, model_runner)
-    torch.cuda.synchronize()
+    synchronize(device)
     prefill_latency = time.time() - tic
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
@@ -312,10 +318,10 @@ def latency_test_run_once(
     # Decode
     decode_latencies = []
     for i in range(output_len):
-        torch.cuda.synchronize()
+        synchronize(device)
         tic = time.time()
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-        torch.cuda.synchronize()
+        synchronize(device)
         latency = time.time() - tic
         tot_latency += latency
         throughput = batch_size / latency
@@ -368,6 +374,7 @@ def latency_test(
         bench_args.batch_size[0],
         bench_args.input_len[0],
         4,  # shorter decoding to speed up the warmup
+        server_args.device
     )
     rank_print("Benchmark ...")
 
@@ -378,7 +385,7 @@ def latency_test(
     ):
         reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
         ret = latency_test_run_once(
-            bench_args.run_name, model_runner, rank_print, reqs, bs, il, ol
+            bench_args.run_name, model_runner, rank_print, reqs, bs, il, ol, server_args.device
         )
         if ret is not None:
             result_list.append(ret)
@@ -502,7 +509,7 @@ if __name__ == "__main__":
     ), "options changed, this code need to be updated"
     parser._actions[1].required = False
     args = parser.parse_args()
-
+    print(args)
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 

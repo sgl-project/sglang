@@ -17,13 +17,13 @@ from sglang.global_config import global_config
 from sglang.srt.layers.flashinfer_utils import update_flashinfer_indices
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import flashinfer_is_available
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 # ROCm: flashinfer available later
-if not is_hip():
+if flashinfer_is_available():
     from flashinfer import (
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
@@ -85,7 +85,7 @@ class FlashInferAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.model_runner = model_runner
-
+      
         local_num_qo_heads = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
         )
@@ -105,7 +105,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.workspace_buffer = torch.empty(
             global_config.flashinfer_workspace_size,
             dtype=torch.uint8,
-            device="cuda",
+            device=self.model_runner.device_config.device_type,
         )
 
         if model_runner.sliding_window_size is None:
@@ -347,6 +347,7 @@ class TritonAttnBackend(AttentionBackend):
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
         self.num_head = model_runner.model_config.num_attention_heads
+        self.model_runner = model_runner
 
         if global_server_args_dict.get("triton_attention_reduce_in_fp32", False):
             self.reduce_dtype = torch.float32
@@ -370,14 +371,14 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = torch.empty(
                 (self.num_head, total_num_tokens),
                 dtype=self.reduce_dtype,
-                device="cuda",
+                device=self.model_runner.device_config.device_type,
             )
 
             max_seq_len = torch.max(input_metadata.seq_lens).item()
             max_extend_len = None
         else:
             start_loc = attn_logits = max_seq_len = None
-            prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
+            prefix_lens = torch.tensor(batch.prefix_lens_cpu, device=self.model_runner.device_config.device_type)
             max_extend_len = torch.max(input_metadata.seq_lens - prefix_lens).item()
 
         self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len

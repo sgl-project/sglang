@@ -115,7 +115,7 @@ class InputMetadata:
                         ],
                         axis=0,
                     ),
-                    device="cuda",
+                    device=batch.device,
                 )
             else:
                 # Deprecated
@@ -131,15 +131,15 @@ class InputMetadata:
                         ],
                         axis=0,
                     ),
-                    device="cuda",
+                    device=batch.device,
                 )
 
         # Positions should be in long type
         self.positions = self.positions.to(torch.int64)
 
     def compute_extend_infos(self, batch: ScheduleBatch):
-        self.extend_seq_lens = torch.tensor(batch.extend_lens_cpu, device="cuda")
-        self.extend_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
+        self.extend_seq_lens = torch.tensor(batch.extend_lens_cpu, device=batch.device)
+        self.extend_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device=batch.device)
         self.extend_start_loc = torch.zeros_like(self.extend_seq_lens)
         self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
         self.extend_no_prefix = all(x == 0 for x in batch.prefix_lens_cpu)

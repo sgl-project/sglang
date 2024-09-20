@@ -20,9 +20,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import flashinfer_is_available
 
-if not is_hip():
+if flashinfer_is_available():
     from flashinfer.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 from vllm.distributed import (
@@ -146,8 +146,8 @@ def get_act_fn(
     return act_fn
 
 
-if is_hip():
+if not flashinfer_is_available():
     logger.info(
-        "FlashInfer is not available on AMD GPUs. Fallback to other kernel libraries."
+        "FlashInfer is not available on Non-NV GPUs. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul

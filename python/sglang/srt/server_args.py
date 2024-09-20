@@ -21,7 +21,7 @@ import logging
 import random
 from typing import List, Optional, Union
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import flashinfer_is_available
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     dtype: str = "auto"
+    device: str = "cuda"
     kv_cache_dtype: str = "auto"
     trust_remote_code: bool = True
     context_length: Optional[int] = None
@@ -157,7 +158,7 @@ class ServerArgs:
             self.sampling_backend = "pytorch"
 
         # ROCm: flashinfer available later
-        if is_hip():
+        if not flashinfer_is_available():
             self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
 
@@ -249,6 +250,13 @@ class ServerArgs:
             '* "bfloat16" for a balance between precision and range.\n'
             '* "float" is shorthand for FP32 precision.\n'
             '* "float32" for FP32 precision.',
+        )
+        parser.add_argument(
+            "--device",
+            type=str,
+            default="cuda",
+            choices=["cuda", "xpu"],
+            help="device type to run SGLang."
         )
         parser.add_argument(
             "--kv-cache-dtype",

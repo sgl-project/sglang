@@ -381,6 +381,9 @@ class ScheduleBatch:
     # Stream
     has_stream: bool = False
 
+    # device 
+    device:str = "cuda"
+
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -393,6 +396,7 @@ class ScheduleBatch:
             tree_cache=tree_cache,
             return_logprob=return_logprob,
             has_stream=has_stream,
+            device=req_to_token_pool.device
         )
 
     def batch_size(self):
@@ -467,7 +471,7 @@ class ScheduleBatch:
             pt += req.extend_input_len
 
         # Set fields
-        with torch.device("cuda"):
+        with torch.device(self.device):
             self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
             self.req_pool_indices = torch.tensor(req_pool_indices_cpu)
             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
@@ -683,7 +687,7 @@ class ScheduleBatch:
         else:
             self.sampling_info.penalizer_orchestrator.cumulate_input_tokens(input_ids)
 
-        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
+        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device=self.device)
         self.seq_lens.add_(1)
 
         # Alloc mem
@@ -705,7 +709,7 @@ class ScheduleBatch:
             return
 
         self.reqs = [self.reqs[i] for i in unfinished_indices]
-        new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cuda")
+        new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device=self.device)
         self.seq_lens = self.seq_lens[new_indices]
         self.input_ids = None
         self.req_pool_indices = self.req_pool_indices[new_indices]

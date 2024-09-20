@@ -47,10 +47,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import flashinfer_is_available
 
 # ROCm: flashinfer available later
-if not is_hip():
+if flashinfer_is_available():
     from flashinfer import bmm_fp8
 
 

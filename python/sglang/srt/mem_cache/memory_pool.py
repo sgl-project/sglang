@@ -27,11 +27,12 @@ logger = logging.getLogger(__name__)
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
-    def __init__(self, size: int, max_context_len: int):
+    def __init__(self, size: int, max_context_len: int, device: str):
         self.size = size
+        self.device=device
         self.free_slots = list(range(size))
         self.req_to_token = torch.empty(
-            (size, max_context_len), dtype=torch.int32, device="cuda"
+            (size, max_context_len), dtype=torch.int32, device=device
         )
 
     def alloc(self, need_size: int) -> List[int]:
@@ -60,9 +61,11 @@ class BaseTokenToKVPool(ABC):
         self,
         size: int,
         dtype: torch.dtype,
+        device: str
     ):
         self.size = size
         self.dtype = dtype
+        self.device = device
         if dtype == torch.float8_e5m2:
             # NOTE: Store as torch.uint8 because Tensor index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
@@ -70,10 +73,10 @@ class BaseTokenToKVPool(ABC):
             self.store_dtype = dtype
 
         # We also add one slot. This slot is used for writing dummy output from padded tokens.
-        self.mem_state = torch.ones((self.size + 1,), dtype=torch.bool, device="cuda")
+        self.mem_state = torch.ones((self.size + 1,), dtype=torch.bool, device=device)
 
         # Prefetch buffer
-        self.prefetch_buffer = torch.empty(0, device="cuda", dtype=torch.int32)
+        self.prefetch_buffer = torch.empty(0, device=device, dtype=torch.int32)
         self.prefetch_chunk_size = 512
 
         self.can_use_mem_size = self.size
@@ -112,7 +115,7 @@ class BaseTokenToKVPool(ABC):
         self.can_use_mem_size += len(free_index)
 
     def clear(self):
-        self.prefetch_buffer = torch.empty(0, device="cuda", dtype=torch.int32)
+        self.prefetch_buffer = torch.empty(0, device=self.device, dtype=torch.int32)
 
         self.mem_state.fill_(True)
         self.can_use_mem_size = self.size
@@ -149,22 +152,23 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self,
         size: int,
         dtype: torch.dtype,
+        device:str,
         head_num: int,
         head_dim: int,
         layer_num: int,
     ):
-        super().__init__(size, dtype)
+        super().__init__(size, dtype, device)
 
         # [size, head_num, head_dim] for each layer
         self.k_buffer = [
             torch.empty(
-                (size + 1, head_num, head_dim), dtype=self.store_dtype, device="cuda"
+                (size + 1, head_num, head_dim), dtype=self.store_dtype, device=device
             )
             for _ in range(layer_num)
         ]
         self.v_buffer = [
             torch.empty(
-                (size + 1, head_num, head_dim), dtype=self.store_dtype, device="cuda"
+                (size + 1, head_num, head_dim), dtype=self.store_dtype, device=device
             )
             for _ in range(layer_num)
         ]
@@ -207,18 +211,19 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         self,
         size: int,
         dtype: torch.dtype,
+        device: str,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         layer_num: int,
     ):
-        super().__init__(size, dtype)
+        super().__init__(size, dtype, device)
 
         self.kv_lora_rank = kv_lora_rank
         self.kv_buffer = [
             torch.empty(
                 (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
                 dtype=self.store_dtype,
-                device="cuda",
+                device=device,
             )
             for _ in range(layer_num)
         ]
