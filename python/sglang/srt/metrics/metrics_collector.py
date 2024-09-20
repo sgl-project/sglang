@@ -38,54 +38,54 @@ class Metrics:
 
         # Configuration Stats
         self.max_total_num_tokens = Gauge(
-            "max_total_num_tokens",
-            "Maximum total number of tokens",
+            name="sglang:max_total_num_tokens",
+            documentation="Maximum total number of tokens",
             labelnames=labelnames,
             multiprocess_mode="min",
         )  # static across processes
 
         self.max_prefill_tokens = Gauge(
-            "max_prefill_tokens",
-            "Maximum prefill tokens",
+            name="sglang:max_prefill_tokens",
+            documentation="Maximum prefill tokens",
             labelnames=labelnames,
             multiprocess_mode="min",
         )  # static across processes
 
         self.max_running_requests = Gauge(
-            "max_running_requests",
-            "Maximum running requests",
+            name="sglang:max_running_requests",
+            documentation="Maximum running requests",
             labelnames=labelnames,
             multiprocess_mode="min",
         )  # static across processes
 
         self.context_len = Gauge(
-            "context_len",
-            "Context length",
+            name="sglang:context_len",
+            documentation="Context length",
             labelnames=labelnames,
             multiprocess_mode="min",
         )  # static across processes
         # Decode Stats
         self.num_running_sys = Gauge(
-            "num_requests_running",
-            "Number of requests currently running on GPU",
+            name="sglang:num_requests_running",
+            documentation="Number of requests currently running on GPU",
             labelnames=labelnames,
             multiprocess_mode="sum",
         )
         self.num_waiting_sys = Gauge(
-            "num_requests_waiting",
-            "Number of requests waiting to be processed.",
+            name="sglang:num_requests_waiting",
+            documentation="Number of requests waiting to be processed.",
             labelnames=labelnames,
             multiprocess_mode="sum",
         )
         self.gen_throughput = Gauge(
-            "gen_throughput",
-            "Gen token throughput (token/s)",
+            name="sglang:gen_throughput",
+            documentation="Gen token throughput (token/s)",
             labelnames=labelnames,
             multiprocess_mode="sum",
         )
         self.token_usage = Gauge(
-            "token_usage",
-            "Total token usage",
+            name="sglang:token_usage",
+            documentation="Total token usage",
             labelnames=labelnames,
             multiprocess_mode="sum",
         )
@@ -98,33 +98,33 @@ class Metrics:
         #     multiprocess_mode="sum")
 
         self.new_seq = Gauge(
-            "new_seq",
-            "Number of new sequences",
+            name="sglang:new_seq",
+            documentation="Number of new sequences",
             labelnames=labelnames,
             multiprocess_mode="sum",
         )
         self.new_token = Gauge(
-            "new_token",
-            "Number of new token",
+            name="sglang:new_token",
+            documentation="Number of new token",
             labelnames=labelnames,
             multiprocess_mode="sum",
         )
         #   Prefix caching block hit rate
         self.cached_token = Gauge(
-            "cached_token",
-            "Number of cached token",
+            name="sglang:cached_token",
+            documentation="Number of cached token",
             labelnames=labelnames,
             multiprocess_mode="sum",
         )
         self.cache_hit_rate = Gauge(
-            "cache_hit_rate",
-            "Cache hit rate",
+            name="sglang:cache_hit_rate",
+            documentation="Cache hit rate",
             labelnames=labelnames,
             multiprocess_mode="sum",
         )
         self.queue_req = Gauge(
-            "queue_req",
-            "Number of queue requests",
+            name="sglang:queue_req",
+            documentation="Number of queue requests",
             labelnames=labelnames,
             multiprocess_mode="sum",
         )
@@ -132,20 +132,20 @@ class Metrics:
         # Request Stats
         #   Metadata
         self.num_prompt_tokens_requests = Histogram(
-            "request_prompt_tokens",
-            "Number of prefill tokens processed",
+            name="sglang:request_prompt_tokens",
+            documentation="Number of prefill tokens processed",
             labelnames=labelnames,
             buckets=build_1_2_5_buckets(max_model_len),
         )
         self.num_generation_tokens_requests = Histogram(
-            "request_generation_tokens",
-            "Number of generation tokens processed.",
+            name="sglang:request_generation_tokens",
+            documentation="Number of generation tokens processed.",
             labelnames=labelnames,
             buckets=build_1_2_5_buckets(max_model_len),
         )
         self.finished_reason_requests = Counter(
-            "request_success_total",
-            "Count of successfully processed requests.",
+            name="sglang:request_success_total",
+            documentation="Count of successfully processed requests.",
             labelnames=labelnames + ["finished_reason"],
         )
 
