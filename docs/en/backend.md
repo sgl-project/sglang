@@ -73,7 +73,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --mem-fraction-static 0.7
 ```
-- See `hyperparameter tuning <https://sglang.readthedocs.io/en/latest/hyperparameter_tuning.html>` on tuning hyperparameters for better performance.
+- See `hyperparameter tuning <https://sglang.readthedocs.io/en/latest/hyperparameter_tuning.html>`_ on tuning hyperparameters for better performance.
 - If you see out-of-memory errors during prefill for long prompts, try to set a smaller chunked prefill size.
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
