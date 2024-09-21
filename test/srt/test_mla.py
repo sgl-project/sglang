@@ -20,7 +20,7 @@ class TestMLA(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--tp", "2"],
+            other_args=["--tp", "2", "--trust-remote-code"],
         )
 
     @classmethod
