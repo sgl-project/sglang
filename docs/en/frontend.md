@@ -70,7 +70,7 @@ print(state["answer_1"])
 #### More Examples
 
 Anthropic and VertexAI (Gemini) models are also supported.
-You can find more examples at [examples/quick_start](examples/frontend_language/quick_start).
+You can find more examples at [examples/quick_start](https://github.com/sgl-project/sglang/tree/main/examples/frontend_language/quick_start).
 
 ### Language Feature
 To begin with, import sglang.
@@ -83,7 +83,7 @@ You can implement your prompt flow in a function decorated by `sgl.function`.
 You can then invoke the function with `run` or `run_batch`.
 The system will manage the state, chat template, parallelism and batching for you.
 
-The complete code for the examples below can be found at [readme_examples.py](examples/frontend_language/usage/readme_examples.py)
+The complete code for the examples below can be found at [readme_examples.py](https://github.com/sgl-project/sglang/blob/main/examples/frontend_language/usage/readme_examples.py)
 
 #### Control Flow
 You can use any Python code within the function body, including control flow, nested function calls, and external libraries.
@@ -132,7 +132,7 @@ def image_qa(s, image_file, question):
     s += sgl.assistant(sgl.gen("answer", max_tokens=256)
 ```
 
-See also [srt_example_llava.py](examples/frontend_language/quick_start/local_example_llava_next.py).
+See also [local_example_llava_next.py](https://github.com/sgl-project/sglang/blob/main/examples/frontend_language/quick_start/local_example_llava_next.py).
 
 #### Constrained Decoding
 Use `regex` to specify a regular expression as a decoding constraint.
@@ -176,7 +176,7 @@ def character_gen(s, name):
     s += sgl.gen("json_output", max_tokens=256, regex=character_regex)
 ```
 
-See also [json_decode.py](examples/frontend_language/usage/json_decode.py) for an additional example of specifying formats with Pydantic models.
+See also [json_decode.py](https://github.com/sgl-project/sglang/blob/main/examples/frontend_language/usage/json_decode.py) for an additional example of specifying formats with Pydantic models.
 
 #### Batching
 Use `run_batch` to run a batch of requests with continuous batching.
