@@ -132,7 +132,7 @@ def image_qa(s, image_file, question):
     s += sgl.assistant(sgl.gen("answer", max_tokens=256)
 ```
 
-See also [srt_example_llava.py](examples/frontend_language/quick_start/local_example_llava_next.py).
+See also [local_example_llava_next.py](https://github.com/sgl-project/sglang/blob/main/examples/frontend_language/quick_start/local_example_llava_next.py).
 
 #### Constrained Decoding
 Use `regex` to specify a regular expression as a decoding constraint.
