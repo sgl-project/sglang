@@ -187,12 +187,6 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_latency.TestBenchLatency.test_moe_default
 
-      - name: Benchmark MLA Eval Accuracy (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_mla.TestMLA.test_mmlu
-
 
   accuracy-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -239,6 +233,12 @@ jobs:
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
+      
+       - name: Evaluate MLA Accuracy (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_mla.TestMLA.test_mmlu
 
   finish:
     needs: [
