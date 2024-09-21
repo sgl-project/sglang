@@ -238,7 +238,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_mla.TestMLA.test_mmlu
+          python3 test_mla.py
 
   finish:
     needs: [
