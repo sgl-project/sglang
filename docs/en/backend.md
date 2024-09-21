@@ -122,7 +122,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - gte-Qwen2
   - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
 
-Instructions for supporting a new model are `here <https://sglang.readthedocs.io/en/latest/model_support.html>`.
+Instructions for supporting a new model are `here <https://sglang.readthedocs.io/en/latest/model_support.html>`_.
 
 #### Use Models From ModelScope
 <details>
