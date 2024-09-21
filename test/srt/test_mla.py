@@ -39,6 +39,18 @@ class TestMLA(unittest.TestCase):
         metrics = run_eval(args)
         assert metrics["score"] >= 0.5
 
+    def test_mgsm_en(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mgsm_en",
+            num_examples=None,
+            num_threads=1024,
+        )
+
+        metrics = run_eval(args)
+        assert metrics["score"] >= 0.8
+
 
 if __name__ == "__main__":
     unittest.main()
