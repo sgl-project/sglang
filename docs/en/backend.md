@@ -19,7 +19,7 @@ curl http://localhost:30000/generate \
     }
   }'
 ```
-Learn more about the argument format `here <https://sglang.readthedocs.io/en/latest/sampling_params.html>`.
+Learn more about the argument format `here <https://sglang.readthedocs.io/en/latest/sampling_params.html>`_.
 
 ### OpenAI Compatible API
 In addition, the server supports OpenAI-compatible APIs.
