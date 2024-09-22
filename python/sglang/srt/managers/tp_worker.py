@@ -63,7 +63,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     configure_logger,
-    get_available_gpu_memory,
     is_multimodal_model,
     set_random_seed,
     suppress_other_loggers,
@@ -96,8 +95,8 @@ class ModelTpServer:
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
-        # Metrics
-        self.log_stats = True
+
+        # Init model and tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,
             server_args.trust_remote_code,
@@ -335,9 +334,6 @@ class ModelTpServer:
             waiting_queue=len(self.waiting_queue),
         )
         self.log_metrics(decode_stats=decode_stats)
-
-    def _get_stats(self):
-        pass
 
     def check_memory(self):
         available_size = (
