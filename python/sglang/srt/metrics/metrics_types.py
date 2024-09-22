@@ -57,6 +57,8 @@ class SystemStats:
     #   KV Cache Usage in %
     # gpu_cache_usage_sys: float
     #   Prefix caching block hit rate
+    # Token usage in %
+    token_usage: float = 0.0
     is_mixed_chunk: bool = False
     new_seq: int = 0
     new_token: int = 0

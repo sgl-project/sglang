@@ -234,6 +234,7 @@ class ConsoleMetricsCollector(MetricsCollector):
                 f"#new-token: {stats.new_token}, "
                 f"#cached-token: {stats.cached_token}, "
                 f"cache hit rate: {stats.cache_hit_rate:.2f}%, "
+                f"token usage: {stats.token_usage:.2f}, "
                 f"#queue-req: {stats.queue_req}"
             )
         else:
@@ -243,6 +244,7 @@ class ConsoleMetricsCollector(MetricsCollector):
                 f"#new-token: {stats.new_token}, "
                 f"#cached-token: {stats.cached_token}, "
                 f"cache hit rate: {stats.cache_hit_rate:.2f}%, "
+                f"token usage: {stats.token_usage:.2f}, "
                 f"#running-req: {stats.running_req}, "
                 f"#queue-req: {stats.queue_req}"
             )

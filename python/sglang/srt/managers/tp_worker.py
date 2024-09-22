@@ -546,6 +546,11 @@ class ModelTpServer:
             running_req = (
                 num_mixed_running if self.is_mixed_chunk == True else running_bs
             )
+            num_used = self.max_total_num_tokens - (
+                self.token_to_kv_pool.available_size()
+                + self.tree_cache.evictable_size()
+            )
+            token_usage = num_used / self.max_total_num_tokens
             system_stats = SystemStats(
                 is_mixed_chunk=self.is_mixed_chunk,
                 new_seq=len(can_run_list),
@@ -554,37 +559,10 @@ class ModelTpServer:
                 cache_hit_rate=100.0 * tree_cache_hit_rate,
                 running_req=running_req,
                 queue_req=len(self.waiting_queue) - len(can_run_list) + has_inflight,
+                token_usage=token_usage,
             )
+
             self.log_metrics(system_stats=system_stats)
-
-            num_used = self.max_total_num_tokens - (
-                self.token_to_kv_pool.available_size()
-                + self.tree_cache.evictable_size()
-            )
-
-            if num_mixed_running > 0:
-                logger.info(
-                    f"Prefill batch"
-                    f"(mixed #running-req: {num_mixed_running}). "
-                    f"#new-seq: {len(can_run_list)}, "
-                    f"#new-token: {adder.log_input_tokens}, "
-                    f"#cached-token: {adder.log_hit_tokens}, "
-                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
-                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
-                )
-            else:
-                logger.info(
-                    f"Prefill batch. "
-                    f"#new-seq: {len(can_run_list)}, "
-                    f"#new-token: {adder.log_input_tokens}, "
-                    f"#cached-token: {adder.log_hit_tokens}, "
-                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
-                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                    f"#running-req: {running_bs}, "
-                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
-                )
-
         # Return the new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
