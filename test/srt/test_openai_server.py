@@ -445,7 +445,7 @@ class TestOpenAIServer(unittest.TestCase):
         for mode in ["completion", "chat"]:
             self.run_batch(mode)
 
-    def test_calcel_batch(self):
+    def test_cancel_batch(self):
         for mode in ["completion", "chat"]:
             self.run_cancel_batch(mode)
 
@@ -494,6 +494,37 @@ class TestOpenAIServer(unittest.TestCase):
         )
         text = response.choices[0].message.content
         assert isinstance(text, str)
+
+    def test_response_prefill(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant"},
+                {
+                    "role": "user",
+                    "content": """
+Extract the name, size, price, and color from this product description as a JSON object:
+
+<description>
+The SmartHome Mini is a compact smart home assistant available in black or white for only $49.99. At just 5 inches wide, it lets you control lights, thermostats, and other connected devices via voice or app—no matter where you place it in your home. This affordable little hub brings convenient hands-free control to your smart devices.
+</description>
+""",
+                },
+                {
+                    "role": "assistant",
+                    "content": "{\n",
+                },
+            ],
+            temperature=0,
+        )
+
+        assert (
+            response.choices[0]
+            .message.content.strip()
+            .startswith('"name": "SmartHome Mini",')
+        )
 
 
 if __name__ == "__main__":
