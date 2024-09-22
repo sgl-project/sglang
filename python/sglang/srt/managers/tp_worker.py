@@ -144,16 +144,26 @@ class ModelTpServer:
             self.max_total_num_tokens - 1,
         )
 
+        self.metrics_collectors = []
         # Lazy loading to ensure prometheus is initialized
-        from sglang.srt.metrics.metrics_collector import SGLangMetricsCollector
+        from sglang.srt.metrics.metrics_collector import (
+            ConsoleMetricsCollector,
+            PrometheusMetricsCollector,
+        )
 
-        self.metrics_collector = SGLangMetricsCollector(
+        metrics_collector = PrometheusMetricsCollector(
             labels={
-                "model": self.model_config.path,
+                "name": self.model_config.path,
                 # TODO: Add lora name/path in the future,
             },
             max_model_len=self.max_total_num_tokens,
         )
+        console_metrics_collector = ConsoleMetricsCollector(
+            name=__name__,
+        )
+
+        self.metrics_collectors.append(metrics_collector)
+        self.metrics_collectors.append(console_metrics_collector)
 
         # Sync random seed across TP workers
         server_args.random_seed = broadcast_recv_input(
@@ -163,20 +173,18 @@ class ModelTpServer:
         )[0]
         set_random_seed(server_args.random_seed)
 
-        # Print debug info
-        logger.info(
-            f"max_total_num_tokens={self.max_total_num_tokens}, "
-            f"max_prefill_tokens={self.max_prefill_tokens}, "
-            f"max_running_requests={self.max_running_requests}, "
-            f"context_len={self.model_config.context_len}"
+        # Log config stats
+        config_stats = ConfigStats(
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_prefill_tokens=self.max_prefill_tokens,
+            max_running_requests=self.max_running_requests,
+            context_len=self.model_config.context_len,
         )
-        self.metrics_collector.log_config_stats(
-            ConfigStats(
-                max_total_num_tokens=self.max_total_num_tokens,
-                max_prefill_tokens=self.max_prefill_tokens,
-                max_running_requests=self.max_running_requests,
-                context_len=self.model_config.context_len,
-            )
+        self.log_metrics(
+            config_stats=config_stats,
+            system_stats=SystemStats(),
+            decode_stats=DecodeStats(),
+            prefill_stats=PrefillStats(),
         )
         # Init cache
         if (
@@ -298,7 +306,7 @@ class ModelTpServer:
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
-                        self.print_decode_stats()
+                        self.log_decode_stats()
 
                     if self.running_batch.is_empty():
                         self.running_batch = None
@@ -306,35 +314,27 @@ class ModelTpServer:
 
                     if self.out_pyobjs and self.running_batch.has_stream:
                         break
-                    # if self.tp_rank == 0 and self.log_stats:
-                    #     stats =
             else:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
 
-    def print_decode_stats(self):
+    def log_decode_stats(self):
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
         throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
-        logger.info(
-            f"Decode batch. "
-            f"#running-req: {len(self.running_batch.reqs)}, "
-            f"#token: {num_used}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-            f"gen throughput (token/s): {throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}"
+
+        decode_stats = DecodeStats(
+            num_running_sys=len(self.running_batch.reqs),
+            num_waiting_sys=len(self.waiting_queue),
+            gen_throughput=throughput,
+            num_token=num_used,
+            token_usage=num_used / self.max_total_num_tokens,
+            waiting_queue=len(self.waiting_queue),
         )
-        self.metrics_collector.log_decode_stats(
-            DecodeStats(
-                num_running_sys=len(self.running_batch.reqs),
-                num_waiting_sys=len(self.waiting_queue),
-                gen_throughput=throughput,
-                token_usage=num_used / self.max_total_num_tokens,
-            )
-        )
+        self.log_metrics(decode_stats=decode_stats)
 
     def _get_stats(self):
         pass
@@ -545,38 +545,19 @@ class ModelTpServer:
             else:
                 tree_cache_hit_rate = 0.0
 
-            if num_mixed_running > 0:
-                logger.info(
-                    f"Prefill batch"
-                    f"(mixed #running-req: {num_mixed_running}). "
-                    f"#new-seq: {len(can_run_list)}, "
-                    f"#new-token: {adder.log_input_tokens}, "
-                    f"#cached-token: {adder.log_hit_tokens}, "
-                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
-                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
-                )
-            else:
-                logger.info(
-                    f"Prefill batch. "
-                    f"#new-seq: {len(can_run_list)}, "
-                    f"#new-token: {adder.log_input_tokens}, "
-                    f"#cached-token: {adder.log_hit_tokens}, "
-                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
-                    f"#running-req: {running_bs}, "
-                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
-                )
-            self.metrics_collector.log_system_stats(
-                SystemStats(
-                    new_seq=len(can_run_list),
-                    new_token=adder.log_input_tokens,
-                    cached_token=adder.log_hit_tokens,
-                    cache_hit_rate=100.0 * tree_cache_hit_rate,
-                    running_req=running_bs,
-                    queue_req=len(self.waiting_queue)
-                    - len(can_run_list)
-                    + has_inflight,
-                )
+            running_req = (
+                num_mixed_running if self.is_mixed_chunk == True else running_bs
             )
+            system_stats = SystemStats(
+                is_mixed_chunk=self.is_mixed_chunk,
+                new_seq=len(can_run_list),
+                new_token=adder.log_input_tokens,
+                cached_token=adder.log_hit_tokens,
+                cache_hit_rate=100.0 * tree_cache_hit_rate,
+                running_req=running_req,
+                queue_req=len(self.waiting_queue) - len(can_run_list) + has_inflight,
+            )
+            self.log_metrics(system_stats=system_stats)
 
         # Return the new batch
         new_batch = ScheduleBatch.init_new(
@@ -923,13 +904,12 @@ class ModelTpServer:
                         "prompt_tokens": len(req.origin_input_ids),
                     }
                     output_meta_info.append(meta_info)
-        self.metrics_collector.log_prefill_stats(
-            PrefillStats(
-                num_prompt_tokens_requests=num_prompt_tokens_requests,
-                num_generation_tokens_requests=num_generation_tokens_requests,
-                finished_reason_requests=finished_reason_requests,
-            )
+        prefill_stats = PrefillStats(
+            num_prompt_tokens_requests=num_prompt_tokens_requests,
+            num_generation_tokens_requests=num_generation_tokens_requests,
+            finished_reason_requests=finished_reason_requests,
         )
+        self.log_metrics(prefill_stats=prefill_stats)
         # Send to detokenizer
         if output_rids:
             if self.model_runner.is_generation:
@@ -1006,6 +986,24 @@ class ModelTpServer:
             flash_cache_success = self.flush_cache()
             assert flash_cache_success, "Cache flush failed after updating weights"
         return success, message
+
+    def log_metrics(
+        self,
+        config_stats: ConfigStats = None,
+        system_stats: SystemStats = None,
+        decode_stats: DecodeStats = None,
+        prefill_stats: PrefillStats = None,
+    ):
+        """Log metrics to the metrics collector."""
+        for collector in self.metrics_collectors:
+            if config_stats is not None:
+                collector.log_config_stats(config_stats)
+            if system_stats is not None:
+                collector.log_system_stats(system_stats)
+            if decode_stats is not None:
+                collector.log_decode_stats(decode_stats)
+            if prefill_stats is not None:
+                collector.log_prefill_stats(prefill_stats)
 
 
 def run_tp_server(
