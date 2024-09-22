@@ -47,7 +47,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install --no-deps -e "python[dev]"
+          pip install -e "python[dev]"
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Run test
@@ -256,7 +256,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -e "python[all]"
+          pip install -e --no-deps "python[all]"
 
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
