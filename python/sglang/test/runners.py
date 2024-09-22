@@ -21,19 +21,18 @@ from typing import List, Union
 
 import torch
 import torch.nn.functional as F
-from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.server import Runtime
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 
 DEFAULT_PROMPTS = [
-    # the output of gemma-2-2b from SRT is unstable on the commented prompt
-    # "The capital of France is",
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",
     "The capital of the United Kingdom is",
     "Today is a sunny day and I like",
     "AI is a field of computer science focused on",
+    # the output of gemma-2-2b from SRT is unstable on the commented prompt
+    # "The capital of France is",
 ]
 
 dirpath = os.path.dirname(__file__)
@@ -132,6 +131,8 @@ class HFRunner:
                             input_ids = torch.tensor([p], device="cuda")
 
                         if lora_paths is not None and lora_paths[i] is not None:
+                            from peft import PeftModel
+
                             self.model = PeftModel.from_pretrained(
                                 self.base_model,
                                 lora_paths[i],
