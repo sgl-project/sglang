@@ -587,3 +587,37 @@ def run_bench_latency(model, other_args):
         kill_child_process(process.pid)
 
     return output_throughput
+
+
+def lcs(X, Y):
+    m = len(X)
+    n = len(Y)
+    L = [[0] * (n + 1) for _ in range(m + 1)]
+
+    for i in range(m + 1):
+        for j in range(n + 1):
+            if i == 0 or j == 0:
+                L[i][j] = 0
+            elif X[i - 1] == Y[j - 1]:
+                L[i][j] = L[i - 1][j - 1] + 1
+            else:
+                L[i][j] = max(L[i - 1][j], L[i][j - 1])
+
+    return L[m][n]
+
+
+def calculate_rouge_l(output_strs_list1, output_strs_list2):
+    """calculate the ROUGE-L score"""
+    rouge_l_scores = []
+
+    for s1, s2 in zip(output_strs_list1, output_strs_list2):
+        lcs_len = lcs(s1, s2)
+        precision = lcs_len / len(s1) if len(s1) > 0 else 0
+        recall = lcs_len / len(s2) if len(s2) > 0 else 0
+        if precision + recall > 0:
+            fmeasure = (2 * precision * recall) / (precision + recall)
+        else:
+            fmeasure = 0.0
+        rouge_l_scores.append(fmeasure)
+
+    return rouge_l_scores
