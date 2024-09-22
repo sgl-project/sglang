@@ -15,7 +15,7 @@ The following two commands should give the same text output and very similar pre
 
 ### Add the model to the test suite
 To make sure the new model is well maintained in the future, it is better to add it to the test suite.
-You can add it to the `ALL_OTHER_MODELS` list in the `sglang/test/srt/models/test_generation_models.py` and run the following command to test it.
+You can add it to the `ALL_OTHER_MODELS` list in the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/srt/models/test_generation_models.py) and run the following command to test it.
 
 For example, if the model is Qwen/Qwen2-1.5B
 ```
