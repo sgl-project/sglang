@@ -15,6 +15,8 @@ limitations under the License.
 
 """Utilities for Prometheus Metrics Collection."""
 
+import logging
+from abc import ABC, abstractmethod
 from typing import Counter as CollectionsCounter
 from typing import Dict, List, Optional, Union
 
@@ -171,7 +173,82 @@ class Metrics:
         #         )
 
 
-class SGLangMetricsCollector:
+class MetricsCollector(ABC):
+    """
+    SGLang Metrics Collector
+    """
+
+    @abstractmethod
+    def log_config_stats(self, stats: ConfigStats) -> None:
+        pass
+
+    @abstractmethod
+    def log_prefill_stats(self, stats: PrefillStats) -> None:
+        pass
+
+    @abstractmethod
+    def log_decode_stats(self, stats: DecodeStats) -> None:
+        pass
+
+    @abstractmethod
+    def log_system_stats(self, stats: SystemStats) -> None:
+        pass
+
+
+class ConsoleMetricsCollector(MetricsCollector):
+    """
+    SGLang Metrics Collector that logs to console
+    """
+
+    def __init__(self, name: str) -> None:
+        self.logger = logging.getLogger(name)
+
+    def log_config_stats(self, stats: ConfigStats) -> None:
+        self.logger.info(
+            f"max_total_num_tokens={stats.max_total_num_tokens}, "
+            f"max_prefill_tokens={stats.max_prefill_tokens}, "
+            f"max_running_requests={stats.max_running_requests}, "
+            f"context_len={stats.context_len}"
+        )
+
+    def log_prefill_stats(self, stats: PrefillStats) -> None:
+        # We don't log prefill stats to console for now
+        pass
+
+    def log_decode_stats(self, stats: DecodeStats) -> None:
+        self.logger.info(
+            f"Decode batch. "
+            f"#running-req: {stats.num_running_sys}, "
+            f"#token: {stats.num_token}, "
+            f"token usage: {stats.token_usage:.2f}, "
+            f"gen throughput (token/s): {stats.gen_throughput:.2f}, "
+            f"#queue-req: {stats.waiting_queue}"
+        )
+
+    def log_system_stats(self, stats: SystemStats) -> None:
+        if stats.is_mixed_chunk:
+            self.logger.info(
+                f"Prefill batch"
+                f"(mixed #running-req: {stats.running_req}). "
+                f"#new-seq: {stats.new_seq}, "
+                f"#new-token: {stats.new_token}, "
+                f"#cached-token: {stats.cached_token}, "
+                f"cache hit rate: {stats.cache_hit_rate:.2f}%, "
+                f"#queue-req: {stats.queue_req}"
+            )
+        else:
+            self.logger.info(
+                f"Prefill batch. "
+                f"#new-seq: {stats.new_seq}, "
+                f"#new-token: {stats.new_token}, "
+                f"#cached-token: {stats.cached_token}, "
+                f"cache hit rate: {stats.cache_hit_rate:.2f}%, "
+                f"#running-req: {stats.running_req}, "
+                f"#queue-req: {stats.queue_req}"
+            )
+
+
+class PrometheusMetricsCollector(MetricsCollector):
     """
     SGLang Metrics Collector
     """
