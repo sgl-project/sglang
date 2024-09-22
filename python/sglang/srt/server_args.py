@@ -108,8 +108,6 @@ class ServerArgs:
     # LoRA
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
-    # Multi-Modal
-    image_processor_max_workers: int = 4
 
     def __post_init__(self):
         # Set missing default values
