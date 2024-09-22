@@ -14,12 +14,12 @@ The following two commands should give the same text output and very similar pre
 - Get the SGLang output by `python3 -m sglang.bench_latency --correct --model [new model]`
 
 ### Add the model to the test suite
-To make sure the new model is well maintained in the future, it is better to add it to our test suite.
+To make sure the new model is well maintained in the future, it is better to add it to the test suite.
 You can add it to the `ALL_OTHER_MODELS` list in the `sglang/test/srt/models/test_generation_models.py` and run the following command to test it.
 
-For example, if the model is Qwen/Qwen2-1.5B.
+For example, if the model is Qwen/Qwen2-1.5B
 ```
-ONLY_RUN=TinyLlama/TinyLlama-1.1B-Chat-v0.4 python3 -m unittest test_generation_models.TestGenerationModels.test_others
+ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others
 ```
 
 ## Port a model from vLLM to SGLang
