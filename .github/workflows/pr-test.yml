@@ -256,7 +256,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -e --no-deps "python[all]"
+          pip install -e "python[all]" --no-deps
 
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
