@@ -3,7 +3,7 @@ Usage:
 
 To test a specific model:
 1. Add it to ALL_OTHER_MODELS
-2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others`
+2. Run `ONLY_RUN=TinyLlama/TinyLlama-1.1B-Chat-v0.4 python3 -m unittest test_generation_models.TestGenerationModels.test_others`
 
 """
 
@@ -141,7 +141,7 @@ class TestGenerationModels(unittest.TestCase):
             ):
                 continue
             self.assert_close_logits_and_output_strs(
-                DEFAULT_PROMPTS, model_case, torch_dtype
+                DEFAULT_PROMPTS, model_case, torch.float16
             )
 
 
