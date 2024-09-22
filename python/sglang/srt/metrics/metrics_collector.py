@@ -18,7 +18,7 @@ limitations under the License.
 import logging
 from abc import ABC, abstractmethod
 from typing import Counter as CollectionsCounter
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Union
 
 import numpy as np
 from prometheus_client import Counter, Gauge, Histogram
@@ -126,7 +126,7 @@ class Metrics:
         )
         self.queue_req = Gauge(
             name="sglang:queue_req",
-            documentation="Number of queue requests",
+            documentation="Number of queued requests",
             labelnames=labelnames,
             multiprocess_mode="sum",
         )
@@ -150,27 +150,6 @@ class Metrics:
             documentation="Count of successfully processed requests.",
             labelnames=labelnames + ["finished_reason"],
         )
-
-        # Decode Stats in tp_worker.py
-        # logger.info(
-        #     f"Decode batch. "
-        #     f"#running-req: {len(self.running_batch.reqs)}, "
-        #     f"#token: {num_used}, "
-        #     f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-        #     f"gen throughput (token/s): {throughput:.2f}, "
-        #     f"#queue-req: {len(self.waiting_queue)}"
-        # )
-
-        # prefill batch in tp_worker.py
-        # logger.info(
-        #             f"Prefill batch"
-        #             f"(mixed #running-req: {num_mixed_running}). "
-        #             f"#new-seq: {len(can_run_list)}, "
-        #             f"#new-token: {adder.log_input_tokens}, "
-        #             f"#cached-token: {adder.log_hit_tokens}, "
-        #             f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
-        #             f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
-        #         )
 
 
 class MetricsCollector(ABC):
