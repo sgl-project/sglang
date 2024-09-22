@@ -130,7 +130,7 @@ class ModelRunner:
             self.init_cublas()
             self.init_cuda_graphs()
         else:
-            self.cuda_graph_runner=None
+            self.cuda_graph_runner = None
             
 
     def init_torch_distributed(self):
