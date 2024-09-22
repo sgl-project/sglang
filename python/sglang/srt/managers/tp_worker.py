@@ -185,6 +185,7 @@ class ModelTpServer:
             decode_stats=DecodeStats(),
             prefill_stats=PrefillStats(),
         )
+
         # Init cache
         if (
             server_args.chunked_prefill_size is not None
