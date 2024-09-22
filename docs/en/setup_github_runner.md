@@ -8,7 +8,10 @@ You can mount a folder for the shared huggingface model weights cache. The comma
 
 ```
 docker pull nvidia/cuda:12.1.1-devel-ubuntu22.04
+# Nvidia
 docker run --shm-size 64g -it -v /tmp/huggingface:/hf_home --gpus all nvidia/cuda:12.1.1-devel-ubuntu22.04 /bin/bash
+# AMD
+docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video --shm-size 64g -it -v /tmp/huggingface:/hf_home henryx/haisgl:sgl0.3.1.post3_vllm0.6.0_triton3.0.0_rocm6.2.1 /bin/bash
 ```
 
 ### Step 2: Configure the runner by `config.sh`

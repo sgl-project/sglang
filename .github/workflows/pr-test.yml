@@ -246,6 +246,28 @@ jobs:
           cd test/srt
           python3 test_data_parallelism.py
 
+  accuracy-test-1-gpu-amd:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner-amd
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]" --no-deps
+
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Evaluate Accuracy
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_eval_accuracy_large.py
+
   finish:
     needs: [
       unit-test-frontend, unit-test-backend-part-1, unit-test-backend-part-2, unit-test-backend-part-3,
