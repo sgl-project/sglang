@@ -18,6 +18,9 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && rm -rf /var/lib/apt/lists/* \
     && apt clean
 
+# For openbmb/MiniCPM models
+RUN pip3 install datamodel_code_generator
+
 WORKDIR /sgl-workspace
 
 RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
