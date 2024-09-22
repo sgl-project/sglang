@@ -21,18 +21,9 @@ import logging
 import random
 from typing import List, Optional, Union
 
+from sglang.srt.utils import is_hip
+
 logger = logging.getLogger(__name__)
-
-
-class LoRAPathAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        setattr(namespace, self.dest, {})
-        for lora_path in values:
-            if "=" in lora_path:
-                name, path = lora_path.split("=", 1)
-                getattr(namespace, self.dest)[name] = path
-            else:
-                getattr(namespace, self.dest)[lora_path] = lora_path
 
 
 @dataclasses.dataclass
@@ -106,11 +97,12 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     disable_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    disable_mla: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
+    max_torch_compile_bs: int = 32
     torchao_config: str = ""
     enable_p2p_check: bool = False
-    enable_mla: bool = False
     triton_attention_reduce_in_fp32: bool = False
 
     # LoRA
@@ -164,11 +156,12 @@ class ServerArgs:
             )
             self.sampling_backend = "pytorch"
 
-        # Default kernel backends
-        if self.enable_mla:
-            logger.info("MLA optimization is tunred on. Use triton backend.")
+        # ROCm: flashinfer available later
+        if is_hip():
             self.attention_backend = "triton"
+            self.sampling_backend = "pytorch"
 
+        # Default kernel backends
         if self.attention_backend is None:
             self.attention_backend = "flashinfer"
 
@@ -507,6 +500,11 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
+            "--disable-mla",
+            action="store_true",
+            help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
+        )
+        parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
@@ -515,6 +513,12 @@ class ServerArgs:
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
+        )
+        parser.add_argument(
+            "--max-torch-compile-bs",
+            type=int,
+            default=ServerArgs.max_torch_compile_bs,
+            help="Set the maximum batch size when using torch compile.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -526,11 +530,6 @@ class ServerArgs:
             "--enable-p2p-check",
             action="store_true",
             help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
-        )
-        parser.add_argument(
-            "--enable-mla",
-            action="store_true",
-            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
             "--triton-attention-reduce-in-fp32",
@@ -609,3 +608,14 @@ class PortArgs:
     controller_port: int
     detokenizer_port: int
     nccl_ports: List[int]
+
+
+class LoRAPathAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, {})
+        for lora_path in values:
+            if "=" in lora_path:
+                name, path = lora_path.split("=", 1)
+                getattr(namespace, self.dest)[name] = path
+            else:
+                getattr(namespace, self.dest)[lora_path] = lora_path

@@ -144,17 +144,17 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
 
-      - name: Benchmark Offline Throughput (w/o ChunkedPrefill)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_chunked_prefill
-
       - name: Benchmark Offline Throughput (w/ Triton)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
+
+      - name: Benchmark Offline Throughput (w/ FP8)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
   performance-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -228,11 +228,45 @@ jobs:
           cd human-eval
           pip install -e .
 
-      - name: Evaluate Accuracy
+      - name: Evaluate Accuracy (TP=2)
         timeout-minutes: 20
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
+      
+      - name: Evaluate MLA Accuracy (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_mla.py
+
+      - name: Evaluate Data Parallelism Accuracy (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_data_parallelism.py
+
+  accuracy-test-1-gpu-amd:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner-amd
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]" --no-deps
+
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Evaluate Accuracy
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_eval_accuracy_large.py
 
   finish:
     needs: [

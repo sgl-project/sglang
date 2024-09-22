@@ -12,21 +12,25 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from flashinfer import (
-    BatchDecodeWithPagedKVCacheWrapper,
-    BatchPrefillWithPagedKVCacheWrapper,
-    BatchPrefillWithRaggedKVCacheWrapper,
-)
-from flashinfer.cascade import merge_state
-from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
 from sglang.global_config import global_config
 from sglang.srt.layers.flashinfer_utils import update_flashinfer_indices
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+# ROCm: flashinfer available later
+if not is_hip():
+    from flashinfer import (
+        BatchDecodeWithPagedKVCacheWrapper,
+        BatchPrefillWithPagedKVCacheWrapper,
+        BatchPrefillWithRaggedKVCacheWrapper,
+    )
+    from flashinfer.cascade import merge_state
+    from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
 
 class AttentionBackend(ABC):
@@ -342,7 +346,9 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
-        self.num_head = model_runner.model_config.num_attention_heads
+        self.num_head = (
+            model_runner.model_config.num_attention_heads // model_runner.tp_size
+        )
 
         if global_server_args_dict.get("triton_attention_reduce_in_fp32", False):
             self.reduce_dtype = torch.float32

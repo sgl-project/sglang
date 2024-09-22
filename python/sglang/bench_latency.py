@@ -1,5 +1,7 @@
 """
-Benchmark the latency of a given model. It accepts arguments similar to those of launch_server.py.
+Benchmark the latency of running a single static batch.
+This script does not launch a server and uses the low-level APIs.
+It accepts arguments similar to those of launch_server.py.
 
 # Usage (latency test)
 ## with dummy weights:
@@ -62,8 +64,13 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server import _set_envs_and_config
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_child_process, suppress_other_loggers
+from sglang.srt.utils import (
+    configure_logger,
+    kill_child_process,
+    suppress_other_loggers,
+)
 
 
 @dataclasses.dataclass
@@ -339,6 +346,8 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
+    configure_logger(server_args, prefix=f" TP{tp_rank}")
+    _set_envs_and_config(server_args)
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model

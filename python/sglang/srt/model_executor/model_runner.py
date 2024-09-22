@@ -40,7 +40,7 @@ from vllm.model_executor.models import ModelRegistry
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.layers.attention_backend import FlashInferAttnBackend, TritonAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import SampleOutput, Sampler
+from sglang.srt.layers.sampler import Sampler
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
@@ -54,11 +54,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_generation_model,
-    is_llama3_405b_fp8_head_16,
     is_multimodal_model,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
-    monkey_patch_vllm_qvk_linear_loader,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,12 +86,20 @@ class ModelRunner:
         self.is_multimodal_model = is_multimodal_model(
             self.model_config.hf_config.architectures
         )
+
+        if (
+            self.model_config.attention_arch == AttentionArch.MLA
+            and not self.server_args.disable_mla
+        ):
+            logger.info("MLA optimization is tunred on. Use triton backend.")
+            self.server_args.attention_backend = "triton"
+
         global_server_args_dict.update(
             {
                 "attention_backend": server_args.attention_backend,
                 "sampling_backend": server_args.sampling_backend,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                "enable_mla": server_args.enable_mla,
+                "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
             }
         )
@@ -166,10 +172,13 @@ class ModelRunner:
         return min_per_gpu_memory
 
     def load_model(self):
-        torch.set_num_threads(1)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
+
+        # This can reduce thread conflicts and speed up weight loading.
+        torch.set_num_threads(1)
+
         if torch.cuda.get_device_capability()[0] < 8:
             logger.info(
                 "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
@@ -178,6 +187,7 @@ class ModelRunner:
             if torch.cuda.get_device_capability()[1] < 5:
                 raise RuntimeError("SGLang only supports sm75 and above.")
 
+        # Prepare the vllm model config
         monkey_patch_vllm_dummy_weight_loader()
         self.device_config = DeviceConfig()
         self.load_config = LoadConfig(load_format=self.server_args.load_format)
@@ -188,23 +198,16 @@ class ModelRunner:
             tokenizer_mode=None,
             trust_remote_code=self.server_args.trust_remote_code,
             dtype=self.server_args.dtype,
-            seed=42,
+            seed=self.server_args.random_seed,
             skip_tokenizer_init=True,
         )
-
-        # A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints
-        # Drop this after Sept, 2024.
-        if is_llama3_405b_fp8_head_16(self.model_config) and self.tp_size <= 8:
-            self.model_config.hf_config.num_key_value_heads = 8
-            self.vllm_model_config.hf_config.num_key_value_heads = 8
-            monkey_patch_vllm_qvk_linear_loader()
-
-        self.dtype = self.vllm_model_config.dtype
         if self.model_config.model_override_args is not None:
             self.vllm_model_config.hf_config.update(
                 self.model_config.model_override_args
             )
+        self.dtype = self.vllm_model_config.dtype
 
+        # Load the model
         self.model = get_model(
             model_config=self.vllm_model_config,
             load_config=self.load_config,
@@ -255,20 +258,20 @@ class ModelRunner:
                 tokenizer_mode=None,
                 trust_remote_code=self.server_args.trust_remote_code,
                 dtype=self.server_args.dtype,
-                seed=42,
+                seed=self.server_args.random_seed,
                 skip_tokenizer_init=True,
             )
         except Exception as e:
-            logger.error(f"Failed to load model config: {e}")
-            return False, "Failed to update model weights"
+            message = f"Failed to load model config: {e}."
+            return False, message
 
         load_config = LoadConfig(load_format=load_format)
 
         # Only support vllm DefaultModelLoader for now
         loader = get_model_loader(load_config)
         if not isinstance(loader, DefaultModelLoader):
-            logger.error("Failed to get weights iterator: Unsupported loader")
-            return False, "Failed to update model weights"
+            message = f"Failed to get model loader: {loader}."
+            return False, message
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
@@ -293,14 +296,14 @@ class ModelRunner:
             try:
                 iter = get_weight_iter(vllm_model_config)
             except Exception as e:
-                message = f"Failed to get weights iterator: {e}"
-                logger.error(message)
+                message = f"Failed to get weights iterator: {e}."
                 return False, message
             try:
                 model = model_load_weights(self.model, iter)
             except Exception as e:
-                message = f"Failed to update weights: {e}. \n Rolling back to original weights"
-                logger.error(message)
+                message = (
+                    f"Failed to update weights: {e}.\nRolling back to original weights."
+                )
                 del iter
                 gc.collect()
                 iter = get_weight_iter(self.vllm_model_config)
@@ -315,7 +318,7 @@ class ModelRunner:
         self.model_config.path = model_path
 
         logger.info("Update weights end.")
-        return True, "Succeeded to update model weights"
+        return True, "Succeeded to update model weights."
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
@@ -334,7 +337,7 @@ class ModelRunner:
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
-            and self.server_args.enable_mla
+            and not self.server_args.disable_mla
         ):
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
@@ -397,12 +400,12 @@ class ModelRunner:
             )
 
         self.req_to_token_pool = ReqToTokenPool(
-            max_num_reqs,
-            self.model_config.context_len + 8,
+            max_num_reqs + 1,
+            self.model_config.context_len + 4,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
-            and self.server_args.enable_mla
+            and not self.server_args.disable_mla
         ):
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
@@ -521,21 +524,6 @@ class ModelRunner:
         else:
             raise ValueError(f"Invaid forward mode: {batch.forward_mode}")
 
-    def _check_sample_results(self, sample_output: SampleOutput):
-        if not torch.all(sample_output.success):
-            probs = sample_output.probs
-            batch_next_token_ids = sample_output.batch_next_token_ids
-            logging.warning("Sampling failed, fallback to top_k=1 strategy")
-            probs = probs.masked_fill(torch.isnan(probs), 0.0)
-            argmax_ids = torch.argmax(probs, dim=-1)
-            batch_next_token_ids = torch.where(
-                sample_output.success, batch_next_token_ids, argmax_ids
-            )
-            sample_output.probs = probs
-            sample_output.batch_next_token_ids = batch_next_token_ids
-
-        return sample_output.batch_next_token_ids
-
     def _apply_logits_bias(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
@@ -564,13 +552,16 @@ class ModelRunner:
     def sample(
         self, logits_output: LogitsProcessorOutput, batch: ScheduleBatch
     ) -> torch.Tensor:
+        # Put CPU-heavy tasks here. They will be overlapped with the forward pass.
         batch.sampling_info.update_regex_vocab_mask(batch)
         batch.sampling_info.update_penalties()
         logits = self._apply_logits_bias(
             logits_output.next_token_logits, batch.sampling_info
         )
-        sample_output = self.sampler(logits, batch.sampling_info)
-        return self._check_sample_results(sample_output)
+
+        # Sample the next tokens.
+        next_token_ids = self.sampler(logits, batch.sampling_info)
+        return next_token_ids
 
 
 @lru_cache()

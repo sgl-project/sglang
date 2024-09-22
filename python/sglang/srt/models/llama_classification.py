@@ -19,10 +19,10 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 
@@ -36,6 +36,7 @@ class LlamaForClassification(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.torchao_config = None
         self.quant_config = quant_config
         self.model = LlamaModel(config, quant_config=quant_config)
 
@@ -43,8 +44,6 @@ class LlamaForClassification(nn.Module):
             config.hidden_size, config.classification_out_size, bias=False
         )
         self.eos_token_id = config.eos_token_id
-
-        self.param_dict = dict(self.named_parameters())
 
     @torch.no_grad()
     def forward(
@@ -77,7 +76,7 @@ class LlamaForClassification(nn.Module):
         return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        params_dict = self.param_dict
+        params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             if "classification_head" in name:
