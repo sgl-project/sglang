@@ -182,16 +182,6 @@ class ModelRunner:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
                 )
-        #elif self.device_config.device_type == 'xpu':
-        #    torch.xpu.set_device(self.gpu_id)
-        #    logger.info("Init oneCCL begin.")
-        #    if not self.server_args.enable_p2p_check:
-        #        monkey_patch_vllm_p2p_access_check(self.gpu_id)
-        #    
-        #    min_per_gpu_memory = get_available_gpu_memory(
-        #        self.device_config.device_type, self.gpu_id, distributed=self.tp_size > 1
-        #    )
-
         return min_per_gpu_memory
 
     def load_model(self):
