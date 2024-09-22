@@ -227,7 +227,6 @@ class ModelRunner:
                 self.model_config.model_override_args
             )
         self.dtype = self.vllm_model_config.dtype
-        
         # Load the model
         self.model = get_model(
             model_config=self.vllm_model_config,
