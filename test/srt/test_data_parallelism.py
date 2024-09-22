@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestMLA(unittest.TestCase):
+class TestDataParallelism(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
