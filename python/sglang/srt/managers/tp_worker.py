@@ -143,6 +143,10 @@ class ModelTpServer:
         self.time_waiting_requests: List[float] = []
         self.time_decode_requests: List[float] = []
         self._stats = Stats()
+        self._stats.max_total_num_tokens = self.max_total_num_tokens
+        self._stats.max_prefill_tokens = self.max_prefill_tokens
+        self._stats.max_running_requests = self.max_running_requests
+        self._stats.context_len = self.model_config.context_len
         # Lazy loading to ensure prometheus is initialized
         from sglang.srt.metrics.metrics_collector import PrometheusMetricsCollector
 
