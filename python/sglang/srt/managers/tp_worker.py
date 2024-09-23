@@ -161,6 +161,14 @@ class ModelTpServer:
         )[0]
         set_random_seed(server_args.random_seed)
 
+        # Print debug info
+        logger.info(
+            f"max_total_num_tokens={self.max_total_num_tokens}, "
+            f"max_prefill_tokens={self.max_prefill_tokens}, "
+            f"max_running_requests={self.max_running_requests}, "
+            f"context_len={self.model_config.context_len}"
+        )
+
         # Init cache
         if (
             server_args.chunked_prefill_size is not None
@@ -569,7 +577,30 @@ class ModelTpServer:
                 self.token_to_kv_pool.available_size()
                 + self.tree_cache.evictable_size()
             )
-            token_usage = num_used / self.max_total_num_tokens
+
+            if num_mixed_running > 0:
+                logger.info(
+                    f"Prefill batch"
+                    f"(mixed #running-req: {num_mixed_running}). "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
+                )
+            else:
+                logger.info(
+                    f"Prefill batch. "
+                    f"#new-seq: {len(can_run_list)}, "
+                    f"#new-token: {adder.log_input_tokens}, "
+                    f"#cached-token: {adder.log_hit_tokens}, "
+                    f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
+                    f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                    f"#running-req: {running_bs}, "
+                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
+                )
+
             self._stats.is_mixed_chunk = self.is_mixed_chunk
             self._stats.new_seq = len(can_run_list)
             self._stats.new_token = adder.log_input_tokens
@@ -579,9 +610,9 @@ class ModelTpServer:
             self._stats.queue_req = (
                 len(self.waiting_queue) - len(can_run_list) + has_inflight
             )
-            self._stats.token_usage = token_usage
-
+            self._stats.token_usage = num_used / self.max_total_num_tokens
             self.log_metrics()
+
         # Return the new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
