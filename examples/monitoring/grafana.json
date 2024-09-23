@@ -47,8 +47,8 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 5,
-        "w": 4,
+        "h": 3,
+        "w": 3,
         "x": 0,
         "y": 0
       },
@@ -61,7 +61,7 @@
         "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
-            "lastNotNull"
+            "last"
           ],
           "fields": "",
           "values": false
@@ -118,9 +118,9 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 4,
+        "h": 3,
+        "w": 3,
+        "x": 3,
         "y": 0
       },
       "id": 1,
@@ -132,7 +132,7 @@
         "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
-            "lastNotNull"
+            "last"
           ],
           "fields": "",
           "values": false
@@ -169,77 +169,6 @@
         "type": "prometheus",
         "uid": "ddyfngn31dg5cf"
       },
-      "description": "max_prefill_tokens from server args",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 8,
-        "y": 0
-      },
-      "id": 3,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "percentChangeColorMode": "standard",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showPercentChange": false,
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "11.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
-          },
-          "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "sglang:max_prefill_tokens{instance=\"$instance\", name=\"$model_name\"}",
-          "fullMetaSearch": false,
-          "includeNullMetadata": true,
-          "instant": false,
-          "legendFormat": "__auto",
-          "range": true,
-          "refId": "A",
-          "useBackend": false
-        }
-      ],
-      "title": "Max Prefill Tokens",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "default": true,
-        "type": "prometheus",
-        "uid": "ddyfngn31dg5cf"
-      },
       "description": "max_total_tokens",
       "fieldConfig": {
         "defaults": {
@@ -260,9 +189,9 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 12,
+        "h": 3,
+        "w": 3,
+        "x": 6,
         "y": 0
       },
       "id": 4,
@@ -274,7 +203,7 @@
         "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
-            "lastNotNull"
+            "last"
           ],
           "fields": "",
           "values": false
@@ -311,44 +240,11 @@
         "type": "prometheus",
         "uid": "ddyfngn31dg5cf"
       },
-      "description": "",
+      "description": "max_prefill_tokens from server args",
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+            "mode": "thresholds"
           },
           "mappings": [],
           "thresholds": {
@@ -364,24 +260,30 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 0,
-        "y": 5
+        "h": 3,
+        "w": 3,
+        "x": 9,
+        "y": 0
       },
-      "id": 5,
+      "id": 3,
       "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "last"
+          ],
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
+      "pluginVersion": "11.2.0",
       "targets": [
         {
           "datasource": {
@@ -390,6 +292,147 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
+          "expr": "sglang:max_prefill_tokens{instance=\"$instance\", name=\"$model_name\"}",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Max Prefill Tokens",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus",
+        "uid": "ddyfngn31dg5cf"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "disableTextWrap": false,
+          "editorMode": "builder",
+          "expr": "sglang:cached_token{instance=\"$instance\", name=\"$model_name\"}",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "{{__name__}}",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Cached Tokens",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus",
+        "uid": "ddyfngn31dg5cf"
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "id": 5,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
           "expr": "sglang:cache_hit_rate{instance=\"$instance\", name=\"$model_name\"}",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
@@ -401,7 +444,7 @@
         }
       ],
       "title": "Cache Hit Rate (%)",
-      "type": "timeseries"
+      "type": "stat"
     },
     {
       "datasource": {
@@ -465,12 +508,12 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 5
+        "x": 0,
+        "y": 3
       },
-      "id": 6,
+      "id": 14,
       "options": {
         "legend": {
           "calcs": [],
@@ -490,18 +533,86 @@
             "uid": "ddyfngn31dg5cf"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "sglang:cached_token{instance=\"$instance\", name=\"$model_name\"}",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by(le) (rate(sglang:e2e_request_latency_seconds_bucket{instance=\"$instance\", name=\"$model_name\"}[$__rate_interval])))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "{{__name__}}",
+          "legendFormat": "P99",
           "range": true,
           "refId": "A",
           "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by(le) (rate(sglang:e2e_request_latency_seconds_bucket{instance=\"$instance\", name=\"$model_name\"}[$__rate_interval])))",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "P90",
+          "range": true,
+          "refId": "B",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "disableTextWrap": false,
+          "editorMode": "builder",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(sglang:e2e_request_latency_seconds_bucket{instance=\"$instance\", name=\"$model_name\"}[$__rate_interval])))",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "P95",
+          "range": true,
+          "refId": "C",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "disableTextWrap": false,
+          "editorMode": "builder",
+          "expr": "histogram_quantile(0.5, sum by(le) (rate(sglang:e2e_request_latency_seconds_bucket{instance=\"$instance\", name=\"$model_name\"}[$__rate_interval])))",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "P50",
+          "range": true,
+          "refId": "D",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "disableTextWrap": false,
+          "editorMode": "builder",
+          "expr": "rate(sglang:e2e_request_latency_seconds_sum{instance=\"$instance\", name=\"$model_name\"}[$__rate_interval]) / rate(sglang:e2e_request_latency_seconds_count[$__rate_interval])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "Average",
+          "range": true,
+          "refId": "E",
+          "useBackend": false
         }
       ],
-      "title": "Cached Tokens",
+      "title": "E2E Request Latency (S)",
       "type": "timeseries"
     },
     {
@@ -567,9 +678,106 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 12,
+        "x": 12,
+        "y": 3
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "editorMode": "code",
+          "expr": "sglang:gen_throughput",
+          "instant": false,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Generation Throughput (Token / S)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus",
+        "uid": "ddyfngn31dg5cf"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
         "x": 0,
-        "y": 12
+        "y": 11
       },
       "id": 7,
       "options": {
@@ -668,9 +876,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 12
+        "w": 12,
+        "x": 12,
+        "y": 11
       },
       "id": 8,
       "options": {
@@ -769,11 +977,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 12
+        "w": 12,
+        "x": 0,
+        "y": 19
       },
-      "id": 9,
+      "id": 16,
       "options": {
         "legend": {
           "calcs": [],
@@ -793,18 +1001,236 @@
             "uid": "ddyfngn31dg5cf"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "sglang:queue_req{instance=\"$instance\", name=\"$model_name\"}",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by(le) (rate(sglang:decode_request_latency_seconds_bucket{instance=\"$instance\", name=\"$model_name\"}[$__rate_interval])))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "{{__name__}}",
+          "legendFormat": "P99",
           "range": true,
           "refId": "A",
           "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by(le) (rate(sglang:decode_request_latency_seconds_bucket{instance=\"$instance\", name=\"$model_name\"}[$__rate_interval])))",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "P90",
+          "range": true,
+          "refId": "B",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(sglang:decode_request_latency_seconds_bucket{instance=\"$instance\", name=\"$model_name\"}[$__rate_interval])))",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "P95",
+          "range": true,
+          "refId": "C",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by(le) (rate(sglang:decode_request_latency_seconds_bucket{instance=\"$instance\", name=\"$model_name\"}[$__rate_interval])))",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "P50",
+          "range": true,
+          "refId": "D",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "rate(sglang:decode_request_latency_seconds_sum{instance=\"$instance\", name=\"$model_name\"}[$__rate_interval]) / rate(sglang:decode_request_latency_seconds_count[$__rate_interval])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "Average",
+          "range": true,
+          "refId": "E",
+          "useBackend": false
         }
       ],
-      "title": "Number of Requests Queued",
+      "title": "Time Request Decoding (S)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": true,
+        "type": "prometheus",
+        "uid": "ddyfngn31dg5cf"
+      },
+      "description": "Time requests waiting before added to batch",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sglang:waiting_request_latency_seconds_bucket[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "P99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sglang:waiting_request_latency_seconds_bucket[$__rate_interval])))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "P95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(sglang:waiting_request_latency_seconds_bucket[$__rate_interval])))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "P90",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:waiting_request_latency_seconds_bucket[$__rate_interval])))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "P50",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "editorMode": "code",
+          "expr": "rate(sglang:waiting_request_latency_seconds_sum[$__rate_interval])\r\n/\r\nrate(sglang:waiting_request_latency_seconds_count[$__rate_interval])",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "Average",
+          "range": true,
+          "refId": "E"
+        }
+      ],
+      "title": "Time Request Waiting (S)",
       "type": "timeseries"
     },
     {
@@ -872,9 +1298,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 20
+        "y": 27
       },
-      "id": 10,
+      "id": 11,
       "options": {
         "legend": {
           "calcs": [],
@@ -894,8 +1320,8 @@
             "uid": "ddyfngn31dg5cf"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "sglang:token_usage",
+          "editorMode": "code",
+          "expr": "sum(rate(sglang:request_prompt_tokens_sum{instance=\"$instance\", name=\"$model_name\"}[$__rate_interval])) by (instance, name)",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
@@ -903,9 +1329,26 @@
           "range": true,
           "refId": "A",
           "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "ddyfngn31dg5cf"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "B",
+          "useBackend": false
         }
       ],
-      "title": "Total Token Usage",
+      "title": "Prompt Tokens",
       "type": "timeseries"
     },
     {
@@ -973,9 +1416,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 20
+        "y": 27
       },
-      "id": 11,
+      "id": 17,
       "options": {
         "legend": {
           "calcs": [],
@@ -1034,11 +1477,19 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 28
+        "y": 35
       },
       "id": 13,
       "options": {
         "calculate": false,
+        "calculation": {
+          "yBuckets": {
+            "scale": {
+              "log": 2,
+              "type": "log"
+            }
+          }
+        },
         "cellGap": 1,
         "color": {
           "exponent": 0.5,
@@ -1079,7 +1530,7 @@
             "uid": "ddyfngn31dg5cf"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "sum by(le) (increase(sglang:request_prompt_tokens_bucket{name=\"$model_name\", instance=\"$instance\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
@@ -1090,7 +1541,7 @@
           "useBackend": false
         }
       ],
-      "title": "Request Prompt Tokens",
+      "title": "Request Prompt Tokens (WIP)",
       "type": "heatmap"
     },
     {
@@ -1099,6 +1550,7 @@
         "type": "prometheus",
         "uid": "ddyfngn31dg5cf"
       },
+      "description": "",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -1118,19 +1570,34 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 28
+        "y": 35
       },
       "id": 12,
       "options": {
         "calculate": false,
+        "calculation": {
+          "xBuckets": {
+            "mode": "size",
+            "value": ""
+          },
+          "yBuckets": {
+            "mode": "size",
+            "scale": {
+              "log": 2,
+              "type": "log"
+            },
+            "value": ""
+          }
+        },
         "cellGap": 1,
         "color": {
           "exponent": 0.5,
           "fill": "dark-orange",
+          "min": 0,
           "mode": "scheme",
           "reverse": false,
           "scale": "exponential",
-          "scheme": "Oranges",
+          "scheme": "Spectral",
           "steps": 64
         },
         "exemplars": {
@@ -1143,16 +1610,19 @@
           "show": true
         },
         "rowsFrame": {
-          "layout": "auto"
+          "layout": "auto",
+          "value": "Request count"
         },
         "tooltip": {
           "mode": "single",
           "showColorScale": false,
-          "yHistogram": false
+          "yHistogram": true
         },
         "yAxis": {
+          "axisLabel": "Generation Length",
           "axisPlacement": "left",
-          "reverse": false
+          "reverse": false,
+          "unit": "none"
         }
       },
       "pluginVersion": "11.2.0",
@@ -1163,7 +1633,7 @@
             "uid": "ddyfngn31dg5cf"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "sum by(le) (increase(sglang:request_generation_tokens_bucket{name=\"$model_name\", instance=\"$instance\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
@@ -1174,7 +1644,7 @@
           "useBackend": false
         }
       ],
-      "title": "Request Generation Tokens",
+      "title": "Request Generation Tokens (WIP)",
       "type": "heatmap"
     }
   ],
@@ -1249,6 +1719,6 @@
   "timezone": "browser",
   "title": "SGLang Dashboard",
   "uid": "ddyp55uq7brpcc",
-  "version": 4,
+  "version": 11,
   "weekStart": ""
 }
