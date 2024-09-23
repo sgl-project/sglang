@@ -1648,7 +1648,7 @@
       "type": "heatmap"
     }
   ],
-  "refresh": "auto",
+  "refresh": "5s",
   "schemaVersion": 39,
   "tags": [],
   "templating": {
@@ -1712,13 +1712,13 @@
     ]
   },
   "time": {
-    "from": "now-30m",
+    "from": "now-5m",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "browser",
   "title": "SGLang Dashboard",
   "uid": "ddyp55uq7brpcc",
-  "version": 11,
+  "version": 12,
   "weekStart": ""
 }
