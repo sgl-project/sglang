@@ -20,44 +20,27 @@ from typing import List
 
 
 @dataclass
-class ConfigStats:
-    # Model config
+class Stats:
+    # config
     max_total_num_tokens: int = 0
     max_prefill_tokens: int = 0
     max_running_requests: int = 0
     context_len: int = 0
-
-
-@dataclass
-class PrefillStats:
-    # Request stats
-    #   TODO Latency
-    #   Metadata
+    # request stats
     num_prompt_tokens_requests: List[int] = field(default_factory=list)
     num_generation_tokens_requests: List[int] = field(default_factory=list)
-    # best_of_requests: List[int]
-    # n_requests: List[int]
     finished_reason_requests: List[str] = field(default_factory=list)
-
-
-@dataclass
-class DecodeStats:
-    # System stats (should have _sys suffix)
-    #   Scheduler State
-    num_running_sys: int = 0
-    num_waiting_sys: int = 0
+    # decode stats
+    num_running_req: int = 0
+    num_waiting_req: int = 0
     gen_throughput: float = 0.0
     num_token: int = 0
     token_usage: float = 0.0
     waiting_queue: int = 0
-
-
-@dataclass
-class SystemStats:
-    #   KV Cache Usage in %
-    # gpu_cache_usage_sys: float
-    #   Prefix caching block hit rate
-    # Token usage in %
+    time_e2e_requests: List[float] = field(default_factory=list)
+    time_waiting_requests: List[float] = field(default_factory=list)
+    time_decode_requests: List[float] = field(default_factory=list)
+    # system stats
     token_usage: float = 0.0
     is_mixed_chunk: bool = False
     new_seq: int = 0

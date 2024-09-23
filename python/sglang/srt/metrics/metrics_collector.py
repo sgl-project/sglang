@@ -23,12 +23,7 @@ from typing import Dict, List, Union
 import numpy as np
 from prometheus_client import Counter, Gauge, Histogram
 
-from sglang.srt.metrics.metrics_types import (
-    ConfigStats,
-    DecodeStats,
-    PrefillStats,
-    SystemStats,
-)
+from sglang.srt.metrics.metrics_types import Stats
 
 
 class Metrics:
@@ -150,6 +145,24 @@ class Metrics:
             documentation="Count of successfully processed requests.",
             labelnames=labelnames + ["finished_reason"],
         )
+        self.histogram_time_e2e_requests = Histogram(
+            name="sglang:e2e_request_latency_seconds",
+            documentation="Histogram of End-to-end request latency in seconds",
+            labelnames=labelnames,
+            buckets=build_1_2_5_buckets(max_model_len),
+        )
+        self.histogram_time_waiting_requests = Histogram(
+            name="sglang:waiting_request_latency_seconds",
+            documentation="Histogram of request waiting time in seconds",
+            labelnames=labelnames,
+            buckets=build_1_2_5_buckets(max_model_len),
+        )
+        self.histogram_time_decode_requests = Histogram(
+            name="sglang:decode_request_latency_seconds",
+            documentation="Histogram of request decoding time in seconds",
+            labelnames=labelnames,
+            buckets=build_1_2_5_buckets(max_model_len),
+        )
 
 
 class MetricsCollector(ABC):
@@ -158,75 +171,8 @@ class MetricsCollector(ABC):
     """
 
     @abstractmethod
-    def log_config_stats(self, stats: ConfigStats) -> None:
+    def log_stats(self, stats: Stats) -> None:
         pass
-
-    @abstractmethod
-    def log_prefill_stats(self, stats: PrefillStats) -> None:
-        pass
-
-    @abstractmethod
-    def log_decode_stats(self, stats: DecodeStats) -> None:
-        pass
-
-    @abstractmethod
-    def log_system_stats(self, stats: SystemStats) -> None:
-        pass
-
-
-class ConsoleMetricsCollector(MetricsCollector):
-    """
-    SGLang Metrics Collector that logs to console
-    """
-
-    def __init__(self, name: str) -> None:
-        self.logger = logging.getLogger(name)
-
-    def log_config_stats(self, stats: ConfigStats) -> None:
-        self.logger.info(
-            f"max_total_num_tokens={stats.max_total_num_tokens}, "
-            f"max_prefill_tokens={stats.max_prefill_tokens}, "
-            f"max_running_requests={stats.max_running_requests}, "
-            f"context_len={stats.context_len}"
-        )
-
-    def log_prefill_stats(self, stats: PrefillStats) -> None:
-        # We don't log prefill stats to console for now
-        pass
-
-    def log_decode_stats(self, stats: DecodeStats) -> None:
-        self.logger.info(
-            f"Decode batch. "
-            f"#running-req: {stats.num_running_sys}, "
-            f"#token: {stats.num_token}, "
-            f"token usage: {stats.token_usage:.2f}, "
-            f"gen throughput (token/s): {stats.gen_throughput:.2f}, "
-            f"#queue-req: {stats.waiting_queue}"
-        )
-
-    def log_system_stats(self, stats: SystemStats) -> None:
-        if stats.is_mixed_chunk:
-            self.logger.info(
-                f"Prefill batch"
-                f"(mixed #running-req: {stats.running_req}). "
-                f"#new-seq: {stats.new_seq}, "
-                f"#new-token: {stats.new_token}, "
-                f"#cached-token: {stats.cached_token}, "
-                f"cache hit rate: {stats.cache_hit_rate:.2f}%, "
-                f"token usage: {stats.token_usage:.2f}, "
-                f"#queue-req: {stats.queue_req}"
-            )
-        else:
-            self.logger.info(
-                f"Prefill batch. "
-                f"#new-seq: {stats.new_seq}, "
-                f"#new-token: {stats.new_token}, "
-                f"#cached-token: {stats.cached_token}, "
-                f"cache hit rate: {stats.cache_hit_rate:.2f}%, "
-                f"token usage: {stats.token_usage:.2f}, "
-                f"#running-req: {stats.running_req}, "
-                f"#queue-req: {stats.queue_req}"
-            )
 
 
 class PrometheusMetricsCollector(MetricsCollector):
@@ -260,13 +206,11 @@ class PrometheusMetricsCollector(MetricsCollector):
         for datum in data:
             histogram.labels(**self.labels).observe(datum)
 
-    def log_config_stats(self, stats: ConfigStats) -> None:
+    def log_stats(self, stats: Stats) -> None:
         self._log_gauge(self.metrics.max_total_num_tokens, stats.max_total_num_tokens)
         self._log_gauge(self.metrics.max_prefill_tokens, stats.max_prefill_tokens)
         self._log_gauge(self.metrics.max_running_requests, stats.max_running_requests)
         self._log_gauge(self.metrics.context_len, stats.context_len)
-
-    def log_prefill_stats(self, stats: PrefillStats) -> None:
         self._log_histogram(
             self.metrics.num_prompt_tokens_requests, stats.num_prompt_tokens_requests
         )
@@ -274,26 +218,25 @@ class PrometheusMetricsCollector(MetricsCollector):
             self.metrics.num_generation_tokens_requests,
             stats.num_generation_tokens_requests,
         )
-        # self._log_counter(self.metrics.finished_reason_requests, stats.finished_reason_requests)
-
-    def log_decode_stats(self, stats: DecodeStats) -> None:
-        self._log_gauge(self.metrics.num_running_sys, stats.num_running_sys)
-        self._log_gauge(self.metrics.num_waiting_sys, stats.num_waiting_sys)
+        # self._log_gauge(self.metrics.gpu_cache_usage_sys, stats.gpu_cache_usage_sys)
+        self._log_gauge(self.metrics.num_running_sys, stats.num_running_req)
+        self._log_gauge(self.metrics.num_waiting_sys, stats.num_waiting_req)
         self._log_gauge(self.metrics.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.metrics.token_usage, stats.token_usage)
-
-    def log_system_stats(self, stats: SystemStats) -> None:
-        # self._log_gauge(self.metrics.gpu_cache_usage_sys, stats.gpu_cache_usage_sys)
+        self._log_histogram(
+            self.metrics.histogram_time_e2e_requests, stats.time_e2e_requests
+        )
+        self._log_histogram(
+            self.metrics.histogram_time_waiting_requests, stats.time_waiting_requests
+        )
+        self._log_histogram(
+            self.metrics.histogram_time_decode_requests, stats.time_decode_requests
+        )
         self._log_gauge(self.metrics.new_seq, stats.new_seq)
         self._log_gauge(self.metrics.new_token, stats.new_token)
         self._log_gauge(self.metrics.cached_token, stats.cached_token)
         self._log_gauge(self.metrics.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.metrics.queue_req, stats.queue_req)
-
-    def _log_histogram(self, histogram, data: Union[List[int], List[float]]) -> None:
-        # Convenience function for logging list to histogram.
-        for datum in data:
-            histogram.labels(**self.labels).observe(datum)
 
 
 def build_1_2_5_buckets(max_value: int) -> List[int]:
