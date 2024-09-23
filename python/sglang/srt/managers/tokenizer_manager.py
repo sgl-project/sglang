@@ -123,6 +123,7 @@ class TokenizerManager:
                     initializer=init_global_processor,
                     mp_context=mp.get_context("fork"),
                     initargs=(server_args,),
+                    max_workers=os.environ.get("SGLANG_CPU_COUNT", os.cpu_count()),
                 )
             else:
                 self.tokenizer = get_tokenizer(

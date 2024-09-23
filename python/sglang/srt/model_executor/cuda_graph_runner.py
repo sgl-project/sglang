@@ -108,6 +108,10 @@ class CudaGraphRunner:
             self.capture_bs = list(range(1, 32)) + [64, 128]
         else:
             self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+
+        self.capture_bs = [
+            bs for bs in self.capture_bs if bs <= model_runner.req_to_token_pool.size
+        ]
         self.compile_bs = (
             [
                 bs
@@ -118,21 +122,8 @@ class CudaGraphRunner:
             else []
         )
 
-        # Common inputs
-        self.max_bs = max(self.capture_bs)
-        self.input_ids = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
-        self.req_pool_indices = torch.zeros(
-            (self.max_bs,), dtype=torch.int32, device="cuda"
-        )
-        self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int32, device="cuda")
-        self.position_ids_offsets = torch.ones(
-            (self.max_bs,), dtype=torch.int32, device="cuda"
-        )
-        self.out_cache_loc = torch.zeros(
-            (self.max_bs,), dtype=torch.int32, device="cuda"
-        )
-
         # Attention backend
+        self.max_bs = max(self.capture_bs)
         self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -140,6 +131,16 @@ class CudaGraphRunner:
 
         if self.use_torch_compile:
             set_torch_compile_config()
+
+        # Common inputs
+        with torch.device("cuda"):
+            self.input_ids = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.seq_lens = torch.full(
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+            )
+            self.position_ids_offsets = torch.ones((self.max_bs,), dtype=torch.int32)
+            self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32)
 
         # Capture
         try:
@@ -149,7 +150,7 @@ class CudaGraphRunner:
                 f"Capture cuda graph failed: {e}\n"
                 "Possible solutions:\n"
                 "1. disable cuda graph by --disable-cuda-graph\n"
-                "2. set --mem-fraction-static to a smaller value\n"
+                "2. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
                 "3. disable torch compile by not using --enable-torch-compile\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
