@@ -239,6 +239,7 @@ jobs:
         run: |
           cd test/srt
           python3 test_mla.py
+          python3 test_mla_fp8.py
 
       - name: Evaluate Data Parallelism Accuracy (TP=2)
         timeout-minutes: 10
