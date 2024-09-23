@@ -366,7 +366,7 @@ class ModelTpServer:
         self.time_waiting_requests = []
         self.time_decode_requests = []
 
-        self.log_metrics()
+        self.log_metrics(self._stats)
 
     def check_memory(self):
         available_size = (
@@ -615,7 +615,7 @@ class ModelTpServer:
                 len(self.waiting_queue) - len(can_run_list) + has_inflight
             )
             self._stats.token_usage = num_used / self.max_total_num_tokens
-            self.log_metrics()
+            self.log_metrics(self._stats)
 
         # Return the new batch
         new_batch = ScheduleBatch.init_new(
@@ -966,10 +966,13 @@ class ModelTpServer:
                         "prompt_tokens": len(req.origin_input_ids),
                     }
                     output_meta_info.append(meta_info)
-        self._stats.num_prompt_tokens_requests = num_prompt_tokens_requests
-        self._stats.num_generation_tokens_requests = num_generation_tokens_requests
-        self._stats.finished_reason_requests = finished_reason_requests
-        self.log_metrics()
+        stats = Stats(
+            num_generation_tokens_requests=num_generation_tokens_requests,
+            num_prompt_tokens_requests=num_prompt_tokens_requests,
+            finished_reason_requests=finished_reason_requests,
+        )
+        self.log_metrics(stats)
+
         # Send to detokenizer
         if output_rids:
             if self.model_runner.is_generation:
@@ -1049,9 +1052,10 @@ class ModelTpServer:
             logger.error(message)
         return success, message
 
-    def log_metrics(self):
+    def log_metrics(self, stats):
         """Collect metrics."""
-        self.metrics_collector.log_stats(self._stats)
+
+        self.metrics_collector.log_stats(stats)
 
 
 def run_tp_server(
