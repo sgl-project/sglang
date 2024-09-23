@@ -304,6 +304,7 @@ class CudaGraphRunner:
             self.seq_lens[:bs],
             None,
             self.flashinfer_handlers[bs],
+            spec_draft_input=batch.spec_draft_input,
         )
 
         # Sampling inputs

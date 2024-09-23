@@ -27,7 +27,6 @@ import torch
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
-from sglang.srt.managers.speculative_utils import SpecDraftInput
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -35,6 +34,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 if TYPE_CHECKING:
     from sglang.srt.layers.sampler import SampleOutput
+    from sglang.srt.managers.speculative_utils import SpecDraftInput
 
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -631,6 +631,9 @@ class ScheduleBatch:
         return jump_forward_reqs
 
     def prepare_for_decode(self, input_ids=None):
+        if self.spec_draft_input:
+            self.spec_draft_input.prepare_for_decode(self)
+            return
         if input_ids is None:
             input_ids = [
                 r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]

@@ -24,10 +24,10 @@ import numpy as np
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.speculative_utils import SpecDraftInput
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.speculative_utils import EAGLEDraftInput, SpecDraftInput
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -109,8 +109,10 @@ class InputMetadata:
 
     def compute_positions(self, batch: ScheduleBatch):
         position_ids_offsets = batch.position_ids_offsets
-
-        if self.forward_mode == ForwardMode.DECODE:
+        spec_positions = getattr(self.spec_draft_input, "positions", None)
+        if spec_positions is not None:
+            self.positions = spec_positions
+        elif self.forward_mode == ForwardMode.DECODE:
             if True:
                 self.positions = self.seq_lens - 1
             else:
@@ -198,14 +200,13 @@ class InputMetadata:
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
         )
+        ret.spec_draft_input = batch.spec_draft_input
 
         ret.sampling_info.prepare_penalties()
 
         ret.compute_positions(batch)
 
         ret.compute_extend_infos(batch)
-
-        ret.spec_draft_input = batch.spec_draft_input
 
         if (
             forward_mode != ForwardMode.DECODE
@@ -264,6 +265,7 @@ class InputMetadata:
             self.seq_lens,
             prefix_lens,
             flashinfer_use_ragged=flashinfer_use_ragged,
+            spec_draft_input=self.spec_draft_input,
         )
 
         (
@@ -287,6 +289,7 @@ def update_flashinfer_indices(
     prefix_lens,
     flashinfer_decode_wrapper=None,
     flashinfer_use_ragged=False,
+    spec_draft_input=None,
 ):
     """Init auxiliary variables for FlashInfer attention backend."""
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -300,20 +303,35 @@ def update_flashinfer_indices(
         else:
             paged_kernel_lens = seq_lens
 
-        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
-        kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
         req_pool_indices_cpu = req_pool_indices.cpu().numpy()
         paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
-        kv_indices = torch.cat(
-            [
-                model_runner.req_to_token_pool.req_to_token[
-                    req_pool_indices_cpu[i], : paged_kernel_lens_cpu[i]
-                ]
-                for i in range(batch_size)
-            ],
-            dim=0,
-        ).contiguous()
-        kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
+        if (
+            spec_draft_input.__class__.__name__ == "EAGLEDraftInput"
+            and forward_mode == ForwardMode.DECODE
+        ):
+            kv_indices, kv_indptr, kv_last_page_len = (
+                spec_draft_input.generate_attn_arg(
+                    req_pool_indices_cpu,
+                    paged_kernel_lens_cpu,
+                    model_runner.req_to_token_pool,
+                )
+            )
+
+        else:
+            kv_indices = torch.cat(
+                [
+                    model_runner.req_to_token_pool.req_to_token[
+                        req_pool_indices_cpu[i], : paged_kernel_lens_cpu[i]
+                    ]
+                    for i in range(batch_size)
+                ],
+                dim=0,
+            ).contiguous()
+            kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
+            kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+            kv_last_page_len = torch.ones(
+                (batch_size,), dtype=torch.int32, device="cuda"
+            )
 
         if forward_mode == ForwardMode.DECODE:
             # CUDA graph uses different flashinfer_decode_wrapper

@@ -25,6 +25,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 
+from sglang.srt.managers.speculative_utils import EAGLEDraftInput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 
 
@@ -158,7 +159,10 @@ class LogitsProcessor(nn.Module):
         weight,
         logits_metadata: Union[LogitsMetadata, InputMetadata],
     ):
+        eagle_draft_input = None
         if isinstance(logits_metadata, InputMetadata):
+            if isinstance(logits_metadata.spec_draft_input, EAGLEDraftInput):
+                eagle_draft_input = logits_metadata.spec_draft_input
             logits_metadata = LogitsMetadata.from_input_metadata(logits_metadata)
         assert isinstance(logits_metadata, LogitsMetadata)
 
@@ -172,6 +176,9 @@ class LogitsProcessor(nn.Module):
                 - 1
             )
             last_hidden = hidden_states[last_index]
+
+        if eagle_draft_input:
+            eagle_draft_input.hidden_states = last_hidden
 
         last_logits = torch.matmul(last_hidden, weight.T)
         if self.do_tensor_parallel_all_gather:

@@ -320,11 +320,22 @@ class LlamaForCausalLMEagle(nn.Module):
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
     ) -> LogitsProcessorOutput:
+        print("*" * 100)
+        print(input_metadata.forward_mode)
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
+        input_metadata.spec_draft_input.hidden_states = hidden_states
         logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
-        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
+        # sample_output = self.sampler(logits_output, input_metadata.sampling_info)
+        if isinstance(logits_output, LogitsProcessorOutput):
+            logits_output = logits_output.next_token_logits
+        sample_output = self.sampler._get_probs(
+            logits_output, sampling_info=input_metadata.sampling_info
+        )
+        input_metadata.spec_draft_input.capture_for_decode(
+            sample_output, input_metadata.forward_mode
+        )
         return sample_output, logits_output
 
     def get_module_name(self, name):

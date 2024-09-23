@@ -76,3 +76,29 @@ class SpecDraftServer(ModelTpServer):
             else:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
+
+    def forward_prefill_batch(self, batch: ScheduleBatch):
+        # Only implement EAGLE currently.
+        if self.server_args.speculative_algorithm == "EAGLE":
+            batch.prepare_for_extend(self.model_config.vocab_size)
+
+            if self.model_runner.is_generation:
+                # Forward and sample the next tokens
+                if batch.extend_num_tokens != 0:
+                    sample_output, logits_output = self.model_runner.forward(
+                        batch, ForwardMode.SPECEXTEND
+                    )
+        else:
+            super().forward_prefill_batch(batch)
+
+    def forward_decode_batch(self, batch: ScheduleBatch):
+        # don't need check memory, draft runner have same kv cache capacity
+        # with target runner. target target will decides which req need be retracted.
+
+        # Update batch tensors
+        batch.prepare_for_decode()
+
+        # Forward and sample the next tokens
+        sample_output, logits_output = self.model_runner.forward(
+            batch, ForwardMode.DECODE
+        )
