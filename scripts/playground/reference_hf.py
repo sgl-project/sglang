@@ -45,7 +45,7 @@ def normal_text(args):
         "The capital of the United Kindom is",
         "Today is a sunny day and I like",
     ]
-    max_new_tokens = 17
+    max_new_tokens = 16
 
     torch.cuda.set_device(0)
 

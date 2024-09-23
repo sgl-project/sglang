@@ -97,14 +97,12 @@ class InputMetadata:
         self.modalities = [r.modalities for r in reqs]
 
     def compute_positions(self, batch: ScheduleBatch):
-        position_ids_offsets = batch.position_ids_offsets
-
         if self.forward_mode.is_decode():
             if True:
                 self.positions = self.seq_lens - 1
             else:
                 # Deprecated
-                self.positions = (self.seq_lens - 1) + position_ids_offsets
+                self.positions = (self.seq_lens - 1) + batch.position_ids_offsets
         else:
             if True:
                 self.positions = torch.tensor(
@@ -119,7 +117,7 @@ class InputMetadata:
                 )
             else:
                 # Deprecated
-                position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
+                position_ids_offsets_cpu = batch.position_ids_offsets.cpu().numpy()
                 self.positions = torch.tensor(
                     np.concatenate(
                         [
