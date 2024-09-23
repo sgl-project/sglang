@@ -175,14 +175,7 @@ class TokenizerManager:
             input_text = obj.text if not_use_index else obj.text[index]
             if obj.input_ids is None:
                 assert self.tokenizer is not None
-                if self.tokenizer.bos_token and input_text.startswith(
-                    self.tokenizer.bos_token
-                ):
-                    input_ids = self.tokenizer.encode(
-                        input_text, add_special_tokens=False
-                    )
-                else:
-                    input_ids = self.tokenizer.encode(input_text)
+                input_ids = self.tokenizer.encode(input_text)
             else:
                 input_ids = obj.input_ids if not_use_index else obj.input_ids[index]
 
@@ -220,14 +213,7 @@ class TokenizerManager:
                     input_text = obj.text
                     rid = obj.rid[0]
                 if self.tokenizer is not None:
-                    if self.tokenizer.bos_token and input_text.startswith(
-                        self.tokenizer.bos_token
-                    ):
-                        input_ids = self.tokenizer.encode(
-                            input_text, add_special_tokens=False
-                        )
-                    else:
-                        input_ids = self.tokenizer.encode(input_text)
+                    input_ids = self.tokenizer.encode(input_text)
                 else:
                     assert obj.input_ids is not None
                     input_ids = obj.input_ids
@@ -345,14 +331,7 @@ class TokenizerManager:
                     ## select operation
                     if obj.input_ids is None:
                         input_text = obj.text[i]
-                        if self.tokenizer.bos_token and input_text.startswith(
-                            self.tokenizer.bos_token
-                        ):
-                            input_ids = self.tokenizer.encode(
-                                obj.text[i], add_special_tokens=False
-                            )
-                        else:
-                            input_ids = self.tokenizer.encode(obj.text[i])
+                        input_ids = self.tokenizer.encode(obj.text[i])
                     else:
                         input_text = None
                         input_ids = obj.input_ids[i]
