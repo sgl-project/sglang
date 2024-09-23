@@ -680,8 +680,6 @@ class ScheduleBatch:
                 r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
                 for r in self.reqs
             ]
-        else:
-            self.sampling_info.penalizer_orchestrator.cumulate_input_tokens(input_ids)
 
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
