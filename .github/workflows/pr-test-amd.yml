@@ -1,0 +1,50 @@
+name: PR Test (AMD)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  accuracy-test-1-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner-amd
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]" --no-deps
+
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Evaluate Accuracy
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_eval_accuracy_large.py
+
+  finish:
+    needs: [
+      accuracy-test-1-gpu
+    ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Finish
+        run: echo "This is an empty step to ensure that all jobs are completed."
