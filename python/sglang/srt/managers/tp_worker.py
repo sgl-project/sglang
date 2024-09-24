@@ -215,6 +215,7 @@ class ModelTpServer:
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.do_not_get_new_batch = False
 
+    @torch.inference_mode()
     def exposed_step(self, recv_reqs: List):
         try:
             # Recv requests
@@ -246,7 +247,6 @@ class ModelTpServer:
         self.out_pyobjs = []
         return ret
 
-    @torch.inference_mode()
     def forward_step(self):
         if self.do_not_get_new_batch and self.current_inflight_req is None:
             new_batch = None

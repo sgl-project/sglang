@@ -467,7 +467,6 @@ class ModelRunner:
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
 
-    @torch.inference_mode()
     def forward_decode(self, batch: ScheduleBatch):
         if self.server_args.lora_paths is not None:
             self.lora_manager.prepare_lora_batch(batch)
@@ -481,7 +480,6 @@ class ModelRunner:
             batch.input_ids, input_metadata.positions, input_metadata
         )
 
-    @torch.inference_mode()
     def forward_extend(self, batch: ScheduleBatch):
         input_metadata = InputMetadata.from_schedule_batch(self, batch)
         if self.server_args.lora_paths is not None:
@@ -500,7 +498,6 @@ class ModelRunner:
                 get_embedding=True,
             )
 
-    @torch.inference_mode()
     def forward_extend_multi_modal(self, batch: ScheduleBatch):
         input_metadata = InputMetadata.from_schedule_batch(self, batch)
         return self.model.forward(
