@@ -403,5 +403,8 @@ class LlamaForCausalLM(nn.Module):
         else:
             load_weights_per_param(name, loaded_weight)
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
 
 EntryClass = LlamaForCausalLM

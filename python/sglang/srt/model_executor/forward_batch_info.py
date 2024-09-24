@@ -41,11 +41,13 @@ class ForwardMode(IntEnum):
     DECODE = auto()
     # Speculative Extend of draft model.
     SPECEXTEND = auto()
+    # Speculative Decode of draft model.
+    SPECDECODE = auto()
     # Speculative verify of target model.
     SPECVERIFY = auto()
 
     def is_spec_mode(self):
-        return self in (self.SPECEXTEND, self.SPECVERIFY)
+        return self in (self.SPECEXTEND, self.SPECVERIFY, self.SPECDECODE)
 
 
 @dataclass
@@ -110,7 +112,7 @@ class InputMetadata:
     def compute_positions(self, batch: ScheduleBatch):
         position_ids_offsets = batch.position_ids_offsets
         spec_positions = getattr(self.spec_draft_input, "positions", None)
-        if spec_positions is not None:
+        if spec_positions is not None:  # ForwardMode.SPECDECODE
             self.positions = spec_positions
         elif self.forward_mode == ForwardMode.DECODE:
             if True:

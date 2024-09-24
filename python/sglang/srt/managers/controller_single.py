@@ -256,14 +256,9 @@ class ControllerSingleSpecDraft(ControllerSingle):
 
     def loop_for_forward(self):
         while True:
-            recv_reqs = self.recv_requests_from_mp_queue()
+            if not self.mp_queue.empty():
+                recv_reqs = self.mp_queue.get()
             self.spec_server.exposed_step(recv_reqs)
-
-    def recv_requests_from_mp_queue(self):
-        recv_reqs = []
-        if not self.mp_queue.empty():
-            recv_reqs = self.mp_queue.get()
-        return recv_reqs
 
 
 def start_spec_controller_process(

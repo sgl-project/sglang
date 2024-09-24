@@ -113,6 +113,23 @@ class ModelRunner:
 
         min_per_gpu_memory = self.init_torch_distributed()
         self.load_model()
+        if self.server_args.speculative_algorithm == "EAGLE":
+            if self.is_draft_runner:
+                assert hasattr(
+                    self.model, "set_embed_and_head"
+                ), "The model: {} is not support EAGLE now.".format(
+                    self.model.__class__.__name__
+                )
+                embed, head = self.spec_info.draft_input_queue.get()
+                self.model.set_embed_and_head(embed, head)
+            else:
+                assert hasattr(
+                    self.model, "get_embed_and_head"
+                ), "The model: {} is not support EAGLE now.".format(
+                    self.model.__class__.__name__
+                )
+                self.spec_info.draft_input_queue.put(self.model.get_embed_and_head())
+
         self.init_memory_pool(
             min_per_gpu_memory,
             server_args.max_num_reqs,
@@ -614,7 +631,11 @@ class ModelRunner:
     ) -> Tuple[SampleOutput, LogitsProcessorOutput]:
         if self.is_multimodal_model and forward_mode == ForwardMode.EXTEND:
             return self.forward_extend_multi_modal(batch)
-        elif forward_mode in (ForwardMode.DECODE, ForwardMode.SPECVERIFY):
+        elif forward_mode in (
+            ForwardMode.DECODE,
+            ForwardMode.SPECVERIFY,
+            ForwardMode.SPECDECODE,
+        ):
             return self.forward_decode(batch, forward_mode)
         elif forward_mode in (ForwardMode.EXTEND, ForwardMode.SPECEXTEND):
             return self.forward_extend(batch, forward_mode)

@@ -162,7 +162,7 @@ class ServerArgs:
             type=float,
             help="The number of token sampled from draft model in Speculative Decoding.",
             required=False,
-            default=4,
+            default=5,
         )
         parser.add_argument(
             "--tokenizer-path",

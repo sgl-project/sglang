@@ -49,6 +49,10 @@ class SpecDraftInput:
         pass
 
 
+class SpecVerifyInput:
+    pass
+
+
 class SpecDraftInfoFactory:
     def __init__(self):
         self.factory = {}
@@ -75,18 +79,19 @@ class EAGLEDraftInput(SpecDraftInput):
     prev_mode = None
     sample_output = None
     topk: int = 10
-    verify_token: int = 60
+    num_verify_token: int = 60
 
     scores: torch.Tensor = None
     score_list: List[torch.Tensor] = []
     token_list: List[torch.Tensor] = []
     iter = 0
+    root_token: int = None
 
     positions: torch.Tensor = None
     tree_mask: torch.Tensor = None
 
     def __init__(self):
-        self.tree_mask_init = torch.eye(self.topk).to("cuda")
+        self.tree_mask_init = torch.eye(self.topk).to("cuda").unsqueeze(0)
         self.tree_mask = self.tree_mask_init.clone()
 
     def prepare_for_extend(self, batch):
@@ -101,7 +106,7 @@ class EAGLEDraftInput(SpecDraftInput):
         batch.input_ids = torch.tensor(
             model_input_ids, dtype=torch.int32, device="cuda"
         )
-        del verified_id
+        self.verified_id = self.verified_id.clone()
 
     def capture_for_decode(self, sample_output: SampleOutput, prev_mode: ForwardMode):
         self.sample_output = sample_output
@@ -128,17 +133,14 @@ class EAGLEDraftInput(SpecDraftInput):
             ]
             batch.input_ids = torch.gather(
                 topk_index.reshape(-1, self.topk**2), index=topk_cs_index, dim=1
-            )
+            ).flatten()
             batch.out_cache_loc = batch.alloc_token_slots(batch.input_ids.numel())
             self.score_list.append(scores)
             self.token_list.append(topk_index)
-            self.tree_mask = torch.cat(
-                (self.tree_mask[:, :, selected_input_index], self.tree_mask_init), dim=3
-            )
 
         elif self.prev_mode == ForwardMode.SPECEXTEND:
             self.scores = topk_p  # b, top_k
-            self.score_list.append(topk_p)
+            self.score_list.append(topk_p.unsqueeze(1))
             self.token_list.append(topk_index)
             batch.spec_draft_input.hidden_states = (
                 batch.spec_draft_input.hidden_states.repeat(self.topk, 1)
@@ -165,8 +167,15 @@ class EAGLEDraftInput(SpecDraftInput):
         self.iter += 1
 
     def prepare_for_verify(self):
-        pass
-        # self.score = torch.concat()
+        score_list = torch.cat(self.score_list, dim=1).view(-1)  # b, 1/topk, topk
+        ss_token_list = torch.cat(self.token_list, dim=0).view(-1)
+        top_scores = torch.topk(score_list, self.num_verify_token, dim=-1)
+        top_scores_index = top_scores.indices
+        top_scores_index = torch.sort(top_scores_index).values
+        draft_tokens = ss_token_list[top_scores_index]
+        draft_tokens = torch.cat((self.verified_id, draft_tokens), dim=0)
+
+        print(draft_tokens)
 
     def generate_attn_arg(
         self,
@@ -202,7 +211,7 @@ class EAGLEDraftInput(SpecDraftInput):
         self.iter = 0
         self.score_list.clear()
         self.positions = None
-        self.tree_mask = torch.eye(self.topk).to("cuda")
+        self.tree_mask = self.tree_mask_init.clone()
 
 
 class SpecInfoPipline:
