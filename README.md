@@ -60,7 +60,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.3.1.post2 https://github.com/sgl-project/sglang.git
+git clone -b v0.3.1.post3 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -90,9 +90,9 @@ docker run --gpus all \
 <summary>More</summary>
 
 > This method is recommended if you plan to serve it as a service.
-> A better approach is to use the [k8s-sglang-service.yaml](./docker/k8s-sglang-service.yaml).
+> A better approach is to use the [k8s-sglang-service.yaml](docker/k8s-sglang-service.yaml).
 
-1. Copy the [compose.yml](./docker/compose.yaml) to your local machine
+1. Copy the [compose.yml](docker/compose.yaml) to your local machine
 2. Execute the command `docker compose up -d` in your terminal.
 </details>
 
@@ -271,7 +271,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - gte-Qwen2
   - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
 
-Instructions for supporting a new model are [here](https://github.com/sgl-project/sglang/blob/main/docs/en/model_support.md).
+Instructions for supporting a new model are [here](docs/en/model_support.md).
 
 #### Use Models From ModelScope
 <details>
@@ -566,7 +566,7 @@ def chat_example(s):
 Learn more at this [blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/).
 
 ## Roadmap
-[Development Roadmap (2024 Q3)](https://github.com/sgl-project/sglang/issues/634)
+[Development Roadmap (2024 Q4)](https://github.com/sgl-project/sglang/issues/1487)
 
 ## Citation And Acknowledgment
 Please cite our paper, [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), if you find the project useful.
