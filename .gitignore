@@ -183,8 +183,3 @@ work_dirs/
 *.csv
 
 !logo.png
-test.py
-a.txt
-b.txt
-*.txt
-launch_server.py.lprof
