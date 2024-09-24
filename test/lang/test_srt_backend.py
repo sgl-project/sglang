@@ -67,7 +67,7 @@ class TestSRTBackend(unittest.TestCase):
         # Run twice to capture more bugs
         for _ in range(2):
             accuracy, latency = test_hellaswag_select()
-            assert accuracy > 0.71
+            assert accuracy > 0.71, f"{accuracy=}"
 
 
 if __name__ == "__main__":
