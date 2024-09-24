@@ -291,7 +291,7 @@ def extend_attention_fwd(
             BLOCK_M, BLOCK_N = (128, 64)
         else:
             BLOCK_M, BLOCK_N = (32, 64)
-    elif cuda_is_available and  CUDA_CAPABILITY[0] >= 8:
+    elif cuda_is_available and CUDA_CAPABILITY[0] >= 8:
         if Lq <= 128:
             BLOCK_M, BLOCK_N = (128, 128)
         elif Lq <= 256:

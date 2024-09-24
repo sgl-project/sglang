@@ -381,8 +381,8 @@ class ScheduleBatch:
     # Stream
     has_stream: bool = False
 
-    # device 
-    device:str = "cuda"
+    # device
+    device: str = "cuda"
 
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
@@ -396,7 +396,7 @@ class ScheduleBatch:
             tree_cache=tree_cache,
             return_logprob=return_logprob,
             has_stream=has_stream,
-            device=req_to_token_pool.device
+            device=req_to_token_pool.device,
         )
 
     def batch_size(self):
@@ -707,7 +707,9 @@ class ScheduleBatch:
             return
 
         self.reqs = [self.reqs[i] for i in unfinished_indices]
-        new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device=self.device)
+        new_indices = torch.tensor(
+            unfinished_indices, dtype=torch.int32, device=self.device
+        )
         self.seq_lens = self.seq_lens[new_indices]
         self.input_ids = None
         self.req_pool_indices = self.req_pool_indices[new_indices]

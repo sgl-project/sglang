@@ -59,6 +59,7 @@ def is_hip() -> bool:
 def flashinfer_is_available():
     return torch.cuda.is_available() and not is_hip()
 
+
 def enable_show_time_cost():
     global show_time_cost
     show_time_cost = True
@@ -130,7 +131,7 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
-    if device == 'cuda':
+    if device == "cuda":
         num_gpus = torch.cuda.device_count()
         assert gpu_id < num_gpus
 
@@ -143,20 +144,20 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
         torch.cuda.empty_cache()
         free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
-    elif device == 'xpu':
+    elif device == "xpu":
         num_gpus = torch.xpu.device_count()
         assert gpu_id < num_gpus
 
         if torch.xpu.current_device() != gpu_id:
             print(
-               f"WARNING: current device is not {gpu_id}, but {torch.xpu.current_device()}, ",
-               "which may cause useless memory allocation for torch XPU context.",
+                f"WARNING: current device is not {gpu_id}, but {torch.xpu.current_device()}, ",
+                "which may cause useless memory allocation for torch XPU context.",
             )
         torch.xpu.empty_cache()
         used_memory = torch.xpu.memory_allocated()
-        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory 
+        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
-    
+
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
             torch.device(device, gpu_id)
@@ -164,7 +165,6 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
         free_gpu_memory = tensor.item()
 
-        
     return free_gpu_memory / (1 << 30)
 
 

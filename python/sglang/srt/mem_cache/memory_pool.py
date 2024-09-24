@@ -29,7 +29,7 @@ class ReqToTokenPool:
 
     def __init__(self, size: int, max_context_len: int, device: str):
         self.size = size
-        self.device=device
+        self.device = device
         self.free_slots = list(range(size))
         self.req_to_token = torch.empty(
             (size, max_context_len), dtype=torch.int32, device=device
@@ -57,12 +57,7 @@ class ReqToTokenPool:
 class BaseTokenToKVPool(ABC):
     """A memory pool that maps a token to its kv cache locations"""
 
-    def __init__(
-        self,
-        size: int,
-        dtype: torch.dtype,
-        device: str
-    ):
+    def __init__(self, size: int, dtype: torch.dtype, device: str):
         self.size = size
         self.dtype = dtype
         self.device = device
@@ -152,7 +147,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self,
         size: int,
         dtype: torch.dtype,
-        device:str,
+        device: str,
         head_num: int,
         head_dim: int,
         layer_num: int,

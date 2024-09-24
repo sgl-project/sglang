@@ -34,14 +34,14 @@ class SamplingBatchInfo:
     linear_penalties: torch.Tensor = None
     scaling_penalties: torch.Tensor = None
 
-    #Device
-    device:str ="cuda"
+    # Device
+    device: str = "cuda"
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         reqs = batch.reqs
         ret = cls(vocab_size=vocab_size)
-        ret.device = batch.device        
+        ret.device = batch.device
 
         with torch.device(batch.device):
             ret.temperatures = torch.tensor(
@@ -114,7 +114,10 @@ class SamplingBatchInfo:
 
         if has_regex:
             self.vocab_mask = torch.zeros(
-                batch.batch_size(), self.vocab_size, dtype=torch.bool, device=self.device
+                batch.batch_size(),
+                self.vocab_size,
+                dtype=torch.bool,
+                device=self.device,
             )
             for i, req in enumerate(batch.reqs):
                 if req.regex_fsm is not None:
@@ -139,7 +142,12 @@ class SamplingBatchInfo:
 
     @staticmethod
     def merge_bias_tensor(
-        lhs: torch.Tensor, rhs: torch.Tensor, bs1: int, bs2: int, device: str, default: int = 0,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        bs1: int,
+        bs2: int,
+        device: str,
+        default: int = 0,
     ):
         # bias tensor can be None
         if lhs is not None or rhs is not None:

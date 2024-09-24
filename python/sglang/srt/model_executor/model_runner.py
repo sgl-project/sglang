@@ -79,7 +79,7 @@ class ModelRunner:
         # Parse args
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
-        self.device_config=DeviceConfig(device)
+        self.device_config = DeviceConfig(device)
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -126,21 +126,20 @@ class ModelRunner:
             server_args.max_total_tokens,
         )
         self.init_attention_backend()
-        if device == 'cuda':
+        if device == "cuda":
             self.init_cublas()
             self.init_cuda_graphs()
         else:
             self.cuda_graph_runner = None
-            
 
     def init_torch_distributed(self):
-        device_type=self.device_config.device_type
+        device_type = self.device_config.device_type
         # Init torch distributed
         if device_type == "cuda":
             torch.cuda.set_device(self.gpu_id)
-            backend = "nccl" 
+            backend = "nccl"
 
-        #ToDO(liangan1):Just use gloo to bypass the initilization fail,need to use ccl for xpu backend
+        # ToDO(liangan1):Just use gloo to bypass the initilization fail,need to use ccl for xpu backend
         elif device_type == "xpu":
             torch.xpu.set_device(self.gpu_id)
             backend = "gloo"
@@ -170,7 +169,9 @@ class ModelRunner:
 
         # Currently, there is a bug with mulit-node tensor parallelsim + padded cuda graph,
         # so we disable padding in cuda graph.
-        if device_type == "cuda" and not all(in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)):
+        if device_type == "cuda" and not all(
+            in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)
+        ):
             self.server_args.disable_cuda_graph_padding = True
             logger.info(
                 "Setting disable_cuda_graph_padding to True because of multi-node tensor parallelism."
@@ -178,7 +179,9 @@ class ModelRunner:
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
-            local_gpu_memory = get_available_gpu_memory(device_type, self.gpu_id, self.gpu_id)
+            local_gpu_memory = get_available_gpu_memory(
+                device_type, self.gpu_id, self.gpu_id
+            )
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
@@ -186,7 +189,7 @@ class ModelRunner:
         return min_per_gpu_memory
 
     def load_model(self):
-        device_type=self.device_config.device_type
+        device_type = self.device_config.device_type
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(device_type, self.gpu_id):.2f} GB on {device_type}:{self.gpu_id} device"
         )
@@ -413,9 +416,7 @@ class ModelRunner:
             )
 
         self.req_to_token_pool = ReqToTokenPool(
-            max_num_reqs + 1,
-            self.model_config.context_len + 4,
-            device_type 
+            max_num_reqs + 1, self.model_config.context_len + 4, device_type
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA

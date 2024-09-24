@@ -271,11 +271,13 @@ def correctness_test(
         rank_print(f"========== Prompt {i} ==========")
         rank_print(tokenizer.decode(output_ids[i]), "\n")
 
+
 def synchronize(device):
-    if device == 'cuda':
+    if device == "cuda":
         torch.cuda.synchronize()
-    elif device == 'xpu':
+    elif device == "xpu":
         torch.xpu.synchronize()
+
 
 @torch.inference_mode()
 def latency_test_run_once(
@@ -374,7 +376,7 @@ def latency_test(
         bench_args.batch_size[0],
         bench_args.input_len[0],
         4,  # shorter decoding to speed up the warmup
-        server_args.device
+        server_args.device,
     )
     rank_print("Benchmark ...")
 
@@ -385,7 +387,14 @@ def latency_test(
     ):
         reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
         ret = latency_test_run_once(
-            bench_args.run_name, model_runner, rank_print, reqs, bs, il, ol, server_args.device
+            bench_args.run_name,
+            model_runner,
+            rank_print,
+            reqs,
+            bs,
+            il,
+            ol,
+            server_args.device,
         )
         if ret is not None:
             result_list.append(ret)

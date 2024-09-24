@@ -85,7 +85,7 @@ class FlashInferAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.model_runner = model_runner
-      
+
         local_num_qo_heads = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
         )
