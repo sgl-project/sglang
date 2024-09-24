@@ -244,7 +244,7 @@ class RuntimeEndpoint(BaseBackend):
                 "temperature": 0,
             },
             "return_logprob": True,
-            "logprob_start_len": max(prompt_len - 1, 0),  # for token healing
+            "logprob_start_len": max(prompt_len - 1, 0),  # For token healing
         }
         obj = self._generate_http_request(s, data)
 
