@@ -256,7 +256,7 @@ class ServerArgs:
             type=str,
             default="cuda",
             choices=["cuda", "xpu"],
-            help="device type to run SGLang."
+            help="The device type."
         )
         parser.add_argument(
             "--kv-cache-dtype",
