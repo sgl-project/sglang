@@ -78,14 +78,16 @@ class ModelTpServer:
         server_args: ServerArgs,
         nccl_port: int,
         model_overide_args: dict,
-        controller_info: ControllerInfo,
-        dp_worker_id: int,
+        controller_info: Optional[ControllerInfo] = None,
+        dp_worker_id: Optional[int] = None,
     ):
+
         suppress_other_loggers()
 
         # Copy arguments
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
+
         self.dp_rank = dp_worker_id
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
@@ -120,6 +122,9 @@ class ModelTpServer:
             self.swap_cache = torch.frombuffer(
                 buffer=shm.buf, dtype=self.model_runner.dtype
             ).reshape(self.controller_info.cache_shape)
+            self.controller_info.available_kv_cache[self.dp_rank].value = (
+                self.model_runner.token_to_kv_pool.available_size()
+            )
         else:
             self.controller_info = None
 
@@ -181,6 +186,8 @@ class ModelTpServer:
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 disable=server_args.disable_radix_cache,
+                gpu_id=gpu_id,
+                pre_radix=(server_args.load_balance_method == "pre_radix"),
             )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.scheduler = PolicyScheduler(self.schedule_policy, self.tree_cache)
@@ -192,6 +199,7 @@ class ModelTpServer:
         self.running_batch: ScheduleBatch = None
         self.out_pyobjs = []
         self.decode_forward_ct = 0
+        self.forward_ct = 0
         self.stream_interval = server_args.stream_interval
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
@@ -268,8 +276,9 @@ class ModelTpServer:
                     self.forward_decode_batch(self.running_batch)
 
                     # Print stats
-                    if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
+                    if self.tp_rank == 0 and self.decode_forward_ct % 10 == 0:
                         self.print_decode_stats()
+                        pass
 
                     if self.running_batch.is_empty():
                         self.running_batch = None
@@ -296,6 +305,13 @@ class ModelTpServer:
             f"gen throughput (token/s): {throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
+
+        with open(
+            f"token_usage_gpu_{self.gpu_id}.log", mode="a+", encoding="utf-8"
+        ) as f:
+            f.write(
+                f"{self.gpu_id}\t\t{num_used / self.max_total_num_tokens:.2f}\t\t{len(self.waiting_queue)}\n"
+            )
 
     def check_memory(self):
         available_size = (
@@ -430,9 +446,13 @@ class ModelTpServer:
                 adder.log_input_tokens + adder.log_hit_tokens
             ) / 10**9
             self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10**9
-            tree_cache_hit_rate = (
-                self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
-            )
+
+            try:
+                tree_cache_hit_rate = (
+                    self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
+                )
+            except ZeroDivisionError:
+                tree_cache_hit_rate = 1.0
             logger.info(
                 f"[gpu={self.gpu_id}] Prefill batch. "
                 f"#new-seq: {len(can_run_list)}, "
@@ -461,11 +481,25 @@ class ModelTpServer:
 
         if self.controller_info:
             num = 0
-            for r in batch.reqs:
-                num += len(r.origin_input_ids)
+            for req in batch.reqs:
+                num += len(req.origin_input_ids)
             with self.controller_info.lock:
-                self.controller_info.current_bs[self.dp_rank].value -= num
+                self.controller_info.waiting_prefill_compute[self.dp_rank].value -= num
+                self.controller_info.available_kv_cache[self.dp_rank].value = (
+                    self.token_to_kv_pool.available_size()
+                    + self.tree_cache.evictable_size()
+                )
+                self.controller_info.running_reqs[
+                    self.dp_rank
+                ].value = batch.batch_size() + (
+                    self.running_batch.batch_size()
+                    if self.running_batch is not None
+                    else 0
+                )
 
+                self.controller_info.waiting_reqs[self.dp_rank].value = len(
+                    self.waiting_queue
+                )
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
@@ -605,17 +639,26 @@ class ModelTpServer:
             self.new_token_ratio = new_token_ratio
 
             logger.info(
-                "decode out of memory happened, "
+                f"[gpu{self.gpu_id}]decode out of memory happened, "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
+
+            num = 0
+            for req in retracted_reqs:
+                num += len(req.fill_ids)
+
+            if self.controller_info is not None:
+                with self.controller_info.lock:
+                    self.controller_info.waiting_prefill_compute[
+                        self.dp_rank
+                    ].value += num
             self.waiting_queue.extend(retracted_reqs)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
-
         if not self.disable_regex_jump_forward:
             # Check for jump-forward
             jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
@@ -626,6 +669,20 @@ class ModelTpServer:
         # Update batch tensors
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         batch.prepare_for_decode()
+
+        if self.controller_info is not None and self.decode_forward_ct % 10 == 0:
+            with self.controller_info.lock:
+                self.controller_info.available_kv_cache[self.dp_rank].value = (
+                    self.token_to_kv_pool.available_size()
+                    + self.tree_cache.evictable_size()
+                )
+                self.controller_info.running_reqs[self.dp_rank].value = (
+                    batch.batch_size()
+                )
+
+                self.controller_info.waiting_reqs[self.dp_rank].value = len(
+                    self.waiting_queue
+                )
 
         # Forward and sample the next tokens
         output = self.model_runner.forward(batch, ForwardMode.DECODE)

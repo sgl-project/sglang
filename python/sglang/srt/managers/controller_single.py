@@ -31,6 +31,7 @@ from sglang.srt.managers.tp_worker import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_parent_process
+from sglang.srt.managers.io_struct import ControllerInfo
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)

@@ -10,5 +10,6 @@ if __name__ == "__main__":
     ServerArgs.add_cli_args(parser)
     args = parser.parse_args()
     server_args = ServerArgs.from_cli_args(args)
+    
 
     launch_server(server_args)

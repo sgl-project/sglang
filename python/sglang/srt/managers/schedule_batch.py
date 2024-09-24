@@ -432,6 +432,14 @@ class ScheduleBatch:
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
+        # num = 0
+        # for req in reqs:
+        #     num += len(req.origin_input_ids)
+        # if num != extend_num_tokens:
+        #     print("*" * 100)
+        #     print(extend_num_tokens)
+        #     for req in reqs:
+        #         print(len(req.origin_input_ids))
         seq_lens = []
 
         # Allocate memory

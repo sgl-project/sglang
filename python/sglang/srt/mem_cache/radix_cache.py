@@ -55,19 +55,86 @@ def _key_match(key0: List, key1: List):
     return i
 
 
+import threading
+from copy import deepcopy
+from dataclasses import dataclass
+
+import zmq
+
+
+@dataclass
+class RadixCacheSend:
+    gpu_id: int
+    root_node: TreeNode
+    time: time
+
+
 class RadixCache(BasePrefixCache):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool: BaseTokenToKVPool,
         disable: bool = False,
+        gpu_id: int = 0,
+        pre_radix: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
         self.disable = disable
+        self.pre_radix = pre_radix
+        self.gpu_id = gpu_id
+        self.send_cnt = 0
+        self.change_cnt = 0
+        if pre_radix:
+            context = zmq.Context()
+            self.send_radix_tree = context.socket(zmq.PUSH)
+            self.send_radix_tree.setsockopt(zmq.SNDHWM, 1000)
+            self.send_radix_tree.connect(f"tcp://127.0.0.1:41935")
+
+            self.change_cnt_lock = threading.Lock()
+
+            threading.Thread(target=self.loop_for_send_tree_cache).start()
+
+        else:
+            print(f"dp[{self.gpu_id}] will not use pre_radix....")
+
         self.reset()
 
     ##### Public API #####
+
+    def loop_for_send_tree_cache(self):
+        while True:
+            with self.change_cnt_lock:
+                if self.change_cnt != 0:
+                    self.change_cnt -= 1
+                    self.send_prefix_tree()
+            time.sleep(0.5)
+
+    def send_prefix_tree(self):
+        # t1 = time.time()
+        if self.pre_radix:
+            self.send_cnt += 1
+            try:
+                try:
+                    node = deepcopy(self.root_node)
+                except Exception as e:
+                    return
+                self.send_radix_tree.send_pyobj(
+                    RadixCacheSend(
+                        gpu_id=self.gpu_id, root_node=node, time=time.time()
+                    ),
+                    zmq.NOBLOCK,
+                )
+                # if self.send_cnt % 10 == 0:
+                # print(f"[{self.gpu_id}] has send [{self.send_cnt}] caches")
+                del node
+                # torch.cuda.empty_cache()
+            except zmq.Again as e:
+                print(
+                    "=======================================Radix Cache Queue is full, drop out new radix cache tree======================================="
+                )
+        # t2 = time.time()
+        # print(f"send radix time = {t2 - t1}")
 
     def reset(self):
         self.root_node = TreeNode()
@@ -75,6 +142,8 @@ class RadixCache(BasePrefixCache):
         self.root_node.value = []
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
+
+        # self.send_prefix_tree()
 
     def match_prefix(self, key: List, **kwargs):
         if self.disable:
@@ -95,7 +164,12 @@ class RadixCache(BasePrefixCache):
 
         if value is None:
             value = [x for x in key]
-        return self._insert_helper(self.root_node, key, value)
+        res = self._insert_helper(self.root_node, key, value)
+
+        if self.pre_radix:
+            with self.change_cnt_lock:
+                self.change_cnt += 1
+        return res
 
     def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         """Cache request when it finishes."""
@@ -117,6 +191,8 @@ class RadixCache(BasePrefixCache):
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
+
+        # self.send_prefix_tree()
 
     def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         """Cache request when it is unfinished."""
@@ -145,6 +221,8 @@ class RadixCache(BasePrefixCache):
         self.inc_lock_ref(new_last_node)
         req.prefix_indices = new_indices
         req.last_node = new_last_node
+
+        # self.send_prefix_tree()
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
@@ -175,6 +253,10 @@ class RadixCache(BasePrefixCache):
 
             if len(x.parent.children) == 0:
                 heapq.heappush(leaves, x.parent)
+        # self.send_prefix_tree()
+        if self.pre_radix:
+            with self.change_cnt_lock:
+                self.change_cnt += 1
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:

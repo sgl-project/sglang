@@ -25,7 +25,7 @@ from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import aiohttp
 import numpy as np
 import requests
@@ -311,25 +311,15 @@ def download_sharegpt_dataset(path):
         raise Exception(f"Failed to download dataset: {e}")
 
 
-import pickle
-
-
 def sample_sharegpt_requests(
     dataset_path: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
-    max_seqlen: int,
+    fixed_output_len: Optional[int] = None,
 ) -> List[Tuple[str, int, int]]:
-    cache_path = f"./input_cache_v2_{num_requests}"
-    # 尝试加载缓存的 input_requests
-    if os.path.isfile(cache_path):
-        with open(cache_path, "rb") as f:
-            input_requests = pickle.load(f)
-        print("Loaded input_requests from cache.")
-        return input_requests
-    prompts = []
-    prompt_lens = []
-    response_lens = []
+    if fixed_output_len is not None and fixed_output_len < 4:
+        raise ValueError("output_len too small")
+
     # Download sharegpt if necessary
     if not os.path.isfile(dataset_path) and not os.path.isfile(default_sharegpt_path):
         download_sharegpt_dataset(default_sharegpt_path)
@@ -341,53 +331,43 @@ def sample_sharegpt_requests(
 
     # Load the dataset.
     with open(dataset_path) as f:
-        datasets = json.load(f)
-        for data in datasets:
-            if len(data["conversations"]) >= 2:
-                prompt = data["conversations"][0]["value"]
-                res = data["conversations"][1]["value"]
-                prompt_token_ids = tokenizer(prompt).input_ids
-                completion_token_ids = tokenizer(res).input_ids
+        dataset = json.load(f)
+    # Filter out the conversations with less than 2 turns.
+    dataset = [data for data in dataset if len(data["conversations"]) >= 2]
+    # Only keep the first two turns of each conversation.
+    dataset = [
+        (data["conversations"][0]["value"], data["conversations"][1]["value"])
+        for data in dataset
+    ]
 
-                if (
-                    len(prompt_token_ids) + len(completion_token_ids) < max_seqlen
-                    and len(prompt_token_ids) > 0
-                    and len(completion_token_ids) > 0
-                ):
-                    prompts.append(prompt)
-                    prompt_lens.append(len(prompt_token_ids))
-                    response_lens.append(len(completion_token_ids))
-            if len(prompts) > num_requests:
-                break
+    # Shuffle the dataset.
+    random.shuffle(dataset)
 
-    sampled_ids = [random.randint(0, len(prompts) - 1) for _ in range(num_requests)]
-    sampled_prompts = [prompts[idx] for idx in sampled_ids]
-    sampled_prompts_lens = [prompt_lens[idx] for idx in sampled_ids]
-    sampled_response_lens = [response_lens[idx] for idx in sampled_ids]
+    # Filter out sequences that are too long or too short
+    filtered_dataset: List[Tuple[str, int, int]] = []
+    for i in range(len(dataset)):
+        if len(filtered_dataset) == num_requests:
+            break
 
-    for i, (prompt_len, gen_len) in enumerate(
-        zip(sampled_prompts_lens, sampled_response_lens)
-    ):
-        total = prompt_len + gen_len
-        if total > max_seqlen:
-            print(f"truncating long prompt+gen_len {prompt_len=} {gen_len=}")
-            gen_len = max_seqlen - prompt_len
-        sampled_response_lens[i] = gen_len
-    input_requests = list(
-        zip(sampled_prompts, sampled_prompts_lens, sampled_response_lens)
-    )
-    
-    
-    with open(cache_path, "wb") as f:
-        pickle.dump(input_requests, f)
-        print(f"Saved input_requests_{num_requests} to cache.")
-    print(f"#Input tokens: {np.sum(sampled_prompts_lens)}")
-    print(f"#Output tokens: {np.sum(sampled_response_lens)}")
-    return input_requests
+        # Tokenize the prompts and completions.
+        prompt = dataset[i][0]
+        prompt_token_ids = tokenizer(prompt).input_ids
+        completion = dataset[i][1]
+        completion_token_ids = tokenizer(completion).input_ids
+        prompt_len = len(prompt_token_ids)
+        output_len = (
+            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
+        )
+        if prompt_len < 4 or output_len < 4:
+            # Prune too short sequences.
+            continue
+        if prompt_len > 1024 or prompt_len + output_len > 2048:
+            # Prune too long sequences.
+            continue
+        filtered_dataset.append((prompt, prompt_len, output_len))
 
-
+    return filtered_dataset
 import pickle
-
 
 def sample_random_requests(
     input_len: int,
@@ -397,10 +377,10 @@ def sample_random_requests(
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
 ) -> List[Tuple[str, int, int]]:
-    cache_path = f"./input_cache_{num_prompts}"
+    cache_path = f'./input_cache_{num_prompts}'
     # 尝试加载缓存的 input_requests
     if os.path.isfile(cache_path):
-        with open(cache_path, "rb") as f:
+        with open(cache_path, 'rb') as f:
             input_requests = pickle.load(f)
         print("Loaded input_requests from cache.")
         return input_requests
@@ -414,63 +394,63 @@ def sample_random_requests(
         output_len + 1,
         size=num_prompts,
     )
+    # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
-    if True:
-        # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
-
-        # Download sharegpt if necessary
-        if not os.path.isfile(dataset_path) and not os.path.isfile(
-            default_sharegpt_path
-        ):
-            download_sharegpt_dataset(default_sharegpt_path)
-            dataset_path = default_sharegpt_path
-        else:
-            dataset_path = (
-                dataset_path if os.path.isfile(dataset_path) else default_sharegpt_path
-            )
-
-        # Load the dataset.
-        with open(dataset_path) as f:
-            dataset = json.load(f)
-        # Filter out the conversations with less than 2 turns.
-        dataset = [data for data in dataset if len(data["conversations"]) >= 2]
-        # Only keep the first two turns of each conversation.
-        dataset = [
-            (data["conversations"][0]["value"], data["conversations"][1]["value"])
-            for data in dataset
-        ]
-
-        # Shuffle the dataset.
-        random.shuffle(dataset)
-
-        # Filter out sequences that are too long or too short
-        input_requests: List[Tuple[str, int, int]] = []
-        for i in range(num_prompts):
-            # Tokenize the prompts and completions.
-            prompt = dataset[i][0]
-            prompt_token_ids = tokenizer(prompt).input_ids
-            prompt_len = len(prompt_token_ids)
-
-            if prompt_len > input_lens[i]:
-                input_ids = prompt_token_ids[: input_lens[i]]
-            else:
-                ratio = (input_lens[i] + prompt_len - 1) // prompt_len
-                input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            prompt = tokenizer.decode(input_ids)
-            input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
+    # Download sharegpt if necessary
+    if not os.path.isfile(dataset_path) and not os.path.isfile(
+        default_sharegpt_path
+    ):
+        download_sharegpt_dataset(default_sharegpt_path)
+        dataset_path = default_sharegpt_path
     else:
-        # Sample token ids from random integers. This can cause some NaN issues.
-        offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
-        input_requests = []
-        for i in range(num_prompts):
-            prompt = tokenizer.decode(
-                [
-                    (offsets[i] + i + j) % tokenizer.vocab_size
-                    for j in range(input_lens[i])
-                ]
-            )
-            input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
-    with open(cache_path, "wb") as f:
+        dataset_path = (
+            dataset_path if os.path.isfile(dataset_path) else default_sharegpt_path
+        )
+
+    # Load the dataset.
+    with open(dataset_path) as f:
+        dataset = json.load(f)
+    # Filter out the conversations with less than 2 turns.
+    dataset = [data for data in dataset if len(data["conversations"]) >= 2]
+    # Only keep the first two turns of each conversation.
+    dataset = [
+        (data["conversations"][0]["value"], data["conversations"][1]["value"])
+        for data in dataset
+    ]
+
+    # Shuffle the dataset.
+    random.shuffle(dataset)
+
+    def process_prompt(i):
+        prompt = dataset[i][0]
+        prompt_token_ids = tokenizer(prompt).input_ids
+        prompt_len = len(prompt_token_ids)
+        if prompt_len > input_lens[i]:
+            input_ids = prompt_token_ids[: input_lens[i]]
+        else:
+            ratio = (input_lens[i] + prompt_len - 1) // prompt_len
+            input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
+        prompt = tokenizer.decode(input_ids)
+        # print(f"sample {i} has been processed...")
+        return (prompt, int(input_lens[i]), int(output_lens[i]))
+    input_requests = []
+    # Filter out sequences that are too long or too short
+    t1 = time.time()
+    with ThreadPoolExecutor(max_workers=os.cpu_count() * 5) as executor:
+        # 提交所有任务
+        futures = [executor.submit(process_prompt, i) for i in range(num_prompts)]
+        
+        # 等待所有任务完成，并收集结果
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                input_requests.append(result)
+            except Exception as e:
+                print(f"Task generated an exception: {e}")
+    t2 = time.time()
+    print(f"It takes {t2 - t1} seconds to prepare prompts....")
+    # 保存 input_requests 到缓存文件
+    with open(cache_path, 'wb') as f:
         pickle.dump(input_requests, f)
         print(f"Saved input_requests_{num_prompts} to cache.")
     print(f"#Input tokens: {np.sum(input_lens)}")
@@ -511,9 +491,9 @@ def calculate_metrics(
     tpots: List[float] = []
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
-
-    input_lens: List[float] = []
-
+    
+    input_lens:List[float] = []
+    
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_len
@@ -523,9 +503,10 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             total_input += input_requests[i][1]
-
+            
             input_lens.append(input_requests[i][1])
-
+            
+            
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
@@ -544,11 +525,11 @@ def calculate_metrics(
             "on the benchmark arguments.",
             stacklevel=2,
         )
-
-    # metric_data = [input_lens, output_lens, ttfts]
-    # with open(f'metrics_{time.time()}.json', 'w') as f:
-    #     json.dump(metric_data, f)
-
+        
+    metric_data = [input_lens, output_lens, ttfts]
+    with open(f'metrics_{time.time()}.json', 'w') as f:
+        json.dump(metric_data, f)
+    
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -596,15 +577,16 @@ async def benchmark(
 
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
-
+    
     words = test_prompt.split()
 
     # 使用random.shuffle打乱单词列表
     random.shuffle(words)
 
     # 将打乱后的单词列表合并回文本
-    test_prompt = " ".join(words)
+    test_prompt = ' '.join(words)
 
+    
     test_input = RequestFuncInput(
         model=model_id,
         prompt=test_prompt,
@@ -771,31 +753,6 @@ async def benchmark(
         "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
         "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
     }
-
-    balance_method = os.getenv("LOAD_BALANCE_METHOD")
-    new_item = {
-        "method": balance_method,
-        "mean_ttft": metrics.mean_ttft_ms,
-        "request_rate": request_rate,
-        "request_throughput": metrics.request_throughput,
-        "p99_ttft_ms": metrics.p99_ttft_ms,
-        "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
-        "time": datetime.now().isoformat(),
-    }
-    file_name = f"{balance_method}_result.json"
-    if not os.path.exists(file_name):
-        with open(file_name, "w") as f:
-            json.dump([], f)
-
-    with open(file_name, "r") as f:
-        tmp_data = json.load(f)
-
-    tmp_data.append(new_item)
-
-    with open(file_name, "w") as f:
-        json.dump(tmp_data, f, indent=4)
-
-    print(f"add new item to {file_name}: {new_item}")
     return result
 
 
@@ -892,7 +849,7 @@ def run_benchmark(args_: argparse.Namespace):
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
-            max_seqlen=args.sharegpt_max_seqlen,
+            fixed_output_len=args.sharegpt_output_len,
         )
     elif args.dataset_name == "random":
         input_requests = sample_random_requests(
@@ -924,7 +881,6 @@ def run_benchmark(args_: argparse.Namespace):
                 )
             )
     else:
-
         return asyncio.run(
             benchmark(
                 backend=backend,
@@ -1000,12 +956,6 @@ if __name__ == "__main__":
         type=int,
         default=1000,
         help="Number of prompts to process. Default is 1000.",
-    )
-    parser.add_argument(
-        "--sharegpt-max-seqlen",
-        type=int,
-        default=8192,
-        help="Number of max request len. Default is 8192.",
     )
     parser.add_argument(
         "--sharegpt-output-len",

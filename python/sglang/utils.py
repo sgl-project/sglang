@@ -15,6 +15,8 @@ from typing import Union
 
 import numpy as np
 import requests
+from sglang.srt.model_config import ModelConfig, AttentionArch
+from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.model_config import AttentionArch, ModelConfig
 from sglang.srt.server_args import ServerArgs
