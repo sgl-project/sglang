@@ -4,9 +4,7 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import (
-    create_flashinfer_kv_indices_triton,
-)
+from sglang.srt.layers.flashinfer_utils import create_flashinfer_kv_indices_triton
 
 
 class TestCreateKvIndices(unittest.TestCase):
@@ -57,8 +55,8 @@ class TestCreateKvIndices(unittest.TestCase):
             paged_kernel_lens,
             kv_indptr,
             None,
-            req_to_token.size(1),
             kv_indices_triton,
+            req_to_token.size(1),
         )
 
         # Check

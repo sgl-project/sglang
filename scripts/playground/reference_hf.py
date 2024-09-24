@@ -39,7 +39,6 @@ def normal_text(args):
         device_map="auto",
         trust_remote_code=True,
     )
-    m.cuda()
 
     prompts = [
         "The capital of France is",
@@ -48,11 +47,13 @@ def normal_text(args):
     ]
     max_new_tokens = 16
 
+    torch.cuda.set_device(0)
+
     for i, p in enumerate(prompts):
         if isinstance(p, str):
-            input_ids = t.encode(p, return_tensors="pt").cuda()
+            input_ids = t.encode(p, return_tensors="pt").to("cuda:0")
         else:
-            input_ids = torch.tensor([p], device="cuda")
+            input_ids = torch.tensor([p], device="cuda:0")
 
         output_ids = m.generate(
             input_ids, do_sample=False, max_new_tokens=max_new_tokens

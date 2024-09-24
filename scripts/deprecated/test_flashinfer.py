@@ -6,8 +6,11 @@ from flashinfer import (
 )
 from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
-from sglang.srt.layers.extend_attention import extend_attention_fwd, redundant_attention
 from sglang.srt.layers.token_attention import token_attention_fwd
+from sglang.srt.layers.triton_attention.extend_attention import (
+    extend_attention_fwd,
+    redundant_attention,
+)
 
 flashinfer_prefill_wrapper = None
 flashinfer_decode_wrapper = None

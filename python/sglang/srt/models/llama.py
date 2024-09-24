@@ -24,12 +24,6 @@ from torch import nn
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -39,10 +33,15 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler
-from sglang.srt.layers.torchao_utils import torchao_quantize_param_data
+from sglang.srt.layers.torchao_utils import apply_torchao_config_
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
@@ -305,9 +304,6 @@ class LlamaForCausalLM(nn.Module):
         self.model = LlamaModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
-
-        self.param_dict = dict(self.named_parameters())
 
     @torch.no_grad()
     def forward(
@@ -318,11 +314,54 @@ class LlamaForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
-        logits_output = self.logits_processor(
+        return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
-        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-        return sample_output, logits_output
+
+    def get_hidden_dim(self, module_name):
+        if module_name in ["q_proj", "o_proj", "qkv_proj"]:
+            return self.config.hidden_size, self.config.hidden_size
+        elif module_name in ["kv_proj"]:
+            return self.config.hidden_size, self.config.hidden_size // (
+                self.config.num_attention_heads // self.config.num_key_value_heads
+            )
+        elif module_name == "gate_up_proj":
+            return self.config.hidden_size, self.config.intermediate_size
+        elif module_name == "down_proj":
+            return self.config.intermediate_size, self.config.hidden_size
+        else:
+            raise NotImplementedError()
+
+    def get_module_name(self, name):
+        params_mapping = {
+            "q_proj": "qkv_proj",
+            "k_proj": "qkv_proj",
+            "v_proj": "qkv_proj",
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+        }
+        return params_mapping.get(name, name)
+
+    def get_module_name_from_weight_name(self, name):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id, num_shard)
+            ("qkv_proj", "q_proj", "q", 3),
+            ("qkv_proj", "k_proj", "k", 3),
+            ("qkv_proj", "v_proj", "v", 3),
+            ("gate_up_proj", "gate_proj", 0, 2),
+            ("gate_up_proj", "up_proj", 1, 2),
+        ]
+        for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
+            if weight_name in name:
+                return (
+                    name.replace(weight_name, param_name)[: -len(".weight")],
+                    num_shard,
+                )
+        return name[: -len(".weight")], 1
+
+    def get_num_params(self):
+        params_dict = dict(self.named_parameters())
+        return len(params_dict)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -333,7 +372,7 @@ class LlamaForCausalLM(nn.Module):
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
-        params_dict = self.param_dict
+        params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
@@ -364,24 +403,7 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-                if self.torchao_config:
-                    if name.endswith("proj.weight") and param.ndim == 2:
-                        params_dict[name] = torchao_quantize_param_data(
-                            param, self.torchao_config
-                        )
-
-        if self.torchao_config:
-            # quantizing the loaded, stacked params, e.g. "...qkv_proj"
-            stacked_params = set(entry[0] for entry in stacked_params_mapping)
-            for param_suffix in stacked_params:
-                for name in params_dict:
-                    if param_suffix in name:
-                        param = params_dict[name]
-                        params_dict[name] = torchao_quantize_param_data(
-                            param, self.torchao_config
-                        )
-
-            self.load_state_dict(params_dict, assign=True)
+        apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

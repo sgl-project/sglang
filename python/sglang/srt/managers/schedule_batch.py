@@ -19,7 +19,7 @@ limitations under the License.
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -31,19 +31,17 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.sampler import SampleOutput
-
+from sglang.srt.server_args import ServerArgs
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 # Put some global args for easy access
 global_server_args_dict = {
-    "disable_flashinfer": False,
-    "disable_flashinfer_sampling": False,
-    "triton_attention_reduce_in_fp32": False,
-    "enable_mla": False,
+    "attention_backend": ServerArgs.attention_backend,
+    "sampling_backend": ServerArgs.sampling_backend,
+    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
+    "disable_mla": ServerArgs.disable_mla,
+    "torchao_config": ServerArgs.torchao_config,
 }
 
 
@@ -54,8 +52,8 @@ class BaseFinishReason:
     def __init__(self, is_error: bool = False):
         self.is_error = is_error
 
-    def __str__(self):
-        raise NotImplementedError("Subclasses must implement this method")
+    def to_json(self):
+        raise NotImplementedError()
 
 
 class FINISH_MATCHED_TOKEN(BaseFinishReason):
@@ -63,17 +61,11 @@ class FINISH_MATCHED_TOKEN(BaseFinishReason):
         super().__init__()
         self.matched = matched
 
-    def __str__(self) -> str:
-        return f"FINISH_MATCHED_TOKEN: {self.matched}"
-
-
-class FINISH_LENGTH(BaseFinishReason):
-    def __init__(self, length: int):
-        super().__init__()
-        self.length = length
-
-    def __str__(self) -> str:
-        return f"FINISH_LENGTH: {self.length}"
+    def to_json(self):
+        return {
+            "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
 
 
 class FINISH_MATCHED_STR(BaseFinishReason):
@@ -81,22 +73,45 @@ class FINISH_MATCHED_STR(BaseFinishReason):
         super().__init__()
         self.matched = matched
 
-    def __str__(self) -> str:
-        return f"FINISH_MATCHED_STR: {self.matched}"
+    def to_json(self):
+        return {
+            "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
+
+
+class FINISH_LENGTH(BaseFinishReason):
+    def __init__(self, length: int):
+        super().__init__()
+        self.length = length
+
+    def to_json(self):
+        return {
+            "type": "length",  # to match OpenAI API's return value
+            "length": self.length,
+        }
 
 
 class FINISH_ABORT(BaseFinishReason):
     def __init__(self):
         super().__init__(is_error=True)
 
-    def __str__(self) -> str:
-        return "FINISH_ABORT"
+    def to_json(self):
+        return {
+            "type": "abort",
+        }
 
 
 class Req:
     """Store all inforamtion of a request."""
 
-    def __init__(self, rid, origin_input_text, origin_input_ids):
+    def __init__(
+        self,
+        rid: str,
+        origin_input_text: str,
+        origin_input_ids: Tuple[int],
+        lora_path: Optional[str] = None,
+    ):
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
@@ -104,9 +119,14 @@ class Req:
         self.origin_input_ids = origin_input_ids
         self.output_ids = []  # Each decode stage's output ids
         self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
+        self.lora_path = lora_path
 
         # Memory info
         self.req_pool_idx = None
+
+        # Check finish
+        self.tokenizer = None
+        self.finished_reason = None
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -126,7 +146,7 @@ class Req:
         # this does not include the jump forward tokens.
         self.completion_tokens_wo_jump_forward = 0
 
-        # For vision input
+        # For vision inputs
         self.pixel_values = None
         self.image_sizes = None
         self.image_offsets = None
@@ -134,31 +154,35 @@ class Req:
         self.modalities = None
 
         # Prefix info
-        self.extend_input_len = 0
         self.prefix_indices = []
+        self.extend_input_len = 0
         self.last_node = None
 
         # Sampling parameters
         self.sampling_params = None
         self.stream = False
 
-        # Check finish
-        self.tokenizer = None
-        self.finished_reason = None
-
-        # Logprobs
+        # Logprobs (arguments)
         self.return_logprob = False
-        self.embedding = None
         self.logprob_start_len = 0
         self.top_logprobs_num = 0
+
+        # Logprobs (return value)
         self.normalized_prompt_logprob = None
         self.input_token_logprobs = None
         self.input_top_logprobs = None
         self.output_token_logprobs = []
         self.output_top_logprobs = []
+
+        # Logprobs (internal values)
         # The tokens is prefilled but need to be considered as decode tokens
         # and should be updated for the decode logprobs
         self.last_update_decode_tokens = 0
+        # The relative logprob_start_len in an extend batch
+        self.extend_logprob_start_len = 0
+
+        # Embedding
+        self.embedding = None
 
         # Constrained decoding
         self.regex_fsm: RegexGuide = None
@@ -336,6 +360,7 @@ class ScheduleBatch:
     tree_cache: BasePrefixCache
 
     forward_mode: ForwardMode = None
+    sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
@@ -347,14 +372,19 @@ class ScheduleBatch:
 
     # For mixed chunekd prefill
     prefix_lens_cpu: List[int] = None
+    running_bs: int = None
 
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
 
+    # Stream
+    has_stream: bool = False
+
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
         return_logprob = any(req.return_logprob for req in reqs)
+        has_stream = any(req.stream for req in reqs)
 
         return cls(
             reqs=reqs,
@@ -362,17 +392,14 @@ class ScheduleBatch:
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
             return_logprob=return_logprob,
+            has_stream=has_stream,
         )
 
     def batch_size(self):
-        return len(self.reqs) if self.reqs is not None else 0
+        return len(self.reqs)
 
     def is_empty(self):
         return len(self.reqs) == 0
-
-    def has_stream(self) -> bool:
-        # Return whether batch has at least 1 streaming request
-        return any(r.stream for r in self.reqs)
 
     def alloc_req_slots(self, num_reqs):
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
@@ -402,7 +429,7 @@ class ScheduleBatch:
     def prepare_for_extend(self, vocab_size: int):
         self.forward_mode = ForwardMode.EXTEND
 
-        bs = self.batch_size()
+        bs = len(self.reqs)
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
@@ -416,8 +443,8 @@ class ScheduleBatch:
         for i, req in enumerate(reqs):
             req.req_pool_idx = req_pool_indices_cpu[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
-            ext_len = seq_len - pre_len
             seq_lens.append(seq_len)
+            assert seq_len - pre_len == req.extend_input_len
 
             if pre_len > 0:
                 self.req_to_token_pool.req_to_token[req.req_pool_idx][
@@ -425,9 +452,19 @@ class ScheduleBatch:
                 ] = req.prefix_indices
 
             self.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
-                out_cache_loc[pt : pt + ext_len]
+                out_cache_loc[pt : pt + req.extend_input_len]
             )
-            pt += ext_len
+
+            # Compute the relative logprob_start_len in an extend batch
+            if req.logprob_start_len >= pre_len:
+                extend_logprob_start_len = min(
+                    req.logprob_start_len - pre_len, req.extend_input_len - 1
+                )
+            else:
+                extend_logprob_start_len = req.extend_input_len - 1
+
+            req.extend_logprob_start_len = extend_logprob_start_len
+            pt += req.extend_input_len
 
         # Set fields
         with torch.device("cuda"):
@@ -440,18 +477,13 @@ class ScheduleBatch:
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
         self.prefix_lens_cpu = [len(r.prefix_indices) for r in reqs]
-
+        self.extend_lens_cpu = [r.extend_input_len for r in reqs]
+        self.extend_logprob_start_lens_cpu = [r.extend_logprob_start_len for r in reqs]
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
-        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        prefix_lens_cpu = [len(r.prefix_indices) for r in self.reqs]
-        prefix_lens_cpu.extend(
-            [
-                len(r.origin_input_ids) + len(r.output_ids) - 1
-                for r in running_batch.reqs
-            ]
-        )
+        self.forward_mode = ForwardMode.MIXED
+        running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
             req.fill_ids = req.origin_input_ids + req.output_ids
@@ -459,15 +491,25 @@ class ScheduleBatch:
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
-        extend_num_tokens = self.extend_num_tokens + running_batch.batch_size()
+        extend_num_tokens = self.extend_num_tokens + running_bs
+
         self.merge(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
         self.extend_num_tokens = extend_num_tokens
-        self.prefix_lens_cpu = prefix_lens_cpu
+
+        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+        self.prefix_lens_cpu.extend(
+            [
+                len(r.origin_input_ids) + len(r.output_ids) - 1
+                for r in running_batch.reqs
+            ]
+        )
+        self.extend_lens_cpu.extend([1] * running_bs)
+        self.extend_logprob_start_lens_cpu.extend([0] * running_bs)
 
     def check_decode_mem(self):
-        bs = self.batch_size()
+        bs = len(self.reqs)
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 
@@ -638,21 +680,17 @@ class ScheduleBatch:
                 r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
                 for r in self.reqs
             ]
-        else:
-            self.sampling_info.penalizer_orchestrator.cumulate_input_tokens(input_ids)
 
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
 
         # Alloc mem
-        bs = self.batch_size()
+        bs = len(self.reqs)
         self.out_cache_loc = self.alloc_token_slots(bs)
 
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
-
-        self.sampling_info.update_regex_vocab_mask(self)
 
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:
@@ -673,6 +711,7 @@ class ScheduleBatch:
         self.out_cache_loc = None
         self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
+        self.has_stream = any(req.stream for req in self.reqs)
 
         self.sampling_info.filter(unfinished_indices, new_indices)
 
@@ -683,7 +722,6 @@ class ScheduleBatch:
         self.sampling_info.merge(other.sampling_info)
 
         self.reqs.extend(other.reqs)
-
         self.req_pool_indices = torch.concat(
             [self.req_pool_indices, other.req_pool_indices]
         )
@@ -694,18 +732,4 @@ class ScheduleBatch:
         self.out_cache_loc = None
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
-
-    def check_sample_results(self, sample_output: SampleOutput):
-        if not torch.all(sample_output.success):
-            probs = sample_output.probs
-            batch_next_token_ids = sample_output.batch_next_token_ids
-            logging.warning("Sampling failed, fallback to top_k=1 strategy")
-            probs = probs.masked_fill(torch.isnan(probs), 0.0)
-            argmax_ids = torch.argmax(probs, dim=-1)
-            batch_next_token_ids = torch.where(
-                sample_output.success, batch_next_token_ids, argmax_ids
-            )
-            sample_output.probs = probs
-            sample_output.batch_next_token_ids = batch_next_token_ids
-
-        return sample_output.batch_next_token_ids
+        self.has_stream = any(req.stream for req in self.reqs)

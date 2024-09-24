@@ -6,6 +6,7 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -26,6 +27,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1), False, False),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
 
@@ -52,7 +54,11 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         if is_tp2:
             other_args.extend(["--tp", "2"])
         if "DeepSeek" in model:
-            other_args.append("--enable-mla")
+            other_args.extend(["--mem-frac", "0.85"])
+        if "AWQ" in model:
+            other_args.extend(["--quantization", "awq"])
+        elif "GPTQ" in model:
+            other_args.extend(["--quantization", "gptq"])
 
         self.process = popen_launch_server(
             model,

@@ -19,11 +19,10 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import SampleOutput
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 
@@ -37,6 +36,7 @@ class LlamaForClassification(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.torchao_config = None
         self.quant_config = quant_config
         self.model = LlamaModel(config, quant_config=quant_config)
 
@@ -44,8 +44,6 @@ class LlamaForClassification(nn.Module):
             config.hidden_size, config.classification_out_size, bias=False
         )
         self.eos_token_id = config.eos_token_id
-
-        self.param_dict = dict(self.named_parameters())
 
     @torch.no_grad()
     def forward(
@@ -75,28 +73,10 @@ class LlamaForClassification(nn.Module):
             output_top_logprobs=None,
         )
 
-        # A dummy to make this work
-        sample_output = SampleOutput(
-            success=torch.full(
-                size=(scores.shape[0],),
-                fill_value=True,
-                dtype=torch.bool,
-            ),
-            probs=torch.full(
-                size=(scores.shape[0], 1),
-                fill_value=1.0,
-                dtype=torch.float16,
-            ),
-            batch_next_token_ids=torch.full(
-                size=(scores.shape[0],),
-                fill_value=0,
-                dtype=torch.long,
-            ),
-        )
-        return sample_output, logits_output
+        return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        params_dict = self.param_dict
+        params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             if "classification_head" in name:
