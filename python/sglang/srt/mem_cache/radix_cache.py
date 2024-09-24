@@ -307,7 +307,7 @@ class RadixCache(BasePrefixCache):
         for child in node.children.values():
             x += self._total_size_helper(child)
         return x
-
+    
     def _collect_leaves(self):
         ret_list = []
         stack = [self.root_node]
