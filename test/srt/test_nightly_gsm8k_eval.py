@@ -67,6 +67,29 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             other_args=other_args,
         )
 
+    def test_human_eval_all_models(self):
+        for model_group, is_fp8, is_tp2 in self.model_groups:
+            for model in model_group:
+                lower_bound = get_score_lower_bound(model, is_fp8)
+                if lower_bound is None:
+                    print("Skip {model} fp8={is_fp8}. Please set the assert threshold")
+                    continue
+                with self.subTest(model=model):
+                    self.launch_server(model, is_fp8, is_tp2)
+
+                    args = SimpleNamespace(
+                        base_url=self.base_url,
+                        model=model,
+                        eval_name="humaneval",
+                        num_examples=None,
+                        num_threads=1024,
+                    )
+
+                    metrics = run_eval(args)
+                    assert metrics["score"] >= lower_bound, f"{metrics}"
+
+                    self.tearDown()
+
     def test_mgsm_en_all_models(self):
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:

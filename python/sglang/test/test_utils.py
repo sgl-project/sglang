@@ -35,6 +35,11 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-In
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
 
 
+def get_score_lower_bound(model, is_fp8):
+    if model == "mistralai/Mistral-7B-Instruct-v0.3" and not is_fp8:
+        return 0.8
+
+
 def is_in_ci():
     """Return whether it is in CI runner."""
     return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
