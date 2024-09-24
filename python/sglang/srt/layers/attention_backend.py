@@ -349,6 +349,7 @@ class TritonAttnBackend(AttentionBackend):
         self.num_head = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
         )
+        self.device = model_runner.device_config.device_type
 
         if global_server_args_dict.get("triton_attention_reduce_in_fp32", False):
             self.reduce_dtype = torch.float32
@@ -372,14 +373,14 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = torch.empty(
                 (self.num_head, total_num_tokens),
                 dtype=self.reduce_dtype,
-                device=self.model_runner.device_config.device_type,
+                device=self.device,
             )
 
             max_seq_len = torch.max(input_metadata.seq_lens).item()
             max_extend_len = None
         else:
             start_loc = attn_logits = max_seq_len = None
-            prefix_lens = torch.tensor(batch.prefix_lens_cpu, device=self.model_runner.device_config.device_type)
+            prefix_lens = torch.tensor(batch.prefix_lens_cpu, device=self.device)
             max_extend_len = torch.max(input_metadata.seq_lens - prefix_lens).item()
 
         self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len

@@ -126,7 +126,7 @@ class ModelRunner:
             server_args.max_total_tokens,
         )
         self.init_attention_backend()
-        if self.device_config.device_type == 'cuda':
+        if device == 'cuda':
             self.init_cublas()
             self.init_cuda_graphs()
         else:
@@ -134,13 +134,14 @@ class ModelRunner:
             
 
     def init_torch_distributed(self):
+        device_type=self.device_config.device_type
         # Init torch distributed
-        if self.device_config.device_type == "cuda":
+        if device_type == "cuda":
             torch.cuda.set_device(self.gpu_id)
             backend = "nccl" 
 
         #ToDO(liangan1):Just use gloo to bypass the initilization fail,need to use ccl for xpu backend
-        elif self.device_config.device_type == "xpu":
+        elif device_type == "xpu":
             torch.xpu.set_device(self.gpu_id)
             backend = "gloo"
 
@@ -163,13 +164,13 @@ class ModelRunner:
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         min_per_gpu_memory = get_available_gpu_memory(
-            self.device_config.device_type, self.gpu_id, distributed=self.tp_size > 1
+            device_type, self.gpu_id, distributed=self.tp_size > 1
         )
         self.tp_group = get_tp_group()
 
         # Currently, there is a bug with mulit-node tensor parallelsim + padded cuda graph,
         # so we disable padding in cuda graph.
-        if self.device_config.device_type == "cuda" and not all(in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)):
+        if device_type == "cuda" and not all(in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)):
             self.server_args.disable_cuda_graph_padding = True
             logger.info(
                 "Setting disable_cuda_graph_padding to True because of multi-node tensor parallelism."
@@ -177,7 +178,7 @@ class ModelRunner:
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
-            local_gpu_memory = get_available_gpu_memory(self.device_config.device_type, self.gpu_id, self.gpu_id)
+            local_gpu_memory = get_available_gpu_memory(device_type, self.gpu_id, self.gpu_id)
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
@@ -185,13 +186,14 @@ class ModelRunner:
         return min_per_gpu_memory
 
     def load_model(self):
+        device_type=self.device_config.device_type
         logger.info(
-            f"Load weight begin. avail mem={get_available_gpu_memory(self.device_config.device_type, self.gpu_id):.2f} GB on {self.device_config.device_type}:{self.gpu_id} device"
+            f"Load weight begin. avail mem={get_available_gpu_memory(device_type, self.gpu_id):.2f} GB on {device_type}:{self.gpu_id} device"
         )
 
         # This can reduce thread conflicts and speed up weight loading.
         torch.set_num_threads(1)
-        if self.device_config.device_type == "cuda":
+        if device_type == "cuda":
             if torch.cuda.get_device_capability()[0] < 8:
                 logger.info(
                     "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
@@ -240,7 +242,7 @@ class ModelRunner:
             f"Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
-            f"avail mem={get_available_gpu_memory(self.device_config.device_type, self.gpu_id):.2f} GB on {self.device_config.device_type}:{self.gpu_id}"
+            f"avail mem={get_available_gpu_memory(device_type, self.gpu_id):.2f} GB on {device_type}:{self.gpu_id}"
         )
 
     def update_weights(self, model_path: str, load_format: str):
@@ -374,6 +376,7 @@ class ModelRunner:
         max_num_reqs: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
     ):
+        device_type = self.device_config.device_type
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
@@ -412,7 +415,7 @@ class ModelRunner:
         self.req_to_token_pool = ReqToTokenPool(
             max_num_reqs + 1,
             self.model_config.context_len + 4,
-            self.device_config.device_type 
+            device_type 
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -421,7 +424,7 @@ class ModelRunner:
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
-                device=self.device_config.device_type,
+                device=device_type,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
@@ -430,14 +433,14 @@ class ModelRunner:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
-                device=self.device_config.device_type,
+                device=device_type,
                 head_num=self.model_config.get_num_kv_heads(self.tp_size),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
             )
         logger.info(
             f"Memory pool end. "
-            f"avail mem={get_available_gpu_memory(self.device_config.device_type, self.gpu_id):.2f} GB  on {self.device_config.device_type}:{self.gpu_id}"
+            f"avail mem={get_available_gpu_memory(device_type, self.gpu_id):.2f} GB  on {device_type}:{self.gpu_id}"
         )
 
     def init_cublas(self):
