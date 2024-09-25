@@ -161,6 +161,7 @@ def get_tokenizer(
             "Using a slow tokenizer. This might cause a significant "
             "slowdown. Consider using a fast tokenizer instead."
         )
+    tokenizer.clean_up_tokenization_spaces = False
     return tokenizer
 
 
