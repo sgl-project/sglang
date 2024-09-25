@@ -174,13 +174,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
-    # For this script, model-path is not required
-    assert (
-        parser._actions[1].option_strings[0] == "--model-path"
-    ), "options changed, this code need to be updated"
-    parser._actions[1].required = False
     args = parser.parse_args()
-
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 
