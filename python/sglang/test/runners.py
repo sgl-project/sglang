@@ -21,8 +21,9 @@ from typing import List, Union
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
+from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server import Runtime
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 
@@ -92,11 +93,7 @@ class HFRunner:
         self.model_proc.start()
 
     def start_model_process(self, in_queue, out_queue, model_path, torch_dtype):
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            torch_dtype=torch_dtype,
-        )
-
+        self.tokenizer = get_tokenizer(model_path)
         if self.is_generation:
             self.base_model = AutoModelForCausalLM.from_pretrained(
                 model_path,

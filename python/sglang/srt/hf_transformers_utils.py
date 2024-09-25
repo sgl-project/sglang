@@ -129,6 +129,7 @@ def get_tokenizer(
             *args,
             trust_remote_code=trust_remote_code,
             tokenizer_revision=tokenizer_revision,
+            clean_up_tokenization_spaces=False,
             **kwargs,
         )
     except TypeError as e:
@@ -161,7 +162,6 @@ def get_tokenizer(
             "Using a slow tokenizer. This might cause a significant "
             "slowdown. Consider using a fast tokenizer instead."
         )
-    tokenizer.clean_up_tokenization_spaces = False
     return tokenizer
 
 
