@@ -51,6 +51,7 @@ CI_MODELS = [
 # All other models
 ALL_OTHER_MODELS = [
     ModelCase("Qwen/Qwen2-1.5B"),
+    ModelCase("HuggingFaceTB/SmolLM-135M-Instruct"),
 ]
 
 TORCH_DTYPES = [torch.float16]

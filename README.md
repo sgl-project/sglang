@@ -263,6 +263,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - BaiChuan2
 - MiniCPM / MiniCPM 3
 - XVERSE / XVERSE MoE
+- SmolLM
 
 
 **Embedding Models**
