@@ -581,12 +581,12 @@ def import_model_classes():
                     for tmp in entry:
                         assert (
                             tmp.__name__ not in model_arch_name_to_cls
-                        ), f"{tmp.__name__}"
+                        ), f"Duplicated model implementation for {tmp.__name__}"
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
                     assert (
                         entry.__name__ not in model_arch_name_to_cls
-                    ), f"{entry.__name__}"
+                    ), f"Duplicated model implementation for {entry.__name__}"
                     model_arch_name_to_cls[entry.__name__] = entry
 
     return model_arch_name_to_cls
