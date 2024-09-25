@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m sglang.launch_server --model-path /model/llama-classification
+python3 -m sglang.launch_server --disable-cuda-graph --model-path /model/llama-classification
 
 python3 test_httpserver_classify.py
 """

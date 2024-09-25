@@ -22,13 +22,14 @@ import asyncio
 import dataclasses
 import json
 import logging
-import torch.multiprocessing as mp
 import multiprocessing
 import os
 import threading
 import time
 from http import HTTPStatus
 from typing import Dict, List, Optional, Union
+
+import torch.multiprocessing as mp
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -38,6 +39,7 @@ import requests
 import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
@@ -78,6 +80,7 @@ from sglang.srt.utils import (
     assert_pkg_version,
     configure_logger,
     enable_show_time_cost,
+    is_hip,
     kill_child_process,
     maybe_set_triton_cache_manager,
     prepare_model,
@@ -93,6 +96,14 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 app = FastAPI()
 tokenizer_manager = None
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
@@ -144,7 +155,7 @@ async def flush_cache():
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
 
     success, message = await tokenizer_manager.update_weights(obj, request)
-    content = {"message": message, "success": str(success)}
+    content = {"success": success, "message": message}
     if success:
         return JSONResponse(
             content,
@@ -273,7 +284,6 @@ async def retrieve_file_content(file_id: str):
 
 def launch_server(
     server_args: ServerArgs,
-    model_overide_args: Optional[dict] = None,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
 ):
     """Launch an HTTP server."""
@@ -289,7 +299,7 @@ def launch_server(
         server_args.port,
         server_args.additional_ports,
         server_args.dp_size,
-        server_args.speculative_algorithm is not None
+        server_args.speculative_algorithm is not None,
     )
     ports = server_args.additional_ports
     port_args = PortArgs(
@@ -319,7 +329,6 @@ def launch_server(
             tp_rank_range,
             server_args,
             ports[3],
-            model_overide_args,
         )
 
         try:
@@ -330,23 +339,19 @@ def launch_server(
             return
 
     # Launch processes
-    tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
-    if server_args.chat_template:
-        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
     pipe_controller_reader, pipe_controller_writer = mp.Pipe(duplex=False)
-    pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
     if server_args.dp_size == 1:
         start_controller_process = start_controller_process_single
     else:
         start_controller_process = start_controller_process_multi
-
     proc_controller = mp.Process(
         target=start_controller_process,
-        args=(server_args, port_args, pipe_controller_writer, model_overide_args),
+        args=(server_args, port_args, pipe_controller_writer),
     )
     proc_controller.start()
 
+    pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
     proc_detoken = mp.Process(
         target=start_detokenizer_process,
         args=(
@@ -356,6 +361,10 @@ def launch_server(
         ),
     )
     proc_detoken.start()
+
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+    if server_args.chat_template:
+        load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
 
     # Wait for the model to finish loading
     controller_init_state = pipe_controller_reader.recv()
@@ -420,7 +429,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         maybe_set_triton_cache_manager()
 
     # Check flashinfer version
-    if not server_args.disable_flashinfer:
+    if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer",
             "0.1.6",
@@ -428,6 +437,10 @@ def _set_envs_and_config(server_args: ServerArgs):
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
+
+    if is_hip():
+        # to figure out a better method of not using fork later
+        mp.set_start_method("spawn", force=True)
 
 
 def _wait_and_warmup(server_args, pipe_finish_writer, pid):
@@ -442,13 +455,12 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         time.sleep(1)
         try:
             res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
-            assert res.status_code == 200, f"{res}"
+            assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
-        except (AssertionError, requests.exceptions.RequestException) as e:
+        except (AssertionError, requests.exceptions.RequestException):
             last_traceback = get_exception_traceback()
             pass
-    model_info = res.json()
 
     if not success:
         if pipe_finish_writer is not None:
@@ -456,6 +468,8 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_child_process(pid, including_parent=False)
         return
+
+    model_info = res.json()
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
@@ -503,7 +517,6 @@ class Runtime:
     def __init__(
         self,
         log_level: str = "error",
-        model_overide_args: Optional[dict] = None,
         *args,
         **kwargs,
     ):
@@ -527,7 +540,7 @@ class Runtime:
 
         proc = mp.Process(
             target=launch_server,
-            args=(self.server_args, model_overide_args, pipe_writer),
+            args=(self.server_args, pipe_writer),
         )
         proc.start()
         pipe_writer.close()
@@ -606,6 +619,7 @@ class Runtime:
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
     ):
         json_data = {
             "text": prompt,
@@ -613,7 +627,9 @@ class Runtime:
             "return_logprob": return_logprob,
             "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
+            "lora_path": lora_path,
         }
+        assert not isinstance(lora_path, list) or len(lora_path) == len(prompt)
         response = requests.post(
             self.url + "/generate",
             json=json_data,

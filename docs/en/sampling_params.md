@@ -23,6 +23,7 @@ class GenerateReqInput:
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # The start location of the prompt for return_logprob.
+    # By default, this value is "-1", which means it will only return logprobs for output tokens.
     logprob_start_len: Optional[Union[List[int], int]] = None
     # The number of top logprobs to return.
     top_logprobs_num: Optional[Union[List[int], int]] = None

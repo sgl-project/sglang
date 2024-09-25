@@ -16,11 +16,9 @@ limitations under the License.
 """Utilities for Huggingface Transformers."""
 
 import contextlib
-import functools
-import json
 import os
 import warnings
-from typing import AbstractSet, Collection, Dict, List, Literal, Optional, Type, Union
+from typing import Dict, Optional, Type, Union
 
 from huggingface_hub import snapshot_download
 from transformers import (
@@ -50,8 +48,6 @@ for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
 
-from sglang.srt.utils import is_multimodal_model
-
 
 def download_from_hf(model_path: str):
     if os.path.exists(model_path):
@@ -60,17 +56,11 @@ def download_from_hf(model_path: str):
     return snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
 
 
-def get_config_json(model_path: str):
-    with open(os.path.join(model_path, "configs.json")) as f:
-        config = json.load(f)
-    return config
-
-
 def get_config(
     model: str,
     trust_remote_code: bool,
     revision: Optional[str] = None,
-    model_overide_args: Optional[dict] = None,
+    model_override_args: Optional[dict] = None,
 ):
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision
@@ -78,8 +68,8 @@ def get_config(
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
         config = config_class.from_pretrained(model, revision=revision)
-    if model_overide_args:
-        config.update(model_overide_args)
+    if model_override_args:
+        config.update(model_override_args)
     return config
 
 
@@ -100,7 +90,7 @@ def get_context_length(config):
     """Get the context length of a model from a huggingface model configs."""
     rope_scaling = getattr(config, "rope_scaling", None)
     if rope_scaling:
-        rope_scaling_factor = config.rope_scaling["factor"]
+        rope_scaling_factor = config.rope_scaling.get("factor", 1)
         if "original_max_position_embeddings" in rope_scaling:
             rope_scaling_factor = 1
         if config.rope_scaling.get("rope_type", None) == "llama3":

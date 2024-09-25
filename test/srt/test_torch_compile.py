@@ -22,7 +22,7 @@ class TestTorchCompile(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile", "--disable-radix-cache"],
+            other_args=["--enable-torch-compile"],
         )
 
     @classmethod
@@ -34,12 +34,12 @@ class TestTorchCompile(unittest.TestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=32,
+            num_examples=64,
             num_threads=32,
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.6
+        assert metrics["score"] >= 0.65
 
     def run_decode(self, max_new_tokens):
         response = requests.post(

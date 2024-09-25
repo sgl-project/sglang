@@ -116,7 +116,7 @@ class EAGLEDraftInput(SpecDraftInput):
         prob = self.sample_output  # b * (1/topk), vocab
         top = torch.topk(prob, self.topk, dim=-1)
         topk_index, topk_p = top.indices, top.values  # b * (1/topk), topk
-        if self.prev_mode == ForwardMode.DECODE:
+        if self.prev_mode == ForwardMode.SPECDECODE:
             scores = torch.mul(
                 self.scores.unsqueeze(1), topk_p
             )  # (b, topk) mul (b * topk ,topk) -> b, topk, topk
@@ -152,6 +152,7 @@ class EAGLEDraftInput(SpecDraftInput):
             batch.seq_lens[:, None]
             + torch.ones([1, self.topk], device="cuda") * self.iter
         )
+        print("input ids ", batch.input_ids)
         print("allocate ", batch.out_cache_loc)
         print("next pos ", self.positions)
         # TODO: Check it @kavioyu
@@ -179,10 +180,12 @@ class EAGLEDraftInput(SpecDraftInput):
 
     def generate_attn_arg(
         self,
-        req_pool_indices: List,
-        paged_kernel_lens: List,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
         req_to_token_pool: ReqToTokenPool,
     ):
+        req_pool_indices = req_pool_indices.tolist()
+        paged_kernel_lens = paged_kernel_lens.tolist()
         bs = self.topk * len(req_pool_indices)
         seq_len = self.positions.reshape(-1).contiguous()
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")

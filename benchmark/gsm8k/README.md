@@ -1,8 +1,3 @@
-## Download data
-```
-bash download_data.sh
-```
-
 ## Run benchmark
 
 ### Benchmark sglang

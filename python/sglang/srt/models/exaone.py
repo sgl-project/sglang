@@ -23,12 +23,6 @@ import torch
 from torch import nn
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -38,9 +32,14 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
@@ -297,7 +296,6 @@ class ExaoneForCausalLM(nn.Module):
         config,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: Optional[CacheConfig] = None,
-        efficient_weight_load=False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -305,7 +303,6 @@ class ExaoneForCausalLM(nn.Module):
         self.transformer = ExaoneModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
 
     @torch.no_grad()
     def forward(
@@ -318,36 +315,11 @@ class ExaoneForCausalLM(nn.Module):
         hidden_states = self.transformer(
             input_ids, positions, input_metadata, input_embeds
         )
-        logits_output = self.logits_processor(
+        return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
-        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-        return sample_output, logits_output
 
-    def get_module_name(self, name):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id, num_shard)
-            ("qkv_proj", "q_proj", "q", 3),
-            ("qkv_proj", "k_proj", "k", 3),
-            ("qkv_proj", "v_proj", "v", 3),
-            ("gate_up_proj", "c_fc_0", 0, 2),
-            ("gate_up_proj", "c_fc_1", 1, 2),
-        ]
-        for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
-            if weight_name in name:
-                return (
-                    name.replace(weight_name, param_name)[: -len(".weight")],
-                    num_shard,
-                )
-        return name[: -len(".weight")], 1
-
-    def get_num_params(self):
-        params_dict = dict(self.named_parameters())
-        return len(params_dict)
-
-    def load_weights(
-        self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -358,16 +330,17 @@ class ExaoneForCausalLM(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
 
-        def load_weights_per_param(name, loaded_weight):
+        for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
-                return
+                continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
-                return
+                continue
             if name.startswith("model.vision_tower") and name not in params_dict:
-                return
+                continue
 
+            name = name.replace("attn.attention", "self_attn")
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -382,18 +355,10 @@ class ExaoneForCausalLM(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    return
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-        if name is None or loaded_weight is None:
-            for name, loaded_weight in weights:
-                name = name.replace("attn.attention", "self_attn")
-                load_weights_per_param(name, loaded_weight)
-        else:
-            name = name.replace("attn.attention", "self_attn")
-            load_weights_per_param(name, loaded_weight)
 
 
 EntryClass = ExaoneForCausalLM

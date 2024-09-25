@@ -47,12 +47,9 @@ class SpecDraftServer(ModelTpServer):
         tp_rank: int,
         server_args: ServerArgs,
         nccl_port: int,
-        model_overide_args: dict,
         spec_queue: SpecInfoPipline,
     ):
-        super().__init__(
-            gpu_id, tp_rank, server_args, nccl_port, model_overide_args, spec_queue
-        )
+        super().__init__(gpu_id, tp_rank, server_args, nccl_port, spec_queue)
 
     def exposed_step(self, recv_reqs: List):
         try:
@@ -124,9 +121,7 @@ class SpecDraftServer(ModelTpServer):
             if self.model_runner.is_generation:
                 # Forward and sample the next tokens
                 if batch.extend_num_tokens != 0:
-                    sample_output, logits_output = self.model_runner.forward(
-                        batch, ForwardMode.SPECEXTEND
-                    )
+                    sample_output, logits_output = self.model_runner.forward(batch)
         else:
             super().forward_prefill_batch(batch)
 
@@ -136,8 +131,7 @@ class SpecDraftServer(ModelTpServer):
 
         # Update batch tensors
         batch.prepare_for_decode()
+        batch.forward_mode = ForwardMode.SPECDECODE
 
         # Forward and sample the next tokens
-        sample_output, logits_output = self.model_runner.forward(
-            batch, ForwardMode.SPECDECODE
-        )
+        sample_output, logits_output = self.model_runner.forward(batch)

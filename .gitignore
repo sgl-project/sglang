@@ -166,6 +166,9 @@ cython_debug/
 # Vim
 *.swp
 
+# Documentation
+docs/en/_build
+
 # SGL
 benchmark/mmlu/data
 benchmark/mmlu/data.tar

@@ -15,14 +15,14 @@ limitations under the License.
 
 """
 Memory-efficient attention for prefill.
-It supporst page size = 1 and prefill with KV cache (i.e. extend).
+It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.prefill_attention import context_attention_fwd
+from sglang.srt.layers.triton_attention.prefill_attention import context_attention_fwd
 
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
@@ -61,12 +61,14 @@ def _fwd_kernel(
     stride_buf_vbs,
     stride_buf_vh,
     stride_req_to_tokens_b,
+    logit_cap: tl.constexpr,
+    Lq: tl.constexpr,
+    Lv: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    logit_cap: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -86,13 +88,18 @@ def _fwd_kernel(
     offs_m = tl.arange(0, BLOCK_M)
     mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len_extend
 
+    mask_d = offs_d < Lq
+    mask_dv = offs_dv < Lv
+
     offs_q = (
         (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None])
         * stride_qbs
         + cur_head * stride_qh
         + offs_d[None, :]
     )
-    q = tl.load(Q_Extend + offs_q, mask=mask_m[:, None], other=0.0)
+    q = tl.load(
+        Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
+    )
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
@@ -104,7 +111,7 @@ def _fwd_kernel(
         )
         qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
 
-    # stage1: compute scores with prefix
+    # stage 1: compute scores with prefix
     offs_n = tl.arange(0, BLOCK_N)
 
     acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
@@ -125,10 +132,11 @@ def _fwd_kernel(
             + cur_kv_head * stride_buf_kh
             + offs_d[:, None]
         )
-        k = tl.load(K_Buffer + offs_buf_k, mask=mask_n[None, :], other=0.0)
+        k = tl.load(
+            K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+        )
 
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)
+        qk = tl.dot(q.to(k.dtype), k)
         if BLOCK_DPE > 0:
             offs_kpe = (
                 offs_kv_loc[None, :] * stride_buf_kbs
@@ -140,7 +148,7 @@ def _fwd_kernel(
                 mask=mask_n[None, :],
                 other=0.0,
             )
-            qk += tl.dot(qpe, kpe)
+            qk += tl.dot(qpe.to(kpe.dtype), kpe)
         qk *= sm_scale
 
         if logit_cap > 0:
@@ -158,13 +166,15 @@ def _fwd_kernel(
             + cur_kv_head * stride_buf_vh
             + offs_dv[None, :]
         )
-        v = tl.load(V_Buffer + offs_buf_v, mask=mask_n[:, None], other=0.0)
+        v = tl.load(
+            V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+        )
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
         e_max = n_e_max
 
-    # stage2: compute the trianlge part
+    # stage 2: compute the trianlge part
 
     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     for start_n in range(0, cur_block_m_end, BLOCK_N):
@@ -177,11 +187,11 @@ def _fwd_kernel(
             + cur_kv_head * stride_kh
             + offs_d[:, None]
         )
-        k = tl.load(K_Extend + offs_k, mask=mask_n[None, :], other=0.0)
+        k = tl.load(
+            K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+        )
 
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)
-
+        qk = tl.dot(q, k, out_dtype=tl.float32)
         if BLOCK_DPE > 0:
             offs_kpe = (
                 (cur_seq_extend_start_contiguous + start_n + offs_n[None, :])
@@ -217,7 +227,9 @@ def _fwd_kernel(
             + cur_kv_head * stride_vh
             + offs_dv[None, :]
         )
-        v = tl.load(V_Extend + offs_v, mask=mask_n[:, None], other=0.0)
+        v = tl.load(
+            V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+        )
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -229,7 +241,9 @@ def _fwd_kernel(
         + cur_head * stride_oh
         + offs_dv[None, :]
     )
-    tl.store(O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None])
+    tl.store(
+        O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None] & mask_dv[None, :]
+    )
 
 
 def extend_attention_fwd(
@@ -241,48 +255,51 @@ def extend_attention_fwd(
     v_buffer,
     req_to_tokens,
     b_req_idx,
-    b_start_loc,
     b_seq_len,
-    b_seq_len_prefix,
-    b_start_loc_extend,
     b_seq_len_extend,
-    max_len_in_batch,
+    b_start_loc_extend,
     max_len_extend,
     sm_scale=None,
-    logit_cap=-1,
+    logit_cap=0.0,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
-    Lq, Lk, Lv, Lo = (
+    Lq, Lk, Lv = (
         q_extend.shape[-1],
         k_extend.shape[-1],
         v_extend.shape[-1],
-        o_extend.shape[-1],
     )
-
-    assert Lq == Lk and Lv == Lo
-    assert Lq in {16, 32, 64, 128, 256, 576}
-    assert Lv in {16, 32, 64, 128, 256, 512}
 
     if Lq == 576:
         BLOCK_DMODEL = 512
         BLOCK_DPE = 64
+    elif Lq == 288:
+        BLOCK_DMODEL = 256
+        BLOCK_DPE = 32
     else:
-        BLOCK_DMODEL = Lq
+        BLOCK_DMODEL = triton.next_power_of_2(Lq)
         BLOCK_DPE = 0
-    BLOCK_DV = Lv
+    BLOCK_DV = triton.next_power_of_2(Lv)
 
     if CUDA_CAPABILITY[0] >= 9:
-        BLOCK_M, BLOCK_N = (128, 64)
+        if Lq <= 256:
+            BLOCK_M, BLOCK_N = (128, 64)
+        else:
+            BLOCK_M, BLOCK_N = (32, 64)
     elif CUDA_CAPABILITY[0] >= 8:
-        BLOCK_M, BLOCK_N = (128, 128) if Lq <= 128 else (64, 64)
+        if Lq <= 128:
+            BLOCK_M, BLOCK_N = (128, 128)
+        elif Lq <= 256:
+            BLOCK_M, BLOCK_N = (64, 64)
+        else:
+            BLOCK_M, BLOCK_N = (32, 64)
     else:
         BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
-    sm_scale = 1.0 / (Lq**0.5) if sm_scale is None else sm_scale
+    sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = b_seq_len.shape[0], q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
@@ -317,25 +334,24 @@ def extend_attention_fwd(
         v_buffer.stride(0),
         v_buffer.stride(1),
         req_to_tokens.stride(0),
+        logit_cap=logit_cap,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        Lq=Lq,
+        Lv=Lv,
         num_warps=num_warps,
         num_stages=num_stages,
-        logit_cap=logit_cap,
     )
 
 
 def redundant_attention(
     q_extend,
-    k_extend,
-    v_extend,
     o_extend,
     k_buffer,
     v_buffer,
-    req_to_tokens,
     b_req_idx,
     b_start_loc,
     b_seq_len,
@@ -366,106 +382,3 @@ def redundant_attention(
         pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
         o_extend[pt : pt + cur_seq_len_extend] = o_buffer[pl:pr]
         pt += cur_seq_len_extend
-
-
-def test():
-    torch.manual_seed(0)
-
-    B, N_CTX, H_Q, H_KV, D = 19, 12331, 12, 4, 128
-    dtype = torch.float16
-
-    b_seq_len_prefix = torch.randint(
-        1, N_CTX // 2, (B,), dtype=torch.int32, device="cuda"
-    )
-    b_seq_len_extend = torch.randint(
-        1, N_CTX // 2, (B,), dtype=torch.int32, device="cuda"
-    )
-    b_seq_len = b_seq_len_prefix + b_seq_len_extend
-    max_len_in_batch = torch.max(b_seq_len, 0)[0].item()
-
-    b_req_idx = torch.arange(B, dtype=torch.int32, device="cuda")
-    req_to_tokens = torch.empty((B, max_len_in_batch), dtype=torch.int32, device="cuda")
-    b_start_loc = torch.zeros((B,), dtype=torch.int32, device="cuda")
-    b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], 0)
-    b_start_loc_extend = torch.zeros((B,), dtype=torch.int32, device="cuda")
-    b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
-    for i in range(B):
-        req_to_tokens[i, : b_seq_len[i]] = torch.arange(
-            b_start_loc[i], b_start_loc[i] + b_seq_len[i]
-        )
-
-    total_token_num = torch.sum(b_seq_len).item()
-    extend_token_num = torch.sum(b_seq_len_extend).item()
-    k_buffer = torch.empty(
-        (total_token_num, H_KV, D), dtype=dtype, device="cuda"
-    ).normal_(mean=0.1, std=0.2)
-    v_buffer = torch.empty(
-        (total_token_num, H_KV, D), dtype=dtype, device="cuda"
-    ).normal_(mean=0.1, std=0.2)
-
-    k_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype, device="cuda")
-    v_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype, device="cuda")
-    q_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
-    for i in range(B):
-        extend_start_in_buffer = b_start_loc[i] + b_seq_len_prefix[i]
-        extend_end_in_buffer = b_start_loc[i] + b_seq_len[i]
-        extend_start = b_start_loc_extend[i]
-        extend_end = b_start_loc_extend[i] + b_seq_len_extend[i]
-        k_extend[extend_start:extend_end] = k_buffer[
-            extend_start_in_buffer:extend_end_in_buffer
-        ]
-        v_extend[extend_start:extend_end] = v_buffer[
-            extend_start_in_buffer:extend_end_in_buffer
-        ]
-        q_extend[extend_start:extend_end] = torch.empty(
-            (b_seq_len_extend[i], H_Q, D), dtype=dtype, device="cuda"
-        ).normal_(mean=0.1, std=0.2)
-
-    o_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
-    o_redundant = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
-
-    b_seq_len_extend = b_seq_len - b_seq_len_prefix
-    b_start_loc_extend = torch.zeros_like(b_seq_len)
-    b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
-    max_len_extend = torch.max(b_seq_len_extend, 0)[0].item()
-    extend_attention_fwd(
-        q_extend,
-        k_extend,
-        v_extend,
-        o_extend,
-        k_buffer,
-        v_buffer,
-        req_to_tokens,
-        b_req_idx,
-        b_start_loc,
-        b_seq_len,
-        b_seq_len_prefix,
-        b_start_loc_extend,
-        b_seq_len_extend,
-        max_len_in_batch,
-        max_len_extend,
-    )
-
-    redundant_attention(
-        q_extend,
-        k_extend,
-        v_extend,
-        o_redundant,
-        k_buffer,
-        v_buffer,
-        req_to_tokens,
-        b_req_idx,
-        b_start_loc,
-        b_seq_len,
-        b_seq_len_prefix,
-        max_len_in_batch,
-    )
-
-    print("Mean: ", torch.mean(torch.abs(o_extend - o_redundant)))
-    print("Max: ", torch.max(torch.abs(o_extend - o_redundant)))
-
-    assert torch.allclose(o_extend, o_redundant, rtol=1e-2)
-
-
-if __name__ == "__main__":
-    test()

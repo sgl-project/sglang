@@ -1,0 +1,258 @@
+name: PR Test
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-test-frontend:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[dev]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/lang
+          python3 run_suite.py --suite minimal
+
+  unit-test-backend-part-1:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[dev]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite minimal --range-begin 0 --range-end 7
+
+  unit-test-backend-part-2:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[dev]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite minimal --range-begin 7 --range-end 14
+
+  unit-test-backend-part-3:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[dev]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite minimal --range-begin 14
+
+  performance-test-1-gpu-part-1:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Benchmark Single Latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_latency.TestBenchLatency.test_default
+
+      - name: Benchmark Online Latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
+
+      - name: Benchmark Offline Throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
+
+  performance-test-1-gpu-part-2:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Benchmark Offline Throughput (w/o RadixAttention)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
+
+      - name: Benchmark Offline Throughput (w/ Triton)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
+
+      - name: Benchmark Offline Throughput (w/ FP8)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
+
+  performance-test-2-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Benchmark Offline Throughput (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
+
+      - name: Benchmark Offline Throughput (w/o RadixAttention) (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
+
+      - name: Benchmark Single Latency (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_latency.TestBenchLatency.test_moe_default
+
+  accuracy-test-1-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Evaluate Accuracy
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_eval_accuracy_large.py
+
+  accuracy-test-2-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Evaluate Accuracy (TP=2)
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_moe_eval_accuracy_large.py
+      
+      - name: Evaluate MLA Accuracy (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_mla.py
+          python3 test_mla_fp8.py
+
+      - name: Evaluate Data Parallelism Accuracy (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_data_parallelism.py
+
+  finish:
+    needs: [
+      unit-test-frontend, unit-test-backend-part-1, unit-test-backend-part-2, unit-test-backend-part-3,
+      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
+      accuracy-test-1-gpu, accuracy-test-2-gpu
+    ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Finish
+        run: echo "This is an empty step to ensure that all jobs are completed."

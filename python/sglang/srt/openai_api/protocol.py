@@ -82,6 +82,14 @@ class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
 
 
+class JsonSchemaResponseFormat(BaseModel):
+    name: str
+    description: Optional[str] = None
+    # use alias to workaround pydantic conflict
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    strict: Optional[bool] = False
+
+
 class FileRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/files/create
     file: bytes  # The File object (not file name) to be uploaded
@@ -200,11 +208,6 @@ class CompletionStreamResponse(BaseModel):
     usage: Optional[UsageInfo] = None
 
 
-class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant"]
-    content: str
-
-
 class ChatCompletionMessageContentTextPart(BaseModel):
     type: Literal["text"]
     text: str
@@ -218,11 +221,17 @@ class ChatCompletionMessageContentImageURL(BaseModel):
 class ChatCompletionMessageContentImagePart(BaseModel):
     type: Literal["image_url"]
     image_url: ChatCompletionMessageContentImageURL
+    modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart, ChatCompletionMessageContentImagePart
 ]
+
+
+class ChatCompletionMessageGenericParam(BaseModel):
+    role: Literal["system", "assistant"]
+    content: Union[str, List[ChatCompletionMessageContentTextPart]]
 
 
 class ChatCompletionMessageUserParam(BaseModel):
@@ -236,8 +245,8 @@ ChatCompletionMessageParam = Union[
 
 
 class ResponseFormat(BaseModel):
-    # type must be "json_object" or "text"
-    type: Literal["text", "json_object"]
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: Optional[JsonSchemaResponseFormat] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -263,7 +272,6 @@ class ChatCompletionRequest(BaseModel):
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
-    json_schema: Optional[str] = None
     min_tokens: Optional[int] = 0
     repetition_penalty: Optional[float] = 1.0
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)

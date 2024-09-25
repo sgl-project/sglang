@@ -21,9 +21,9 @@ import torch
 import torch.nn as nn
 from transformers import CLIPVisionModel, LlavaConfig
 from vllm.config import CacheConfig
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.llava import LlavaLlamaForCausalLM
 
 

@@ -32,16 +32,16 @@ from transformers import (
 )
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 from vllm.config import CacheConfig
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
     unpad_image_shape,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
-from sglang.srt.models.llama2 import LlamaForCausalLM
+from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
@@ -136,8 +136,14 @@ class LlavaBaseForCausalLM(nn.Module):
         image_sizes: Optional[List[List[int]]] = None,
         image_offsets: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        if input_metadata.forward_mode == ForwardMode.EXTEND:
+        if input_metadata.forward_mode.is_extend():
             bs = input_metadata.batch_size
+            # Got List[List[str]] extend it to List[str]
+            # The length of the List should be equal to batch size
+            modalities_list = []
+            for modalities in input_metadata.modalities:
+                if modalities is not None:
+                    modalities_list.extend(modalities)
 
             # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
@@ -179,11 +185,14 @@ class LlavaBaseForCausalLM(nn.Module):
                     new_image_features = []
                     height = width = self.num_patches_per_side
                     for image_idx, image_feature in enumerate(image_features):
-                        if len(image_sizes[image_idx]) == 1:
+                        if modalities_list[image_idx] == "image":
                             image_aspect_ratio = (
                                 self.config.image_aspect_ratio
                             )  # single image
-                        else:
+                        elif (
+                            modalities_list[image_idx] == "multi-images"
+                            or modalities_list[image_idx] == "video"
+                        ):
                             image_aspect_ratio = "pad"  # multi image
                         # image_aspect_ratio = (
                         #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
@@ -191,6 +200,7 @@ class LlavaBaseForCausalLM(nn.Module):
                         if (
                             image_feature.shape[0] > 1
                             and "anyres" in image_aspect_ratio
+                            and modalities_list[image_idx] == "image"
                         ):
                             base_image_feature = image_feature[0]
                             image_feature = image_feature[1:]
@@ -290,7 +300,7 @@ class LlavaBaseForCausalLM(nn.Module):
                             )
                             image_feature = image_feature.unsqueeze(0)
                         else:
-                            if image_feature.shape[0] > 16:  # video
+                            if modalities_list[image_idx] == "video":  # video
                                 # 2x2 pooling
                                 num_of_frames = image_feature.shape[0]
                                 image_feature = image_feature.view(
@@ -312,6 +322,21 @@ class LlavaBaseForCausalLM(nn.Module):
                                     .transpose(1, 2)
                                     .contiguous()
                                 )  # N, C, H*W
+                            if "unpad" in self.mm_patch_merge_type:
+                                image_feature = torch.cat(
+                                    (
+                                        image_feature,
+                                        # Expand to (bs, 1, hidden_dim) and concat at the end of the image tokens
+                                        self.language_model.model.image_newline[
+                                            None, None
+                                        ].expand(
+                                            image_feature.shape[0],
+                                            1,
+                                            image_feature.shape[-1],
+                                        ),
+                                    ),
+                                    dim=1,
+                                )
 
                         new_image_features.append(image_feature)
                     image_features = new_image_features
@@ -350,7 +375,7 @@ class LlavaBaseForCausalLM(nn.Module):
             return self.language_model(
                 input_ids, positions, input_metadata, input_embeds=input_embeds
             )
-        elif input_metadata.forward_mode == ForwardMode.DECODE:
+        elif input_metadata.forward_mode.is_decode():
             return self.language_model(input_ids, positions, input_metadata)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -395,21 +420,19 @@ class LlavaBaseForCausalLM(nn.Module):
             "model.mm_projector.0": "multi_modal_projector.linear_1",
             "model.mm_projector.2": "multi_modal_projector.linear_2",
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
+            "model.image_newline": "language_model.model.image_newline",
         }
         params_dict = dict(self.named_parameters())
-        weights = list(weights)
         for name, loaded_weight in weights:
-            # FIXME: why projector weights read two times?
-            if "projector" in name or "vision_tower" in name:
+            if "projector" in name or "vision_tower" in name or "image_newline" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-        # load language model
-        self.language_model.load_weights(weights)
+            else:
+                self.language_model.load_weights([(name, loaded_weight)])
 
     @property
     def num_patches_per_side(self):
@@ -429,6 +452,7 @@ class LlavaLlamaForCausalLM(LlavaBaseForCausalLM):
         self.vision_tower = None
         self.config.vision_config.hidden_size = config.mm_hidden_size
         self.config.text_config.hidden_size = config.hidden_size
+
         self.multi_modal_projector = LlavaMultiModalProjector(config)
         self.language_model = LlamaForCausalLM(config, quant_config=quant_config)
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
@@ -448,9 +472,9 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
 
         self.config = config
         self.vision_tower = None
+
         if getattr(self.config, "vision_config", None) is None:
             self.config.vision_config = CLIPVisionConfig(self.config.mm_vision_tower)
-
         if getattr(self.config, "text_config", None) is None:
             self.config.text_config = Qwen2Config(self.config._name_or_path)
 
@@ -459,7 +483,6 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
 
         if getattr(self.config, "projector_hidden_act", None) is None:
             self.config.projector_hidden_act = "gelu"
-
         if getattr(self.config, "image_token_index", None) is None:
             self.config.image_token_index = 151646
 
@@ -482,9 +505,9 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
 
         self.config = config
         self.vision_tower = None
+
         if getattr(self.config, "vision_config", None) is None:
             self.config.vision_config = CLIPVisionConfig(self.config.mm_vision_tower)
-
         if getattr(self.config, "text_config", None) is None:
             self.config.text_config = MistralConfig(self.config._name_or_path)
 
@@ -493,7 +516,6 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
 
         if getattr(self.config, "projector_hidden_act", None) is None:
             self.config.projector_hidden_act = "gelu"
-
         if getattr(self.config, "image_token_index", None) is None:
             self.config.image_token_index = 32000
 

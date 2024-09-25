@@ -1,4 +1,4 @@
-name: Accuracy Test
+name: PR Test (AMD)
 
 on:
   push:
@@ -14,14 +14,13 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: accuracy-test-${{ github.ref }}
+  group: pr-test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  accuracy-test:
+  accuracy-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 1-gpu-runner
-
+    runs-on: 1-gpu-runner-amd
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -29,8 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          pip install -e "python[all]" --no-deps
 
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
@@ -41,3 +39,12 @@ jobs:
         run: |
           cd test/srt
           python3 test_eval_accuracy_large.py
+
+  finish:
+    needs: [
+      accuracy-test-1-gpu
+    ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Finish
+        run: echo "This is an empty step to ensure that all jobs are completed."

@@ -93,12 +93,14 @@ def multi_image_stream_request_test(client):
                         "image_url": {
                             "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
                         },
+                        "modalities": "multi-images",
                     },
                     {
                         "type": "image_url",
                         "image_url": {
                             "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
                         },
+                        "modalities": "multi-images",
                     },
                     {
                         "type": "text",
@@ -215,16 +217,14 @@ def prepare_video_messages(video_path):
         base64_frames.append(base64_str)
 
     messages = [{"role": "user", "content": []}]
-    frame_format = {
-        "type": "image_url",
-        "image_url": {"url": "data:image/jpeg;base64,{}"},
-    }
 
     for base64_frame in base64_frames:
-        frame_format["image_url"]["url"] = "data:image/jpeg;base64,{}".format(
-            base64_frame
-        )
-        messages[0]["content"].append(frame_format.copy())
+        frame_format = {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{base64_frame}"},
+            "modalities": "video",
+        }
+        messages[0]["content"].append(frame_format)
 
     prompt = {"type": "text", "text": "Please describe the video in detail."}
     messages[0]["content"].append(prompt)

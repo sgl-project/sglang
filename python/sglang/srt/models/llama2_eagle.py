@@ -310,7 +310,6 @@ class LlamaForCausalLMEagle(nn.Module):
         self.model = LlamaModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
 
     @torch.no_grad()
     def forward(
@@ -327,12 +326,11 @@ class LlamaForCausalLMEagle(nn.Module):
         logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
-        # sample_output = self.sampler(logits_output, input_metadata.sampling_info)
         if isinstance(logits_output, LogitsProcessorOutput):
             logits_output = logits_output.next_token_logits
-        sample_output = self.sampler._get_probs(
-            logits_output, sampling_info=input_metadata.sampling_info
-        )
+        sample_output = torch.softmax(
+            logits_output, dim=-1
+        )  # TODO: Support more sampling method @kavioyu
         input_metadata.spec_draft_input.capture_for_decode(
             sample_output, input_metadata.forward_mode
         )

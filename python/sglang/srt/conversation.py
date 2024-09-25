@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Conversation templates."""
+"""Conversation chat templates."""
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
@@ -71,6 +71,7 @@ class Conversation:
     # Stop criteria (the default one is EOS token)
     stop_str: Union[str, List[str]] = None
     image_data: Optional[List[str]] = None
+    modalities: Optional[List[str]] = None
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -379,6 +380,7 @@ def generate_chat_conv(
         sep2=conv.sep2,
         stop_str=conv.stop_str,
         image_data=[],
+        modalities=[],
     )
 
     if isinstance(request.messages, str):
@@ -386,7 +388,16 @@ def generate_chat_conv(
     for message in request.messages:
         msg_role = message.role
         if msg_role == "system":
-            conv.system_message = message.content
+            if isinstance(message.content, str):
+                conv.system_message = message.content
+            elif isinstance(message.content, list):
+                if (
+                    len(message.content) != 1
+                    or getattr(message.content[0], "type", None) != "text"
+                ):
+                    raise ValueError("The system message should be a single text.")
+                else:
+                    conv.system_message = getattr(message.content[0], "text", "")
         elif msg_role == "user":
             # Handle the various types of Chat Request content types here.
             role = conv.roles[0]
@@ -399,6 +410,7 @@ def generate_chat_conv(
                 for content in message.content:
                     if content.type == "image_url":
                         num_image_url += 1
+                        conv.modalities.append(content.modalities)
                 if num_image_url > 1:
                     image_token = "<image>"
                 else:
@@ -414,7 +426,20 @@ def generate_chat_conv(
                         conv.append_image(content.image_url.url)
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
-            conv.append_message(conv.roles[1], message.content)
+            parsed_content = ""
+            if isinstance(message.content, str):
+                parsed_content = message.content
+            elif isinstance(message.content, list):
+                if (
+                    len(message.content) != 1
+                    or getattr(message.content[0], "type", None) != "text"
+                ):
+                    raise ValueError(
+                        "The assistant's response should be a single text."
+                    )
+                else:
+                    parsed_content = getattr(message.content[0], "text", "")
+            conv.append_message(conv.roles[1], parsed_content)
         else:
             raise ValueError(f"Unknown role: {msg_role}")
 

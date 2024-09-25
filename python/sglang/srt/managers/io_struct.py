@@ -20,7 +20,7 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 
 import copy
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -43,6 +43,7 @@ class GenerateReqInput:
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
+    # By default, this value is "-1", which means it will only return logprobs for output tokens.
     logprob_start_len: Optional[Union[List[int], int]] = None
     # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: Optional[Union[List[int], int]] = None
@@ -50,6 +51,13 @@ class GenerateReqInput:
     return_text_in_logprobs: bool = False
     # Whether to stream output.
     stream: bool = False
+    # The modalities of the image data [image, multi-images, video]
+    modalities: Optional[List[str]] = None
+
+    is_single: bool = True
+
+    # LoRA related
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (
@@ -125,6 +133,9 @@ class GenerateReqInput:
                 self.image_data = [None] * num
             elif not isinstance(self.image_data, list):
                 self.image_data = [self.image_data] * num
+            elif isinstance(self.image_data, list):
+                # multi-image with n > 1
+                self.image_data = self.image_data * num
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * num
@@ -177,6 +188,11 @@ class TokenizedGenerateReqInput:
     top_logprobs_num: int
     # Whether to stream output
     stream: bool
+    # Modalities of the input images
+    modalites: Optional[List[str]] = None
+
+    # LoRA related
+    lora_path: Optional[str] = None  # None means just use the base model
 
 
 @dataclass
@@ -189,6 +205,8 @@ class EmbeddingReqInput:
     rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
     sampling_params: Union[List[Dict], Dict] = None
+
+    is_single: bool = True
 
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (

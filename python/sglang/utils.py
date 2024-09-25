@@ -4,6 +4,7 @@ import base64
 import importlib
 import json
 import logging
+import os
 import signal
 import sys
 import traceback
@@ -11,10 +12,11 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import requests
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +38,11 @@ def is_same_type(values: list):
 
 def read_jsonl(filename: str):
     """Read a JSONL file."""
-    rets = []
     with open(filename) as fin:
         for line in fin:
             if line.startswith("#"):
                 continue
-            rets.append(json.loads(line))
-    return rets
+            yield json.loads(line)
 
 
 def dump_state_text(filename: str, states: list, mode: str = "w"):
@@ -260,3 +260,37 @@ class LazyImport:
     def __call__(self, *args, **kwargs):
         module = self._load()
         return module(*args, **kwargs)
+
+
+def download_and_cache_file(url: str, filename: Optional[str] = None):
+    """Read and cache a file from a url."""
+    if filename is None:
+        filename = os.path.join("/tmp", url.split("/")[-1])
+
+    # Check if the cache file already exists
+    if os.path.exists(filename):
+        return filename
+
+    print(f"Downloading from {url} to {filename}")
+
+    # Stream the response to show the progress bar
+    response = requests.get(url, stream=True)
+    response.raise_for_status()  # Check for request errors
+
+    # Total size of the file in bytes
+    total_size = int(response.headers.get("content-length", 0))
+    chunk_size = 1024  # Download in chunks of 1KB
+
+    # Use tqdm to display the progress bar
+    with open(filename, "wb") as f, tqdm(
+        desc=filename,
+        total=total_size,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as bar:
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            f.write(chunk)
+            bar.update(len(chunk))
+
+    return filename

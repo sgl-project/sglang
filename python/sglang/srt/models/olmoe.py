@@ -13,91 +13,107 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
-"""Inference-only LLaMA model compatible with HuggingFace weights."""
+# Adapted from:
+# https://github.com/vllm-project/vllm/pull/7922
 
-from typing import Any, Dict, Iterable, Optional, Tuple
+"""Inference-only OLMoE model compatible with HuggingFace weights."""
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
-from transformers import LlamaConfig
+from transformers import PretrainedConfig
 from vllm.config import CacheConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.utils import print_warning_once
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler
-from sglang.srt.managers.speculative_utils import DraftInfoFactory
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
-class LlamaMLP(nn.Module):
+class OlmoeMoE(nn.Module):
+    """A tensor-parallel MoE implementation for Olmoe that shards each expert
+    across all ranks.
+
+    Each expert's weights are sharded across all ranks and a fused MoE
+    kernel is used for the forward pass, and finally we reduce the outputs
+    across ranks.
+    """
+
     def __init__(
         self,
+        num_experts: int,
+        top_k: int,
         hidden_size: int,
         intermediate_size: int,
-        hidden_act: str,
+        params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
         prefix: str = "",
-    ) -> None:
+    ):
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+        self.hidden_size = hidden_size
+
+        # Gate always runs at half / full precision for now.
+        self.gate = ReplicatedLinear(
+            hidden_size, num_experts, bias=False, quant_config=None
         )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
+
+        self.experts = FusedMoE(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            reduce_results=True,
+            renormalize=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            tp_size=tp_size,
         )
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
 
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # NOTE: hidden_states can have either 1D or 2D shape.
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
+        return final_hidden_states.view(orig_shape)
 
 
-class LlamaAttention(nn.Module):
+class OlmoeAttention(nn.Module):
+
     def __init__(
         self,
-        config: LlamaConfig,
+        layer_id: int,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        layer_id: int = 0,
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
-        rope_is_neox_style: bool = True,
-        max_position_embeddings: int = 8192,
+        max_position_embeddings: int = 4096,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -115,10 +131,7 @@ class LlamaAttention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        # MistralConfig has an optional head_dim introduced by Mistral-Nemo
-        self.head_dim = getattr(
-            config, "head_dim", self.hidden_size // self.total_num_heads
-        )
+        self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -132,14 +145,14 @@ class LlamaAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
         )
+        self.q_norm = RMSNorm(hidden_size, eps=1e-5)
+        self.k_norm = RMSNorm(hidden_size, eps=1e-5)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
         )
 
         self.rotary_emb = get_rope(
@@ -148,14 +161,14 @@ class LlamaAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=rope_is_neox_style,
+            is_neox_style=True,
         )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
-            num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            num_kv_heads=self.num_kv_heads,
         )
 
     def forward(
@@ -166,56 +179,47 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.q_norm(q.contiguous()), self.k_norm(k.contiguous())
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
         return output
 
 
-class LlamaDecoderLayer(nn.Module):
+class OlmoeDecoderLayer(nn.Module):
+
     def __init__(
         self,
-        config: LlamaConfig,
+        config: PretrainedConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(
-            config, "original_max_position_embeddings", None
-        ):
-            rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings
-            )
-        rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = LlamaAttention(
-            config=config,
+        max_position_embeddings = getattr(config, "max_position_embeddings", 4096)
+
+        self.self_attn = OlmoeAttention(
+            layer_id,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
-            rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
         )
-        self.mlp = LlamaMLP(
-            hidden_size=self.hidden_size,
+
+        self.mlp = OlmoeMoE(
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
 
     def forward(
         self,
@@ -223,13 +227,14 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -242,29 +247,28 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class LlamaModel(nn.Module):
+class OlmoeModel(nn.Module):
+
     def __init__(
         self,
-        config: LlamaConfig,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
-        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
         )
         self.layers = nn.ModuleList(
             [
-                LlamaDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
-                )
-                for i in range(config.num_hidden_layers)
+                OlmoeDecoderLayer(config, layer_id, quant_config=quant_config)
+                for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=1e-5)
 
     def forward(
         self,
@@ -281,83 +285,44 @@ class LlamaModel(nn.Module):
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                input_metadata,
-                residual,
+                positions, hidden_states, input_metadata, residual
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
-class LlamaForCausalLM(nn.Module):
+class OlmoeForCausalLM(nn.Module):
+
+    fall_back_to_pt_during_load = False
+
     def __init__(
         self,
-        config: LlamaConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        config: PretrainedConfig,
         cache_config: Optional[CacheConfig] = None,
-        efficient_weight_load=False,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = LlamaModel(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.model = OlmoeModel(config, quant_config)
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, quant_config=quant_config
+        )
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
 
-    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
-    ) -> LogitsProcessorOutput:
-        if input_metadata.forward_mode.is_spec_mode():
-            input_metadata.spec_draft_input = DraftInfoFactory.get(
-                input_metadata.spec_algorithm
-            )()
+    ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
-        logits_output = self.logits_processor(
+        return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
-        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-        if input_metadata.spec_draft_input is not None:
-            input_metadata.spec_draft_input.verified_id = (
-                sample_output.batch_next_token_ids
-            )
-            if hasattr(input_metadata.spec_draft_input, "hidden_states"):
-                input_metadata.spec_draft_input.hidden_states = hidden_states
-            input_metadata.spec_draft_input.verified_id = (
-                sample_output.batch_next_token_ids
-            )
-        return sample_output, logits_output
 
-    def get_module_name(self, name):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id, num_shard)
-            ("qkv_proj", "q_proj", "q", 3),
-            ("qkv_proj", "k_proj", "k", 3),
-            ("qkv_proj", "v_proj", "v", 3),
-            ("gate_up_proj", "gate_proj", 0, 2),
-            ("gate_up_proj", "up_proj", 1, 2),
-        ]
-        for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
-            if weight_name in name:
-                return (
-                    name.replace(weight_name, param_name)[: -len(".weight")],
-                    num_shard,
-                )
-        return name[: -len(".weight")], 1
-
-    def get_num_params(self):
-        params_dict = dict(self.named_parameters())
-        return len(params_dict)
-
-    def load_weights(
-        self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -366,45 +331,85 @@ class LlamaForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+
         params_dict = dict(self.named_parameters())
-
-        def load_weights_per_param(name, loaded_weight):
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                return
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                return
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                return
-
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
+                    continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                if name not in params_dict:
+                    continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    return
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+                    break
+                else:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Remapping the name of FP8 kv-scale.
+                    if name.endswith("kv_scale"):
+                        remapped_kv_scale_name = name.replace(
+                            ".kv_scale", ".attn.kv_scale"
+                        )
+                        if remapped_kv_scale_name not in params_dict:
+                            print_warning_once(
+                                "Found kv scale in the checkpoint "
+                                f"(e.g. {name}), but not found the expected "
+                                f"name in the model "
+                                f"(e.g. {remapped_kv_scale_name}). "
+                                "kv-scale is not loaded."
+                            )
+                            continue
+                        else:
+                            name = remapped_kv_scale_name
 
-        if name is None or loaded_weight is None:
-            for name, loaded_weight in weights:
-                load_weights_per_param(name, loaded_weight)
-        else:
-            load_weights_per_param(name, loaded_weight)
-
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
 
-EntryClass = LlamaForCausalLM
+EntryClass = OlmoeForCausalLM

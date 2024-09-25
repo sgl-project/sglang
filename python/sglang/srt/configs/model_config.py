@@ -33,17 +33,17 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
-        model_overide_args: Optional[dict] = None,
+        model_override_args: Optional[dict] = None,
     ) -> None:
         self.path = path
         self.trust_remote_code = trust_remote_code
         self.revision = revision
-        self.model_overide_args = model_overide_args
+        self.model_override_args = model_override_args
         self.hf_config = get_config(
             self.path,
             trust_remote_code,
             revision,
-            model_overide_args=model_overide_args,
+            model_override_args=model_override_args,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         if context_length is not None:
@@ -61,6 +61,11 @@ class ModelConfig:
         # FIXME: temporary special judge for deepseek v2 MLA architecture
         if "DeepseekV2ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 256
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+        elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
