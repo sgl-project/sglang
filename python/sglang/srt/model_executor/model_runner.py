@@ -568,17 +568,25 @@ def import_model_classes():
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
-            module = importlib.import_module(name)
+            try:
+                module = importlib.import_module(name)
+            except Exception as e:
+                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+                continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
                 if isinstance(
                     entry, list
                 ):  # To support multiple model classes in one module
                     for tmp in entry:
-                        assert tmp.__name__ not in model_arch_name_to_cls
+                        assert (
+                            tmp.__name__ not in model_arch_name_to_cls
+                        ), f"{tmp.__name__}"
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
-                    assert entry.__name__ not in model_arch_name_to_cls
+                    assert (
+                        entry.__name__ not in model_arch_name_to_cls
+                    ), f"{entry.__name__}"
                     model_arch_name_to_cls[entry.__name__] = entry
 
     return model_arch_name_to_cls
