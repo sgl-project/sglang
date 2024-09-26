@@ -56,6 +56,7 @@ class JumpForwardMap:
             except InvalidSyntax as e:
                 logger.warning(f"skip invalid regex: {regex_string}, error: {e}")
                 self.state_to_jump_forward = None
+                return
 
             byte_fsm = make_byte_level_fsm(
                 regex_pattern.to_fsm().reduce(), keep_utf8=True
