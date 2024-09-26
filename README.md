@@ -291,7 +291,7 @@ Or start it by docker.
 ```bash
 docker run --gpus all \
     -p 30000:30000 \
-    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -v ~/.cache/modelscope:/root/.cache/modelscope \
     --env "SGLANG_USE_MODELSCOPE=true" \
     --ipc=host \
     lmsysorg/sglang:latest \

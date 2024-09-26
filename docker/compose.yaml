@@ -5,7 +5,7 @@ services:
     volumes:
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
       # If you use modelscope, you need mount this directory
-      # - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      # - ${HOME}/.cache/modelscope:/root/.cache/modelscope
     restart: always
     network_mode: host
     # Or you can only publish port 30000
