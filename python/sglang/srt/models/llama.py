@@ -403,6 +403,14 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+        if (
+            hasattr(self.config, "tie_word_embeddings")
+            and self.config.tie_word_embeddings
+        ):
+            # Tie output embedding layer to input embedding layer, to solve issues where lm_head.weight is missing
+            param = self.lm_head.weight
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, self.model.embed_tokens.weight)
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
 

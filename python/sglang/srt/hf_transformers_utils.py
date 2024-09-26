@@ -129,6 +129,7 @@ def get_tokenizer(
             *args,
             trust_remote_code=trust_remote_code,
             tokenizer_revision=tokenizer_revision,
+            clean_up_tokenization_spaces=False,
             **kwargs,
         )
     except TypeError as e:
