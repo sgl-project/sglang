@@ -54,7 +54,7 @@ class JumpForwardMap:
             try:
                 regex_pattern = interegular.parse_pattern(regex_string)
             except InvalidSyntax as e:
-                logger.warning(f"skip invalid regex: {regex_string}, error: {e}")
+                logger.warning(f"skip invalid regex: {regex_string}")
                 self.state_to_jump_forward = None
                 return
 
