@@ -12,7 +12,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-from interegular import parse_pattern, InvalidSyntax
+
+from interegular import InvalidSyntax, parse_pattern
 
 """Cache for the compressed finite state machine."""
 import logging
@@ -24,6 +25,7 @@ from sglang.srt.constrained import RegexGuide, TransformerTokenizer
 from sglang.srt.constrained.base_tool_cache import BaseToolCache
 
 logger = logging.getLogger(__name__)
+
 
 class FSMCache(BaseToolCache):
     def __init__(

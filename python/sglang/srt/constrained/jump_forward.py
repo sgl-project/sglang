@@ -19,13 +19,12 @@ Reference: https://lmsys.org/blog/2024-02-05-compressed-fsm/
 """
 
 import dataclasses
+import logging
 from collections import defaultdict
-from interegular import InvalidSyntax
 
 import interegular
 import outlines.caching
-
-import logging
+from interegular import InvalidSyntax
 
 from sglang.srt.constrained import (
     FSMInfo,
@@ -38,6 +37,7 @@ from sglang.srt.constrained.base_tool_cache import BaseToolCache
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
 
 logger = logging.getLogger(__name__)
+
 
 @dataclasses.dataclass
 class JumpEdge:
