@@ -54,6 +54,7 @@ from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
+    TokenizeReqInput,
     UpdateWeightReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -147,6 +148,17 @@ async def flush_cache():
         "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
+
+
+@app.post("/tokenize_text")
+async def tokenize_text(obj: TokenizeReqInput, request: Request):
+    """Handle a tokenize request."""
+    try:
+        return await tokenizer_manager.tokenize_text(obj, request)
+    except Exception as e:
+        return JSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
 
 
 @app.post("/update_weights")

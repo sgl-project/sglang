@@ -236,6 +236,24 @@ class RuntimeEndpoint(BaseBackend):
         obj = self._generate_http_request(s, data)
         prompt_len = obj["meta_info"]["prompt_tokens"]
 
+        # Determine logprob_start_len based on whether token healing happened
+        texts = [s.text_] + [s.text_ + c for c in choices]
+        res = http_request(
+            self.base_url + "/tokenize_text",
+            json={"text": texts},
+            api_key=self.api_key,
+            verify=self.verify,
+        )
+        self._assert_success(res)
+        token_ids = res.json()
+        token_pre_healing = token_ids[0][prompt_len - 1]
+        logprob_start_len = []
+        for token_id in token_ids[1:]:
+            if token_id[prompt_len - 1] != token_pre_healing:
+                logprob_start_len.append(prompt_len - 2)
+            else:
+                logprob_start_len.append(prompt_len - 1)
+
         # Compute logprob
         data = {
             "text": [s.text_ + c for c in choices],
@@ -244,7 +262,7 @@ class RuntimeEndpoint(BaseBackend):
                 "temperature": 0,
             },
             "return_logprob": True,
-            "logprob_start_len": max(prompt_len - 1, 0),  # For token healing
+            "logprob_start_len": logprob_start_len,
         }
         obj = self._generate_http_request(s, data)
 
