@@ -24,7 +24,7 @@ RUN pip3 install datamodel_code_generator
 WORKDIR /sgl-workspace
 
 RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
-    && git clone --depth=1 https://github.com/sgl-project/sglang.git \
+    && git clone --depth=1 https://github.com/KylinMountain/sglang.git \
     && cd sglang \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          python3 -m pip --no-cache-dir install -e "python[srt]"; \
