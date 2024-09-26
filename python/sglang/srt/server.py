@@ -434,10 +434,8 @@ def _set_envs_and_config(server_args: ServerArgs):
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
-
-    if is_hip():
-        # to figure out a better method of not using fork later
-        mp.set_start_method("spawn", force=True)
+    # to figure out a better method of not using fork later
+    mp.set_start_method("spawn", force=True)
 
 
 def _wait_and_warmup(server_args, pipe_finish_writer, pid):
