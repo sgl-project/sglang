@@ -26,12 +26,14 @@ I'm going to the
 import argparse
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
+
+from sglang.srt.hf_transformers_utils import get_tokenizer
 
 
 @torch.inference_mode()
 def normal_text(args):
-    t = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    t = get_tokenizer(args.model_path, trust_remote_code=True)
     m = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch.float16,

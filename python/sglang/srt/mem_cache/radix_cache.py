@@ -291,15 +291,15 @@ class RadixCache(BasePrefixCache):
 
     def _collect_leaves(self):
         ret_list = []
+        stack = [self.root_node]
 
-        def dfs_(cur_node):
+        while stack:
+            cur_node = stack.pop()
             if len(cur_node.children) == 0:
                 ret_list.append(cur_node)
+            else:
+                stack.extend(cur_node.children.values())
 
-            for x in cur_node.children.values():
-                dfs_(x)
-
-        dfs_(self.root_node)
         return ret_list
 
 

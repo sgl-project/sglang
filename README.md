@@ -60,7 +60,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.3.1.post3 https://github.com/sgl-project/sglang.git
+git clone -b v0.3.2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -263,6 +263,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - BaiChuan2
 - MiniCPM / MiniCPM 3
 - XVERSE / XVERSE MoE
+- SmolLM
 
 
 **Embedding Models**
