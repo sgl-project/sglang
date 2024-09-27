@@ -18,13 +18,13 @@ def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
     """
     # Lazy import to suppress some warnings
     from torchao.quantization import (
+        float8_dynamic_activation_float8_weight,
         int4_weight_only,
         int8_dynamic_activation_int8_weight,
         int8_weight_only,
-        float8_dynamic_activation_float8_weight,
         quantize_,
     )
-    from torchao.quantization.observer import PerTensor, PerRow
+    from torchao.quantization.observer import PerRow, PerTensor
 
     dummy_linear = torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
     dummy_linear.weight = param
@@ -53,8 +53,15 @@ def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
             "per_row": PerRow(),
             "per_tensor": PerTensor(),
         }
-        assert granularity in GRANULARITY_MAP, f"Supported granularity are: {GRANULARITY_MAP.keys()}, got {granularity}"
-        quantize_(dummy_linear, float8_dynamic_activation_float8_weight(granularity=GRANULARITY_MAP[granularity]))
+        assert (
+            granularity in GRANULARITY_MAP
+        ), f"Supported granularity are: {GRANULARITY_MAP.keys()}, got {granularity}"
+        quantize_(
+            dummy_linear,
+            float8_dynamic_activation_float8_weight(
+                granularity=GRANULARITY_MAP[granularity]
+            ),
+        )
 
     return dummy_linear.weight
 
