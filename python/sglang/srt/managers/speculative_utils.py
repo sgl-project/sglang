@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, Type
 
 import torch
+import triton
 
 from python.sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
@@ -76,23 +77,20 @@ class EAGLEDraftInput(SpecDraftInput):
     hidden_states: torch.Tensor = None
     verified_id: torch.Tensor = None
 
-    prev_mode = None
-    sample_output = None
-    topk: int = 10
-    num_verify_token: int = 60
+    def init(self):
+        self.prev_mode = None
+        self.sample_output = None
+        self.topk: int = 10
+        self.num_verify_token: int = 59
 
-    scores: torch.Tensor = None
-    score_list: List[torch.Tensor] = []
-    token_list: List[torch.Tensor] = []
-    iter = 0
-    root_token: int = None
+        self.scores: torch.Tensor = None
+        self.score_list: List[torch.Tensor] = []
+        self.token_list: List[torch.Tensor] = []
+        self.parents_list: List[torch.Tensor] = []
+        self.iter = 0
+        self.root_token: int = None
 
     positions: torch.Tensor = None
-    tree_mask: torch.Tensor = None
-
-    def __init__(self):
-        self.tree_mask_init = torch.eye(self.topk).to("cuda").unsqueeze(0)
-        self.tree_mask = self.tree_mask_init.clone()
 
     def prepare_for_extend(self, batch):
         seq_lens = [0] + batch.seq_lens.tolist()
@@ -107,6 +105,7 @@ class EAGLEDraftInput(SpecDraftInput):
             model_input_ids, dtype=torch.int32, device="cuda"
         )
         self.verified_id = self.verified_id.clone()
+        # need consider bs @kavioyu
 
     def capture_for_decode(self, sample_output: SampleOutput, prev_mode: ForwardMode):
         self.sample_output = sample_output
@@ -118,7 +117,7 @@ class EAGLEDraftInput(SpecDraftInput):
         topk_index, topk_p = top.indices, top.values  # b * (1/topk), topk
         if self.prev_mode == ForwardMode.SPECDECODE:
             scores = torch.mul(
-                self.scores.unsqueeze(1), topk_p
+                self.scores.unsqueeze(2), topk_p.reshape(-1, self.topk, self.topk)
             )  # (b, topk) mul (b * topk ,topk) -> b, topk, topk
             topk_cs = torch.topk(
                 scores.flatten(start_dim=1), self.topk, dim=-1
@@ -126,7 +125,7 @@ class EAGLEDraftInput(SpecDraftInput):
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
             self.scores = topk_cs_p
 
-            selected_input_index = topk_cs_index.flatten() // self.topk  # b, topk
+            selected_input_index = topk_cs_index.flatten() // self.topk  # b* topk
 
             batch.spec_draft_input.hidden_states = batch.spec_draft_input.hidden_states[
                 selected_input_index, :
@@ -137,34 +136,34 @@ class EAGLEDraftInput(SpecDraftInput):
             batch.out_cache_loc = batch.alloc_token_slots(batch.input_ids.numel())
             self.score_list.append(scores)
             self.token_list.append(topk_index)
+            self.parents_list.append(
+                selected_input_index + (self.topk * (self.iter - 1) + 1)
+            )
 
         elif self.prev_mode == ForwardMode.SPECEXTEND:
             self.scores = topk_p  # b, top_k
             self.score_list.append(topk_p.unsqueeze(1))
             self.token_list.append(topk_index)
             batch.spec_draft_input.hidden_states = (
-                batch.spec_draft_input.hidden_states.repeat(self.topk, 1)
+                batch.spec_draft_input.hidden_states.repeat_interleave(self.topk, 0)
             )
             batch.input_ids = topk_index.flatten()
             batch.out_cache_loc = batch.alloc_token_slots(topk_index.numel())
+            self.parents_list.append(
+                torch.zeros(self.topk + 1, dtype=torch.long, device="cuda")
+            )
 
         self.positions = (
             batch.seq_lens[:, None]
             + torch.ones([1, self.topk], device="cuda") * self.iter
-        )
-        print("input ids ", batch.input_ids)
-        print("allocate ", batch.out_cache_loc)
-        print("next pos ", self.positions)
-        # TODO: Check it @kavioyu
+        ).flatten()
+
         batch.req_to_token_pool.req_to_token[
             batch.req_pool_indices,
             batch.seq_lens
-            + self.topk * self.iter
-            - 1 : batch.seq_lens
-            + self.topk * (self.iter + 1)
-            - 1,
+            + self.topk * self.iter : batch.seq_lens
+            + self.topk * (self.iter + 1),
         ] = batch.out_cache_loc
-
         self.iter += 1
 
     def prepare_for_verify(self):
@@ -173,10 +172,10 @@ class EAGLEDraftInput(SpecDraftInput):
         top_scores = torch.topk(score_list, self.num_verify_token, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
+
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((self.verified_id, draft_tokens), dim=0)
-
-        print(draft_tokens)
+        print(torch.cat(self.parents_list, dim=0))
 
     def generate_attn_arg(
         self,
@@ -189,9 +188,10 @@ class EAGLEDraftInput(SpecDraftInput):
         bs = self.topk * len(req_pool_indices)
         seq_len = self.positions.reshape(-1).contiguous()
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
-        cum_kv_seq_len[1:] = torch.cumsum(seq_len, dim=0)
+        cum_kv_seq_len[1:] = torch.cumsum(seq_len + 1, dim=0)
         kv_last_page_len = torch.ones((bs,), dtype=torch.int32, device="cuda")
         kv_indices_list = []
+        # TODO: reimplement it by triton @kavioyu
         for i in range(len(req_pool_indices)):
             for k in range(self.topk):
                 index = torch.arange(self.iter) * self.topk + k
@@ -205,16 +205,13 @@ class EAGLEDraftInput(SpecDraftInput):
                         req_pool_indices[i], paged_kernel_lens[i] + index
                     ]
                 )
-
         kv_indices = torch.cat(kv_indices_list, dim=0).contiguous()
-
         return kv_indices, cum_kv_seq_len, kv_last_page_len
 
     def clear(self):
         self.iter = 0
         self.score_list.clear()
         self.positions = None
-        self.tree_mask = self.tree_mask_init.clone()
 
 
 class SpecInfoPipline:

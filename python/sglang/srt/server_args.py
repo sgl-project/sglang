@@ -212,7 +212,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--num-speculative-tokens",
-            type=float,
+            type=int,
             help="The number of token sampled from draft model in Speculative Decoding.",
             required=False,
             default=5,

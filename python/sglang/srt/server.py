@@ -483,7 +483,9 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [10, 11, 12]
     else:
-        json_data["text"] = "The capital city of France is"
+        json_data["text"] = (
+            "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Where is the capital city of France? ASSISTANT:"
+        )
 
     try:
         for _ in range(server_args.dp_size):

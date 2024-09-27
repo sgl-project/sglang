@@ -83,8 +83,10 @@ class SpecDraftServer(ModelTpServer):
         if new_batch is not None:
             # Run a new prefill batch
             draft_input = self.spec_queue.draft_input_queue.get()
+            draft_input.init()
             new_batch.spec_draft_input = draft_input
             self.forward_prefill_batch(new_batch)
+            new_batch.spec_draft_input.prepare_for_decode(new_batch)
 
             if not new_batch.is_empty():
                 if self.running_batch is None:
@@ -130,8 +132,8 @@ class SpecDraftServer(ModelTpServer):
         # with target runner. target target will decides which req need be retracted.
 
         # Update batch tensors
-        batch.prepare_for_decode()
         batch.forward_mode = ForwardMode.SPECDECODE
 
         # Forward and sample the next tokens
         sample_output, logits_output = self.model_runner.forward(batch)
+        batch.spec_draft_input.prepare_for_decode(batch)

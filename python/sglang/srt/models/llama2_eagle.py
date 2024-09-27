@@ -181,6 +181,7 @@ class LlamaDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_id = layer_id
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
@@ -224,20 +225,23 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
+        residual = hidden_states
+
+        if self.layer_id != 0:
             hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             input_metadata=input_metadata,
         )
 
+        hidden_states = residual + hidden_states
+        residual = hidden_states
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
         return hidden_states, residual
 
 
@@ -263,7 +267,7 @@ class LlamaModel(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.fc = torch.nn.Linear(config.hidden_size * 2, config.hidden_size)
 
     def forward(
@@ -292,7 +296,7 @@ class LlamaModel(nn.Module):
                 input_metadata,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        # hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -321,6 +325,8 @@ class LlamaForCausalLMEagle(nn.Module):
     ) -> LogitsProcessorOutput:
         print("*" * 100)
         print(input_metadata.forward_mode)
+        print(input_ids)
+        print(positions)
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
         input_metadata.spec_draft_input.hidden_states = hidden_states
         logits_output = self.logits_processor(

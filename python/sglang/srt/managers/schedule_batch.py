@@ -690,9 +690,6 @@ class ScheduleBatch:
         return jump_forward_reqs
 
     def prepare_for_decode(self, input_ids=None):
-        if self.spec_draft_input:
-            self.spec_draft_input.prepare_for_decode(self)
-            return
         self.forward_mode = ForwardMode.DECODE
 
         if input_ids is None:
