@@ -13,11 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from interegular import InvalidSyntax, parse_pattern
-
 """Cache for the compressed finite state machine."""
 import logging
 
+from interegular import InvalidSyntax, parse_pattern
 from outlines.fsm.json_schema import build_regex_from_schema
 from transformers import AutoTokenizer
 
