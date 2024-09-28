@@ -39,7 +39,9 @@ class TestEmbeddingModels(unittest.TestCase):
         prefill_tolerance,
     ) -> None:
         with HFRunner(
-            model_path, torch_dtype=torch_dtype, is_generation=False
+            model_path,
+            torch_dtype=torch_dtype,
+            model_type="embedding",
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts)
 
@@ -47,7 +49,7 @@ class TestEmbeddingModels(unittest.TestCase):
             model_path,
             tp_size=tp_size,
             torch_dtype=torch_dtype,
-            is_generation=False,
+            model_type="embedding",
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts)
 
