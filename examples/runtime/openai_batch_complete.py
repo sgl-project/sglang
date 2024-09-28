@@ -82,7 +82,7 @@ class OpenAIBatchProcessor:
 processor = OpenAIBatchProcessor()
 
 # Process the batch job
-input_file_path = "input_complete.jsonl"
+input_file_path = "input.jsonl"
 endpoint = "/v1/completions"
 completion_window = "24h"
 
