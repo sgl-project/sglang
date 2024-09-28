@@ -35,6 +35,7 @@ from vllm.sequence import VLLM_TOKEN_ID_ARRAY_TYPE, SequenceData
 
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
 
@@ -666,7 +667,7 @@ class MllamaTextCrossAttention(nn.Module):
     def __init__(
         self,
         config: Optional[config_mllama.MllamaTextConfig] = None,
-        layer_idx: Optional[int] = None,
+        layer_id: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -681,7 +682,7 @@ class MllamaTextCrossAttention(nn.Module):
         self.dropout = config.dropout
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // self.num_heads
-        self.layer_idx = layer_idx
+        self.layer_id = layer_id
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.q_local_size = self.num_local_heads * self.head_dim
         self.kv_local_size = self.num_local_key_value_heads * self.head_dim
@@ -708,11 +709,13 @@ class MllamaTextCrossAttention(nn.Module):
         self.k_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.scaling = self.head_dim**-0.5
 
-        self.attn = Attention(
+        # TODO: impl cross attention
+        self.attn = RadixAttention(
             self.num_local_heads,
             self.head_dim,
             self.scaling,
             self.num_local_key_value_heads,
+            layer_id=layer_id,
         )
 
     def forward(
@@ -752,14 +755,14 @@ class MllamaCrossAttentionDecoderLayer(torch.nn.Module):
     def __init__(
         self,
         config: config_mllama.MllamaTextConfig,
-        layer_idx: int,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig],
     ) -> None:
         super().__init__()
-        self.layer_idx = layer_idx
+        self.layer_id = layer_id
         self.cross_attn = MllamaTextCrossAttention(
             config=config,
-            layer_idx=layer_idx,
+            layer_id=layer_id,
             quant_config=quant_config,
         )
 
@@ -816,7 +819,7 @@ class MllamaTextModel(nn.Module):
         quant_config: Optional[QuantizationConfig],
     ):
         super().__init__()
-        self.padding_idx = config.pad_token_id
+        self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size + 8, config.hidden_size
@@ -824,16 +827,20 @@ class MllamaTextModel(nn.Module):
         self.cross_attention_layers = config.cross_attention_layers
 
         layers = []
-        for layer_idx in range(config.num_hidden_layers):
-            if layer_idx in self.cross_attention_layers:
+        for layer_id in range(config.num_hidden_layers):
+            if layer_id in self.cross_attention_layers:
                 layers.append(
                     MllamaCrossAttentionDecoderLayer(
-                        config, layer_idx, quant_config=quant_config
+                        config, layer_id, quant_config=quant_config
                     )
                 )
             else:
                 # TODO: force LlamaDecoderLayer to config.attention_bias=False
-                layers.append(LlamaDecoderLayer(config, quant_config=quant_config))
+                layers.append(
+                    LlamaDecoderLayer(
+                        config, quant_config=quant_config, layer_id=layer_id
+                    )
+                )
 
         self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -851,7 +858,7 @@ class MllamaTextModel(nn.Module):
         inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
 
-        for idx, decoder_layer in enumerate(self.layers):
+        for _, decoder_layer in enumerate(self.layers):
             if isinstance(decoder_layer, MllamaCrossAttentionDecoderLayer):
                 if not skip_cross_attention:
                     hidden_states = decoder_layer(
@@ -923,7 +930,6 @@ class MllamaForCausalLM(nn.Module):
 
 
 class MllamaForConditionalGeneration(nn.Module):
-
     def __init__(
         self,
         config: config_mllama.MllamaConfig,
@@ -951,7 +957,20 @@ class MllamaForConditionalGeneration(nn.Module):
             config.text_config.hidden_size,
             bias=True,
         )
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(config.text_config)
+
+    # def pad_input_ids(self, input_ids, pad_value, pixel_values, image_sizes):
+    #     if isinstance(pixel_values, list):
+    #         pixel_values = pixel_values[0]
+    #     print(f"pixel_values: {pixel_values.shape}")
+    #     num_concurrent_media, num_tiles = pixel_values.shape[1:3]
+    #     num_patches = self.vision_model.num_patches
+    #     image_len = num_concurrent_media * num_tiles * num_patches
+
+    #     print(
+    #         f"\x1b[31mnum_tiles: {num_tiles}, num_patches: {num_patches}, image_len: {image_len}\x1b[0m"
+    #     )
+    #     return image_len, None
 
     def _parse_and_validate_image_input(self, **kwargs: object):
         # tensor with the same shape will be batched together by
@@ -1033,15 +1052,18 @@ class MllamaForConditionalGeneration(nn.Module):
         self, cross_attention_states: torch.Tensor, input_metadata: InputMetadata
     ):
 
+        # TODO: fix input_metadata.encoder_seq_lens
         cross_attention_states_flat = torch.zeros(
-            sum(attn_metadata.encoder_seq_lens),
+            sum(input_metadata.encoder_seq_lens),
             cross_attention_states.shape[-1],
             device=cross_attention_states.device,
             dtype=cross_attention_states.dtype,
         )
         start_pos = 0
         for seq_len, vision_token_in_batch in zip(
-            attn_metadata.encoder_seq_lens, cross_attention_states
+            # TODO: fix input_metadata.encoder_seq_lens
+            input_metadata.encoder_seq_lens,
+            cross_attention_states,
         ):
             end_pos = start_pos + seq_len
             cross_attention_states_flat[start_pos:end_pos] = vision_token_in_batch[
@@ -1054,8 +1076,10 @@ class MllamaForConditionalGeneration(nn.Module):
             (int(input_metadata.extend_seq_lens.sum()), 1), dtype=torch.bool
         )
         start_pos = 0
+
+        # TODO: fix input_metadata.encoder_seq_lens
         for seq_len, encoder_seq_len in zip(
-            input_metadata.seq_lens.tolist(), attn_metadata.encoder_seq_lens
+            input_metadata.seq_lens.tolist(), input_metadata.encoder_seq_lens
         ):
             if encoder_seq_len == 0:
                 full_text_row_masked_out_mask[start_pos : start_pos + seq_len] = False
@@ -1074,15 +1098,27 @@ class MllamaForConditionalGeneration(nn.Module):
         **kwargs: object,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         image_inputs = self._parse_and_validate_image_input(**kwargs)
+        setattr(
+            input_metadata,
+            "encoder_seq_lens_tensor",
+            torch.zeros_like(input_metadata.seq_lens),
+        )
+        setattr(
+            input_metadata,
+            "encoder_seq_lens",
+            input_metadata.encoder_seq_lens_tensor.tolist(),
+        )
         if image_inputs is None:
             cross_attention_mask = None
             full_text_row_masked_out_mask = (
-                (attn_metadata.encoder_seq_lens_tensor != 0)
+                # TODO: fix input_metadata.encoder_seq_lens
+                (input_metadata.encoder_seq_lens_tensor != 0)
                 .reshape(-1, 1)
                 .to(input_ids.device)
             )
             cross_attention_states = None
-            skip_cross_attention = max(attn_metadata.encoder_seq_lens) == 0
+            # TODO: fix input_metadata.encoder_seq_lens
+            skip_cross_attention = max(input_metadata.encoder_seq_lens) == 0
         else:
             # NOTE: llama's reference implementation runs vision model on CPU
             pixel_values = image_inputs["data"]
@@ -1105,7 +1141,7 @@ class MllamaForConditionalGeneration(nn.Module):
             # TODO: support multi-image by this mask
             cross_attention_mask = None
 
-        outputs = self.language_model(
+        hidden_states = self.language_model(
             input_ids=input_ids,
             positions=positions,
             cross_attention_states=cross_attention_states,
@@ -1114,8 +1150,9 @@ class MllamaForConditionalGeneration(nn.Module):
             input_metadata=input_metadata,
             skip_cross_attention=skip_cross_attention,
         )
-
-        return outputs
+        return self.logits_processor(
+            input_ids, hidden_states, self.language_model.lm_head.weight, input_metadata
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
