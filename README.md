@@ -163,6 +163,7 @@ curl http://localhost:30000/generate \
     }
   }'
 ```
+
 Learn more about the argument specification, streaming, and multi-modal support [here](docs/en/sampling_params.md).
 
 ### OpenAI Compatible API
@@ -264,7 +265,6 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - MiniCPM / MiniCPM 3
 - XVERSE / XVERSE MoE
 - SmolLM
-
 
 **Embedding Models**
 
