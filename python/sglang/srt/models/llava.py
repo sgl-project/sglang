@@ -35,25 +35,22 @@ from vllm.config import CacheConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
     unpad_image_shape,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
 
 class LlavaBaseForCausalLM(nn.Module):
-    def pad_input_ids(
-        self,
-        input_ids: List[int],
-        pad_value: List[int],
-        pixel_values: List,
-        image_sizes: List[List[int]],
-    ):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+        image_sizes, pad_values = image_inputs.image_sizes, image_inputs.pad_values
+
         # hardcode for spatial_unpad + anyres
         image_aspect_ratio = "anyres" if len(image_sizes) == 1 else "pad"
         offset_list = []
@@ -92,8 +89,8 @@ class LlavaBaseForCausalLM(nn.Module):
                         new_w = int(new_w // times)
                 new_image_feature_len += new_h * (new_w + 1)
 
-            pad_ids = pad_value * (
-                (new_image_feature_len + len(pad_value)) // len(pad_value)
+            pad_ids = pad_values * (
+                (new_image_feature_len + len(pad_values)) // len(pad_values)
             )
             # print("calculated new_image_feature_len: ", new_image_feature_len)
             try:
@@ -107,7 +104,9 @@ class LlavaBaseForCausalLM(nn.Module):
                 + input_ids[offset + 1 :]
             )
             offset_list.append(offset)
-        return input_ids, offset_list
+
+        image_inputs.image_offsets = offset_list
+        return input_ids
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)

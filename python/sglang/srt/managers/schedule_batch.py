@@ -102,6 +102,20 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
+@dataclass
+class ImageInputs:
+    pixel_values: torch.Tensor
+    image_hash: int
+    image_sizes: Optional[list] = None
+    image_offsets: Optional[list] = None
+    pad_values: Optional[list] = None
+    modalities: Optional[list] = None
+
+    image_embeds: Optional[List[torch.Tensor]] = None
+    aspect_ratio_ids: Optional[List[torch.Tensor]] = None
+    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
+
+
 class Req:
     """Store all inforamtion of a request."""
 
@@ -147,11 +161,12 @@ class Req:
         self.completion_tokens_wo_jump_forward = 0
 
         # For vision inputs
-        self.pixel_values = None
-        self.image_sizes = None
-        self.image_offsets = None
-        self.pad_value = None
-        self.modalities = None
+        self.image_inputs: Optional[ImageInputs] = None
+        # self.pixel_values = None
+        # self.image_sizes = None
+        # self.image_offsets = None
+        # self.pad_value = None
+        # self.modalities = None
 
         # Prefix info
         self.prefix_indices = []
@@ -654,15 +669,9 @@ class ScheduleBatch:
                     self.tree_cache.cache_finished_req(req, cur_all_ids)
 
                     # re-applying image padding
-                    if req.pixel_values is not None:
-                        (
-                            req.origin_input_ids,
-                            req.image_offsets,
-                        ) = model_runner.model.pad_input_ids(
-                            req.origin_input_ids_unpadded,
-                            req.pad_value,
-                            req.pixel_values,
-                            req.image_sizes,
+                    if req.image_inputs is not None:
+                        req.origin_input_ids = model_runner.model.pad_input_ids(
+                            req.origin_input_ids_unpadded, req.image_inputs
                         )
 
                     jump_forward_reqs.append(req)

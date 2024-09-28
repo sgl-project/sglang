@@ -26,7 +26,8 @@ from vllm.config import CacheConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama import LlamaForCausalLM
 
 
@@ -54,17 +55,12 @@ class LlavaVidForCausalLM(nn.Module):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def pad_input_ids(
-        self,
-        input_ids: List[int],
-        pad_value: List[int],
-        pixel_values: List,
-        image_sizes: List[List[int]],
-    ):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+        pad_values = image_inputs.pad_values
         new_image_feature_len = self.image_feature_len
 
-        pad_ids = pad_value * (
-            (new_image_feature_len + len(pad_value)) // len(pad_value)
+        pad_ids = pad_values * (
+            (new_image_feature_len + len(pad_values)) // len(pad_values)
         )
         offset = input_ids.index(self.config.image_token_index)
         # old_len + pad_len - 1, because we need to remove image_token_id
@@ -73,7 +69,8 @@ class LlavaVidForCausalLM(nn.Module):
             + pad_ids[:new_image_feature_len]
             + input_ids[offset + 1 :]
         )
-        return new_input_ids, [offset]
+        image_inputs.image_offsets = [offset]
+        return new_input_ids
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)

@@ -91,10 +91,10 @@ class InputMetadata:
 
     def init_multimuldal_info(self, batch: ScheduleBatch):
         reqs = batch.reqs
-        self.pixel_values = [r.pixel_values for r in reqs]
-        self.image_sizes = [r.image_sizes for r in reqs]
-        self.image_offsets = [r.image_offsets for r in reqs]
-        self.modalities = [r.modalities for r in reqs]
+        self.pixel_values = [r.image_inputs.pixel_values for r in reqs]
+        self.image_sizes = [r.image_inputs.image_sizes for r in reqs]
+        self.image_offsets = [r.image_inputs.image_offsets for r in reqs]
+        self.modalities = [r.image_inputs.modalities for r in reqs]
 
     def compute_positions(self, batch: ScheduleBatch):
         if self.forward_mode.is_decode():
