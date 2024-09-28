@@ -219,6 +219,8 @@ def is_generation_model(model_architectures, is_embedding: bool = False):
     if (
         "LlamaEmbeddingModel" in model_architectures
         or "MistralModel" in model_architectures
+        or "LlamaForSequenceClassification" in model_architectures
+        or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
     ):
         return False
     else:
