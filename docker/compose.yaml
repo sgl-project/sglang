@@ -4,6 +4,8 @@ services:
     container_name: sglang
     volumes:
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      # If you use modelscope, you need mount this directory
+      # - ${HOME}/.cache/modelscope:/root/.cache/modelscope
     restart: always
     network_mode: host
     # Or you can only publish port 30000
@@ -11,6 +13,8 @@ services:
     #   - 30000:30000
     environment:
       HF_TOKEN: <secret>
+      # if you use modelscope to download model, you need set this environment
+      # - SGLANG_USE_MODELSCOPE: true
     entrypoint: python3 -m sglang.launch_server
     command:
       --model-path meta-llama/Meta-Llama-3.1-8B-Instruct
