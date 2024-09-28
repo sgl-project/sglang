@@ -317,11 +317,6 @@ class UpdateWeightReqOutput:
 
 
 @dataclass
-class TokenizeReqInput:
-    text: Union[List[str], str]
-
-
-@dataclass
 class AbortReq:
     # The request id
     rid: str

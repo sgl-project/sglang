@@ -48,7 +48,6 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    TokenizeReqInput,
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
 )
@@ -545,14 +544,6 @@ class TokenizerManager:
             return result.success, result.message
         else:
             return False, "Another update is in progress. Please try again later."
-
-    async def tokenize_text(
-        self, obj: TokenizeReqInput, request: Optional[fastapi.Request] = None
-    ):
-        if isinstance(obj.text, str):
-            return self.tokenizer.encode(obj.text)
-        else:
-            return [self.tokenizer.encode(t) for t in obj.text]
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.

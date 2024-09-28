@@ -236,24 +236,6 @@ class RuntimeEndpoint(BaseBackend):
         obj = self._generate_http_request(s, data)
         prompt_len = obj["meta_info"]["prompt_tokens"]
 
-        # Determine logprob_start_len based on whether token healing happened
-        texts = [s.text_] + [s.text_ + c for c in choices]
-        res = http_request(
-            self.base_url + "/tokenize_text",
-            json={"text": texts},
-            api_key=self.api_key,
-            verify=self.verify,
-        )
-        self._assert_success(res)
-        token_ids = res.json()
-        token_pre_healing = token_ids[0][prompt_len - 1]
-        logprob_start_len = []
-        for token_id in token_ids[1:]:
-            if token_id[prompt_len - 1] != token_pre_healing:
-                logprob_start_len.append(prompt_len - 2)
-            else:
-                logprob_start_len.append(prompt_len - 1)
-
         # Compute logprob
         data = {
             "text": [s.text_ + c for c in choices],
@@ -262,7 +244,8 @@ class RuntimeEndpoint(BaseBackend):
                 "temperature": 0,
             },
             "return_logprob": True,
-            "logprob_start_len": logprob_start_len,
+            "return_text_in_logprobs": True,
+            "logprob_start_len": prompt_len - 2,  # For token healing
         }
         obj = self._generate_http_request(s, data)
 
@@ -271,6 +254,17 @@ class RuntimeEndpoint(BaseBackend):
         ]
         input_token_logprobs = [r["meta_info"]["input_token_logprobs"] for r in obj]
         output_token_logprobs = [r["meta_info"]["output_token_logprobs"] for r in obj]
+
+        # Remove extra token if no token healing occurred
+        for i in range(len(input_token_logprobs)):
+            healed_token_str = input_token_logprobs[i][0][-1]
+            healed_token_logprob = input_token_logprobs[i][0][0]
+            if s.text_.endswith(healed_token_str):
+                normalized_prompt_logprobs[i] = (
+                    normalized_prompt_logprobs[i] * len(input_token_logprobs[i])
+                    - healed_token_logprob
+                ) / (len(input_token_logprobs[i]) - 1)
+                input_token_logprobs[i] = input_token_logprobs[i][1:]
 
         # Compute unconditional logprobs if required
         if choices_method.requires_unconditional_logprobs:
