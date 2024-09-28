@@ -1,7 +1,9 @@
 """
 Usage:
+
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 python openai_batch_chat.py
+
 Note: Before running this script,
 you should create the input.jsonl file with the following content:
 {"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo-0125", "messages": [{"role": "system", "content": "You are a helpful assistant."},{"role": "user", "content": "Hello world!  List 3 NBA players and tell a story"}],"max_tokens": 300}}
@@ -13,12 +15,10 @@ import os
 import time
 
 import openai
-from openai import OpenAI
 
 
 class OpenAIBatchProcessor:
-    def __init__(self, api_key):
-        # client = OpenAI(api_key=api_key)
+    def __init__(self):
         client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
 
         self.client = client
@@ -81,8 +81,7 @@ class OpenAIBatchProcessor:
 
 
 # Initialize the OpenAIBatchProcessor
-api_key = os.environ.get("OPENAI_API_KEY")
-processor = OpenAIBatchProcessor(api_key)
+processor = OpenAIBatchProcessor()
 
 # Process the batch job
 input_file_path = "input.jsonl"

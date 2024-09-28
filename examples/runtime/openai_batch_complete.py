@@ -10,16 +10,13 @@ you should create the input.jsonl file with the following content:
 """
 
 import json
-import os
 import time
 
 import openai
-from openai import OpenAI
 
 
 class OpenAIBatchProcessor:
-    def __init__(self, api_key):
-        # client = OpenAI(api_key=api_key)
+    def __init__(self):
         client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
 
         self.client = client
@@ -82,11 +79,10 @@ class OpenAIBatchProcessor:
 
 
 # Initialize the OpenAIBatchProcessor
-api_key = os.environ.get("OPENAI_API_KEY")
-processor = OpenAIBatchProcessor(api_key)
+processor = OpenAIBatchProcessor()
 
 # Process the batch job
-input_file_path = "input_complete.jsonl"
+input_file_path = "input.jsonl"
 endpoint = "/v1/completions"
 completion_window = "24h"
 
