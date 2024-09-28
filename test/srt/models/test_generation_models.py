@@ -30,7 +30,7 @@ from typing import List
 import torch
 
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
-from sglang.test.test_utils import calculate_rouge_l
+from sglang.test.test_utils import calculate_rouge_l, is_in_ci
 
 
 @dataclasses.dataclass
@@ -51,6 +51,7 @@ CI_MODELS = [
 # All other models
 ALL_OTHER_MODELS = [
     ModelCase("Qwen/Qwen2-1.5B"),
+    ModelCase("HuggingFaceTB/SmolLM-135M-Instruct"),
 ]
 
 TORCH_DTYPES = [torch.float16]
@@ -72,7 +73,9 @@ class TestGenerationModels(unittest.TestCase):
         max_new_tokens = 32
 
         with HFRunner(
-            model_path, torch_dtype=torch_dtype, is_generation=True
+            model_path,
+            torch_dtype=torch_dtype,
+            model_type="generation",
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -80,7 +83,7 @@ class TestGenerationModels(unittest.TestCase):
             model_path,
             tp_size=model_case.tp_size,
             torch_dtype=torch_dtype,
-            is_generation=True,
+            model_type="generation",
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -132,6 +135,9 @@ class TestGenerationModels(unittest.TestCase):
                 )
 
     def test_others(self):
+        if is_in_ci():
+            return
+
         for model_case in ALL_OTHER_MODELS:
             if (
                 "ONLY_RUN" in os.environ

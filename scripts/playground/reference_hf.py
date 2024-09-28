@@ -26,12 +26,14 @@ I'm going to the
 import argparse
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
+
+from sglang.srt.hf_transformers_utils import get_tokenizer
 
 
 @torch.inference_mode()
 def normal_text(args):
-    t = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    t = get_tokenizer(args.model_path, trust_remote_code=True)
     m = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch.float16,
@@ -45,7 +47,7 @@ def normal_text(args):
         "The capital of the United Kindom is",
         "Today is a sunny day and I like",
     ]
-    max_new_tokens = 17
+    max_new_tokens = 16
 
     torch.cuda.set_device(0)
 

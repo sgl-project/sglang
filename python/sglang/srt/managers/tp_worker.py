@@ -22,7 +22,7 @@ import os
 import pickle
 import time
 import warnings
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
 import torch
 import torch.distributed
@@ -41,6 +41,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TokenizedRewardReqInput,
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
 )
@@ -235,6 +236,7 @@ class ModelTpServer:
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.do_not_get_new_batch = False
 
+    @torch.inference_mode()
     def exposed_step(self, recv_reqs: List):
         try:
             # Recv requests
@@ -242,7 +244,9 @@ class ModelTpServer:
                 if isinstance(recv_req, TokenizedGenerateReqInput):
                     self.handle_generate_request(recv_req)
                     self.do_not_get_new_batch = False
-                elif isinstance(recv_req, TokenizedEmbeddingReqInput):
+                elif isinstance(
+                    recv_req, (TokenizedEmbeddingReqInput, TokenizedRewardReqInput)
+                ):
                     self.handle_embedding_request(recv_req)
                     self.do_not_get_new_batch = False
                 elif isinstance(recv_req, FlushCacheReq):
@@ -270,7 +274,6 @@ class ModelTpServer:
         self.out_pyobjs = []
         return ret
 
-    @torch.inference_mode()
     def forward_step(self):
         if self.do_not_get_new_batch and self.current_inflight_req is None:
             new_batch = None
@@ -475,7 +478,7 @@ class ModelTpServer:
 
     def handle_embedding_request(
         self,
-        recv_req: TokenizedEmbeddingReqInput,
+        recv_req: Union[TokenizedEmbeddingReqInput, TokenizedRewardReqInput],
     ):
         req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.tokenizer = self.tokenizer

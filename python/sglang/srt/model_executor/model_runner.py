@@ -467,7 +467,6 @@ class ModelRunner:
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
 
-    @torch.inference_mode()
     def forward_decode(self, batch: ScheduleBatch):
         if self.server_args.lora_paths is not None:
             self.lora_manager.prepare_lora_batch(batch)
@@ -481,7 +480,6 @@ class ModelRunner:
             batch.input_ids, input_metadata.positions, input_metadata
         )
 
-    @torch.inference_mode()
     def forward_extend(self, batch: ScheduleBatch):
         input_metadata = InputMetadata.from_schedule_batch(self, batch)
         if self.server_args.lora_paths is not None:
@@ -500,7 +498,6 @@ class ModelRunner:
                 get_embedding=True,
             )
 
-    @torch.inference_mode()
     def forward_extend_multi_modal(self, batch: ScheduleBatch):
         input_metadata = InputMetadata.from_schedule_batch(self, batch)
         return self.model.forward(
@@ -571,17 +568,25 @@ def import_model_classes():
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
-            module = importlib.import_module(name)
+            try:
+                module = importlib.import_module(name)
+            except Exception as e:
+                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+                continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
                 if isinstance(
                     entry, list
                 ):  # To support multiple model classes in one module
                     for tmp in entry:
-                        assert tmp.__name__ not in model_arch_name_to_cls
+                        assert (
+                            tmp.__name__ not in model_arch_name_to_cls
+                        ), f"Duplicated model implementation for {tmp.__name__}"
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
-                    assert entry.__name__ not in model_arch_name_to_cls
+                    assert (
+                        entry.__name__ not in model_arch_name_to_cls
+                    ), f"Duplicated model implementation for {entry.__name__}"
                     model_arch_name_to_cls[entry.__name__] = entry
 
     return model_arch_name_to_cls
