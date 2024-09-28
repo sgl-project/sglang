@@ -80,6 +80,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
 ```
 - To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes.
+- To enable torchao quantization, add `--torchao-config int4wo-128`. It supports various quantization strategies.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
 - If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](https://sglang.readthedocs.io/en/latest/custom_chat_template.html).
