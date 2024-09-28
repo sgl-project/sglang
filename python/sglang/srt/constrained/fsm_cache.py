@@ -83,6 +83,6 @@ class FSMCache(BaseToolCache):
         try:
             parse_pattern(regex)
         except InvalidSyntax as e:
-            logger.warning(f"skip invalid regex guide: {regex}")
+            logger.warning(f"skip invalid regex guide: {regex=}, {e=}")
             return None, regex
         return RegexGuide(regex, self.outlines_tokenizer), regex
