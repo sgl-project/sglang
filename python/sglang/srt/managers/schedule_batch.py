@@ -106,7 +106,7 @@ class FINISH_ABORT(BaseFinishReason):
 @dataclass
 class ImageInputs:
     pixel_values: torch.Tensor
-    image_hash: int
+    image_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
     pad_values: Optional[list] = None
@@ -121,18 +121,22 @@ class ImageInputs:
         # Use image hash as fake token_ids, which is then used for prefix matching
         ret = ImageInputs(
             pixel_values=obj["pixel_values"],
-            image_hash=hash(tuple(obj["image_hashes"])),
+            image_hashes=hash(tuple(obj["image_hashes"])),
         )
-        image_hash = ret.image_hash
+        image_hash = ret.image_hashes
         ret.pad_values = [
             (image_hash) % vocab_size,
             (image_hash >> 16) % vocab_size,
             (image_hash >> 32) % vocab_size,
             (image_hash >> 64) % vocab_size,
         ]
-        ret.image_sizes = obj["image_sizes"]
-        # Only when pixel values is not None we have modalities
-        ret.modalities = obj["modalities"]
+
+        if hasattr(obj, "image_sizes"):
+            ret.image_sizes = obj["image_sizes"]
+        if hasattr(obj, "modalities"):
+            # Only when pixel values is not None we have modalities
+            ret.modalities = obj["modalities"]
+
         return ret
 
 

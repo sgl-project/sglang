@@ -36,6 +36,7 @@ from vllm.sequence import VLLM_TOKEN_ID_ARRAY_TYPE, SequenceData
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
 
@@ -959,18 +960,17 @@ class MllamaForConditionalGeneration(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.text_config)
 
-    # def pad_input_ids(self, input_ids, pad_value, pixel_values, image_sizes):
-    #     if isinstance(pixel_values, list):
-    #         pixel_values = pixel_values[0]
-    #     print(f"pixel_values: {pixel_values.shape}")
-    #     num_concurrent_media, num_tiles = pixel_values.shape[1:3]
-    #     num_patches = self.vision_model.num_patches
-    #     image_len = num_concurrent_media * num_tiles * num_patches
+    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+        pixel_values = image_inputs.pixel_values
+        pad_values = image_inputs.pad_values
 
-    #     print(
-    #         f"\x1b[31mnum_tiles: {num_tiles}, num_patches: {num_patches}, image_len: {image_len}\x1b[0m"
-    #     )
-    #     return image_len, None
+        num_concurrent_media, num_tiles = pixel_values.shape[1:3]
+        num_patches = self.vision_model.num_patches
+        image_len = num_concurrent_media * num_tiles * num_patches
+
+        pad_ids = pad_values * ((image_len + len(pad_values)) // len(pad_values))
+
+        return pad_ids[:image_len] + input_ids
 
     def _parse_and_validate_image_input(self, **kwargs: object):
         # tensor with the same shape will be batched together by
