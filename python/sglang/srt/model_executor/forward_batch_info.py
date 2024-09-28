@@ -26,6 +26,7 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.layers.attention_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.speculative_utils import SpecDraftInput
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -37,17 +38,30 @@ class ForwardMode(IntEnum):
     EXTEND = auto()
     # Decode one token.
     DECODE = auto()
+    # Speculative Extend of draft model.
+    SPECEXTEND = auto()
+    # Speculative Decode of draft model.
+    SPECDECODE = auto()
+    # Speculative verify of target model.
+    SPECVERIFY = auto()
     # Contains both PREFILL and EXTEND.
     MIXED = auto()
+
+    def is_spec_mode(self):
+        return self in (self.SPECEXTEND, self.SPECVERIFY, self.SPECDECODE)
 
     def is_prefill(self):
         return self == ForwardMode.PREFILL
 
     def is_extend(self):
-        return self == ForwardMode.EXTEND or self == ForwardMode.MIXED
+        return self in (ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.SPECEXTEND)
 
     def is_decode(self):
-        return self == ForwardMode.DECODE
+        return self in (
+            ForwardMode.DECODE,
+            ForwardMode.SPECDECODE,
+            ForwardMode.SPECVERIFY,
+        )
 
     def is_mixed(self):
         return self == ForwardMode.MIXED
@@ -89,6 +103,10 @@ class InputMetadata:
     image_offsets: List[List[int]] = None
     modalities: List[List[str]] = None
 
+    # Information used for speculative decoding
+    spec_draft_input: SpecDraftInput = None
+    spec_algorithm: str = None
+
     def init_multimuldal_info(self, batch: ScheduleBatch):
         reqs = batch.reqs
         self.pixel_values = [r.pixel_values for r in reqs]
@@ -97,7 +115,10 @@ class InputMetadata:
         self.modalities = [r.modalities for r in reqs]
 
     def compute_positions(self, batch: ScheduleBatch):
-        if self.forward_mode.is_decode():
+        spec_positions = getattr(self.spec_draft_input, "positions", None)
+        if spec_positions is not None:  # ForwardMode.SPECDECODE
+            self.positions = spec_positions
+        elif self.forward_mode.is_decode():
             if True:
                 self.positions = self.seq_lens - 1
             else:
@@ -162,6 +183,8 @@ class InputMetadata:
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
         )
+        ret.spec_draft_input = batch.spec_draft_input
+        ret.spec_algorithm = batch.spec_algorithm
 
         ret.compute_positions(batch)
 

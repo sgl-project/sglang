@@ -3,12 +3,15 @@
 import os
 import sys
 
+import torch.multiprocessing as multiprocessing
+
 from sglang.srt.server import launch_server
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_child_process
 
 if __name__ == "__main__":
     server_args = prepare_server_args(sys.argv[1:])
+    multiprocessing.set_start_method("forkserver", force=True)
 
     try:
         launch_server(server_args)

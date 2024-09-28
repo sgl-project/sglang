@@ -43,6 +43,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.speculative_utils import SpecInfoPipline
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -74,6 +75,8 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        spec_info: SpecInfoPipline,
+        is_draft_runner: bool,
     ):
         # Parse args
         self.model_config = model_config
@@ -83,6 +86,8 @@ class ModelRunner:
         self.tp_size = tp_size
         self.nccl_port = nccl_port
         self.server_args = server_args
+        self.spec_info = spec_info
+        self.is_draft_runner = is_draft_runner
         self.is_multimodal_model = is_multimodal_model(
             self.model_config.hf_config.architectures
         )
@@ -116,6 +121,23 @@ class ModelRunner:
         min_per_gpu_memory = self.init_torch_distributed()
         self.sampler = Sampler()
         self.load_model()
+        if self.server_args.speculative_algorithm == "EAGLE":
+            if self.is_draft_runner:
+                assert hasattr(
+                    self.model, "set_embed_and_head"
+                ), "The model: {} is not support EAGLE now.".format(
+                    self.model.__class__.__name__
+                )
+                embed, head = self.spec_info.draft_input_queue.get()
+                self.model.set_embed_and_head(embed, head)
+            else:
+                assert hasattr(
+                    self.model, "get_embed_and_head"
+                ), "The model: {} is not support EAGLE now.".format(
+                    self.model.__class__.__name__
+                )
+                self.spec_info.draft_input_queue.put(self.model.get_embed_and_head())
+
         if server_args.lora_paths is not None:
             self.init_lora_manager()
         self.init_memory_pool(
@@ -192,7 +214,11 @@ class ModelRunner:
         self.device_config = DeviceConfig()
         self.load_config = LoadConfig(load_format=self.server_args.load_format)
         self.vllm_model_config = VllmModelConfig(
-            model=self.server_args.model_path,
+            model=(
+                self.server_args.draft_model_path
+                if self.is_draft_runner
+                else self.server_args.model_path
+            ),
             quantization=self.server_args.quantization,
             tokenizer=None,
             tokenizer_mode=None,
@@ -352,9 +378,22 @@ class ModelRunner:
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
-        rest_memory = available_gpu_memory - total_gpu_memory * (
-            1 - self.mem_fraction_static
-        )
+        if self.server_args.speculative_algorithm is not None:
+            if self.is_draft_runner:
+                rest_memory = available_gpu_memory - total_gpu_memory * (
+                    1
+                    - self.server_args.draft_mem_fraction
+                    - self.server_args.mem_fraction_static
+                )
+            else:
+                rest_memory = available_gpu_memory - total_gpu_memory * (
+                    1 - self.server_args.mem_fraction_static
+                )
+        else:
+            rest_memory = available_gpu_memory - total_gpu_memory * (
+                1 - self.mem_fraction_static
+            )
+
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
@@ -372,8 +411,12 @@ class ModelRunner:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
-
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        if self.is_draft_runner:
+            self.max_total_num_tokens = self.spec_info.max_total_num_tokens.value
+        else:
+            self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+            if self.spec_info is not None:
+                self.spec_info.max_total_num_tokens.value = self.max_total_num_tokens
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(
@@ -476,9 +519,11 @@ class ModelRunner:
 
         input_metadata = InputMetadata.from_schedule_batch(self, batch)
 
-        return self.model.forward(
+        ret = self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
         )
+        batch.spec_draft_input = input_metadata.spec_draft_input
+        return ret
 
     def forward_extend(self, batch: ScheduleBatch):
         input_metadata = InputMetadata.from_schedule_batch(self, batch)
@@ -486,9 +531,11 @@ class ModelRunner:
             self.lora_manager.prepare_lora_batch(batch, input_metadata.extend_seq_lens)
 
         if self.is_generation:
-            return self.model.forward(
+            ret = self.model.forward(
                 batch.input_ids, input_metadata.positions, input_metadata
             )
+            batch.spec_draft_input = input_metadata.spec_draft_input
+            return ret
         else:
             # Only embedding models have get_embedding parameter
             return self.model.forward(

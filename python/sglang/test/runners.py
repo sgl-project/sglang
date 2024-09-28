@@ -14,12 +14,12 @@ limitations under the License.
 """
 
 import json
-import multiprocessing as mp
 import os
 from dataclasses import dataclass
 from typing import List, Union
 
 import torch
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 

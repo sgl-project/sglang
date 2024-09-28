@@ -22,12 +22,12 @@ limitations under the License.
 """
 
 import dataclasses
-import multiprocessing as mp
 import os
 import unittest
 from typing import List
 
 import torch
+import torch.multiprocessing as mp
 
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l, is_in_ci

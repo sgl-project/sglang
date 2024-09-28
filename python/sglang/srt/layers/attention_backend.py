@@ -160,6 +160,7 @@ class FlashInferAttnBackend(AttentionBackend):
             input_metadata.seq_lens,
             prefix_lens,
             use_ragged=use_ragged,
+            spec_draft_input=input_metadata.spec_draft_input,
         )
 
         self.forward_metadata = (use_ragged, total_num_tokens, self.decode_wrapper)
@@ -307,7 +308,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrapper = decode_wrapper[0]
             else:
                 decode_wrapper = decode_wrapper[1]
-
+        if input_metadata.spec_draft_input is not None:
+            print("save kv pos")
+            print(input_metadata.out_cache_loc)
         if k is not None:
             assert v is not None
             input_metadata.token_to_kv_pool.set_kv_buffer(

@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.managers.speculative_utils import EAGLEDraftInput
+
 
 @triton.jit
 def create_flashinfer_kv_indices_triton(
@@ -49,6 +51,7 @@ class FlashinferUpdater:
         prefix_lens,
         decode_wrapper=None,
         use_ragged=False,
+        spec_draft_input=None,
     ):
         self.forward_mode = forward_mode
         self.model_runner = model_runner
@@ -56,6 +59,7 @@ class FlashinferUpdater:
         self.seq_lens = seq_lens
         self.prefix_lens = prefix_lens
         self.use_ragged = use_ragged
+        self.spec_draft_input = spec_draft_input
 
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -86,23 +90,35 @@ class FlashinferUpdater:
         else:
             paged_kernel_lens = self.seq_lens
 
-        self.kv_indptr = torch.zeros(
-            (self.batch_size + 1,), dtype=torch.int32, device="cuda"
-        )
-        self.kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-        self.kv_indices = torch.empty(
-            self.kv_indptr[-1], dtype=torch.int32, device="cuda"
-        )
+        if (
+            isinstance(self.spec_draft_input, EAGLEDraftInput)
+            and self.forward_mode.is_decode()
+        ):
+            self.kv_indices, self.kv_indptr, self.kv_last_page_len = (
+                self.spec_draft_input.generate_attn_arg(
+                    self.req_pool_indices,
+                    paged_kernel_lens,
+                    self.model_runner.req_to_token_pool,
+                )
+            )
+        else:
+            self.kv_indptr = torch.zeros(
+                (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+            )
+            self.kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+            self.kv_indices = torch.empty(
+                self.kv_indptr[-1], dtype=torch.int32, device="cuda"
+            )
 
-        create_flashinfer_kv_indices_triton[(self.batch_size,)](
-            self.model_runner.req_to_token_pool.req_to_token,
-            self.req_pool_indices,
-            paged_kernel_lens,
-            self.kv_indptr,
-            None,
-            self.kv_indices,
-            self.model_runner.req_to_token_pool.req_to_token.size(1),
-        )
+            create_flashinfer_kv_indices_triton[(self.batch_size,)](
+                self.model_runner.req_to_token_pool.req_to_token,
+                self.req_pool_indices,
+                paged_kernel_lens,
+                self.kv_indptr,
+                None,
+                self.kv_indices,
+                self.model_runner.req_to_token_pool.req_to_token.size(1),
+            )
 
     def _init_indices_sliding_window(self, wrapper_id):
         if wrapper_id == 0:
@@ -218,6 +234,7 @@ def update_flashinfer_indices(
     prefix_lens,
     decode_wrapper=None,
     use_ragged=False,
+    spec_draft_input=None,
 ):
     updater = FlashinferUpdater(
         forward_mode,
@@ -227,6 +244,7 @@ def update_flashinfer_indices(
         prefix_lens,
         decode_wrapper,
         use_ragged,
+        spec_draft_input,
     )
 
     if model_runner.sliding_window_size is None:

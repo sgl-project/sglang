@@ -20,10 +20,10 @@ Each data parallel worker can manage multiple tensor parallel workers.
 
 import dataclasses
 import logging
-import multiprocessing
 from enum import Enum, auto
 
 import numpy as np
+import torch.multiprocessing as multiprocessing
 import zmq
 
 from sglang.srt.managers.controller_single import (

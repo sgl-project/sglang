@@ -22,12 +22,14 @@ import asyncio
 import dataclasses
 import json
 import logging
-import multiprocessing as mp
+import multiprocessing
 import os
 import threading
 import time
 from http import HTTPStatus
 from typing import Dict, List, Optional, Union
+
+import torch.multiprocessing as mp
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -298,7 +300,7 @@ async def retrieve_file_content(file_id: str):
 
 def launch_server(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[mp.connection.Connection] = None,
+    pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
 ):
     """Launch an HTTP server."""
     global tokenizer_manager
@@ -313,6 +315,7 @@ def launch_server(
         server_args.port,
         server_args.additional_ports,
         server_args.dp_size,
+        server_args.speculative_algorithm is not None,
     )
     ports = server_args.additional_ports
     port_args = PortArgs(
@@ -496,7 +499,9 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [10, 11, 12]
     else:
-        json_data["text"] = "The capital city of France is"
+        json_data["text"] = (
+            "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Where is the capital city of France? ASSISTANT:"
+        )
 
     try:
         for _ in range(server_args.dp_size):

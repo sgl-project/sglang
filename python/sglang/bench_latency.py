@@ -48,7 +48,6 @@ import argparse
 import dataclasses
 import itertools
 import logging
-import multiprocessing
 import os
 import sqlite3
 import time
@@ -58,6 +57,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as multiprocessing
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_tokenizer

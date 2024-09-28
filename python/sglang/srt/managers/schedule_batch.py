@@ -18,8 +18,9 @@ limitations under the License.
 """Meta data for requests and batches"""
 
 import logging
+import uuid
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
@@ -31,6 +32,10 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.speculative_utils import SpecDraftInput
+
 from sglang.srt.server_args import ServerArgs
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -358,6 +363,7 @@ class ScheduleBatch:
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: BaseTokenToKVPool
     tree_cache: BasePrefixCache
+    bid: str
 
     forward_mode: ForwardMode = None
     sampling_info: SamplingBatchInfo = None
@@ -378,11 +384,16 @@ class ScheduleBatch:
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
 
+    # For speculative decoding
+    spec_draft_input: SpecDraftInput = None
+    spec_algorithm: str = None
     # Stream
     has_stream: bool = False
 
     @classmethod
-    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+    def init_new(
+        cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache, spec_algorithm=None
+    ):
         return_logprob = any(req.return_logprob for req in reqs)
         has_stream = any(req.stream for req in reqs)
 
@@ -392,7 +403,9 @@ class ScheduleBatch:
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
             return_logprob=return_logprob,
+            bid=uuid.uuid4().hex,
             has_stream=has_stream,
+            spec_algorithm=spec_algorithm,
         )
 
     def batch_size(self):
@@ -427,7 +440,9 @@ class ScheduleBatch:
         return out_cache_loc
 
     def prepare_for_extend(self, vocab_size: int):
-        self.forward_mode = ForwardMode.EXTEND
+        self.forward_mode = (
+            ForwardMode.SPECEXTEND if self.spec_algorithm else ForwardMode.EXTEND
+        )
 
         bs = len(self.reqs)
         reqs = self.reqs
@@ -480,6 +495,8 @@ class ScheduleBatch:
         self.extend_lens_cpu = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens_cpu = [r.extend_logprob_start_len for r in reqs]
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
+        if self.spec_draft_input:
+            self.spec_draft_input.prepare_for_extend(self)
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED

@@ -20,12 +20,12 @@ import concurrent.futures
 import dataclasses
 import json
 import logging
-import multiprocessing as mp
 import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import fastapi
 import numpy as np
+import torch.multiprocessing as mp
 import transformers
 import uvloop
 import zmq

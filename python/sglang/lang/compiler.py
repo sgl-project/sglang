@@ -1,4 +1,4 @@
-import multiprocessing
+import torch.multiprocessing as multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from typing import List, Union

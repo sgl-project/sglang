@@ -2,7 +2,6 @@
 
 import asyncio
 import contextvars
-import multiprocessing
 import queue
 import threading
 import uuid
@@ -11,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional
 
+import torch.multiprocessing as multiprocessing
 import tqdm
 
 from sglang.global_config import global_config

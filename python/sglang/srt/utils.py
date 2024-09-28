@@ -174,6 +174,7 @@ def allocate_init_ports(
     port: Optional[int] = None,
     additional_ports: Optional[List[int]] = None,
     dp_size: int = 1,
+    with_spec_worker: bool = False,
 ):
     """Allocate ports for all connections."""
     if additional_ports:
@@ -185,7 +186,7 @@ def allocate_init_ports(
     cur_port = ret_ports[-1] + 1 if len(ret_ports) > 0 else 10000
 
     # HTTP + Tokenizer + Controller + Detokenizer + dp_size * 1 (nccl)
-    num_ports_needed = 4 + dp_size
+    num_ports_needed = 4 + (dp_size * 2 if with_spec_worker else 1)
     while len(ret_ports) < num_ports_needed:
         if cur_port not in ret_ports and is_port_available(cur_port):
             ret_ports.append(cur_port)
