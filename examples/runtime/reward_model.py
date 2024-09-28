@@ -1,8 +1,6 @@
 # launch server
 # python -m sglang.launch_server --model LxzGordon/URM-LLaMa-3.1-8B --is-embedding
 
-import json
-
 import requests
 
 url = "http://127.0.0.1:30000"
