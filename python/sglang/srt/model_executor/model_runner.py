@@ -133,6 +133,7 @@ class ModelRunner:
             self.cuda_graph_runner = None
 
     def init_torch_distributed(self):
+        logger.info("Init torch distributed begin.")
         device_type = self.device_config.device_type
         # Init torch distributed
         if device_type == "cuda":
@@ -143,8 +144,6 @@ class ModelRunner:
         elif device_type == "xpu":
             torch.xpu.set_device(self.gpu_id)
             backend = "gloo"
-
-        logger.info("Init torch distributed begin.")
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
@@ -257,12 +256,13 @@ class ModelRunner:
         )
         from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
+        device_type = self.device_config.device_type
         logger.info(
             f"Update weights begin. "
-            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(device_type, self.gpu_id):.2f} GB on {device_type}:{self.gpu_id}"
         )
 
-        target_device = torch.device(self.device_config.device)
+        target_device = torch.device(device_type)
 
         try:
             # TODO: Use a better method to check this
