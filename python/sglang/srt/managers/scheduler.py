@@ -70,6 +70,8 @@ class Scheduler:
         while True:
             if self.tp_rank == 0:
                 recv_reqs = self.recv_requests_from_zmq()
+            else:
+                recv_reqs = None
 
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
             out_pyobjs = self.tp_server.exposed_step(recv_reqs)
