@@ -86,6 +86,11 @@ class InputMetadata:
     # For multimodal
     image_inputs: List[ImageInputs] = None
 
+    # Double Sparsity Settings
+    sorted_channels: List[torch.Tensor] = None
+    heavy_token_num: int = 256
+    sparse_decode_thresold: int = 4096
+
     def init_multimuldal_info(self, batch: ScheduleBatch):
         self.image_inputs = [r.image_inputs for r in batch.reqs]
 
@@ -163,5 +168,10 @@ class InputMetadata:
             ret.compute_extend_infos(batch)
 
         model_runner.attn_backend.init_forward_metadata(batch, ret)
+        
+        if model_runner.server_args.enable_double_sparsity:
+            ret.sorted_channels = model_runner.sorted_channels
+            ret.heavy_token_num = model_runner.server_args.ds_heavy_token_num
+            ret.sparse_decode_thresold = model_runner.server_args.ds_sparse_decode_threshold
 
         return ret

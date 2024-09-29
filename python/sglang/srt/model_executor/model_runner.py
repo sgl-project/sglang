@@ -18,6 +18,7 @@ limitations under the License.
 import gc
 import importlib
 import importlib.resources
+import json
 import logging
 import pkgutil
 from functools import lru_cache
@@ -38,7 +39,7 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
-from sglang.srt.layers.attention_backend import FlashInferAttnBackend, TritonAttnBackend
+from sglang.srt.layers.attention_backend import FlashInferAttnBackend, TritonAttnBackend, DoubleSparseAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -46,6 +47,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
+    DoubleSparseTokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
@@ -126,6 +128,9 @@ class ModelRunner:
         self.init_cublas()
         self.init_attention_backend()
         self.init_cuda_graphs()
+
+        if self.server_args.enable_double_sparsity:
+            self.init_double_sparsity_channel_config(self.server_args.ds_heavy_channel_type)
 
     def init_torch_distributed(self):
         # Init torch distributed
@@ -414,6 +419,15 @@ class ModelRunner:
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
             )
+        elif self.server_args.enable_double_sparsity:
+            self.token_to_kv_pool = DoubleSparseTokenToKVPool(
+                self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                heavy_channel_num=self.server_args.ds_heavy_channel_num,
+            )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
@@ -445,10 +459,27 @@ class ModelRunner:
                 "Window attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
             )
-            self.attn_backend = TritonAttnBackend(self)
+            if self.server_args.enable_double_sparsity:
+                self.attn_backend = DoubleSparseAttnBackend(self)
+            else:
+                self.attn_backend = TritonAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
+            )
+            
+    def init_double_sparsity_channel_config(self, selected_channel):
+        
+        selected_channel = "." + selected_channel + "_proj"
+        self.sorted_channels = []
+        # load channel config
+        with open(self.server_args.ds_channel_config_path, "r") as f:
+            channel_config = json.load(f)
+        
+        for i in range(self.model_config.num_hidden_layers):
+            key = "model.layers." + str(i) + ".self_attn" + selected_channel
+            self.sorted_channels.append(
+                torch.tensor(channel_config[key])[:,:self.server_args.ds_heavy_channel_num].contiguous().cuda()
             )
 
     def init_cuda_graphs(self):
