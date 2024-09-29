@@ -172,12 +172,8 @@ class TokenizedGenerateReqInput:
     input_text: str
     # The input token ids
     input_ids: List[int]
-    # The pixel values for input images
-    pixel_values: List[float]
-    # The hash values of input images
-    image_hashes: List[int]
-    # The image sizes
-    image_sizes: List[List[int]]
+    # The image input
+    image_inputs: dict
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the logprobs
@@ -188,8 +184,6 @@ class TokenizedGenerateReqInput:
     top_logprobs_num: int
     # Whether to stream output
     stream: bool
-    # Modalities of the input images
-    modalites: Optional[List[str]] = None
 
     # LoRA related
     lora_path: Optional[str] = None  # None means just use the base model

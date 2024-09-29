@@ -49,6 +49,7 @@ from sglang.srt.managers.policy_scheduler import PolicyScheduler, PrefillAdder
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     BaseFinishReason,
+    ImageInputs,
     Req,
     ScheduleBatch,
 )
@@ -340,29 +341,16 @@ class ModelTpServer:
             req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.tokenizer = self.tokenizer
         req.sampling_params = recv_req.sampling_params
-        req.pixel_values = recv_req.pixel_values
-        if req.pixel_values is not None:
-            # Use image hash as fake token_ids, which is then used
-            # for prefix matching
-            image_hash = hash(tuple(recv_req.image_hashes))
-            req.pad_value = [
-                (image_hash) % self.model_config.vocab_size,
-                (image_hash >> 16) % self.model_config.vocab_size,
-                (image_hash >> 32) % self.model_config.vocab_size,
-                (image_hash >> 64) % self.model_config.vocab_size,
-            ]
-            req.image_sizes = recv_req.image_sizes
-            (
-                req.origin_input_ids,
-                req.image_offsets,
-            ) = self.model_runner.model.pad_input_ids(
-                req.origin_input_ids_unpadded,
-                req.pad_value,
-                req.pixel_values,
-                req.image_sizes,
+
+        # Image inputs
+        if recv_req.image_inputs is not None:
+            req.image_inputs = ImageInputs.from_dict(
+                recv_req.image_inputs, self.model_config.vocab_size
             )
-            # Only when pixel values is not None we have modalities
-            req.modalities = recv_req.modalites
+            req.origin_input_ids = self.model_runner.model.pad_input_ids(
+                req.origin_input_ids_unpadded, req.image_inputs
+            )
+
         req.return_logprob = recv_req.return_logprob
         req.top_logprobs_num = recv_req.top_logprobs_num
         req.stream = recv_req.stream
