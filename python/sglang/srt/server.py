@@ -310,7 +310,7 @@ def launch_server(
     ports = server_args.additional_ports
     port_args = PortArgs(
         tokenizer_port=ports[0],
-        tokenizer_broadcast_port=ports[1],
+        scheduler_port=ports[1],
         detokenizer_port=ports[2],
         nccl_ports=ports[3:],
     )
