@@ -15,13 +15,10 @@ limitations under the License.
 
 """DetokenizerManager is a process that detokenizes the token ids."""
 
-import asyncio
 import dataclasses
 from typing import List
 
-import uvloop
 import zmq
-import zmq.asyncio
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
@@ -33,8 +30,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.utils import find_printable_text, get_exception_traceback
-
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 @dataclasses.dataclass
@@ -57,7 +52,7 @@ class DetokenizerManager:
         port_args: PortArgs,
     ):
         # Init inter-process communication
-        context = zmq.asyncio.Context(2)
+        context = zmq.Context(2)
         self.recv_from_router = context.socket(zmq.PULL)
         self.recv_from_router.bind(f"tcp://127.0.0.1:{port_args.detokenizer_port}")
 
@@ -75,11 +70,11 @@ class DetokenizerManager:
 
         self.decode_status = {}
 
-    async def handle_loop(self):
+    def handle_loop(self):
         """The event loop that handles requests"""
 
         while True:
-            recv_obj = await self.recv_from_router.recv_pyobj()
+            recv_obj = self.recv_from_router.recv_pyobj()
 
             if isinstance(recv_obj, BatchEmbeddingOut):
                 # If it is embedding model, no detokenization is needed.
@@ -181,5 +176,4 @@ def start_detokenizer_process(
         pipe_writer.send(get_exception_traceback())
         raise
     pipe_writer.send("init ok")
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(manager.handle_loop())
+    manager.handle_loop()
