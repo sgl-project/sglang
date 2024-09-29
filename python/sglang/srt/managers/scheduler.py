@@ -953,15 +953,7 @@ class Scheduler:
                     break
 
     def update_weights(self, recv_req: UpdateWeightReqInput):
-        success, message = self.tp_worker.update_weights(
-            recv_req.model_path, recv_req.load_format
-        )
-        if success:
-            flash_cache_success = self.flush_cache()
-            assert flash_cache_success, "Cache flush failed after updating weights"
-        else:
-            logger.error(message)
-        return success, message
+        return self.tp_worker.update_weights(recv_req)
 
 
 def run_scheduler_process(

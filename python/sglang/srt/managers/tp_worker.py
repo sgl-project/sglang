@@ -113,10 +113,15 @@ class ModelTpWorker:
     def forward_batch_embedding(self, batch):
         logits_output = self.model_runner.forward(batch)
         embeddings = logits_output.embeddings.tolist()
-        return logits_output, embeddings
+        return embeddings
 
     def update_weights(self, recv_req: UpdateWeightReqInput):
-        success, message = self.tp_worker.update_weights(
+        success, message = self.model_runner.update_weights(
             recv_req.model_path, recv_req.load_format
         )
+        if success:
+            flash_cache_success = self.flush_cache()
+            assert flash_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
         return success, message
