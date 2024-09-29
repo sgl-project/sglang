@@ -705,10 +705,15 @@ class TokenizerManager:
             if len(image_data) > 1:
                 aspect_ratio = "pad"  # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
                 pixel_values, image_hashes, image_sizes = [], [], []
+                res = []
                 for img_data in image_data:
-                    pixel_v, image_h, image_s = await self._process_single_image(
-                        img_data, aspect_ratio, grid_pinpoints
+                    res.append(
+                        self._process_single_image(
+                            img_data, aspect_ratio, grid_pinpoints
+                        )
                     )
+                res = await asyncio.gather(*res)
+                for pixel_v, image_h, image_s in res:
                     pixel_values.append(pixel_v)
                     image_hashes.append(image_h)
                     image_sizes.append(image_s)
