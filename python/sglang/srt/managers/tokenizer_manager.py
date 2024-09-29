@@ -690,6 +690,7 @@ class TokenizerManager:
         if not image_data:
             return None
 
+        # TODO: move this into a processor for each vision architecture
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
             self.hf_config.image_grid_pinpoints
