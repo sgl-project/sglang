@@ -106,9 +106,10 @@ class LoRAManager:
             )
         self.target_modules = set(
             [
-                self.base_model.get_module_name(module)
-                for module in self.origin_target_modules
+                name for name, module in self.base_model.named_modules()
+                if module in self.origin_target_modules
             ]
+        )
         )
         self.target_weights = set(
             [get_stacked_name(module) for module in self.origin_target_modules]
