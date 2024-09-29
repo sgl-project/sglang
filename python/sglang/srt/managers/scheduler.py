@@ -18,7 +18,6 @@ limitations under the License.
 import logging
 import multiprocessing
 
-import torch
 import zmq
 
 from sglang.srt.managers.tp_worker import ModelTpServer
