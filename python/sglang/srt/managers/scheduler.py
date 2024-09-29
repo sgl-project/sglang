@@ -356,17 +356,14 @@ class Scheduler:
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        if isinstance(recv_req, TokenizedGenerateReqInput):
-            req = Req(
-                recv_req.rid,
-                recv_req.input_text,
-                recv_req.input_ids,
-                lora_path=recv_req.lora_path,
-            )
-        else:
-            req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
+        req = Req(
+            recv_req.rid,
+            recv_req.input_text,
+            recv_req.input_ids,
+            recv_req.sampling_params,
+            lora_path=recv_req.lora_path,
+        )
         req.tokenizer = self.tokenizer
-        req.sampling_params = recv_req.sampling_params
 
         # Image inputs
         if recv_req.image_inputs is not None:
@@ -426,9 +423,13 @@ class Scheduler:
         self,
         recv_req: Union[TokenizedEmbeddingReqInput, TokenizedRewardReqInput],
     ):
-        req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
+        req = Req(
+            recv_req.rid,
+            recv_req.input_text,
+            recv_req.input_ids,
+            recv_req.sampling_params,
+        )
         req.tokenizer = self.tokenizer
-        req.sampling_params = recv_req.sampling_params
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) >= self.max_req_input_len:

@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -143,6 +144,7 @@ class Req:
         rid: str,
         origin_input_text: str,
         origin_input_ids: Tuple[int],
+        sampling_params: SamplingParams,
         lora_path: Optional[str] = None,
     ):
         # Input and output info
@@ -152,6 +154,8 @@ class Req:
         self.origin_input_ids = origin_input_ids
         self.output_ids = []  # Each decode stage's output ids
         self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
+
+        self.sampling_params = sampling_params
         self.lora_path = lora_path
 
         # Memory info
@@ -160,6 +164,7 @@ class Req:
         # Check finish
         self.tokenizer = None
         self.finished_reason = None
+        self.stream = False
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -186,10 +191,6 @@ class Req:
         self.prefix_indices = []
         self.extend_input_len = 0
         self.last_node = None
-
-        # Sampling parameters
-        self.sampling_params = None
-        self.stream = False
 
         # Logprobs (arguments)
         self.return_logprob = False
