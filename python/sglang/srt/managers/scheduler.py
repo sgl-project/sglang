@@ -934,7 +934,7 @@ class Scheduler:
             if_success = False
         return if_success
 
-    def abort_request(self, recv_req):
+    def abort_request(self, recv_req: AbortReq):
         # Delete requests in the waiting queue
         to_del = None
         for i, req in enumerate(self.waiting_queue):
@@ -952,7 +952,7 @@ class Scheduler:
                     req.finished_reason = FINISH_ABORT()
                     break
 
-    def update_weights(self, recv_req):
+    def update_weights(self, recv_req: UpdateWeightReqInput):
         success, message = self.tp_worker.update_weights(
             recv_req.model_path, recv_req.load_format
         )

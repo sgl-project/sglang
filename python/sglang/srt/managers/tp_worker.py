@@ -20,6 +20,7 @@ import logging
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.managers.io_struct import UpdateWeightReqInput
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import broadcast_pyobj, is_multimodal_model, set_random_seed
@@ -114,7 +115,7 @@ class ModelTpWorker:
         embeddings = logits_output.embeddings.tolist()
         return logits_output, embeddings
 
-    def update_weights(self, recv_req):
+    def update_weights(self, recv_req: UpdateWeightReqInput):
         success, message = self.tp_worker.update_weights(
             recv_req.model_path, recv_req.load_format
         )
