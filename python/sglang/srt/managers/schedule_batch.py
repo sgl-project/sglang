@@ -115,6 +115,25 @@ class ImageInputs:
     aspect_ratio_ids: Optional[List[torch.Tensor]] = None
     aspect_ratio_mask: Optional[List[torch.Tensor]] = None
 
+    @staticmethod
+    def from_dict(obj, vocab_size):
+        # Use image hash as fake token_ids, which is then used for prefix matching
+        ret = ImageInputs(
+            pixel_values=obj["pixel_values"],
+            image_hash=hash(tuple(obj["image_hashes"])),
+        )
+        image_hash = ret.image_hash
+        ret.pad_values = [
+            (image_hash) % vocab_size,
+            (image_hash >> 16) % vocab_size,
+            (image_hash >> 32) % vocab_size,
+            (image_hash >> 64) % vocab_size,
+        ]
+        ret.image_sizes = obj["image_sizes"]
+        # Only when pixel values is not None we have modalities
+        ret.modalities = obj["modalities"]
+        return ret
+
 
 class Req:
     """Store all inforamtion of a request."""
@@ -162,11 +181,6 @@ class Req:
 
         # For vision inputs
         self.image_inputs: Optional[ImageInputs] = None
-        # self.pixel_values = None
-        # self.image_sizes = None
-        # self.image_offsets = None
-        # self.pad_value = None
-        # self.modalities = None
 
         # Prefix info
         self.prefix_indices = []
