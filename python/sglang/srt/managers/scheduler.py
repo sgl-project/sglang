@@ -41,6 +41,7 @@ class Scheduler:
     ):
         # Parse args
         self.tp_rank = tp_rank
+        self.tp_size = server_args.tp_size
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -79,13 +80,16 @@ class Scheduler:
         while True:
             self.recv_requests_from_zmq()
 
-            # Sync step requests among all TP workers
             num_reqs = len(self.recv_reqs)
-            tmp_tensor = torch.tensor([num_reqs], dtype=torch.int32)
-            torch.distributed.all_reduce(
-                tmp_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
-            )
-            num_reqs = tmp_tensor.item()
+            if self.tp_size > 1:
+                # Sync step requests among all TP workers
+                tmp_tensor = torch.tensor([num_reqs], dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    tmp_tensor,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.tp_cpu_group,
+                )
+                num_reqs = tmp_tensor.item()
             step_reqs = self.recv_reqs[:num_reqs]
             self.recv_reqs = self.recv_reqs[num_reqs:]
 
