@@ -46,8 +46,10 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
+    RewardReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TokenizedRewardReqInput,
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
 )
@@ -86,8 +88,8 @@ class TokenizerManager:
         self.recv_from_detokenizer = context.socket(zmq.PULL)
         self.recv_from_detokenizer.bind(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
 
-        self.send_to_controller = context.socket(zmq.PUSH)
-        self.send_to_controller.connect(f"tcp://127.0.0.1:{port_args.controller_port}")
+        self.send_to_scheduler = context.socket(zmq.PUSH)
+        self.send_to_scheduler.connect(f"tcp://127.0.0.1:{port_args.scheduler_port}")
 
         # Read model args
         self.model_path = server_args.model_path
@@ -142,7 +144,7 @@ class TokenizerManager:
 
     async def generate_request(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        obj: Union[GenerateReqInput, EmbeddingReqInput, RewardReqInput],
         request: Optional[fastapi.Request] = None,
     ):
         if self.to_create_loop:
@@ -163,7 +165,7 @@ class TokenizerManager:
 
     async def _handle_single_request(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        obj: Union[GenerateReqInput, EmbeddingReqInput, RewardReqInput],
         request: Optional[fastapi.Request] = None,
         index: Optional[int] = None,
         is_cache_for_prefill: Optional[bool] = False,
@@ -173,7 +175,13 @@ class TokenizerManager:
 
             rid = obj.rid if not_use_index else obj.rid[index]
             input_text = obj.text if not_use_index else obj.text[index]
-            if obj.input_ids is None:
+            if hasattr(obj, "conv"):
+                # reward model
+                assert self.tokenizer is not None
+                conv = obj.conv if not_use_index else obj.conv[index]
+                input_text = self.tokenizer.apply_chat_template(conv, tokenize=False)
+                input_ids = self.tokenizer.encode(input_text)
+            elif obj.input_ids is None:
                 assert self.tokenizer is not None
                 input_ids = self.tokenizer.encode(input_text)
             else:
@@ -186,10 +194,9 @@ class TokenizerManager:
             )
 
             if self.is_generation:
-                pixel_values, image_hashes, image_sizes = await self._get_pixel_values(
-                    obj.image_data if not_use_index else obj.image_data[index]
+                image_inputs = await self._get_image_inputs(
+                    obj, obj.image_data if not_use_index else obj.image_data[index]
                 )
-                modalities = obj.modalities
                 return_logprob = (
                     obj.return_logprob if not_use_index else obj.return_logprob[index]
                 )
@@ -240,10 +247,7 @@ class TokenizerManager:
 
             sampling_params = SamplingParams(**obj.sampling_params[0])
             sampling_params.max_new_tokens = 0
-            pixel_values, image_hashes, image_sizes = await self._get_pixel_values(
-                obj.image_data[0]
-            )
-            modalities = obj.modalities
+            image_inputs = await self._get_image_inputs(obj, obj.image_data[0])
             return_logprob = obj.return_logprob[0]
             logprob_start_len = obj.logprob_start_len[0]
             top_logprobs_num = obj.top_logprobs_num[0]
@@ -254,29 +258,34 @@ class TokenizerManager:
                 rid,
                 input_text,
                 input_ids,
-                pixel_values,
-                image_hashes,
-                image_sizes,
+                image_inputs,
                 sampling_params,
                 return_logprob,
                 logprob_start_len,
                 top_logprobs_num,
                 obj.stream,
-                modalities,
                 (
                     obj.lora_path[index]
                     if isinstance(obj.lora_path, list)
                     else obj.lora_path
                 ),
             )
-        else:  # is embedding
+        elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
                 rid,
                 input_text,
                 input_ids,
                 sampling_params,
             )
-        self.send_to_controller.send_pyobj(tokenized_obj)
+        else:
+            assert isinstance(obj, RewardReqInput)
+            tokenized_obj = TokenizedRewardReqInput(
+                rid,
+                input_text,
+                input_ids,
+                sampling_params,
+            )
+        self.send_to_scheduler.send_pyobj(tokenized_obj)
 
         # Recv results
         event = asyncio.Event()
@@ -292,7 +301,7 @@ class TokenizerManager:
 
     async def _handle_batch_request(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        obj: Union[GenerateReqInput, EmbeddingReqInput, RewardReqInput],
         request: Optional[fastapi.Request] = None,
     ):
         batch_size = obj.batch_size
@@ -329,9 +338,16 @@ class TokenizerManager:
                 rid = obj.rid[index]
                 if parallel_sample_num == 1:
                     ## select operation
-                    if obj.input_ids is None:
+                    if hasattr(obj, "conv"):
+                        # reward model
+                        conv = obj.conv[i]
+                        input_text = self.tokenizer.apply_chat_template(
+                            conv, tokenize=False
+                        )
+                        input_ids = self.tokenizer.encode(input_text)
+                    elif obj.input_ids is None:
                         input_text = obj.text[i]
-                        input_ids = self.tokenizer.encode(obj.text[i])
+                        input_ids = self.tokenizer.encode(input_text)
                     else:
                         input_text = None
                         input_ids = obj.input_ids[i]
@@ -346,38 +362,42 @@ class TokenizerManager:
                 sampling_params = self._get_sampling_params(obj.sampling_params[index])
 
                 if self.is_generation:
-                    pixel_values, image_hashes, image_sizes = (
-                        await self._get_pixel_values(obj.image_data[index])
+                    image_inputs = await self._get_image_inputs(
+                        obj, obj.image_data[index]
                     )
-                    modalities = obj.modalities
 
                     tokenized_obj = TokenizedGenerateReqInput(
                         rid,
                         input_text,
                         input_ids,
-                        pixel_values,
-                        image_hashes,
-                        image_sizes,
+                        image_inputs,
                         sampling_params,
                         obj.return_logprob[index],
                         obj.logprob_start_len[index],
                         obj.top_logprobs_num[index],
                         obj.stream,
-                        modalities,
                         (
                             obj.lora_path[index]
                             if isinstance(obj.lora_path, list)
                             else obj.lora_path
                         ),
                     )
-                else:
+                elif isinstance(obj, EmbeddingReqInput):
                     tokenized_obj = TokenizedEmbeddingReqInput(
                         rid,
                         input_text,
                         input_ids,
                         sampling_params,
                     )
-                self.send_to_controller.send_pyobj(tokenized_obj)
+                else:
+                    assert isinstance(obj, RewardReqInput)
+                    tokenized_obj = TokenizedRewardReqInput(
+                        rid,
+                        input_text,
+                        input_ids,
+                        sampling_params,
+                    )
+                self.send_to_scheduler.send_pyobj(tokenized_obj)
 
                 event = asyncio.Event()
                 state = ReqState([], False, event)
@@ -442,7 +462,7 @@ class TokenizerManager:
     async def _wait_for_response(
         self,
         state: ReqState,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        obj: Union[GenerateReqInput, EmbeddingReqInput, RewardReqInput],
         rid: str,
         request: Optional[fastapi.Request] = None,
         index: Optional[int] = None,
@@ -469,7 +489,7 @@ class TokenizerManager:
                     ),
                     obj.return_text_in_logprobs,
                 )
-            else:  # isinstance(obj, EmbeddingReqInput)
+            else:  # isinstance(obj, (EmbeddingReqInput, RewardReqInput))
                 out = state.out_list[-1]
 
             out["index"] = response_index
@@ -510,14 +530,14 @@ class TokenizerManager:
 
     def flush_cache(self):
         req = FlushCacheReq()
-        self.send_to_controller.send_pyobj(req)
+        self.send_to_scheduler.send_pyobj(req)
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
             return
         del self.rid_to_state[rid]
         req = AbortReq(rid)
-        self.send_to_controller.send_pyobj(req)
+        self.send_to_scheduler.send_pyobj(req)
 
     async def update_weights(
         self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
@@ -534,7 +554,7 @@ class TokenizerManager:
                 # wait for the previous generation requests to finish
                 while len(self.rid_to_state) > 0:
                     await asyncio.sleep(0)
-                self.send_to_controller.send_pyobj(obj)
+                self.send_to_scheduler.send_pyobj(obj)
                 self.model_update_result = asyncio.Future()
                 result = await self.model_update_result
                 if result.success:
@@ -645,6 +665,7 @@ class TokenizerManager:
     def detokenize_logprob_tokens(
         self, token_logprobs: List[Tuple[float, int]], decode_to_text: bool
     ):
+        # TODO(lianmin): This should run on DetokenizerManager
         if not decode_to_text:
             return [(logprob, token_id, None) for logprob, token_id in token_logprobs]
 
@@ -666,10 +687,11 @@ class TokenizerManager:
                 )
         return top_logprobs
 
-    async def _get_pixel_values(self, image_data: List[Union[str, bytes]]):
+    async def _get_image_inputs(self, obj, image_data: List[Union[str, bytes]]):
         if not image_data:
-            return None, None, None
+            return None
 
+        # TODO: move this into a processor for each vision architecture
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
             self.hf_config.image_grid_pinpoints
@@ -710,7 +732,12 @@ class TokenizerManager:
         else:
             raise ValueError(f"Invalid image data: {image_data}")
 
-        return pixel_values, image_hashes, image_sizes
+        return {
+            "pixel_values": pixel_values,
+            "image_hashes": image_hashes,
+            "image_sizes": image_sizes,
+            "modalities": obj.modalities,
+        }
 
     async def _process_single_image(
         self, image_data: Union[bytes, str], aspect_ratio: str, grid_pinpoints: str

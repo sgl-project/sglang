@@ -35,6 +35,7 @@ srt = [
     "zmq",
     "vllm==0.5.5",
     "outlines>=0.0.44",
+    "modelscope",
 ]
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]

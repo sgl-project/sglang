@@ -15,13 +15,12 @@ limitations under the License.
 
 """DetokenizerManager is a process that detokenizes the token ids."""
 
-import asyncio
 import dataclasses
+import logging
+from collections import OrderedDict
 from typing import List
 
-import uvloop
 import zmq
-import zmq.asyncio
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
@@ -32,9 +31,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import configure_logger, kill_parent_process
 from sglang.utils import find_printable_text, get_exception_traceback
 
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -57,9 +57,9 @@ class DetokenizerManager:
         port_args: PortArgs,
     ):
         # Init inter-process communication
-        context = zmq.asyncio.Context(2)
-        self.recv_from_router = context.socket(zmq.PULL)
-        self.recv_from_router.bind(f"tcp://127.0.0.1:{port_args.detokenizer_port}")
+        context = zmq.Context(2)
+        self.recv_from_scheduler = context.socket(zmq.PULL)
+        self.recv_from_scheduler.bind(f"tcp://127.0.0.1:{port_args.detokenizer_port}")
 
         self.send_to_tokenizer = context.socket(zmq.PUSH)
         self.send_to_tokenizer.connect(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
@@ -73,13 +73,13 @@ class DetokenizerManager:
                 trust_remote_code=server_args.trust_remote_code,
             )
 
-        self.decode_status = {}
+        self.decode_status = LimitedCapacityDict()
 
-    async def handle_loop(self):
+    def event_loop(self):
         """The event loop that handles requests"""
 
         while True:
-            recv_obj = await self.recv_from_router.recv_pyobj()
+            recv_obj = self.recv_from_scheduler.recv_pyobj()
 
             if isinstance(recv_obj, BatchEmbeddingOut):
                 # If it is embedding model, no detokenization is needed.
@@ -170,16 +170,29 @@ class DetokenizerManager:
             )
 
 
-def start_detokenizer_process(
+class LimitedCapacityDict(OrderedDict):
+    def __init__(self, capacity=1 << 15, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.capacity = capacity
+
+    def __setitem__(self, key, value):
+        if len(self) >= self.capacity:
+            # Remove the oldest element (first item in the dict)
+            self.popitem(last=False)
+        # Set the new item
+        super().__setitem__(key, value)
+
+
+def run_detokenizer_process(
     server_args: ServerArgs,
     port_args: PortArgs,
-    pipe_writer,
 ):
+    configure_logger(server_args)
+
     try:
         manager = DetokenizerManager(server_args, port_args)
+        manager.event_loop()
     except Exception:
-        pipe_writer.send(get_exception_traceback())
-        raise
-    pipe_writer.send("init ok")
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(manager.handle_loop())
+        msg = get_exception_traceback()
+        logger.error(msg)
+        kill_parent_process()

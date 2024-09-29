@@ -17,16 +17,12 @@ limitations under the License.
 
 import json
 import logging
-import multiprocessing
 import os
-import pickle
 import time
 import warnings
-from typing import Any, List, Optional
+from typing import List, Optional, Union
 
 import torch
-import torch.distributed
-import torch.distributed as dist
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -41,6 +37,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TokenizedRewardReqInput,
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
 )
@@ -48,6 +45,7 @@ from sglang.srt.managers.policy_scheduler import PolicyScheduler, PrefillAdder
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     BaseFinishReason,
+    ImageInputs,
     Req,
     ScheduleBatch,
 )
@@ -56,7 +54,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    configure_logger,
+    broadcast_pyobj,
     is_multimodal_model,
     set_random_seed,
     suppress_other_loggers,
@@ -138,7 +136,7 @@ class ModelTpServer:
         )
 
         # Sync random seed across TP workers
-        server_args.random_seed = broadcast_recv_input(
+        server_args.random_seed = broadcast_pyobj(
             [server_args.random_seed],
             self.tp_rank,
             self.model_runner.tp_group.cpu_group,
@@ -223,7 +221,9 @@ class ModelTpServer:
                 if isinstance(recv_req, TokenizedGenerateReqInput):
                     self.handle_generate_request(recv_req)
                     self.do_not_get_new_batch = False
-                elif isinstance(recv_req, TokenizedEmbeddingReqInput):
+                elif isinstance(
+                    recv_req, (TokenizedEmbeddingReqInput, TokenizedRewardReqInput)
+                ):
                     self.handle_embedding_request(recv_req)
                     self.do_not_get_new_batch = False
                 elif isinstance(recv_req, FlushCacheReq):
@@ -337,29 +337,16 @@ class ModelTpServer:
             req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.tokenizer = self.tokenizer
         req.sampling_params = recv_req.sampling_params
-        req.pixel_values = recv_req.pixel_values
-        if req.pixel_values is not None:
-            # Use image hash as fake token_ids, which is then used
-            # for prefix matching
-            image_hash = hash(tuple(recv_req.image_hashes))
-            req.pad_value = [
-                (image_hash) % self.model_config.vocab_size,
-                (image_hash >> 16) % self.model_config.vocab_size,
-                (image_hash >> 32) % self.model_config.vocab_size,
-                (image_hash >> 64) % self.model_config.vocab_size,
-            ]
-            req.image_sizes = recv_req.image_sizes
-            (
-                req.origin_input_ids,
-                req.image_offsets,
-            ) = self.model_runner.model.pad_input_ids(
-                req.origin_input_ids_unpadded,
-                req.pad_value,
-                req.pixel_values,
-                req.image_sizes,
+
+        # Image inputs
+        if recv_req.image_inputs is not None:
+            req.image_inputs = ImageInputs.from_dict(
+                recv_req.image_inputs, self.model_config.vocab_size
             )
-            # Only when pixel values is not None we have modalities
-            req.modalities = recv_req.modalites
+            req.origin_input_ids = self.model_runner.model.pad_input_ids(
+                req.origin_input_ids_unpadded, req.image_inputs
+            )
+
         req.return_logprob = recv_req.return_logprob
         req.top_logprobs_num = recv_req.top_logprobs_num
         req.stream = recv_req.stream
@@ -407,7 +394,7 @@ class ModelTpServer:
 
     def handle_embedding_request(
         self,
-        recv_req: TokenizedEmbeddingReqInput,
+        recv_req: Union[TokenizedEmbeddingReqInput, TokenizedRewardReqInput],
     ):
         req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.tokenizer = self.tokenizer
@@ -944,82 +931,3 @@ class ModelTpServer:
         else:
             logger.error(message)
         return success, message
-
-
-def run_tp_server(
-    gpu_id: int,
-    tp_rank: int,
-    server_args: ServerArgs,
-    nccl_port: int,
-):
-    """Run a tensor parallel model server."""
-    configure_logger(server_args, prefix=f" TP{tp_rank}")
-
-    try:
-        model_server = ModelTpServer(
-            gpu_id,
-            tp_rank,
-            server_args,
-            nccl_port,
-        )
-        tp_cpu_group = model_server.model_runner.tp_group.cpu_group
-
-        while True:
-            recv_reqs = broadcast_recv_input(None, tp_rank, tp_cpu_group)
-            model_server.exposed_step(recv_reqs)
-    except Exception:
-        logger.error("Exception in run_tp_server:\n" + get_exception_traceback())
-        raise
-
-
-def launch_tp_servers(
-    gpu_ids: List[int],
-    tp_rank_range: List[int],
-    server_args: ServerArgs,
-    nccl_port: int,
-):
-    """Launch multiple tensor parallel servers."""
-    procs = []
-    for i in tp_rank_range:
-        proc = multiprocessing.Process(
-            target=run_tp_server,
-            args=(gpu_ids[i], i, server_args, nccl_port),
-        )
-        proc.start()
-        procs.append(proc)
-
-    return procs
-
-
-def broadcast_recv_input(
-    data: Any, rank: int, dist_group: torch.distributed.ProcessGroup
-):
-    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
-
-    if rank == 0:
-        if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long)
-            dist.broadcast(tensor_size, src=0, group=dist_group)
-        else:
-            serialized_data = pickle.dumps(data)
-            size = len(serialized_data)
-            tensor_data = torch.ByteTensor(list(serialized_data))
-            tensor_size = torch.tensor([size], dtype=torch.long)
-
-            dist.broadcast(tensor_size, src=0, group=dist_group)
-            dist.broadcast(tensor_data, src=0, group=dist_group)
-        return data
-    else:
-        tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.broadcast(tensor_size, src=0, group=dist_group)
-        size = tensor_size.item()
-
-        if size == 0:
-            return []
-
-        tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.broadcast(tensor_data, src=0, group=dist_group)
-
-        serialized_data = bytes(tensor_data.tolist())
-        data = pickle.loads(serialized_data)
-        return data

@@ -26,7 +26,8 @@ from vllm.config import CacheConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 from sglang.srt.models.llama import LlamaForCausalLM
 
 
@@ -54,17 +55,12 @@ class LlavaVidForCausalLM(nn.Module):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def pad_input_ids(
-        self,
-        input_ids: List[int],
-        pad_value: List[int],
-        pixel_values: List,
-        image_sizes: List[List[int]],
-    ):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+        pad_values = image_inputs.pad_values
         new_image_feature_len = self.image_feature_len
 
-        pad_ids = pad_value * (
-            (new_image_feature_len + len(pad_value)) // len(pad_value)
+        pad_ids = pad_values * (
+            (new_image_feature_len + len(pad_values)) // len(pad_values)
         )
         offset = input_ids.index(self.config.image_token_index)
         # old_len + pad_len - 1, because we need to remove image_token_id
@@ -73,7 +69,8 @@ class LlavaVidForCausalLM(nn.Module):
             + pad_ids[:new_image_feature_len]
             + input_ids[offset + 1 :]
         )
-        return new_input_ids, [offset]
+        image_inputs.image_offsets = [offset]
+        return new_input_ids
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
@@ -112,10 +109,8 @@ class LlavaVidForCausalLM(nn.Module):
         input_ids: torch.LongTensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
-        pixel_values: Optional[List[Optional[np.array]]] = None,
-        image_sizes: Optional[List[List[int]]] = None,
-        image_offsets: Optional[List[int]] = None,
     ) -> torch.Tensor:
+        image_inputs = input_metadata.image_inputs
         if input_metadata.forward_mode.is_extend():
             bs = input_metadata.batch_size
 
@@ -123,14 +118,22 @@ class LlavaVidForCausalLM(nn.Module):
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
             # Whether the requests need vision inputs
-            max_image_offset = np.array(
-                [max(image_offsets[i]) if image_offsets[i] else -1 for i in range(bs)]
-            )
+            max_image_offset = []
+            for im in image_inputs:
+                if im and im.image_offsets:
+                    max_image_offset.append(max(im.image_offsets))
+                else:
+                    max_image_offset.append(-1)
             start_positions = positions[input_metadata.extend_start_loc].cpu().numpy()
-            need_vision = start_positions <= max_image_offset
+            need_vision = start_positions <= np.array(max_image_offset)
 
             if need_vision.any():
-                pixel_values = [pixel_values[i] for i in range(bs) if need_vision[i]]
+                pixel_values = [
+                    image_inputs[i].pixel_values for i in range(bs) if need_vision[i]
+                ]
+                image_offsets = [
+                    image_inputs[i].image_offsets for i in range(bs) if need_vision[i]
+                ]
 
                 ########## Encode Image ########
 

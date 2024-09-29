@@ -21,7 +21,7 @@ import logging
 import random
 from typing import List, Optional, Union
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ipv6
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +78,9 @@ class ServerArgs:
     load_balance_method: str = "round_robin"
 
     # Distributed args
-    nccl_init_addr: Optional[str] = None
+    dist_init_addr: Optional[str] = None
     nnodes: int = 1
-    node_rank: Optional[int] = None
+    node_rank: int = 0
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
@@ -426,14 +426,17 @@ class ServerArgs:
 
         # Multi-node distributed serving args
         parser.add_argument(
-            "--nccl-init-addr",
+            "--dist-init-addr",
+            "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
             type=str,
-            help="The nccl init address of multi-node server.",
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
         )
         parser.add_argument(
             "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
         )
-        parser.add_argument("--node-rank", type=int, help="The node rank.")
+        parser.add_argument(
+            "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+        )
 
         # Model override args
         parser.add_argument(
@@ -567,7 +570,10 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        return f"http://{self.host}:{self.port}"
+        if is_ipv6(self.host):
+            return f"http://[{self.host}]:{self.port}"
+        else:
+            return f"http://{self.host}:{self.port}"
 
     def check_server_args(self):
         assert (
@@ -582,6 +588,11 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
+
+        assert self.dp_size == 1, (
+            "The support for data parallelism is temporarily disabled during refactor. "
+            "Please use sglang<=0.3.2 or wait for later updates."
+        )
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
@@ -604,9 +615,13 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 @dataclasses.dataclass
 class PortArgs:
+    # The port for tokenizer to receive inputs from detokenizer (zmq)
     tokenizer_port: int
-    controller_port: int
+    # The port for scheduler to receive inputs from tokenizer (zmq)
+    scheduler_port: int
+    # The port for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_port: int
+    # The port for nccl initialization for multiple TP groups (torch.dist)
     nccl_ports: List[int]
 
 

@@ -14,12 +14,16 @@ limitations under the License.
 """
 
 """Cache for the compressed finite state machine."""
+import logging
 
+from interegular import InvalidSyntax, parse_pattern
 from outlines.fsm.json_schema import build_regex_from_schema
 from transformers import AutoTokenizer
 
 from sglang.srt.constrained import RegexGuide, TransformerTokenizer
 from sglang.srt.constrained.base_tool_cache import BaseToolCache
+
+logger = logging.getLogger(__name__)
 
 
 class FSMCache(BaseToolCache):
@@ -76,5 +80,9 @@ class FSMCache(BaseToolCache):
             regex = key_string
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
-
+        try:
+            parse_pattern(regex)
+        except InvalidSyntax as e:
+            logger.warning(f"skip invalid regex guide: {regex=}, {e=}")
+            return None, regex
         return RegexGuide(regex, self.outlines_tokenizer), regex

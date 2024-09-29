@@ -11,7 +11,7 @@
 
 --------------------------------------------------------------------------------
 
-| [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/) | [**Paper**](https://arxiv.org/abs/2312.07104) | [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2ngly9muu-t37XiH87qvD~6rVBTkTEHw) | [**Join Weekly Development Meeting**](https://calendar.app.google/v2Tw3kuHkKYyp8VV7) |
+| [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/) | [**Paper**](https://arxiv.org/abs/2312.07104) | [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2ngly9muu-t37XiH87qvD~6rVBTkTEHw) | [**Join Weekly Development Meeting**](https://t.co/4BFjCLnVHq) |
 
 SGLang is a fast serving framework for large language models and vision language models.
 It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
@@ -163,7 +163,8 @@ curl http://localhost:30000/generate \
     }
   }'
 ```
-Learn more about the argument format [here](docs/en/sampling_params.md).
+
+Learn more about the argument specification, streaming, and multi-modal support [here](docs/en/sampling_params.md).
 
 ### OpenAI Compatible API
 In addition, the server supports OpenAI-compatible APIs.
@@ -202,7 +203,7 @@ response = client.embeddings.create(
 print(response)
 ```
 
-It supports streaming, vision, and most features of the Chat/Completions/Models/Batch endpoints specified by the [OpenAI API Reference](https://platform.openai.com/docs/api-reference/).
+It supports streaming, vision, and almost all features of the Chat/Completions/Models/Batch endpoints specified by the [OpenAI API Reference](https://platform.openai.com/docs/api-reference/).
 
 ### Additional Server Arguments
 - To enable multi-GPU tensor parallelism, add `--tp 2`. If it reports the error "peer access is not supported between these two devices", add `--enable-p2p-check` to the server launch command.
@@ -223,10 +224,11 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
 ```
 - To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes.
+- To enable torchao quantization, add `--torchao-config int4wo-128`. It supports various quantization strategies.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
 - If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](docs/en/custom_chat_template.md).
-- To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port.
+- To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
 ```
 # Node 0
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-0:50000 --nnodes 2 --node-rank 0
@@ -241,9 +243,9 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - Llama / Llama 2 / Llama 3 / Llama 3.1
 - Mistral / Mixtral / Mistral NeMo
 - Gemma / Gemma 2
-- OLMoE
 - Qwen / Qwen 2 / Qwen 2 MoE
 - DeepSeek / DeepSeek 2
+- OLMoE
 - [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
   - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov --port=30000 --chat-template=chatml-llava`
   - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8 --chat-template=chatml-llava`
@@ -265,7 +267,6 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - XVERSE / XVERSE MoE
 - SmolLM
 
-
 **Embedding Models**
 
 - e5-mistral
@@ -285,6 +286,17 @@ export SGLANG_USE_MODELSCOPE=true
 Launch [Qwen2-7B-Instruct](https://www.modelscope.cn/models/qwen/qwen2-7b-instruct) Server
 ```
 SGLANG_USE_MODELSCOPE=true python -m sglang.launch_server --model-path qwen/Qwen2-7B-Instruct --port 30000
+```
+
+Or start it by docker.
+```bash
+docker run --gpus all \
+    -p 30000:30000 \
+    -v ~/.cache/modelscope:/root/.cache/modelscope \
+    --env "SGLANG_USE_MODELSCOPE=true" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --host 0.0.0.0 --port 30000
 ```
   
 </details>
