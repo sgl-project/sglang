@@ -618,7 +618,8 @@ class PortArgs:
     scheduler_port: int
     # The port for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_port: int
-    nccl_ports: List[int]  # For multiple TP groups (torch.dist)
+    # For multiple TP groups (torch.dist)
+    nccl_ports: List[int]
 
 
 class LoRAPathAction(argparse.Action):
