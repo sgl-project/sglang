@@ -54,6 +54,7 @@ from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
+    RewardReqInput,
     UpdateWeightReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -211,6 +212,21 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
 
 app.post("/encode")(encode_request)
 app.put("/encode")(encode_request)
+
+
+async def judge_request(obj: RewardReqInput, request: Request):
+    """Handle an embedding request."""
+    try:
+        ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+        return ret
+    except ValueError as e:
+        return JSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
+app.post("/judge")(judge_request)
+app.put("/judge")(judge_request)
 
 
 @app.post("/v1/completions")
@@ -597,7 +613,7 @@ class Runtime:
                         if chunk == "data: [DONE]\n\n":
                             break
                         data = json.loads(chunk[5:].strip("\n"))
-                        if hasattr(data, "text"):
+                        if "text" in data:
                             cur = data["text"][pos:]
                             if cur:
                                 yield cur
@@ -633,15 +649,26 @@ class Runtime:
 
     def encode(
         self,
-        prompt: Union[str, List[str]],
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
     ):
-        json_data = {
-            "text": prompt,
-        }
-        response = requests.post(
-            self.url + "/encode",
-            json=json_data,
-        )
+        if isinstance(prompt, str) or isinstance(prompt[0], str):
+            # embedding
+            json_data = {
+                "text": prompt,
+            }
+            response = requests.post(
+                self.url + "/encode",
+                json=json_data,
+            )
+        else:
+            # reward
+            json_data = {
+                "conv": prompt,
+            }
+            response = requests.post(
+                self.url + "/judge",
+                json=json_data,
+            )
         return json.dumps(response.json())
 
     def __del__(self):
