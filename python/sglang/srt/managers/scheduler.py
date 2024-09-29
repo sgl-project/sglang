@@ -373,7 +373,7 @@ class Scheduler:
             req.image_inputs = ImageInputs.from_dict(
                 recv_req.image_inputs, self.model_config.vocab_size
             )
-            req.origin_input_ids = self.model_runner.model.pad_input_ids(
+            req.origin_input_ids = self.tp_worker.model_runner.model.pad_input_ids(
                 req.origin_input_ids_unpadded, req.image_inputs
             )
 
@@ -756,7 +756,9 @@ class Scheduler:
 
         # Check for jump-forward
         if not self.disable_regex_jump_forward:
-            jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
+            jump_forward_reqs = batch.check_for_jump_forward(
+                self.tp_worker.model_runner
+            )
             self.waiting_queue.extend(jump_forward_reqs)
             if batch.is_empty():
                 return
