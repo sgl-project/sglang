@@ -21,7 +21,7 @@ import logging
 import random
 from typing import List, Optional, Union
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ipv6
 
 logger = logging.getLogger(__name__)
 
@@ -570,7 +570,10 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        return f"http://{self.host}:{self.port}"
+        if is_ipv6(self.host):
+            return f"http://[{self.host}]:{self.port}"
+        else:
+            return f"http://{self.host}:{self.port}"
 
     def check_server_args(self):
         assert (
