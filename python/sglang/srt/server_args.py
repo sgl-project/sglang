@@ -618,7 +618,7 @@ class PortArgs:
     scheduler_port: int
     # The port for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_port: int
-    # For multiple TP groups (torch.dist)
+    # The port for nccl initialization for multiple TP groups (torch.dist)
     nccl_ports: List[int]
 
 
