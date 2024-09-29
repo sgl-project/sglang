@@ -88,13 +88,8 @@ class TokenizerManager:
         self.recv_from_detokenizer = context.socket(zmq.PULL)
         self.recv_from_detokenizer.bind(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
 
-        if server_args.dist_init_addr:
-            host, port = server_args.dist_init_addr.split(":")
-            bind_address = f"tcp://{host}:{int(port) + 1}"
-        else:
-            bind_address = f"tcp://127.0.0.1:{port_args.tokenizer_broadcast_port}"
-        self.broadcast_to_scheduler = context.socket(zmq.PUB)
-        self.broadcast_to_scheduler.bind(bind_address)
+        self.send_to_scheduler = context.socket(zmq.PUSH)
+        self.send_to_scheduler.connect(f"tcp://127.0.0.1:{port_args.scheduler_port}")
 
         # Read model args
         self.model_path = server_args.model_path
@@ -290,7 +285,7 @@ class TokenizerManager:
                 input_ids,
                 sampling_params,
             )
-        self.broadcast_to_scheduler.send_pyobj(tokenized_obj)
+        self.send_to_scheduler.send_pyobj(tokenized_obj)
 
         # Recv results
         event = asyncio.Event()
@@ -402,7 +397,7 @@ class TokenizerManager:
                         input_ids,
                         sampling_params,
                     )
-                self.broadcast_to_scheduler.send_pyobj(tokenized_obj)
+                self.send_to_scheduler.send_pyobj(tokenized_obj)
 
                 event = asyncio.Event()
                 state = ReqState([], False, event)
@@ -535,14 +530,14 @@ class TokenizerManager:
 
     def flush_cache(self):
         req = FlushCacheReq()
-        self.broadcast_to_scheduler.send_pyobj(req)
+        self.send_to_scheduler.send_pyobj(req)
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
             return
         del self.rid_to_state[rid]
         req = AbortReq(rid)
-        self.broadcast_to_scheduler.send_pyobj(req)
+        self.send_to_scheduler.send_pyobj(req)
 
     async def update_weights(
         self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
@@ -559,7 +554,7 @@ class TokenizerManager:
                 # wait for the previous generation requests to finish
                 while len(self.rid_to_state) > 0:
                     await asyncio.sleep(0)
-                self.broadcast_to_scheduler.send_pyobj(obj)
+                self.send_to_scheduler.send_pyobj(obj)
                 self.model_update_result = asyncio.Future()
                 result = await self.model_update_result
                 if result.success:
