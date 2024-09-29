@@ -16,6 +16,7 @@ limitations under the License.
 """Common utilities."""
 
 import base64
+import ipaddress
 import logging
 import os
 import pickle
@@ -52,6 +53,14 @@ time_infos = {}
 # torch flag AMD GPU
 def is_hip() -> bool:
     return torch.version.hip is not None
+
+
+def is_ipv6(address):
+    try:
+        ipaddress.IPv6Address(address)
+        return True
+    except ipaddress.AddressValueError:
+        return False
 
 
 def enable_show_time_cost():
