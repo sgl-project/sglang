@@ -18,6 +18,7 @@ limitations under the License.
 """Meta data for requests and batches"""
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -189,6 +190,16 @@ class Req:
         self.regex_fsm_state: int = 0
         self.jump_forward_map: JumpForwardMap = None
 
+        # Lifetime traces
+        # time when request is created and added to waitlist
+        self.created_time = None
+        # time when request is added to prefill batech
+        self.queued_time = None
+        # time when request is being processed
+        self.started_time = None
+        # time when request is finished
+        self.finished_time = None
+
     # whether request reached finished condition
     def finished(self) -> bool:
         return self.finished_reason is not None
@@ -262,6 +273,7 @@ class Req:
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+            self.finished_time = time.time()
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
             )
@@ -275,6 +287,7 @@ class Req:
             matched_eos |= last_token_id == self.tokenizer.eos_token_id
 
         if matched_eos and not self.sampling_params.ignore_eos:
+            self.finished_time = time.time()
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
             return
 
@@ -285,6 +298,7 @@ class Req:
 
             for stop_str in self.sampling_params.stop_strs:
                 if stop_str in tail_str or stop_str in self.decoded_text:
+                    self.finished_time = time.time()
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
 
@@ -425,6 +439,10 @@ class ScheduleBatch:
                 exit(1)
 
         return out_cache_loc
+
+    def mark_reqs_started(self):
+        for req in self.reqs:
+            req.started_time = time.time()
 
     def prepare_for_extend(self, vocab_size: int):
         self.forward_mode = ForwardMode.EXTEND

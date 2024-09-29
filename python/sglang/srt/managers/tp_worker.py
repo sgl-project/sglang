@@ -54,6 +54,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.metrics.metrics_types import Stats
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -138,6 +139,25 @@ class ModelTpServer:
             self.max_total_num_tokens - 1,
         )
 
+        # Setup Metrics and Collectors
+        self.time_e2e_requests: List[float] = []
+        self.time_waiting_requests: List[float] = []
+        self.time_decode_requests: List[float] = []
+        self._stats = Stats()
+        self._stats.max_total_num_tokens = self.max_total_num_tokens
+        self._stats.max_prefill_tokens = self.max_prefill_tokens
+        self._stats.max_running_requests = self.max_running_requests
+        self._stats.context_len = self.model_config.context_len
+        # Lazy loading to ensure prometheus is initialized
+        from sglang.srt.metrics.metrics_collector import PrometheusMetricsCollector
+
+        self.metrics_collector = PrometheusMetricsCollector(
+            labels={
+                "name": self.model_config.path,
+                # TODO: Add lora name/path in the future,
+            },
+            max_model_len=self.max_total_num_tokens,
+        )
         # Sync random seed across TP workers
         server_args.random_seed = broadcast_recv_input(
             [server_args.random_seed],
@@ -241,6 +261,10 @@ class ModelTpServer:
 
             # Forward
             self.forward_step()
+            # log stats
+            if self.tp_rank == 0:
+                self.log_step_metrics()
+
         except Exception:
             logger.error("Exception in ModelTpServer:\n" + get_exception_traceback())
             raise
@@ -303,6 +327,49 @@ class ModelTpServer:
             f"gen throughput (token/s): {throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
+
+    def log_step_metrics(self):
+
+        self._stats.time_e2e_requests = self.time_e2e_requests
+        self._stats.time_waiting_requests = self.time_waiting_requests
+        self._stats.time_decode_requests = self.time_decode_requests
+
+        if self.running_batch:
+            num_used = self.max_total_num_tokens - (
+                self.token_to_kv_pool.available_size()
+                + self.tree_cache.evictable_size()
+            )
+            token_usage = num_used / self.max_total_num_tokens
+            throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
+            self.num_generated_tokens = 0
+            self.last_stats_tic = time.time()
+
+            self._stats.num_running_req = len(self.running_batch.reqs)
+            self._stats.num_waiting_req = len(self.waiting_queue)
+            self._stats.gen_throughput = throughput
+            self._stats.num_token = num_used
+            self._stats.token_usage = token_usage
+        else:
+            self._stats.num_running_req = 0
+            self._stats.num_waiting_req = 0
+            self._stats.gen_throughput = 0.0
+            self._stats.num_token = 0
+            self._stats.token_usage = 0.0
+            self._stats.waiting_queue = 0
+            self._stats.cache_hit_rate = 0.0
+
+        if self.tree_cache_metrics["total"] > 0:
+            self._stats.cache_hit_rate = 100.0 * (
+                self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
+            )
+        else:
+            self._stats.cache_hit_rate = 0.0
+
+        self.time_e2e_requests = []
+        self.time_waiting_requests = []
+        self.time_decode_requests = []
+
+        self.log_metrics(self._stats)
 
     def check_memory(self):
         available_size = (
@@ -405,7 +472,8 @@ class ModelTpServer:
             ),
             self.max_req_input_len - 1 - len(req.origin_input_ids),
         )
-
+        # TODO: add created time
+        req.created_time = time.time()
         self.waiting_queue.append(req)
 
     def handle_embedding_request(
@@ -424,6 +492,7 @@ class ModelTpServer:
             )
             req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
 
+        req.created_time = time.time()
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
@@ -508,6 +577,9 @@ class ModelTpServer:
             else:
                 tree_cache_hit_rate = 0.0
 
+            running_req = (
+                num_mixed_running if self.is_mixed_chunk == True else running_bs
+            )
             num_used = self.max_total_num_tokens - (
                 self.token_to_kv_pool.available_size()
                 + self.tree_cache.evictable_size()
@@ -536,6 +608,18 @@ class ModelTpServer:
                     f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
                 )
 
+            self._stats.is_mixed_chunk = self.is_mixed_chunk
+            self._stats.new_seq = len(can_run_list)
+            self._stats.new_token = adder.log_input_tokens
+            self._stats.cached_token = adder.log_hit_tokens
+            self._stats.cache_hit_rate = 100.0 * tree_cache_hit_rate
+            self._stats.running_req = running_req
+            self._stats.queue_req = (
+                len(self.waiting_queue) - len(can_run_list) + has_inflight
+            )
+            self._stats.token_usage = num_used / self.max_total_num_tokens
+            self.log_metrics(self._stats)
+
         # Return the new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -549,6 +633,7 @@ class ModelTpServer:
     def forward_prefill_batch(self, batch: ScheduleBatch):
         # Build batch tensors
         batch.prepare_for_extend(self.model_config.vocab_size)
+        batch.mark_reqs_started()
 
         decoding_reqs = []
         if self.is_mixed_chunk and self.running_batch is not None:
@@ -800,6 +885,9 @@ class ModelTpServer:
         output_rids = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
+        num_prompt_tokens_requests: List[int] = []
+        num_generation_tokens_requests: List[int] = []
+        finished_reason_requests: List[str] = []
         if self.model_runner.is_generation:
             output_vids = []
             decoded_texts = []
@@ -822,6 +910,9 @@ class ModelTpServer:
                     or len(req.output_ids) == 1
                 )
             ):
+                self.time_e2e_requests.append(req.finished_time - req.created_time)
+                self.time_waiting_requests.append(req.queued_time - req.created_time)
+                self.time_decode_requests.append(req.finished_time - req.started_time)
                 output_rids.append(req.rid)
                 output_finished_reason.append(req.finished_reason)
                 if self.model_runner.is_generation:
@@ -835,6 +926,16 @@ class ModelTpServer:
                     )
                     output_spaces_between_special_tokens.append(
                         req.sampling_params.spaces_between_special_tokens
+                    )
+
+                    num_prompt_tokens_requests.append(len(req.origin_input_ids))
+                    num_generation_tokens_requests.append(len(req.output_ids))
+                    finished_reason_requests.append(
+                        (
+                            req.finished_reason.to_json()
+                            if req.finished_reason is not None
+                            else None
+                        )
                     )
 
                     meta_info = {
@@ -868,6 +969,12 @@ class ModelTpServer:
                         "prompt_tokens": len(req.origin_input_ids),
                     }
                     output_meta_info.append(meta_info)
+        stats = Stats(
+            num_generation_tokens_requests=num_generation_tokens_requests,
+            num_prompt_tokens_requests=num_prompt_tokens_requests,
+            finished_reason_requests=finished_reason_requests,
+        )
+        self.log_metrics(stats)
 
         # Send to detokenizer
         if output_rids:
@@ -947,6 +1054,11 @@ class ModelTpServer:
         else:
             logger.error(message)
         return success, message
+
+    def log_metrics(self, stats):
+        """Collect metrics."""
+
+        self.metrics_collector.log_stats(stats)
 
 
 def run_tp_server(

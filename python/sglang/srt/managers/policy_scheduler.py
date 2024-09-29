@@ -17,6 +17,7 @@ limitations under the License.
 
 import os
 import random
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import Dict, List, Optional
@@ -286,6 +287,7 @@ class PrefillAdder:
                 or (req.return_logprob and req.normalized_prompt_logprob is None)
             ):
                 # Non-chunked prefill
+                req.queued_time = time.time()
                 self.can_run_list.append(req)
                 self.tree_cache.inc_lock_ref(req.last_node)
                 self._prefill_one_req(
@@ -301,6 +303,7 @@ class PrefillAdder:
 
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                req.queued_time = time.time()
                 self.can_run_list.append(req)
                 self.new_inflight_req = req
                 self.tree_cache.inc_lock_ref(req.last_node)
