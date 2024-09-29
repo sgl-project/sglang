@@ -138,7 +138,8 @@ class ModelRunner:
         if self.server_args.dist_init_addr:
             nccl_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
-            nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port}"
+            nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port + 400}"
+        print(f"{nccl_init_method=}")
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         init_distributed_environment(
             backend="nccl",

@@ -80,7 +80,7 @@ class ServerArgs:
     # Distributed args
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
-    node_rank: Optional[int] = None
+    node_rank: int = 0
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
@@ -434,7 +434,9 @@ class ServerArgs:
         parser.add_argument(
             "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
         )
-        parser.add_argument("--node-rank", type=int, help="The node rank.")
+        parser.add_argument(
+            "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+        )
 
         # Model override args
         parser.add_argument(
@@ -583,6 +585,11 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
+
+        assert self.dp_size == 1, (
+            "The support for data parallelism is temporarily disabled during refactor. "
+            "Please use sglang<=0.3.2 or wait for later updates."
+        )
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:

@@ -324,12 +324,17 @@ def launch_server(
     # Launch tensor parallel scheduler processes
     scheduler_procs = []
     scheduler_pipe_readers = []
-    tp_size = server_args.tp_size
-    for tp_rank in range(tp_size):
+    tp_size_per_node = server_args.tp_size // server_args.nnodes
+    tp_rank_range = range(
+        tp_size_per_node * server_args.node_rank,
+        tp_size_per_node * (server_args.node_rank + 1),
+    )
+    for tp_rank in tp_rank_range:
         reader, writer = mp.Pipe(duplex=False)
+        gpu_id = tp_rank % tp_size_per_node
         proc = mp.Process(
             target=run_scheduler_process,
-            args=(server_args, port_args, tp_rank, writer),
+            args=(server_args, port_args, gpu_id, tp_rank, writer),
         )
         proc.start()
         scheduler_procs.append(proc)
@@ -412,9 +417,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             "at https://docs.flashinfer.ai/installation.html.",
         )
 
-    if is_hip():
-        # to figure out a better method of not using fork later
-        mp.set_start_method("spawn", force=True)
+    mp.set_start_method("spawn", force=True)
 
 
 def _wait_and_warmup(server_args, pipe_finish_writer, pid):
@@ -478,7 +481,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
-        pipe_finish_writer.send("init ok")
+        pipe_finish_writer.send("ready")
 
 
 class Runtime:
@@ -525,7 +528,7 @@ class Runtime:
         except EOFError:
             init_state = ""
 
-        if init_state != "init ok":
+        if init_state != "ready":
             self.shutdown()
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."

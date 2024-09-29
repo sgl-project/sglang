@@ -13,19 +13,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""A controller that manages a group of tensor parallel workers."""
+"""A scheduler that manages a tensor parallel GPU worker."""
 
 import logging
 import multiprocessing
-from typing import List
 
 import zmq
 
-from sglang.srt.managers.tp_worker import (
-    ModelTpServer,
-    broadcast_recv_input,
-    launch_tp_servers,
-)
+from sglang.srt.managers.tp_worker import ModelTpServer
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, kill_parent_process
 from sglang.utils import get_exception_traceback
@@ -34,11 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 class Scheduler:
+    """A scheduler that manages a tensor parallel GPU worker."""
 
     def __init__(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        gpu_id: int,
         tp_rank: int,
     ):
         # Parse args
@@ -49,26 +46,27 @@ class Scheduler:
 
         if server_args.dist_init_addr:
             host, port = server_args.dist_init_addr.split(":")
-            bind_address = f"tcp://{host}:{port + 1}"
+            bind_address = f"tcp://{host}:{int(port) + 1}"
         else:
             bind_address = f"tcp://127.0.0.1:{port_args.tokenizer_broadcast_port}"
         self.recv_from_tokenizer = context.socket(zmq.SUB)
-        self.recv_from_tokenizer.bind(bind_address)
+        self.recv_from_tokenizer.connect(bind_address)
         self.recv_from_tokenizer.setsockopt_string(
             zmq.SUBSCRIBE, ""
         )  # Subscribe to all messages
 
-        self.send_to_detokenizer = context.socket(zmq.PUSH)
-        self.send_to_detokenizer.connect(
-            f"tcp://127.0.0.1:{port_args.detokenizer_port}"
-        )
+        if self.tp_rank == 0:
+            self.send_to_detokenizer = context.socket(zmq.PUSH)
+            self.send_to_detokenizer.connect(
+                f"tcp://127.0.0.1:{port_args.detokenizer_port}"
+            )
 
         # Launch a tp server
         self.tp_server = ModelTpServer(
-            0,
-            0,
-            server_args,
-            port_args.nccl_ports[0],
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            server_args=server_args,
+            nccl_port=port_args.nccl_ports[0],
         )
 
     def event_loop(self):
@@ -77,8 +75,9 @@ class Scheduler:
 
             out_pyobjs = self.tp_server.exposed_step(recv_reqs)
 
-            for obj in out_pyobjs:
-                self.send_to_detokenizer.send_pyobj(obj)
+            if self.tp_rank == 0:
+                for obj in out_pyobjs:
+                    self.send_to_detokenizer.send_pyobj(obj)
 
     def recv_requests_from_zmq(self):
         recv_reqs = []
@@ -95,13 +94,14 @@ class Scheduler:
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
+    gpu_id: int,
     tp_rank: int,
     pipe_writer: multiprocessing.connection.Connection,
 ):
-    configure_logger(server_args)
+    configure_logger(server_args, prefix=f" TP{tp_rank}")
 
     try:
-        scheduler = Scheduler(server_args, port_args, tp_rank)
+        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank)
         pipe_writer.send("ready")
         scheduler.event_loop()
     except Exception:

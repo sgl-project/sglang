@@ -90,11 +90,11 @@ class TokenizerManager:
 
         if server_args.dist_init_addr:
             host, port = server_args.dist_init_addr.split(":")
-            bind_address = f"tcp://{host}:{port + 1}"
+            bind_address = f"tcp://{host}:{int(port) + 1}"
         else:
             bind_address = f"tcp://127.0.0.1:{port_args.tokenizer_broadcast_port}"
         self.broadcast_to_scheduler = context.socket(zmq.PUB)
-        self.broadcast_to_scheduler.connect(bind_address)
+        self.broadcast_to_scheduler.bind(bind_address)
 
         # Read model args
         self.model_path = server_args.model_path
@@ -670,7 +670,7 @@ class TokenizerManager:
     def detokenize_logprob_tokens(
         self, token_logprobs: List[Tuple[float, int]], decode_to_text: bool
     ):
-        # This should run on DetokenizerManager
+        # TODO(lianmin): This should run on DetokenizerManager
         if not decode_to_text:
             return [(logprob, token_id, None) for logprob, token_id in token_logprobs]
 
