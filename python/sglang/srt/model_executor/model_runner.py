@@ -135,8 +135,8 @@ class ModelRunner:
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
 
-        if self.server_args.nccl_init_addr:
-            nccl_init_method = f"tcp://{self.server_args.nccl_init_addr}"
+        if self.server_args.dist_init_addr:
+            nccl_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
             nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)

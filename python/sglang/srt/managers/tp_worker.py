@@ -17,16 +17,12 @@ limitations under the License.
 
 import json
 import logging
-import multiprocessing
 import os
-import pickle
 import time
 import warnings
-from typing import Any, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
-import torch.distributed
-import torch.distributed as dist
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -58,7 +54,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    configure_logger,
+    broadcast_pyobj,
     is_multimodal_model,
     set_random_seed,
     suppress_other_loggers,
@@ -140,7 +136,7 @@ class ModelTpServer:
         )
 
         # Sync random seed across TP workers
-        server_args.random_seed = broadcast_recv_input(
+        server_args.random_seed = broadcast_pyobj(
             [server_args.random_seed],
             self.tp_rank,
             self.model_runner.tp_group.cpu_group,
@@ -935,82 +931,3 @@ class ModelTpServer:
         else:
             logger.error(message)
         return success, message
-
-
-def run_tp_server(
-    gpu_id: int,
-    tp_rank: int,
-    server_args: ServerArgs,
-    nccl_port: int,
-):
-    """Run a tensor parallel model server."""
-    configure_logger(server_args, prefix=f" TP{tp_rank}")
-
-    try:
-        model_server = ModelTpServer(
-            gpu_id,
-            tp_rank,
-            server_args,
-            nccl_port,
-        )
-        tp_cpu_group = model_server.model_runner.tp_group.cpu_group
-
-        while True:
-            recv_reqs = broadcast_recv_input(None, tp_rank, tp_cpu_group)
-            model_server.exposed_step(recv_reqs)
-    except Exception:
-        logger.error("Exception in run_tp_server:\n" + get_exception_traceback())
-        raise
-
-
-def launch_tp_servers(
-    gpu_ids: List[int],
-    tp_rank_range: List[int],
-    server_args: ServerArgs,
-    nccl_port: int,
-):
-    """Launch multiple tensor parallel servers."""
-    procs = []
-    for i in tp_rank_range:
-        proc = multiprocessing.Process(
-            target=run_tp_server,
-            args=(gpu_ids[i], i, server_args, nccl_port),
-        )
-        proc.start()
-        procs.append(proc)
-
-    return procs
-
-
-def broadcast_recv_input(
-    data: Any, rank: int, dist_group: torch.distributed.ProcessGroup
-):
-    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
-
-    if rank == 0:
-        if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long)
-            dist.broadcast(tensor_size, src=0, group=dist_group)
-        else:
-            serialized_data = pickle.dumps(data)
-            size = len(serialized_data)
-            tensor_data = torch.ByteTensor(list(serialized_data))
-            tensor_size = torch.tensor([size], dtype=torch.long)
-
-            dist.broadcast(tensor_size, src=0, group=dist_group)
-            dist.broadcast(tensor_data, src=0, group=dist_group)
-        return data
-    else:
-        tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.broadcast(tensor_size, src=0, group=dist_group)
-        size = tensor_size.item()
-
-        if size == 0:
-            return []
-
-        tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.broadcast(tensor_data, src=0, group=dist_group)
-
-        serialized_data = bytes(tensor_data.tolist())
-        data = pickle.loads(serialized_data)
-        return data
