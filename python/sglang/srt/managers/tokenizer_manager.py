@@ -150,14 +150,9 @@ class TokenizerManager:
             await asyncio.sleep(0.001)
 
         obj.post_init()
-        is_single = obj.is_single
 
-        if is_single:
-            async for response in self._handle_single_request(obj, request):
-                yield response
-        else:
-            async for response in self._handle_batch_request(obj, request):
-                yield response
+        async for response in self._handle_batch_request(obj, request):
+            yield response
 
     async def _handle_single_request(
         self,
@@ -331,7 +326,7 @@ class TokenizerManager:
                     continue
                 index = i * parallel_sample_num + j
                 if parallel_sample_num != 1:
-                    # Here when using parallel sampling we should consider prefill stage so the index is :  j + i * (parallel_sample_num-1) + batch_size - 1
+                    # Here when using parallel sampling we should consider prefill stage so the index is :  j - 1 + i * (parallel_sample_num-1) + batch_size
                     index += batch_size - 1 - i
                 rid = obj.rid[index]
                 if parallel_sample_num == 1:
@@ -351,7 +346,7 @@ class TokenizerManager:
                         input_ids = obj.input_ids[i]
                 else:
                     assert obj.input_ids is not None
-                    if batch_size == 1:
+                    if isinstance(obj.input_ids[0], int):
                         input_text = None
                         input_ids = obj.input_ids
                     else:
@@ -412,36 +407,40 @@ class TokenizerManager:
                     )
                 )
 
-        # Then process the responses based on streaming option
-        is_stream = hasattr(obj, "stream") and obj.stream
+        if obj.is_single:
+            async for response in generators[0]:
+                yield response
+        else:
+            # Then process the responses based on streaming option
+            is_stream = hasattr(obj, "stream") and obj.stream
 
-        tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
-        output_list = [None] * len(tasks)
+            tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
+            output_list = [None] * len(tasks)
 
-        # Recv results
-        while tasks:
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            # Recv results
+            while tasks:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
-            for task in done:
-                cur_index = tasks.index(task)
+                for task in done:
+                    cur_index = tasks.index(task)
 
-                try:
-                    result = task.result()
+                    try:
+                        result = task.result()
 
-                    if is_stream:
-                        yield result
-                    else:
-                        output_list[result["index"]] = result
+                        if is_stream:
+                            yield result
+                        else:
+                            output_list[result["index"]] = result
 
-                    tasks[cur_index] = asyncio.create_task(
-                        generators[cur_index].__anext__()
-                    )
-                except StopAsyncIteration:
-                    del generators[cur_index]
-                    del tasks[cur_index]
+                        tasks[cur_index] = asyncio.create_task(
+                            generators[cur_index].__anext__()
+                        )
+                    except StopAsyncIteration:
+                        del generators[cur_index]
+                        del tasks[cur_index]
 
-        if not is_stream:
-            yield output_list
+            if not is_stream:
+                yield output_list
 
     def _validate_input_length(self, input_ids: List[int]):
         if len(input_ids) >= self.context_len:
@@ -471,7 +470,7 @@ class TokenizerManager:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
             except asyncio.TimeoutError:
                 if request is not None and await request.is_disconnected():
-                    for rid in [obj.rid] if obj.is_single else obj.rid:
+                    for rid in obj.rid:
                         self.abort_request(rid)
                     raise ValueError(f"Abort request {rid}")
                 continue
@@ -567,11 +566,8 @@ class TokenizerManager:
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(3)
-            if obj.is_single:
-                self.abort_request(obj.rid)
-            else:
-                for rid in obj.rid:
-                    self.abort_request(rid)
+            for rid in obj.rid:
+                self.abort_request(rid)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
