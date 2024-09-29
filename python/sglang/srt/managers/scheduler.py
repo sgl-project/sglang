@@ -18,6 +18,7 @@ limitations under the License.
 import logging
 import multiprocessing
 
+import torch
 import zmq
 
 from sglang.srt.managers.tp_worker import ModelTpServer
@@ -60,6 +61,8 @@ class Scheduler:
             self.send_to_detokenizer.connect(
                 f"tcp://127.0.0.1:{port_args.detokenizer_port}"
             )
+        else:
+            self.send_to_detokenizer = None
 
         # Launch a tp server
         self.tp_server = ModelTpServer(
@@ -68,27 +71,37 @@ class Scheduler:
             server_args=server_args,
             nccl_port=port_args.nccl_ports[0],
         )
+        self.tp_cpu_group = self.tp_server.model_runner.tp_group.cpu_group
+
+        self.recv_reqs = []
 
     def event_loop(self):
         while True:
-            recv_reqs = self.recv_requests_from_zmq()
+            self.recv_requests_from_zmq()
 
-            out_pyobjs = self.tp_server.exposed_step(recv_reqs)
+            # Sync step requests among all TP workers
+            num_reqs = len(self.recv_reqs)
+            tmp_tensor = torch.tensor([num_reqs], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                tmp_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
+            num_reqs = tmp_tensor.item()
+            step_reqs = self.recv_reqs[:num_reqs]
+            self.recv_reqs = self.recv_reqs[num_reqs:]
 
-            if self.tp_rank == 0:
+            out_pyobjs = self.tp_server.exposed_step(step_reqs)
+
+            if self.send_to_detokenizer:
                 for obj in out_pyobjs:
                     self.send_to_detokenizer.send_pyobj(obj)
 
     def recv_requests_from_zmq(self):
-        recv_reqs = []
         while True:
             try:
                 recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
             except zmq.ZMQError:
                 break
-            recv_reqs.append(recv_req)
-
-        return recv_reqs
+            self.recv_reqs.append(recv_req)
 
 
 def run_scheduler_process(

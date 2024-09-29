@@ -340,6 +340,12 @@ def launch_server(
         scheduler_procs.append(proc)
         scheduler_pipe_readers.append(reader)
 
+    if server_args.node_rank >= 1:
+        # For other nodes, they do not need to run tokenizer or detokenizer,
+        # so they can just wait here.
+        while True:
+            pass
+
     # Launch detokenizer process
     detoken_proc = mp.Process(
         target=run_detokenizer_process,
