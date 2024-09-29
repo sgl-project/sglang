@@ -58,6 +58,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
+    is_generation_model,
     is_multimodal_model,
     kill_parent_process,
     set_random_seed,
@@ -82,6 +83,7 @@ class Scheduler:
         tp_rank: int,
     ):
         # Parse args
+        self.server_args = server_args
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
@@ -127,6 +129,9 @@ class Scheduler:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                 )
+        self.is_generation = is_generation_model(
+            self.model_config.hf_config.architectures, self.server_args.is_embedding
+        )
 
         # Launch a tensor parallel worker
         self.tp_worker = ModelTpWorker(
@@ -136,16 +141,15 @@ class Scheduler:
             nccl_port=port_args.nccl_ports[0],
         )
         self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
-        self.model_runner = self.tp_worker.model_runner
-        self.tokenizer = self.tp_worker.tokenizer
 
-        # Get configs from the tp worker
-        self.model_config = self.tp_worker.model_config
-        self.max_total_num_tokens = self.tp_worker.max_total_num_tokens
-        self.max_prefill_tokens = self.tp_worker.max_prefill_tokens
-        self.max_running_requests = self.tp_worker.max_running_requests
-        self.max_req_input_len = self.tp_worker.max_req_input_len
-        self.random_seed = self.tp_worker.random_seed
+        # Get token and memory info from the tp worker
+        (
+            self.max_total_num_tokens,
+            self.max_prefill_tokens,
+            self.max_running_requests,
+            self.max_req_input_len,
+            self.random_seed,
+        ) = self.tp_worker.get_token_and_memory_info()
         set_random_seed(self.random_seed)
 
         # Print debug info
@@ -567,12 +571,12 @@ class Scheduler:
             decoding_reqs = self.running_batch.reqs
             self.running_batch = None
 
-        if self.model_runner.is_generation:
+        if self.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
-                logits_output = self.model_runner.forward(batch)
-                next_token_ids = self.model_runner.sample(logits_output, batch)
-
+                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+                    batch
+                )
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     next_token_ids
                 )
@@ -635,8 +639,7 @@ class Scheduler:
                     )
         else:
             assert batch.extend_num_tokens != 0
-            logits_output = self.model_runner.forward(batch)
-            embeddings = logits_output.embeddings.tolist()
+            embeddings = self.tp_worker.forward_batch_embedding(batch)
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -751,8 +754,8 @@ class Scheduler:
                 self.min_new_token_ratio,
             )
 
+        # Check for jump-forward
         if not self.disable_regex_jump_forward:
-            # Check for jump-forward
             jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
             self.waiting_queue.extend(jump_forward_reqs)
             if batch.is_empty():
@@ -763,8 +766,7 @@ class Scheduler:
         batch.prepare_for_decode()
 
         # Forward and sample the next tokens
-        logits_output = self.model_runner.forward(batch)
-        next_token_ids = self.model_runner.sample(logits_output, batch)
+        logits_output, next_token_ids = self.tp_worker.forward_batch_generation(batch)
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
         )
@@ -810,7 +812,7 @@ class Scheduler:
         output_rids = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
-        if self.model_runner.is_generation:
+        if self.is_generation:
             output_vids = []
             decoded_texts = []
             output_read_ids = []
@@ -834,7 +836,7 @@ class Scheduler:
             ):
                 output_rids.append(req.rid)
                 output_finished_reason.append(req.finished_reason)
-                if self.model_runner.is_generation:
+                if self.is_generation:
                     output_vids.append(req.vid)
                     decoded_texts.append(req.decoded_text)
                     read_ids, read_offset = req.init_incremental_detokenize()
@@ -881,7 +883,7 @@ class Scheduler:
 
         # Send to detokenizer
         if output_rids:
-            if self.model_runner.is_generation:
+            if self.is_generation:
                 self.out_pyobjs.append(
                     BatchTokenIDOut(
                         output_rids,
@@ -948,7 +950,7 @@ class Scheduler:
                     break
 
     def update_weights(self, recv_req):
-        success, message = self.model_runner.update_weights(
+        success, message = self.tp_worker.update_weights(
             recv_req.model_path, recv_req.load_format
         )
         if success:

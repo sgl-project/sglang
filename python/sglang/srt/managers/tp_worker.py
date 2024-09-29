@@ -17,50 +17,14 @@ limitations under the License.
 
 import json
 import logging
-import os
-import time
-import warnings
-from typing import List, Optional, Union
 
-import torch
-
-from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.fsm_cache import FSMCache
-from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import (
-    AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
-    FlushCacheReq,
-    TokenizedEmbeddingReqInput,
-    TokenizedGenerateReqInput,
-    TokenizedRewardReqInput,
-    UpdateWeightReqInput,
-    UpdateWeightReqOutput,
-)
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    BaseFinishReason,
-    ImageInputs,
-    Req,
-    ScheduleBatch,
-)
-from sglang.srt.managers.scheduler_policy import PrefillAdder, SchedulerPolicy
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import broadcast_pyobj, is_multimodal_model, set_random_seed
-from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-
-
-# Crash on warning if we are running CI tests
-crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
 
 
 class ModelTpWorker:
@@ -106,6 +70,8 @@ class ModelTpWorker:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                 )
+
+        # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
         self.max_running_requests = min(
@@ -128,3 +94,28 @@ class ModelTpWorker:
             self.model_runner.tp_group.cpu_group,
         )[0]
         set_random_seed(self.random_seed)
+
+    def get_token_and_memory_info(self):
+        return (
+            self.max_total_num_tokens,
+            self.max_prefill_tokens,
+            self.max_running_requests,
+            self.max_req_input_len,
+            self.random_seed,
+        )
+
+    def forward_batch_generation(self, batch):
+        logits_output = self.model_runner.forward(batch)
+        next_token_ids = self.model_runner.sample(logits_output, batch)
+        return logits_output, next_token_ids
+
+    def forward_batch_embedding(self, batch):
+        logits_output = self.model_runner.forward(batch)
+        embeddings = logits_output.embeddings.tolist()
+        return logits_output, embeddings
+
+    def update_weights(self, recv_req):
+        success, message = self.tp_worker.update_weights(
+            recv_req.model_path, recv_req.load_format
+        )
+        return success, message
