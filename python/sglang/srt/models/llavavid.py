@@ -109,10 +109,8 @@ class LlavaVidForCausalLM(nn.Module):
         input_ids: torch.LongTensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
-        pixel_values: Optional[List[Optional[np.array]]] = None,
-        image_sizes: Optional[List[List[int]]] = None,
-        image_offsets: Optional[List[int]] = None,
     ) -> torch.Tensor:
+        image_inputs = input_metadata.image_inputs
         if input_metadata.forward_mode.is_extend():
             bs = input_metadata.batch_size
 
@@ -120,14 +118,22 @@ class LlavaVidForCausalLM(nn.Module):
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
             # Whether the requests need vision inputs
-            max_image_offset = np.array(
-                [max(image_offsets[i]) if image_offsets[i] else -1 for i in range(bs)]
-            )
+            max_image_offset = []
+            for im in image_inputs:
+                if im and im.image_offsets:
+                    max_image_offset.append(max(im.image_offsets))
+                else:
+                    max_image_offset.append(-1)
             start_positions = positions[input_metadata.extend_start_loc].cpu().numpy()
-            need_vision = start_positions <= max_image_offset
+            need_vision = start_positions <= np.array(max_image_offset)
 
             if need_vision.any():
-                pixel_values = [pixel_values[i] for i in range(bs) if need_vision[i]]
+                pixel_values = [
+                    image_inputs[i].pixel_values for i in range(bs) if need_vision[i]
+                ]
+                image_offsets = [
+                    image_inputs[i].image_offsets for i in range(bs) if need_vision[i]
+                ]
 
                 ########## Encode Image ########
 

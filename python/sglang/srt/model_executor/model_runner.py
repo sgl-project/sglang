@@ -498,23 +498,10 @@ class ModelRunner:
                 get_embedding=True,
             )
 
-    def forward_extend_multi_modal(self, batch: ScheduleBatch):
-        input_metadata = InputMetadata.from_schedule_batch(self, batch)
-        return self.model.forward(
-            batch.input_ids,
-            input_metadata.positions,
-            input_metadata,
-            input_metadata.pixel_values,
-            input_metadata.image_sizes,
-            input_metadata.image_offsets,
-        )
-
     def forward(self, batch: ScheduleBatch) -> Tuple[LogitsProcessorOutput]:
         assert batch.forward_mode is not None
 
-        if self.is_multimodal_model and batch.forward_mode.is_extend():
-            return self.forward_extend_multi_modal(batch)
-        elif batch.forward_mode.is_decode():
+        if batch.forward_mode.is_decode():
             return self.forward_decode(batch)
         elif batch.forward_mode.is_extend():
             return self.forward_extend(batch)
