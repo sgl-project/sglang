@@ -594,6 +594,16 @@ class ServerArgs:
             "Please use sglang<=0.3.2 or wait for later updates."
         )
 
+        if isinstance(self.lora_paths, list):
+            lora_paths = self.lora_paths
+            self.lora_paths = {}
+            for lora_path in lora_paths:
+                if "=" in lora_path:
+                    name, path = lora_path.split("=", 1)
+                    self.lora_paths[name] = path
+                else:
+                    self.lora_paths[lora_path] = lora_path
+
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
