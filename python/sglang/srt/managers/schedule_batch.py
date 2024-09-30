@@ -640,7 +640,7 @@ class ScheduleBatch:
 
         return retracted_reqs, new_estimate_ratio
 
-    def check_for_jump_forward(self, model_runner):
+    def check_for_jump_forward(self, pad_input_ids_func):
         jump_forward_reqs = []
         filter_indices = [i for i in range(len(self.reqs))]
 
@@ -697,7 +697,7 @@ class ScheduleBatch:
 
                     # re-applying image padding
                     if req.image_inputs is not None:
-                        req.origin_input_ids = model_runner.model.pad_input_ids(
+                        req.origin_input_ids = pad_input_ids_func(
                             req.origin_input_ids_unpadded, req.image_inputs
                         )
 
