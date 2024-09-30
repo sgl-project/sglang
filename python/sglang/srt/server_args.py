@@ -21,9 +21,7 @@ import logging
 import random
 from typing import List, Optional, Union
 
-
-from sglang.srt.utils import is_hip, is_ipv6, flashinfer_is_available
-
+from sglang.srt.utils import flashinfer_is_available, is_hip, is_ipv6
 
 logger = logging.getLogger(__name__)
 
