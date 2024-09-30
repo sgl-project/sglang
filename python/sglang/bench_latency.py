@@ -167,9 +167,13 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer):
         assert len(input_ids[i]) > bench_args.cut_len
 
         tmp_input_ids = input_ids[i][: bench_args.cut_len]
-        req = Req(rid=i, origin_input_text=prompts[i], origin_input_ids=tmp_input_ids)
+        req = Req(
+            rid=i,
+            origin_input_text=prompts[i],
+            origin_input_ids=tmp_input_ids,
+            sampling_params=sampling_params,
+        )
         req.prefix_indices = []
-        req.sampling_params = sampling_params
         req.fill_ids = req.origin_input_ids
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         reqs.append(req)
@@ -199,9 +203,13 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
 
     reqs = []
     for i in range(len(input_ids)):
-        req = Req(rid=i, origin_input_text="", origin_input_ids=list(input_ids[i]))
+        req = Req(
+            rid=i,
+            origin_input_text="",
+            origin_input_ids=list(input_ids[i]),
+            sampling_params=sampling_params,
+        )
         req.prefix_indices = []
-        req.sampling_params = sampling_params
         req.fill_ids = req.origin_input_ids
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         reqs.append(req)

@@ -27,11 +27,11 @@ logger = logging.getLogger(__name__)
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
-    def __init__(self, size: int, max_context_len: int):
+    def __init__(self, size: int, max_context_len: int, device: str):
         self.size = size
         self.free_slots = list(range(size))
         self.req_to_token = torch.empty(
-            (size, max_context_len), dtype=torch.int32, device="cuda"
+            (size, max_context_len), dtype=torch.int32, device=device
         )
 
     def alloc(self, need_size: int) -> List[int]:
