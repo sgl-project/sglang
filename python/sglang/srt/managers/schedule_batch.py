@@ -16,7 +16,7 @@ limitations under the License.
 """
 Store information about requests and batches.
 
-The following is the flow of data structures in a batch:
+The following is the flow of data structures for a batch:
 
 ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
@@ -774,8 +774,8 @@ class ScheduleBatch:
                 image_inputs
             ) = None
         else:
-            extend_seq_lens = self.extend_seq_lens
-            extend_prefix_lens = self.extend_prefix_lens
+            extend_seq_lens = self.extend_lens
+            extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
             image_inputs = [r.image_inputs for r in self.reqs]
 

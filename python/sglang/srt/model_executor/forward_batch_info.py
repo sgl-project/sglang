@@ -15,7 +15,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Meta data for a forward pass."""
+"""
+Store information about a forward batch.
+
+The following is the flow of data structures for a batch:
+
+ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
+
+- ScheduleBatch is managed by `scheduler.py::Scheduler`.
+  It contains high-level scheduling data. Most of the data is on the CPU.
+- ModelWorkerBatch is managed by `tp_worker.py::TpModelWorker`.
+- ForwardBatch is managed by `model_runner.py::ModelRunner`.
+  It contains low-level tensor data. Most of the data consists of GPU tensors.
+"""
+
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List
@@ -124,15 +137,17 @@ class ForwardBatch:
             ret.positions = torch.tensor(
                 np.concatenate(
                     [
-                        np.arange(batch.prefix_lens_cpu[i], len(req.fill_ids))
-                        for i, req in enumerate(batch.reqs)
+                        np.arange(prefix_len, prefix_len + extend_len)
+                        for prefix_len, extend_len in zip(
+                            batch.extend_prefix_lens, batch.extend_seq_lens
+                        )
                     ],
                     axis=0,
                 ),
                 device=device,
             ).to(torch.int64)
 
-            ret.image_inputs = [r.image_inputs for r in batch.reqs]
+            ret.image_inputs = batch.image_inputs
             ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device=device)
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, device=device
