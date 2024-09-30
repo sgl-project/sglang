@@ -28,19 +28,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import safetensors.torch
 import torch
 from torch import nn
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.loader import DefaultModelLoader
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 class BaseLayerWithLoRA(nn.Module):

@@ -41,7 +41,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.constrained import disable_cache
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
@@ -72,8 +71,6 @@ from sglang.srt.utils import (
     allocate_init_ports,
     assert_pkg_version,
     configure_logger,
-    enable_show_time_cost,
-    is_hip,
     kill_child_process,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
@@ -399,14 +396,6 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set ulimit
     set_ulimit()
-
-    # Enable show time cost for debugging
-    if server_args.show_time_cost:
-        enable_show_time_cost()
-
-    # Disable disk cache
-    if server_args.disable_disk_cache:
-        disable_cache()
 
     # Fix triton bugs
     if server_args.tp_size * server_args.dp_size > 1:

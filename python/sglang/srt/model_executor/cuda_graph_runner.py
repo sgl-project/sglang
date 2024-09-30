@@ -31,8 +31,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import monkey_patch_vllm_all_gather
 
 if TYPE_CHECKING:
@@ -143,7 +142,6 @@ class CudaGraphRunner:
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.position_ids_offsets = torch.ones((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32)
 
         # Capture
@@ -189,7 +187,6 @@ class CudaGraphRunner:
         input_ids = self.input_ids[:bs]
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
-        position_ids_offsets = self.position_ids_offsets[:bs]
         out_cache_loc = self.out_cache_loc[:bs]
 
         # Attention backend
@@ -199,9 +196,10 @@ class CudaGraphRunner:
 
         # Run and capture
         def run_once():
-            input_metadata = InputMetadata(
+            forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.DECODE,
                 batch_size=bs,
+                input_ids=input_ids,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 req_to_token_pool=self.model_runner.req_to_token_pool,
@@ -210,9 +208,9 @@ class CudaGraphRunner:
                 out_cache_loc=out_cache_loc,
                 return_logprob=False,
                 top_logprobs_nums=[0] * bs,
-                positions=(seq_lens - 1 + position_ids_offsets).to(torch.int64),
+                positions=torch.clamp((seq_lens - 1), min=0).to(torch.int64),
             )
-            return forward(input_ids, input_metadata.positions, input_metadata)
+            return forward(input_ids, forward_batch.positions, forward_batch)
 
         for _ in range(2):
             torch.cuda.synchronize()
@@ -235,24 +233,22 @@ class CudaGraphRunner:
         self.graph_memory_pool = graph.pool()
         return graph, out
 
-    def replay(self, batch: ScheduleBatch):
-        assert batch.out_cache_loc is not None
-        raw_bs = len(batch.reqs)
+    def replay(self, forward_batch: ForwardBatch):
+        assert forward_batch.out_cache_loc is not None
+        raw_bs = forward_batch.batch_size
 
         # Pad
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
-            self.position_ids_offsets.fill_(1)
             self.out_cache_loc.zero_()
 
         # Common inputs
-        self.input_ids[:raw_bs] = batch.input_ids
-        self.req_pool_indices[:raw_bs] = batch.req_pool_indices
-        self.seq_lens[:raw_bs] = batch.seq_lens
-        self.position_ids_offsets[:raw_bs] = batch.position_ids_offsets
-        self.out_cache_loc[:raw_bs] = batch.out_cache_loc
+        self.input_ids[:raw_bs] = forward_batch.input_ids
+        self.req_pool_indices[:raw_bs] = forward_batch.req_pool_indices
+        self.seq_lens[:raw_bs] = forward_batch.seq_lens
+        self.out_cache_loc[:raw_bs] = forward_batch.out_cache_loc
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -275,15 +271,15 @@ class CudaGraphRunner:
             )
 
         # Extract logprobs
-        if batch.return_logprob:
+        if forward_batch.return_logprob:
             logits_output.next_token_logprobs = torch.nn.functional.log_softmax(
                 logits_output.next_token_logits, dim=-1
             )
-            return_top_logprob = any(x > 0 for x in batch.top_logprobs_nums)
+            return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
             if return_top_logprob:
                 logits_metadata = LogitsMetadata(
                     forward_mode=ForwardMode.DECODE,
-                    top_logprobs_nums=batch.top_logprobs_nums,
+                    top_logprobs_nums=forward_batch.top_logprobs_nums,
                 )
                 logits_output.output_top_logprobs = LogitsProcessor.get_top_logprobs(
                     logits_output.next_token_logprobs, logits_metadata

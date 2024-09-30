@@ -25,7 +25,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 @dataclasses.dataclass
@@ -61,26 +61,30 @@ class LogitsMetadata:
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
 
     @classmethod
-    def from_input_metadata(cls, input_metadata: InputMetadata):
-        return_top_logprob = any(x > 0 for x in input_metadata.top_logprobs_nums)
-        if input_metadata.forward_mode.is_extend():
+    def from_forward_batch(cls, forward_batch: ForwardBatch):
+        if forward_batch.return_logprob:
+            return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
+        else:
+            return_top_logprob = False
+
+        if forward_batch.forward_mode.is_extend():
             extend_logprob_pruned_lens_cpu = [
                 extend_len - start_len
                 for extend_len, start_len in zip(
-                    input_metadata.extend_seq_lens,
-                    input_metadata.extend_logprob_start_lens_cpu,
+                    forward_batch.extend_seq_lens,
+                    forward_batch.extend_logprob_start_lens_cpu,
                 )
             ]
         else:
             extend_logprob_pruned_lens_cpu = None
         return cls(
-            forward_mode=input_metadata.forward_mode,
-            top_logprobs_nums=input_metadata.top_logprobs_nums,
-            return_logprob=input_metadata.return_logprob,
+            forward_mode=forward_batch.forward_mode,
+            top_logprobs_nums=forward_batch.top_logprobs_nums,
+            return_logprob=forward_batch.return_logprob,
             return_top_logprob=return_top_logprob,
-            extend_seq_lens=input_metadata.extend_seq_lens,
-            extend_seq_lens_cpu=input_metadata.extend_seq_lens_cpu,
-            extend_logprob_start_lens_cpu=input_metadata.extend_logprob_start_lens_cpu,
+            extend_seq_lens=forward_batch.extend_seq_lens,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
         )
 
@@ -162,10 +166,10 @@ class LogitsProcessor(nn.Module):
         input_ids,
         hidden_states,
         weight,
-        logits_metadata: Union[LogitsMetadata, InputMetadata],
+        logits_metadata: Union[LogitsMetadata, ForwardBatch],
     ):
-        if isinstance(logits_metadata, InputMetadata):
-            logits_metadata = LogitsMetadata.from_input_metadata(logits_metadata)
+        if isinstance(logits_metadata, ForwardBatch):
+            logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
         assert isinstance(logits_metadata, LogitsMetadata)
 
         # Get the last hidden states and last logits for the next token prediction
