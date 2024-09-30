@@ -76,7 +76,6 @@ class InputMetadata:
     extend_seq_lens: torch.Tensor = None
     extend_prefix_lens: torch.Tensor = None
     extend_start_loc: torch.Tensor = None
-    extend_no_prefix: bool = None
 
     # For logprob
     return_logprob: bool = False
@@ -127,7 +126,6 @@ class InputMetadata:
             ret.extend_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
             ret.extend_start_loc = torch.zeros_like(ret.extend_seq_lens)
             ret.extend_start_loc[1:] = torch.cumsum(ret.extend_seq_lens[:-1], dim=0)
-            ret.extend_no_prefix = all(x == 0 for x in batch.prefix_lens_cpu)
             ret.extend_seq_lens_cpu = batch.extend_lens_cpu
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens_cpu
 

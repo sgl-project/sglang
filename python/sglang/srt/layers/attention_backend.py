@@ -148,6 +148,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged = True
 
             total_num_tokens = torch.sum(input_metadata.seq_lens).item()
+            extend_no_prefix = not torch.any(input_metadata.extend_prefix_lens).item()
 
         update_flashinfer_indices(
             input_metadata.forward_mode,
@@ -158,7 +159,12 @@ class FlashInferAttnBackend(AttentionBackend):
             use_ragged=use_ragged,
         )
 
-        self.forward_metadata = (use_ragged, total_num_tokens, self.decode_wrapper)
+        self.forward_metadata = (
+            use_ragged,
+            extend_no_prefix,
+            total_num_tokens,
+            self.decode_wrapper,
+        )
 
     def init_cuda_graph_state(self, max_bs: int):
         self.cuda_graph_kv_indptr = torch.zeros(
@@ -224,7 +230,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.cuda_graph_metadata[bs] = decode_wrapper
 
-        self.forward_metadata = (False, None, decode_wrapper)
+        self.forward_metadata = (False, False, None, decode_wrapper)
 
     def init_forward_metadata_replay_cuda_graph(
         self, bs: int, req_pool_indices, seq_lens
@@ -250,7 +256,9 @@ class FlashInferAttnBackend(AttentionBackend):
             else:
                 prefill_wrapper_paged = self.prefill_wrapper_paged[1]
 
-        use_ragged, total_num_tokens, decode_wrapper = self.forward_metadata
+        use_ragged, extend_no_prefix, total_num_tokens, decode_wrapper = (
+            self.forward_metadata
+        )
 
         if not use_ragged:
             if k is not None:
@@ -276,7 +284,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 logits_soft_cap=layer.logit_cap,
             )
 
-            if input_metadata.extend_no_prefix:
+            if extend_no_prefix:
                 o = o1
             else:
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
@@ -296,7 +304,9 @@ class FlashInferAttnBackend(AttentionBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
-        use_ragged, total_num_tokens, decode_wrapper = self.forward_metadata
+        use_ragged, extend_no_prefix, total_num_tokens, decode_wrapper = (
+            self.forward_metadata
+        )
 
         if isinstance(decode_wrapper, list):
             if layer.sliding_window_size != -1:
