@@ -18,7 +18,7 @@ limitations under the License.
 """Meta data for a forward pass."""
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Set
+from typing import TYPE_CHECKING, List
 
 import numpy as np
 import torch
@@ -53,8 +53,8 @@ class ForwardMode(IntEnum):
 
 
 @dataclass
-class InputMetadata:
-    """Store all inforamtion of a forward pass."""
+class ForwardBatch:
+    """Store all inputs of a forward pass."""
 
     # The forward mode
     forward_mode: ForwardMode

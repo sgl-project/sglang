@@ -40,7 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.loader import DefaultModelLoader
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 class BaseLayerWithLoRA(nn.Module):

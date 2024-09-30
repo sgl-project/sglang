@@ -30,6 +30,6 @@ To port a model from vLLM to SGLang, you can compare these two files [SGLang Lla
   - Replace vllm's `LogitsProcessor` with SGLang's `LogitsProcessor`.
   - Replace other vLLM layers with SGLang layers (e.g., `RMSNorm`, `SiluAndMul`).
   - Remove `Sample`.
-  - Change `forward()` functions, and add `input_metadata`.
+  - Change `forward()` functions, and add `forward_batch`.
   - Add `EntryClass` at the end.
 
