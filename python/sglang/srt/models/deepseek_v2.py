@@ -46,7 +46,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_hip
 
 # ROCm: flashinfer available later
@@ -281,7 +281,7 @@ class DeepseekV2Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if self.q_lora_rank is not None:
             q = self.q_a_proj(hidden_states)[0]
@@ -314,7 +314,7 @@ class DeepseekV2Attention(nn.Module):
         v = torch.nn.functional.pad(v, [0, 256 - self.v_head_dim], value=0).view(
             -1, self.num_local_heads * 256
         )
-        attn_output = self.attn(q, k, v, input_metadata)
+        attn_output = self.attn(q, k, v, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, 256)[
             ..., : self.v_head_dim
         ].reshape(-1, self.num_local_heads * self.v_head_dim)
@@ -433,7 +433,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         q_len = hidden_states.shape[0]
         q_input = hidden_states.new_empty(
@@ -471,7 +471,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_input[..., self.kv_lora_rank :] = q_pe
         k_input[..., self.kv_lora_rank :] = k_pe
 
-        attn_output = self.attn(q_input, k_input, v_input, input_metadata)
+        attn_output = self.attn(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.w_vc.dtype == torch.float8_e4m3fn:
@@ -567,7 +567,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
@@ -579,7 +579,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
 
         # Fully Connected
@@ -623,14 +623,14 @@ class DeepseekV2Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions, hidden_states, input_metadata, residual
+                positions, hidden_states, forward_batch, residual
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -658,11 +658,11 @@ class DeepseekV2ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, input_metadata)
+        hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
