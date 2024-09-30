@@ -150,19 +150,24 @@ class LoRAManager:
         self.A_buffer = {}
         self.B_buffer = {}
         num_layer = self.base_hf_config.num_hidden_layers
+
         for module_A, module_B in self.target_weights:
-            # init A tensor, column_major=True
             if hasattr(self.base_model, "get_hidden_dim"):
                 hidden_dim_A, _ = self.base_model.get_hidden_dim(module_A)
+                hidden_dim_B, _ = self.base_model.get_hidden_dim(module_B)
             else:
                 hidden_dim_A = self.base_model.config.hidden_size
-            c = self.loras[-1].get_stacked_multiply(module_A)
+                hidden_dim_B = self.base_model.config.hidden_size
+
+            c_A = self.loras[-1].get_stacked_multiply(module_A)
+            c_B = self.loras[-1].get_stacked_multiply(module_B)
+
             if module_A not in self.A_buffer:
                 self.A_buffer[module_A] = [
                     torch.empty(
                         (
                             self.max_loras_per_batch,
-                            self.max_lora_dim * c,
+                            self.max_lora_dim * c_A,
                             hidden_dim_A,
                         ),
                         dtype=self.dtype,
@@ -170,18 +175,13 @@ class LoRAManager:
                     )
                     for i in range(num_layer)
                 ]
-            # init B tensor, column_major=True
-            if hasattr(self.base_model, "get_hidden_dim"):
-                hidden_dim_B, _ = self.base_model.get_hidden_dim(module_B)
-            else:
-                hidden_dim_B = self.base_model.config.hidden_size
-            c = self.loras[-1].get_stacked_multiply(module_B)
+
             if module_B not in self.B_buffer:
                 self.B_buffer[module_B] = [
                     torch.empty(
                         (
                             self.max_loras_per_batch,
-                            hidden_dim_B * c,
+                            hidden_dim_B * c_B,
                             self.max_lora_dim,
                         ),
                         dtype=self.dtype,
