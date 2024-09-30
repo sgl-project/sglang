@@ -48,7 +48,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -466,47 +466,47 @@ class ModelRunner:
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
 
-    def forward_decode(self, input_metadata: InputMetadata):
+    def forward_decode(self, forward_batch: ForwardBatch):
         if self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            input_metadata.batch_size
+            forward_batch.batch_size
         ):
-            return self.cuda_graph_runner.replay(input_metadata)
+            return self.cuda_graph_runner.replay(forward_batch)
 
         return self.model.forward(
-            input_metadata.input_ids, input_metadata.positions, input_metadata
+            forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
-    def forward_extend(self, input_metadata: InputMetadata):
+    def forward_extend(self, forward_batch: ForwardBatch):
         if self.is_generation:
             return self.model.forward(
-                input_metadata.input_ids, input_metadata.positions, input_metadata
+                forward_batch.input_ids, forward_batch.positions, forward_batch
             )
         else:
             # Only embedding models have get_embedding parameter
             return self.model.forward(
-                input_metadata.input_ids,
-                input_metadata.positions,
-                input_metadata,
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
                 get_embedding=True,
             )
 
-    def forward(self, input_metadata: InputMetadata) -> LogitsProcessorOutput:
+    def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         # Attach attention information
-        input_metadata.req_to_token_pool = self.req_to_token_pool
-        input_metadata.token_to_kv_pool = self.token_to_kv_pool
-        input_metadata.attn_backend = self.attn_backend
-        input_metadata.attn_backend.init_forward_metadata(input_metadata)
+        forward_batch.req_to_token_pool = self.req_to_token_pool
+        forward_batch.token_to_kv_pool = self.token_to_kv_pool
+        forward_batch.attn_backend = self.attn_backend
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         # Attach lora information
         if self.server_args.lora_paths is not None:
-            self.lora_manager.prepare_lora_batch(input_metadata)
+            self.lora_manager.prepare_lora_batch(forward_batch)
 
-        if input_metadata.forward_mode.is_decode():
-            return self.forward_decode(input_metadata)
-        elif input_metadata.forward_mode.is_extend():
-            return self.forward_extend(input_metadata)
+        if forward_batch.forward_mode.is_decode():
+            return self.forward_decode(forward_batch)
+        elif forward_batch.forward_mode.is_extend():
+            return self.forward_extend(forward_batch)
         else:
-            raise ValueError(f"Invaid forward mode: {input_metadata.forward_mode}")
+            raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
 
     def _apply_logits_bias(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo

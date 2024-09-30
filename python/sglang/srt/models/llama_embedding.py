@@ -6,7 +6,7 @@ from transformers import LlamaConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
-from sglang.srt.model_executor.model_runner import InputMetadata
+from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.models.llama import LlamaModel
 
 
@@ -26,15 +26,15 @@ class LlamaEmbeddingModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
         assert (
             get_embedding
         ), "LlamaEmbeddingModel / MistralModel is only used for embedding"
-        hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
-        return self.pooler(hidden_states, input_metadata)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        return self.pooler(hidden_states, forward_batch)
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None
