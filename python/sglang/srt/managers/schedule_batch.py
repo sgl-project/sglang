@@ -515,7 +515,8 @@ class ScheduleBatch:
 
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
-        self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+        if self.return_logprob:
+            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
         self.prefix_lens = [len(r.prefix_indices) for r in reqs]
         self.extend_lens = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
@@ -739,12 +740,14 @@ class ScheduleBatch:
 
         self.reqs = [self.reqs[i] for i in unfinished_indices]
         new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cuda")
-        self.seq_lens = self.seq_lens[new_indices]
-        self.input_ids = None
         self.req_pool_indices = self.req_pool_indices[new_indices]
+        self.seq_lens = self.seq_lens[new_indices]
         self.out_cache_loc = None
-        self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
+        if self.return_logprob:
+            self.top_logprobs_nums = [
+                self.top_logprobs_nums[i] for i in unfinished_indices
+            ]
         self.has_stream = any(req.stream for req in self.reqs)
 
         self.sampling_info.filter_batch(unfinished_indices, new_indices)
@@ -761,8 +764,9 @@ class ScheduleBatch:
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
-        self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
+        if self.return_logprob:
+            self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.has_stream = any(req.stream for req in self.reqs)
 
     def get_model_worker_batch(self):
@@ -777,7 +781,6 @@ class ScheduleBatch:
             image_inputs = [r.image_inputs for r in self.reqs]
 
         lora_paths = [req.lora_path for req in self.reqs]
-
         self.sampling_info.regex_fsm_states = [req.regex_fsm_state for req in self.reqs]
 
         return ModelWorkerBatch(
