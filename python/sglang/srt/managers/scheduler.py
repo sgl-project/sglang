@@ -26,7 +26,6 @@ from typing import List, Optional, Union
 import torch
 import zmq
 
-from python.sglang.srt.managers.schedule_policy import PrefillAdder, SchedulePolicy
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.fsm_cache import FSMCache
@@ -51,6 +50,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.schedule_policy import PrefillAdder, SchedulePolicy
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
