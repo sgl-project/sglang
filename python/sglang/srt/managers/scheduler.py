@@ -151,7 +151,7 @@ class Scheduler:
             self.random_seed,
         ) = self.tp_worker.get_token_and_memory_info()
         set_random_seed(self.random_seed)
-        self.pad_input_ids_func = self.tp_worker.model_runner.pad_input_ids
+        self.pad_input_ids_func = self.tp_worker.model_runner.model.pad_input_ids
 
         # Print debug info
         logger.info(
