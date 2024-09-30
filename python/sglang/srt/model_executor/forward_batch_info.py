@@ -68,6 +68,7 @@ class InputMetadata:
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
+    running_bs: int = 0
 
     # Position information
     positions: torch.Tensor = None
@@ -106,6 +107,7 @@ class InputMetadata:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            running_bs=batch.running_bs,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             lora_paths=[req.lora_path for req in batch.reqs],
