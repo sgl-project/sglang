@@ -21,7 +21,7 @@ import logging
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import UpdateWeightReqInput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
@@ -109,15 +109,13 @@ class TpModelWorker:
             self.random_seed,
         )
 
-    def forward_batch_generation(
-        self, model_worker_batch: ModelWorkerBatch, schedule_batch: ScheduleBatch
-    ):
+    def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
-        next_token_ids = self.model_runner.sample(logits_output, schedule_batch)
+        next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         return logits_output, next_token_ids
 
-    def forward_batch_embedding(self, model_worker_batch: ForwardBatch):
+    def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
         embeddings = logits_output.embeddings.tolist()
