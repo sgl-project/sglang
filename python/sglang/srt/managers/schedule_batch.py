@@ -534,7 +534,7 @@ class ScheduleBatch:
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
         extend_num_tokens = self.extend_num_tokens + running_bs
 
-        self.merge(running_batch)
+        self.merge_batch(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
         self.extend_num_tokens = extend_num_tokens
@@ -747,13 +747,13 @@ class ScheduleBatch:
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         self.has_stream = any(req.stream for req in self.reqs)
 
-        self.sampling_info.filter(unfinished_indices, new_indices)
+        self.sampling_info.filter_batch(unfinished_indices, new_indices)
 
-    def merge(self, other: "ScheduleBatch"):
+    def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
-        self.sampling_info.merge(other.sampling_info)
+        self.sampling_info.merge_batch(other.sampling_info)
 
         self.reqs.extend(other.reqs)
         self.req_pool_indices = torch.concat(
@@ -778,6 +778,8 @@ class ScheduleBatch:
 
         lora_paths = [req.lora_path for req in self.reqs]
 
+        self.sampling_info.regex_fsm_states = [req.regex_fsm_state for req in self.reqs]
+
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -791,6 +793,7 @@ class ScheduleBatch:
             extend_logprob_start_lens=extend_logprob_start_lens,
             image_inputs=image_inputs,
             lora_paths=lora_paths,
+            sampling_info=self.sampling_info,
         )
 
 
@@ -821,3 +824,6 @@ class ModelWorkerBatch:
 
     # For LoRA
     lora_paths: Optional[List[str]]
+
+    # Sampling info
+    sampling_info: SamplingBatchInfo

@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 
 class ForwardMode(IntEnum):
@@ -103,6 +104,9 @@ class ForwardBatch:
     # For LoRA
     lora_paths: Optional[List[str]] = None
 
+    # Sampling info
+    sampling_info: SamplingBatchInfo = None
+
     # Attention backend
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: BaseTokenToKVPool = None
@@ -126,6 +130,7 @@ class ForwardBatch:
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             lora_paths=batch.lora_paths,
+            sampling_info=batch.sampling_info,
         )
 
         # Init position information

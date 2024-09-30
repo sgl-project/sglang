@@ -68,6 +68,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server import _set_envs_and_config
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    allocate_init_ports,
     configure_logger,
     kill_child_process,
     suppress_other_loggers,
@@ -126,6 +127,11 @@ def load_model(server_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
+    server_args.port, server_args.additional_ports = allocate_init_ports(
+        server_args.port,
+        server_args.additional_ports,
+        server_args.dp_size,
+    )
     model_config = ModelConfig(
         server_args.model_path,
         server_args.trust_remote_code,
@@ -137,7 +143,7 @@ def load_model(server_args, tp_rank):
         gpu_id=tp_rank,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
-        nccl_port=28888,
+        nccl_port=server_args.additional_ports[-1],
         server_args=server_args,
     )
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
@@ -229,7 +235,7 @@ def extend(reqs, model_runner):
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, batch).tolist()
+    next_token_ids = model_runner.sample(logits_output, forward_batch).tolist()
     return next_token_ids, logits_output.next_token_logits, batch
 
 
@@ -238,7 +244,7 @@ def decode(input_token_ids, batch, model_runner):
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, batch).tolist()
+    next_token_ids = model_runner.sample(logits_output, forward_batch).tolist()
     return next_token_ids, logits_output.next_token_logits
 
 
@@ -360,7 +366,6 @@ def latency_test(
     tp_rank,
 ):
     configure_logger(server_args, prefix=f" TP{tp_rank}")
-    _set_envs_and_config(server_args)
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
@@ -466,6 +471,7 @@ def plot_latency_test(
 
 
 def main(server_args, bench_args):
+    _set_envs_and_config(server_args)
 
     if server_args.model_path:
         if bench_args.correctness_test:
@@ -515,8 +521,6 @@ if __name__ == "__main__":
         level=getattr(logging, server_args.log_level.upper()),
         format="%(message)s",
     )
-
-    multiprocessing.set_start_method("spawn", force=True)
 
     try:
         main(server_args, bench_args)

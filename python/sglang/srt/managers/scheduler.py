@@ -292,7 +292,7 @@ class Scheduler:
                 if self.running_batch is None:
                     self.running_batch = new_batch
                 else:
-                    self.running_batch.merge(new_batch)
+                    self.running_batch.merge_batch(new_batch)
         else:
             # Run a decode batch
             if self.running_batch is not None:

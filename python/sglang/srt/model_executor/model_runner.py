@@ -38,11 +38,12 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.constrained import disable_cache
 from sglang.srt.layers.attention_backend import FlashInferAttnBackend, TritonAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -52,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    enable_show_time_cost,
     get_available_gpu_memory,
     is_generation_model,
     is_multimodal_model,
@@ -101,6 +103,12 @@ class ModelRunner:
             )
             server_args.chunked_prefill_size = None
             server_args.mem_fraction_static *= 0.95
+
+        # Global vars
+        if server_args.show_time_cost:
+            enable_show_time_cost()
+        if server_args.disable_disk_cache:
+            disable_cache()
 
         global_server_args_dict.update(
             {
@@ -498,16 +506,27 @@ class ModelRunner:
         else:
             raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
 
-    def _apply_logits_bias(
-        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
-    ):
+    def sample(
+        self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        # Put CPU-heavy tasks here. They will be overlapped with the forward pass.
+        sampling_info = forward_batch.sampling_info
+        sampling_info.update_regex_vocab_mask()
+        sampling_info.update_penalties()
+        logits = self.apply_logits_bias(logits_output.next_token_logits, sampling_info)
+
+        # Sample the next tokens.
+        next_token_ids = self.sampler(logits, sampling_info)
+        return next_token_ids
+
+    def apply_logits_bias(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
         # Apply logit_bias
         if sampling_info.logit_bias is not None:
             logits.add_(sampling_info.logit_bias)
 
         # min-token, presence, frequency
         if sampling_info.linear_penalties is not None:
-            logits += sampling_info.linear_penalties
+            logits.add_(sampling_info.linear_penalties)
 
         # repetition
         if sampling_info.scaling_penalties is not None:
@@ -522,20 +541,6 @@ class ModelRunner:
             logits = logits.masked_fill(sampling_info.vocab_mask, float("-inf"))
 
         return logits
-
-    def sample(
-        self, logits_output: LogitsProcessorOutput, schedule_batch: ScheduleBatch
-    ) -> torch.Tensor:
-        # Put CPU-heavy tasks here. They will be overlapped with the forward pass.
-        schedule_batch.sampling_info.update_regex_vocab_mask(schedule_batch)
-        schedule_batch.sampling_info.update_penalties()
-        logits = self._apply_logits_bias(
-            logits_output.next_token_logits, schedule_batch.sampling_info
-        )
-
-        # Sample the next tokens.
-        next_token_ids = self.sampler(logits, schedule_batch.sampling_info)
-        return next_token_ids
 
 
 @lru_cache()
