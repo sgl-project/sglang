@@ -159,6 +159,123 @@ class TokenizerManager:
             async for response in self._handle_batch_request(obj, request):
                 yield response
 
+    async def _process_single_request(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput, RewardReqInput],
+        request: Optional[fastapi.Request] = None,
+        index: Optional[int] = None,
+        is_cache_for_prefill: Optional[bool] = False,
+    ):
+        if not is_cache_for_prefill:  # The normal case with a single prompt
+            not_use_index = index is None
+
+            rid = obj.rid if not_use_index else obj.rid[index]
+            input_text = obj.text if not_use_index else obj.text[index]
+            if hasattr(obj, "conv"):
+                # reward model
+                assert self.tokenizer is not None
+                conv = obj.conv if not_use_index else obj.conv[index]
+                input_text = self.tokenizer.apply_chat_template(conv, tokenize=False)
+                input_ids = self.tokenizer.encode(input_text)
+            elif obj.input_ids is None:
+                assert self.tokenizer is not None
+                input_ids = self.tokenizer.encode(input_text)
+            else:
+                input_ids = obj.input_ids if not_use_index else obj.input_ids[index]
+
+            self._validate_input_length(input_ids)
+
+            sampling_params = self._get_sampling_params(
+                obj.sampling_params if not_use_index else obj.sampling_params[index]
+            )
+
+            if self.is_generation:
+                image_inputs = await self.image_processor.process_images_async(
+                    obj.image_data if not_use_index else obj.image_data[index], obj
+                )
+                return_logprob = (
+                    obj.return_logprob if not_use_index else obj.return_logprob[index]
+                )
+                logprob_start_len = (
+                    obj.logprob_start_len
+                    if not_use_index
+                    else obj.logprob_start_len[index]
+                )
+                top_logprobs_num = (
+                    obj.top_logprobs_num
+                    if not_use_index
+                    else obj.top_logprobs_num[index]
+                )
+        else:  # A prefill request to cache the common prompt for parallel sampling
+            assert self.is_generation
+            if obj.text is not None:
+                if isinstance(obj.text, list):
+                    input_text = obj.text[index]
+                    rid = obj.rid[index]
+                else:
+                    input_text = obj.text
+                    rid = obj.rid[0]
+                if self.tokenizer is not None:
+                    input_ids = self.tokenizer.encode(input_text)
+                else:
+                    assert obj.input_ids is not None
+                    input_ids = obj.input_ids
+                    if isinstance(obj.input_ids, list) and isinstance(
+                        obj.input_ids[0], list
+                    ):
+                        # when obj["input_ids"] is List[List[int]]
+                        input_ids = obj.input_ids[index]
+                        rid = obj.rid[index]
+                    else:
+                        input_ids = obj.input_ids
+                        rid = obj.rid[0]
+            else:
+                input_text = None
+                if isinstance(obj.input_ids, list) and isinstance(
+                    obj.input_ids[0], list
+                ):
+                    # when obj["input_ids"] is List[List[int]]
+                    input_ids = obj.input_ids[index]
+                    rid = obj.rid[index]
+                else:
+                    input_ids = obj.input_ids
+                    rid = obj.rid[0]
+
+        # Send to the controller
+        if self.is_generation:
+            tokenized_obj = TokenizedGenerateReqInput(
+                rid,
+                input_text,
+                input_ids,
+                image_inputs,
+                sampling_params,
+                return_logprob,
+                logprob_start_len,
+                top_logprobs_num,
+                obj.stream,
+                (
+                    obj.lora_path[index]
+                    if isinstance(obj.lora_path, list)
+                    else obj.lora_path
+                ),
+            )
+        elif isinstance(obj, EmbeddingReqInput):
+            tokenized_obj = TokenizedEmbeddingReqInput(
+                rid,
+                input_text,
+                input_ids,
+                sampling_params,
+            )
+        else:
+            assert isinstance(obj, RewardReqInput)
+            tokenized_obj = TokenizedRewardReqInput(
+                rid,
+                input_text,
+                input_ids,
+                sampling_params,
+            )
+        self.send_to_scheduler.send_pyobj(tokenized_obj)
+
     async def _handle_single_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput, RewardReqInput],
