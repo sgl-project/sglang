@@ -703,7 +703,7 @@ class ScheduleBatch:
                 for r in self.reqs
             ]
 
-        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
+        self.input_ids = input_ids
         self.seq_lens.add_(1)
 
         # Alloc mem
