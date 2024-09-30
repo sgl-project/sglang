@@ -83,6 +83,10 @@ class ForwardBatch:
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
 
+    # For logprob
+    return_logprob: bool = False
+    top_logprobs_nums: List[int] = None
+
     # Position information
     positions: torch.Tensor = None
 
@@ -90,10 +94,6 @@ class ForwardBatch:
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
     extend_start_loc: Optional[torch.Tensor] = None
-
-    # For logprob
-    return_logprob: bool = False
-    top_logprobs_nums: List[int] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
 
@@ -118,7 +118,7 @@ class ForwardBatch:
 
         ret = cls(
             forward_mode=batch.forward_mode,
-            batch_size=batch.batch_size,
+            batch_size=len(batch.seq_lens),
             input_ids=torch.tensor(batch.input_ids, dtype=torch.int32, device=device),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,

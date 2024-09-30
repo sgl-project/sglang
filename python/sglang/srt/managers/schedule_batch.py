@@ -409,16 +409,16 @@ class ScheduleBatch:
     req_pool_indices: List[int] = None
     seq_lens: List[int] = None
     out_cache_loc: torch.Tensor = None
-    extend_num_tokens: int = None
-
-    # For mixed chunekd prefill
-    prefix_lens: List[int] = None
-    extend_lens: List[int] = None
-    running_bs: int = None
 
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
+
+    # For extend and mixed chunekd prefill
+    prefix_lens: List[int] = None
+    extend_lens: List[int] = None
+    extend_num_tokens: int = None
+    running_bs: int = None
 
     # Stream
     has_stream: bool = False
@@ -519,6 +519,7 @@ class ScheduleBatch:
         self.prefix_lens = [len(r.prefix_indices) for r in reqs]
         self.extend_lens = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
@@ -779,15 +780,14 @@ class ScheduleBatch:
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
-            batch_size=len(self.reqs),
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
-            extend_seq_lens=extend_seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
             image_inputs=image_inputs,
             lora_paths=lora_paths,
@@ -798,8 +798,6 @@ class ScheduleBatch:
 class ModelWorkerBatch:
     # The forward mode
     forward_mode: ForwardMode
-    # The batch size
-    batch_size: int
     # The input ids
     input_ids: List[int]
     # The indices of requests in the req_to_token_pool
@@ -809,17 +807,17 @@ class ModelWorkerBatch:
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
 
-    # For extend
-    extend_seq_lens: Optional[List[int]]
-    extend_prefix_lens: Optional[List[int]]
-
     # For logprob
     return_logprob: bool
     top_logprobs_nums: List[int]
+
+    # For extend
+    extend_seq_lens: Optional[List[int]]
+    extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
 
     # For multimodal
     image_inputs: Optional[List[ImageInputs]]
 
     # For LoRA
-    lora_paths: List[str]
+    lora_paths: Optional[List[str]]
