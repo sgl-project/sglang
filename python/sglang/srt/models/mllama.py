@@ -37,7 +37,7 @@ from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import ImageInputs
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
 
 logger = init_logger(__name__)
@@ -724,7 +724,7 @@ class MllamaTextCrossAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         cross_attention_states: Optional[torch.Tensor],
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv_dec, _ = self.qkv_proj(hidden_states)
         q, _, _ = qkv_dec.split(
@@ -744,7 +744,7 @@ class MllamaTextCrossAttention(nn.Module):
         q = q.view(-1, self.num_local_heads, self.head_dim)
         q = self.q_norm(q)
 
-        output = self.attn(q, k, v, input_metadata)
+        output = self.attn(q, k, v, forward_batch)
         out, _ = self.o_proj(output)
         return out
 
@@ -787,7 +787,7 @@ class MllamaCrossAttentionDecoderLayer(torch.nn.Module):
         cross_attention_states: torch.Tensor,
         cross_attention_mask: torch.Tensor,
         full_text_row_masked_out_mask: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -796,7 +796,7 @@ class MllamaCrossAttentionDecoderLayer(torch.nn.Module):
             hidden_states=hidden_states,
             attention_mask=cross_attention_mask,
             cross_attention_states=cross_attention_states,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
         hidden_states = full_text_row_masked_out_mask * hidden_states
         hidden_states = residual + self.cross_attn_attn_gate.tanh() * hidden_states
@@ -853,7 +853,7 @@ class MllamaTextModel(nn.Module):
         cross_attention_states: Optional[torch.LongTensor],
         cross_attention_mask: Optional[torch.LongTensor],
         full_text_row_masked_out_mask: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         skip_cross_attention: bool,
     ) -> torch.Tensor:
         inputs_embeds = self.embed_tokens(input_ids)
@@ -867,13 +867,13 @@ class MllamaTextModel(nn.Module):
                         cross_attention_states=cross_attention_states,
                         cross_attention_mask=cross_attention_mask,
                         full_text_row_masked_out_mask=full_text_row_masked_out_mask,
-                        input_metadata=input_metadata,
+                        forward_batch=forward_batch,
                     )
             elif isinstance(decoder_layer, LlamaDecoderLayer):
                 hidden_states, residual = decoder_layer(
                     positions=positions,
                     hidden_states=hidden_states,
-                    input_metadata=input_metadata,
+                    forward_batch=forward_batch,
                     residual=None,
                 )
                 hidden_states = hidden_states + residual
@@ -915,7 +915,7 @@ class MllamaForCausalLM(nn.Module):
         cross_attention_states: Optional[torch.LongTensor],
         cross_attention_mask: Optional[torch.LongTensor],
         full_text_row_masked_out_mask: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         skip_cross_attention: bool,
     ) -> torch.Tensor:
         hidden_states = self.model(
@@ -924,7 +924,7 @@ class MllamaForCausalLM(nn.Module):
             cross_attention_states=cross_attention_states,
             cross_attention_mask=cross_attention_mask,
             full_text_row_masked_out_mask=full_text_row_masked_out_mask,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
             skip_cross_attention=skip_cross_attention,
         )
         return hidden_states
@@ -1049,12 +1049,12 @@ class MllamaForConditionalGeneration(nn.Module):
         raise AssertionError("This line should be unreachable.")
 
     def flat_encoder_result(
-        self, cross_attention_states: torch.Tensor, input_metadata: InputMetadata
+        self, cross_attention_states: torch.Tensor, forward_batch: ForwardBatch
     ):
 
         # TODO: fix input_metadata.encoder_seq_lens
         cross_attention_states_flat = torch.zeros(
-            sum(input_metadata.encoder_seq_lens),
+            sum(forward_batch.encoder_seq_lens),
             cross_attention_states.shape[-1],
             device=cross_attention_states.device,
             dtype=cross_attention_states.dtype,
@@ -1062,7 +1062,7 @@ class MllamaForConditionalGeneration(nn.Module):
         start_pos = 0
         for seq_len, vision_token_in_batch in zip(
             # TODO: fix input_metadata.encoder_seq_lens
-            input_metadata.encoder_seq_lens,
+            forward_batch.encoder_seq_lens,
             cross_attention_states,
         ):
             end_pos = start_pos + seq_len
@@ -1073,13 +1073,13 @@ class MllamaForConditionalGeneration(nn.Module):
         cross_attention_states = cross_attention_states_flat
 
         full_text_row_masked_out_mask = torch.ones(
-            (int(input_metadata.extend_seq_lens.sum()), 1), dtype=torch.bool
+            (int(forward_batch.extend_seq_lens.sum()), 1), dtype=torch.bool
         )
         start_pos = 0
 
         # TODO: fix input_metadata.encoder_seq_lens
         for seq_len, encoder_seq_len in zip(
-            input_metadata.seq_lens.tolist(), input_metadata.encoder_seq_lens
+            forward_batch.seq_lens.tolist(), forward_batch.encoder_seq_lens
         ):
             if encoder_seq_len == 0:
                 full_text_row_masked_out_mask[start_pos : start_pos + seq_len] = False
@@ -1094,31 +1094,31 @@ class MllamaForConditionalGeneration(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         **kwargs: object,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         image_inputs = self._parse_and_validate_image_input(**kwargs)
         setattr(
-            input_metadata,
+            forward_batch,
             "encoder_seq_lens_tensor",
-            torch.zeros_like(input_metadata.seq_lens),
+            torch.zeros_like(forward_batch.seq_lens),
         )
         setattr(
-            input_metadata,
+            forward_batch,
             "encoder_seq_lens",
-            input_metadata.encoder_seq_lens_tensor.tolist(),
+            forward_batch.encoder_seq_lens_tensor.tolist(),
         )
         if image_inputs is None:
             cross_attention_mask = None
             full_text_row_masked_out_mask = (
                 # TODO: fix input_metadata.encoder_seq_lens
-                (input_metadata.encoder_seq_lens_tensor != 0)
+                (forward_batch.encoder_seq_lens_tensor != 0)
                 .reshape(-1, 1)
                 .to(input_ids.device)
             )
             cross_attention_states = None
             # TODO: fix input_metadata.encoder_seq_lens
-            skip_cross_attention = max(input_metadata.encoder_seq_lens) == 0
+            skip_cross_attention = max(forward_batch.encoder_seq_lens) == 0
         else:
             # NOTE: llama's reference implementation runs vision model on CPU
             pixel_values = image_inputs["data"]
@@ -1135,7 +1135,7 @@ class MllamaForConditionalGeneration(nn.Module):
             )
 
             cross_attention_states, full_text_row_masked_out_mask = (
-                self.flat_encoder_result(cross_attention_states, input_metadata)
+                self.flat_encoder_result(cross_attention_states, forward_batch)
             )
             skip_cross_attention = False
             # TODO: support multi-image by this mask
@@ -1147,11 +1147,11 @@ class MllamaForConditionalGeneration(nn.Module):
             cross_attention_states=cross_attention_states,
             cross_attention_mask=cross_attention_mask,
             full_text_row_masked_out_mask=full_text_row_masked_out_mask,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
             skip_cross_attention=skip_cross_attention,
         )
         return self.logits_processor(
-            input_ids, hidden_states, self.language_model.lm_head.weight, input_metadata
+            input_ids, hidden_states, self.language_model.lm_head.weight, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
