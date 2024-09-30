@@ -15,7 +15,6 @@ limitations under the License.
 
 import multiprocessing as mp
 import unittest
-import uuid
 
 import torch
 
@@ -85,9 +84,9 @@ class TestLoRA(unittest.TestCase):
 
         with SRTRunner(
             base_path,
-            tp_size=tp_size,
             torch_dtype=torch_dtype,
-            is_generation=True,
+            model_type="generation",
+            tp_size=tp_size,
             lora_paths=all_lora_paths,
             max_loras_per_batch=3,
             disable_cuda_graph=True,
