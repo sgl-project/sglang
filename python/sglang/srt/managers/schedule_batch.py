@@ -531,7 +531,7 @@ class ScheduleBatch:
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.extend_input_len = 1
 
-        input_ids = torch.cat([self.input_ids, running_batch.input_ids])
+        input_ids = self.input_ids + running_batch.input_ids
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
         extend_num_tokens = self.extend_num_tokens + running_bs
 
