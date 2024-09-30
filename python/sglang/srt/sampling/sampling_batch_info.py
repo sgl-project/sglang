@@ -110,12 +110,10 @@ class SamplingBatchInfo:
                     self.linear_penalties = penalizer.apply(self.linear_penalties)
 
     def update_regex_vocab_mask(self):
-        has_regex = any(regex_fsm is not None for regex_fsm in self.regex_fsms)
-
         # Reset the vocab mask
         self.vocab_mask = None
 
-        if has_regex:
+        if any(regex_fsm is not None for regex_fsm in self.regex_fsms):
             self.vocab_mask = torch.zeros(
                 len(self.regex_fsms), self.vocab_size, dtype=torch.bool, device="cuda"
             )
@@ -135,11 +133,12 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "logit_bias",
-            "regex_fsms",
         ]:
-            self_val = getattr(self, item, None)
-            if self_val is not None:  # logit_bias can be None
-                setattr(self, item, self_val[new_indices])
+            value = getattr(self, item, None)
+            if value is not None:  # logit_bias can be None
+                setattr(self, item, value[new_indices])
+
+        self.regex_fsms = [self.regex_fsms[i] for i in new_indices]
 
     @staticmethod
     def merge_bias_tensor(
@@ -169,7 +168,6 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
-            "regex_fsms",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
@@ -178,3 +176,5 @@ class SamplingBatchInfo:
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other)
         )
+
+        self.regex_fsms.extend(other.regex_fsms)
