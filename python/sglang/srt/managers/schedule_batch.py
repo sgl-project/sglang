@@ -13,7 +13,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Meta data for requests and batches"""
+"""
+Store information about requests and batches.
+
+The following is the flow of data structures in a batch:
+
+ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
+
+- ScheduleBatch is managed by `scheduler.py::Scheduler`.
+  It contains high-level scheduling data. Most of the data is on the CPU.
+- ModelWorkerBatch is managed by `tp_worker.py::TpModelWorker`.
+- ForwardBatch is managed by `model_runner.py::ModelRunner`.
+  It contains low-level tensor data. Most of the data consists of GPU tensors.
+"""
 
 import logging
 from dataclasses import dataclass
@@ -27,7 +39,7 @@ from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs

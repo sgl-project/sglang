@@ -575,9 +575,9 @@ class Scheduler:
         if self.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
-                forward_batch = batch.get_forward_batch()
+                model_worker_batch = batch.get_model_worker_batch()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-                    forward_batch, batch
+                    model_worker_batch, batch
                 )
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     next_token_ids
@@ -641,8 +641,8 @@ class Scheduler:
                     )
         else:
             assert batch.extend_num_tokens != 0
-            forward_batch = batch.get_forward_batch()
-            embeddings = self.tp_worker.forward_batch_embedding(forward_batch)
+            model_worker_batch = batch.get_model_worker_batch()
+            embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -771,9 +771,9 @@ class Scheduler:
         batch.prepare_for_decode()
 
         # Forward and sample the next tokens
-        forward_batch = batch.get_forward_batch()
+        model_worker_batch = batch.get_model_worker_batch()
         logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-            forward_batch, batch
+            model_worker_batch, batch
         )
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids

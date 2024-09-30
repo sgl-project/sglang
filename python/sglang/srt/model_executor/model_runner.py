@@ -524,17 +524,17 @@ class ModelRunner:
         return logits
 
     def sample(
-        self, logits_output: LogitsProcessorOutput, batch: ScheduleBatch
+        self, logits_output: LogitsProcessorOutput, schedule_batch: ScheduleBatch
     ) -> torch.Tensor:
         # Put CPU-heavy tasks here. They will be overlapped with the forward pass.
-        batch.sampling_info.update_regex_vocab_mask(batch)
-        batch.sampling_info.update_penalties()
+        schedule_batch.sampling_info.update_regex_vocab_mask(schedule_batch)
+        schedule_batch.sampling_info.update_penalties()
         logits = self._apply_logits_bias(
-            logits_output.next_token_logits, batch.sampling_info
+            logits_output.next_token_logits, schedule_batch.sampling_info
         )
 
         # Sample the next tokens.
-        next_token_ids = self.sampler(logits, batch.sampling_info)
+        next_token_ids = self.sampler(logits, schedule_batch.sampling_info)
         return next_token_ids
 
 
