@@ -6,8 +6,8 @@ from flashinfer import (
 )
 from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
-from sglang.srt.layers.token_attention import token_attention_fwd
-from sglang.srt.layers.triton_attention.extend_attention import (
+from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd
+from sglang.srt.layers.attention.triton_ops.extend_attention import (
     extend_attention_fwd,
     redundant_attention,
 )
@@ -159,7 +159,7 @@ def test_batch_decode_with_paged_kv_cache(
     b_seq_len = torch.full((batch_size,), kv_len, dtype=torch.int32).to(0)
     max_len_in_batch = kv_len
     other_kv_index = 0
-    token_attention_fwd(
+    decode_attention_fwd(
         q,
         k_buffer,
         v_buffer,

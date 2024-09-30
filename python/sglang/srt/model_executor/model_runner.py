@@ -39,7 +39,10 @@ from vllm.model_executor.models import ModelRegistry
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.constrained import disable_cache
-from sglang.srt.layers.attention_backend import FlashInferAttnBackend, TritonAttnBackend
+from sglang.srt.layers.attention.attention_backend import (
+    FlashInferAttnBackend,
+    TritonAttnBackend,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.lora.lora_manager import LoRAManager

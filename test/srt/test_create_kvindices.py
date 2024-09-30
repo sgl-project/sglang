@@ -4,7 +4,9 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.layers.flashinfer_utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.flashinfer_utils import (
+    create_flashinfer_kv_indices_triton,
+)
 
 
 class TestCreateKvIndices(unittest.TestCase):

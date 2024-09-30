@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from sglang.global_config import global_config
-from sglang.srt.layers.flashinfer_utils import update_flashinfer_indices
+from sglang.srt.layers.attention.flashinfer_utils import update_flashinfer_indices
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_hip
@@ -334,10 +334,10 @@ class FlashInferAttnBackend(AttentionBackend):
 class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
-        from sglang.srt.layers.triton_attention.decode_attention import (
+        from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
         )
-        from sglang.srt.layers.triton_attention.extend_attention import (
+        from sglang.srt.layers.attention.triton_ops.extend_attention import (
             extend_attention_fwd,
         )
 
