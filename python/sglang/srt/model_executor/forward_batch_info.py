@@ -31,7 +31,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import torch
@@ -87,21 +87,21 @@ class ForwardBatch:
     positions: torch.Tensor = None
 
     # For extend
-    extend_seq_lens: torch.Tensor = None
-    extend_prefix_lens: torch.Tensor = None
-    extend_start_loc: torch.Tensor = None
+    extend_seq_lens: Optional[torch.Tensor] = None
+    extend_prefix_lens: Optional[torch.Tensor] = None
+    extend_start_loc: Optional[torch.Tensor] = None
 
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: List[int] = None
-    extend_seq_lens_cpu: List[int] = None
-    extend_logprob_start_lens_cpu: List[int] = None
+    extend_seq_lens_cpu: Optional[List[int]] = None
+    extend_logprob_start_lens_cpu: Optional[List[int]] = None
 
     # For multimodal
-    image_inputs: List[ImageInputs] = None
+    image_inputs: Optional[List[ImageInputs]] = None
 
     # For LoRA
-    lora_paths: List[str] = None
+    lora_paths: Optional[List[str]] = None
 
     # Attention backend
     req_to_token_pool: ReqToTokenPool = None
@@ -120,10 +120,8 @@ class ForwardBatch:
             forward_mode=batch.forward_mode,
             batch_size=batch.batch_size,
             input_ids=torch.tensor(batch.input_ids, dtype=torch.int32, device=device),
-            req_pool_indices=torch.tensor(
-                batch.req_pool_indices, dtype=torch.int32, device=device
-            ),
-            seq_lens=torch.tensor(batch.seq_lens, dtype=torch.int32, device=device),
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,

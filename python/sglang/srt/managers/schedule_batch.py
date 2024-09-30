@@ -510,8 +510,8 @@ class ScheduleBatch:
 
         # Set fields
         self.input_ids = sum(input_ids, [])
-        self.req_pool_indices = req_pool_indices
-        self.seq_lens = seq_lens
+        self.req_pool_indices = torch.tensor(req_pool_indices, device="cuda")
+        self.seq_lens = torch.tensor(seq_lens, device="cuda")
 
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
@@ -741,7 +741,6 @@ class ScheduleBatch:
         self.seq_lens = self.seq_lens[new_indices]
         self.input_ids = None
         self.req_pool_indices = self.req_pool_indices[new_indices]
-        self.position_ids_offsets = self.position_ids_offsets[new_indices]
         self.out_cache_loc = None
         self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
@@ -760,9 +759,6 @@ class ScheduleBatch:
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
-        self.position_ids_offsets = torch.concat(
-            [self.position_ids_offsets, other.position_ids_offsets]
-        )
         self.out_cache_loc = None
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
@@ -807,9 +803,9 @@ class ModelWorkerBatch:
     # The input ids
     input_ids: List[int]
     # The indices of requests in the req_to_token_pool
-    req_pool_indices: List[int]
+    req_pool_indices: torch.Tensor
     # The sequence length
-    seq_lens: List[int]
+    seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
 
