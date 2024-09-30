@@ -29,7 +29,7 @@ from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -511,6 +511,9 @@ class ScheduleBatch:
         self.extend_logprob_start_lens_cpu = [r.extend_logprob_start_len for r in reqs]
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
 
+        input_metadata = InputMetadata.from_schedule_batch(self)
+        return input_metadata
+
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
@@ -715,6 +718,9 @@ class ScheduleBatch:
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
+
+        input_metadata = InputMetadata.from_schedule_batch(self)
+        return input_metadata
 
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:

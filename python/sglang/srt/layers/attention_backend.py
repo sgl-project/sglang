@@ -37,9 +37,7 @@ class AttentionBackend(ABC):
     """The base class of attention backends"""
 
     @abstractmethod
-    def init_forward_metadata(
-        self, batch: ScheduleBatch, input_metadata: InputMetadata
-    ):
+    def init_forward_metadata(self, input_metadata: InputMetadata):
         """Init the metadata for a forward pass."""
         raise NotImplementedError()
 
@@ -133,9 +131,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata = None
         self.cuda_graph_metadata = {}
 
-    def init_forward_metadata(
-        self, batch: ScheduleBatch, input_metadata: InputMetadata
-    ):
+    def init_forward_metadata(self, input_metadata: InputMetadata):
         if input_metadata.forward_mode.is_decode():
             prefix_lens = None
             use_ragged = False
@@ -351,9 +347,7 @@ class TritonAttnBackend(AttentionBackend):
 
         self.cuda_graph_max_seq_len = model_runner.model_config.context_len
 
-    def init_forward_metadata(
-        self, batch: ScheduleBatch, input_metadata: InputMetadata
-    ):
+    def init_forward_metadata(self, input_metadata: InputMetadata):
         """Init auxiliary variables for triton attention backend."""
 
         if input_metadata.forward_mode.is_decode():
@@ -371,7 +365,7 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = None
         else:
             start_loc = attn_logits = max_seq_len = None
-            prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
+            prefix_lens = input_metadata.extend_prefix_lens
             max_extend_len = torch.max(input_metadata.seq_lens - prefix_lens).item()
 
         self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len
