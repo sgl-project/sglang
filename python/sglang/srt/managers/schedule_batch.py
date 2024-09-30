@@ -29,7 +29,7 @@ from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -510,6 +510,9 @@ class ScheduleBatch:
         self.extend_lens_cpu = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens_cpu = [r.extend_logprob_start_len for r in reqs]
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
+
+    def get_input_metadata(self):
+        return InputMetadata.from_schedule_batch(self)
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
