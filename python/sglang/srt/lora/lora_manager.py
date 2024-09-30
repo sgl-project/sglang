@@ -147,7 +147,10 @@ class LoRAManager:
     
         for module_A, module_B in self.target_weights:
             # init A tensor, column_major=True
-            hidden_dim_A = self.base_model.config.hidden_size  # get_hidden_dim 대체
+            if hasattr(self.base_model, 'get_hidden_dim'):
+                hidden_dim_A, _ = self.base_model.get_hidden_dim(module_A)
+            else:
+                hidden_dim_A = self.base_model.config.hidden_size
             c = self.loras[-1].get_stacked_multiply(module_A)
             if module_A not in self.A_buffer:
                 self.A_buffer[module_A] = [
@@ -163,7 +166,10 @@ class LoRAManager:
                     for i in range(num_layer)
                 ]
             # init B tensor, column_major=True
-            hidden_dim_B = self.base_model.config.hidden_size  # get_hidden_dim 대체
+            if hasattr(self.base_model, 'get_hidden_dim'):
+                hidden_dim_B, _ = self.base_model.get_hidden_dim(module_B)
+            else:
+                hidden_dim_B = self.base_model.config.hidden_size
             c = self.loras[-1].get_stacked_multiply(module_B)
             if module_B not in self.B_buffer:
                 self.B_buffer[module_B] = [
