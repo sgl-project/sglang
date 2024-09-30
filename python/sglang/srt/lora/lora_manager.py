@@ -103,12 +103,18 @@ class LoRAManager:
             self.origin_target_modules = set(self.origin_target_modules) | set(
                 self.configs[name].target_modules
             )
-        self.target_modules = set(
-            [
+        if hasattr(self.base_model, "get_module_name"):
+            self.target_modules = {
                 self.base_model.get_module_name(module)
                 for module in self.origin_target_modules
-            ]
-        )
+            }
+        else:
+            named_modules_dict = dict(self.base_model.named_modules())
+            self.target_modules = {
+                name
+                for name, module in named_modules_dict.items()
+                if module in self.origin_target_modules
+            }
         self.target_weights = set(
             [get_stacked_name(module) for module in self.origin_target_modules]
         )
@@ -144,10 +150,9 @@ class LoRAManager:
         self.A_buffer = {}
         self.B_buffer = {}
         num_layer = self.base_hf_config.num_hidden_layers
-    
         for module_A, module_B in self.target_weights:
             # init A tensor, column_major=True
-            if hasattr(self.base_model, 'get_hidden_dim'):
+            if hasattr(self.base_model, "get_hidden_dim"):
                 hidden_dim_A, _ = self.base_model.get_hidden_dim(module_A)
             else:
                 hidden_dim_A = self.base_model.config.hidden_size
@@ -166,7 +171,7 @@ class LoRAManager:
                     for i in range(num_layer)
                 ]
             # init B tensor, column_major=True
-            if hasattr(self.base_model, 'get_hidden_dim'):
+            if hasattr(self.base_model, "get_hidden_dim"):
                 hidden_dim_B, _ = self.base_model.get_hidden_dim(module_B)
             else:
                 hidden_dim_B = self.base_model.config.hidden_size
