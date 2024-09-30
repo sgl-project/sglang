@@ -87,12 +87,20 @@ class ModelRunner:
             self.model_config.hf_config.architectures
         )
 
+        # Model-specific adjustment
         if (
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
             logger.info("MLA optimization is tunred on. Use triton backend.")
             self.server_args.attention_backend = "triton"
+
+        if self.is_multimodal_model:
+            logger.info(
+                "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
+            )
+            server_args.chunked_prefill_size = None
+            server_args.mem_fraction_static *= 0.95
 
         global_server_args_dict.update(
             {
@@ -103,14 +111,6 @@ class ModelRunner:
                 "torchao_config": server_args.torchao_config,
             }
         )
-
-        # Model-specific adjustment
-        if self.is_multimodal_model:
-            logger.info(
-                "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
-            )
-            server_args.chunked_prefill_size = None
-            server_args.mem_fraction_static *= 0.95
 
         # Init componnets
         min_per_gpu_memory = self.init_torch_distributed()
@@ -400,8 +400,7 @@ class ModelRunner:
             )
 
         self.req_to_token_pool = ReqToTokenPool(
-            max_num_reqs + 1,
-            self.model_config.context_len + 4,
+            max_num_reqs + 1, self.model_config.context_len + 4, device="cuda"
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
