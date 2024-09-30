@@ -21,7 +21,7 @@ import importlib.resources
 import logging
 import pkgutil
 from functools import lru_cache
-from typing import Optional, Tuple, Type
+from typing import Optional, Type
 
 import torch
 import torch.nn as nn
@@ -491,16 +491,6 @@ class ModelRunner:
             )
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        # Attach attention information
-        forward_batch.req_to_token_pool = self.req_to_token_pool
-        forward_batch.token_to_kv_pool = self.token_to_kv_pool
-        forward_batch.attn_backend = self.attn_backend
-        forward_batch.attn_backend.init_forward_metadata(forward_batch)
-
-        # Attach lora information
-        if self.server_args.lora_paths is not None:
-            self.lora_manager.prepare_lora_batch(forward_batch)
-
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():

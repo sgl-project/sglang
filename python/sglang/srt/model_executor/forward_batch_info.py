@@ -25,8 +25,9 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention_backend import AttentionBackend
-    from sglang.srt.managers.schedule_batch import ImageInputs, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 class ForwardMode(IntEnum):
@@ -95,22 +96,28 @@ class ForwardBatch:
     attn_backend: AttentionBackend = None
 
     @classmethod
-    def from_schedule_batch(
+    def init_new(
         cls,
-        batch: ScheduleBatch,
+        batch: ModelWorkerBatch,
+        model_runner: ModelRunner,
     ):
+        device = "cuda"
+
         ret = cls(
             forward_mode=batch.forward_mode,
-            batch_size=batch.batch_size(),
-            input_ids=batch.input_ids,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
+            batch_size=batch.batch_size,
+            input_ids=torch.tensor(batch.input_ids, dtype=torch.int32, device=device),
+            req_pool_indices=torch.tensor(
+                batch.req_pool_indices, dtype=torch.int32, device=device
+            ),
+            seq_lens=torch.tensor(batch.seq_lens, dtype=torch.int32, device=device),
             out_cache_loc=batch.out_cache_loc,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
-            lora_paths=[req.lora_path for req in batch.reqs],
+            lora_paths=batch.lora_paths,
         )
 
+        # Init position information
         if ret.forward_mode.is_decode():
             ret.positions = (ret.seq_lens - 1).to(torch.int64)
         else:
@@ -122,15 +129,27 @@ class ForwardBatch:
                     ],
                     axis=0,
                 ),
-                device="cuda",
+                device=device,
             ).to(torch.int64)
 
             ret.image_inputs = [r.image_inputs for r in batch.reqs]
-            ret.extend_seq_lens = torch.tensor(batch.extend_lens_cpu, device="cuda")
-            ret.extend_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
+            ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device=device)
+            ret.extend_prefix_lens = torch.tensor(
+                batch.extend_prefix_lens, device=device
+            )
             ret.extend_start_loc = torch.zeros_like(ret.extend_seq_lens)
             ret.extend_start_loc[1:] = torch.cumsum(ret.extend_seq_lens[:-1], dim=0)
-            ret.extend_seq_lens_cpu = batch.extend_lens_cpu
-            ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens_cpu
+            ret.extend_seq_lens_cpu = batch.extend_seq_lens
+            ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
+
+        # Init attention information
+        ret.req_to_token_pool = model_runner.req_to_token_pool
+        ret.token_to_kv_pool = model_runner.token_to_kv_pool
+        ret.attn_backend = model_runner.attn_backend
+        model_runner.attn_backend.init_forward_metadata(ret)
+
+        # Init lora information
+        if model_runner.server_args.lora_paths is not None:
+            model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret

@@ -62,6 +62,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server import _set_envs_and_config
@@ -225,7 +226,8 @@ def extend(reqs, model_runner):
         tree_cache=None,
     )
     batch.prepare_for_extend(model_runner.model_config.vocab_size)
-    forward_batch = batch.get_forward_batch()
+    model_worker_batch = batch.get_model_worker_batch()
+    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, batch).tolist()
     return next_token_ids, logits_output.next_token_logits, batch
@@ -233,7 +235,8 @@ def extend(reqs, model_runner):
 
 def decode(input_token_ids, batch, model_runner):
     batch.prepare_for_decode(input_token_ids)
-    forward_batch = batch.get_forward_batch()
+    model_worker_batch = batch.get_model_worker_batch()
+    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, batch).tolist()
     return next_token_ids, logits_output.next_token_logits

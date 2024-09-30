@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -105,6 +103,8 @@ class FINISH_ABORT(BaseFinishReason):
 
 @dataclass
 class ImageInputs:
+    """The image related inputs."""
+
     pixel_values: torch.Tensor
     image_hash: int
     image_sizes: Optional[list] = None
@@ -137,7 +137,7 @@ class ImageInputs:
 
 
 class Req:
-    """Store all inforamtion of a request."""
+    """The input and output status of a request."""
 
     def __init__(
         self,
@@ -393,15 +393,15 @@ class ScheduleBatch:
     sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
-    input_ids: torch.Tensor = None
-    req_pool_indices: torch.Tensor = None
-    seq_lens: torch.Tensor = None
-    position_ids_offsets: torch.Tensor = None
+    input_ids: List[int] = None
+    req_pool_indices: List[int] = None
+    seq_lens: List[int] = None
     out_cache_loc: torch.Tensor = None
     extend_num_tokens: int = None
 
     # For mixed chunekd prefill
-    prefix_lens_cpu: List[int] = None
+    prefix_lens: List[int] = None
+    extend_lens: List[int] = None
     running_bs: int = None
 
     # For processing logprobs
@@ -466,12 +466,12 @@ class ScheduleBatch:
         seq_lens = []
 
         # Allocate memory
-        req_pool_indices_cpu = self.alloc_req_slots(bs)
+        req_pool_indices = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
         pt = 0
         for i, req in enumerate(reqs):
-            req.req_pool_idx = req_pool_indices_cpu[i]
+            req.req_pool_idx = req_pool_indices[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
             assert seq_len - pre_len == req.extend_input_len
@@ -497,22 +497,17 @@ class ScheduleBatch:
             pt += req.extend_input_len
 
         # Set fields
-        with torch.device("cuda"):
-            self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
-            self.req_pool_indices = torch.tensor(req_pool_indices_cpu)
-            self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
-            self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int64)
+        self.input_ids = sum(input_ids, [])
+        self.req_pool_indices = req_pool_indices
+        self.seq_lens = seq_lens
 
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
         self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
-        self.prefix_lens_cpu = [len(r.prefix_indices) for r in reqs]
-        self.extend_lens_cpu = [r.extend_input_len for r in reqs]
-        self.extend_logprob_start_lens_cpu = [r.extend_logprob_start_len for r in reqs]
+        self.prefix_lens = [len(r.prefix_indices) for r in reqs]
+        self.extend_lens = [r.extend_input_len for r in reqs]
+        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
-
-    def get_forward_batch(self):
-        return ForwardBatch.from_schedule_batch(self)
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
@@ -532,14 +527,14 @@ class ScheduleBatch:
         self.extend_num_tokens = extend_num_tokens
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        self.prefix_lens_cpu.extend(
+        self.prefix_lens.extend(
             [
                 len(r.origin_input_ids) + len(r.output_ids) - 1
                 for r in running_batch.reqs
             ]
         )
-        self.extend_lens_cpu.extend([1] * running_bs)
-        self.extend_logprob_start_lens_cpu.extend([0] * running_bs)
+        self.extend_lens.extend([1] * running_bs)
+        self.extend_logprob_start_lens.extend([0] * running_bs)
 
     def check_decode_mem(self):
         bs = len(self.reqs)
@@ -760,3 +755,63 @@ class ScheduleBatch:
         self.top_logprobs_nums.extend(other.top_logprobs_nums)
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         self.has_stream = any(req.stream for req in self.reqs)
+
+    def get_model_worker_batch(self):
+        if self.forward_mode.is_decode():
+            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = (
+                image_inputs
+            ) = None
+        else:
+            extend_seq_lens = self.extend_seq_lens
+            extend_prefix_lens = self.extend_prefix_lens
+            extend_logprob_start_lens = self.extend_logprob_start_lens
+            image_inputs = [r.image_inputs for r in self.reqs]
+
+        lora_paths = [req.lora_path for req in self.reqs]
+
+        return ModelWorkerBatch(
+            forward_mode=self.forward_mode,
+            batch_size=len(self.reqs),
+            input_ids=self.input_ids,
+            req_pool_indices=self.req_pool_indices,
+            seq_lens=self.seq_lens,
+            out_cache_loc=self.out_cache_loc,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            return_logprob=self.return_logprob,
+            top_logprobs_nums=self.top_logprobs_nums,
+            extend_logprob_start_lens=extend_logprob_start_lens,
+            image_inputs=image_inputs,
+            lora_paths=lora_paths,
+        )
+
+
+@dataclass
+class ModelWorkerBatch:
+    # The forward mode
+    forward_mode: ForwardMode
+    # The batch size
+    batch_size: int
+    # The input ids
+    input_ids: List[int]
+    # The indices of requests in the req_to_token_pool
+    req_pool_indices: List[int]
+    # The sequence length
+    seq_lens: List[int]
+    # The indices of output tokens in the token_to_kv_pool
+    out_cache_loc: torch.Tensor
+
+    # For extend
+    extend_seq_lens: Optional[List[int]]
+    extend_prefix_lens: Optional[List[int]]
+
+    # For logprob
+    return_logprob: bool
+    top_logprobs_nums: List[int]
+    extend_logprob_start_lens: Optional[List[int]]
+
+    # For multimodal
+    image_inputs: Optional[List[ImageInputs]]
+
+    # For LoRA
+    lora_paths: List[str]
