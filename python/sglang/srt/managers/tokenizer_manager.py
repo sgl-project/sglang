@@ -103,6 +103,8 @@ class TokenizerManager:
         self.context_len = server_args.context_length or get_context_length(
             self.hf_config
         )
+        # Create image processor placeholder
+        self.image_processor = get_dummy_image_processor()
 
         # Create tokenizer
         if server_args.skip_tokenizer_init:
@@ -127,7 +129,6 @@ class TokenizerManager:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                 )
-                self.image_processor = get_dummy_image_processor()
 
         # Store states
         self.to_create_loop = True
