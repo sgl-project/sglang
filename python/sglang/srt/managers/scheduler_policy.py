@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Request policy scheduler"""
+"""Request scheduler policy"""
 
 import os
 import random
@@ -32,7 +32,7 @@ from sglang.srt.mem_cache.radix_cache import TreeNode
 CLIP_MAX_NEW_TOKENS = int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS", "4096"))
 
 
-class PolicyScheduler:
+class SchedulerPolicy:
     def __init__(self, policy: str, tree_cache: BasePrefixCache):
         if tree_cache.disable and policy in ["lpm", "dfs-weight"]:
             # LPM and DFS-weight is meaningless when the tree cache is disabled.

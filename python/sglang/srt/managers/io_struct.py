@@ -18,7 +18,6 @@ The definition of objects transfered between different
 processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
-import copy
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
@@ -53,11 +52,11 @@ class GenerateReqInput:
     stream: bool = False
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
-
-    is_single: bool = True
-
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+
+    # Whether it is a single request or a batch request
+    is_single: bool = True
 
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (
@@ -172,12 +171,8 @@ class TokenizedGenerateReqInput:
     input_text: str
     # The input token ids
     input_ids: List[int]
-    # The pixel values for input images
-    pixel_values: List[float]
-    # The hash values of input images
-    image_hashes: List[int]
-    # The image sizes
-    image_sizes: List[List[int]]
+    # The image input
+    image_inputs: dict
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the logprobs
@@ -188,8 +183,6 @@ class TokenizedGenerateReqInput:
     top_logprobs_num: int
     # Whether to stream output
     stream: bool
-    # Modalities of the input images
-    modalites: Optional[List[str]] = None
 
     # LoRA related
     lora_path: Optional[str] = None  # None means just use the base model
@@ -312,10 +305,6 @@ class BatchTokenIDOut:
     spaces_between_special_tokens: List[bool]
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
-
-    def __post_init__(self):
-        # deepcopy meta_info to avoid modification in place
-        self.meta_info = copy.deepcopy(self.meta_info)
 
 
 @dataclass

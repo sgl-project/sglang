@@ -89,12 +89,20 @@ class ModelRunner:
             self.model_config.hf_config.architectures
         )
 
+        # Model-specific adjustment
         if (
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
             logger.info("MLA optimization is tunred on. Use triton backend.")
             self.server_args.attention_backend = "triton"
+
+        if self.is_multimodal_model:
+            logger.info(
+                "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
+            )
+            server_args.chunked_prefill_size = None
+            server_args.mem_fraction_static *= 0.95
 
         global_server_args_dict.update(
             {
@@ -105,14 +113,6 @@ class ModelRunner:
                 "torchao_config": server_args.torchao_config,
             }
         )
-
-        # Model-specific adjustment
-        if self.is_multimodal_model:
-            logger.info(
-                "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
-            )
-            server_args.chunked_prefill_size = None
-            server_args.mem_fraction_static *= 0.95
 
         # Init componnets
         min_per_gpu_memory = self.init_torch_distributed()
@@ -148,8 +148,8 @@ class ModelRunner:
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
 
-        if self.server_args.nccl_init_addr:
-            nccl_init_method = f"tcp://{self.server_args.nccl_init_addr}"
+        if self.server_args.dist_init_addr:
+            nccl_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
             nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
@@ -515,23 +515,10 @@ class ModelRunner:
                 get_embedding=True,
             )
 
-    def forward_extend_multi_modal(self, batch: ScheduleBatch):
-        input_metadata = InputMetadata.from_schedule_batch(self, batch)
-        return self.model.forward(
-            batch.input_ids,
-            input_metadata.positions,
-            input_metadata,
-            input_metadata.pixel_values,
-            input_metadata.image_sizes,
-            input_metadata.image_offsets,
-        )
-
     def forward(self, batch: ScheduleBatch) -> Tuple[LogitsProcessorOutput]:
         assert batch.forward_mode is not None
 
-        if self.is_multimodal_model and batch.forward_mode.is_extend():
-            return self.forward_extend_multi_modal(batch)
-        elif batch.forward_mode.is_decode():
+        if batch.forward_mode.is_decode():
             return self.forward_decode(batch)
         elif batch.forward_mode.is_extend():
             return self.forward_extend(batch)

@@ -25,7 +25,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention_backend import AttentionBackend
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import ImageInputs, ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -84,17 +84,10 @@ class InputMetadata:
     extend_logprob_start_lens_cpu: List[int] = None
 
     # For multimodal
-    pixel_values: List[torch.Tensor] = None
-    image_sizes: List[List[List[int]]] = None
-    image_offsets: List[List[int]] = None
-    modalities: List[List[str]] = None
+    image_inputs: List[ImageInputs] = None
 
     def init_multimuldal_info(self, batch: ScheduleBatch):
-        reqs = batch.reqs
-        self.pixel_values = [r.pixel_values for r in reqs]
-        self.image_sizes = [r.image_sizes for r in reqs]
-        self.image_offsets = [r.image_offsets for r in reqs]
-        self.modalities = [r.modalities for r in reqs]
+        self.image_inputs = [r.image_inputs for r in batch.reqs]
 
     def compute_positions(self, batch: ScheduleBatch):
         if self.forward_mode.is_decode():

@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -102,6 +103,39 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
+@dataclass
+class ImageInputs:
+    pixel_values: torch.Tensor
+    image_hash: int
+    image_sizes: Optional[list] = None
+    image_offsets: Optional[list] = None
+    pad_values: Optional[list] = None
+    modalities: Optional[list] = None
+
+    image_embeds: Optional[List[torch.Tensor]] = None
+    aspect_ratio_ids: Optional[List[torch.Tensor]] = None
+    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
+
+    @staticmethod
+    def from_dict(obj, vocab_size):
+        # Use image hash as fake token_ids, which is then used for prefix matching
+        ret = ImageInputs(
+            pixel_values=obj["pixel_values"],
+            image_hash=hash(tuple(obj["image_hashes"])),
+        )
+        image_hash = ret.image_hash
+        ret.pad_values = [
+            (image_hash) % vocab_size,
+            (image_hash >> 16) % vocab_size,
+            (image_hash >> 32) % vocab_size,
+            (image_hash >> 64) % vocab_size,
+        ]
+        ret.image_sizes = obj["image_sizes"]
+        # Only when pixel values is not None we have modalities
+        ret.modalities = obj["modalities"]
+        return ret
+
+
 class Req:
     """Store all inforamtion of a request."""
 
@@ -110,6 +144,7 @@ class Req:
         rid: str,
         origin_input_text: str,
         origin_input_ids: Tuple[int],
+        sampling_params: SamplingParams,
         lora_path: Optional[str] = None,
     ):
         # Input and output info
@@ -119,6 +154,8 @@ class Req:
         self.origin_input_ids = origin_input_ids
         self.output_ids = []  # Each decode stage's output ids
         self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
+
+        self.sampling_params = sampling_params
         self.lora_path = lora_path
 
         # Memory info
@@ -127,6 +164,7 @@ class Req:
         # Check finish
         self.tokenizer = None
         self.finished_reason = None
+        self.stream = False
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -147,20 +185,12 @@ class Req:
         self.completion_tokens_wo_jump_forward = 0
 
         # For vision inputs
-        self.pixel_values = None
-        self.image_sizes = None
-        self.image_offsets = None
-        self.pad_value = None
-        self.modalities = None
+        self.image_inputs: Optional[ImageInputs] = None
 
         # Prefix info
         self.prefix_indices = []
         self.extend_input_len = 0
         self.last_node = None
-
-        # Sampling parameters
-        self.sampling_params = None
-        self.stream = False
 
         # Logprobs (arguments)
         self.return_logprob = False
@@ -658,15 +688,9 @@ class ScheduleBatch:
                     self.tree_cache.cache_finished_req(req, cur_all_ids)
 
                     # re-applying image padding
-                    if req.pixel_values is not None:
-                        (
-                            req.origin_input_ids,
-                            req.image_offsets,
-                        ) = model_runner.model.pad_input_ids(
-                            req.origin_input_ids_unpadded,
-                            req.pad_value,
-                            req.pixel_values,
-                            req.image_sizes,
+                    if req.image_inputs is not None:
+                        req.origin_input_ids = model_runner.model.pad_input_ids(
+                            req.origin_input_ids_unpadded, req.image_inputs
                         )
 
                     jump_forward_reqs.append(req)
