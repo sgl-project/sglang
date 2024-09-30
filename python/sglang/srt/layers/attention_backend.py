@@ -15,7 +15,7 @@ import torch.nn as nn
 
 from sglang.global_config import global_config
 from sglang.srt.layers.flashinfer_utils import update_flashinfer_indices
-from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.utils import is_hip
 
@@ -135,6 +135,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if input_metadata.forward_mode.is_decode():
             prefix_lens = None
             use_ragged = False
+            extend_no_prefix = False
             total_num_tokens = None
         else:
             prefix_lens = input_metadata.extend_prefix_lens
