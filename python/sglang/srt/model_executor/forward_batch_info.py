@@ -86,7 +86,7 @@ class ForwardBatch:
 
     # For logprob
     return_logprob: bool = False
-    top_logprobs_nums: List[int] = None
+    top_logprobs_nums: Optional[List[int]] = None
 
     # Position information
     positions: torch.Tensor = None

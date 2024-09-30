@@ -412,7 +412,7 @@ class ScheduleBatch:
 
     # For processing logprobs
     return_logprob: bool = False
-    top_logprobs_nums: List[int] = None
+    top_logprobs_nums: Optional[List[int]] = None
 
     # For extend and mixed chunekd prefill
     prefix_lens: List[int] = None
@@ -765,8 +765,12 @@ class ScheduleBatch:
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
-        if self.return_logprob:
+        if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
+        elif self.return_logprob:
+            self.top_logprobs_nums.extend([0] * len(other.reqs))
+        elif other.return_logprob:
+            self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
         self.has_stream = any(req.stream for req in self.reqs)
 
     def get_model_worker_batch(self):
@@ -815,7 +819,7 @@ class ModelWorkerBatch:
 
     # For logprob
     return_logprob: bool
-    top_logprobs_nums: List[int]
+    top_logprobs_nums: Optional[List[int]]
 
     # For extend
     extend_seq_lens: Optional[List[int]]
