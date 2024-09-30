@@ -18,7 +18,7 @@ limitations under the License.
 """Meta data for a forward pass."""
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Set
 
 import numpy as np
 import torch
@@ -86,6 +86,9 @@ class InputMetadata:
     # For multimodal
     image_inputs: List[ImageInputs] = None
 
+    # For LoRA
+    lora_paths: List[str] = None
+
     # Attention backend
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: BaseTokenToKVPool = None
@@ -105,6 +108,7 @@ class InputMetadata:
             out_cache_loc=batch.out_cache_loc,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
+            lora_paths=[req.lora_path for req in batch.reqs],
         )
 
         if ret.forward_mode.is_decode():

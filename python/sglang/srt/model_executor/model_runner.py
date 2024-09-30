@@ -499,7 +499,7 @@ class ModelRunner:
 
         # Attach lora information
         if self.server_args.lora_paths is not None:
-            self.lora_manager.prepare_lora_batch(None)
+            self.lora_manager.prepare_lora_batch(input_metadata)
 
         if input_metadata.forward_mode.is_decode():
             return self.forward_decode(input_metadata)
