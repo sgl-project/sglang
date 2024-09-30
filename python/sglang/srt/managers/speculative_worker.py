@@ -113,7 +113,11 @@ class SpecDraftServer(ModelTpServer):
 
             if self.out_pyobjs and self.running_batch.has_stream():
                 break
-        self.running_batch.spec_draft_input.prepare_for_verify()
+        verify_input = self.running_batch.spec_draft_input.prepare_for_verify(
+            self.running_batch
+        )
+        print(verify_input.draft_token)
+        print(verify_input.retrive_index)
 
     def forward_prefill_batch(self, batch: ScheduleBatch):
         # Only implement EAGLE currently.

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, List, Type
 import torch
 import triton
 
+from python.sglang.srt.managers.build_tree_kernel import build_tree_kernel
 from python.sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     InputMetadata,
@@ -89,6 +90,7 @@ class EAGLEDraftInput(SpecDraftInput):
         self.parents_list: List[torch.Tensor] = []
         self.iter = 0
         self.root_token: int = None
+        assert self.topk <= 10, "topk should <= 10"
 
     positions: torch.Tensor = None
 
@@ -166,7 +168,7 @@ class EAGLEDraftInput(SpecDraftInput):
         ] = batch.out_cache_loc
         self.iter += 1
 
-    def prepare_for_verify(self):
+    def prepare_for_verify(self, batch: ScheduleBatch):
         score_list = torch.cat(self.score_list, dim=1).view(-1)  # b, 1/topk, topk
         ss_token_list = torch.cat(self.token_list, dim=0).view(
             -1
@@ -179,12 +181,15 @@ class EAGLEDraftInput(SpecDraftInput):
         draft_tokens = torch.cat((self.verified_id, draft_tokens), dim=0)
 
         parent_list = torch.cat(self.parents_list[:-1], dim=0)
-        torch.save(top_scores, "score_list.pth")
-        torch.save(top_scores, "scores.pth")
-        print(parent_list.shape)
-        print(parent_list)
-        print(top_scores_index.shape)
-        print(top_scores_index)
+        tree_mask, position, retrive_index = build_tree_kernel(
+            parent_list,
+            top_scores_index,
+            batch.seq_lens,
+            self.topk,
+            self.iter - 1,
+            self.num_verify_token,
+        )
+        return EagleVerifyInput(draft_tokens, tree_mask, position, retrive_index)
 
     def generate_attn_arg(
         self,
@@ -221,6 +226,20 @@ class EAGLEDraftInput(SpecDraftInput):
         self.iter = 0
         self.score_list.clear()
         self.positions = None
+
+
+class EagleVerifyInput:
+    def __init__(
+        self,
+        draft_token: torch.Tensor,
+        tree_mask: torch.Tensor,
+        position: torch.Tensor,
+        retrive_index: torch.Tensor,
+    ):
+        self.draft_token = draft_token
+        self.tree_mask = tree_mask
+        self.position = position
+        self.retrive_index = retrive_index
 
 
 class SpecInfoPipline:
