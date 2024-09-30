@@ -37,7 +37,7 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention_backend import AttentionBackend
+    from sglang.srt.layers.attention import AttentionBackend
     from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner

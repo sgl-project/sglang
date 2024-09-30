@@ -3,12 +3,14 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.triton_attention.decode_attention import decode_attention_fwd
-from sglang.srt.layers.triton_attention.extend_attention import (
+from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd
+from sglang.srt.layers.attention.triton_ops.extend_attention import (
     extend_attention_fwd,
     redundant_attention,
 )
-from sglang.srt.layers.triton_attention.prefill_attention import context_attention_fwd
+from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+    context_attention_fwd,
+)
 
 
 class TestExtendAttention(unittest.TestCase):
