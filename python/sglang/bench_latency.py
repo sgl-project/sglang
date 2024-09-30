@@ -224,14 +224,16 @@ def extend(reqs, model_runner):
         token_to_kv_pool=model_runner.token_to_kv_pool,
         tree_cache=None,
     )
-    input_metadata = batch.prepare_for_extend(model_runner.model_config.vocab_size)
+    batch.prepare_for_extend(model_runner.model_config.vocab_size)
+    input_metadata = batch.get_input_metadata()
     logits_output = model_runner.forward(input_metadata)
     next_token_ids = model_runner.sample(logits_output, batch).tolist()
     return next_token_ids, logits_output.next_token_logits, batch
 
 
 def decode(input_token_ids, batch, model_runner):
-    input_metadata = batch.prepare_for_decode(input_token_ids)
+    batch.prepare_for_decode(input_token_ids)
+    input_metadata = batch.get_input_metadata()
     logits_output = model_runner.forward(input_metadata)
     next_token_ids = model_runner.sample(logits_output, batch).tolist()
     return next_token_ids, logits_output.next_token_logits

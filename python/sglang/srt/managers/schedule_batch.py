@@ -511,8 +511,8 @@ class ScheduleBatch:
         self.extend_logprob_start_lens_cpu = [r.extend_logprob_start_len for r in reqs]
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
 
-        input_metadata = InputMetadata.from_schedule_batch(self)
-        return input_metadata
+    def get_input_metadata(self):
+        return InputMetadata.from_schedule_batch(self)
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
@@ -718,9 +718,6 @@ class ScheduleBatch:
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
-
-        input_metadata = InputMetadata.from_schedule_batch(self)
-        return input_metadata
 
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:
