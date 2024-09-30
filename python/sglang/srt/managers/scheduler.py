@@ -577,7 +577,7 @@ class Scheduler:
             if batch.extend_num_tokens != 0:
                 input_metadata = batch.get_input_metadata()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-                    input_metadata
+                    input_metadata, batch
                 )
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     next_token_ids
@@ -773,7 +773,7 @@ class Scheduler:
         # Forward and sample the next tokens
         input_metadata = batch.get_input_metadata()
         logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-            input_metadata
+            input_metadata, batch
         )
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
