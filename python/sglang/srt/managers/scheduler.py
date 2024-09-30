@@ -142,7 +142,7 @@ class Scheduler:
         )
         self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
         self.pad_input_ids_func = getattr(
-            self.tp_worker.model_runner.model, "pad_input_ids"
+            self.tp_worker.model_runner.model, "pad_input_ids", None
         )
 
         # Get token and memory info from the tp worker
