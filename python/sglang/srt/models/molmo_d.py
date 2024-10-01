@@ -1,9 +1,13 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 
+import einops
+import requests
 import torch
 import torch.nn as nn
-from transformers import CLIPVisionModel
+from PIL import Image
+from transformers import AutoModelForCausalLM, AutoProcessor, CLIPVisionModel
+from vllm.model_executor.layers.activation import QuickGELU
 
 
 # TODO: This should be a config in huggingface...
@@ -12,6 +16,33 @@ class MolmoVisionBackboneConfig:
     image_dim: int = 2048
     vit_feature_select_layers: List[int] = field(default_factory=lambda: [-2, -9])
     num_prefix_tokens: int = 1
+    image_num_patch: Tuple[int, int] = (14, 14)
+    image_pooling_h: int = 2
+    image_pooling_w: int = 2
+    hidden_size: int = 3584
+    image_embed_dim: int = 1024
+
+
+class MolmoMLP(nn.Module):
+    def __init__(self, config: MolmoVisionBackboneConfig):
+        super().__init__()
+        self.config = config
+        self.w1 = nn.Linear(
+            config.image_embed_dim, self.config.hidden_size * 2, bias=False
+        )
+        self.w2 = nn.Linear(
+            self.config.hidden_size * 2, self.config.hidden_size, bias=False
+        )
+        self.w3 = nn.Linear(
+            config.image_embed_dim, self.config.hidden_size * 2, bias=False
+        )
+        self.act = QuickGELU()
+
+    def forward(self, image_features: torch.Tensor):
+        image_features = self.w2(
+            self.act(self.w1(image_features), self.w3(image_features))
+        )
+        return image_features
 
 
 class MolmoVisionBackbone(nn.Module):
@@ -24,8 +55,7 @@ class MolmoVisionBackbone(nn.Module):
         )
         self.pad_embed = nn.Parameter(torch.zeros((2, config.image_dim)))
 
-    def encode_images(self, images: torch.Tensor):
-        breakpoint()
+    def encode_image(self, images: torch.Tensor):
         B, T, N, D = images.shape
 
         # Mask checks if all tokens are equal to -1
@@ -49,7 +79,7 @@ class MolmoVisionBackbone(nn.Module):
 
     def forward(self, images: torch.Tensor, image_masks: torch.Tensor):
         batch_size, num_images = images.shape[:2]
-        image_features, cls_embed = self.encode_images(images)
+        image_features, cls_embed = self.encode_image(images)
 
         pad_embed = self.pad_embed[:, None, None, None, :]
         all_pad = image_masks == 0
@@ -64,15 +94,63 @@ class MolmoVisionBackbone(nn.Module):
 
         # Dropout was none
         image_features = image_features.reshape(
-            (batch_size, num_image) + image_features.shape[-2] + (-1,)
+            (batch_size, num_images) + self.config.image_num_patch + (-1,)
         )
-        # TODO: continue forward
+        image_features = einops.rearrange(
+            image_features,
+            "b n (h dh) (w dw) c -> (b n h w) (dh dw) c",
+            dh=self.config.image_pooling_h,
+            dw=self.config.image_pooling_w,
+        )
+        image_features = self.image_pooling_2d(image_features[:, :1, :], image_features)
+
+        h, w = self.config.image_num_patch
+        h, w = (h + self.config.image_pooling_h - 1) // self.config.image_pooling_h, (
+            w + self.config.image_pooling_w - 1
+        ) // self.config.image_pooling_w
+        image_features = image_features.reshape(batch_size, num_images, h * w, -1)
+
+        # MLP layer to map the feature.
+        image_features = self.image_projector(image_features)
+
+        # image_features: (batch_size, num_image, num_patch, d_model)
+        # cls_embed: (batch_size, num_image, d_model)
+        return image_features, cls_embed
 
 
 if __name__ == "__main__":
-    model = MolmoVisionBackbone(MolmoVisionBackboneConfig()).to("cuda")
-    model.eval()
-    images = torch.randn(1, 3, 336, 336).to("cuda")
-    image_features, cls_embed = model.encode_images(images)
+    processor = AutoProcessor.from_pretrained(
+        "allenai/Molmo-7B-D-0924",
+        trust_remote_code=True,
+        torch_dtype="auto",
+        device_map="auto",
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        "allenai/Molmo-7B-D-0924",
+        trust_remote_code=True,
+        torch_dtype="auto",
+        device_map="auto",
+    )
+    # model = CLIPVisionModel.from_pretrained(
+    #         "openai/clip-vit-large-patch14-336", torch_dtype=torch.float16
+    #     )
+    # breakpoint()
+    inputs = processor.process(
+        images=[
+            Image.open(
+                requests.get("https://picsum.photos/id/237/536/354", stream=True).raw
+            )
+        ],
+        text="Describe this image.",
+    )
+    # model = MolmoVisionBackbone(MolmoVisionBackboneConfig()).to("cuda")
+    # model.eval()
+    print(model)
+
+    # Takes in bs, num_crops, num_patches_h * num_patches_w, patch_size * patch_size * 3
+    #                  -> bs, num_crops, num_patches_h * num_patches_w, image_embed_dim * 2
+    image_features, cls_embed = model.model.vision_backbone.encode_image(
+        inputs["images"].unsqueeze(0).to("cuda")
+    )
     print(image_features.shape)
     print(cls_embed.shape)
