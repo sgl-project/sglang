@@ -7,6 +7,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 import torch
@@ -32,6 +33,11 @@ if not is_hip():
     from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
 
+class WrapperDispatch(Enum):
+    SLIDING_WINDOW = auto()
+    CROSS_ATTENTION = auto()
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -53,10 +59,19 @@ class FlashInferAttnBackend(AttentionBackend):
             device="cuda",
         )
 
+        assert not (
+            model_runner.sliding_window_size is not None
+            and model_runner.has_cross_attention
+        ), "Sliding window and cross attention are not supported together"
+
+        self.num_wrappers = 1
+        self.dispatch_reason = None
         if model_runner.sliding_window_size is not None:
             self.num_wrappers = 2
-        else:
-            self.num_wrappers = 1
+            self.dispatch_reason = WrapperDispatch.SLIDING_WINDOW
+        elif model_runner.has_cross_attention:
+            self.num_wrappers = 2
+            self.dispatch_reason = WrapperDispatch.CROSS_ATTENTION
 
         # NOTE: we do not use ragged attention when there are multiple wrappers
         self.prefill_wrapper_ragged = (
@@ -88,8 +103,12 @@ class FlashInferAttnBackend(AttentionBackend):
         if self.num_wrappers == 1:
             return 0
 
-        # TODO: make sure the idx is related to sliding window size
-        return layer.sliding_window_size == -1
+        if self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+            return layer.sliding_window_size == -1
+        if self.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
+            return layer.is_cross_attention
+
+        raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode():
