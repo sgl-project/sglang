@@ -7,7 +7,6 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
-from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,7 +14,10 @@ import torch.nn as nn
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention import AttentionBackend
-from sglang.srt.layers.attention.flashinfer_utils import update_flashinfer_indices
+from sglang.srt.layers.attention.flashinfer_utils import (
+    WrapperDispatch,
+    update_flashinfer_indices,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_hip
 
@@ -31,11 +33,6 @@ if not is_hip():
     )
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
-
-
-class WrapperDispatch(Enum):
-    SLIDING_WINDOW = auto()
-    CROSS_ATTENTION = auto()
 
 
 class FlashInferAttnBackend(AttentionBackend):

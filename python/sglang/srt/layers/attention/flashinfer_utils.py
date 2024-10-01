@@ -1,8 +1,13 @@
+from enum import Enum, auto
+
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.flashinfer_backend import WrapperDispatch
+
+class WrapperDispatch(Enum):
+    SLIDING_WINDOW = auto()
+    CROSS_ATTENTION = auto()
 
 
 @triton.jit
