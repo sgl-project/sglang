@@ -74,11 +74,26 @@ class GenerateReqInput:
                 self.batch_size = 1
             else:
                 self.batch_size = len(self.input_ids)
-        if (
-            isinstance(self.sampling_params, dict)
-            and self.sampling_params.get("n", 1) != 1
-        ):
-            self.is_single = False
+
+        if self.sampling_params is None:
+            self.parallel_sample_num = 1
+        if isinstance(self.sampling_params, dict):
+            self.parallel_sample_num = self.sampling_params.get("n", 1)
+        else:  # isinstance(self.sampling_params, list):
+            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            for sp in self.sampling_params:
+                # TODO cope with the case that the parallel_sample_num is different for different samples
+                assert self.parallel_sample_num == sp.get(
+                    "n", 1
+                ), "The parallel_sample_num should be the same for all samples in sample params."
+
+        if self.parallel_sample_num > 1:
+            if self.is_single:
+                self.is_single = False
+                if self.text is not None:
+                    self.text = [self.text]
+                if self.input_ids is not None:
+                    self.input_ids = [self.input_ids]
 
         if self.is_single:
             if self.sampling_params is None:
@@ -92,18 +107,6 @@ class GenerateReqInput:
             if self.top_logprobs_num is None:
                 self.top_logprobs_num = 0
         else:
-            if self.sampling_params is None:
-                self.parallel_sample_num = 1
-            if isinstance(self.sampling_params, dict):
-                self.parallel_sample_num = self.sampling_params.get("n", 1)
-            else:  # isinstance(self.sampling_params, list):
-                self.parallel_sample_num = self.sampling_params[0].get("n", 1)
-                for sp in self.sampling_params:
-                    # TODO cope with the case that the parallel_sample_num is different for different samples
-                    assert self.parallel_sample_num == sp.get(
-                        "n", 1
-                    ), "The parallel_sample_num should be the same for all samples in sample params."
-
             if self.parallel_sample_num == 1:
                 num = self.batch_size
             else:
