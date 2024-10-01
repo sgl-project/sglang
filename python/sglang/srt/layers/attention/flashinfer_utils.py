@@ -47,7 +47,7 @@ class FlashinferUpdater:
         req_pool_indices,
         seq_lens,
         prefix_lens,
-        decode_wrapper=None,
+        decode_wrappers=None,
         use_ragged=False,
     ):
         self.forward_mode = forward_mode
@@ -66,14 +66,14 @@ class FlashinferUpdater:
         self.head_dim = model_runner.model_config.head_dim
         self.batch_size = len(req_pool_indices)
 
-        self.decode_wrapper = (
-            decode_wrapper or self.model_runner.attn_backend.decode_wrapper
+        self.decode_wrappers = (
+            decode_wrappers or self.model_runner.attn_backend.decode_wrappers
         )
         self.prefill_wrapper_ragged = (
             self.model_runner.attn_backend.prefill_wrapper_ragged
         )
-        self.prefill_wrapper_paged = (
-            self.model_runner.attn_backend.prefill_wrapper_paged
+        self.prefill_wrappers_paged = (
+            self.model_runner.attn_backend.prefill_wrappers_paged
         )
 
         self.kv_last_page_len = torch.ones(
@@ -142,6 +142,7 @@ class FlashinferUpdater:
         )
 
     def _update_decode_indices(self, decode_wrapper):
+        assert not isinstance(decode_wrapper, list)
         decode_wrapper.end_forward()
         decode_wrapper.begin_forward(
             self.kv_indptr,
@@ -156,6 +157,9 @@ class FlashinferUpdater:
         )
 
     def _update_extend_indices(self, ragged_wrapper, paged_wrapper):
+        assert not isinstance(paged_wrapper, list)
+        assert not isinstance(ragged_wrapper, list)
+
         # extend part
         qo_indptr = torch.zeros(
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
@@ -189,11 +193,11 @@ class FlashinferUpdater:
         self._init_indices_no_sliding_window()
 
         if self.forward_mode.is_decode():
-            self._update_decode_indices(self.decode_wrapper)
+            self._update_decode_indices(self.decode_wrappers[0])
         else:
             self._update_extend_indices(
                 self.prefill_wrapper_ragged,
-                self.prefill_wrapper_paged,
+                self.prefill_wrappers_paged[0],
             )
 
     def update_indices_sliding_window(self):
@@ -202,11 +206,11 @@ class FlashinferUpdater:
         for wrapper_id in range(2):
             self._init_indices_sliding_window(wrapper_id)
             if self.forward_mode.is_decode():
-                self._update_decode_indices(self.decode_wrapper[wrapper_id])
+                self._update_decode_indices(self.decode_wrappers[wrapper_id])
             else:
                 self._update_extend_indices(
                     None,
-                    self.prefill_wrapper_paged[wrapper_id],
+                    self.prefill_wrappers_paged[wrapper_id],
                 )
 
 
@@ -216,7 +220,7 @@ def update_flashinfer_indices(
     req_pool_indices,
     seq_lens,
     prefix_lens,
-    decode_wrapper=None,
+    decode_wrappers=None,
     use_ragged=False,
 ):
     updater = FlashinferUpdater(
@@ -225,7 +229,7 @@ def update_flashinfer_indices(
         req_pool_indices,
         seq_lens,
         prefix_lens,
-        decode_wrapper,
+        decode_wrappers,
         use_ragged,
     )
 
