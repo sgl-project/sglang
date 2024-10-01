@@ -1,6 +1,6 @@
 """
 Usage:
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --port 30000
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --port 30000
 python openai_chat.py
 """
 
@@ -10,7 +10,7 @@ from openai import OpenAI
 client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
-    model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+    model="meta-llama/Llama-3.1-8B-Instruct",
     messages=[
         {"role": "system", "content": "You are a helpful AI assistant"},
         {

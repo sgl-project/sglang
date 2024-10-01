@@ -44,7 +44,7 @@ class ModelCase:
 
 # Popular models that run on CI
 CI_MODELS = [
-    ModelCase("meta-llama/Meta-Llama-3.1-8B-Instruct"),
+    ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
     ModelCase("google/gemma-2-2b"),
 ]
 
