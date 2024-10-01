@@ -167,51 +167,59 @@ class TokenizerManager:
         is_cache_for_prefill: Optional[bool] = False,
     ):
         if not is_cache_for_prefill:  # The normal case with a single prompt
-            not_use_index = index is None
-
-            rid = obj.rid if not_use_index else obj.rid[index]
-            if hasattr(obj, "conv"):
-                # reward model
-                assert self.tokenizer is not None
-                conv = obj.conv if not_use_index else obj.conv[index]
-                input_text = self.tokenizer.apply_chat_template(conv, tokenize=False)
-                input_ids = self.tokenizer.encode(input_text)
-            elif obj.input_ids is None:
-                assert self.tokenizer is not None
-                input_text = obj.text if not_use_index else obj.text[input_id_index]
-                input_ids = self.tokenizer.encode(input_text)
-            else:
-                if obj.text is not None:
-                    input_text = obj.text if not_use_index else obj.text[input_id_index]
+            if index is None:
+                rid = obj.rid
+                if hasattr(obj, "conv"):
+                    # reward model
+                    conv = obj.conv
+                    input_text = self.tokenizer.apply_chat_template(
+                        conv, tokenize=False
+                    )
+                    input_ids = self.tokenizer.encode(input_text)
+                elif obj.input_ids is None:
+                    input_text = obj.text
+                    input_ids = self.tokenizer.encode(input_text)
                 else:
-                    input_text = None
-                input_ids = (
-                    obj.input_ids if not_use_index else obj.input_ids[input_id_index]
-                )
+                    input_text = obj.text if obj.text is not None else None
+                    input_ids = obj.input_ids
+
+                sampling_params = self._get_sampling_params(obj.sampling_params)
+                if self.is_generation:
+                    image_inputs = await self.image_processor.process_images_async(
+                        obj.image_data, obj
+                    )
+                    return_logprob = obj.return_logprob
+                    logprob_start_len = obj.logprob_start_len
+                    top_logprobs_num = obj.top_logprobs_num
+            else:
+                rid = obj.rid[index]
+                if hasattr(obj, "conv"):
+                    # reward model
+                    conv = obj.conv[index]
+                    input_text = self.tokenizer.apply_chat_template(
+                        conv, tokenize=False
+                    )
+                    input_ids = self.tokenizer.encode(input_text)
+                elif obj.input_ids is None:
+                    input_text = obj.text[input_id_index]
+                    input_ids = self.tokenizer.encode(input_text)
+                else:
+                    input_text = (
+                        obj.text[input_id_index] if obj.text is not None else None
+                    )
+                    input_ids = obj.input_ids[input_id_index]
+
+                sampling_params = self._get_sampling_params(obj.sampling_params[index])
+                if self.is_generation:
+                    image_inputs = await self.image_processor.process_images_async(
+                        obj.image_data[index], obj
+                    )
+                    return_logprob = obj.return_logprob[index]
+                    logprob_start_len = obj.logprob_start_len[index]
+                    top_logprobs_num = obj.top_logprobs_num[index]
 
             self._validate_input_length(input_ids)
 
-            sampling_params = self._get_sampling_params(
-                obj.sampling_params if not_use_index else obj.sampling_params[index]
-            )
-
-            if self.is_generation:
-                image_inputs = await self.image_processor.process_images_async(
-                    obj.image_data if not_use_index else obj.image_data[index], obj
-                )
-                return_logprob = (
-                    obj.return_logprob if not_use_index else obj.return_logprob[index]
-                )
-                logprob_start_len = (
-                    obj.logprob_start_len
-                    if not_use_index
-                    else obj.logprob_start_len[index]
-                )
-                top_logprobs_num = (
-                    obj.top_logprobs_num
-                    if not_use_index
-                    else obj.top_logprobs_num[index]
-                )
         else:  # A prefill request to cache the common prompt for parallel sampling
             assert self.is_generation
             if obj.text is not None:
