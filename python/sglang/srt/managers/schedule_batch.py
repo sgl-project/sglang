@@ -123,6 +123,7 @@ class ImageInputs:
     image_offsets: Optional[list] = None
     pad_values: Optional[list] = None
     modalities: Optional[list] = None
+    num_image_tokens: Optional[int] = None
 
     image_embeds: Optional[List[torch.Tensor]] = None
     aspect_ratio_ids: Optional[List[torch.Tensor]] = None
@@ -781,15 +782,14 @@ class ScheduleBatch:
 
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode():
-            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = (
-                image_inputs
-            ) = None
+            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
-            image_inputs = [r.image_inputs for r in self.reqs]
 
+        # NOTE: decode also has image_inputs
+        image_inputs = [r.image_inputs for r in self.reqs]
         lora_paths = [req.lora_path for req in self.reqs]
         self.sampling_info.regex_fsm_states = [req.regex_fsm_state for req in self.reqs]
 

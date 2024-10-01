@@ -56,6 +56,7 @@ class FlashinferUpdater:
         prefix_lens,
         decode_wrappers=None,
         use_ragged=False,
+        encoder_lens=None,
     ):
         self.forward_mode = forward_mode
         self.model_runner = model_runner
@@ -63,6 +64,7 @@ class FlashinferUpdater:
         self.seq_lens = seq_lens
         self.prefix_lens = prefix_lens
         self.use_ragged = use_ragged
+        self.encoder_lens = encoder_lens
 
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -161,6 +163,15 @@ class FlashinferUpdater:
                 # full attention
                 paged_kernel_lens = self.seq_lens
             self.kv_start_idx = self.seq_lens - paged_kernel_lens
+        elif dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
+            if wrapper_id == 0:
+                # Text Attention
+                paged_kernel_lens = self.seq_lens - self.encoder_lens
+                self.kv_start_idx = self.encoder_lens
+            else:
+                # Image Attention
+                paged_kernel_lens = self.encoder_lens
+                self.kv_start_idx = None
 
         self.kv_indptr = torch.zeros(
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
@@ -192,7 +203,15 @@ class FlashinferUpdater:
             )
 
     def _update_indices_cross_attention(self):
-        pass
+        for wrapper_id in range(2):
+            self._get_indices(WrapperDispatch.CROSS_ATTENTION, wrapper_id)
+            if self.forward_mode.is_decode():
+                self._update_decode_indices(self.decode_wrappers[wrapper_id])
+            else:
+                self._update_extend_indices(
+                    None,
+                    self.prefill_wrappers_paged[wrapper_id],
+                )
 
     def _update_indices_sliding_window(self):
         assert self.use_ragged is False
@@ -213,6 +232,7 @@ def update_flashinfer_indices(
     req_pool_indices,
     seq_lens,
     prefix_lens,
+    encoder_lens=None,
     decode_wrappers=None,
     use_ragged=False,
 ):
@@ -222,8 +242,9 @@ def update_flashinfer_indices(
         req_pool_indices,
         seq_lens,
         prefix_lens,
-        decode_wrappers,
-        use_ragged,
+        decode_wrappers=decode_wrappers,
+        use_ragged=use_ragged,
+        encoder_lens=encoder_lens,
     )
 
     dispatch_reason = model_runner.attn_backend.dispatch_reason
