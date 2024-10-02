@@ -126,9 +126,7 @@ class SamplingBatchInfo:
                 if req.regex_fsm is not None:
                     self.vocab_mask[i].fill_(1)
                     self.vocab_mask[i][
-                        req.regex_fsm.get_next_instruction(
-                            req.regex_fsm_state[i]
-                        ).tokens
+                        req.regex_fsm.get_next_instruction(req.regex_fsm_state).tokens
                     ] = 0
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
