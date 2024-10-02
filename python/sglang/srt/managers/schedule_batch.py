@@ -423,10 +423,14 @@ class ScheduleBatch:
     # Stream
     has_stream: bool = False
 
+    # Has regex
+    has_regex: bool = False
+
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
         return_logprob = any(req.return_logprob for req in reqs)
         has_stream = any(req.stream for req in reqs)
+        has_regex = any(req.regex_fsm for req in reqs)
 
         return cls(
             reqs=reqs,
@@ -435,6 +439,7 @@ class ScheduleBatch:
             tree_cache=tree_cache,
             return_logprob=return_logprob,
             has_stream=has_stream,
+            has_regex=has_regex,
         )
 
     def batch_size(self):
@@ -750,7 +755,9 @@ class ScheduleBatch:
             ]
         else:
             self.top_logprobs_nums = None
+
         self.has_stream = any(req.stream for req in self.reqs)
+        self.has_regex = any(req.regex_fsm for req in self.reqs)
 
         self.sampling_info.filter_batch(unfinished_indices, new_indices)
 
@@ -771,9 +778,11 @@ class ScheduleBatch:
             self.top_logprobs_nums.extend([0] * len(other.reqs))
         elif other.return_logprob:
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
-        self.has_stream = any(req.stream for req in self.reqs)
         self.reqs.extend(other.reqs)
+
         self.return_logprob = self.return_logprob or other.return_logprob
+        self.has_stream = self.has_stream or other.has_stream
+        self.has_regex = self.has_regex or other.has_regex
 
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode():
@@ -787,7 +796,11 @@ class ScheduleBatch:
             image_inputs = [r.image_inputs for r in self.reqs]
 
         lora_paths = [req.lora_path for req in self.reqs]
-        self.sampling_info.regex_fsm_states = [req.regex_fsm_state for req in self.reqs]
+        if self.has_regex:
+            self.sampling_info.regex_fsm = [req.regex_fsm for req in self.reqs]
+            self.sampling_info.regex_fsm_states = [
+                req.regex_fsm_state for req in self.reqs
+            ]
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
