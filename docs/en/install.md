@@ -35,7 +35,7 @@ docker run --gpus all \
     --env "HF_TOKEN=<secret>" \
     --ipc=host \
     lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
+    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 ```
 
 ### Method 4: Using docker compose
@@ -75,7 +75,7 @@ resources:
 run: |
   conda deactivate
   python3 -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
     --host 0.0.0.0 \
     --port 30000
 ```
