@@ -319,6 +319,7 @@ class LlamaForCausalLM(nn.Module):
         )
 
     def get_hidden_dim(self, module_name):
+        # return input_dim, output_dim
         if module_name in ["q_proj", "o_proj", "qkv_proj"]:
             return self.config.hidden_size, self.config.hidden_size
         elif module_name in ["kv_proj"]:
