@@ -104,20 +104,16 @@ class LoRAManager:
                 self.configs[name].target_modules
             )
         if hasattr(self.base_model, "get_module_name"):
-            self.target_modules = set(
-                [
-                    self.base_model.get_module_name(module)
-                    for module in self.origin_target_modules
-                ]
-            )
+            self.target_modules = {
+                self.base_model.get_module_name(module)
+                for module in self.origin_target_modules
+            }
         else:
-            self.target_modules = set(
-                [
-                    name
-                    for name, module in self.base_model.named_modules()
-                    if name in self.origin_target_modules
-                ]
-            )
+            self.target_modules = {
+                name
+                for name, module in self.base_model.named_modules()
+                if name in self.origin_target_modules
+            }
         self.target_weights = set(
             [get_stacked_name(module) for module in self.origin_target_modules]
         )
