@@ -113,18 +113,22 @@ class SamplingBatchInfo:
                     self.linear_penalties = penalizer.apply(self.linear_penalties)
 
     def update_regex_vocab_mask(self):
+        has_regex = any(req.regex_fsm is not None for req in self.schedule_batch.reqs)
+
         # Reset the vocab mask
         self.vocab_mask = None
 
-        if any(req.regex_fsm is not None for req in self.schedule_batch.reqs):
+        if has_regex:
             self.vocab_mask = torch.zeros(
-                len(self.regex_fsms), self.vocab_size, dtype=torch.bool, device="cuda"
+                len(self.temperatures), self.vocab_size, dtype=torch.bool, device="cuda"
             )
-            for i, regex_fsm in enumerate(self.regex_fsms):
-                if regex_fsm is not None:
+            for i, req in enumerate(self.schedule_batch.reqs):
+                if req.regex_fsm is not None:
                     self.vocab_mask[i].fill_(1)
                     self.vocab_mask[i][
-                        regex_fsm.get_next_instruction(self.regex_fsm_states[i]).tokens
+                        req.regex_fsm.get_next_instruction(
+                            req.regex_fsm_state[i]
+                        ).tokens
                     ] = 0
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
