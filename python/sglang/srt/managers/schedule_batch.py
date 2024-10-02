@@ -797,7 +797,7 @@ class ScheduleBatch:
 
         lora_paths = [req.lora_path for req in self.reqs]
         if self.has_regex:
-            self.sampling_info.regex_fsm = [req.regex_fsm for req in self.reqs]
+            self.sampling_info.regex_fsms = [req.regex_fsm for req in self.reqs]
             self.sampling_info.regex_fsm_states = [
                 req.regex_fsm_state for req in self.reqs
             ]
