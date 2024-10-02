@@ -109,7 +109,7 @@ class SamplingBatchInfo:
                     self.linear_penalties = penalizer.apply(self.linear_penalties)
 
     def update_regex_vocab_mask(self):
-        has_regex = any(regex_fsm for regex_fsm in self.regex_fsms)
+        has_regex = self.regex_fsms and any(regex_fsm for regex_fsm in self.regex_fsms)
 
         # Reset the vocab mask
         self.vocab_mask = None
