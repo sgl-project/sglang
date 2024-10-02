@@ -936,6 +936,7 @@ class Scheduler:
                         "prompt_tokens": len(req.origin_input_ids),
                         "completion_tokens": len(req.output_ids),
                         "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
+                        "cached_tokens": len(req.prefix_indices),
                         "finish_reason": (
                             req.finished_reason.to_json()
                             if req.finished_reason is not None
