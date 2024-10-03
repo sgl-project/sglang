@@ -30,6 +30,7 @@ class ReqToTokenPool:
 
     def __init__(self, size: int, max_context_len: int, device: str):
         self.size = size
+        self.max_context_len = max_context_len
         self.free_slots = list(range(size))
         self.req_to_token = torch.empty(
             (size, max_context_len), dtype=torch.int32, device=device
@@ -54,7 +55,7 @@ class ReqToTokenPool:
         self.free_slots = list(range(self.size))
 
 
-class BaseTokenToKVPool(ABC):
+class BaseTokenToKVPool:
     """A memory pool that maps a token to its kv cache locations"""
 
     def __init__(
@@ -92,19 +93,15 @@ class BaseTokenToKVPool(ABC):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_slots = np.arange(1, self.size + 1)
 
-    @abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
 
-    @abstractmethod
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
 
-    @abstractmethod
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
 
-    @abstractmethod
     def set_kv_buffer(
         self,
         layer_id: int,

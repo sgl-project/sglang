@@ -141,9 +141,6 @@ class Scheduler:
             nccl_port=port_args.nccl_ports[0],
         )
         self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
-        self.pad_input_ids_func = getattr(
-            self.tp_worker.model_runner.model, "pad_input_ids", None
-        )
 
         # Get token and memory info from the tp worker
         (
@@ -154,6 +151,9 @@ class Scheduler:
             self.random_seed,
         ) = self.tp_worker.get_token_and_memory_info()
         set_random_seed(self.random_seed)
+        self.pad_input_ids_func = getattr(
+            self.tp_worker.model_runner.model, "pad_input_ids", None
+        )
 
         # Print debug info
         logger.info(

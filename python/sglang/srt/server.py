@@ -118,6 +118,7 @@ async def health_generate(request: Request) -> Response:
 
 @app.get("/get_model_info")
 async def get_model_info():
+    """Get the model information."""
     result = {
         "model_path": tokenizer_manager.model_path,
         "is_generation": tokenizer_manager.is_generation,
@@ -127,11 +128,13 @@ async def get_model_info():
 
 @app.get("/get_server_args")
 async def get_server_args():
+    """Get the server arguments."""
     return dataclasses.asdict(tokenizer_manager.server_args)
 
 
 @app.get("/flush_cache")
 async def flush_cache():
+    """Flush the radix cache."""
     tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
@@ -142,7 +145,7 @@ async def flush_cache():
 
 @app.post("/update_weights")
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
-
+    """Update the weights inplace without re-launching the server."""
     success, message = await tokenizer_manager.update_weights(obj, request)
     content = {"success": success, "message": message}
     if success:
@@ -205,7 +208,7 @@ app.put("/encode")(encode_request)
 
 
 async def judge_request(obj: RewardReqInput, request: Request):
-    """Handle an embedding request."""
+    """Handle a reward model request."""
     try:
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
@@ -307,7 +310,7 @@ def launch_server(
     ports = server_args.additional_ports
     port_args = PortArgs(
         tokenizer_port=ports[0],
-        scheduler_port=ports[1],
+        scheduler_input_port=ports[1],
         detokenizer_port=ports[2],
         nccl_ports=ports[3:],
     )
