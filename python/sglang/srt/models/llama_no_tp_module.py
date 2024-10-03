@@ -488,7 +488,7 @@ class NoTPModuleLlamaForCausalLM(nn.Module):
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
 
-class NoTPModulePhi3ForCausalLM(LlamaForCausalLM):
+class NoTPModulePhi3ForCausalLM(NoTPModuleLlamaForCausalLM):
     pass
 
 
