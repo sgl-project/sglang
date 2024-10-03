@@ -70,9 +70,7 @@ class BaseTokenToKVPool(ABC):
         else:
             self.store_dtype = dtype
 
-        # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = np.arange(1, self.size + 1)
-
+        self.free_slots = None
         self.clear()
 
     def available_size(self):
@@ -92,7 +90,7 @@ class BaseTokenToKVPool(ABC):
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = np.arange(1, self.size)
+        self.free_slots = np.arange(1, self.size + 1)
 
     @abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
