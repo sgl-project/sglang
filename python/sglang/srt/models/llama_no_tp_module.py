@@ -17,11 +17,12 @@ limitations under the License.
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
+import types
 from typing import Any, Dict, Iterable, Optional, Tuple
-from torch.nn.parameter import Parameter
 
 import torch
 from torch import nn
+from torch.nn.parameter import Parameter
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -40,7 +41,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.torchao_utils import apply_torchao_config_
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
-import types
+
 
 def gate_up_proj_weight_loader(
     self,
@@ -85,7 +86,9 @@ class LlamaMLP(nn.Module):
             bias=False,
         )
         self.gate_up_proj.output_sizes = [intermediate_size] * 2
-        self.gate_up_proj.weight_loader = types.MethodType(gate_up_proj_weight_loader, self.gate_up_proj)
+        self.gate_up_proj.weight_loader = types.MethodType(
+            gate_up_proj_weight_loader, self.gate_up_proj
+        )
         self.gate_up_proj.weight.weight_loader = self.gate_up_proj.weight_loader
         self.down_proj = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
         if hidden_act != "silu":
@@ -111,6 +114,7 @@ def _get_shard_offset_mapping(self, loaded_shard_id: str):
     }
     return shard_offset_mapping.get(loaded_shard_id)
 
+
 def _get_shard_size_mapping(self, loaded_shard_id: str):
     shard_size_mapping = {
         "q": self.num_heads * self.head_size,
@@ -118,6 +122,7 @@ def _get_shard_size_mapping(self, loaded_shard_id: str):
         "v": self.num_kv_heads * self.head_size,
     }
     return shard_size_mapping.get(loaded_shard_id)
+
 
 def qkv_proj_weight_loader(
     self,
@@ -206,9 +211,15 @@ class LlamaAttention(nn.Module):
         self.qkv_proj.total_num_kv_heads = self.total_num_kv_heads
         self.qkv_proj.num_heads = self.total_num_heads
         self.qkv_proj.num_kv_heads = self.total_num_kv_heads
-        self.qkv_proj.weight_loader = types.MethodType(qkv_proj_weight_loader, self.qkv_proj)
-        self.qkv_proj._get_shard_offset_mapping = types.MethodType(_get_shard_offset_mapping, self.qkv_proj)
-        self.qkv_proj._get_shard_size_mapping = types.MethodType(_get_shard_size_mapping, self.qkv_proj)
+        self.qkv_proj.weight_loader = types.MethodType(
+            qkv_proj_weight_loader, self.qkv_proj
+        )
+        self.qkv_proj._get_shard_offset_mapping = types.MethodType(
+            _get_shard_offset_mapping, self.qkv_proj
+        )
+        self.qkv_proj._get_shard_size_mapping = types.MethodType(
+            _get_shard_size_mapping, self.qkv_proj
+        )
         self.qkv_proj.weight.weight_loader = self.qkv_proj.weight_loader
         self.qkv_proj.weight.output_dim = 0
         self.o_proj = torch.nn.Linear(
