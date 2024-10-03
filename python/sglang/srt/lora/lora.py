@@ -101,12 +101,12 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     ) -> None:
         super().__init__(base_layer, segment_gemm, lora_rank, scaling)
 
-    def set_lora_info(self, A_buffer, B_buffer, bs, seq_lens, weight_indices):
+    def set_lora_info(self, A_buffer, B_buffer, bs, seg_indptr, weight_indices):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
         self.bs = bs
-        self.seq_lens = seq_lens
+        self.seg_indptr = seg_indptr
         self.weight_indices = weight_indices
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -115,7 +115,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             weights=self.A_buffer,
             batch_size=self.bs,
             weight_column_major=True,
-            seg_lens=self.seq_lens,
+            seg_indptr=self.seg_indptr,
             weight_indices=self.weight_indices,
         )
         # FIXME
@@ -132,7 +132,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                 weights=self.B_buffer[:, left:right, :].contiguous(),
                 batch_size=self.bs,
                 weight_column_major=True,
-                seg_lens=self.seq_lens,
+                seg_indptr=self.seg_indptr,
                 weight_indices=self.weight_indices,
             )
         return base_output + lora_output * self.scaling
@@ -145,14 +145,14 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         super().__init__(base_layer, segment_gemm, lora_rank, scaling)
 
     def set_lora_info(
-        self, A_buffer_qkv, B_buffer_q, B_buffer_kv, bs, seq_lens, weight_indices
+        self, A_buffer_qkv, B_buffer_q, B_buffer_kv, bs, seg_indptr, weight_indices
     ):
         self.set_lora = True
         self.A_buffer_qkv = A_buffer_qkv
         self.B_buffer_q = B_buffer_q
         self.B_buffer_kv = B_buffer_kv
         self.bs = bs
-        self.seq_lens = seq_lens
+        self.seg_indptr = seg_indptr
         self.weight_indices = weight_indices
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -161,7 +161,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             weights=self.A_buffer_qkv,
             batch_size=self.bs,
             weight_column_major=True,
-            seg_lens=self.seq_lens,
+            seg_indptr=self.seg_indptr,
             weight_indices=self.weight_indices,
         )
         # FIXME parallelize qkv
@@ -173,7 +173,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             weights=self.B_buffer_q,
             batch_size=self.bs,
             weight_column_major=True,
-            seg_lens=self.seq_lens,
+            seg_indptr=self.seg_indptr,
             weight_indices=self.weight_indices,
         )
         # kv
@@ -189,7 +189,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                     weights=self.B_buffer_kv[:, left:right, :].contiguous(),
                     batch_size=self.bs,
                     weight_column_major=True,
-                    seg_lens=self.seq_lens,
+                    seg_indptr=self.seg_indptr,
                     weight_indices=self.weight_indices,
                 )
             )
@@ -202,12 +202,12 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     ) -> None:
         super().__init__(base_layer, segment_gemm, lora_rank, scaling)
 
-    def set_lora_info(self, A_buffer, B_buffer, bs, seq_lens, weight_indices):
+    def set_lora_info(self, A_buffer, B_buffer, bs, seg_indptr, weight_indices):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
         self.bs = bs
-        self.seq_lens = seq_lens
+        self.seg_indptr = seg_indptr
         self.weight_indices = weight_indices
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -216,7 +216,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             weights=self.A_buffer,
             batch_size=self.bs,
             weight_column_major=True,
-            seg_lens=self.seq_lens,
+            seg_indptr=self.seg_indptr,
             weight_indices=self.weight_indices,
         )
         lora_output = self.segment_gemm.run(
@@ -224,7 +224,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             weights=self.B_buffer,
             batch_size=self.bs,
             weight_column_major=True,
-            seg_lens=self.seq_lens,
+            seg_indptr=self.seg_indptr,
             weight_indices=self.weight_indices,
         )
         return base_output + lora_output * self.scaling
