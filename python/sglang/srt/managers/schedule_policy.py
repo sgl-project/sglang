@@ -48,9 +48,12 @@ class SchedulePolicy:
         if self.policy == "lpm" or self.policy == "dfs-weight":
             for r in waiting_queue:
                 # NOTE: the prefix_indices must always be aligned with last_node
-                r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
+                matched_prefix_indices, r.last_node = self.tree_cache.match_prefix(
                     rid=r.rid, key=r.adjust_max_prefix_ids()
                 )
+                r.cached_tokens += (len(matched_prefix_indices) - len(r.prefix_indices))
+                r.prefix_indices = matched_prefix_indices
+
             prefix_computed = True
 
         if self.policy == "lpm":
