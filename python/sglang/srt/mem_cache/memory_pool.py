@@ -88,7 +88,7 @@ class BaseTokenToKVPool(ABC):
         return torch.tensor(select_index, dtype=torch.int32, device="cuda")
 
     def free(self, free_index: torch.Tensor):
-        self.free_slots = np.concate(self.free_slots, free_index.cpu().numpy())
+        self.free_slots = np.concatenate((self.free_slots, free_index.cpu().numpy()))
 
     def clear(self):
         # The slot 0 is used for writing dummy outputs from padded tokens.
