@@ -26,6 +26,7 @@ LORA_SETS = [
     #     "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"],
     # },
     {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
+    # {"base": "Qwen/Qwen2.5-14B-Instruct", "loras": ["mssongit/Qwen2.5-14B-SFT-LoRA"]},
     # {"base": "mistralai/Mistral-7B-Instruct-v0.3", "loras": ["/home/ying/test_lora"]},
     # {
     #     "base": "mistralai/Mistral-7B-Instruct-v0.3",
@@ -170,7 +171,7 @@ class TestLoRA(unittest.TestCase):
         print(f"{srt_no_lora_outputs.output_strs=}")
         for i in range(len(prompts)):
             assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i], (
-                str_outputs.output_strs[i].strip(" "),
+                srt_outputs.output_strs[i].strip(" "),
                 hf_outputs.output_strs[i],
             )
             # assert (
@@ -264,7 +265,7 @@ class TestLoRA(unittest.TestCase):
 
         for i in range(len(prompts)):
             assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i], (
-                str_outputs.output_strs[i].strip(" "),
+                srt_outputs.output_strs[i].strip(" "),
                 hf_outputs.output_strs[i],
             )
             assert (
