@@ -70,8 +70,8 @@ class BaseTokenToKVPool(ABC):
         else:
             self.store_dtype = dtype
 
-        # The slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = np.arange(1, self.size)
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        self.free_slots = np.arange(1, self.size + 1)
 
         self.clear()
 
@@ -91,7 +91,7 @@ class BaseTokenToKVPool(ABC):
         self.free_slots = np.concatenate((self.free_slots, free_index.cpu().numpy()))
 
     def clear(self):
-        # The slot 0 is used for writing dummy outputs from padded tokens.
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_slots = np.arange(1, self.size)
 
     @abstractmethod
@@ -131,6 +131,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         super().__init__(size, dtype)
 
         # [size, head_num, head_dim] for each layer
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.k_buffer = [
             torch.empty(
                 (size + 1, head_num, head_dim),
@@ -194,6 +195,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         super().__init__(size, dtype)
 
         self.kv_lora_rank = kv_lora_rank
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.kv_buffer = [
             torch.empty(
                 (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
