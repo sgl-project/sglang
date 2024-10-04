@@ -1,6 +1,6 @@
+import asyncio
 import json
 import unittest
-import asyncio
 
 import openai
 import requests
@@ -19,12 +19,16 @@ class TestCacheReport(unittest.TestCase):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.min_cached = 5
-        cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300, other_args=[
-            "--chunked-prefill-size=40",
-            ])
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=300,
+            other_args=[
+                "--chunked-prefill-size=40",
+            ],
+        )
         cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
         cls.aclient = openai.AsyncClient(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
-
 
     @classmethod
     def tearDownClass(cls):
@@ -61,7 +65,7 @@ class TestCacheReport(unittest.TestCase):
             max_tokens=128,
         )
         return response
-    
+
     async def run_openai_async(self, message):
         response = await self.aclient.chat.completions.create(
             model=self.model,
@@ -75,7 +79,9 @@ class TestCacheReport(unittest.TestCase):
 
     def cache_report_openai(self, message):
         response = self.run_openai(message)
-        print(f"openai first request cached_tokens: {int(response.usage.cached_tokens)}")
+        print(
+            f"openai first request cached_tokens: {int(response.usage.cached_tokens)}"
+        )
         first_cached_tokens = int(response.usage.cached_tokens)
         # assert int(response.usage.cached_tokens) == 0
         assert first_cached_tokens < self.min_cached
@@ -84,7 +90,7 @@ class TestCacheReport(unittest.TestCase):
         print(f"openai second request usage: {response.usage}")
         print(f"openai second request cached_tokens: {cached_tokens}")
         assert cached_tokens > 0
-        assert cached_tokens == int(response.usage.prompt_tokens)-1
+        assert cached_tokens == int(response.usage.prompt_tokens) - 1
         return first_cached_tokens
 
     async def cache_report_openai_async(self, message):
@@ -99,19 +105,25 @@ class TestCacheReport(unittest.TestCase):
         # print("=" * 100)
         cached_tokens = int(response.json()["meta_info"]["cached_tokens"])
         print(f"sglang first request cached_tokens: {cached_tokens}")
-        print(f"sglang first request prompt_tokens: {int(response.json()['meta_info']['prompt_tokens'])}")
+        print(
+            f"sglang first request prompt_tokens: {int(response.json()['meta_info']['prompt_tokens'])}"
+        )
         # can't assure to be 0: depends on the initialisation request / if a template is used with the model
         assert cached_tokens < self.min_cached
 
     def test_cache_split_prefill_openai(self):
-        self.cache_report_openai("€ This is a very long and unique text that should not be already cached, the twist is"
-                                 " that it should be longer than the chunked-prefill-size, so it should be split among"
-                                 " several prefill requests. Still, it shouldn't be cached")
+        self.cache_report_openai(
+            "€ This is a very long and unique text that should not be already cached, the twist is"
+            " that it should be longer than the chunked-prefill-size, so it should be split among"
+            " several prefill requests. Still, it shouldn't be cached"
+        )
 
     def test_cache_report_openai(self):
         self.cache_report_openai("Introduce the capital of France.")
 
-        first_cached_tokens_1 = self.cache_report_openai("How many sparrow do you need to lift a coconut?")
+        first_cached_tokens_1 = self.cache_report_openai(
+            "How many sparrow do you need to lift a coconut?"
+        )
 
         first_cached_tokens_2 = self.cache_report_openai("* sing something about cats")
         # first request may not have 0 cached tokens, but if they only have the template in common they
@@ -120,26 +132,38 @@ class TestCacheReport(unittest.TestCase):
 
     def test_cache_report_openai_async(self):
         async def run_test():
-            task0 = asyncio.create_task(self.cache_report_openai_async(
-                "first request, to start the inference and let the next two request be started in the same batch"
-            ))
-            await asyncio.sleep(0.05) #to force the first request to be started first
-            task1 = asyncio.create_task(self.cache_report_openai_async(
-                "> can the same batch parallel request use the cache?"
-            ))
-            task2 = asyncio.create_task(self.cache_report_openai_async(
-                "> can the same batch parallel request use the cache?"
-            ))
+            task0 = asyncio.create_task(
+                self.cache_report_openai_async(
+                    "first request, to start the inference and let the next two request be started in the same batch"
+                )
+            )
+            await asyncio.sleep(0.05)  # to force the first request to be started first
+            task1 = asyncio.create_task(
+                self.cache_report_openai_async(
+                    "> can the same batch parallel request use the cache?"
+                )
+            )
+            task2 = asyncio.create_task(
+                self.cache_report_openai_async(
+                    "> can the same batch parallel request use the cache?"
+                )
+            )
             result0, result1, result2 = await asyncio.gather(task0, task1, task2)
 
             cached_tokens0, prompt_tokens0 = result0
             cached_tokens1, prompt_tokens1 = result1
             cached_tokens2, prompt_tokens2 = result2
-            
-            print(f"Async request 0 - Cached tokens: {cached_tokens0}, Prompt tokens: {prompt_tokens0}")
-            print(f"Async request 1 - Cached tokens: {cached_tokens1}, Prompt tokens: {prompt_tokens1}")
-            print(f"Async request 2 - Cached tokens: {cached_tokens2}, Prompt tokens: {prompt_tokens2}")
-            
+
+            print(
+                f"Async request 0 - Cached tokens: {cached_tokens0}, Prompt tokens: {prompt_tokens0}"
+            )
+            print(
+                f"Async request 1 - Cached tokens: {cached_tokens1}, Prompt tokens: {prompt_tokens1}"
+            )
+            print(
+                f"Async request 2 - Cached tokens: {cached_tokens2}, Prompt tokens: {prompt_tokens2}"
+            )
+
             # Assert that no requests used the cache (becausefirst is alone, and the next two are in the same batch)
             # If a new optimisation limiting starting request with same prefix at the same time was added
             # to maximise the cache hit, this would not be true
