@@ -87,7 +87,9 @@ class TokenizerManager:
         self.recv_from_detokenizer.bind(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
 
         self.send_to_scheduler = context.socket(zmq.PUSH)
-        self.send_to_scheduler.connect(f"tcp://127.0.0.1:{port_args.scheduler_port}")
+        self.send_to_scheduler.connect(
+            f"tcp://127.0.0.1:{port_args.scheduler_input_port}"
+        )
 
         # Read model args
         self.model_path = server_args.model_path
