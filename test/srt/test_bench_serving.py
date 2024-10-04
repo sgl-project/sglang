@@ -25,7 +25,7 @@ class TestBenchServing(unittest.TestCase):
     def test_offline_throughput_non_stream_small_batch_size(self):
         res = run_bench_serving(
             model=DEFAULT_MODEL_NAME_FOR_TEST,
-            num_prompts=50,
+            num_prompts=200,
             request_rate=float("inf"),
             dataset_name="sharegpt",
             random_input_len=None,
