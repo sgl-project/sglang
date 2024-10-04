@@ -20,7 +20,6 @@ class TestCacheReport(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.min_cached = 5
         cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300, other_args=[
-            "--disable-cuda-graph",
             "--chunked-prefill-size=40",
             ])
         cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
