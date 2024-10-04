@@ -517,3 +517,34 @@ def test_hellaswag_select():
     accuracy = np.mean(np.array(preds) == np.array(labels))
 
     return accuracy, latency
+
+
+def test_gen_min_new_tokens(model_path):
+    """
+    Validate sgl.gen(min_tokens) functionality.
+
+    The test asks a question where, without a min_tokens constraint, the generated answer is expected to be short.
+    By enforcing the min_tokens parameter, we ensure the generated answer has at least the specified number of tokens.
+    We verify that the number of tokens in the answer is greater than the min_tokens threshold.
+    """
+    import sglang as sgl
+    from sglang.srt.hf_transformers_utils import get_tokenizer
+
+    MIN_TOKENS, MAX_TOKENS = 64, 128
+
+    @sgl.function
+    def answer_with_min_tokens(s):
+        s += sgl.user("What is the capital of the United States?")
+        s += sgl.assistant(
+            sgl.gen("answer", min_tokens=MIN_TOKENS, max_tokens=MAX_TOKENS)
+        )
+
+    state = answer_with_min_tokens.run()
+    answer = state["answer"]
+
+    # Create tokenizer
+    tokenizer = get_tokenizer(model_path)
+    token_ids = tokenizer.encode(answer)
+
+    # Ensure the number of generated tokens is greater than the minimum token count
+    assert len(token_ids) > MIN_TOKENS

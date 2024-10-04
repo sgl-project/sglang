@@ -76,6 +76,7 @@ def trace_program(program, arguments, backend):
     return tracer
 
 
+# The state in sglang function
 class TracerProgramState(ProgramState):
     def __init__(self, backend, arguments, only_trace_prefix):
         self.pid = uuid.uuid4().hex
