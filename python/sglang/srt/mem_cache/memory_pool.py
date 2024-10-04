@@ -30,6 +30,7 @@ class ReqToTokenPool:
     def __init__(self, size: int, max_context_len: int, device: str):
         self.size = size
         self.max_context_len = max_context_len
+        self.device = device
         self.free_slots = list(range(size))
         self.req_to_token = torch.empty(
             (size, max_context_len), dtype=torch.int32, device=device
