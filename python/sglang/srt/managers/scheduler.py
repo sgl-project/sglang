@@ -96,7 +96,9 @@ class Scheduler:
 
         if self.tp_rank == 0:
             self.recv_from_tokenizer = context.socket(zmq.PULL)
-            self.recv_from_tokenizer.bind(f"tcp://127.0.0.1:{port_args.scheduler_port}")
+            self.recv_from_tokenizer.bind(
+                f"tcp://127.0.0.1:{port_args.scheduler_input_port}"
+            )
 
             self.send_to_detokenizer = context.socket(zmq.PUSH)
             self.send_to_detokenizer.connect(
