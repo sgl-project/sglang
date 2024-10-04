@@ -627,10 +627,11 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 class PortArgs:
     # The port for tokenizer to receive inputs from detokenizer (zmq)
     tokenizer_port: int
-    # The port for scheduler to receive inputs from tokenizer (zmq)
-    scheduler_port: int
+    # The port for scheduler (rank 0) to receive inputs from tokenizer (zmq)
+    scheduler_input_port: int
     # The port for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_port: int
+
     # The port for nccl initialization for multiple TP groups (torch.dist)
     nccl_ports: List[int]
 
