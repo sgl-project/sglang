@@ -47,13 +47,13 @@ I'm going to the park
 import argparse
 import dataclasses
 import itertools
+import json
 import logging
 import multiprocessing
 import os
 import sqlite3
 import time
 from typing import Tuple
-import json
 
 import numpy as np
 import pandas as pd
