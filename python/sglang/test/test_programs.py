@@ -525,7 +525,7 @@ def test_gen_min_new_tokens(model_path):
 
     The test asks a question where, without a min_tokens constraint, the generated answer is expected to be short.
     By enforcing the min_tokens parameter, we ensure the generated answer has at least the specified number of tokens.
-    We verify that the number of tokens in the answer is greater than the min_tokens threshold.
+    We verify that the number of tokens in the answer is >= the min_tokens threshold.
     """
     import sglang as sgl
     from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -546,5 +546,7 @@ def test_gen_min_new_tokens(model_path):
     tokenizer = get_tokenizer(model_path)
     token_ids = tokenizer.encode(answer)
 
-    # Ensure the number of generated tokens is greater than the minimum token count
-    assert len(token_ids) > MIN_TOKENS
+    # Ensure the number of generated tokens is >= the minimum token count
+    assert (
+        len(token_ids) >= MIN_TOKENS
+    ), f"Generated {len(token_ids)} tokens, min required: {MIN_TOKENS}"
