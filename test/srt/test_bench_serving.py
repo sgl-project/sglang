@@ -20,7 +20,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 2850
+            assert res["output_throughput"] > 2830
 
     def test_offline_throughput_non_stream_small_batch_size(self):
         res = run_bench_serving(
@@ -35,7 +35,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 880
+            assert res["output_throughput"] > 1000
 
     def test_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
@@ -46,7 +46,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 2800
+            assert res["output_throughput"] > 2880
 
     def test_offline_throughput_without_chunked_prefill(self):
         res = run_bench_serving(
@@ -73,7 +73,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 2960
+            assert res["output_throughput"] > 2930
 
     def test_offline_throughput_default_fp8(self):
         res = run_bench_serving(

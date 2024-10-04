@@ -444,9 +444,6 @@ class Scheduler:
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
-        if len(self.waiting_queue) == 0 and self.current_inflight_req is None:
-            return None
-
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
