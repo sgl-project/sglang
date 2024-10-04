@@ -533,20 +533,40 @@ def test_gen_min_new_tokens(model_path):
     MIN_TOKENS, MAX_TOKENS = 64, 128
 
     @sgl.function
-    def answer_with_min_tokens(s):
+    def convo_1(s):
         s += sgl.user("What is the capital of the United States?")
         s += sgl.assistant(
             sgl.gen("answer", min_tokens=MIN_TOKENS, max_tokens=MAX_TOKENS)
         )
 
-    state = answer_with_min_tokens.run()
-    answer = state["answer"]
+    @sgl.function
+    def convo_2(s):
+        s += sgl.user("What is the most beautiful integar?")
+        s += sgl.assistant(
+            sgl.gen_int("answer", min_tokens=MIN_TOKENS, max_tokens=MAX_TOKENS)
+        )
 
-    # Create tokenizer
+    @sgl.function
+    def convo_3(s):
+        s += sgl.user("Who is your favorite singner?")
+        s += sgl.assistant(
+            sgl.gen_string("answer", min_tokens=MIN_TOKENS, max_tokens=MAX_TOKENS)
+        )
+
+    def assert_min_tokens(tokenizer, text):
+        token_ids = tokenizer.encode(text)
+        assert (
+            len(token_ids) >= MIN_TOKENS
+        ), f"Generated {len(token_ids)} tokens, min required: {MIN_TOKENS}. Text: {text}"
+
     tokenizer = get_tokenizer(model_path)
-    token_ids = tokenizer.encode(answer)
 
-    # Ensure the number of generated tokens is >= the minimum token count
-    assert (
-        len(token_ids) >= MIN_TOKENS
-    ), f"Generated {len(token_ids)} tokens, min required: {MIN_TOKENS}. Answer: {answer}"
+    state = convo_1.run()
+    assert_min_tokens(tokenizer, state["answer"])
+
+    # TODO (ByronHsu): gen_int and gen_string are not constrained by min_tokens likely due to the conflict with the regex matching
+    # state = convo_2.run()
+    # assert_min_tokens(tokenizer, state["answer"])
+
+    # state = convo_3.run()
+    # assert_min_tokens(tokenizer, state["answer"])
