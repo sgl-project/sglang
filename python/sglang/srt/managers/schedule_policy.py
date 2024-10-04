@@ -51,7 +51,7 @@ class SchedulePolicy:
                 matched_prefix_indices, r.last_node = self.tree_cache.match_prefix(
                     rid=r.rid, key=r.adjust_max_prefix_ids()
                 )
-                r.cached_tokens += (len(matched_prefix_indices) - len(r.prefix_indices))
+                r.cached_tokens += len(matched_prefix_indices)
                 r.prefix_indices = matched_prefix_indices
 
             prefix_computed = True
