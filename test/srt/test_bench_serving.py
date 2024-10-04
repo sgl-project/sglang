@@ -20,7 +20,22 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 2600
+            assert res["output_throughput"] > 2850
+
+    def test_offline_throughput_non_stream_small_batch_size(self):
+        res = run_bench_serving(
+            model=DEFAULT_MODEL_NAME_FOR_TEST,
+            num_prompts=50,
+            request_rate=float("inf"),
+            dataset_name="sharegpt",
+            random_input_len=None,
+            random_output_len=None,
+            disable_stream=True,
+            other_server_args=["--max-running-requests", "10"],
+        )
+
+        if is_in_ci():
+            assert res["output_throughput"] > 880
 
     def test_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
@@ -58,7 +73,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 2600
+            assert res["output_throughput"] > 2960
 
     def test_offline_throughput_default_fp8(self):
         res = run_bench_serving(

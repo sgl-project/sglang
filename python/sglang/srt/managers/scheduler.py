@@ -21,6 +21,7 @@ import multiprocessing
 import os
 import time
 import warnings
+from enum import IntEnum, auto
 from typing import List, Optional, Union
 
 import torch
@@ -70,6 +71,12 @@ logger = logging.getLogger(__name__)
 
 # Crash on warning if we are running CI tests
 crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+
+
+class NewBatchState(IntEnum):
+    FREE = auto()
+    FULL = auto()
+    NOREQ = auto()
 
 
 class Scheduler:
@@ -224,7 +231,7 @@ class Scheduler:
         )
         self.new_token_ratio = self.min_new_token_ratio
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
-        self.do_not_get_new_batch = False
+        self.get_new_batch_state = NewBatchState.FREE
 
     def event_loop(self):
         while True:
@@ -263,12 +270,14 @@ class Scheduler:
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 self.handle_generate_request(recv_req)
-                self.do_not_get_new_batch = False
+                if self.get_new_batch_state == NewBatchState.NOREQ:
+                    self.get_new_batch_state = NewBatchState.FREE
             elif isinstance(
                 recv_req, (TokenizedEmbeddingReqInput, TokenizedRewardReqInput)
             ):
                 self.handle_embedding_request(recv_req)
-                self.do_not_get_new_batch = False
+                if self.get_new_batch_state == NewBatchState.NOREQ:
+                    self.get_new_batch_state = NewBatchState.FREE
             elif isinstance(recv_req, FlushCacheReq):
                 self.flush_cache()
             elif isinstance(recv_req, AbortReq):
@@ -281,11 +290,13 @@ class Scheduler:
 
     @torch.inference_mode()
     def forward_step(self):
-        if self.do_not_get_new_batch and self.current_inflight_req is None:
+        if (
+            self.get_new_batch_state != NewBatchState.FREE
+            and self.current_inflight_req is None
+        ):
             new_batch = None
         else:
             new_batch = self.get_new_prefill_batch()
-        self.do_not_get_new_batch = False
 
         if new_batch is not None:
             # Run a new prefill batch
@@ -449,6 +460,7 @@ class Scheduler:
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
         if running_bs >= self.max_running_requests:
+            self.get_new_batch_state = NewBatchState.FULL
             return None
 
         # Get priority queue
@@ -492,9 +504,11 @@ class Scheduler:
                 )
                 > self.max_loras_per_batch
             ):
+                self.get_new_batch_state = NewBatchState.FULL
                 break
 
             if adder.no_remaining_tokens():
+                self.get_new_batch_state = NewBatchState.FULL
                 break
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
             res = adder.add_one_req(req)
@@ -502,6 +516,7 @@ class Scheduler:
                 not res
                 or running_bs + len(adder.can_run_list) >= self.max_running_requests
             ):
+                self.get_new_batch_state = NewBatchState.FULL
                 break
 
         can_run_list = adder.can_run_list
@@ -511,6 +526,8 @@ class Scheduler:
             self.current_inflight_req = adder.new_inflight_req
 
         if len(can_run_list) == 0:
+            if len(self.waiting_queue) == 0:
+                self.get_new_batch_state = NewBatchState.NOREQ
             return None
 
         # Print stats
@@ -812,9 +829,6 @@ class Scheduler:
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
 
-        if not has_finished:
-            self.do_not_get_new_batch = True
-
         self.handle_finished_requests(batch)
 
     def handle_finished_requests(self, batch: ScheduleBatch):
@@ -835,6 +849,9 @@ class Scheduler:
         for i, req in enumerate(batch.reqs):
             if not req.finished() and req is not self.current_inflight_req:
                 unfinished_indices.append(i)
+            else:
+                if self.get_new_batch_state == NewBatchState.FULL:
+                    self.get_new_batch_state = NewBatchState.FREE
 
             if req.finished() or (
                 req.stream

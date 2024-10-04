@@ -845,6 +845,7 @@ def run_benchmark(args_: argparse.Namespace):
     tokenizer = get_tokenizer(tokenizer_id)
 
     if args.dataset_name == "sharegpt":
+        assert args.random_input_len is None and args.random_output_len is None
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
@@ -852,6 +853,7 @@ def run_benchmark(args_: argparse.Namespace):
             fixed_output_len=args.sharegpt_output_len,
         )
     elif args.dataset_name == "random":
+        assert args.random_input_len is not None and args.random_output_len is not None
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
@@ -964,13 +966,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--random-input-len",
         type=int,
-        default=1024,
         help="Number of input tokens per request, used only for random dataset.",
     )
     parser.add_argument(
         "--random-output-len",
         type=int,
-        default=128,
         help="Number of output tokens per request, used only for random dataset.",
     )
     parser.add_argument(
