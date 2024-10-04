@@ -1,5 +1,3 @@
-#!/usr/bin/python
-
 import unittest
 
 import sglang as sgl
