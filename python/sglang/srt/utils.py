@@ -177,35 +177,6 @@ def is_port_available(port):
             return False
 
 
-def allocate_init_ports(
-    port: Optional[int] = None,
-    additional_ports: Optional[List[int]] = None,
-    dp_size: int = 1,
-):
-    """Allocate ports for all connections."""
-    if additional_ports:
-        ret_ports = [port] + additional_ports
-    else:
-        ret_ports = [port]
-
-    ret_ports = list(set(x for x in ret_ports if is_port_available(x)))
-    cur_port = ret_ports[-1] + 1 if len(ret_ports) > 0 else 10000
-
-    # HTTP + Tokenizer + Controller + Detokenizer + dp_size * 1 (nccl)
-    num_ports_needed = 4 + dp_size
-    while len(ret_ports) < num_ports_needed:
-        if cur_port not in ret_ports and is_port_available(cur_port):
-            ret_ports.append(cur_port)
-        cur_port += 1
-
-    if port is not None and ret_ports[0] != port:
-        logger.warning(
-            f"WARNING: Port {port} is not available. Use port {ret_ports[0]} instead."
-        )
-
-    return ret_ports[0], ret_ports[1:num_ports_needed]
-
-
 def is_multimodal_model(model_architectures):
     if (
         "LlavaLlamaForCausalLM" in model_architectures

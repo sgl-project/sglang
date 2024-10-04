@@ -66,9 +66,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server import _set_envs_and_config
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    allocate_init_ports,
     configure_logger,
     kill_child_process,
     suppress_other_loggers,
@@ -127,11 +126,7 @@ def load_model(server_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
-    server_args.port, server_args.additional_ports = allocate_init_ports(
-        server_args.port,
-        server_args.additional_ports,
-        server_args.dp_size,
-    )
+    port_args = PortArgs.init_new(server_args)
     model_config = ModelConfig(
         server_args.model_path,
         server_args.trust_remote_code,
@@ -143,7 +138,7 @@ def load_model(server_args, tp_rank):
         gpu_id=tp_rank,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
-        nccl_port=server_args.additional_ports[-1],
+        nccl_port=port_args.nccl_ports[0],
         server_args=server_args,
     )
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")

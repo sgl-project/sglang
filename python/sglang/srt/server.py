@@ -24,6 +24,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import random
 import threading
 import time
 from http import HTTPStatus
@@ -68,9 +69,9 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
-    allocate_init_ports,
     assert_pkg_version,
     configure_logger,
+    is_port_available,
     kill_child_process,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
@@ -302,18 +303,7 @@ def launch_server(
     _set_envs_and_config(server_args)
 
     # Allocate ports for inter-process communications
-    server_args.port, server_args.additional_ports = allocate_init_ports(
-        server_args.port,
-        server_args.additional_ports,
-        server_args.dp_size,
-    )
-    ports = server_args.additional_ports
-    port_args = PortArgs(
-        tokenizer_port=ports[0],
-        scheduler_input_port=ports[1],
-        detokenizer_port=ports[2],
-        nccl_ports=ports[3:],
-    )
+    port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
     # If using model from www.modelscope.cn, first download the model.
@@ -499,17 +489,16 @@ class Runtime:
         self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
 
         # Pre-allocate ports
-        self.server_args.port, self.server_args.additional_ports = allocate_init_ports(
-            self.server_args.port,
-            self.server_args.additional_ports,
-            self.server_args.dp_size,
-        )
+        for port in range(10000, 40000):
+            if is_port_available(port):
+                break
+            port += 1
+        self.server_args.port = port
 
         self.url = self.server_args.url()
-        self.generate_url = (
-            f"http://{self.server_args.host}:{self.server_args.port}/generate"
-        )
+        self.generate_url = self.url + "/generate"
 
+        # NOTE: We store pid instead of proc to fix some issues during __delete__
         self.pid = None
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
 
