@@ -411,8 +411,8 @@ class ModelRunner:
 
         device = "cuda"
         self.req_to_token_pool = ReqToTokenPool(
-            max_num_reqs + 1,
-            self.model_config.context_len + 4,
+            size=max_num_reqs + 1,
+            max_context_len=self.model_config.context_len + 4,
             device=device,
         )
         if (

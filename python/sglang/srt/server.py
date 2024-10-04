@@ -24,6 +24,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import random
 import threading
 import time
 from http import HTTPStatus
@@ -68,9 +69,9 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
-    allocate_init_ports,
     assert_pkg_version,
     configure_logger,
+    is_port_available,
     kill_child_process,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
@@ -118,6 +119,7 @@ async def health_generate(request: Request) -> Response:
 
 @app.get("/get_model_info")
 async def get_model_info():
+    """Get the model information."""
     result = {
         "model_path": tokenizer_manager.model_path,
         "is_generation": tokenizer_manager.is_generation,
@@ -127,11 +129,13 @@ async def get_model_info():
 
 @app.get("/get_server_args")
 async def get_server_args():
+    """Get the server arguments."""
     return dataclasses.asdict(tokenizer_manager.server_args)
 
 
 @app.get("/flush_cache")
 async def flush_cache():
+    """Flush the radix cache."""
     tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
@@ -142,7 +146,7 @@ async def flush_cache():
 
 @app.post("/update_weights")
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
-
+    """Update the weights inplace without re-launching the server."""
     success, message = await tokenizer_manager.update_weights(obj, request)
     content = {"success": success, "message": message}
     if success:
@@ -205,7 +209,7 @@ app.put("/encode")(encode_request)
 
 
 async def judge_request(obj: RewardReqInput, request: Request):
-    """Handle an embedding request."""
+    """Handle a reward model request."""
     try:
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
@@ -299,18 +303,7 @@ def launch_server(
     _set_envs_and_config(server_args)
 
     # Allocate ports for inter-process communications
-    server_args.port, server_args.additional_ports = allocate_init_ports(
-        server_args.port,
-        server_args.additional_ports,
-        server_args.dp_size,
-    )
-    ports = server_args.additional_ports
-    port_args = PortArgs(
-        tokenizer_port=ports[0],
-        scheduler_port=ports[1],
-        detokenizer_port=ports[2],
-        nccl_ports=ports[3:],
-    )
+    port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
     # If using model from www.modelscope.cn, first download the model.
@@ -496,17 +489,16 @@ class Runtime:
         self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
 
         # Pre-allocate ports
-        self.server_args.port, self.server_args.additional_ports = allocate_init_ports(
-            self.server_args.port,
-            self.server_args.additional_ports,
-            self.server_args.dp_size,
-        )
+        for port in range(10000, 40000):
+            if is_port_available(port):
+                break
+            port += 1
+        self.server_args.port = port
 
         self.url = self.server_args.url()
-        self.generate_url = (
-            f"http://{self.server_args.host}:{self.server_args.port}/generate"
-        )
+        self.generate_url = self.url + "/generate"
 
+        # NOTE: We store pid instead of proc to fix some issues during __delete__
         self.pid = None
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
 
