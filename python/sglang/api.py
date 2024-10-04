@@ -40,6 +40,14 @@ def Runtime(*args, **kwargs):
     return Runtime(*args, **kwargs)
 
 
+def Engine(*args, **kwargs):
+    # Avoid importing unnecessary dependency
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    from sglang.srt.server import Engine
+
+    return Engine(*args, **kwargs)
+
+
 def set_default_backend(backend: BaseBackend):
     global_config.default_backend = backend
 
