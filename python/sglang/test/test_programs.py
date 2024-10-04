@@ -549,4 +549,4 @@ def test_gen_min_new_tokens(model_path):
     # Ensure the number of generated tokens is >= the minimum token count
     assert (
         len(token_ids) >= MIN_TOKENS
-    ), f"Generated {len(token_ids)} tokens, min required: {MIN_TOKENS}"
+    ), f"Generated {len(token_ids)} tokens, min required: {MIN_TOKENS}. Answer: {answer}"
