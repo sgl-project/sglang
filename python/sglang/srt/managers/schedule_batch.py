@@ -242,9 +242,12 @@ class Req:
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
-            self.prefix_indices, self.last_node = tree_cache.match_prefix(
+            matched_prefix_indices, self.last_node = tree_cache.match_prefix(
                 rid=self.rid, key=self.adjust_max_prefix_ids()
             )
+            # The number of new cached tokens, is the number of matched prefix indices
+            self.cached_tokens += len(matched_prefix_indices)
+            self.prefix_indices = matched_prefix_indices
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
