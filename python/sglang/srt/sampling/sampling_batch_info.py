@@ -21,7 +21,7 @@ class SamplingBatchInfo:
     min_ps: torch.Tensor
 
     # Dispatch in CUDA graph
-    need_min_p_sampling: bool = False
+    need_min_p_sampling: bool
 
     # Bias Tensors
     vocab_size: int
