@@ -514,7 +514,16 @@ def get_similarities(vec1, vec2):
     return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)
 
 
-def run_bench_serving(model, num_prompts, request_rate, other_server_args):
+def run_bench_serving(
+    model,
+    num_prompts,
+    request_rate,
+    other_server_args,
+    dataset_name="random",
+    random_input_len=4096,
+    random_output_len=2048,
+    disable_stream=False,
+):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -530,21 +539,21 @@ def run_bench_serving(model, num_prompts, request_rate, other_server_args):
         base_url=base_url,
         host=None,
         port=None,
-        dataset_name="random",
+        dataset_name=dataset_name,
         dataset_path="",
         model=None,
         tokenizer=None,
         num_prompts=num_prompts,
         sharegpt_output_len=None,
-        random_input_len=4096,
-        random_output_len=2048,
+        random_input_len=random_input_len,
+        random_output_len=random_output_len,
         random_range_ratio=0.0,
         request_rate=request_rate,
         multi=None,
         seed=0,
         output_file=None,
         disable_tqdm=False,
-        disable_stream=False,
+        disable_stream=disable_stream,
         disable_ignore_eos=False,
         extra_request_body=None,
     )
