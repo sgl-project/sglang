@@ -223,7 +223,6 @@ if __name__ == "__main__":
         model_path=args.model_path,  # "liuhaotian/llava-v1.6-vicuna-7b",
         tokenizer_path=tokenizer_path,
         port=cur_port,
-        additional_ports=[cur_port + 1, cur_port + 2, cur_port + 3, cur_port + 4],
         json_model_override_args=json.dumps(model_override_args),
         tp_size=1,
     )
