@@ -57,9 +57,7 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(
-        model_path="/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/"
-    )
+    runtime = sgl.Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
     sgl.set_default_backend(runtime)
 
     # Run a single request
