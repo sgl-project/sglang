@@ -1,10 +1,12 @@
+import math
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import einops
 import requests
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoModelForCausalLM, AutoProcessor, CLIPVisionModel
 from vllm.model_executor.layers.activation import QuickGELU
@@ -12,7 +14,7 @@ from vllm.model_executor.layers.activation import QuickGELU
 
 # TODO: This should be a config in huggingface...
 @dataclass
-class VisionBackboneConfig:
+class MolmoVisionBackboneConfig:
     image_default_input_size: Tuple[int, int] = (336, 336)
     image_patch_size: int = 14
     image_pos_patch_size: int = 14
@@ -31,8 +33,14 @@ class VisionBackboneConfig:
         return h // self.image_patch_size, w // self.image_patch_size
 
 
+@dataclass
+class PlaceholderConfig:
+    hidden_size: int = 3584
+    intermediate_size: int = 37888
+
+
 class MolmoViTMLP(nn.Module):
-    def __init__(self, config: VisionBackboneConfig):
+    def __init__(self, config: MolmoVisionBackboneConfig):
         super().__init__()
         self.config = config
         self.w1 = nn.Linear(config.image_emb_dim, config.image_mlp_dim, bias=False)
@@ -47,7 +55,7 @@ class MolmoViTMLP(nn.Module):
 
 
 class MolmoMultiHeadDotProductAttention(nn.Module):
-    def __init__(self, config: VisionBackboneConfig):
+    def __init__(self, config: MolmoVisionBackboneConfig):
         super().__init__()
         self.config = config
         self.num_heads = config.image_num_heads
@@ -77,7 +85,7 @@ class MolmoMultiHeadDotProductAttention(nn.Module):
             hidden_states.shape[:2] + (self.num_heads * self.head_dim,)
         )
 
-    def forward(self, inputs_q: torch.Tensor, inputs_kv: torch.Tensor):
+    def forward(self, inputs_q: torch.Tensor, inputs_kv: torch.Tensor = None):
         if inputs_kv is None:
             inputs_k = inputs_q
             inputs_v = inputs_q
@@ -87,8 +95,8 @@ class MolmoMultiHeadDotProductAttention(nn.Module):
 
         # (bsz, seq_len, embed_dim)
         q = self.wq(inputs_q)
-        k = self.wk(inputs_kv)
-        v = self.wv(inputs_kv)
+        k = self.wk(inputs_k)
+        v = self.wv(inputs_v)
 
         # TODO: Implement flash attention or xformers
         q = self._split_heads(q)
@@ -113,7 +121,7 @@ class MolmoMultiHeadDotProductAttention(nn.Module):
 
 
 class MolmoResidualAttentionBlock(nn.Module):
-    def __init__(self, config: VisionBackboneConfig):
+    def __init__(self, config: MolmoVisionBackboneConfig):
         super().__init__()
         self.config = config
         self.attention = MolmoMultiHeadDotProductAttention(config)
@@ -132,7 +140,7 @@ class MolmoResidualAttentionBlock(nn.Module):
 
 
 class BlockCollection(nn.Module):
-    def __init__(self, config: VisionBackboneConfig):
+    def __init__(self, config: MolmoVisionBackboneConfig):
         super().__init__()
         self.config = config
         self.resblocks = nn.ModuleList(
@@ -142,16 +150,17 @@ class BlockCollection(nn.Module):
             ]
         )
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, x: torch.Tensor):
         hidden_states = []
         for block in self.resblocks:
-            hidden_states.append(block(hidden_states))
+            x = block(x)
+            hidden_states.append(x)
 
         return hidden_states
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config: VisionBackboneConfig):
+    def __init__(self, config: MolmoVisionBackboneConfig):
         super().__init__()
         self.config = config
         self.scale = config.image_emb_dim**-0.5
@@ -161,20 +170,18 @@ class VisionTransformer(nn.Module):
         self.positional_embedding = nn.Parameter(
             torch.randn(config.image_num_pos, config.image_emb_dim)
         )
-        self.patch_embedding = nn.Parameter(
-            torch.randn(
-                config.image_patch_size * config.image_patch_size * 3,
-                config.image_emb_dim,
-            )
+        self.patch_embedding = nn.Linear(
+            config.image_patch_size * config.image_patch_size * 3,
+            config.image_emb_dim,
         )
         self.transformer = BlockCollection(config)
         self.pre_ln = nn.LayerNorm(config.image_emb_dim, eps=config.image_norm_eps)
 
-    def _expand_token(token: torch.Tensor, batch_size: int) -> torch.Tensor:
+    def _expand_token(self, token: torch.Tensor, batch_size: int) -> torch.Tensor:
         return token.view(1, 1, -1).expand(batch_size, -1, -1)
 
     def _add_pos_embed(self, x: torch.Tensor, patch_num: int) -> torch.Tensor:
-        cls_embed = self.positional_embedding[0]
+        cls_embed = self.positional_embedding[0:1]
         pos_embed = self.positional_embedding[1:]
 
         pos_embed = pos_embed.reshape(
@@ -218,7 +225,8 @@ class VisionTransformer(nn.Module):
 
         # Expand the class embedding to batch size then concate along the patch dimension
         x = torch.cat(
-            self._expand_token(self.class_embedding, x.shape[0]).to(x.device), dim=1
+            [self._expand_token(self.class_embedding, x.shape[0]).to(x.device), x],
+            dim=1,
         )
         x = self._add_pos_embed(x, patch_num)
         x = self.pre_ln(x)
@@ -227,25 +235,26 @@ class VisionTransformer(nn.Module):
 
 
 class MolmoMultiModalProjector(nn.Module):
-    def __init__(self, config: MolmoVisionBackboneConfig):
+    def __init__(
+        self,
+        config: PlaceholderConfig,
+        input_dim: Optional[int] = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.w1 = nn.Linear(
-            config.image_embed_dim, self.config.hidden_size * 2, bias=False
+            input_dim or config.hidden_size, config.intermediate_size // 2, bias=False
         )
-        self.w2 = nn.Linear(
-            self.config.hidden_size * 2, self.config.hidden_size, bias=False
-        )
+        self.w2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.w3 = nn.Linear(
-            config.image_embed_dim, self.config.hidden_size * 2, bias=False
+            input_dim or config.hidden_size, config.intermediate_size // 2, bias=False
         )
-        self.act = QuickGELU()
+        self.act = nn.SiLU()
 
-    def forward(self, image_features: torch.Tensor):
-        image_features = self.w2(
-            self.act(self.w1(image_features), self.w3(image_features))
-        )
-        return image_features
+    def forward(self, x: torch.Tensor):
+        x = self.act(self.w1(x), self.w3(x))
+        x = self.w2(x)
+        return x
 
 
 class MolmoVisionBackbone(nn.Module):
@@ -254,27 +263,42 @@ class MolmoVisionBackbone(nn.Module):
 
         self.config = config
         self.image_vit = VisionTransformer(config)
-        self.pad_embed = nn.Parameter(torch.zeros((2, config.image_dim)))
+        self.image_projector = MolmoMultiModalProjector(
+            PlaceholderConfig(),
+            input_dim=config.image_emb_dim,
+        )
+        self.pad_embed = nn.Parameter(torch.zeros((2, config.image_emb_dim)))
+        self.image_pooling_2d = MolmoMultiHeadDotProductAttention(config)
+
+        self.vit_layers = [-2, -9]
+        self.image_num_patch = config.image_num_patch
+        self.llm_patches_per_crop = (
+            (self.image_num_patch[0] + 1) // 2,
+            (self.image_num_patch[1] + 1) // 2,
+        )
 
     def encode_image(self, images: torch.Tensor):
         B, T, N, D = images.shape
 
         # Mask checks if all tokens are equal to -1
         mask = ~torch.all(images.view(B * T, N, D) == -1, dim=(1, 2), keepdim=True)
+        images = images.view(B * T, N, D)
 
-        hidden_states = self.image_vit(images, output_hidden_states=True)[2]
+        hidden_states = self.image_vit(images)
 
         features = []
-        for layer in self.config.vit_feature_select_layers:
+        for layer in self.vit_layers:
             features.append(hidden_states[layer])
             image_features = torch.cat(features, dim=-1)
+
+        # Since num_prefix_tokens is always 1, we can just take the first token
         cls_embed = image_features[:, 0]
         image_features = image_features[:, 1:]
 
         image_features = image_features * mask
         image_features = image_features.view(B, T, N, -1)
 
-        cls_embed = cls_embed.view(B, T, -1) if cls_embed is not None else None
+        cls_embed = cls_embed.view(B, T, -1)
 
         return image_features, cls_embed
 
@@ -282,6 +306,7 @@ class MolmoVisionBackbone(nn.Module):
         batch_size, num_images = images.shape[:2]
         image_features, cls_embed = self.encode_image(images)
 
+        assert image_masks is not None
         pad_embed = self.pad_embed[:, None, None, None, :]
         all_pad = image_masks == 0
         partial_pad = torch.logical_and(image_masks < 1, torch.logical_not(all_pad)).to(
@@ -305,8 +330,7 @@ class MolmoVisionBackbone(nn.Module):
         )
         image_features = self.image_pooling_2d(image_features[:, :1, :], image_features)
 
-        h, w = self.config.image_num_patch
-        h, w = (h + 2 - 1) // 2, (w + 2 - 1) // 2
+        h, w = self.llm_patches_per_crop
         image_features = image_features.reshape(batch_size, num_images, h * w, -1)
 
         # MLP layer to map the feature.
@@ -324,12 +348,12 @@ if __name__ == "__main__":
         torch_dtype="auto",
         device_map="auto",
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        "allenai/Molmo-7B-D-0924",
-        trust_remote_code=True,
-        torch_dtype="auto",
-        device_map="auto",
-    )
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     "allenai/Molmo-7B-D-0924",
+    #     trust_remote_code=True,
+    #     torch_dtype="auto",
+    #     device_map="auto",
+    # )
     # model = CLIPVisionModel.from_pretrained(
     #         "openai/clip-vit-large-patch14-336", torch_dtype=torch.float16
     #     )
@@ -342,14 +366,12 @@ if __name__ == "__main__":
         ],
         text="Describe this image.",
     )
-    # model = MolmoVisionBackbone(MolmoVisionBackboneConfig()).to("cuda")
-    # model.eval()
+    model = MolmoVisionBackbone(MolmoVisionBackboneConfig()).to("cuda")
+    model.eval()
     print(model)
 
     # Takes in bs, num_crops, num_patches_h * num_patches_w, patch_size * patch_size * 3
     #                  -> bs, num_crops, num_patches_h * num_patches_w, image_embed_dim * 2
-    image_features, cls_embed = model.model.vision_backbone.encode_image(
-        inputs["images"].unsqueeze(0).to("cuda")
-    )
+    image_features, cls_embed = model(inputs["images"].unsqueeze(0).to("cuda"))
     print(image_features.shape)
     print(cls_embed.shape)
