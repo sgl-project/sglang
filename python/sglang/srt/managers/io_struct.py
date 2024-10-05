@@ -79,7 +79,7 @@ class GenerateReqInput:
             self.parallel_sample_num = 1
         if isinstance(self.sampling_params, dict):
             self.parallel_sample_num = self.sampling_params.get("n", 1)
-        else:  # isinstance(self.sampling_params, list):
+        elif isinstance(self.sampling_params, list):
             self.parallel_sample_num = self.sampling_params[0].get("n", 1)
             for sp in self.sampling_params:
                 # TODO cope with the case that the parallel_sample_num is different for different samples
