@@ -72,7 +72,7 @@ def test_select(check_answer):
         statement="The capital of Germany is Berlin.",
     )
     if check_answer:
-        assert ret["answer"] == "True", ret.text
+        assert ret["answer"] == "True", ret.text()
     else:
         assert ret["answer"] in ["True", "False", "Unknown"]
 
@@ -80,7 +80,7 @@ def test_select(check_answer):
         statement="The capital of Canada is Tokyo.",
     )
     if check_answer:
-        assert ret["answer"] == "False", ret.text
+        assert ret["answer"] == "False", ret.text()
     else:
         assert ret["answer"] in ["True", "False", "Unknown"]
 
@@ -88,7 +88,7 @@ def test_select(check_answer):
         statement="Purple is a better color than green.",
     )
     if check_answer:
-        assert ret["answer"] == "Unknown", ret.text
+        assert ret["answer"] == "Unknown", ret.text()
     else:
         assert ret["answer"] in ["True", "False", "Unknown"]
 
@@ -100,8 +100,8 @@ def test_decode_int():
         s += "The number of days in a year is " + sgl.gen_int("days") + "\n"
 
     ret = decode_int.run(temperature=0.1)
-    assert int(ret["hours"]) == 24, ret.text
-    assert int(ret["days"]) == 365, ret.text
+    assert int(ret["hours"]) == 24, ret.text()
+    assert int(ret["days"]) == 365, ret.text()
 
 
 def test_decode_json_regex():
