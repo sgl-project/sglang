@@ -55,21 +55,28 @@ class MolmoViTMLP(nn.Module):
 
 
 class MolmoMultiHeadDotProductAttention(nn.Module):
-    def __init__(self, config: MolmoVisionBackboneConfig):
+    def __init__(self, config: MolmoVisionBackboneConfig, num_vit_layers: int = 1):
         super().__init__()
         self.config = config
         self.num_heads = config.image_num_heads
         self.num_kv_heads = config.image_num_key_value_heads
         self.head_dim = config.image_emb_dim // config.image_num_heads
+        self.num_vit_layers = num_vit_layers
 
         self.wq = nn.Linear(
-            config.image_emb_dim, self.num_heads * self.head_dim, bias=False
+            config.image_emb_dim * num_vit_layers,
+            self.num_heads * self.head_dim,
+            bias=False,
         )
         self.wk = nn.Linear(
-            config.image_emb_dim, self.num_kv_heads * self.head_dim, bias=False
+            config.image_emb_dim * num_vit_layers,
+            self.num_kv_heads * self.head_dim,
+            bias=False,
         )
         self.wv = nn.Linear(
-            config.image_emb_dim, self.num_kv_heads * self.head_dim, bias=False
+            config.image_emb_dim * num_vit_layers,
+            self.num_kv_heads * self.head_dim,
+            bias=False,
         )
         self.out = nn.Linear(
             self.num_heads * self.head_dim, config.image_emb_dim, bias=False
@@ -252,7 +259,9 @@ class MolmoMultiModalProjector(nn.Module):
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor):
-        x = self.act(self.w1(x), self.w3(x))
+        # TODO: Impelement efficient fused SiluAndMul
+        intermediate = torch.cat([self.w1(x), self.w3(x)], dim=-1)
+        x = self.act(intermediate)
         x = self.w2(x)
         return x
 
@@ -262,15 +271,19 @@ class MolmoVisionBackbone(nn.Module):
         super().__init__()
 
         self.config = config
+        self.vit_layers = [-2, -9]
         self.image_vit = VisionTransformer(config)
         self.image_projector = MolmoMultiModalProjector(
             PlaceholderConfig(),
             input_dim=config.image_emb_dim,
         )
-        self.pad_embed = nn.Parameter(torch.zeros((2, config.image_emb_dim)))
-        self.image_pooling_2d = MolmoMultiHeadDotProductAttention(config)
+        self.pad_embed = nn.Parameter(
+            torch.zeros((2, config.image_emb_dim * len(self.vit_layers)))
+        )
+        self.image_pooling_2d = MolmoMultiHeadDotProductAttention(
+            config, num_vit_layers=len(self.vit_layers)
+        )
 
-        self.vit_layers = [-2, -9]
         self.image_num_patch = config.image_num_patch
         self.llm_patches_per_crop = (
             (self.image_num_patch[0] + 1) // 2,
@@ -322,13 +335,27 @@ class MolmoVisionBackbone(nn.Module):
         image_features = image_features.reshape(
             (batch_size, num_images) + self.config.image_num_patch + (-1,)
         )
+
+        if self.image_num_patch[0] % 2 == 1:
+            # Pad so we can still pool 2x2 patches
+            image_features = F.pad(
+                image_features,
+                (0, 0, 0, 1, 0, 1, 0, 0, 0, 0),
+            )
+
+        print(image_features.shape)
+        # Divide into 2x2 patches
         image_features = einops.rearrange(
             image_features,
             "b n (h dh) (w dw) c -> (b n h w) (dh dw) c",
             dh=2,
             dw=2,
         )
-        image_features = self.image_pooling_2d(image_features[:, :1, :], image_features)
+        print(image_features.shape)
+
+        query = image_features.mean(-2, keepdim=True)
+        print(query.shape)
+        image_features = self.image_pooling_2d(query, image_features)
 
         h, w = self.llm_patches_per_crop
         image_features = image_features.reshape(batch_size, num_images, h * w, -1)
@@ -372,6 +399,9 @@ if __name__ == "__main__":
 
     # Takes in bs, num_crops, num_patches_h * num_patches_w, patch_size * patch_size * 3
     #                  -> bs, num_crops, num_patches_h * num_patches_w, image_embed_dim * 2
-    image_features, cls_embed = model(inputs["images"].unsqueeze(0).to("cuda"))
+    image_features, cls_embed = model(
+        inputs["images"].unsqueeze(0).to("cuda"),
+        inputs["image_masks"].unsqueeze(0).to("cuda"),
+    )
     print(image_features.shape)
     print(cls_embed.shape)
