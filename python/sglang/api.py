@@ -48,6 +48,10 @@ def flush_cache(backend: Optional[BaseBackend] = None):
     backend = backend or global_config.default_backend
     if backend is None:
         return False
+
+    # If backend is Runtime
+    if hasattr(backend, "endpoint"):
+        backend = backend.endpoint
     return backend.flush_cache()
 
 
@@ -55,6 +59,10 @@ def get_server_args(backend: Optional[BaseBackend] = None):
     backend = backend or global_config.default_backend
     if backend is None:
         return None
+
+    # If backend is Runtime
+    if hasattr(backend, "endpoint"):
+        backend = backend.endpoint
     return backend.get_server_args()
 
 
