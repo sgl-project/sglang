@@ -25,6 +25,7 @@ from typing import List, Optional, Union
 
 import torch
 import zmq
+from torch.profiler import ProfilerActivity, profile, record_function
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -74,6 +75,8 @@ logger = logging.getLogger(__name__)
 
 # Crash on warning if we are running CI tests
 crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+
+counter = 0
 
 
 class Scheduler:
@@ -281,6 +284,7 @@ class Scheduler:
 
     @torch.inference_mode()
     def forward_step(self):
+        global counter
         if (
             self.batch_is_full or len(self.waiting_queue) == 0
         ) and self.current_inflight_req is None:
@@ -290,7 +294,18 @@ class Scheduler:
 
         if new_batch is not None:
             # Run a new prefill batch
-            self.forward_prefill_batch(new_batch)
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            ) as prof:
+                with record_function("forward_prefill_batch"):
+                    with open(f"trace/bs_{counter}.json", "w") as f:
+                        json.dump({"bs": len(new_batch.reqs)}, f)
+                    self.forward_prefill_batch(new_batch)
+            prof.export_chrome_trace(f"trace/trace_prefill_{counter}.json")
+            counter += 1
 
             if not new_batch.is_empty():
                 if self.running_batch is None:
@@ -301,20 +316,34 @@ class Scheduler:
             # Run a decode batch
             if self.running_batch is not None:
                 # Run a few decode batches continuously for reducing overhead
-                for _ in range(global_config.num_continue_decode_steps):
-                    self.num_generated_tokens += len(self.running_batch.reqs)
-                    self.forward_decode_batch(self.running_batch)
+                bs = []
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                ) as prof:
 
-                    # Print stats
-                    if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
-                        self.print_decode_stats()
+                    with record_function("multiple_decode_step"):
+                        for _ in range(global_config.num_continue_decode_steps):
+                            self.num_generated_tokens += len(self.running_batch.reqs)
+                            bs.append(len(self.running_batch.reqs))
+                            self.forward_decode_batch(self.running_batch)
 
-                    if self.running_batch.is_empty():
-                        self.running_batch = None
-                        break
+                            # Print stats
+                            if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
+                                self.print_decode_stats()
 
-                    if self.out_pyobjs and self.running_batch.has_stream:
-                        break
+                            if self.running_batch.is_empty():
+                                self.running_batch = None
+                                break
+
+                            if self.out_pyobjs and self.running_batch.has_stream:
+                                break
+                with open(f"trace/bs_{counter}.json", "w") as f:
+                    json.dump({"bs": bs}, f)
+                prof.export_chrome_trace(f"trace/trace_decode_{counter}.json")
+                counter += 1
             else:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
