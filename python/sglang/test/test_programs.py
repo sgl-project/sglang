@@ -539,20 +539,6 @@ def test_gen_min_new_tokens(model_path):
             sgl.gen("answer", min_tokens=MIN_TOKENS, max_tokens=MAX_TOKENS)
         )
 
-    @sgl.function
-    def convo_2(s):
-        s += sgl.user("What is the most beautiful integar?")
-        s += sgl.assistant(
-            sgl.gen_int("answer", min_tokens=MIN_TOKENS, max_tokens=MAX_TOKENS)
-        )
-
-    @sgl.function
-    def convo_3(s):
-        s += sgl.user("Who is your favorite singner?")
-        s += sgl.assistant(
-            sgl.gen_string("answer", min_tokens=MIN_TOKENS, max_tokens=MAX_TOKENS)
-        )
-
     def assert_min_tokens(tokenizer, text):
         token_ids = tokenizer.encode(text)
         assert (
@@ -563,10 +549,3 @@ def test_gen_min_new_tokens(model_path):
 
     state = convo_1.run()
     assert_min_tokens(tokenizer, state["answer"])
-
-    # TODO (ByronHsu): gen_int and gen_string are not constrained by min_tokens likely due to the conflict with the regex matching
-    # state = convo_2.run()
-    # assert_min_tokens(tokenizer, state["answer"])
-
-    # state = convo_3.run()
-    # assert_min_tokens(tokenizer, state["answer"])
