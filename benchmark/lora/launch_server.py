@@ -1,7 +1,7 @@
 import argparse
 import os
 
-NUM_LORAS = 128
+NUM_LORAS = 1
 LORA_PATH = {
     "base": "mistralai/Mistral-7B-Instruct-v0.3",
     "lora": "/home/ying/test_lora",
@@ -29,11 +29,6 @@ def launch_server(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--num-loras",
-        type=int,
-        default=128,
-    )
     parser.add_argument(
         "--base-only",
         action="store_true",
