@@ -41,6 +41,8 @@ class SamplingParams:
         n: int = 1,
         json_schema: Optional[str] = None,
     ) -> None:
+        if stop_token_ids is None:
+            stop_token_ids = []
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
