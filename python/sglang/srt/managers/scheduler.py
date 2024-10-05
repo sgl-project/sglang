@@ -50,7 +50,11 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.managers.schedule_policy import PrefillAdder, SchedulePolicy
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    SchedulePolicy,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -493,16 +497,15 @@ class Scheduler:
                 self.batch_is_full = True
                 break
 
-            if adder.no_remaining_tokens():
+            if running_bs + len(adder.can_run_list) >= self.max_running_requests:
                 self.batch_is_full = True
                 break
+
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
             res = adder.add_one_req(req)
-            if (
-                not res
-                or running_bs + len(adder.can_run_list) >= self.max_running_requests
-            ):
-                self.batch_is_full = True
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    self.batch_is_full = True
                 break
 
         can_run_list = adder.can_run_list
