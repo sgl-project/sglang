@@ -150,8 +150,8 @@ class SglFunction:
         self,
         *args,
         max_new_tokens: int = 128,
-        stop: Union[str, List[str]] = [],
-        stop_token_ids: Optional[List[int]] = [],
+        stop: Union[str, List[str]] = None,
+        stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
@@ -168,6 +168,12 @@ class SglFunction:
         **kwargs,
     ):
         from sglang.lang.interpreter import run_program
+
+        # avoid using [] as the default arg: https://nikos7am.com/posts/mutable-default-arguments/
+        if stop is None:
+            stop = []
+        if stop_token_ids is None:
+            stop_token_ids = []
 
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
