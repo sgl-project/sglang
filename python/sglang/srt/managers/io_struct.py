@@ -119,8 +119,7 @@ class GenerateReqInput:
             elif not isinstance(self.image_data, list):
                 self.image_data = [self.image_data] * num
             elif isinstance(self.image_data, list):
-                # FIXME incorrect order for duplication
-                self.image_data = self.image_data * num
+                pass
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * num
