@@ -11,18 +11,14 @@
 
 --------------------------------------------------------------------------------
 
-| [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/) | [**Paper**](https://arxiv.org/abs/2312.07104) | [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2ngly9muu-t37XiH87qvD~6rVBTkTEHw) | [**Join Weekly Development Meeting**](https://t.co/4BFjCLnVHq) |
+| [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/) | [**Paper**](https://arxiv.org/abs/2312.07104) | [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2ngly9muu-t37XiH87qvD~6rVBTkTEHw) | [**Join Bi-Weekly Development Meeting**](https://t.co/4BFjCLnVHq) |
 
-SGLang is a fast serving framework for large language models and vision language models.
-It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
-The core features include:
+## Upcoming Events
+- [Oct. 5, 2024] Public bi-weekly development meeting. ([single day calendar invite](https://t.co/4BFjCLnVHq), [meeting link](meet.google.com/kkw-xvpk-mkj), [copy all events](https://calendar.google.com/calendar/event?action=TEMPLATE&tmeid=ODQydDRrOHNobDc5ZWRqNWdvaGE1czdyM3BfMjAyNDEwMDZUMDMwMDAwWiBzcXkxNDE1QG0&tmsrc=sqy1415%40gmail.com&scp=ALL), [meeting notes](https://docs.google.com/document/d/1xEow4eIM152xNcRxqZz9VEcOiTQo8-CEuuQ5qTmkt-E/edit?usp=sharing))
+- [Oct. 11, 2024] Invited talks at AMD Advancing AI Developer Day.
+- [Oct. 16, 2024] Online meetup for efficient LLM deployment and serving, co-hosted by SGLang, FlashInfer, and MLC LLM! Fill out the [Google form](https://forms.gle/B3YeedLxmrrhL1NM8) to receive the invite link.
 
-- **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, jump-forward constrained decoding, continuous batching, token attention (paged attention), tensor parallelism, FlashInfer kernels, chunked prefill, and quantization (INT4/FP8/AWQ/GPTQ).
-- **Flexible Frontend Language**: Offers an intuitive interface for programming LLM applications, including chained generation calls, advanced prompting, control flow, multi-modal inputs, parallelism, and external interactions.
-- **Extensive Model Support**: Supports a wide range of generative models (Llama 3, Gemma 2, Mistral, QWen, DeepSeek, LLaVA, etc.) and embedding models (e5-mistral), with easy extensibility for integrating new models.
-- **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
-
-## News
+## News 
 - [2024/09] 🔥 SGLang v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
 - [2024/07] 🔥 Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
 - [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
@@ -35,6 +31,16 @@ The core features include:
 - [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
 
 </details>
+
+## About
+SGLang is a fast serving framework for large language models and vision language models.
+It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
+The core features include:
+
+- **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, jump-forward constrained decoding, continuous batching, token attention (paged attention), tensor parallelism, FlashInfer kernels, chunked prefill, and quantization (INT4/FP8/AWQ/GPTQ).
+- **Flexible Frontend Language**: Offers an intuitive interface for programming LLM applications, including chained generation calls, advanced prompting, control flow, multi-modal inputs, parallelism, and external interactions.
+- **Extensive Model Support**: Supports a wide range of generative models (Llama 3, Gemma 2, Mistral, QWen, DeepSeek, LLaVA, etc.) and embedding models (e5-mistral), with easy extensibility for integrating new models.
+- **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
 
 ## Contents
 - [Install](#install)
