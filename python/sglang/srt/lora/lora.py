@@ -119,7 +119,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             weight_indices=self.weight_indices,
         )
         # FIXME
-        assert lora_a_output.shape[-1] == self.lora_rank * 2
         lora_output = torch.empty_like(base_output)
         output_dim = lora_output.shape[-1] // 2
         for i in range(2):
