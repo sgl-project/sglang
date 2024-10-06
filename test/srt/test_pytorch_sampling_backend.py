@@ -1,5 +1,8 @@
+import json
 import unittest
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
@@ -38,6 +41,32 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
 
         metrics = run_eval(args)
         assert metrics["score"] >= 0.65
+
+    def test_greedy(self):
+        response_single = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 32,
+                },
+            },
+        ).json()
+        response_batch = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": ["The capital of France is"] * 10,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 32,
+                },
+            },
+        ).json()
+        text = response_single["text"]
+        print(text)
+        for i in range(10):
+            assert response_batch[i]["text"] == text
 
 
 if __name__ == "__main__":
