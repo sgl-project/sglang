@@ -594,7 +594,9 @@ def set_weight_attrs(
 
 
 def broadcast_pyobj(
-    data: List[Any], rank: int, dist_group: torch.distributed.ProcessGroup
+    data: List[Any],
+    rank: int,
+    dist_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
