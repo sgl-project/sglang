@@ -95,8 +95,8 @@ docker run --gpus all \
 <details>
 <summary>More</summary>
 
-> This method is recommended if you plan to serve it as a service.
-> A better approach is to use the [k8s-sglang-service.yaml](docker/k8s-sglang-service.yaml).
+> This method is recommended if you plan to serve the model as a service.
+> A better approach would be to use the [k8s-sglang-service.yaml](docker/k8s-sglang-service.yaml).
 
 1. Copy the [compose.yml](docker/compose.yaml) to your local machine
 2. Execute the command `docker compose up -d` in your terminal.
@@ -558,7 +558,7 @@ for out in state.text_iter():
 
 #### Roles
 
-Use `sgl.system`， `sgl.user` and `sgl.assistant` to set roles when using Chat models. You can also define more complex role prompts using begin and end tokens.
+Use `sgl.system`， `sgl.user`, and `sgl.assistant` to set roles when using Chat models. You can also define more complex role prompts by using begin and end tokens.
 
 ```python
 @sgl.function
@@ -588,5 +588,5 @@ Learn more at this [blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/).
 [Development Roadmap (2024 Q4)](https://github.com/sgl-project/sglang/issues/1487)
 
 ## Citation And Acknowledgment
-Please cite our paper, [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), if you find the project useful.
+Please cite our paper, [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), if you find this project useful.
 We also learned from the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
