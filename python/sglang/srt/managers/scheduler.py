@@ -282,7 +282,8 @@ class Scheduler:
 
         if new_batch is not None:
             # Run a new prefill batch
-            self.run_batch_prefill(new_batch)
+            result = self.run_batch_prefill(new_batch)
+            self.process_batch_result_prefill(new_batch, result)
 
             if not new_batch.is_empty():
                 if self.running_batch is None:
@@ -295,7 +296,8 @@ class Scheduler:
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(global_config.num_continue_decode_steps):
                     batch = self.get_new_batch_decode()
-                    self.run_batch_decode(batch)
+                    result = self.run_batch_decode(batch)
+                    self.process_batch_result_decode(batch, result)
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
@@ -544,7 +546,7 @@ class Scheduler:
                     f"#cached-token: {adder.log_hit_tokens}, "
                     f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
                     f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
+                    f"#queue-req: {len(self.waiting_queue) + has_inflight}"
                 )
             else:
                 logger.info(
@@ -555,7 +557,7 @@ class Scheduler:
                     f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
                     f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                     f"#running-req: {running_bs}, "
-                    f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
+                    f"#queue-req: {len(self.waiting_queue) + has_inflight}"
                 )
 
         # Create a new batch
@@ -578,7 +580,7 @@ class Scheduler:
 
         return new_batch
 
-    def get_new_batch_decode(self) -> Optional[ScheduleBatch]:
+    def get_new_batch_decode(self) -> ScheduleBatch:
         batch = self.running_batch
 
         # Check if decode out of memory
@@ -620,6 +622,36 @@ class Scheduler:
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
+            else:
+                if self.tokenizer is None:
+                    next_token_ids = []
+                    for req in batch.reqs:
+                        next_token_ids.append(
+                            next(iter(req.sampling_params.stop_token_ids))
+                        )
+                else:
+                    next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
+            return logits_output, next_token_ids
+
+        else:
+            assert batch.extend_num_tokens != 0
+            model_worker_batch = batch.get_model_worker_batch()
+            embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
+            return embeddings
+
+    def run_batch_decode(self, batch: ScheduleBatch):
+        # Forward and sample the next tokens
+        model_worker_batch = batch.get_model_worker_batch()
+        logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+            model_worker_batch
+        )
+        return logits_output, next_token_ids
+
+    def process_batch_result_prefill(self, batch: ScheduleBatch, result):
+        if self.is_generation:
+            # Forward and sample the next tokens
+            if batch.extend_num_tokens != 0:
+                logits_output, next_token_ids = result
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     next_token_ids
                 )
@@ -682,8 +714,7 @@ class Scheduler:
                     )
         else:
             assert batch.extend_num_tokens != 0
-            model_worker_batch = batch.get_model_worker_batch()
-            embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
+            embeddings = result
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -702,6 +733,45 @@ class Scheduler:
                 if req is self.current_inflight_req:
                     # Inflight request would get a new req idx
                     self.req_to_token_pool.free(req.req_pool_idx)
+
+        self.handle_finished_requests(batch)
+
+    def process_batch_result_decode(self, batch: ScheduleBatch, result):
+        logits_output, next_token_ids = result
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            next_token_ids
+        )
+        self.num_generated_tokens += len(self.running_batch.reqs)
+
+        # Move logprobs to cpu
+        if logits_output.next_token_logprobs is not None:
+            next_token_logprobs = logits_output.next_token_logprobs[
+                torch.arange(len(next_token_ids), device=next_token_ids.device),
+                next_token_ids,
+            ].tolist()
+
+        next_token_ids = next_token_ids.tolist()
+
+        # Check finish condition
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            req.completion_tokens_wo_jump_forward += 1
+            req.output_ids.append(next_token_id)
+            req.check_finished()
+
+            if req.regex_fsm is not None:
+                req.regex_fsm_state = req.regex_fsm.get_next_state(
+                    req.regex_fsm_state, next_token_id
+                )
+
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
+
+            if req.return_logprob:
+                req.output_token_logprobs.append(
+                    (next_token_logprobs[i], next_token_id)
+                )
+                if req.top_logprobs_num > 0:
+                    req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
 
         self.handle_finished_requests(batch)
 
@@ -777,49 +847,6 @@ class Scheduler:
             req.output_top_logprobs.append(output.output_top_logprobs[i])
 
         return num_input_logprobs
-
-    def run_batch_decode(self, batch: ScheduleBatch):
-        # Forward and sample the next tokens
-        model_worker_batch = batch.get_model_worker_batch()
-        logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-            model_worker_batch
-        )
-        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            next_token_ids
-        )
-        self.num_generated_tokens += len(self.running_batch.reqs)
-
-        # Move logprobs to cpu
-        if logits_output.next_token_logprobs is not None:
-            next_token_logprobs = logits_output.next_token_logprobs[
-                torch.arange(len(next_token_ids), device=next_token_ids.device),
-                next_token_ids,
-            ].tolist()
-
-        next_token_ids = next_token_ids.tolist()
-
-        # Check finish condition
-        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-            req.completion_tokens_wo_jump_forward += 1
-            req.output_ids.append(next_token_id)
-            req.check_finished()
-
-            if req.regex_fsm is not None:
-                req.regex_fsm_state = req.regex_fsm.get_next_state(
-                    req.regex_fsm_state, next_token_id
-                )
-
-            if req.finished():
-                self.tree_cache.cache_finished_req(req)
-
-            if req.return_logprob:
-                req.output_token_logprobs.append(
-                    (next_token_logprobs[i], next_token_id)
-                )
-                if req.top_logprobs_num > 0:
-                    req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
-
-        self.handle_finished_requests(batch)
 
     def handle_finished_requests(self, batch: ScheduleBatch):
         output_rids = []
