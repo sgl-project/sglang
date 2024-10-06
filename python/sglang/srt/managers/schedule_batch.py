@@ -144,7 +144,7 @@ class ImageInputs:
         ]
         ret.image_sizes = obj["image_sizes"]
         # Only when pixel values is not None we have modalities
-        ret.modalities = obj["modalities"]
+        ret.modalities = obj["modalities"] or ["image"]
         return ret
 
 
