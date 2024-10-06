@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import sglang as sgl
@@ -5,26 +6,25 @@ from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
 
 class TestSRTBackend(unittest.TestCase):
-    engine = None
 
-    @classmethod
-    def setUpClass(cls):
-        cls.engine = sgl.Engine(model_path=DEFAULT_MODEL_NAME_FOR_TEST)
+    def test_engine_runtime_consistency(self):
+        prompt = "Today is a sunny day and I like"
+        model_path = DEFAULT_MODEL_NAME_FOR_TEST
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.engine.shutdown()
+        # without sampling_backend="pytorch", flashinfer sampling introduces randomness
+        engine = sgl.Engine(
+            model_path=model_path, random_seed=42, sampling_backend="pytorch"
+        )
+        out1 = engine.generate(prompt, {"temperature": 0})["text"]
+        engine.shutdown()
 
-    def test_generate(self):
-        prompts = [
-            "The capital of China is",
-            "The square root of 144 is",
-        ]
+        runtime = sgl.Runtime(
+            model_path=model_path, random_seed=42, sampling_backend="pytorch"
+        )
+        out2 = json.loads(runtime.generate(prompt, {"temperature": 0}))["text"]
+        runtime.shutdown()
 
-        outputs = self.engine.generate(prompts, {"max_new_tokens": 128})
-
-        assert "Beijing" in outputs[0]["text"]
-        assert "12" in outputs[1]["text"]
+        assert out1 == out2, f"{out1} != {out2}"
 
 
 if __name__ == "__main__":
