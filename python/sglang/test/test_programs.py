@@ -519,7 +519,7 @@ def test_hellaswag_select():
     return accuracy, latency
 
 
-def test_gen_min_new_tokens(model_path):
+def test_gen_min_new_tokens():
     """
     Validate sgl.gen(min_tokens) functionality.
 
@@ -530,6 +530,7 @@ def test_gen_min_new_tokens(model_path):
     import sglang as sgl
     from sglang.srt.hf_transformers_utils import get_tokenizer
 
+    model_path = sgl.global_config.default_backend.endpoint.get_model_name()
     MIN_TOKENS, MAX_TOKENS = 64, 128
 
     @sgl.function

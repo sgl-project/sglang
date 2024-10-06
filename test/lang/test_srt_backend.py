@@ -70,10 +70,8 @@ class TestSRTBackend(unittest.TestCase):
             accuracy, latency = test_hellaswag_select()
             assert accuracy > 0.71, f"{accuracy=}"
 
-    # TODO (ByronHsu): intentionally add "0" in the test name to ensure the alpha-numeric order is ahead, so this test is run before test_decode_int
-    # See issue at https://github.com/sgl-project/sglang/issues/1575
-    def test_0_gen_min_new_tokens(self):
-        test_gen_min_new_tokens(DEFAULT_MODEL_NAME_FOR_TEST)
+    def test_gen_min_new_tokens(self):
+        test_gen_min_new_tokens()
 
 
 if __name__ == "__main__":
