@@ -296,8 +296,10 @@ class Scheduler:
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(global_config.num_continue_decode_steps):
                     batch = self.get_new_batch_decode()
-                    result = self.run_batch_decode(batch)
-                    self.process_batch_result_decode(batch, result)
+
+                    if batch:
+                        result = self.run_batch_decode(batch)
+                        self.process_batch_result_decode(batch, result)
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
@@ -607,7 +609,7 @@ class Scheduler:
             jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
             self.waiting_queue.extend(jump_forward_reqs)
             if batch.is_empty():
-                return
+                return None
 
         # Update batch tensors
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
