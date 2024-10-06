@@ -747,7 +747,9 @@ class ScheduleBatch:
             return
 
         self.reqs = [self.reqs[i] for i in unfinished_indices]
-        new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cuda")
+        new_indices = torch.tensor(
+            unfinished_indices, dtype=torch.int32, device=self.seq_lens.device
+        )
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
         self.out_cache_loc = None
