@@ -282,7 +282,7 @@ class Scheduler:
 
         if new_batch is not None:
             # Run a new prefill batch
-            result = self.run_batch_prefill(new_batch)
+            result = self.run_batch(new_batch)
             self.process_batch_result_prefill(new_batch, result)
 
             if not new_batch.is_empty():
@@ -298,7 +298,7 @@ class Scheduler:
                     batch = self.get_new_batch_decode()
 
                     if batch:
-                        result = self.run_batch_decode(batch)
+                        result = self.run_batch(batch)
                         self.process_batch_result_decode(batch, result)
 
                     # Print stats
@@ -582,7 +582,7 @@ class Scheduler:
 
         return new_batch
 
-    def get_new_batch_decode(self) -> ScheduleBatch:
+    def get_new_batch_decode(self) -> Optional[ScheduleBatch]:
         batch = self.running_batch
 
         # Check if decode out of memory
@@ -616,48 +616,34 @@ class Scheduler:
         batch.prepare_for_decode()
         return batch
 
-    def run_batch_prefill(self, batch: ScheduleBatch):
+    def run_batch(self, batch: ScheduleBatch):
         if self.is_generation:
-            # Forward and sample the next tokens
-            if batch.extend_num_tokens != 0:
+            if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
                 model_worker_batch = batch.get_model_worker_batch()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
             else:
-                if self.tokenizer is None:
-                    next_token_ids = []
-                    for req in batch.reqs:
-                        next_token_ids.append(
-                            next(iter(req.sampling_params.stop_token_ids))
-                        )
-                else:
+                logits_output = None
+                if self.tokenizer is not None:
                     next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
+                else:
+                    next_token_ids = [0] * len(batch.reqs)
             return logits_output, next_token_ids
-
-        else:
+        else:  # embedding or reward model
             assert batch.extend_num_tokens != 0
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             return embeddings
 
-    def run_batch_decode(self, batch: ScheduleBatch):
-        # Forward and sample the next tokens
-        model_worker_batch = batch.get_model_worker_batch()
-        logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-            model_worker_batch
-        )
-        return logits_output, next_token_ids
-
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
         if self.is_generation:
-            # Forward and sample the next tokens
-            if batch.extend_num_tokens != 0:
-                logits_output, next_token_ids = result
-                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                    next_token_ids
-                )
+            logits_output, next_token_ids = result
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                next_token_ids
+            )
 
+            if logits_output:
                 # Move logprobs to cpu
                 if logits_output.next_token_logprobs is not None:
                     logits_output.next_token_logprobs = (
@@ -675,16 +661,7 @@ class Scheduler:
                         logits_output.normalized_prompt_logprobs.tolist()
                     )
 
-                next_token_ids = next_token_ids.tolist()
-            else:
-                if self.tokenizer is None:
-                    next_token_ids = []
-                    for req in batch.reqs:
-                        next_token_ids.append(
-                            next(iter(req.sampling_params.stop_token_ids))
-                        )
-                else:
-                    next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
+            next_token_ids = next_token_ids.tolist()
 
             # Check finish conditions
             logprob_pt = 0
@@ -714,7 +691,7 @@ class Scheduler:
                     logprob_pt += self.add_logprob_return_values(
                         i, req, logprob_pt, next_token_ids, logits_output
                     )
-        else:
+        else:  # embedding or reward model
             assert batch.extend_num_tokens != 0
             embeddings = result
 
@@ -861,7 +838,7 @@ class Scheduler:
             output_read_offsets = []
             output_skip_special_tokens = []
             output_spaces_between_special_tokens = []
-        else:  # for embedding model
+        else:  # embedding or reward model
             output_embeddings = []
         unfinished_indices = []
 
@@ -918,7 +895,7 @@ class Scheduler:
                             req.normalized_prompt_logprob,
                         )
                     output_meta_info.append(meta_info)
-                else:  # for embedding model
+                else:  # embedding or reward model
                     output_embeddings.append(req.embedding)
                     meta_info = {
                         "prompt_tokens": len(req.origin_input_ids),
@@ -941,7 +918,7 @@ class Scheduler:
                         output_finished_reason,
                     )
                 )
-            else:  # for embedding model
+            else:  # embedding or reward model
                 self.out_pyobjs.append(
                     BatchEmbeddingOut(
                         output_rids,
