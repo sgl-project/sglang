@@ -43,13 +43,13 @@ class DummyImageProcessor(BaseImageProcessor):
         return None
 
 
-class HFImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _image_processor):
-        self.hf_config = hf_config
-        self._image_processor = _image_processor
+# class HFImageProcessor(BaseImageProcessor):
+#     def __init__(self, hf_config, server_args, _image_processor):
+#         self.hf_config = hf_config
+#         self._image_processor = _image_processor
 
-    async def process_images_async(self, image_data, **kwargs):
-        return self._image_processor(image_data, **kwargs)
+#     async def process_images_async(self, image_data, **kwargs):
+#         return self._image_processor(image_data, **kwargs)
 
 
 class LlavaImageProcessor(BaseImageProcessor):
@@ -189,10 +189,11 @@ class LlavaImageProcessor(BaseImageProcessor):
 def get_image_processor(
     hf_config, server_args: ServerArgs, _image_processor
 ) -> BaseImageProcessor:
-    if "llava" in hf_config.architectures:
-        return LlavaImageProcessor(hf_config, server_args, _image_processor)
-    else:
-        return HFImageProcessor(hf_config, server_args, _image_processor)
+    # architectures = [architecture.lower() for architecture in hf_config.architectures]
+    # if "llava" in architectures:
+    return LlavaImageProcessor(hf_config, server_args, _image_processor)
+    # else:
+    #     return HFImageProcessor(hf_config, server_args, _image_processor)
 
 
 def get_dummy_image_processor():

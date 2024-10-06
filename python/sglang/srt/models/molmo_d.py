@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import einops
 import requests
@@ -371,7 +371,7 @@ class MolmoVisionBackbone(nn.Module):
         return image_features, cls_embed
 
 
-class MolmoModel(nn.Module):
+class MolmoForCausalLM(nn.Module):
     def __init__(self, config: Qwen2Config, vision_config: MolmoVisionBackboneConfig):
         super().__init__()
         self.config = config
@@ -443,6 +443,55 @@ class MolmoModel(nn.Module):
         elif input_metadata.forward_mode.is_decode():
             return self.transformer(input_ids, positions, input_metadata)
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            print(name)
+            if "vision_backbone" in name:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            else:
+                if "ln_f.weight" in name:
+                    name = "model.norm.weight"
+
+                if "transformer.blocks" in name:
+                    name = name.replace("transformer.blocks", "layers")
+
+                if "attn_out" in name:
+                    name = name.replace("attn_out", "self_attn.o_proj")
+
+                if "att_proj" in name:
+                    name = name.replace("att_proj", "self_attn.qkv_proj")
+
+                if "q_norm" in name:
+                    name = name.replace("q_norm", "self_attn.q_norm")
+
+                if "k_norm" in name:
+                    name = name.replace("k_norm", "self_attn.k_norm")
+
+                if "ff_proj" in name:
+                    name = name.replace("ff_proj", "mlp.gate_up_proj")
+                    assert "weight" in name
+                    up_weight, gate_weight = loaded_weight.chunk(2, dim=0)
+                    loaded_weight = torch.cat([gate_weight, up_weight], dim=0)
+
+                if "ff_out" in name:
+                    if "layers" in name:
+                        name = name.replace("ff_out", "mlp.down_proj")
+                    else:
+                        # lm head
+                        name = name.replace("model.transformer.ff_out", "lm_head")
+
+                if "attn_norm" in name:
+                    name = name.replace("attn_norm", "input_layernorm")
+
+                if "ff_norm" in name:
+                    name = name.replace("ff_norm", "post_attention_layernorm")
+                self.transformer.load_weights([(name, loaded_weight)])
+
+
+EntryClass = [MolmoForCausalLM]
 
 if __name__ == "__main__":
     processor = AutoProcessor.from_pretrained(
@@ -461,12 +510,12 @@ if __name__ == "__main__":
     #         "openai/clip-vit-large-patch14-336", torch_dtype=torch.float16
     #     )
     # breakpoint()
-    inputs = processor.image_processor.preprocess(
-        images=[
-            Image.open(
-                requests.get("https://picsum.photos/id/237/536/354", stream=True).raw
-            )
-        ],
+    inputs = processor.process(
+        # images=[
+        #     Image.open(
+        #         requests.get("https://picsum.photos/id/237/536/354", stream=True).raw
+        #     )
+        # ],
         text="Describe this image.",
     )
     print(inputs)
