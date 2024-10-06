@@ -230,15 +230,8 @@ class Scheduler:
 
     def event_loop(self):
         while True:
-            # Receive requests
-            if self.tp_rank == 0:
-                recv_reqs = self.recv_requests_from_zmq()
-            else:
-                recv_reqs = None
-
-            # Process requests
-            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
-            self.process_requests(recv_reqs)
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
 
             # Forward
             self.forward_step()
@@ -249,19 +242,23 @@ class Scheduler:
                     self.send_to_detokenizer.send_pyobj(obj)
                 self.out_pyobjs = []
 
-    def recv_requests_from_zmq(self):
-        recv_reqs = []
+    def recv_requests(self):
+        if self.tp_rank == 0:
+            recv_reqs = []
 
-        while True:
-            try:
-                recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-            except zmq.ZMQError:
-                break
-            recv_reqs.append(recv_req)
+            while True:
+                try:
+                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+                recv_reqs.append(recv_req)
+        else:
+            recv_reqs = None
 
+        recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs
 
-    def process_requests(self, recv_reqs: List):
+    def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 self.handle_generate_request(recv_req)
