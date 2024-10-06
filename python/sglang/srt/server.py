@@ -296,7 +296,7 @@ def launch_engine(
     server_args: ServerArgs,
 ):
     """
-    Launch the Tokenizer Manager in the main process, the Controller in a subprocess, and the Detokenizer Manager in another subprocess.
+    Launch the Tokenizer Manager in the main process, the Scheduler in a subprocess, and the Detokenizer Manager in another subprocess.
     """
 
     global tokenizer_manager
@@ -371,8 +371,8 @@ def launch_server(
 
     1. HTTP server: A FastAPI server that routes requests to the engine.
     2. SRT engine:
-        1. Tokenizer Manager: Tokenizes the requests and sends them to the controller.
-        2. Controller (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
+        1. Tokenizer Manager: Tokenizes the requests and sends them to the scheduler.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
         3. Detokenizer Manager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
