@@ -1,8 +1,7 @@
 import sglang as sgl
 
-# The __main__ condition is necessary here because we use "spawn" to create subprocesses
-# Spawn starts a fresh program every time, if there is no __main__, it will run into infinite loop to keep spawning processes from sgl.Engine
-if __name__ == "__main__":
+
+def main():
     # Sample prompts.
     prompts = [
         "Hello, my name is",
@@ -21,3 +20,9 @@ if __name__ == "__main__":
     for prompt, output in zip(prompts, outputs):
         print("===============================")
         print(f"Prompt: {prompt}\nGenerated text: {output['text']}")
+
+
+# The __main__ condition is necessary here because we use "spawn" to create subprocesses
+# Spawn starts a fresh program every time, if there is no __main__, it will run into infinite loop to keep spawning processes from sgl.Engine
+if __name__ == "__main__":
+    main()
