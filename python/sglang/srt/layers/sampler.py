@@ -43,7 +43,6 @@ class Sampler(nn.Module):
                 torch.isnan(probs), torch.full_like(probs, 1e-10), probs
             )
 
-        # if torch.all(sampling_info.top_ks == 1):
         if sampling_info.top_ks.max().item() <= 1:
             # Use torch.argmax if all requests use greedy sampling
             batch_next_token_ids = torch.argmax(probs, -1)
