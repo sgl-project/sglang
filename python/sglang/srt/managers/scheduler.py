@@ -277,81 +277,6 @@ class Scheduler:
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 
-    def run_step(self):
-        new_batch = self.get_new_batch_prefill()
-
-        if new_batch is not None:
-            # Run a new prefill batch
-            result = self.run_batch(new_batch)
-            self.process_batch_result_prefill(new_batch, result)
-
-            if not new_batch.is_empty():
-                if self.running_batch is None:
-                    self.running_batch = new_batch
-                else:
-                    self.running_batch.merge_batch(new_batch)
-        else:
-            # Run a decode batch
-            if self.running_batch is not None:
-                # Run a few decode batches continuously for reducing overhead
-                for _ in range(global_config.num_continue_decode_steps):
-                    batch = self.get_new_batch_decode()
-
-                    if batch:
-                        result = self.run_batch(batch)
-                        self.process_batch_result_decode(batch, result)
-
-                    # Print stats
-                    if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
-                        self.print_decode_stats()
-
-                    if self.running_batch.is_empty():
-                        self.running_batch = None
-                        break
-
-                    if self.out_pyobjs and self.running_batch.has_stream:
-                        break
-            else:
-                self.check_memory()
-                self.new_token_ratio = global_config.init_new_token_ratio
-
-    def print_decode_stats(self):
-        num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
-        )
-        throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
-        self.num_generated_tokens = 0
-        self.last_stats_tic = time.time()
-        logger.info(
-            f"Decode batch. "
-            f"#running-req: {len(self.running_batch.reqs)}, "
-            f"#token: {num_used}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-            f"gen throughput (token/s): {throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}"
-        )
-
-    def check_memory(self):
-        available_size = (
-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
-        )
-        if available_size != self.max_total_num_tokens:
-            warnings.warn(
-                "Warning: "
-                f"available_size={available_size}, max_total_num_tokens={self.max_total_num_tokens}\n"
-                "KV cache pool leak detected!"
-            )
-            exit(1) if crash_on_warning else None
-
-        if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
-            warnings.warn(
-                "Warning: "
-                f"available req slots={len(self.req_to_token_pool.free_slots)}, "
-                f"total slots={self.req_to_token_pool.size}\n"
-                "Memory pool leak detected!"
-            )
-            exit(1) if crash_on_warning else None
-
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -440,6 +365,81 @@ class Scheduler:
             req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
 
         self.waiting_queue.append(req)
+
+    def run_step(self):
+        new_batch = self.get_new_batch_prefill()
+
+        if new_batch is not None:
+            # Run a new prefill batch
+            result = self.run_batch(new_batch)
+            self.process_batch_result(new_batch, result)
+
+            if not new_batch.is_empty():
+                if self.running_batch is None:
+                    self.running_batch = new_batch
+                else:
+                    self.running_batch.merge_batch(new_batch)
+        else:
+            # Run a decode batch
+            if self.running_batch is not None:
+                # Run a few decode batches continuously for reducing overhead
+                for _ in range(global_config.num_continue_decode_steps):
+                    batch = self.get_new_batch_decode()
+
+                    if batch:
+                        result = self.run_batch(batch)
+                        self.process_batch_result(batch, result)
+
+                    # Print stats
+                    if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
+                        self.print_decode_stats()
+
+                    if self.running_batch.is_empty():
+                        self.running_batch = None
+                        break
+
+                    if self.out_pyobjs and self.running_batch.has_stream:
+                        break
+            else:
+                self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
+
+    def print_decode_stats(self):
+        num_used = self.max_total_num_tokens - (
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+        )
+        throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
+        self.num_generated_tokens = 0
+        self.last_stats_tic = time.time()
+        logger.info(
+            f"Decode batch. "
+            f"#running-req: {len(self.running_batch.reqs)}, "
+            f"#token: {num_used}, "
+            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            f"gen throughput (token/s): {throughput:.2f}, "
+            f"#queue-req: {len(self.waiting_queue)}"
+        )
+
+    def check_memory(self):
+        available_size = (
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+        )
+        if available_size != self.max_total_num_tokens:
+            warnings.warn(
+                "Warning: "
+                f"available_size={available_size}, max_total_num_tokens={self.max_total_num_tokens}\n"
+                "KV cache pool leak detected!"
+            )
+            exit(1) if crash_on_warning else None
+
+        if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
+            warnings.warn(
+                "Warning: "
+                f"available req slots={len(self.req_to_token_pool.free_slots)}, "
+                f"total slots={self.req_to_token_pool.size}\n"
+                "Memory pool leak detected!"
+            )
+            exit(1) if crash_on_warning else None
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Handle the cases where prefill is not allowed
@@ -636,6 +636,12 @@ class Scheduler:
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             return embeddings
 
+    def process_batch_result(self, batch: ScheduleBatch, result):
+        if batch.forward_mode.is_decode():
+            self.process_batch_result_decode(batch, result)
+        else:
+            self.process_batch_result_prefill(batch, result)
+
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
         if self.is_generation:
             logits_output, next_token_ids = result
@@ -720,7 +726,7 @@ class Scheduler:
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
         )
-        self.num_generated_tokens += len(self.running_batch.reqs)
+        self.num_generated_tokens += len(batch.reqs)
 
         # Move logprobs to cpu
         if logits_output.next_token_logprobs is not None:
