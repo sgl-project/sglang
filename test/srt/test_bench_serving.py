@@ -27,11 +27,11 @@ class TestBenchServing(unittest.TestCase):
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             num_prompts=200,
             request_rate=float("inf"),
+            other_server_args=["--max-running-requests", "10"],
             dataset_name="sharegpt",
             random_input_len=None,
             random_output_len=None,
             disable_stream=True,
-            other_server_args=["--max-running-requests", "10"],
         )
 
         if is_in_ci():
