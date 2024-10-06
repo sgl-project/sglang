@@ -8,8 +8,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from transformers import AutoModelForCausalLM, AutoProcessor, CLIPVisionModel
+from transformers import AutoModelForCausalLM, AutoProcessor, Qwen2Config
 from vllm.model_executor.layers.activation import QuickGELU
+
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
 
 # TODO: This should be a config in huggingface...
@@ -368,6 +371,79 @@ class MolmoVisionBackbone(nn.Module):
         return image_features, cls_embed
 
 
+class MolmoModel(nn.Module):
+    def __init__(self, config: Qwen2Config, vision_config: MolmoVisionBackboneConfig):
+        super().__init__()
+        self.config = config
+        self.transformer = Qwen2ForCausalLM(config)
+        self.vision_backbone = MolmoVisionBackbone(vision_config)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+        image_inputs = input_metadata.image_inputs
+
+        has_image = input_metadata.image_inputs is not None
+
+        if input_metadata.forward_mode.is_extend():
+            x = self.transformer.embed_tokens(input_ids)
+
+            if has_image:
+                images = image_inputs["images"]
+                image_masks = image_inputs["image_masks"]
+                image_input_idx = image_inputs["image_input_idx"]
+                seq_len = len(input_ids)
+
+                images = images.to(device=x.device, dtype=x.dtype)
+                image_features, cls_embed = self.vision_backbone(
+                    images=images, image_masks=image_masks
+                )
+                batch_size = images.shape[0]
+                num_image, num_patch = image_features.shape[1:3]
+
+                assert image_input_idx.shape == (batch_size, num_image, num_patch)
+
+                image_features = image_features.to(x.device)
+                image_features = image_features.view(
+                    batch_size, num_image * num_patch, -1
+                )
+                image_input_idx = image_input_idx.view(batch_size, num_image, num_patch)
+
+                valid = image_input_idx >= 0
+                image_features = image_features * valid[:, :, None].to(
+                    dtype=image_features.dtype
+                )
+                image_features = image_features.view(
+                    batch_size, num_image * num_patch, -1
+                ).contiguous()
+
+                image_input_idx = image_input_idx * valid.to(dtype=image_features.dtype)
+                image_input_idx = image_input_idx * valid.to(image_input_idx.dtype)
+                offset = torch.cat(
+                    [seq_len.new_zeros((1)), seq_len.cumsum(dim=0)[:-1]], dim=0
+                )[:, None]
+                image_input_idx = image_input_idx + offset.to(image_input_idx.dtype)
+                image_input_idx = image_input_idx.flatten()[:, None]
+                mat = (
+                    image_input_idx
+                    == torch.arange(seq_len.sum().item(), device=x.device)[None, :]
+                )
+                mat = mat.to(image_features.dtype)
+                x = x + torch.einsum("nd,nm->md", image_features, mat)
+
+            input_embeds = x
+            input_ids = None
+
+            return self.transformer(
+                input_ids, positions, input_metadata, input_embeds=input_embeds
+            )
+        elif input_metadata.forward_mode.is_decode():
+            return self.transformer(input_ids, positions, input_metadata)
+
+
 if __name__ == "__main__":
     processor = AutoProcessor.from_pretrained(
         "allenai/Molmo-7B-D-0924",
@@ -385,7 +461,7 @@ if __name__ == "__main__":
     #         "openai/clip-vit-large-patch14-336", torch_dtype=torch.float16
     #     )
     # breakpoint()
-    inputs = processor.process(
+    inputs = processor.image_processor.preprocess(
         images=[
             Image.open(
                 requests.get("https://picsum.photos/id/237/536/354", stream=True).raw
@@ -393,15 +469,24 @@ if __name__ == "__main__":
         ],
         text="Describe this image.",
     )
-    model = MolmoVisionBackbone(MolmoVisionBackboneConfig()).to("cuda")
-    model.eval()
-    print(model)
+    print(inputs)
+    # qwen2config = Qwen2Config.from_pretrained("allenai/Molmo-7B-D-0924")
+    # vision_config = MolmoVisionBackboneConfig()
+    # model = MolmoModel(qwen2config, vision_config)
+    # model.eval()
+    # print(model)
 
+    # input_metadata = InputMetadata(
+    #     forward_mode=ForwardMode.EXTEND,
+    #     batch_size=1,
+    #     image_inputs=inputs,
+    # )
     # Takes in bs, num_crops, num_patches_h * num_patches_w, patch_size * patch_size * 3
     #                  -> bs, num_crops, num_patches_h * num_patches_w, image_embed_dim * 2
-    image_features, cls_embed = model(
-        inputs["images"].unsqueeze(0).to("cuda"),
-        inputs["image_masks"].unsqueeze(0).to("cuda"),
-    )
-    print(image_features.shape)
-    print(cls_embed.shape)
+    # input_embeds = model(
+    #     inputs["input_ids"],
+    #     None,
+    #     input_metadata,
+    # )
+    # print(input_embeds.shape)
+    # print(cls_embed.shape)
