@@ -2,10 +2,7 @@ import json
 import unittest
 
 import sglang as sgl
-
-# from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
-
-DEFAULT_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/"
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
 
 class TestSRTBackend(unittest.TestCase):
