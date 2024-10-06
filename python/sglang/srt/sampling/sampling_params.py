@@ -26,7 +26,7 @@ class SamplingParams:
         max_new_tokens: int = 128,
         min_new_tokens: int = 0,
         stop: Optional[Union[str, List[str]]] = None,
-        stop_token_ids: Optional[List[int]] = [],
+        stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
@@ -41,6 +41,8 @@ class SamplingParams:
         n: int = 1,
         json_schema: Optional[str] = None,
     ) -> None:
+        if stop_token_ids is None:
+            stop_token_ids = []
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
