@@ -278,11 +278,11 @@ class Scheduler:
                 raise ValueError(f"Invalid request: {recv_req}")
 
     def run_step(self):
-        new_batch = self.get_new_prefill_batch()
+        new_batch = self.get_new_batch_prefill()
 
         if new_batch is not None:
             # Run a new prefill batch
-            self.forward_prefill_batch(new_batch)
+            self.run_batch_prefill(new_batch)
 
             if not new_batch.is_empty():
                 if self.running_batch is None:
@@ -294,8 +294,8 @@ class Scheduler:
             if self.running_batch is not None:
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(global_config.num_continue_decode_steps):
-                    batch = self.get_new_decode_batch()
-                    self.forward_decode_batch(batch)
+                    batch = self.get_new_batch_decode()
+                    self.run_batch_decode(batch)
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
@@ -437,7 +437,7 @@ class Scheduler:
 
         self.waiting_queue.append(req)
 
-    def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
+    def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Handle the cases where prefill is not allowed
         if (
             self.batch_is_full or len(self.waiting_queue) == 0
@@ -578,7 +578,7 @@ class Scheduler:
 
         return new_batch
 
-    def get_new_decode_batch(self) -> Optional[ScheduleBatch]:
+    def get_new_batch_decode(self) -> Optional[ScheduleBatch]:
         batch = self.running_batch
 
         # Check if decode out of memory
@@ -612,7 +612,7 @@ class Scheduler:
         batch.prepare_for_decode()
         return batch
 
-    def forward_prefill_batch(self, batch: ScheduleBatch):
+    def run_batch_prefill(self, batch: ScheduleBatch):
         if self.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
@@ -778,7 +778,7 @@ class Scheduler:
 
         return num_input_logprobs
 
-    def forward_decode_batch(self, batch: ScheduleBatch):
+    def run_batch_decode(self, batch: ScheduleBatch):
         # Forward and sample the next tokens
         model_worker_batch = batch.get_model_worker_batch()
         logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
