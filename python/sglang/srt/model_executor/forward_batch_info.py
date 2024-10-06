@@ -127,6 +127,7 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            image_inputs=batch.image_inputs,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             lora_paths=batch.lora_paths,
@@ -150,7 +151,6 @@ class ForwardBatch:
                 device=device,
             ).to(torch.int64)
 
-            ret.image_inputs = batch.image_inputs
             ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device=device)
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, device=device

@@ -33,17 +33,6 @@ def init_global_processor(server_args: ServerArgs):
 
 
 class BaseImageProcessor(ABC):
-    @abstractmethod
-    async def process_images_async(self, image_data, **kwargs):
-        pass
-
-
-class DummyImageProcessor(BaseImageProcessor):
-    async def process_images_async(self, *args, **kwargs):
-        return None
-
-
-class LlavaImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _image_processor):
         self.hf_config = hf_config
         self._image_processor = _image_processor
@@ -53,6 +42,23 @@ class LlavaImageProcessor(BaseImageProcessor):
             initargs=(server_args,),
             max_workers=os.environ.get("SGLANG_CPU_COUNT", os.cpu_count()),
         )
+
+    @abstractmethod
+    async def process_images_async(self, image_data, **kwargs):
+        pass
+
+
+class DummyImageProcessor(BaseImageProcessor):
+    def __init__(self):
+        pass
+
+    async def process_images_async(self, *args, **kwargs):
+        return None
+
+
+class LlavaImageProcessor(BaseImageProcessor):
+    def __init__(self, hf_config, server_args, _image_processor):
+        super().__init__(hf_config, server_args, _image_processor)
 
     @staticmethod
     def _process_single_image_task(
@@ -177,10 +183,59 @@ class LlavaImageProcessor(BaseImageProcessor):
         }
 
 
+class MllamaImageProcessor(BaseImageProcessor):
+    def __init__(self, hf_config, server_args, _image_processor):
+        super().__init__(hf_config, server_args, _image_processor)
+
+    @staticmethod
+    def _process_single_image_task(image):
+        # {
+        # "pixel_values": pixel_values,
+        # "aspect_ratio_ids": aspect_ratio_ids,
+        # "aspect_ratio_mask": aspect_ratio_mask
+        # }
+        return global_processor.image_processor(image)
+
+    async def _process_single_image(self, images):
+        if self.executor is not None:
+            loop = asyncio.get_event_loop()
+            image_inputs = await loop.run_in_executor(
+                self.executor,
+                MllamaImageProcessor._process_single_image_task,
+                images,
+            )
+        else:
+            image_inputs = self._image_processor(images)
+
+        return image_inputs
+
+    async def process_images_async(
+        self, image_data: List[Union[str, bytes]], *args, **kwargs
+    ):
+        if not image_data:
+            return None
+
+        if not isinstance(image_data, list):
+            image_data = [image_data]
+
+        if len(image_data) > 0:
+            images = [load_image(image)[0] for image in image_data]
+        else:
+            images = load_image(image_data[0])[0]
+
+        image_inputs = await self._process_single_image(images)
+        image_inputs["image_hashes"] = [hash(str(image_data))]
+
+        return image_inputs
+
+
 def get_image_processor(
     hf_config, server_args: ServerArgs, _image_processor
 ) -> BaseImageProcessor:
-    return LlavaImageProcessor(hf_config, server_args, _image_processor)
+    if "MllamaForConditionalGeneration" in hf_config.architectures:
+        return MllamaImageProcessor(hf_config, server_args, _image_processor)
+    else:
+        return LlavaImageProcessor(hf_config, server_args, _image_processor)
 
 
 def get_dummy_image_processor():
