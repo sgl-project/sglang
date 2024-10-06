@@ -41,8 +41,6 @@ class SamplingParams:
         n: int = 1,
         json_schema: Optional[str] = None,
     ) -> None:
-        if stop_token_ids is None:
-            stop_token_ids = []
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
@@ -51,6 +49,8 @@ class SamplingParams:
         self.presence_penalty = presence_penalty
         self.repetition_penalty = repetition_penalty
         self.stop_strs = stop
+        if stop_token_ids is None:
+            stop_token_ids = []
         self.stop_token_ids = {*stop_token_ids}
         self.max_new_tokens = max_new_tokens
         self.min_new_tokens = min_new_tokens
