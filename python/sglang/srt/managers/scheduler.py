@@ -228,13 +228,14 @@ class Scheduler:
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.batch_is_full = False
 
+    @torch.inference_mode()
     def event_loop(self):
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
-            # Forward
-            self.forward_step()
+            # Run one step
+            self.run_step()
 
             # Send results
             if self.tp_rank == 0:
@@ -276,14 +277,8 @@ class Scheduler:
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 
-    @torch.inference_mode()
-    def forward_step(self):
-        if (
-            self.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.current_inflight_req is None:
-            new_batch = None
-        else:
-            new_batch = self.get_new_prefill_batch()
+    def run_step(self):
+        new_batch = self.get_new_prefill_batch()
 
         if new_batch is not None:
             # Run a new prefill batch
@@ -299,8 +294,8 @@ class Scheduler:
             if self.running_batch is not None:
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(global_config.num_continue_decode_steps):
-                    self.num_generated_tokens += len(self.running_batch.reqs)
-                    self.forward_decode_batch(self.running_batch)
+                    batch = self.get_new_decode_batch()
+                    self.forward_decode_batch(batch)
 
                     # Print stats
                     if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
@@ -443,6 +438,12 @@ class Scheduler:
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
+        # Handle the cases where prefill is not allowed
+        if (
+            self.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.current_inflight_req is None:
+            return None
+
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
@@ -453,8 +454,8 @@ class Scheduler:
         # Get priority queue
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
+        # Prefill policy
         num_mixed_running = running_bs if self.is_mixed_chunk else 0
-
         adder = PrefillAdder(
             self.tree_cache,
             self.running_batch,
@@ -514,6 +515,8 @@ class Scheduler:
         if len(can_run_list) == 0:
             return None
 
+        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
+
         # Print stats
         if self.tp_rank == 0:
             if isinstance(self.tree_cache, RadixCache):
@@ -555,27 +558,61 @@ class Scheduler:
                     f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
                 )
 
-        # Return the new batch
+        # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
             self.token_to_kv_pool,
             self.tree_cache,
         )
-        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
-        return new_batch
+        new_batch.prepare_for_extend(self.model_config.vocab_size)
 
-    def forward_prefill_batch(self, batch: ScheduleBatch):
-        # Build batch tensors
-        batch.prepare_for_extend(self.model_config.vocab_size)
-
+        # Mixed-style chunked prefill
         decoding_reqs = []
         if self.is_mixed_chunk and self.running_batch is not None:
             self.running_batch.prepare_for_decode()
-            batch.mix_with_running(self.running_batch)
+            new_batch.mix_with_running(self.running_batch)
             decoding_reqs = self.running_batch.reqs
             self.running_batch = None
+        new_batch.decoding_reqs = decoding_reqs
 
+        return new_batch
+
+    def get_new_decode_batch(self) -> Optional[ScheduleBatch]:
+        batch = self.running_batch
+
+        # Check if decode out of memory
+        if not batch.check_decode_mem():
+            old_ratio = self.new_token_ratio
+
+            retracted_reqs, new_token_ratio = batch.retract_decode()
+            self.new_token_ratio = new_token_ratio
+
+            logger.info(
+                "Decode out of memory happened. "
+                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
+            )
+            self.waiting_queue.extend(retracted_reqs)
+        else:
+            self.new_token_ratio = max(
+                self.new_token_ratio - self.new_token_ratio_decay,
+                self.min_new_token_ratio,
+            )
+
+        # Check for jump-forward
+        if not self.disable_regex_jump_forward:
+            jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
+            self.waiting_queue.extend(jump_forward_reqs)
+            if batch.is_empty():
+                return
+
+        # Update batch tensors
+        self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
+        batch.prepare_for_decode()
+        return batch
+
+    def forward_prefill_batch(self, batch: ScheduleBatch):
         if self.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
@@ -631,7 +668,7 @@ class Scheduler:
 
                 if req.finished():
                     self.tree_cache.cache_finished_req(req)
-                elif req not in decoding_reqs:
+                elif req not in batch.decoding_reqs:
                     # To reduce overhead, only cache prefill reqs
                     self.tree_cache.cache_unfinished_req(req)
 
@@ -742,36 +779,6 @@ class Scheduler:
         return num_input_logprobs
 
     def forward_decode_batch(self, batch: ScheduleBatch):
-        # Check if decode out of memory
-        if not batch.check_decode_mem():
-            old_ratio = self.new_token_ratio
-
-            retracted_reqs, new_token_ratio = batch.retract_decode()
-            self.new_token_ratio = new_token_ratio
-
-            logger.info(
-                "Decode out of memory happened. "
-                f"#retracted_reqs: {len(retracted_reqs)}, "
-                f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
-            )
-            self.waiting_queue.extend(retracted_reqs)
-        else:
-            self.new_token_ratio = max(
-                self.new_token_ratio - self.new_token_ratio_decay,
-                self.min_new_token_ratio,
-            )
-
-        # Check for jump-forward
-        if not self.disable_regex_jump_forward:
-            jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
-            self.waiting_queue.extend(jump_forward_reqs)
-            if batch.is_empty():
-                return
-
-        # Update batch tensors
-        self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
-        batch.prepare_for_decode()
-
         # Forward and sample the next tokens
         model_worker_batch = batch.get_model_worker_batch()
         logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
@@ -780,6 +787,7 @@ class Scheduler:
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
         )
+        self.num_generated_tokens += len(self.running_batch.reqs)
 
         # Move logprobs to cpu
         if logits_output.next_token_logprobs is not None:
@@ -791,7 +799,6 @@ class Scheduler:
         next_token_ids = next_token_ids.tolist()
 
         # Check finish condition
-        has_finished = False
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
@@ -804,7 +811,6 @@ class Scheduler:
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
-                has_finished = True
 
             if req.return_logprob:
                 req.output_token_logprobs.append(
