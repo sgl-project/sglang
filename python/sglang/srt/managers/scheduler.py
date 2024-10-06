@@ -144,7 +144,7 @@ class Scheduler:
         )
         self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
 
-        # Get token and memory info from the tp worker
+        # Get token and memory info from the model worker
         (
             self.max_total_num_tokens,
             self.max_prefill_tokens,
@@ -976,7 +976,7 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
-    pipe_writer: multiprocessing.connection.Connection,
+    pipe_writer,
 ):
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     suppress_other_loggers()
