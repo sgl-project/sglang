@@ -33,16 +33,18 @@ def function(
 
 
 def Runtime(*args, **kwargs):
-    # Avoid importing unnecessary dependency
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+    # Avoid importing unnecessary dependency
     from sglang.srt.server import Runtime
 
     return Runtime(*args, **kwargs)
 
 
 def Engine(*args, **kwargs):
-    # Avoid importing unnecessary dependency
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+    # Avoid importing unnecessary dependency
     from sglang.srt.server import Engine
 
     return Engine(*args, **kwargs)

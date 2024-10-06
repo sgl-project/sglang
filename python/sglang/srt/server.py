@@ -377,7 +377,7 @@ def launch_server(
 
     Note:
     1. The HTTP server and Tokenizer Manager both run in the main process.
-    2. Inter-process communication is done through TCP (each process uses a different port) via the ZMQ library.
+    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
 
     launch_engine(server_args=server_args)
@@ -462,7 +462,6 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         return
 
     model_info = res.json()
-
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
@@ -689,11 +688,8 @@ class Engine:
             lora_path=lora_path,
         )
 
-        async def async_generate():
-            return await generate_request(obj, None)
-
         # make it synchronous
-        return asyncio.run(async_generate())
+        return asyncio.run(generate_request(obj, None))
 
     def shutdown(self):
         kill_child_process(os.getpid(), including_parent=False)
