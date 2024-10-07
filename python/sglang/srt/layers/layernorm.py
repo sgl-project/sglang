@@ -21,9 +21,9 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_flashinfer_available
 
-if not is_hip():
+if is_flashinfer_available():
     from flashinfer.norm import (
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
@@ -119,8 +119,8 @@ class GemmaRMSNorm(CustomOp):
         return out
 
 
-if is_hip():
+if not is_flashinfer_available():
     logger.info(
-        "FlashInfer is not available on AMD GPUs. Fallback to other kernel libraries."
+        "FlashInfer is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
