@@ -19,13 +19,12 @@ from sglang.srt.layers.attention.flashinfer_utils import (
     update_flashinfer_indices,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import flashinfer_is_available
+from sglang.srt.utils import is_flashinfer_available
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-# ROCm: flashinfer available later
-if flashinfer_is_available():
+if is_flashinfer_available():
     from flashinfer import (
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,

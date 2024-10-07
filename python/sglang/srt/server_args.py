@@ -22,7 +22,7 @@ import random
 import tempfile
 from typing import List, Optional
 
-from sglang.srt.utils import is_hip, is_ipv6, is_port_available
+from sglang.srt.utils import is_flashinfer_available, is_ipv6, is_port_available
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,7 @@ class ServerArgs:
             )
             self.sampling_backend = "pytorch"
 
-        if not flashinfer_is_available():
+        if not is_flashinfer_available():
             self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
 

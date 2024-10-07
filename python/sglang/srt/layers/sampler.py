@@ -7,10 +7,9 @@ from torch import nn
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils import flashinfer_is_available
+from sglang.srt.utils import is_flashinfer_available
 
-# ROCm: flashinfer available later
-if flashinfer_is_available():
+if is_flashinfer_available():
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
         top_k_renorm_prob,
