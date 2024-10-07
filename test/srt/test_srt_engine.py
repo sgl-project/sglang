@@ -12,7 +12,7 @@ class TestSRTBackend(unittest.TestCase):
         model_path = DEFAULT_MODEL_NAME_FOR_TEST
 
         engine = sgl.Engine(model_path=model_path, random_seed=42)
-        out1 = engine.generate(prompt, {"temperature": 0})["text"]
+        out1 = engine.generate(prompt, {"temperature": 0, "max_new_tokens": 8})["text"]
         engine.shutdown()
 
         runtime = sgl.Runtime(model_path=model_path, random_seed=42)
