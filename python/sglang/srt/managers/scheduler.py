@@ -65,6 +65,7 @@ from sglang.srt.utils import (
     is_generation_model,
     is_multimodal_model,
     kill_parent_process,
+    pytorch_profile,
     set_random_seed,
     suppress_other_loggers,
 )
@@ -409,6 +410,10 @@ class Scheduler:
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
             # Run a new prefill batch
+            # replace run_batch with the uncommented line to use pytorch profiler
+            # result = pytorch_profile(
+            #     "profile_prefill_step", self.run_batch, new_batch, data_size=len(new_batch.reqs)
+            # )
             result = self.run_batch(new_batch)
             self.process_batch_result(new_batch, result)
         else:
@@ -418,6 +423,13 @@ class Scheduler:
                     batch = self.get_new_batch_decode()
 
                     if batch:
+                        # replace run_batch with the uncommented line to use pytorch profiler
+                        # result = pytorch_profile(
+                        #     "profile_decode_step",
+                        #     self.run_batch,
+                        #     batch,
+                        #     data_size=len(batch.reqs),
+                        # )
                         result = self.run_batch(batch)
                         self.process_batch_result(batch, result)
 
