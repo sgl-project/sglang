@@ -1,5 +1,5 @@
 <div align="center">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400"></img>
+<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
 [![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
 ![PyPI - Downloads](https://img.shields.io/pypi/dm/sglang)
@@ -10,17 +10,27 @@
 </div>
 
 --------------------------------------------------------------------------------
+<div align="center">
+<p>
+[**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/) | [**Paper**](https://arxiv.org/abs/2312.07104) | [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2ngly9muu-t37XiH87qvD~6rVBTkTEHw) 
+</p>
+	
+<p> 
+		
+[**Join Bi-Weekly Development Meeting (Oct. 19)**](https://calendar.app.google/GYW7S8QGoanCuaxW6) 
+ 
+ </p>
+ </div>
 
-| [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/) | [**Paper**](https://arxiv.org/abs/2312.07104) | [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2ngly9muu-t37XiH87qvD~6rVBTkTEHw) | [**Join Bi-Weekly Development Meeting (Oct. 19)**](https://calendar.app.google/GYW7S8QGoanCuaxW6) |
 
 ## Upcoming Events
 - [Oct. 11, 2024] Invited talks at [AMD Advancing AI](https://www.amd.com/en/corporate/events/advancing-ai.html) Developer Day.
-- [Oct. 16, 2024] Online meetup for efficient LLM deployment and serving, co-hosted by SGLang, FlashInfer, and MLC LLM! Fill out the [Google form](https://forms.gle/B3YeedLxmrrhL1NM8) to receive the invite link.
+- [Oct. 16, 2024] Online meetup for efficient LLM deployment and serving, co-hosted by SGLang, FlashInfer, and MLC LLM! To receive the invite link, fill out the [Google form](https://forms.gle/B3YeedLxmrrhL1NM8).
 
 ## News
 - [2024/09] 🔥 SGLang v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
 - [2024/07] 🔥 Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
+- [2024/02] 🔥 SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
 
 <details>
 <summary>More</summary>
@@ -32,7 +42,7 @@
 </details>
 
 ## About
-SGLang is a fast serving framework for large language models and vision language models.
+SGLang is a fast-serving framework for large language models and vision language models.
 It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
 The core features include:
 
@@ -62,7 +72,7 @@ pip install "sglang[all]"
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
 
-### Method 2: From source
+### Method 2: From the source
 ```
 # Use the last release branch
 git clone -b v0.3.2 https://github.com/sgl-project/sglang.git
@@ -89,7 +99,7 @@ docker run --gpus all \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 ```
 
-### Method 4: Using docker compose
+### Method 4: Using docker-compose
 
 <details>
 <summary>More</summary>
@@ -228,12 +238,12 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
 ```
-- To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes.
-- To enable torchao quantization, add `--torchao-config int4wo-128`. It supports various quantization strategies.
+- To enable torch. compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes.
+- To enable torchon quantization, add `--torchao-config int4wo-128`. It supports various quantization strategies.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
 - If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](docs/en/custom_chat_template.md).
-- To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
+- To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet a deadlock, please try to add `--disable-cuda-graph`
 ```
 # Node 0
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-0:50000 --nnodes 2 --node-rank 0
@@ -315,10 +325,10 @@ docker run --gpus all \
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct-FP8 --tp 8
 
 # Run 405B (fp16) on two nodes
-## on the first node, replace the `172.16.4.52:20000` with your own first node ip address and port
+## On the first node, replace the `172.16.4.52:20000` with your own first node IP address and port
 GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 0 --disable-cuda-graph
 
-## on the first node, replace the `172.16.4.52:20000` with your own first node ip address and port
+## On the first node, replace the `172.16.4.52:20000` with your own first node IP address and port
 GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --nccl-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 1 --disable-cuda-graph
 ```
 
@@ -420,7 +430,7 @@ import sglang as sgl
 `sglang` provides some simple primitives such as `gen`, `select`, `fork`, `image`.
 You can implement your prompt flow in a function decorated by `sgl.function`.
 You can then invoke the function with `run` or `run_batch`.
-The system will manage the state, chat template, parallelism and batching for you.
+The system will manage the state, chat template, parallelism, and batching for you.
 
 The complete code for the examples below can be found at [readme_examples.py](examples/frontend_language/usage/readme_examples.py)
 
@@ -557,7 +567,7 @@ for out in state.text_iter():
 
 #### Roles
 
-Use `sgl.system`， `sgl.user` and `sgl.assistant` to set roles when using Chat models. You can also define more complex role prompts using begin and end tokens.
+Use `sgl.system`， `sgl.user`, and `sgl.assistant` to set roles when using Chat models. You can also define more complex role prompts using begin and end tokens.
 
 ```python
 @sgl.function
