@@ -626,9 +626,11 @@ class Scheduler:
             else:
                 logits_output = None
                 if self.tokenizer is not None:
-                    next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
+                    next_token_ids = torch.full(
+                        (batch.batch_size(),), self.tokenizer.eos_token_id
+                    )
                 else:
-                    next_token_ids = [0] * len(batch.reqs)
+                    next_token_ids = torch.full((batch.batch_size(),), 0)
             return logits_output, next_token_ids
         else:  # embedding or reward model
             assert batch.extend_num_tokens != 0
