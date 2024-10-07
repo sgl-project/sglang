@@ -50,9 +50,17 @@ show_time_cost = False
 time_infos = {}
 
 
-# torch flag AMD GPU
 def is_hip() -> bool:
+    """Return whether it is HIP on the AMD ROCm platform."""
     return torch.version.hip is not None
+
+
+def is_flashinfer_available():
+    """
+    Check whether flashinfer is available.
+    As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
+    """
+    return torch.cuda.is_available() and not is_hip()
 
 
 def is_ipv6(address):
