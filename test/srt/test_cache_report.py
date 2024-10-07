@@ -81,7 +81,6 @@ class TestCacheReport(unittest.TestCase):
 
     def cache_report_openai(self, message):
         response = self.run_openai(message)
-        print(f"openai first response: {response.text}")
         print(
             f"openai first request cached_tokens: {int(response.usage.prompt_tokens_details.cached_tokens)}"
         )
