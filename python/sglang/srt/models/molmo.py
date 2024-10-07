@@ -30,6 +30,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
@@ -104,12 +105,12 @@ class MolmoMultiHeadDotProductAttention(nn.Module):
         )
 
     def _split_heads(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states.view(
+        return hidden_states.reshape(
             hidden_states.shape[:2] + (self.num_heads, self.head_dim)
         )
 
     def _merge_heads(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states.view(
+        return hidden_states.reshape(
             hidden_states.shape[:2] + (self.num_heads * self.head_dim,)
         )
 
@@ -551,9 +552,9 @@ class MolmoVisionBackbone(nn.Module):
         pad_embed = self.pad_embed[:, None, None, None, :]
         all_pad = image_masks == 0
         partial_pad = torch.logical_and(image_masks < 1, torch.logical_not(all_pad)).to(
-            dtype=torch.float32
+            device=image_features.device, dtype=torch.float32
         )
-        all_pad = all_pad.to(dtype=torch.float32)
+        all_pad = all_pad.to(device=image_features.device, dtype=torch.float32)
         image_features = image_features + pad_embed[0] * torch.unsqueeze(all_pad, -1)
         image_features = image_features + pad_embed[1] * torch.unsqueeze(
             partial_pad, -1
@@ -579,8 +580,10 @@ class MolmoVisionBackbone(nn.Module):
             dw=2,
         )
 
-        query = image_features.mean(-2, keepdim=True)
-        image_features = self.image_pooling_2d(query, image_features)
+        query = image_features.mean(-2, keepdim=True).to(dtype=torch.float16)
+        image_features = self.image_pooling_2d(
+            query, image_features.to(dtype=torch.float16)
+        )
 
         h, w = self.llm_patches_per_crop
         image_features = image_features.reshape(batch_size, num_images, h * w, -1)
@@ -614,6 +617,9 @@ class MolmoForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
 
+    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+        return input_ids
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -623,26 +629,35 @@ class MolmoForCausalLM(nn.Module):
         image_inputs = input_metadata.image_inputs
 
         if input_metadata.forward_mode.is_extend():
-            input_embeds = self.model.embed_tokens(input_ids)
-
             # NOTE(CHRIS): Copied from llava, use to check images, may need to change
-            modalities_list = []
-            max_image_offset = []
+            # modalities_list = []
+            # max_image_offset = []
+            # for im in image_inputs:
+            #     if im and im.modalities is not None:
+            #         modalities_list.extend(im.modalities)
+            #     if im and im.image_offsets is not None:
+            #         max_image_offset.append(max(im.image_offsets))
+            #     else:
+            #         max_image_offset.append(-1)
+
+            # start_positions = positions[input_metadata.extend_start_loc].cpu().numpy()
+            # need_vision = start_positions <= np.array(max_image_offset)
+            images = []
+            image_masks = []
+            image_input_idx = []
+
             for im in image_inputs:
-                if im and im.modalities is not None:
-                    modalities_list.extend(im.modalities)
-                if im and im.image_offsets is not None:
-                    max_image_offset.append(max(im.image_offsets))
-                else:
-                    max_image_offset.append(-1)
+                if im is not None and im.pixel_values is not None:
+                    images.append(im.pixel_values)
+                    image_masks.append(im.image_masks)
+                    image_input_idx.append(im.image_input_idx)
 
-            start_positions = positions[input_metadata.extend_start_loc].cpu().numpy()
-            need_vision = start_positions <= np.array(max_image_offset)
+            if images is not None and len(images) > 0:
+                images = torch.stack(images, dim=0)
+                image_masks = torch.stack(image_masks, dim=0)
+                image_input_idx = torch.stack(image_input_idx, dim=0)
 
-            if need_vision.any():
-                images = image_inputs["images"]
-                image_masks = image_inputs["image_masks"]
-                image_input_idx = image_inputs["image_input_idx"]
+                input_embeds = self.model.embed_tokens(input_ids)
                 seq_len = len(input_ids)
 
                 images = images.to(device=input_embeds.device, dtype=input_embeds.dtype)
@@ -685,6 +700,8 @@ class MolmoForCausalLM(nn.Module):
                 input_embeds = input_embeds + torch.einsum(
                     "nd,nm->md", image_features, mat
                 )
+            else:
+                input_embeds = self.model.embed_tokens(input_ids)
 
             input_ids = None
 

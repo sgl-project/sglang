@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, Union
 
 import numpy as np
+import torch
 import transformers
 
 from sglang.srt.hf_transformers_utils import get_processor
@@ -41,15 +42,6 @@ class BaseImageProcessor(ABC):
 class DummyImageProcessor(BaseImageProcessor):
     async def process_images_async(self, *args, **kwargs):
         return None
-
-
-# class HFImageProcessor(BaseImageProcessor):
-#     def __init__(self, hf_config, server_args, _image_processor):
-#         self.hf_config = hf_config
-#         self._image_processor = _image_processor
-
-#     async def process_images_async(self, image_data, **kwargs):
-#         return self._image_processor(image_data, **kwargs)
 
 
 class LlavaImageProcessor(BaseImageProcessor):
@@ -186,14 +178,144 @@ class LlavaImageProcessor(BaseImageProcessor):
         }
 
 
+class MolmoImageProcessor(BaseImageProcessor):
+    SPECIAL_TOKEN_TO_ID = {
+        "<im_patch>": 152066,
+        "<im_start>": 152064,
+        "<im_end>": 152065,
+        "<im_col>": 152067,
+        "<|image|>": 152068,
+    }
+
+    def __init__(self, hf_config, server_args, _image_processor):
+        self.hf_config = hf_config
+        self._image_processor = _image_processor
+        self.executor = concurrent.futures.ProcessPoolExecutor(
+            initializer=init_global_processor,
+            mp_context=mp.get_context("fork"),
+            initargs=(server_args,),
+            max_workers=os.environ.get("SGLANG_CPU_COUNT", os.cpu_count()),
+        )
+        self.image_patch_token_id = self.SPECIAL_TOKEN_TO_ID["<im_patch>"]
+        self.image_start_token_id = self.SPECIAL_TOKEN_TO_ID["<im_start>"]
+        self.image_end_token_id = self.SPECIAL_TOKEN_TO_ID["<im_end>"]
+        self.image_col_token_id = self.SPECIAL_TOKEN_TO_ID["<im_col>"]
+        self.image_prompt_token_id = self.SPECIAL_TOKEN_TO_ID["<|image|>"]
+
+    @staticmethod
+    def _process_image_task(
+        image_data_list: List[Union[str, bytes]],
+        input_ids: List[int],
+        image_patch_token_id: int,
+        image_start_token_id: int,
+        image_end_token_id: int,
+        image_col_token_id: int,
+    ):
+        global global_processor
+
+        # Adapted from https://huggingface.co/allenai/Molmo-7B-D-0924/blob/main/preprocessing_molmo.py
+        # Returns:
+        #   input_ids
+        #   image_input_idx
+        #   images
+        #   image_masks
+        images = []
+        image_sizes = []
+        for image_data in image_data_list:
+            image, image_size = load_image(image_data)
+            image = image.convert("RGB")
+            images.append(np.array(image))
+            image_sizes.append(image_size)
+        hf_dict = global_processor.image_processor.multimodal_preprocess(
+            images=images,
+            image_idx=[-1] * len(images),
+            tokens=np.asarray(input_ids).astype(np.int32),
+            sequence_length=len(input_ids),
+            image_patch_token_id=image_patch_token_id,
+            image_col_token_id=image_col_token_id,
+            image_start_token_id=image_start_token_id,
+            image_end_token_id=image_end_token_id,
+        )
+
+        bos = (
+            global_processor.tokenizer.bos_token_id
+            or global_processor.tokenizer.eos_token_id
+        )
+        decoder_input_tokens = np.pad(
+            hf_dict["input_ids"], [[1, 0]], constant_values=bos
+        )
+        hf_dict["input_ids"] = decoder_input_tokens
+        if "image_input_idx" in hf_dict:
+            # Shift patch mapping up by one since we added BOS
+            image_input_idx = hf_dict["image_input_idx"]
+            hf_dict["image_input_idx"] = np.where(
+                image_input_idx < 0, image_input_idx, image_input_idx + 1
+            )
+
+        for k, v in hf_dict.items():
+            hf_dict[k] = torch.from_numpy(v)
+
+        hf_dict["image_hashes"] = [hash(image_data)]
+        hf_dict["pixel_values"] = hf_dict["images"]
+        hf_dict["image_sizes"] = image_sizes
+
+        del hf_dict["images"]
+
+        return hf_dict
+
+    async def _process_image(
+        self, image_data_list: List[Union[bytes, str]], input_ids: List[int]
+    ):
+        if self.executor is not None:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.executor,
+                MolmoImageProcessor._process_image_task,
+                image_data_list,
+                input_ids,
+                self.image_patch_token_id,
+                self.image_start_token_id,
+                self.image_end_token_id,
+                self.image_col_token_id,
+            )
+        else:
+            return self._process_image_task(
+                image_data_list,
+                input_ids,
+                self.image_patch_token_id,
+                self.image_start_token_id,
+                self.image_end_token_id,
+                self.image_col_token_id,
+            )
+
+    async def process_images_async(self, image_data, request_obj, **kwargs):
+        if not image_data:
+            return None
+
+        input_ids = request_obj.input_ids
+        res = {}
+        if isinstance(image_data, list) and len(image_data) > 0:
+            # Multiple images
+            if len(image_data) > 1:
+                res = await self._process_image(image_data, input_ids)
+            else:
+                res = await self._process_image(image_data[0:1], input_ids)
+        elif isinstance(image_data, str):
+            # A single image
+            res = await self._process_image([image_data], input_ids)
+        else:
+            raise ValueError(f"Invalid image data: {image_data}")
+
+        res["modalities"] = request_obj.modalities
+        return res
+
+
 def get_image_processor(
-    hf_config, server_args: ServerArgs, _image_processor
+    hf_config, server_args: ServerArgs, _processor
 ) -> BaseImageProcessor:
-    # architectures = [architecture.lower() for architecture in hf_config.architectures]
-    # if "llava" in architectures:
-    return LlavaImageProcessor(hf_config, server_args, _image_processor)
-    # else:
-    #     return HFImageProcessor(hf_config, server_args, _image_processor)
+    if "MolmoForCausalLM" in hf_config.architectures:
+        return MolmoImageProcessor(hf_config, server_args, _processor)
+    return LlavaImageProcessor(hf_config, server_args, _processor)
 
 
 def get_dummy_image_processor():
