@@ -19,6 +19,7 @@ SRT = SGLang Runtime.
 """
 
 import asyncio
+import atexit
 import dataclasses
 import json
 import logging
@@ -161,6 +162,7 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
         )
 
 
+# fastapi implicitly converts json in the request to obj (dataclass)
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if obj.stream:
@@ -290,11 +292,13 @@ async def retrieve_file_content(file_id: str):
     return await v1_retrieve_file_content(file_id)
 
 
-def launch_server(
+def launch_engine(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
-    """Launch an HTTP server."""
+    """
+    Launch the Tokenizer Manager in the main process, the Scheduler in a subprocess, and the Detokenizer Manager in another subprocess.
+    """
+
     global tokenizer_manager
 
     # Configure global environment
@@ -354,6 +358,29 @@ def launch_server(
     # Wait for model to finish loading
     for i in range(len(scheduler_pipe_readers)):
         scheduler_pipe_readers[i].recv()
+
+
+def launch_server(
+    server_args: ServerArgs,
+    pipe_finish_writer: Optional[mp.connection.Connection] = None,
+):
+    """
+    Launch SRT (SGLang Runtime) Server
+
+    The SRT server consists of an HTTP server and the SRT engine.
+
+    1. HTTP server: A FastAPI server that routes requests to the engine.
+    2. SRT engine:
+        1. Tokenizer Manager: Tokenizes the requests and sends them to the scheduler.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
+        3. Detokenizer Manager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+
+    Note:
+    1. The HTTP server and Tokenizer Manager both run in the main process.
+    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+    """
+
+    launch_engine(server_args=server_args)
 
     # Add api key authorization
     if server_args.api_key:
@@ -435,7 +462,6 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         return
 
     model_info = res.json()
-
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
@@ -487,6 +513,9 @@ class Runtime:
     ):
         """See the arguments in server_args.py::ServerArgs"""
         self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
+
+        # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
+        atexit.register(self.shutdown)
 
         # Pre-allocate ports
         for port in range(10000, 40000):
@@ -626,3 +655,46 @@ class Runtime:
 
     def __del__(self):
         self.shutdown()
+
+
+class Engine:
+    """
+    SRT Engine without an HTTP server layer.
+
+    This class provides a direct inference engine without the need for an HTTP server. It is designed for use cases where
+    launching the HTTP server adds unnecessary complexity or overhead,
+    """
+
+    def __init__(self, *args, **kwargs):
+
+        # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
+        atexit.register(self.shutdown)
+
+        server_args = ServerArgs(*args, **kwargs)
+        launch_engine(server_args=server_args)
+
+    def generate(
+        self,
+        prompt: Union[str, List[str]],
+        sampling_params: Optional[Dict] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+    ):
+        obj = GenerateReqInput(
+            text=prompt,
+            sampling_params=sampling_params,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            lora_path=lora_path,
+        )
+
+        # make it synchronous
+        return asyncio.run(generate_request(obj, None))
+
+    def shutdown(self):
+        kill_child_process(os.getpid(), including_parent=False)
+
+    # TODO (ByronHsu): encode and async generate

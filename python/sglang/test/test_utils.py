@@ -85,7 +85,7 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None
 
 
 def call_generate_outlines(
-    prompt, temperature, max_tokens, stop=[], regex=None, n=1, url=None
+    prompt, temperature, max_tokens, stop=None, regex=None, n=1, url=None
 ):
     assert url is not None
 

@@ -50,9 +50,17 @@ show_time_cost = False
 time_infos = {}
 
 
-# torch flag AMD GPU
 def is_hip() -> bool:
+    """Return whether it is HIP on the AMD ROCm platform."""
     return torch.version.hip is not None
+
+
+def is_flashinfer_available():
+    """
+    Check whether flashinfer is available.
+    As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
+    """
+    return torch.cuda.is_available() and not is_hip()
 
 
 def is_ipv6(address):
@@ -594,7 +602,9 @@ def set_weight_attrs(
 
 
 def broadcast_pyobj(
-    data: List[Any], rank: int, dist_group: torch.distributed.ProcessGroup
+    data: List[Any],
+    rank: int,
+    dist_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
@@ -622,6 +632,6 @@ def broadcast_pyobj(
         tensor_data = torch.empty(size, dtype=torch.uint8)
         dist.broadcast(tensor_data, src=0, group=dist_group)
 
-        serialized_data = bytes(tensor_data.tolist())
+        serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
         return data

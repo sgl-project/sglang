@@ -26,7 +26,7 @@ class SamplingParams:
         max_new_tokens: int = 128,
         min_new_tokens: int = 0,
         stop: Optional[Union[str, List[str]]] = None,
-        stop_token_ids: Optional[List[int]] = [],
+        stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
@@ -49,6 +49,8 @@ class SamplingParams:
         self.presence_penalty = presence_penalty
         self.repetition_penalty = repetition_penalty
         self.stop_strs = stop
+        if stop_token_ids is None:
+            stop_token_ids = []
         self.stop_token_ids = {*stop_token_ids}
         self.max_new_tokens = max_new_tokens
         self.min_new_tokens = min_new_tokens

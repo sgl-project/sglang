@@ -25,13 +25,11 @@ import torch
 from sglang.srt.lora.lora import LoRAAdapter, get_lora_layer
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_hip, replace_submodule
+from sglang.srt.utils import is_flashinfer_available, replace_submodule
 
 logger = logging.getLogger(__name__)
 
-
-# ROCm: flashinfer available later
-if not is_hip():
+if is_flashinfer_available():
     from flashinfer import SegmentGEMMWrapper
 
 
@@ -274,18 +272,24 @@ class LoRAManager:
         cur_uids = set(forward_batch.lora_paths)
         assert len(cur_uids) <= self.max_loras_per_batch
         i = 0
+        j = len(self.active_uids)
         evictable_uids = list(self.active_uids)
         for uid in cur_uids:
             if uid not in self.active_uids:
-                while i < len(evictable_uids) and evictable_uids[i] in cur_uids:
-                    i += 1
-                if i < len(evictable_uids):
+                if j < self.max_loras_per_batch:
+                    index = j
+                    j += 1
+                else:
+                    while i < len(evictable_uids) and evictable_uids[i] in cur_uids:
+                        i += 1
+                    assert i < len(evictable_uids)
                     self.active_uids.remove(evictable_uids[i])
                     self.buffer_id.pop(evictable_uids[i])
-                self.load_lora(uid, i)
+                    index = i
+                    i += 1
+                self.load_lora(uid, index)
                 self.active_uids.add(uid)
-                self.buffer_id[uid] = i
-                i += 1
+                self.buffer_id[uid] = index
 
         if cur_uids == set([None]):
             return
@@ -295,8 +299,11 @@ class LoRAManager:
         seg_lens = (
             forward_batch.extend_seq_lens
             if forward_batch.forward_mode.is_extend()
-            else torch.ones(bs)
+            else torch.ones(bs, device="cuda")
         )
+        # FIXME: reuse the data rather than recompute
+        seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
+        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
         weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
         for i, lora_path in enumerate(forward_batch.lora_paths):
             weight_indices[i] = self.buffer_id[lora_path]
@@ -310,7 +317,7 @@ class LoRAManager:
                     self.A_buffer[weight_name][layer_id],
                     self.B_buffer[weight_name][layer_id],
                     bs,
-                    seg_lens,
+                    seg_indptr,
                     weight_indices,
                 )
             else:
@@ -319,6 +326,6 @@ class LoRAManager:
                     self.B_buffer["q_proj"][layer_id],
                     self.B_buffer["kv_proj"][layer_id],
                     bs,
-                    seg_lens,
+                    seg_indptr,
                     weight_indices,
                 )

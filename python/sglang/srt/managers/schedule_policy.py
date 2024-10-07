@@ -218,6 +218,7 @@ class PrefillAdder:
                 if not insert_sort:
                     self.req_states.append((tokens_left, tokens_occupied))
                 else:
+                    i = 0
                     for i in range(len(self.req_states)):
                         if tokens_left <= self.req_states[i][0]:
                             break
@@ -248,7 +249,10 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
             tokens_freed += tokens_occupied
 
-        if req.extend_input_len <= self.rem_chunk_tokens:
+        if (
+            self.rem_chunk_tokens is None
+            or req.extend_input_len <= self.rem_chunk_tokens
+        ):
             self.can_run_list.append(req)
             self._prefill_one_req(
                 0,
