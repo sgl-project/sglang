@@ -1,18 +1,36 @@
 import math
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import einops
+import numpy as np
 import requests
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from transformers import AutoModelForCausalLM, AutoProcessor, Qwen2Config
+from transformers import AutoModelForCausalLM, AutoProcessor, PretrainedConfig
+from vllm.config import CacheConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import QuickGELU
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
-from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
 
 # TODO: This should be a config in huggingface...
@@ -81,7 +99,7 @@ class MolmoMultiHeadDotProductAttention(nn.Module):
             self.num_kv_heads * self.head_dim,
             bias=False,
         )
-        self.out = nn.Linear(
+        self.wo = nn.Linear(
             self.num_heads * self.head_dim, config.image_emb_dim, bias=False
         )
 
@@ -125,7 +143,7 @@ class MolmoMultiHeadDotProductAttention(nn.Module):
 
         # (bsz, seq_len, num_heads, head_dim) -> (bsz, seq_len, embed_dim)
         attn_output = self._merge_heads(attn_output)
-        output = self.out(attn_output)
+        output = self.wo(attn_output)
 
         return output
 
@@ -244,50 +262,257 @@ class VisionTransformer(nn.Module):
         return hidden_states
 
 
-class MolmoMultiModalProjector(nn.Module):
+class MolmoAttention(nn.Module):
     def __init__(
         self,
-        config: PlaceholderConfig,
+        config: PretrainedConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = config.num_attention_heads
+
+        assert self.hidden_size % self.total_num_heads == 0
+        assert self.total_num_heads % tp_size == 0
+
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = config.num_key_value_heads or self.total_num_heads
+        if self.total_num_kv_heads >= tp_size:
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            assert tp_size % self.total_num_kv_heads == 0
+
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = self.hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+
+        # Attention input projection. Projects x -> (q, k, v)
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=config.qkv_bias,
+            quant_config=quant_config,
+        )
+
+        self.k_norm: Optional[nn.Module] = None
+        self.q_norm: Optional[nn.Module] = None
+        if config.attention_layer_norm:
+            self.k_norm = RMSNorm(self.kv_size, eps=config.layer_norm_eps)
+            self.q_norm = RMSNorm(self.q_size, eps=config.layer_norm_eps)
+
+        # Rotary embeddings.
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=self.max_position_embeddings,
+            base=self.rope_theta,
+        )
+        self.scaling = self.head_dim**-0.5
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+        )
+        # Attention output projection.
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_metadata: InputMetadata,
+    ):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.q_norm is not None and self.k_norm is not None:
+            q = self.q_norm.forward_native(q)
+            k = self.k_norm.forward_native(k)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, input_metadata)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+
+class MolmoMLP(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
         input_dim: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
-        self.w1 = nn.Linear(
-            input_dim or config.hidden_size, config.intermediate_size // 2, bias=False
+        self.intermediate_size = config.intermediate_size // 2
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_dim or config.hidden_size,
+            [self.intermediate_size, self.intermediate_size],
+            bias=False,
+            quant_config=quant_config,
         )
-        self.w2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self.w3 = nn.Linear(
-            input_dim or config.hidden_size, config.intermediate_size // 2, bias=False
+        self.down_proj = RowParallelLinear(
+            self.intermediate_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
         )
-        self.act = nn.SiLU()
+        self.act = SiluAndMul()
 
     def forward(self, x: torch.Tensor):
-        # TODO: Impelement efficient fused SiluAndMul
-        intermediate = torch.cat([self.w1(x), self.w3(x)], dim=-1)
-        x = self.act(intermediate)
-        x = self.w2(x)
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act(gate_up)
+        x, _ = self.down_proj(x)
         return x
 
 
+class MolmoDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        self.self_attn = MolmoAttention(config, layer_id, quant_config)
+        self.mlp = MolmoMLP(config, quant_config=quant_config)
+
+        # LayerNorm
+        assert config.layer_norm_type == "rms"
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
+        self.norm_after = config.norm_after
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_metadata: InputMetadata,
+        residual: Optional[torch.Tensor] = None,
+    ):
+        if self.norm_after:
+            residual = hidden_states
+        elif residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            positions=positions,
+            input_metadata=input_metadata,
+        )
+
+        if self.norm_after:
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = hidden_states + residual
+            residual = hidden_states
+
+        if not self.norm_after:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+        hidden_states = self.mlp(hidden_states)
+        if self.norm_after:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = hidden_states + residual
+            residual = None
+
+        return hidden_states, residual
+
+
+class MolmoModel(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.embedding_size = config.embedding_size or config.vocab_size
+        # TODO: extra embedding_size hard-coded for now. Consider making it configurable.
+        self.embedding_size += 128
+        self.embed_tokens = VocabParallelEmbedding(
+            self.embedding_size,
+            config.hidden_size,
+            quant_config=quant_config,
+        )
+
+        self.layers = nn.ModuleList(
+            [
+                MolmoDecoderLayer(config, i, quant_config=quant_config)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+
+        assert config.layer_norm_type == "rms"
+        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_metadata: InputMetadata,
+        input_embeds: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+
+        residual = None
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                hidden_states, positions, input_metadata, residual
+            )
+
+        if residual is not None:
+            hidden_states, _ = self.norm(hidden_states, residual)
+        else:
+            hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+
 class MolmoVisionBackbone(nn.Module):
-    def __init__(self, config: MolmoVisionBackboneConfig):
+    def __init__(
+        self,
+        config,
+        vision_config: MolmoVisionBackboneConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
         super().__init__()
 
-        self.config = config
+        self.config = vision_config
         self.vit_layers = [-2, -9]
-        self.image_vit = VisionTransformer(config)
-        self.image_projector = MolmoMultiModalProjector(
-            PlaceholderConfig(),
-            input_dim=config.image_emb_dim,
+        self.image_vit = VisionTransformer(vision_config)
+        self.image_projector = MolmoMLP(
+            config,
+            input_dim=vision_config.image_emb_dim,
+            quant_config=quant_config,
         )
         self.pad_embed = nn.Parameter(
-            torch.zeros((2, config.image_emb_dim * len(self.vit_layers)))
+            torch.zeros((2, vision_config.image_emb_dim * len(self.vit_layers)))
         )
         self.image_pooling_2d = MolmoMultiHeadDotProductAttention(
-            config, num_vit_layers=len(self.vit_layers)
+            vision_config, num_vit_layers=len(self.vit_layers)
         )
 
-        self.image_num_patch = config.image_num_patch
+        self.image_num_patch = vision_config.image_num_patch
         self.llm_patches_per_crop = (
             (self.image_num_patch[0] + 1) // 2,
             (self.image_num_patch[1] + 1) // 2,
@@ -346,7 +571,6 @@ class MolmoVisionBackbone(nn.Module):
                 (0, 0, 0, 1, 0, 1, 0, 0, 0, 0),
             )
 
-        print(image_features.shape)
         # Divide into 2x2 patches
         image_features = einops.rearrange(
             image_features,
@@ -354,10 +578,8 @@ class MolmoVisionBackbone(nn.Module):
             dh=2,
             dw=2,
         )
-        print(image_features.shape)
 
         query = image_features.mean(-2, keepdim=True)
-        print(query.shape)
         image_features = self.image_pooling_2d(query, image_features)
 
         h, w = self.llm_patches_per_crop
@@ -372,11 +594,25 @@ class MolmoVisionBackbone(nn.Module):
 
 
 class MolmoForCausalLM(nn.Module):
-    def __init__(self, config: Qwen2Config, vision_config: MolmoVisionBackboneConfig):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
         super().__init__()
         self.config = config
-        self.transformer = Qwen2ForCausalLM(config)
-        self.vision_backbone = MolmoVisionBackbone(vision_config)
+        self.model = MolmoModel(config, quant_config)
+        self.vision_backbone = MolmoVisionBackbone(
+            config, MolmoVisionBackboneConfig(), quant_config
+        )
+
+        if self.config.weight_tying:
+            self.lm_head = self.model.transformer.wte
+        else:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+
+        self.logits_processor = LogitsProcessor(config)
 
     def forward(
         self,
@@ -386,18 +622,30 @@ class MolmoForCausalLM(nn.Module):
     ) -> torch.Tensor:
         image_inputs = input_metadata.image_inputs
 
-        has_image = input_metadata.image_inputs is not None
-
         if input_metadata.forward_mode.is_extend():
-            x = self.transformer.embed_tokens(input_ids)
+            input_embeds = self.model.embed_tokens(input_ids)
 
-            if has_image:
+            # NOTE(CHRIS): Copied from llava, use to check images, may need to change
+            modalities_list = []
+            max_image_offset = []
+            for im in image_inputs:
+                if im and im.modalities is not None:
+                    modalities_list.extend(im.modalities)
+                if im and im.image_offsets is not None:
+                    max_image_offset.append(max(im.image_offsets))
+                else:
+                    max_image_offset.append(-1)
+
+            start_positions = positions[input_metadata.extend_start_loc].cpu().numpy()
+            need_vision = start_positions <= np.array(max_image_offset)
+
+            if need_vision.any():
                 images = image_inputs["images"]
                 image_masks = image_inputs["image_masks"]
                 image_input_idx = image_inputs["image_input_idx"]
                 seq_len = len(input_ids)
 
-                images = images.to(device=x.device, dtype=x.dtype)
+                images = images.to(device=input_embeds.device, dtype=input_embeds.dtype)
                 image_features, cls_embed = self.vision_backbone(
                     images=images, image_masks=image_masks
                 )
@@ -406,7 +654,7 @@ class MolmoForCausalLM(nn.Module):
 
                 assert image_input_idx.shape == (batch_size, num_image, num_patch)
 
-                image_features = image_features.to(x.device)
+                image_features = image_features.to(input_embeds.device)
                 image_features = image_features.view(
                     batch_size, num_image * num_patch, -1
                 )
@@ -429,28 +677,74 @@ class MolmoForCausalLM(nn.Module):
                 image_input_idx = image_input_idx.flatten()[:, None]
                 mat = (
                     image_input_idx
-                    == torch.arange(seq_len.sum().item(), device=x.device)[None, :]
+                    == torch.arange(seq_len.sum().item(), device=input_embeds.device)[
+                        None, :
+                    ]
                 )
                 mat = mat.to(image_features.dtype)
-                x = x + torch.einsum("nd,nm->md", image_features, mat)
+                input_embeds = input_embeds + torch.einsum(
+                    "nd,nm->md", image_features, mat
+                )
 
-            input_embeds = x
             input_ids = None
 
-            return self.transformer(
+            hidden_states = self.model(
                 input_ids, positions, input_metadata, input_embeds=input_embeds
             )
         elif input_metadata.forward_mode.is_decode():
-            return self.transformer(input_ids, positions, input_metadata)
+            hidden_states = self.model(input_ids, positions, input_metadata)
+
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head.weight, input_metadata
+        )
+
+    def try_load_weights(
+        self, name: str, loaded_weight: torch.Tensor, params_dict: Dict[str, nn.Module]
+    ):
+        try:
+            param = params_dict[name]
+        except KeyError:
+            print(f"no {name}")
+            raise
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+        try:
+            weight_loader(param, loaded_weight)
+        except:
+            raise
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
+        embedding_weight = {}
+        projector_weight = {}
         for name, loaded_weight in weights:
-            print(name)
+            if "rotary_emb.inv_freq" in name:
+                log.info(f"Skipping {name}")
+                continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
+
+            if "wte.embedding" in name:
+                embedding_weight["embedding"] = loaded_weight
+                continue
+
+            if "wte.new_embedding" in name:
+                embedding_weight["new_embedding"] = loaded_weight
+                continue
+
             if "vision_backbone" in name:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if name.startswith("model"):
+                    name = name[len("model.") :]
+
+                if "image_projector" in name:
+                    if "w1" in name:
+                        projector_weight["gate_proj"] = loaded_weight
+                    elif "w3" in name:
+                        projector_weight["up_proj"] = loaded_weight
+                    elif "w2" in name:
+                        projector_weight["down_proj"] = loaded_weight
+                    else:
+                        raise ValueError(f"Unexpected projector weight: {name}")
+                    continue
             else:
                 if "ln_f.weight" in name:
                     name = "model.norm.weight"
@@ -488,7 +782,27 @@ class MolmoForCausalLM(nn.Module):
 
                 if "ff_norm" in name:
                     name = name.replace("ff_norm", "post_attention_layernorm")
-                self.transformer.load_weights([(name, loaded_weight)])
+
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+
+        gate_up_proj_weight = torch.cat(
+            [projector_weight["gate_proj"], projector_weight["up_proj"]], dim=0
+        )
+        name = "vision_backbone.image_projector.gate_up_proj.weight"
+        self.try_load_weights(name, gate_up_proj_weight, params_dict)
+        down_proj_weight = projector_weight["down_proj"]
+        name = "vision_backbone.image_projector.down_proj.weight"
+        self.try_load_weights(name, down_proj_weight, params_dict)
+        embedding_weight = torch.cat(
+            [embedding_weight["embedding"], embedding_weight["new_embedding"]], dim=0
+        )
+        name = "model.embed_tokens.weight"
+        self.try_load_weights(name, embedding_weight, params_dict)
 
 
 EntryClass = [MolmoForCausalLM]
