@@ -16,7 +16,7 @@ class TestSRTBackend(unittest.TestCase):
         engine.shutdown()
 
         runtime = sgl.Runtime(model_path=model_path, random_seed=42)
-        out2 = json.loads(runtime.generate(prompt, {"temperature": 0}))["text"]
+        out2 = json.loads(runtime.generate(prompt, {"temperature": 0, "max_new_tokens": 8}))["text"]
         runtime.shutdown()
 
         print("==== Answer 1 ====")
