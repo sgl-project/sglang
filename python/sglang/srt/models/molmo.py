@@ -673,18 +673,19 @@ class MolmoForCausalLM(nn.Module):
                 image_features = image_features.view(
                     batch_size, num_image * num_patch, -1
                 )
-                image_input_idx = image_input_idx.view(batch_size, num_image, num_patch)
+                image_input_idx = image_input_idx.view(
+                    batch_size, num_image * num_patch
+                ).to(device=image_features.device)
 
-                valid = image_input_idx >= 0
-                image_features = image_features * valid[:, :, None].to(
-                    dtype=image_features.dtype
+                valid = (image_input_idx >= 0).to(
+                    device=image_features.device, dtype=image_features.dtype
                 )
+                image_features = image_features * valid[:, :, None]
                 image_features = image_features.view(
                     batch_size, num_image * num_patch, -1
                 ).contiguous()
 
-                image_input_idx = image_input_idx * valid.to(dtype=image_features.dtype)
-                image_input_idx = image_input_idx * valid.to(image_input_idx.dtype)
+                image_input_idx = image_input_idx * valid
                 offset = torch.cat(
                     [seq_len.new_zeros((1)), seq_len.cumsum(dim=0)[:-1]], dim=0
                 )[:, None]
