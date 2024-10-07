@@ -73,6 +73,7 @@ class ServerArgs:
     # Other
     api_key: Optional[str] = None
     file_storage_pth: str = "SGLang_storage"
+    activate_cache_report: bool = False
 
     # Data parallelism
     dp_size: int = 1
@@ -408,6 +409,11 @@ class ServerArgs:
             type=str,
             default=ServerArgs.file_storage_pth,
             help="The path of the file storage in backend.",
+        )
+        parser.add_argument(
+            "--activate-cache-report",
+            action="store_true",
+            help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
         )
 
         # Data parallelism
