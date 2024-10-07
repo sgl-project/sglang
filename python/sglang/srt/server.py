@@ -514,6 +514,9 @@ class Runtime:
         """See the arguments in server_args.py::ServerArgs"""
         self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
 
+        # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
+        atexit.register(self.shutdown)
+
         # Pre-allocate ports
         for port in range(10000, 40000):
             if is_port_available(port):
