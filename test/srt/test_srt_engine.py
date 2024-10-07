@@ -11,12 +11,14 @@ class TestSRTBackend(unittest.TestCase):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_MODEL_NAME_FOR_TEST
 
+        sampling_params = {"temperature": 0, "max_new_tokens": 8}
+
         engine = sgl.Engine(model_path=model_path, random_seed=42)
-        out1 = engine.generate(prompt, {"temperature": 0, "max_new_tokens": 8})["text"]
+        out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 
         runtime = sgl.Runtime(model_path=model_path, random_seed=42)
-        out2 = json.loads(runtime.generate(prompt, {"temperature": 0, "max_new_tokens": 8}))["text"]
+        out2 = json.loads(runtime.generate(prompt, sampling_params))["text"]
         runtime.shutdown()
 
         print("==== Answer 1 ====")
