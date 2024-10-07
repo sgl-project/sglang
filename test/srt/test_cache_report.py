@@ -25,6 +25,8 @@ class TestCacheReport(unittest.TestCase):
             timeout=300,
             other_args=[
                 "--chunked-prefill-size=40",
+                "--disable-cuda-graph",
+                "--activate-cache-report",
             ],
         )
         cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
@@ -62,7 +64,7 @@ class TestCacheReport(unittest.TestCase):
                 {"role": "user", "content": message},
             ],
             temperature=0,
-            max_tokens=128,
+            max_tokens=100,
         )
         return response
 
@@ -73,20 +75,21 @@ class TestCacheReport(unittest.TestCase):
                 {"role": "user", "content": message},
             ],
             temperature=0,
-            max_tokens=128,
+            max_tokens=100,
         )
         return response
 
     def cache_report_openai(self, message):
         response = self.run_openai(message)
+        print(f"openai first response: {response.text}")
         print(
-            f"openai first request cached_tokens: {int(response.usage.cached_tokens)}"
+            f"openai first request cached_tokens: {int(response.usage.prompt_tokens_details.cached_tokens)}"
         )
-        first_cached_tokens = int(response.usage.cached_tokens)
+        first_cached_tokens = int(response.usage.prompt_tokens_details.cached_tokens)
         # assert int(response.usage.cached_tokens) == 0
         assert first_cached_tokens < self.min_cached
         response = self.run_openai(message)
-        cached_tokens = int(response.usage.cached_tokens)
+        cached_tokens = int(response.usage.prompt_tokens_details.cached_tokens)
         print(f"openai second request usage: {response.usage}")
         print(f"openai second request cached_tokens: {cached_tokens}")
         assert cached_tokens > 0
@@ -95,7 +98,7 @@ class TestCacheReport(unittest.TestCase):
 
     async def cache_report_openai_async(self, message):
         response = await self.run_openai_async(message)
-        cached_tokens = int(response.usage.cached_tokens)
+        cached_tokens = int(response.usage.prompt_tokens_details.cached_tokens)
         prompt_tokens = int(response.usage.prompt_tokens)
         return cached_tokens, prompt_tokens
 
@@ -110,6 +113,13 @@ class TestCacheReport(unittest.TestCase):
         )
         # can't assure to be 0: depends on the initialisation request / if a template is used with the model
         assert cached_tokens < self.min_cached
+        response = self.run_decode()
+        cached_tokens = int(response.json()["meta_info"]["cached_tokens"])
+        print(f"sglang second request cached_tokens: {cached_tokens}")
+        print(
+            f"sglang second request prompt_tokens: {int(response.json()['meta_info']['prompt_tokens'])}"
+        )
+        assert cached_tokens == int(response.json()["meta_info"]["prompt_tokens"]) - 1
 
     def test_cache_split_prefill_openai(self):
         self.cache_report_openai(

@@ -76,8 +76,8 @@ class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
-    # number of tokens that were already cached in the KV store
-    cached_tokens: Optional[int] = 0
+    # only used to return cached tokens when --activate-cache-report is set
+    prompt_tokens_details: Optional[Dict[str, int]] = None
 
 
 class StreamOptions(BaseModel):

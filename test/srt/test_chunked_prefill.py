@@ -23,6 +23,8 @@ class TestChunkedPrefill(unittest.TestCase):
         if enable_mixed_chunk:
             other_args += ["--enable-mixed-chunk"]
 
+        other_args += ["--disable-cuda-graph"]
+
         model = DEFAULT_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
         process = popen_launch_server(
