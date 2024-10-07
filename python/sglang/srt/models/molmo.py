@@ -658,7 +658,11 @@ class MolmoForCausalLM(nn.Module):
                 image_input_idx = torch.stack(image_input_idx, dim=0)
 
                 input_embeds = self.model.embed_tokens(input_ids)
-                seq_len = len(input_ids)
+
+                # Is unsqueeze necessary?
+                seq_len = torch.tensor(
+                    len(input_ids), device=input_embeds.device, dtype=torch.long
+                ).unsqueeze(0)
 
                 images = images.to(device=input_embeds.device, dtype=input_embeds.dtype)
                 image_features, cls_embed = self.vision_backbone(
@@ -682,7 +686,7 @@ class MolmoForCausalLM(nn.Module):
                 )
                 image_features = image_features * valid[:, :, None]
                 image_features = image_features.view(
-                    batch_size, num_image * num_patch, -1
+                    batch_size * num_image * num_patch, -1
                 ).contiguous()
 
                 image_input_idx = image_input_idx * valid
@@ -731,7 +735,7 @@ class MolmoForCausalLM(nn.Module):
             raise
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        params_dict = dict(self.named_parameters())
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
         embedding_weight = {}
         projector_weight = {}
         for name, loaded_weight in weights:
