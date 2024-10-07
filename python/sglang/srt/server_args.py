@@ -151,8 +151,7 @@ class ServerArgs:
             )
             self.sampling_backend = "pytorch"
 
-        # ROCm: flashinfer available later
-        if is_hip():
+        if not flashinfer_is_available():
             self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
 
