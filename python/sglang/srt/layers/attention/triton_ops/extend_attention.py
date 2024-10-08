@@ -26,9 +26,7 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
 
-cuda_is_available = torch.cuda.is_available()
-if cuda_is_available:
-    CUDA_CAPABILITY = torch.cuda.get_device_capability()
+CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
 @triton.jit
@@ -288,12 +286,12 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    if cuda_is_available and CUDA_CAPABILITY[0] >= 9:
+    if CUDA_CAPABILITY[0] >= 9:
         if Lq <= 256:
             BLOCK_M, BLOCK_N = (128, 64)
         else:
             BLOCK_M, BLOCK_N = (32, 64)
-    elif cuda_is_available and CUDA_CAPABILITY[0] >= 8:
+    elif CUDA_CAPABILITY[0] >= 8:
         if Lq <= 128:
             BLOCK_M, BLOCK_N = (128, 128)
         elif Lq <= 256:
