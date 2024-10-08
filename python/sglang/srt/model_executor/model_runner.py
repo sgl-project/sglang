@@ -82,6 +82,7 @@ class ModelRunner:
         # Parse args
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
+        self.device = device
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -159,7 +160,7 @@ class ModelRunner:
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         min_per_gpu_memory = get_available_gpu_memory(
-            self.gpu_id, distributed=self.tp_size > 1
+            self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         self.tp_group = get_tp_group()
 
@@ -173,7 +174,7 @@ class ModelRunner:
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
-            local_gpu_memory = get_available_gpu_memory(self.gpu_id)
+            local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
@@ -183,7 +184,7 @@ class ModelRunner:
 
     def load_model(self):
         logger.info(
-            f"Load weight begin. avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         # This can reduce thread conflicts and speed up weight loading.
@@ -241,7 +242,7 @@ class ModelRunner:
             f"Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
-            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
     def update_weights(self, model_path: str, load_format: str):
@@ -255,7 +256,7 @@ class ModelRunner:
 
         logger.info(
             f"Update weights begin. "
-            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         target_device = torch.device(self.device_config.device)
@@ -344,7 +345,7 @@ class ModelRunner:
 
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(
-            self.gpu_id, distributed=self.tp_size > 1
+            self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -439,7 +440,7 @@ class ModelRunner:
             )
         logger.info(
             f"Memory pool end. "
-            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
     def init_cublas(self):
