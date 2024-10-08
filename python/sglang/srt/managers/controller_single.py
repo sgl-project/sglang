@@ -103,7 +103,7 @@ class ControllerSingle:
             if self.tp_size > 1:
                 broadcast_recv_input(recv_reqs, 0, self.tp_cpu_group)
             if self.spec_queue is not None and recv_reqs:
-                self.spec_queue.draft_input_queue.put_nowait(recv_reqs)
+                self.spec_queue.draft_extend_input_queue.put_nowait(recv_reqs)
             out_pyobjs = self.tp_server.exposed_step(recv_reqs)
 
             for obj in out_pyobjs:
@@ -236,7 +236,7 @@ class ControllerSingleSpecDraft(ControllerSingle):
         self.dp_worker_id = dp_worker_id
 
         self.spec_queue = spec_queue
-        self.mp_queue = spec_queue.draft_input_queue
+        self.mp_queue = spec_queue.draft_extend_input_queue
         self.spec_server = SpecDraftServer(
             gpu_ids[0],
             0,

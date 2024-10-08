@@ -30,9 +30,14 @@ if TYPE_CHECKING:
     from python.sglang.srt.layers.sampler import SampleOutput
     from python.sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.server_args import ServerArgs
 
 
-class SpecDraftInput:
+class SpecInput:
+    pass
+
+
+class SpecDraftInput(SpecInput):
     def prepare_for_extend(self, batch):
         raise NotImplementedError()
 
@@ -51,7 +56,7 @@ class SpecDraftInput:
         pass
 
 
-class SpecVerifyInput:
+class SpecVerifyInput(SpecInput):
     pass
 
 
@@ -78,11 +83,11 @@ class EAGLEDraftInput(SpecDraftInput):
     hidden_states: torch.Tensor = None
     verified_id: torch.Tensor = None
 
-    def init(self):
+    def init(self, server_args: ServerArgs):
         self.prev_mode = None
         self.sample_output = None
         self.topk: int = 10
-        self.num_verify_token: int = 64
+        self.num_verify_token: int = server_args.num_draft_tokens
 
         self.scores: torch.Tensor = None
         self.score_list: List[torch.Tensor] = []
@@ -228,23 +233,32 @@ class EAGLEDraftInput(SpecDraftInput):
         self.positions = None
 
 
-class EagleVerifyInput:
+class EagleVerifyInput(SpecVerifyInput):
     def __init__(
         self,
         draft_token: torch.Tensor,
         tree_mask: torch.Tensor,
-        position: torch.Tensor,
+        positions: torch.Tensor,
         retrive_index: torch.Tensor,
     ):
         self.draft_token = draft_token
         self.tree_mask = tree_mask
-        self.position = position
+        self.positions = positions
         self.retrive_index = retrive_index
+
+    def prepare_model_input(self, batch):
+        batch.input_ids = self.draft_token
+        batch.out_cache_loc = batch.alloc_token_slots(batch.input_ids.numel())
+
+    def verify(self, batch):
+        pass
 
 
 class SpecInfoPipline:
     def __init__(self):
         ctx = torch.multiprocessing.get_context("forkserver")
-        self.draft_input_queue = ctx.Queue()
+        self.reqest_input_queue = ctx.Queue()
+        self.draft_extend_input_queue = ctx.Queue()
+        self.draft_decode_input_queue = ctx.Queue()
         self.draft_output_queue = ctx.Queue()
         self.max_total_num_tokens = ctx.Value("i", -1)

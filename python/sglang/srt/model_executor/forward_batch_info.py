@@ -26,7 +26,7 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.layers.attention_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.managers.speculative_utils import SpecDraftInput
+    from sglang.srt.managers.speculative_utils import SpecInput
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -104,7 +104,7 @@ class InputMetadata:
     modalities: List[List[str]] = None
 
     # Information used for speculative decoding
-    spec_draft_input: SpecDraftInput = None
+    spec_draft_input: SpecInput = None
     spec_algorithm: str = None
 
     def init_multimuldal_info(self, batch: ScheduleBatch):

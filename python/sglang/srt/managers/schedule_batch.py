@@ -34,7 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.speculative_utils import SpecDraftInput
+    from sglang.srt.managers.speculative_utils import SpecInput
 
 from sglang.srt.server_args import ServerArgs
 
@@ -385,7 +385,7 @@ class ScheduleBatch:
     top_logprobs_nums: List[int] = None
 
     # For speculative decoding
-    spec_draft_input: SpecDraftInput = None
+    spec_draft_input: SpecInput = None
     spec_algorithm: str = None
     # Stream
     has_stream: bool = False
@@ -525,14 +525,14 @@ class ScheduleBatch:
         self.extend_lens_cpu.extend([1] * running_bs)
         self.extend_logprob_start_lens_cpu.extend([0] * running_bs)
 
-    def check_decode_mem(self):
+    def check_decode_mem(self, token_per_seq: int = 1):
         bs = len(self.reqs)
-        if self.token_to_kv_pool.available_size() >= bs:
+        if self.token_to_kv_pool.available_size() >= bs * token_per_seq:
             return True
 
         self.tree_cache.evict(bs, self.token_to_kv_pool.free)
 
-        if self.token_to_kv_pool.available_size() >= bs:
+        if self.token_to_kv_pool.available_size() >= bs * token_per_seq:
             return True
 
         return False

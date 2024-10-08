@@ -33,7 +33,8 @@ class ServerArgs:
     draft_model_path: str = None
     speculative_algorithm: str = None
     draft_mem_fraction: float = None
-    num_speculative_tokens: int = None
+    num_speculative_steps: int = None
+    num_draft_tokens: int = None
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
@@ -211,7 +212,14 @@ class ServerArgs:
             required=False,
         )
         parser.add_argument(
-            "--num-speculative-tokens",
+            "--num-speculative-steps",
+            type=int,
+            help="The number of steps sampled from draft model in Speculative Decoding.",
+            required=False,
+            default=5,
+        )
+        parser.add_argument(
+            "--num-draft-tokens",
             type=int,
             help="The number of token sampled from draft model in Speculative Decoding.",
             required=False,

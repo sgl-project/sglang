@@ -272,7 +272,9 @@ class ModelTpServer:
             # Run a new prefill batch
             self.forward_prefill_batch(new_batch)
             if self.is_spec_worker:
-                self.spec_queue.draft_input_queue.put_nowait(new_batch.spec_draft_input)
+                self.spec_queue.draft_extend_input_queue.put_nowait(
+                    new_batch.spec_draft_input
+                )
             else:
                 if not new_batch.is_empty():
                     if self.running_batch is None:
@@ -297,7 +299,7 @@ class ModelTpServer:
 
                     if self.out_pyobjs and self.running_batch.has_stream:
                         break
-            elif self.is_spec_worker:
+            elif self.is_spec_worker and not self.spec_queue.draft_output_queue.empty():
                 self.forward_verify_batch()
             else:
                 self.check_memory()
@@ -814,11 +816,37 @@ class ModelTpServer:
 
         self.handle_finished_requests(batch)
 
-    def forward_verify_batch(self):
-        recv_batch = []
-        while not self.spec_queue.draft_output_queue.empty():
-            recv_batch.append(self.spec_queue.draft_output_queue.get())
-        pass
+    def forward_verify_batch(self, batch: ScheduleBatch):
+        # Check if decode out of memory
+        if not batch.check_decode_mem(self.server_args.num_draft_tokens):
+            old_ratio = self.new_token_ratio
+
+            retracted_reqs, new_token_ratio = batch.retract_decode()
+            self.new_token_ratio = new_token_ratio
+
+            logger.info(
+                "Decode out of memory happened. "
+                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
+            )
+            self.waiting_queue.extend(retracted_reqs)
+        else:
+            self.new_token_ratio = max(
+                self.new_token_ratio - self.new_token_ratio_decay,
+                self.min_new_token_ratio,
+            )
+        verify_input = self.spec_queue.draft_output_queue.get()
+
+        verify_input.prepare_model_input(batch)
+        batch.spec_draft_input = verify_input
+
+        # Forward and sample the next tokens
+        logits_output = self.model_runner.forward(batch)
+        verified_token_ids, draft_input = batch.spec_draft_input.verify(logits_output)
+        # next_token_ids = self.model_runner.sample(logits_output, batch)
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            verified_token_ids
+        )
 
     def handle_finished_requests(self, batch: ScheduleBatch):
         output_rids = []

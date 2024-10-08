@@ -82,8 +82,8 @@ class SpecDraftServer(ModelTpServer):
 
         if new_batch is not None:
             # Run a new prefill batch
-            draft_input = self.spec_queue.draft_input_queue.get()
-            draft_input.init()
+            draft_input = self.spec_queue.draft_extend_input_queue.get()
+            draft_input.init(self.server_args)
             new_batch.spec_draft_input = draft_input
             self.forward_prefill_batch(new_batch)
             new_batch.spec_draft_input.prepare_for_decode(new_batch)
@@ -99,7 +99,7 @@ class SpecDraftServer(ModelTpServer):
     def forward_decode_step(self):
         assert self.running_batch is not None, "Running Batch should not be None."
         # Run a few decode batches continuously for reducing overhead
-        for _ in range(self.server_args.num_speculative_tokens):
+        for _ in range(self.server_args.num_speculative_steps):
             self.num_generated_tokens += len(self.running_batch.reqs)
             self.forward_decode_batch(self.running_batch)
 
@@ -116,8 +116,7 @@ class SpecDraftServer(ModelTpServer):
         verify_input = self.running_batch.spec_draft_input.prepare_for_verify(
             self.running_batch
         )
-        print(verify_input.draft_token)
-        print(verify_input.retrive_index)
+        self.spec_queue.draft_output_queue.put_nowait(verify_input)
 
     def forward_prefill_batch(self, batch: ScheduleBatch):
         # Only implement EAGLE currently.

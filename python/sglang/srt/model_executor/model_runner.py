@@ -128,7 +128,7 @@ class ModelRunner:
                 ), "The model: {} is not support EAGLE now.".format(
                     self.model.__class__.__name__
                 )
-                embed, head = self.spec_info.draft_input_queue.get()
+                embed, head = self.spec_info.draft_extend_input_queue.get()
                 self.model.set_embed_and_head(embed, head)
             else:
                 assert hasattr(
@@ -136,7 +136,9 @@ class ModelRunner:
                 ), "The model: {} is not support EAGLE now.".format(
                     self.model.__class__.__name__
                 )
-                self.spec_info.draft_input_queue.put(self.model.get_embed_and_head())
+                self.spec_info.draft_extend_input_queue.put(
+                    self.model.get_embed_and_head()
+                )
 
         if server_args.lora_paths is not None:
             self.init_lora_manager()
