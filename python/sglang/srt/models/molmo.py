@@ -64,8 +64,8 @@ class MolmoViTMLP(nn.Module):
     def __init__(self, config: MolmoVisionBackboneConfig):
         super().__init__()
         self.config = config
-        self.w1 = nn.Linear(config.image_emb_dim, config.image_mlp_dim, bias=False)
-        self.w2 = nn.Linear(config.image_mlp_dim, config.image_emb_dim, bias=False)
+        self.w1 = nn.Linear(config.image_emb_dim, config.image_mlp_dim, bias=True)
+        self.w2 = nn.Linear(config.image_mlp_dim, config.image_emb_dim, bias=True)
         self.act = QuickGELU()
 
     def forward(self, x: torch.Tensor):
@@ -629,7 +629,6 @@ class MolmoForCausalLM(nn.Module):
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         if image_inputs is not None and image_inputs.input_ids is not None:
-            print(image_inputs.input_ids.tolist())
             return image_inputs.input_ids.tolist()
         else:
             return input_ids
