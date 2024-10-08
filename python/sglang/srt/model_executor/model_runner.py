@@ -425,11 +425,10 @@ class ModelRunner:
                 4096,
             )
 
-        device = "cuda"
         self.req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs + 1,
             max_context_len=self.model_config.context_len + 4,
-            device=device,
+            device=device_type,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -438,21 +437,19 @@ class ModelRunner:
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
-                device=device_type,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
-                device=device,
+                device=device_type,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
-                device=device_type,
                 head_num=self.model_config.get_num_kv_heads(self.tp_size),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
-                device=device,
+                device=device_type,
             )
         logger.info(
             f"Memory pool end. "
