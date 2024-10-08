@@ -20,9 +20,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+torch = ["torch"]
 srt = ["aiohttp", "decord", "fastapi", "hf_transfer", "huggingface_hub", "interegular",
        "packaging", "pillow", "psutil", "pydantic", "python-multipart",
-       "torch", "torchao", "uvicorn", "uvloop", "zmq",
+       "torchao", "uvicorn", "uvloop", "zmq",
        "outlines>=0.0.44", "modelscope"]
 
 #xpu is not enabled in public vllm and torch whl,
@@ -33,7 +34,7 @@ openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
 test = ["jsonlines", "matplotlib", "pandas", "sentence_transformers", "accelerate", "peft"]
-all = ["sglang[srt]", "sglang[vllm]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+all = ["sglang[torch]", "sglang[srt]", "sglang[vllm]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_xpu=["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 dev = ["sglang[all]", "sglang[test]"]
 dev_xpu = ["sglang[all_xpu]", "sglang[test]"]

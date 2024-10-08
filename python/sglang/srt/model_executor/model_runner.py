@@ -86,7 +86,7 @@ class ModelRunner:
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.nccl_port = nccl_port
+        self.dist_port = nccl_port
         self.server_args = server_args
         self.is_multimodal_model = is_multimodal_model(
             self.model_config.hf_config.architectures
@@ -147,20 +147,24 @@ class ModelRunner:
         if self.device == "cuda":
             torch.cuda.set_device(self.gpu_id)
             backend = "nccl"
+        # ToDO(liangan1):Just use gloo to bypass the initilization fail,need to use ccl for xpu backend
+        elif device_type == "xpu":
+            torch.xpu.set_device(self.gpu_id)
+            backend = "gloo"
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
         if self.server_args.dist_init_addr:
-            nccl_init_method = f"tcp://{self.server_args.dist_init_addr}"
+            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
-            nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port}"
+            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         init_distributed_environment(
             backend=backend,
             world_size=self.tp_size,
             rank=self.tp_rank,
             local_rank=self.gpu_id,
-            distributed_init_method=nccl_init_method,
+            distributed_init_method=dist_init_method,
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         min_per_gpu_memory = get_available_gpu_memory(
