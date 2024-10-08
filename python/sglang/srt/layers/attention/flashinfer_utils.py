@@ -1,6 +1,13 @@
+from enum import Enum, auto
+
 import torch
 import triton
 import triton.language as tl
+
+
+class WrapperDispatch(Enum):
+    SLIDING_WINDOW = auto()
+    CROSS_ATTENTION = auto()
 
 
 @triton.jit
@@ -47,7 +54,7 @@ class FlashinferUpdater:
         req_pool_indices,
         seq_lens,
         prefix_lens,
-        decode_wrapper=None,
+        decode_wrappers=None,
         use_ragged=False,
     ):
         self.forward_mode = forward_mode
@@ -66,82 +73,22 @@ class FlashinferUpdater:
         self.head_dim = model_runner.model_config.head_dim
         self.batch_size = len(req_pool_indices)
 
-        self.decode_wrapper = (
-            decode_wrapper or self.model_runner.attn_backend.decode_wrapper
+        self.decode_wrappers = (
+            decode_wrappers or self.model_runner.attn_backend.decode_wrappers
         )
         self.prefill_wrapper_ragged = (
             self.model_runner.attn_backend.prefill_wrapper_ragged
         )
-        self.prefill_wrapper_paged = (
-            self.model_runner.attn_backend.prefill_wrapper_paged
+        self.prefill_wrappers_paged = (
+            self.model_runner.attn_backend.prefill_wrappers_paged
         )
 
         self.kv_last_page_len = torch.ones(
             (self.batch_size,), dtype=torch.int32, device="cuda"
         )
 
-    def _init_indices_no_sliding_window(self):
-        if self.use_ragged:
-            paged_kernel_lens = self.prefix_lens
-        else:
-            paged_kernel_lens = self.seq_lens
-
-        self.kv_indptr = torch.zeros(
-            (self.batch_size + 1,), dtype=torch.int32, device="cuda"
-        )
-        self.kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-        self.kv_indices = torch.empty(
-            self.kv_indptr[-1], dtype=torch.int32, device="cuda"
-        )
-
-        create_flashinfer_kv_indices_triton[(self.batch_size,)](
-            self.model_runner.req_to_token_pool.req_to_token,
-            self.req_pool_indices,
-            paged_kernel_lens,
-            self.kv_indptr,
-            None,
-            self.kv_indices,
-            self.model_runner.req_to_token_pool.req_to_token.size(1),
-        )
-
-    def _init_indices_sliding_window(self, wrapper_id):
-        if wrapper_id == 0:
-            # window attention use paged only
-            if self.forward_mode.is_decode():
-                paged_kernel_lens = torch.minimum(
-                    self.seq_lens,
-                    torch.tensor(self.model_runner.sliding_window_size + 1),
-                )
-            else:
-                paged_kernel_lens = torch.minimum(
-                    self.seq_lens,
-                    torch.tensor(self.model_runner.sliding_window_size)
-                    + self.seq_lens
-                    - self.prefix_lens,
-                )
-        else:
-            # full attention
-            paged_kernel_lens = self.seq_lens
-
-        kv_start_idx = self.seq_lens - paged_kernel_lens
-        self.kv_indptr = torch.zeros(
-            (self.batch_size + 1,), dtype=torch.int32, device="cuda"
-        )
-        self.kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-        self.kv_indices = torch.empty(
-            self.kv_indptr[-1], dtype=torch.int32, device="cuda"
-        )
-        create_flashinfer_kv_indices_triton[(self.batch_size,)](
-            self.model_runner.req_to_token_pool.req_to_token,
-            self.req_pool_indices,
-            paged_kernel_lens,
-            self.kv_indptr,
-            kv_start_idx,
-            self.kv_indices,
-            self.model_runner.req_to_token_pool.req_to_token.size(1),
-        )
-
     def _update_decode_indices(self, decode_wrapper):
+        assert not isinstance(decode_wrapper, list)
         decode_wrapper.end_forward()
         decode_wrapper.begin_forward(
             self.kv_indptr,
@@ -156,6 +103,9 @@ class FlashinferUpdater:
         )
 
     def _update_extend_indices(self, ragged_wrapper, paged_wrapper):
+        assert not isinstance(paged_wrapper, list)
+        assert not isinstance(ragged_wrapper, list)
+
         # extend part
         qo_indptr = torch.zeros(
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
@@ -185,28 +135,75 @@ class FlashinferUpdater:
             1,
         )
 
-    def update_indices_no_sliding_window(self):
-        self._init_indices_no_sliding_window()
+    def _get_indices(self, dispatch_reason: WrapperDispatch = None, wrapper_id=0):
+        if dispatch_reason is None:
+            if self.use_ragged:
+                paged_kernel_lens = self.prefix_lens
+            else:
+                paged_kernel_lens = self.seq_lens
+            self.kv_start_idx = None
+        elif dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+            if wrapper_id == 0:
+                # window attention use paged only
+                if self.forward_mode.is_decode():
+                    paged_kernel_lens = torch.minimum(
+                        self.seq_lens,
+                        torch.tensor(self.model_runner.sliding_window_size + 1),
+                    )
+                else:
+                    paged_kernel_lens = torch.minimum(
+                        self.seq_lens,
+                        torch.tensor(self.model_runner.sliding_window_size)
+                        + self.seq_lens
+                        - self.prefix_lens,
+                    )
+            else:
+                # full attention
+                paged_kernel_lens = self.seq_lens
+            self.kv_start_idx = self.seq_lens - paged_kernel_lens
+
+        self.kv_indptr = torch.zeros(
+            (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+        )
+        self.kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+        self.kv_indices = torch.empty(
+            self.kv_indptr[-1], dtype=torch.int32, device="cuda"
+        )
+
+        create_flashinfer_kv_indices_triton[(self.batch_size,)](
+            self.model_runner.req_to_token_pool.req_to_token,
+            self.req_pool_indices,
+            paged_kernel_lens,
+            self.kv_indptr,
+            self.kv_start_idx,
+            self.kv_indices,
+            self.model_runner.req_to_token_pool.req_to_token.size(1),
+        )
+
+    def _update_indicess_single_wrapper(self):
+        self._get_indices()
 
         if self.forward_mode.is_decode():
-            self._update_decode_indices(self.decode_wrapper)
+            self._update_decode_indices(self.decode_wrappers[0])
         else:
             self._update_extend_indices(
                 self.prefill_wrapper_ragged,
-                self.prefill_wrapper_paged,
+                self.prefill_wrappers_paged[0],
             )
 
-    def update_indices_sliding_window(self):
-        assert self.use_ragged is False
+    def _update_indices_cross_attention(self):
+        pass
 
+    def _update_indices_sliding_window(self):
+        assert self.use_ragged is False
         for wrapper_id in range(2):
-            self._init_indices_sliding_window(wrapper_id)
+            self._get_indices(WrapperDispatch.SLIDING_WINDOW, wrapper_id)
             if self.forward_mode.is_decode():
-                self._update_decode_indices(self.decode_wrapper[wrapper_id])
+                self._update_decode_indices(self.decode_wrappers[wrapper_id])
             else:
                 self._update_extend_indices(
                     None,
-                    self.prefill_wrapper_paged[wrapper_id],
+                    self.prefill_wrappers_paged[wrapper_id],
                 )
 
 
@@ -216,7 +213,7 @@ def update_flashinfer_indices(
     req_pool_indices,
     seq_lens,
     prefix_lens,
-    decode_wrapper=None,
+    decode_wrappers=None,
     use_ragged=False,
 ):
     updater = FlashinferUpdater(
@@ -225,11 +222,16 @@ def update_flashinfer_indices(
         req_pool_indices,
         seq_lens,
         prefix_lens,
-        decode_wrapper,
+        decode_wrappers,
         use_ragged,
     )
 
-    if model_runner.sliding_window_size is None:
-        updater.update_indices_no_sliding_window()
+    dispatch_reason = model_runner.attn_backend.dispatch_reason
+
+    if dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+        updater._update_indices_sliding_window()
+    elif dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
+        updater._update_indices_cross_attention()
     else:
-        updater.update_indices_sliding_window()
+        assert model_runner.attn_backend.num_wrappers == 1
+        updater._update_indicess_single_wrapper()

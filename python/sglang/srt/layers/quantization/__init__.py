@@ -19,7 +19,6 @@ from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
 from vllm.model_executor.layers.quantization.gptq_marlin_24 import GPTQMarlin24Config
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.layers.quantization.qqq import QQQConfig
-from vllm.model_executor.layers.quantization.squeezellm import SqueezeLLMConfig
 from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -39,7 +38,6 @@ QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "gptq_marlin": GPTQMarlinConfig,
     "awq_marlin": AWQMarlinConfig,
     "gptq": GPTQConfig,
-    "squeezellm": SqueezeLLMConfig,
     "compressed-tensors": CompressedTensorsConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "qqq": QQQConfig,

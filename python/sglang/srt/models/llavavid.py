@@ -27,7 +27,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM
 
 
@@ -108,11 +108,11 @@ class LlavaVidForCausalLM(nn.Module):
         self,
         input_ids: torch.LongTensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        image_inputs = input_metadata.image_inputs
-        if input_metadata.forward_mode.is_extend():
-            bs = input_metadata.batch_size
+        image_inputs = forward_batch.image_inputs
+        if forward_batch.forward_mode.is_extend():
+            bs = forward_batch.batch_size
 
             # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
@@ -124,7 +124,7 @@ class LlavaVidForCausalLM(nn.Module):
                     max_image_offset.append(max(im.image_offsets))
                 else:
                     max_image_offset.append(-1)
-            start_positions = positions[input_metadata.extend_start_loc].cpu().numpy()
+            start_positions = positions[forward_batch.extend_start_loc].cpu().numpy()
             need_vision = start_positions <= np.array(max_image_offset)
 
             if need_vision.any():
@@ -169,8 +169,8 @@ class LlavaVidForCausalLM(nn.Module):
                 image_features = new_image_features
 
                 # Fill in the placeholder for the image
-                extend_start_loc_cpu = input_metadata.extend_start_loc.cpu().numpy()
-                prefix_lens_cpu = input_metadata.extend_prefix_lens.cpu().numpy()
+                extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
+                prefix_lens_cpu = forward_batch.extend_prefix_lens.cpu().numpy()
                 pt = 0
                 for i in range(bs):
                     if not need_vision[i]:
@@ -200,10 +200,10 @@ class LlavaVidForCausalLM(nn.Module):
                         pt += 1
 
             return self.language_model(
-                input_ids, positions, input_metadata, input_embeds=input_embeds
+                input_ids, positions, forward_batch, input_embeds=input_embeds
             )
-        elif input_metadata.forward_mode.is_decode():
-            return self.language_model(input_ids, positions, input_metadata)
+        elif forward_batch.forward_mode.is_decode():
+            return self.language_model(input_ids, positions, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Load clip vision model by cfg['mm_vision_tower']:

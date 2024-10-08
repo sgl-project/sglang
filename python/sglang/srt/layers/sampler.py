@@ -42,7 +42,10 @@ class Sampler(nn.Module):
                 torch.isnan(probs), torch.full_like(probs, 1e-10), probs
             )
 
-        if global_server_args_dict["sampling_backend"] == "flashinfer":
+        if sampling_info.top_ks.max().item() <= 1:
+            # Use torch.argmax if all requests use greedy sampling
+            batch_next_token_ids = torch.argmax(probs, -1)
+        elif global_server_args_dict["sampling_backend"] == "flashinfer":
             max_top_k_round, batch_size = 32, probs.shape[0]
             uniform_samples = torch.rand(
                 (max_top_k_round, batch_size), device=probs.device

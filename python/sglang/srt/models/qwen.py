@@ -39,7 +39,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class QWenMLP(nn.Module):
@@ -133,12 +133,12 @@ class QWenAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.c_attn(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, input_metadata)
+        attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.c_proj(attn_output)
         return output
 
@@ -177,7 +177,7 @@ class QWenBlock(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
@@ -185,7 +185,7 @@ class QWenBlock(nn.Module):
         hidden_states = self.attn(
             positions=positions,
             hidden_states=hidden_states,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
         hidden_states = residual + hidden_states
 
@@ -224,7 +224,7 @@ class QWenModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.wte(input_ids)
         for i in range(len(self.h)):
@@ -232,7 +232,7 @@ class QWenModel(nn.Module):
             hidden_states = layer(
                 positions,
                 hidden_states,
-                input_metadata,
+                forward_batch,
             )
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
@@ -257,11 +257,11 @@ class QWenLMHeadModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ):
-        hidden_states = self.transformer(input_ids, positions, input_metadata)
+        hidden_states = self.transformer(input_ids, positions, forward_batch)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

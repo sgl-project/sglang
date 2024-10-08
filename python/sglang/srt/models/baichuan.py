@@ -46,7 +46,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
@@ -189,13 +189,13 @@ class BaiChuanAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.W_pack(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         if self.postion_embedding != "ALIBI":
             q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, input_metadata)
+        attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -237,7 +237,7 @@ class BaiChuanDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -249,7 +249,7 @@ class BaiChuanDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
 
         # Fully Connected
@@ -292,7 +292,7 @@ class BaiChuanModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
@@ -301,7 +301,7 @@ class BaiChuanModel(nn.Module):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                input_metadata,
+                forward_batch,
                 residual,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -350,11 +350,11 @@ class BaiChuanBaseForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, input_metadata)
+        hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

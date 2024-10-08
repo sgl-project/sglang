@@ -130,6 +130,12 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
 
+      - name: Benchmark Offline Throughput (Non-streaming, small batch size)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
+
   performance-test-1-gpu-part-2:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 1-gpu-runner

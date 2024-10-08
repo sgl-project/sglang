@@ -59,10 +59,10 @@ class DetokenizerManager:
         # Init inter-process communication
         context = zmq.Context(2)
         self.recv_from_scheduler = context.socket(zmq.PULL)
-        self.recv_from_scheduler.bind(f"tcp://127.0.0.1:{port_args.detokenizer_port}")
+        self.recv_from_scheduler.bind(f"ipc://{port_args.detokenizer_ipc_name}")
 
         self.send_to_tokenizer = context.socket(zmq.PUSH)
-        self.send_to_tokenizer.connect(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
+        self.send_to_tokenizer.connect(f"ipc://{port_args.tokenizer_ipc_name}")
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = None

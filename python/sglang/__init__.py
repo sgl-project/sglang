@@ -1,6 +1,7 @@
 # SGL API Components
 
 from sglang.api import (
+    Engine,
     Runtime,
     assistant,
     assistant_begin,
@@ -31,6 +32,7 @@ from sglang.lang.choices import (
 # SGLang DSL APIs
 __all__ = [
     "Runtime",
+    "Engine",
     "assistant",
     "assistant_begin",
     "assistant_end",

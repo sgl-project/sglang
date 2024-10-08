@@ -21,7 +21,8 @@ import logging
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import UpdateWeightReqInput
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import broadcast_pyobj, is_multimodal_model, set_random_seed
@@ -29,7 +30,9 @@ from sglang.srt.utils import broadcast_pyobj, is_multimodal_model, set_random_se
 logger = logging.getLogger(__name__)
 
 
-class ModelTpWorker:
+class TpModelWorker:
+    """A tensor parallel model worker."""
+
     def __init__(
         self,
         gpu_id: int,
@@ -108,13 +111,15 @@ class ModelTpWorker:
             self.random_seed,
         )
 
-    def forward_batch_generation(self, input_metadata: InputMetadata, batch):
-        logits_output = self.model_runner.forward(input_metadata)
-        next_token_ids = self.model_runner.sample(logits_output, batch)
+    def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        logits_output = self.model_runner.forward(forward_batch)
+        next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         return logits_output, next_token_ids
 
-    def forward_batch_embedding(self, input_metadata: InputMetadata):
-        logits_output = self.model_runner.forward(input_metadata)
+    def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        logits_output = self.model_runner.forward(forward_batch)
         embeddings = logits_output.embeddings.tolist()
         return embeddings
 

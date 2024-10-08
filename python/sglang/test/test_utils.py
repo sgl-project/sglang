@@ -23,13 +23,13 @@ from sglang.srt.utils import kill_child_process
 from sglang.utils import get_exception_traceback
 
 DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
-DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Meta-Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Meta-Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
@@ -85,7 +85,7 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None
 
 
 def call_generate_outlines(
-    prompt, temperature, max_tokens, stop=[], regex=None, n=1, url=None
+    prompt, temperature, max_tokens, stop=None, regex=None, n=1, url=None
 ):
     assert url is not None
 
@@ -514,7 +514,16 @@ def get_similarities(vec1, vec2):
     return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)
 
 
-def run_bench_serving(model, num_prompts, request_rate, other_server_args):
+def run_bench_serving(
+    model,
+    num_prompts,
+    request_rate,
+    other_server_args,
+    dataset_name="random",
+    random_input_len=4096,
+    random_output_len=2048,
+    disable_stream=False,
+):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -530,21 +539,21 @@ def run_bench_serving(model, num_prompts, request_rate, other_server_args):
         base_url=base_url,
         host=None,
         port=None,
-        dataset_name="random",
+        dataset_name=dataset_name,
         dataset_path="",
         model=None,
         tokenizer=None,
         num_prompts=num_prompts,
         sharegpt_output_len=None,
-        random_input_len=4096,
-        random_output_len=2048,
+        random_input_len=random_input_len,
+        random_output_len=random_output_len,
         random_range_ratio=0.0,
         request_rate=request_rate,
         multi=None,
         seed=0,
         output_file=None,
         disable_tqdm=False,
-        disable_stream=False,
+        disable_stream=disable_stream,
         disable_ignore_eos=False,
         extra_request_body=None,
     )

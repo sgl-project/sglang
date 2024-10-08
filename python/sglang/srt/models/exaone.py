@@ -40,7 +40,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class ExaoneGatedMLP(nn.Module):
@@ -162,12 +162,12 @@ class ExaoneAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, input_metadata)
+        attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.out_proj(attn_output)
         return output
 
@@ -220,7 +220,7 @@ class ExaoneDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -232,7 +232,7 @@ class ExaoneDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
 
         # Fully Connected
@@ -270,7 +270,7 @@ class ExaoneModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
@@ -283,7 +283,7 @@ class ExaoneModel(nn.Module):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                input_metadata,
+                forward_batch,
                 residual,
             )
         hidden_states, _ = self.ln_f(hidden_states, residual)
@@ -309,14 +309,14 @@ class ExaoneForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> LogitsProcessorOutput:
         hidden_states = self.transformer(
-            input_ids, positions, input_metadata, input_embeds
+            input_ids, positions, forward_batch, input_embeds
         )
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
