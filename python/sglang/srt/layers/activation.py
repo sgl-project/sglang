@@ -148,6 +148,6 @@ def get_act_fn(
 
 if not is_flashinfer_available():
     logger.info(
-        "FlashInfer is not available on Non-NV GPUs. Fallback to other kernel libraries."
+        "FlashInfer is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
