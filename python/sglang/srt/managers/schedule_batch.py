@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +13,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Meta data for requests and batches"""
+"""
+Store information about requests and batches.
+
+The following is the flow of data structures for a batch:
+
+ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
+
+- ScheduleBatch is managed by `scheduler.py::Scheduler`.
+  It contains high-level scheduling data. Most of the data is on the CPU.
+- ModelWorkerBatch is managed by `tp_worker.py::TpModelWorker`.
+- ForwardBatch is managed by `model_runner.py::ModelRunner`.
+  It contains low-level tensor data. Most of the data consists of GPU tensors.
+"""
 
 import logging
 from dataclasses import dataclass
@@ -29,7 +39,7 @@ from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -105,6 +115,8 @@ class FINISH_ABORT(BaseFinishReason):
 
 @dataclass
 class ImageInputs:
+    """The image related inputs."""
+
     pixel_values: torch.Tensor
     image_hash: int
     image_sizes: Optional[list] = None
@@ -136,15 +148,15 @@ class ImageInputs:
         ]
         ret.image_sizes = obj["image_sizes"]
         # Only when pixel values is not None we have modalities
-        ret.modalities = obj["modalities"]
         ret.input_ids = obj["input_ids"]
         ret.image_input_idx = obj["image_input_idx"]
         ret.image_masks = obj["image_masks"]
+        ret.modalities = obj["modalities"] or ["image"]
         return ret
 
 
 class Req:
-    """Store all inforamtion of a request."""
+    """The input and output status of a request."""
 
     def __init__(
         self,
@@ -400,28 +412,32 @@ class ScheduleBatch:
     sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
-    input_ids: torch.Tensor = None
-    req_pool_indices: torch.Tensor = None
-    seq_lens: torch.Tensor = None
-    position_ids_offsets: torch.Tensor = None
+    input_ids: List[int] = None
+    req_pool_indices: List[int] = None
+    seq_lens: List[int] = None
     out_cache_loc: torch.Tensor = None
-    extend_num_tokens: int = None
-
-    # For mixed chunekd prefill
-    prefix_lens_cpu: List[int] = None
-    running_bs: int = None
 
     # For processing logprobs
     return_logprob: bool = False
-    top_logprobs_nums: List[int] = None
+    top_logprobs_nums: Optional[List[int]] = None
+
+    # For extend and mixed chunekd prefill
+    prefix_lens: List[int] = None
+    extend_lens: List[int] = None
+    extend_num_tokens: int = None
+    running_bs: int = None
 
     # Stream
     has_stream: bool = False
+
+    # Has regex
+    has_regex: bool = False
 
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
         return_logprob = any(req.return_logprob for req in reqs)
         has_stream = any(req.stream for req in reqs)
+        has_regex = any(req.regex_fsm for req in reqs)
 
         return cls(
             reqs=reqs,
@@ -430,6 +446,7 @@ class ScheduleBatch:
             tree_cache=tree_cache,
             return_logprob=return_logprob,
             has_stream=has_stream,
+            has_regex=has_regex,
         )
 
     def batch_size(self):
@@ -473,12 +490,12 @@ class ScheduleBatch:
         seq_lens = []
 
         # Allocate memory
-        req_pool_indices_cpu = self.alloc_req_slots(bs)
+        req_pool_indices = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
         pt = 0
         for i, req in enumerate(reqs):
-            req.req_pool_idx = req_pool_indices_cpu[i]
+            req.req_pool_idx = req_pool_indices[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
             assert seq_len - pre_len == req.extend_input_len
@@ -504,22 +521,20 @@ class ScheduleBatch:
             pt += req.extend_input_len
 
         # Set fields
-        with torch.device("cuda"):
+        with out_cache_loc.device:
             self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
-            self.req_pool_indices = torch.tensor(req_pool_indices_cpu)
-            self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
-            self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int64)
+            self.req_pool_indices = torch.tensor(req_pool_indices)
+            self.seq_lens = torch.tensor(seq_lens)
 
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
-        self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
-        self.prefix_lens_cpu = [len(r.prefix_indices) for r in reqs]
-        self.extend_lens_cpu = [r.extend_input_len for r in reqs]
-        self.extend_logprob_start_lens_cpu = [r.extend_logprob_start_len for r in reqs]
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
+        if self.return_logprob:
+            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+        self.prefix_lens = [len(r.prefix_indices) for r in reqs]
+        self.extend_lens = [r.extend_input_len for r in reqs]
+        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
 
-    def get_input_metadata(self):
-        return InputMetadata.from_schedule_batch(self)
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
@@ -533,20 +548,20 @@ class ScheduleBatch:
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
         extend_num_tokens = self.extend_num_tokens + running_bs
 
-        self.merge(running_batch)
+        self.merge_batch(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
         self.extend_num_tokens = extend_num_tokens
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        self.prefix_lens_cpu.extend(
+        self.prefix_lens.extend(
             [
                 len(r.origin_input_ids) + len(r.output_ids) - 1
                 for r in running_batch.reqs
             ]
         )
-        self.extend_lens_cpu.extend([1] * running_bs)
-        self.extend_logprob_start_lens_cpu.extend([0] * running_bs)
+        self.extend_lens.extend([1] * running_bs)
+        self.extend_logprob_start_lens.extend([0] * running_bs)
 
     def check_decode_mem(self):
         bs = len(self.reqs)
@@ -638,7 +653,7 @@ class ScheduleBatch:
 
         return retracted_reqs, new_estimate_ratio
 
-    def check_for_jump_forward(self, model_runner):
+    def check_for_jump_forward(self, pad_input_ids_func):
         jump_forward_reqs = []
         filter_indices = [i for i in range(len(self.reqs))]
 
@@ -695,7 +710,7 @@ class ScheduleBatch:
 
                     # re-applying image padding
                     if req.image_inputs is not None:
-                        req.origin_input_ids = model_runner.model.pad_input_ids(
+                        req.origin_input_ids = pad_input_ids_func(
                             req.origin_input_ids_unpadded, req.image_inputs
                         )
 
@@ -715,7 +730,9 @@ class ScheduleBatch:
                 for r in self.reqs
             ]
 
-        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
+        self.input_ids = torch.tensor(
+            input_ids, dtype=torch.int32, device=self.seq_lens.device
+        )
         self.seq_lens.add_(1)
 
         # Alloc mem
@@ -737,33 +754,110 @@ class ScheduleBatch:
             return
 
         self.reqs = [self.reqs[i] for i in unfinished_indices]
-        new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cuda")
-        self.seq_lens = self.seq_lens[new_indices]
-        self.input_ids = None
+        new_indices = torch.tensor(
+            unfinished_indices, dtype=torch.int32, device=self.seq_lens.device
+        )
         self.req_pool_indices = self.req_pool_indices[new_indices]
-        self.position_ids_offsets = self.position_ids_offsets[new_indices]
+        self.seq_lens = self.seq_lens[new_indices]
         self.out_cache_loc = None
-        self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in unfinished_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
+        if self.return_logprob:
+            self.top_logprobs_nums = [
+                self.top_logprobs_nums[i] for i in unfinished_indices
+            ]
+        else:
+            self.top_logprobs_nums = None
+
         self.has_stream = any(req.stream for req in self.reqs)
+        self.has_regex = any(req.regex_fsm for req in self.reqs)
 
-        self.sampling_info.filter(unfinished_indices, new_indices)
+        self.sampling_info.filter_batch(unfinished_indices, new_indices)
 
-    def merge(self, other: "ScheduleBatch"):
+    def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
-        self.sampling_info.merge(other.sampling_info)
+        self.sampling_info.merge_batch(other.sampling_info)
 
-        self.reqs.extend(other.reqs)
         self.req_pool_indices = torch.concat(
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
-        self.position_ids_offsets = torch.concat(
-            [self.position_ids_offsets, other.position_ids_offsets]
-        )
         self.out_cache_loc = None
-        self.top_logprobs_nums.extend(other.top_logprobs_nums)
-        self.return_logprob = any(req.return_logprob for req in self.reqs)
-        self.has_stream = any(req.stream for req in self.reqs)
+        if self.return_logprob and other.return_logprob:
+            self.top_logprobs_nums.extend(other.top_logprobs_nums)
+        elif self.return_logprob:
+            self.top_logprobs_nums.extend([0] * len(other.reqs))
+        elif other.return_logprob:
+            self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
+        self.reqs.extend(other.reqs)
+
+        self.return_logprob = self.return_logprob or other.return_logprob
+        self.has_stream = self.has_stream or other.has_stream
+        self.has_regex = self.has_regex or other.has_regex
+
+    def get_model_worker_batch(self):
+        if self.forward_mode.is_decode():
+            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = (
+                image_inputs
+            ) = None
+        else:
+            extend_seq_lens = self.extend_lens
+            extend_prefix_lens = self.prefix_lens
+            extend_logprob_start_lens = self.extend_logprob_start_lens
+            image_inputs = [r.image_inputs for r in self.reqs]
+
+        lora_paths = [req.lora_path for req in self.reqs]
+        if self.has_regex:
+            self.sampling_info.regex_fsms = [req.regex_fsm for req in self.reqs]
+            self.sampling_info.regex_fsm_states = [
+                req.regex_fsm_state for req in self.reqs
+            ]
+
+        return ModelWorkerBatch(
+            forward_mode=self.forward_mode,
+            input_ids=self.input_ids,
+            req_pool_indices=self.req_pool_indices,
+            seq_lens=self.seq_lens,
+            out_cache_loc=self.out_cache_loc,
+            return_logprob=self.return_logprob,
+            top_logprobs_nums=self.top_logprobs_nums,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_logprob_start_lens=extend_logprob_start_lens,
+            image_inputs=image_inputs,
+            lora_paths=lora_paths,
+            sampling_info=self.sampling_info,
+        )
+
+
+@dataclass
+class ModelWorkerBatch:
+    # The forward mode
+    forward_mode: ForwardMode
+    # The input ids
+    input_ids: torch.Tensor
+    # The indices of requests in the req_to_token_pool
+    req_pool_indices: torch.Tensor
+    # The sequence length
+    seq_lens: torch.Tensor
+    # The indices of output tokens in the token_to_kv_pool
+    out_cache_loc: torch.Tensor
+
+    # For logprob
+    return_logprob: bool
+    top_logprobs_nums: Optional[List[int]]
+
+    # For extend
+    extend_seq_lens: Optional[List[int]]
+    extend_prefix_lens: Optional[List[int]]
+    extend_logprob_start_lens: Optional[List[int]]
+
+    # For multimodal
+    image_inputs: Optional[List[ImageInputs]]
+
+    # For LoRA
+    lora_paths: Optional[List[str]]
+
+    # Sampling info
+    sampling_info: SamplingBatchInfo

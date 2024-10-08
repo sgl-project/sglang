@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
+from sglang.srt.constrained import RegexGuide
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -13,21 +14,23 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass
 class SamplingBatchInfo:
-    # Basic Info
-    vocab_size: int
-
     # Batched sampling params
-    temperatures: torch.Tensor = None
-    top_ps: torch.Tensor = None
-    top_ks: torch.Tensor = None
-    min_ps: torch.Tensor = None
+    temperatures: torch.Tensor
+    top_ps: torch.Tensor
+    top_ks: torch.Tensor
+    min_ps: torch.Tensor
 
     # Dispatch in CUDA graph
-    need_min_p_sampling: bool = False
+    need_min_p_sampling: bool
 
     # Bias Tensors
+    vocab_size: int
     logit_bias: torch.Tensor = None
     vocab_mask: torch.Tensor = None
+
+    # FSM states
+    regex_fsms: List[RegexGuide] = None
+    regex_fsm_states: List[int] = None
 
     # Penalizer
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
@@ -37,24 +40,30 @@ class SamplingBatchInfo:
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         reqs = batch.reqs
-        ret = cls(vocab_size=vocab_size)
-
-        with torch.device("cuda"):
-            ret.temperatures = torch.tensor(
+        with batch.input_ids.device:
+            temperatures = torch.tensor(
                 [r.sampling_params.temperature for r in reqs],
                 dtype=torch.float,
             ).view(-1, 1)
-            ret.top_ps = torch.tensor(
+            top_ps = torch.tensor(
                 [r.sampling_params.top_p for r in reqs], dtype=torch.float
             )
-            ret.top_ks = torch.tensor(
+            top_ks = torch.tensor(
                 [r.sampling_params.top_k for r in reqs], dtype=torch.int
             )
-            ret.min_ps = torch.tensor(
+            min_ps = torch.tensor(
                 [r.sampling_params.min_p for r in reqs], dtype=torch.float
             )
 
-        ret.need_min_p_sampling = any(r.sampling_params.min_p > 0 for r in reqs)
+        ret = cls(
+            temperatures=temperatures,
+            top_ps=top_ps,
+            top_ks=top_ks,
+            min_ps=min_ps,
+            need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+            vocab_size=vocab_size,
+        )
+        # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
@@ -102,24 +111,24 @@ class SamplingBatchInfo:
                         )
                     self.linear_penalties = penalizer.apply(self.linear_penalties)
 
-    def update_regex_vocab_mask(self, batch: ScheduleBatch):
-        has_regex = any(req.regex_fsm is not None for req in batch.reqs)
+    def update_regex_vocab_mask(self):
+        has_regex = self.regex_fsms and any(regex_fsm for regex_fsm in self.regex_fsms)
 
         # Reset the vocab mask
         self.vocab_mask = None
 
         if has_regex:
             self.vocab_mask = torch.zeros(
-                batch.batch_size(), self.vocab_size, dtype=torch.bool, device="cuda"
+                len(self.temperatures), self.vocab_size, dtype=torch.bool, device="cuda"
             )
-            for i, req in enumerate(batch.reqs):
-                if req.regex_fsm is not None:
+            for i, regex_fsm in enumerate(self.regex_fsms):
+                if regex_fsm is not None:
                     self.vocab_mask[i].fill_(1)
                     self.vocab_mask[i][
-                        req.regex_fsm.get_next_instruction(req.regex_fsm_state).tokens
+                        regex_fsm.get_next_instruction(self.regex_fsm_states[i]).tokens
                     ] = 0
 
-    def filter(self, unfinished_indices: List[int], new_indices: torch.Tensor):
+    def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
         self.penalizer_orchestrator.filter(unfinished_indices, new_indices)
 
         for item in [
@@ -129,9 +138,9 @@ class SamplingBatchInfo:
             "min_ps",
             "logit_bias",
         ]:
-            self_val = getattr(self, item, None)
-            if self_val is not None:  # logit_bias can be None
-                setattr(self, item, self_val[new_indices])
+            value = getattr(self, item, None)
+            if value is not None:  # logit_bias can be None
+                setattr(self, item, value[new_indices])
 
     @staticmethod
     def merge_bias_tensor(
@@ -153,7 +162,7 @@ class SamplingBatchInfo:
 
         return None
 
-    def merge(self, other: "SamplingBatchInfo"):
+    def merge_batch(self, other: "SamplingBatchInfo"):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         for item in [

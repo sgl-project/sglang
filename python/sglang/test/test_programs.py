@@ -72,7 +72,7 @@ def test_select(check_answer):
         statement="The capital of Germany is Berlin.",
     )
     if check_answer:
-        assert ret["answer"] == "True", ret.text
+        assert ret["answer"] == "True", ret.text()
     else:
         assert ret["answer"] in ["True", "False", "Unknown"]
 
@@ -80,7 +80,7 @@ def test_select(check_answer):
         statement="The capital of Canada is Tokyo.",
     )
     if check_answer:
-        assert ret["answer"] == "False", ret.text
+        assert ret["answer"] == "False", ret.text()
     else:
         assert ret["answer"] in ["True", "False", "Unknown"]
 
@@ -88,7 +88,7 @@ def test_select(check_answer):
         statement="Purple is a better color than green.",
     )
     if check_answer:
-        assert ret["answer"] == "Unknown", ret.text
+        assert ret["answer"] == "Unknown", ret.text()
     else:
         assert ret["answer"] in ["True", "False", "Unknown"]
 
@@ -100,8 +100,8 @@ def test_decode_int():
         s += "The number of days in a year is " + sgl.gen_int("days") + "\n"
 
     ret = decode_int.run(temperature=0.1)
-    assert int(ret["hours"]) == 24, ret.text
-    assert int(ret["days"]) == 365, ret.text
+    assert int(ret["hours"]) == 24, ret.text()
+    assert int(ret["days"]) == 365, ret.text()
 
 
 def test_decode_json_regex():
@@ -517,3 +517,36 @@ def test_hellaswag_select():
     accuracy = np.mean(np.array(preds) == np.array(labels))
 
     return accuracy, latency
+
+
+def test_gen_min_new_tokens():
+    """
+    Validate sgl.gen(min_tokens) functionality.
+
+    The test asks a question where, without a min_tokens constraint, the generated answer is expected to be short.
+    By enforcing the min_tokens parameter, we ensure the generated answer has at least the specified number of tokens.
+    We verify that the number of tokens in the answer is >= the min_tokens threshold.
+    """
+    import sglang as sgl
+    from sglang.srt.hf_transformers_utils import get_tokenizer
+
+    model_path = sgl.global_config.default_backend.endpoint.get_model_name()
+    MIN_TOKENS, MAX_TOKENS = 64, 128
+
+    @sgl.function
+    def convo_1(s):
+        s += sgl.user("What is the capital of the United States?")
+        s += sgl.assistant(
+            sgl.gen("answer", min_tokens=MIN_TOKENS, max_tokens=MAX_TOKENS)
+        )
+
+    def assert_min_tokens(tokenizer, text):
+        token_ids = tokenizer.encode(text)
+        assert (
+            len(token_ids) >= MIN_TOKENS
+        ), f"Generated {len(token_ids)} tokens, min required: {MIN_TOKENS}. Text: {text}"
+
+    tokenizer = get_tokenizer(model_path)
+
+    state = convo_1.run()
+    assert_min_tokens(tokenizer, state["answer"])

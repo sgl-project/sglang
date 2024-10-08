@@ -17,6 +17,7 @@ limitations under the License.
 
 import base64
 import ipaddress
+import json
 import logging
 import os
 import pickle
@@ -24,6 +25,7 @@ import random
 import resource
 import socket
 import time
+import warnings
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Union
@@ -36,6 +38,7 @@ import torch.distributed as dist
 from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
 from torch import nn
+from torch.profiler import ProfilerActivity, profile, record_function
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
@@ -50,9 +53,17 @@ show_time_cost = False
 time_infos = {}
 
 
-# torch flag AMD GPU
 def is_hip() -> bool:
+    """Return whether it is HIP on the AMD ROCm platform."""
     return torch.version.hip is not None
+
+
+def is_flashinfer_available():
+    """
+    Check whether flashinfer is available.
+    As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
+    """
+    return torch.cuda.is_available() and not is_hip()
 
 
 def is_ipv6(address):
@@ -175,35 +186,6 @@ def is_port_available(port):
             return True
         except socket.error:
             return False
-
-
-def allocate_init_ports(
-    port: Optional[int] = None,
-    additional_ports: Optional[List[int]] = None,
-    dp_size: int = 1,
-):
-    """Allocate ports for all connections."""
-    if additional_ports:
-        ret_ports = [port] + additional_ports
-    else:
-        ret_ports = [port]
-
-    ret_ports = list(set(x for x in ret_ports if is_port_available(x)))
-    cur_port = ret_ports[-1] + 1 if len(ret_ports) > 0 else 10000
-
-    # HTTP + Tokenizer + Controller + Detokenizer + dp_size * 1 (nccl)
-    num_ports_needed = 4 + dp_size
-    while len(ret_ports) < num_ports_needed:
-        if cur_port not in ret_ports and is_port_available(cur_port):
-            ret_ports.append(cur_port)
-        cur_port += 1
-
-    if port is not None and ret_ports[0] != port:
-        logger.warning(
-            f"WARNING: Port {port} is not available. Use port {ret_ports[0]} instead."
-        )
-
-    return ret_ports[0], ret_ports[1:num_ports_needed]
 
 
 def is_multimodal_model(model_architectures):
@@ -354,6 +336,10 @@ def suppress_other_loggers():
     )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
     logging.getLogger("vllm.utils").setLevel(logging.ERROR)
+
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, message="The given NumPy array is not writable"
+    )
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
@@ -624,7 +610,9 @@ def set_weight_attrs(
 
 
 def broadcast_pyobj(
-    data: List[Any], rank: int, dist_group: torch.distributed.ProcessGroup
+    data: List[Any],
+    rank: int,
+    dist_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
 
@@ -635,7 +623,9 @@ def broadcast_pyobj(
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
-            tensor_data = torch.ByteTensor(list(serialized_data))
+            tensor_data = torch.ByteTensor(
+                np.frombuffer(serialized_data, dtype=np.uint8)
+            )
             tensor_size = torch.tensor([size], dtype=torch.long)
 
             dist.broadcast(tensor_size, src=0, group=dist_group)
@@ -652,6 +642,37 @@ def broadcast_pyobj(
         tensor_data = torch.empty(size, dtype=torch.uint8)
         dist.broadcast(tensor_data, src=0, group=dist_group)
 
-        serialized_data = bytes(tensor_data.tolist())
+        serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
         return data
+
+
+step_counter = 0
+
+
+def pytorch_profile(name, func, *args, data_size=-1):
+    """
+    Args:
+        name (string): the name of recorded function.
+        func: the function to be profiled.
+        args: the arguments of the profiled function.
+        data_size (int): some measurement of the computation complexity.
+            Usually, it could be the batch size.
+    """
+    global step_counter
+    os.makedirs("trace", exist_ok=True)
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+        # on_trace_ready=tensorboard_trace_handler('./log_dir'),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    ) as prof:
+        with record_function(name):
+            with open(f"trace/size_{step_counter}.json", "w") as f:
+                json.dump({"size": data_size}, f)
+            result = func(*args)
+    prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
+    step_counter += 1
+    return result

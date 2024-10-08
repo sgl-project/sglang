@@ -499,7 +499,7 @@ class TestOpenAIServer(unittest.TestCase):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
-            model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+            model="meta-llama/Llama-3.1-8B-Instruct",
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant"},
                 {

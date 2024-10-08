@@ -47,6 +47,7 @@ I'm going to the park
 import argparse
 import dataclasses
 import itertools
+import json
 import logging
 import multiprocessing
 import os
@@ -62,10 +63,11 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server import _set_envs_and_config
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
     kill_child_process,
@@ -121,7 +123,7 @@ class BenchArgs:
         )
 
 
-def load_model(server_args, tp_rank):
+def load_model(server_args, port_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
@@ -129,6 +131,7 @@ def load_model(server_args, tp_rank):
         server_args.model_path,
         server_args.trust_remote_code,
         context_length=server_args.context_length,
+        model_override_args=json.loads(server_args.json_model_override_args),
     )
     model_runner = ModelRunner(
         model_config=model_config,
@@ -136,7 +139,7 @@ def load_model(server_args, tp_rank):
         gpu_id=tp_rank,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
-        nccl_port=28888,
+        nccl_port=port_args.nccl_ports[0],
         server_args=server_args,
     )
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
@@ -225,30 +228,33 @@ def extend(reqs, model_runner):
         tree_cache=None,
     )
     batch.prepare_for_extend(model_runner.model_config.vocab_size)
-    input_metadata = batch.get_input_metadata()
-    logits_output = model_runner.forward(input_metadata)
-    next_token_ids = model_runner.sample(logits_output, batch).tolist()
+    model_worker_batch = batch.get_model_worker_batch()
+    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    logits_output = model_runner.forward(forward_batch)
+    next_token_ids = model_runner.sample(logits_output, forward_batch).tolist()
     return next_token_ids, logits_output.next_token_logits, batch
 
 
 def decode(input_token_ids, batch, model_runner):
     batch.prepare_for_decode(input_token_ids)
-    input_metadata = batch.get_input_metadata()
-    logits_output = model_runner.forward(input_metadata)
-    next_token_ids = model_runner.sample(logits_output, batch).tolist()
+    model_worker_batch = batch.get_model_worker_batch()
+    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    logits_output = model_runner.forward(forward_batch)
+    next_token_ids = model_runner.sample(logits_output, forward_batch).tolist()
     return next_token_ids, logits_output.next_token_logits
 
 
 @torch.inference_mode()
 def correctness_test(
     server_args,
+    port_args,
     bench_args,
     tp_rank,
 ):
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
 
     # Prepare inputs
     input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
@@ -334,13 +340,16 @@ def latency_test_run_once(
             rank_print(
                 f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
-    med_decode_latency = np.median(decode_latencies)
-    med_decode_throughput = batch_size / med_decode_latency
-    rank_print(
-        f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
-    )
-    measurement_results["median_decode_latency"] = med_decode_latency
-    measurement_results["median_decode_throughput"] = med_decode_throughput
+
+    # record decode timing from 2nd output
+    if output_len > 1:
+        med_decode_latency = np.median(decode_latencies)
+        med_decode_throughput = batch_size / med_decode_latency
+        rank_print(
+            f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
+        )
+        measurement_results["median_decode_latency"] = med_decode_latency
+        measurement_results["median_decode_throughput"] = med_decode_throughput
 
     throughput = (input_len + output_len) * batch_size / tot_latency
     rank_print(
@@ -353,15 +362,15 @@ def latency_test_run_once(
 
 def latency_test(
     server_args,
+    port_args,
     bench_args,
     tp_rank,
 ):
     configure_logger(server_args, prefix=f" TP{tp_rank}")
-    _set_envs_and_config(server_args)
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
@@ -377,7 +386,7 @@ def latency_test(
         reqs,
         bench_args.batch_size[0],
         bench_args.input_len[0],
-        4,  # shorter decoding to speed up the warmup
+        8,  # shorter decoding to speed up the warmup
     )
     rank_print("Benchmark ...")
 
@@ -463,6 +472,7 @@ def plot_latency_test(
 
 
 def main(server_args, bench_args):
+    _set_envs_and_config(server_args)
 
     if server_args.model_path:
         if bench_args.correctness_test:
@@ -478,8 +488,10 @@ def main(server_args, bench_args):
             "provide --result-filename for plotting the results"
         )
 
+    port_args = PortArgs.init_new(server_args)
+
     if server_args.tp_size == 1:
-        work_func(server_args, bench_args, 0)
+        work_func(server_args, port_args, bench_args, 0)
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
@@ -487,6 +499,7 @@ def main(server_args, bench_args):
                 target=work_func,
                 args=(
                     server_args,
+                    port_args,
                     bench_args,
                     tp_rank,
                 ),
@@ -512,8 +525,6 @@ if __name__ == "__main__":
         level=getattr(logging, server_args.log_level.upper()),
         format="%(message)s",
     )
-
-    multiprocessing.set_start_method("spawn", force=True)
 
     try:
         main(server_args, bench_args)

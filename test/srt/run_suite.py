@@ -7,7 +7,7 @@ suites = {
     "minimal": [
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
-        # "models/test_lora.py",
+        "models/test_lora.py",
         "models/test_reward_models.py",
         "sampling/penaltylib",
         "test_chunked_prefill.py",
@@ -19,6 +19,7 @@ suites = {
         "test_pytorch_sampling_backend.py",
         "test_server_args.py",
         "test_skip_tokenizer_init.py",
+        "test_srt_engine.py",
         "test_srt_endpoint.py",
         "test_torch_compile.py",
         "test_torchao.py",

@@ -19,9 +19,10 @@ import argparse
 import dataclasses
 import logging
 import random
-from typing import List, Optional, Union
+import tempfile
+from typing import List, Optional
 
-from sglang.srt.utils import is_hip, is_ipv6
+from sglang.srt.utils import is_flashinfer_available, is_ipv6, is_port_available
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,6 @@ class ServerArgs:
     # Port
     host: str = "127.0.0.1"
     port: int = 30000
-    additional_ports: Optional[Union[List[int], int]] = None
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -134,11 +134,6 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
-        if isinstance(self.additional_ports, int):
-            self.additional_ports = [self.additional_ports]
-        elif self.additional_ports is None:
-            self.additional_ports = []
-
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
@@ -156,8 +151,7 @@ class ServerArgs:
             )
             self.sampling_backend = "pytorch"
 
-        # ROCm: flashinfer available later
-        if is_hip():
+        if not is_flashinfer_available():
             self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
 
@@ -198,13 +192,6 @@ class ServerArgs:
         )
         parser.add_argument(
             "--port", type=int, default=ServerArgs.port, help="The port of the server."
-        )
-        parser.add_argument(
-            "--additional-ports",
-            type=int,
-            nargs="*",
-            default=[],
-            help="The additional ports specified for the server.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -279,7 +266,6 @@ class ServerArgs:
                 "marlin",
                 "gptq_marlin",
                 "awq_marlin",
-                "squeezellm",
                 "bitsandbytes",
             ],
             help="The quantization method.",
@@ -594,6 +580,16 @@ class ServerArgs:
             "Please use sglang<=0.3.2 or wait for later updates."
         )
 
+        if isinstance(self.lora_paths, list):
+            lora_paths = self.lora_paths
+            self.lora_paths = {}
+            for lora_path in lora_paths:
+                if "=" in lora_path:
+                    name, path = lora_path.split("=", 1)
+                    self.lora_paths[name] = path
+                else:
+                    self.lora_paths[lora_path] = lora_path
+
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
@@ -615,14 +611,30 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 @dataclasses.dataclass
 class PortArgs:
-    # The port for tokenizer to receive inputs from detokenizer (zmq)
-    tokenizer_port: int
-    # The port for scheduler to receive inputs from tokenizer (zmq)
-    scheduler_port: int
-    # The port for detokenizer to receive inputs from scheduler (zmq)
-    detokenizer_port: int
+    # The ipc filename for tokenizer to receive inputs from detokenizer (zmq)
+    tokenizer_ipc_name: str
+    # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
+    scheduler_input_ipc_name: str
+    # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
+    detokenizer_ipc_name: str
+
     # The port for nccl initialization for multiple TP groups (torch.dist)
     nccl_ports: List[int]
+
+    @classmethod
+    def init_new(self, server_args):
+        port = server_args.port + 1
+        while True:
+            if is_port_available(port):
+                break
+            port += 1
+
+        return PortArgs(
+            tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
+            scheduler_input_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
+            detokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
+            nccl_ports=[port],
+        )
 
 
 class LoRAPathAction(argparse.Action):

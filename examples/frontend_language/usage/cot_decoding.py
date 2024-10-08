@@ -108,7 +108,7 @@ def cot_decoding(s, question, get_top_k, is_chat_model, verbose):
 sgl.set_default_backend(sgl.RuntimeEndpoint("http://localhost:30000"))
 
 state = cot_decoding.run(
-    question=r"Claire makes a 3 egg omelet every morning for breakfast. How many dozens of eggs will she eat in 4  weeks?",
+    question=r"Claire makes a 3 egg omelet every morning for breakfast. How many dozens of eggs will she eat in 4 weeks?",
     get_top_k=10,
     is_chat_model=True,
     verbose=False,
