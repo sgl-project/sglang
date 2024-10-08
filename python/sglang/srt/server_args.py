@@ -21,7 +21,7 @@ import logging
 import random
 from typing import List, Optional, Union
 
-from sglang.srt.utils import flashinfer_is_available, is_hip, is_ipv6
+from sglang.srt.utils import is_flashinfer_available, is_hip, is_ipv6
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +158,7 @@ class ServerArgs:
             self.sampling_backend = "pytorch"
 
         # ROCm: flashinfer available later
-        if not flashinfer_is_available():
+        if not is_flashinfer_available():
             self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
 

@@ -21,9 +21,9 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from sglang.srt.utils import flashinfer_is_available
+from sglang.srt.utils import is_flashinfer_available
 
-if flashinfer_is_available():
+if is_flashinfer_available():
     from flashinfer.norm import (
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
@@ -119,7 +119,7 @@ class GemmaRMSNorm(CustomOp):
         return out
 
 
-if not flashinfer_is_available():
+if not is_flashinfer_available():
     logger.info(
         "FlashInfer is not available on Non-NV platforms. Fallback to other kernel libraries."
     )

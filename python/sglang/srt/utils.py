@@ -55,8 +55,9 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
-def flashinfer_is_available():
+def is_flashinfer_available():
     return torch.cuda.is_available() and not is_hip()
+
 
 def is_ipv6(address):
     try:

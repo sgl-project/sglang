@@ -23,13 +23,11 @@ import torch
 
 from sglang.srt.lora.lora import LoRAAdapter, get_lora_layer
 from sglang.srt.lora.lora_config import LoRAConfig
-
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import flashinfer_is_available, replace_submodule
-
+from sglang.srt.utils import is_flashinfer_available, replace_submodule
 
 # ROCm: flashinfer available later
-if flashinfer_is_available():
+if is_flashinfer_available():
     from flashinfer import SegmentGEMMWrapper
 
 
