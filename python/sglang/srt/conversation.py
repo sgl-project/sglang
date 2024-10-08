@@ -72,6 +72,7 @@ class Conversation:
     stop_str: Union[str, List[str]] = None
     image_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
+    image_token_str: Optional[str] = None
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -334,6 +335,7 @@ class Conversation:
             sep=self.sep,
             sep2=self.sep2,
             stop_str=self.stop_str,
+            image_token_str=self.image_token_str,
         )
 
     def dict(self):
@@ -381,6 +383,7 @@ def generate_chat_conv(
         stop_str=conv.stop_str,
         image_data=[],
         modalities=[],
+        image_token_str=conv.image_token_str,
     )
 
     if isinstance(request.messages, str):
@@ -412,16 +415,15 @@ def generate_chat_conv(
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
                 if num_image_url > 1:
-                    image_token = "<image>"
+                    image_token = conv.image_token_str
                 else:
-                    image_token = "<image>\n"
+                    image_token = conv.image_token_str + "\n"
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
                             real_content += "\n"  # for video
                         real_content += content.text
                     elif content.type == "image_url":
-                        # NOTE: Only works for llava
                         real_content += image_token
                         conv.append_image(content.image_url.url)
                 conv.append_message(conv.roles[0], real_content)
@@ -485,6 +487,7 @@ register_conv_template(
         sep_style=SeparatorStyle.CHATML,
         sep="<|im_end|>",
         stop_str=["<|endoftext|>", "<|im_end|>"],
+        image_token_str="<image>",
     )
 )
 
@@ -509,6 +512,7 @@ register_conv_template(
         sep_style=SeparatorStyle.LLAMA3,
         sep="",
         stop_str=["<|end_of_text|>", "<|eot_id|>"],
+        image_token_str="<image>",
     )
 )
 # Reference: https://github.com/InternLM/lmdeploy/blob/387bf54b4f124e72aab30ae9755f562e435d3d01/lmdeploy/model.py#L425-L442
@@ -519,5 +523,16 @@ register_conv_template(
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         sep="\n",
         stop_str=["<|im_end|>", "<|action_end|>"],
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="molmo",
+        system_template="",
+        roles=("User", "Assistant"),
+        sep=" ",
+        stop_str=["<|endoftext|>"],
+        image_token_str="",
     )
 )

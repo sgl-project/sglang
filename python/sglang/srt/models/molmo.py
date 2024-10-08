@@ -12,7 +12,7 @@ from PIL import Image
 from transformers import AutoModelForCausalLM, AutoProcessor, PretrainedConfig
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import QuickGELU
+from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -20,7 +20,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -202,6 +201,7 @@ class VisionTransformer(nn.Module):
         self.patch_embedding = nn.Linear(
             config.image_patch_size * config.image_patch_size * 3,
             config.image_emb_dim,
+            bias=False,
         )
         self.transformer = BlockCollection(config)
         self.pre_ln = nn.LayerNorm(config.image_emb_dim, eps=config.image_norm_eps)
@@ -360,7 +360,7 @@ class MolmoMLP(nn.Module):
         self.intermediate_size = config.intermediate_size // 2
         self.gate_up_proj = MergedColumnParallelLinear(
             input_dim or config.hidden_size,
-            [self.intermediate_size, self.intermediate_size],
+            [self.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
         )
@@ -580,10 +580,9 @@ class MolmoVisionBackbone(nn.Module):
             dw=2,
         )
 
-        query = image_features.mean(-2, keepdim=True).to(dtype=torch.float16)
-        image_features = self.image_pooling_2d(
-            query, image_features.to(dtype=torch.float16)
-        )
+        # NOTE(chris): to float16?
+        query = image_features.mean(-2, keepdim=True)
+        image_features = self.image_pooling_2d(query, image_features)
 
         h, w = self.llm_patches_per_crop
         image_features = image_features.reshape(batch_size, num_images, h * w, -1)
@@ -618,7 +617,11 @@ class MolmoForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
-        return input_ids
+        if image_inputs is not None and image_inputs.input_ids is not None:
+            print(image_inputs.input_ids.tolist())
+            return image_inputs.input_ids.tolist()
+        else:
+            return input_ids
 
     def forward(
         self,
@@ -846,15 +849,15 @@ if __name__ == "__main__":
     #         "openai/clip-vit-large-patch14-336", torch_dtype=torch.float16
     #     )
     # breakpoint()
-    inputs = processor.process(
-        # images=[
-        #     Image.open(
-        #         requests.get("https://picsum.photos/id/237/536/354", stream=True).raw
-        #     )
-        # ],
-        text="Describe this image.",
-    )
-    print(inputs)
+    # inputs = processor.process(
+    #     images=[
+    #         Image.open(
+    #             requests.get("https://picsum.photos/id/237/536/354", stream=True).raw
+    #         )
+    #     ],
+    #     text="Describe this image.",
+    # )
+    # print(inputs)
     # qwen2config = Qwen2Config.from_pretrained("allenai/Molmo-7B-D-0924")
     # vision_config = MolmoVisionBackboneConfig()
     # model = MolmoModel(qwen2config, vision_config)
