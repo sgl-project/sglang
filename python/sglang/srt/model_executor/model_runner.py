@@ -136,9 +136,10 @@ class ModelRunner:
         )
         if self.device == "cuda":
             self.init_cublas()
+            self.init_attention_backend()
             self.init_cuda_graphs()
-
-        self.init_attention_backend()
+        else:
+            self.init_attention_backend()
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed  begin.")
