@@ -180,7 +180,6 @@ class CudaGraphRunner:
                     self.output_buffers[bs] = output_buffers
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
-        print(f"CUDA Graph begin capture_one_batch_size({bs})...")
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
 
@@ -214,15 +213,11 @@ class CudaGraphRunner:
             return forward(input_ids, forward_batch.positions, forward_batch)
 
         for _ in range(2):
-            print("CUDA Graph Debug:  Input prepared")
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
-            print("CUDA Graph Debug: before run_once")
             run_once()
-            print("CUDA Graph Debug: after run_once which mean model.forward is ok")
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
-            print("CUDA Graph Debug after sync and barrer after run_once")
         torch.cuda.synchronize()
         self.model_runner.tp_group.barrier()
 
@@ -233,7 +228,6 @@ class CudaGraphRunner:
         self.model_runner.tp_group.barrier()
 
         self.graph_memory_pool = graph.pool()
-        print("Finish capture_one_batch_size")
         return graph, out
 
     def replay(self, forward_batch: ForwardBatch):
