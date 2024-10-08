@@ -691,8 +691,9 @@ class Engine:
             lora_path=lora_path,
         )
 
-        # make it synchronous
-        return asyncio.run(generate_request(obj, None))
+        # get the current event loop
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(generate_request(obj, None))
 
     def shutdown(self):
         kill_child_process(os.getpid(), including_parent=False)
