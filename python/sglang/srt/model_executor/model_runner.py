@@ -72,7 +72,6 @@ class ModelRunner:
         self,
         model_config: ModelConfig,
         mem_fraction_static: float,
-        device: str,
         gpu_id: int,
         tp_rank: int,
         tp_size: int,
@@ -82,7 +81,7 @@ class ModelRunner:
         # Parse args
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
-        self.device = device
+        self.device = "cuda"
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
