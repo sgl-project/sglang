@@ -50,11 +50,9 @@ class TpModelWorker:
             context_length=server_args.context_length,
             model_override_args=json.loads(server_args.json_model_override_args),
         )
-        print(server_args)
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
-            device=server_args.device,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,

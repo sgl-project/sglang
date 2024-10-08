@@ -81,7 +81,7 @@ class ModelRunner:
         # Parse args
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
-        self.device = "cuda"
+        self.device = server_args.device
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
