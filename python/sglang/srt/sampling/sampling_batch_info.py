@@ -65,6 +65,7 @@ class SamplingBatchInfo:
             min_ps=min_ps,
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             vocab_size=vocab_size,
+            device=batch.input_ids.device,
         )
         # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
 
@@ -78,7 +79,7 @@ class SamplingBatchInfo:
         ret.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
             batch=batch,
-            device=batch.device,
+            device=batch.input_ids.device,
             Penalizers={
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,
