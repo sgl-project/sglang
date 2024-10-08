@@ -79,38 +79,39 @@ class MolmoMultiHeadDotProductAttention(nn.Module):
     def __init__(self, config: MolmoVisionBackboneConfig, num_vit_layers: int = 1):
         super().__init__()
         self.config = config
-        self.num_heads = config.image_num_heads
-        self.num_kv_heads = config.image_num_key_value_heads
+        self.hidden_size = config.image_emb_dim
+        self.total_num_heads = config.image_num_heads
+        self.total_num_kv_heads = config.image_num_key_value_heads
         self.head_dim = config.image_emb_dim // config.image_num_heads
         self.num_vit_layers = num_vit_layers
 
         self.wq = nn.Linear(
             config.image_emb_dim * num_vit_layers,
-            self.num_heads * self.head_dim,
-            bias=False,
+            self.total_num_heads * self.head_dim,
+            bias=True,
         )
         self.wk = nn.Linear(
             config.image_emb_dim * num_vit_layers,
-            self.num_kv_heads * self.head_dim,
-            bias=False,
+            self.total_num_kv_heads * self.head_dim,
+            bias=True,
         )
         self.wv = nn.Linear(
             config.image_emb_dim * num_vit_layers,
-            self.num_kv_heads * self.head_dim,
-            bias=False,
+            self.total_num_kv_heads * self.head_dim,
+            bias=True,
         )
         self.wo = nn.Linear(
-            self.num_heads * self.head_dim, config.image_emb_dim, bias=False
+            self.total_num_heads * self.head_dim, self.hidden_size, bias=True
         )
 
     def _split_heads(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states.reshape(
-            hidden_states.shape[:2] + (self.num_heads, self.head_dim)
+            hidden_states.shape[:2] + (self.total_num_heads, self.head_dim)
         )
 
     def _merge_heads(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states.reshape(
-            hidden_states.shape[:2] + (self.num_heads * self.head_dim,)
+            hidden_states.shape[:2] + (self.total_num_heads * self.head_dim,)
         )
 
     def forward(self, inputs_q: torch.Tensor, inputs_kv: torch.Tensor = None):
@@ -194,9 +195,11 @@ class VisionTransformer(nn.Module):
         self.scale = config.image_emb_dim**-0.5
         self.patch_num = config.image_num_patch
         self.num_prefix_tokens = 1
-        self.class_embedding = nn.Parameter(torch.randn(config.image_emb_dim))
+        self.class_embedding = nn.Parameter(
+            torch.randn(config.image_emb_dim) * self.scale
+        )
         self.positional_embedding = nn.Parameter(
-            torch.randn(config.image_num_pos, config.image_emb_dim)
+            torch.randn(config.image_num_pos, config.image_emb_dim) * self.scale
         )
         self.patch_embedding = nn.Linear(
             config.image_patch_size * config.image_patch_size * 3,
@@ -254,7 +257,12 @@ class VisionTransformer(nn.Module):
 
         # Expand the class embedding to batch size then concate along the patch dimension
         x = torch.cat(
-            [self._expand_token(self.class_embedding, x.shape[0]).to(x.device), x],
+            [
+                self._expand_token(self.class_embedding, x.shape[0]).to(
+                    x.device, x.dtype
+                ),
+                x,
+            ],
             dim=1,
         )
         x = self._add_pos_embed(x, patch_num)
@@ -548,6 +556,7 @@ class MolmoVisionBackbone(nn.Module):
         batch_size, num_images = images.shape[:2]
         image_features, cls_embed = self.encode_image(images)
 
+        og_dtype = image_features.dtype
         assert image_masks is not None
         pad_embed = self.pad_embed[:, None, None, None, :]
         all_pad = image_masks == 0
@@ -559,6 +568,8 @@ class MolmoVisionBackbone(nn.Module):
         image_features = image_features + pad_embed[1] * torch.unsqueeze(
             partial_pad, -1
         )
+
+        image_features = image_features.to(og_dtype)
 
         # Dropout was none
         image_features = image_features.reshape(

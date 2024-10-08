@@ -99,18 +99,31 @@ class TestMolmo(unittest.TestCase):
         with torch.no_grad():
             images = inputs["images"].unsqueeze(0).to("cuda")
             image_masks = inputs["image_masks"].unsqueeze(0).to("cuda")
+
+            hf_outputs_encode_image = model.model.vision_backbone.encode_image(
+                images=images
+            )
+            srt_outputs_encode_image = molmo_vision_backbone.encode_image(images=images)
+
+            assert torch.allclose(
+                hf_outputs_encode_image[0], srt_outputs_encode_image[0], atol=1e-5
+            ), "image_features are not all close"
+            assert torch.allclose(
+                hf_outputs_encode_image[1], srt_outputs_encode_image[1], atol=1e-5
+            ), "cls_embed are not all close"
+
             hf_outputs = model.model.vision_backbone(
                 images=images, image_masks=image_masks
             )
             srt_outputs = molmo_vision_backbone(images=images, image_masks=image_masks)
 
-        # Compare outputs
-        assert torch.allclose(
-            hf_outputs[0], srt_outputs[0], atol=1e-5
-        ), f"image_features are not all close: {hf_outputs[0].shape} {srt_outputs[0].shape}, hf_outputs[0]: {hf_outputs[0]}, srt_outputs[0]: {srt_outputs[0]}"
-        assert torch.allclose(
-            hf_outputs[1], srt_outputs[1], atol=1e-5
-        ), f"cls_embed are not all close: {hf_outputs[1].shape} {srt_outputs[1].shape}, hf_outputs[1]: {hf_outputs[1]}, srt_outputs[1]: {srt_outputs[1]}"
+            # Compare outputs
+            assert torch.allclose(
+                hf_outputs[0], srt_outputs[0], atol=1e-5
+            ), f"image_features are not all close: {hf_outputs[0].shape} {srt_outputs[0].shape}, hf_outputs[0]: {hf_outputs[0]}, srt_outputs[0]: {srt_outputs[0]}"
+            assert torch.allclose(
+                hf_outputs[1], srt_outputs[1], atol=1e-5
+            ), f"cls_embed are not all close: {hf_outputs[1].shape} {srt_outputs[1].shape}, hf_outputs[1]: {hf_outputs[1]}, srt_outputs[1]: {srt_outputs[1]}"
 
     def test_molmo_d(self):
         for text, images in CONVS:
