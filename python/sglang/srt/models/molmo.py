@@ -642,19 +642,6 @@ class MolmoForCausalLM(nn.Module):
         image_inputs = input_metadata.image_inputs
 
         if input_metadata.forward_mode.is_extend():
-            # NOTE(CHRIS): Copied from llava, use to check images, may need to change
-            # modalities_list = []
-            # max_image_offset = []
-            # for im in image_inputs:
-            #     if im and im.modalities is not None:
-            #         modalities_list.extend(im.modalities)
-            #     if im and im.image_offsets is not None:
-            #         max_image_offset.append(max(im.image_offsets))
-            #     else:
-            #         max_image_offset.append(-1)
-
-            # start_positions = positions[input_metadata.extend_start_loc].cpu().numpy()
-            # need_vision = start_positions <= np.array(max_image_offset)
             images = []
             image_masks = []
             image_input_idx = []
