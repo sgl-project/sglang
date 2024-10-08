@@ -621,8 +621,8 @@ class PortArgs:
     # The port for nccl initialization for multiple TP groups (torch.dist)
     nccl_ports: List[int]
 
-    @classmethod
-    def init_new(self, server_args):
+    @staticmethod
+    def init_new(server_args) -> "PortArgs":
         port = server_args.port + 1
         while True:
             if is_port_available(port):
