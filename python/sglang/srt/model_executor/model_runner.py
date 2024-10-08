@@ -189,18 +189,17 @@ class ModelRunner:
 
         # This can reduce thread conflicts and speed up weight loading.
         torch.set_num_threads(1)
-
-        if torch.cuda.get_device_capability()[0] < 8:
-            logger.info(
-                "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
-            )
-            self.server_args.dtype = "float16"
-            if torch.cuda.get_device_capability()[1] < 5:
-                raise RuntimeError("SGLang only supports sm75 and above.")
+        if self.device == "cuda":
+            if torch.cuda.get_device_capability()[0] < 8:
+                logger.info(
+                    "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
+                )
+                self.server_args.dtype = "float16"
+                if torch.cuda.get_device_capability()[1] < 5:
+                    raise RuntimeError("SGLang only supports sm75 and above.")
 
         # Prepare the vllm model config
         monkey_patch_vllm_dummy_weight_loader()
-        self.device_config = DeviceConfig()
         self.load_config = LoadConfig(load_format=self.server_args.load_format)
         self.vllm_model_config = VllmModelConfig(
             model=self.server_args.model_path,
@@ -222,7 +221,7 @@ class ModelRunner:
         self.model = get_model(
             model_config=self.vllm_model_config,
             load_config=self.load_config,
-            device_config=self.device_config,
+            device_config=DeviceConfig(self.device),
             parallel_config=None,
             scheduler_config=None,
             lora_config=None,
@@ -259,7 +258,7 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-        target_device = torch.device(self.device_config.device)
+        target_device = torch.device(self.device)
 
         try:
             # TODO: Use a better method to check this
