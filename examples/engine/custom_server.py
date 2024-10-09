@@ -1,28 +1,3 @@
-"""
-This example shows how to create a custom server on top of SGLang Engine. 
-Here we use Sanic as an example. The server supports non-streaming and streaming endpoints.
-
-1. Install sanic
-
-```
-pip install sanic
-```
-
-2. Run the server
-
-```
-python custom_server
-```
-
-3. Send requests!
-
-```
-curl -X POST http://localhost:8000/generate  -H "Content-Type: application/json"  -d '{"prompt": "Transformer architecture is..."}'
-curl -X POST http://localhost:8000/generate_stream  -H "Content-Type: application/json"  -d '{"prompt": "Transformer architecture is.."}' --no-buffer
-```
-
-"""
-
 from sanic import Sanic
 from sanic.response import json
 import sglang as sgl
