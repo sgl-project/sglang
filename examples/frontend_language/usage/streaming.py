@@ -17,9 +17,6 @@ def multi_turn_question(s, question_1, question_2):
     s += sgl.assistant(sgl.gen("answer_2", max_tokens=256))
 
 
-sgl.set_default_backend(sgl.OpenAI("gpt-3.5-turbo"))
-
-
 def stream_a_variable():
     state = multi_turn_question.run(
         question_1="What is the capital of the United States?",
@@ -45,5 +42,8 @@ async def async_stream():
 
 
 if __name__ == "__main__":
+    runtime = sgl.Runtime(model_path="/shared/public/models/Qwen/Qwen2.5-1.5B-Instruct/")
+    sgl.set_default_backend(runtime)
+
     stream_a_variable()
-    asyncio.run(async_stream())
+    # asyncio.run(async_stream())
