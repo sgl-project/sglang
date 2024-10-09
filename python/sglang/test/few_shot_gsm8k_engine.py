@@ -1,10 +1,3 @@
-"""
-Run few-shot GSM-8K evaluation.
-
-Usage:
-python3 -m sglang.test.few_shot_gsm8k --num-questions 200
-"""
-
 import asyncio
 import argparse
 import ast
