@@ -717,7 +717,7 @@ class Engine:
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
-        stream: bool = True,
+        stream: bool = False,
     ):
         if stream is True:
             assert not isinstance(prompt, list), "streaming is not supported for batch requests"
@@ -736,41 +736,84 @@ class Engine:
         loop = asyncio.get_event_loop()
         ret = loop.run_until_complete(generate_request(obj, None))
 
-        STREAM_END_SYMBOL = "data: [DONE]"
-        STREAM_CHUNK_START_SYMBOL = "data:"
 
-        offset = 0
 
         if stream is True:
-            loop = asyncio.get_event_loop()
-            generator = ret.body_iterator
+            STREAM_END_SYMBOL = "data: [DONE]"
+            STREAM_CHUNK_START_SYMBOL = "data:"
 
-            while True:
-                chunk = loop.run_until_complete(generator.__anext__())
+            def generator_wrapper():
+                offset = 0
+                loop = asyncio.get_event_loop()
+                generator = ret.body_iterator
+                while True:
+                    chunk = loop.run_until_complete(generator.__anext__())
 
-                if chunk.startswith(STREAM_END_SYMBOL):
-                    break
-                else:
-                    # # ANSI color codes
-                    # GREEN = '\033[92m'
-                    # RED = '\033[91m'
-                    # RESET = '\033[0m'  # This resets the color
-
-                    # print(f"{GREEN}chunk{RESET}", chunk)
-                                        
-                    data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :].strip("\n"))
-                    
-                    # return only the lastest chunk of text 
-                    
-                    data["text"] = data["text"][offset:]
-
-                    offset += len(data["text"])
-
-                    yield data
-                
+                    if chunk.startswith(STREAM_END_SYMBOL):
+                        break
+                    else:
+                        # TODO: is strip needed?
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])                    
+                        data["text"] = data["text"][offset:]
+                        offset += len(data["text"])
+                        yield data
+            # we cannot yield in the scope of generate() because python does not allow yield + return in the same function
+            # however, it allows to wrapper the generator as a subfunction and return
+            return generator_wrapper()
         else:
             return ret
 
+    async def async_generate(
+        self,
+        prompt: Union[str, List[str]],
+        sampling_params: Optional[Dict] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        stream: bool = False,
+    ):
+        if stream is True:
+            assert not isinstance(prompt, list), "streaming is not supported for batch requests"
+
+        obj = GenerateReqInput(
+            text=prompt,
+            sampling_params=sampling_params,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            lora_path=lora_path,
+            stream=stream,
+        )
+
+        ret = await generate_request(obj, None)
+
+        if stream is True:
+            STREAM_END_SYMBOL = "data: [DONE]"
+            STREAM_CHUNK_START_SYMBOL = "data:"
+
+            
+            generator = ret.body_iterator
+
+            async def generator_wrapper():
+
+                offset = 0
+
+                while True:
+                    chunk = await generator.__anext__()
+
+                    if chunk.startswith(STREAM_END_SYMBOL):
+                        break
+                    else:
+                        # TODO: is strip needed?
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])                    
+                        data["text"] = data["text"][offset:]
+                        offset += len(data["text"])
+                        yield data
+
+            return generator_wrapper()
+        else:
+            return ret
 
     def shutdown(self):
         kill_child_process(os.getpid(), including_parent=False)
