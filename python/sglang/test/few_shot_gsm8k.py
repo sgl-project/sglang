@@ -15,7 +15,6 @@ import numpy as np
 from sglang.api import set_default_backend
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
-import sglang as sgl
 
 INVALID = -9999999
 
@@ -47,12 +46,11 @@ def get_answer_value(answer_str):
 
 def run_eval(args):
     # Select backend
-    runtime = sgl.Runtime(model_path="/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/")
-    set_default_backend(runtime)
+    set_default_backend(RuntimeEndpoint(f"{args.host}:{args.port}"))
 
     # Read data
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    filename = "/home/jobuser/sglang/data/test.jsonl" # download_and_cache_file(url)
+    filename = download_and_cache_file(url)
     lines = list(read_jsonl(filename))
 
     # Construct prompts
@@ -71,6 +69,8 @@ def run_eval(args):
     #####################################
     ######### SGL Program Begin #########
     #####################################
+
+    import sglang as sgl
 
     @sgl.function
     def few_shot_gsm8k(s, question):
@@ -135,5 +135,4 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     args = parser.parse_args()
-    metrics = run_eval(args)
-    print(metrics)
+    run_eval(args)

@@ -719,8 +719,7 @@ class Engine:
         lora_path: Optional[List[Optional[str]]] = None,
         stream: bool = False,
     ):
-        if stream is True:
-            assert not isinstance(prompt, list), "streaming is not supported for batch requests"
+        # TODO (ByronHsu): refactor to reduce the duplicated code
 
         obj = GenerateReqInput(
             text=prompt,
@@ -735,7 +734,6 @@ class Engine:
         # get the current event loop
         loop = asyncio.get_event_loop()
         ret = loop.run_until_complete(generate_request(obj, None))
-
 
 
         if stream is True:
@@ -772,9 +770,6 @@ class Engine:
         lora_path: Optional[List[Optional[str]]] = None,
         stream: bool = False,
     ):
-        if stream is True:
-            assert not isinstance(prompt, list), "streaming is not supported for batch requests"
-
         obj = GenerateReqInput(
             text=prompt,
             sampling_params=sampling_params,

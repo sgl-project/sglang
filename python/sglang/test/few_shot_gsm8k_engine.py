@@ -5,6 +5,7 @@ Usage:
 python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 """
 
+import asyncio
 import argparse
 import ast
 import re
@@ -45,14 +46,26 @@ def get_answer_value(answer_str):
     except SyntaxError:
         return INVALID
 
+async def concurrent_generate(engine, prompts, sampling_param):
+    tasks = []
+    for prompt in prompts:
+        tasks.append(asyncio.create_task(engine.async_generate(prompt, sampling_param)))
+
+    outputs = await asyncio.gather(*tasks)
+    return outputs
+
 
 def run_eval(args):
     # Select backend
-    engine = sgl.Engine(model_path="/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/", log_level="error")
+    engine = sgl.Engine(model_path=args.model_path, log_level="error")
 
-    # Read data
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    filename = "/home/jobuser/sglang/data/test.jsonl" # download_and_cache_file(url)
+    if args.local_data_path is None:
+        # Read data
+        url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+        filename = download_and_cache_file(url)
+    else:
+        filename = args.local_data_path
+
     lines = list(read_jsonl(filename))
 
     # Construct prompts
@@ -68,59 +81,36 @@ def run_eval(args):
     assert all(l != INVALID for l in labels)
     arguments = [{"question": q} for q in questions]
 
-    #####################################
-    ######### SGL Program Begin #########
-    #####################################
 
-    # @sgl.function
-    # def few_shot_gsm8k(s, question):
-    #     s += few_shot_examples + question
-    #     s += sgl.gen(
-    #         "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
-    #     )
-
-
-    # runtime.add_request(
-
-    # )
-    #####################################
-    ########## SGL Program End ##########
-    #####################################
-
-
-
-
-    sampling_param = {"stop": ["Question", "Assistant:", "<|separator|>"], "max_new_tokens": 512, "temperature": 0}
-
+    # construct the prompts
     prompts = []
     for i, arg in enumerate(arguments):
         q = arg["question"]
         prompt = few_shot_examples + q 
         prompts.append(prompt)
 
+
+    sampling_param = {"stop": ["Question", "Assistant:", "<|separator|>"], "max_new_tokens": 512, "temperature": 0}
+
+    
     # Run requests
     tic = time.time()
 
-    outputs = engine.generate(
-        prompts,
-        sampling_param,
-    )
+    loop = asyncio.get_event_loop()
 
+    outputs = loop.run_until_complete(concurrent_generate(engine, prompts, sampling_param))
+
+    # End requests
     latency = time.time() - tic
 
-    # preds = []
-    # for i in range(len(states)):
-    #     preds.append(get_answer_value(states[i]["answer"]))
+    # Shutdown the engine
+    engine.shutdown()
 
-    # print(f"{preds=}")
-    # print(f"{labels=}")
-
+    # Parse output
     preds = []
  
     for output in outputs:
-        # print(output)
         preds.append(get_answer_value(output["text"]))
-
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
@@ -138,9 +128,6 @@ def run_eval(args):
     print(f"Latency: {latency:.3f} s")
     print(f"Output throughput: {output_throughput:.3f} token/s")
 
-    # Dump results
-    # dump_state_text("tmp_output_gsm8k.txt", states)
-
     return {
         "accuracy": acc,
         "latency": latency,
@@ -150,12 +137,9 @@ def run_eval(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct")
+    parser.add_argument("--local-data-path", type=Optional[str], default=None)
     parser.add_argument("--num-shots", type=int, default=5)
-    parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--num-questions", type=int, default=200)
-    parser.add_argument("--parallel", type=int, default=128)
-    parser.add_argument("--host", type=str, default="http://127.0.0.1")
-    parser.add_argument("--port", type=int, default=30000)
     args = parser.parse_args()
     metrics = run_eval(args)
-    print(metrics)
