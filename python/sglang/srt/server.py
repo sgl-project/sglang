@@ -200,7 +200,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 out = {"error": {"message": str(e)}}
                 yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
-        
+
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
@@ -735,7 +735,6 @@ class Engine:
         loop = asyncio.get_event_loop()
         ret = loop.run_until_complete(generate_request(obj, None))
 
-
         if stream is True:
             STREAM_END_SYMBOL = "data: [DONE]"
             STREAM_CHUNK_START_SYMBOL = "data:"
@@ -750,10 +749,11 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])                    
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
+
             # we cannot yield in the scope of generate() because python does not allow yield + return in the same function
             # however, it allows to wrap the generator as a subfunction and return
             return generator_wrapper()
@@ -786,7 +786,6 @@ class Engine:
             STREAM_END_SYMBOL = "data: [DONE]"
             STREAM_CHUNK_START_SYMBOL = "data:"
 
-            
             generator = ret.body_iterator
 
             async def generator_wrapper():
@@ -799,7 +798,7 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])                    
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data

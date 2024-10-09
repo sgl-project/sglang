@@ -1,16 +1,16 @@
-import asyncio
 import argparse
 import ast
+import asyncio
+import json
 import re
 import time
 
 import numpy as np
 
+import sglang as sgl
 from sglang.api import set_default_backend
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
-import sglang as sgl
-import json
 
 INVALID = -9999999
 
@@ -38,6 +38,7 @@ def get_answer_value(answer_str):
         return ast.literal_eval(numbers[-1])
     except SyntaxError:
         return INVALID
+
 
 async def concurrent_generate(engine, prompts, sampling_param):
     tasks = []
@@ -74,24 +75,27 @@ def run_eval(args):
     assert all(l != INVALID for l in labels)
     arguments = [{"question": q} for q in questions]
 
-
     # construct the prompts
     prompts = []
     for i, arg in enumerate(arguments):
         q = arg["question"]
-        prompt = few_shot_examples + q 
+        prompt = few_shot_examples + q
         prompts.append(prompt)
 
+    sampling_param = {
+        "stop": ["Question", "Assistant:", "<|separator|>"],
+        "max_new_tokens": 512,
+        "temperature": 0,
+    }
 
-    sampling_param = {"stop": ["Question", "Assistant:", "<|separator|>"], "max_new_tokens": 512, "temperature": 0}
-
-    
     # Run requests
     tic = time.time()
 
     loop = asyncio.get_event_loop()
 
-    outputs = loop.run_until_complete(concurrent_generate(engine, prompts, sampling_param))
+    outputs = loop.run_until_complete(
+        concurrent_generate(engine, prompts, sampling_param)
+    )
 
     # End requests
     latency = time.time() - tic
@@ -101,7 +105,7 @@ def run_eval(args):
 
     # Parse output
     preds = []
- 
+
     for output in outputs:
         preds.append(get_answer_value(output["text"]))
 
@@ -130,7 +134,9 @@ def run_eval(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct")
+    parser.add_argument(
+        "--model-path", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct"
+    )
     parser.add_argument("--local-data-path", type=Optional[str], default=None)
     parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--num-questions", type=int, default=200)
