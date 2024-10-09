@@ -60,7 +60,7 @@ class TestSRTBackend(unittest.TestCase):
 
         # Create an LLM.
         llm = sgl.Engine(
-            model_path="/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/",
+            model_path=DEFAULT_MODEL_NAME_FOR_TEST,
             log_level="error",
         )
 

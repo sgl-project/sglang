@@ -209,7 +209,6 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     else:
         try:
             ret = await tokenizer_manager.generate_request(obj, request).__anext__()
-            # ret is a json
             return ret
         except ValueError as e:
             return JSONResponse(
