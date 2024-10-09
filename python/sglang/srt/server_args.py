@@ -36,6 +36,7 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     dtype: str = "auto"
+    device: str = "cuda"
     kv_cache_dtype: str = "auto"
     trust_remote_code: bool = True
     context_length: Optional[int] = None
@@ -236,6 +237,13 @@ class ServerArgs:
             '* "bfloat16" for a balance between precision and range.\n'
             '* "float" is shorthand for FP32 precision.\n'
             '* "float32" for FP32 precision.',
+        )
+        parser.add_argument(
+            "--device",
+            type=str,
+            default="cuda",
+            choices=["cuda", "xpu"],
+            help="The device type.",
         )
         parser.add_argument(
             "--kv-cache-dtype",

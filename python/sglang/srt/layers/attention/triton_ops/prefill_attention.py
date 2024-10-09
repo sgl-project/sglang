@@ -24,7 +24,9 @@ import torch
 import triton
 import triton.language as tl
 
-CUDA_CAPABILITY = torch.cuda.get_device_capability()
+is_cuda_available = torch.cuda.is_available()
+if is_cuda_available:
+    CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
 @triton.jit
@@ -145,7 +147,7 @@ def _fwd_kernel(
 
 
 def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
-    if CUDA_CAPABILITY[0] >= 8:
+    if is_cuda_available and CUDA_CAPABILITY[0] >= 8:
         BLOCK = 128
     else:
         BLOCK = 64
