@@ -5,6 +5,7 @@ Usage:
 python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 """
 
+import asyncio
 import argparse
 import ast
 import re
@@ -16,6 +17,7 @@ from sglang.api import set_default_backend
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
 import sglang as sgl
+import json
 
 INVALID = -9999999
 
@@ -44,11 +46,18 @@ def get_answer_value(answer_str):
     except SyntaxError:
         return INVALID
 
+async def concurrent_generate(engine, prompts, sampling_param):
+    tasks = []
+    for prompt in prompts:
+        tasks.append(asyncio.create_task(engine.async_generate(prompt, sampling_param)))
+
+    outputs = await asyncio.gather(*tasks)
+    return outputs
+
 
 def run_eval(args):
     # Select backend
-    runtime = sgl.Runtime(model_path="/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/")
-    set_default_backend(runtime)
+    engine = sgl.Engine(model_path="/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/", log_level="error")
 
     # Read data
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
@@ -72,33 +81,54 @@ def run_eval(args):
     ######### SGL Program Begin #########
     #####################################
 
-    @sgl.function
-    def few_shot_gsm8k(s, question):
-        s += few_shot_examples + question
-        s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
-        )
+    # @sgl.function
+    # def few_shot_gsm8k(s, question):
+    #     s += few_shot_examples + question
+    #     s += sgl.gen(
+    #         "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+    #     )
 
+
+    # runtime.add_request(
+
+    # )
     #####################################
     ########## SGL Program End ##########
     #####################################
 
+
+    sampling_param = {"stop": ["Question", "Assistant:", "<|separator|>"], "max_new_tokens": 512, "temperature": 0}
+
+    prompts = []
+    for i, arg in enumerate(arguments):
+        q = arg["question"]
+        prompt = few_shot_examples + q 
+        prompts.append(prompt)
+
     # Run requests
     tic = time.time()
-    states = few_shot_gsm8k.run_batch(
-        arguments,
-        temperature=0,
-        num_threads=args.parallel,
-        progress_bar=True,
-    )
+
+    loop = asyncio.get_event_loop()
+
+    outputs = loop.run_until_complete(concurrent_generate(engine, prompts, sampling_param))
+
+    # print(outputs)
+
     latency = time.time() - tic
 
-    preds = []
-    for i in range(len(states)):
-        preds.append(get_answer_value(states[i]["answer"]))
+    # preds = []
+    # for i in range(len(states)):
+    #     preds.append(get_answer_value(states[i]["answer"]))
 
     # print(f"{preds=}")
     # print(f"{labels=}")
+
+    preds = []
+ 
+    for output in outputs:
+        # print(output)
+        preds.append(get_answer_value(output["text"]))
+
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
@@ -106,7 +136,7 @@ def run_eval(args):
 
     # Compute speed
     num_output_tokens = sum(
-        s.get_meta_info("answer")["completion_tokens"] for s in states
+        output["meta_info"]["completion_tokens"] for output in outputs
     )
     output_throughput = num_output_tokens / latency
 
@@ -117,7 +147,7 @@ def run_eval(args):
     print(f"Output throughput: {output_throughput:.3f} token/s")
 
     # Dump results
-    dump_state_text("tmp_output_gsm8k.txt", states)
+    # dump_state_text("tmp_output_gsm8k.txt", states)
 
     return {
         "accuracy": acc,

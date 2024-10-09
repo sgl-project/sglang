@@ -16,6 +16,7 @@ from sglang.api import set_default_backend
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
 import sglang as sgl
+import json
 
 INVALID = -9999999
 
@@ -72,33 +73,58 @@ def run_eval(args):
     ######### SGL Program Begin #########
     #####################################
 
-    @sgl.function
-    def few_shot_gsm8k(s, question):
-        s += few_shot_examples + question
-        s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
-        )
+    # @sgl.function
+    # def few_shot_gsm8k(s, question):
+    #     s += few_shot_examples + question
+    #     s += sgl.gen(
+    #         "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+    #     )
 
+
+    # runtime.add_request(
+
+    # )
     #####################################
     ########## SGL Program End ##########
     #####################################
 
+
+
+
+    sampling_param = {"stop": ["Question", "Assistant:", "<|separator|>"], "max_new_tokens": 512, "temperature": 0}
+
+    prompts = []
+    for i, arg in enumerate(arguments):
+        q = arg["question"]
+        prompt = few_shot_examples + q 
+        prompts.append(prompt)
+
+
     # Run requests
     tic = time.time()
-    states = few_shot_gsm8k.run_batch(
-        arguments,
-        temperature=0,
-        num_threads=args.parallel,
-        progress_bar=True,
+
+    
+    outputs_raw = runtime.generate(
+        prompts,
+        sampling_param,
     )
+
     latency = time.time() - tic
 
-    preds = []
-    for i in range(len(states)):
-        preds.append(get_answer_value(states[i]["answer"]))
+    # preds = []
+    # for i in range(len(states)):
+    #     preds.append(get_answer_value(states[i]["answer"]))
 
     # print(f"{preds=}")
     # print(f"{labels=}")
+
+    outputs = json.loads(outputs_raw)
+    preds = []
+ 
+    for output in outputs:
+        # print(output)
+        preds.append(get_answer_value(output["text"]))
+
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
@@ -106,7 +132,7 @@ def run_eval(args):
 
     # Compute speed
     num_output_tokens = sum(
-        s.get_meta_info("answer")["completion_tokens"] for s in states
+        output["meta_info"]["completion_tokens"] for output in outputs
     )
     output_throughput = num_output_tokens / latency
 
@@ -117,7 +143,7 @@ def run_eval(args):
     print(f"Output throughput: {output_throughput:.3f} token/s")
 
     # Dump results
-    dump_state_text("tmp_output_gsm8k.txt", states)
+    # dump_state_text("tmp_output_gsm8k.txt", states)
 
     return {
         "accuracy": acc,
