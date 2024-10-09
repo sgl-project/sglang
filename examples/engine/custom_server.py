@@ -1,8 +1,8 @@
-from sanic import Sanic
+from sanic import Sanic, text
 from sanic.response import json
+
 import sglang as sgl
 
-from sanic import text
 # from sanic.response import stream
 
 engine = None
@@ -10,17 +10,19 @@ engine = None
 # Create an instance of the Sanic app
 app = Sanic("sanic-server")
 
+
 # Define an asynchronous route handler
 @app.route("/generate", methods=["POST"])
 async def generate(request):
     prompt = request.json.get("prompt")
     if not prompt:
         return json({"error": "Prompt is required"}, status=400)
-    
+
     # async_generate returns a dict
     result = await engine.async_generate(prompt)
-    
+
     return text(result["text"])
+
 
 @app.route("/generate_stream", methods=["POST"])
 async def generate_stream(request):
@@ -28,7 +30,7 @@ async def generate_stream(request):
 
     if not prompt:
         return json({"error": "Prompt is required"}, status=400)
-    
+
     # async_generate returns a dict
     result = await engine.async_generate(prompt, stream=True)
 
@@ -42,9 +44,12 @@ async def generate_stream(request):
 
     await response.eof()
 
+
 def run_server():
     global engine
-    engine = sgl.Engine(model_path="/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/")
+    engine = sgl.Engine(
+        model_path="/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/"
+    )
     app.run(host="0.0.0.0", port=8000, single_process=True)
 
 

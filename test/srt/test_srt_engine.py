@@ -1,11 +1,11 @@
+import asyncio
 import json
 import unittest
+from types import SimpleNamespace
 
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 from sglang.test.few_shot_gsm8k_engine import run_eval
-import asyncio
-from types import SimpleNamespace
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
 
 class TestSRTBackend(unittest.TestCase):
@@ -50,14 +50,19 @@ class TestSRTBackend(unittest.TestCase):
 
         async def async_streaming(engine):
 
-            generator = await engine.async_generate(prompt, sampling_params, stream=True)
+            generator = await engine.async_generate(
+                prompt, sampling_params, stream=True
+            )
 
             async for output in generator:
                 print(output["text"], end="", flush=True)
             print()
 
         # Create an LLM.
-        llm = sgl.Engine(model_path="/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/", log_level="error")
+        llm = sgl.Engine(
+            model_path="/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/",
+            log_level="error",
+        )
 
         # 1. sync + non streaming
         print("\n\n==== 1. sync + non streaming ====")
@@ -71,7 +76,6 @@ class TestSRTBackend(unittest.TestCase):
         for output in output_generator:
             print(output["text"], end="", flush=True)
         print()
-
 
         loop = asyncio.get_event_loop()
         # 3. async + non_streaming
