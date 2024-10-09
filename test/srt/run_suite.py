@@ -9,23 +9,23 @@ suites = {
         "models/test_generation_models.py",
         "models/test_lora.py",
         "models/test_reward_models.py",
-        "sampling/penaltylib",
         "test_chunked_prefill.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
+        "test_srt_engine.py",
         "test_json_constrained.py",
         "test_large_max_new_tokens.py",
         "test_openai_server.py",
         "test_pytorch_sampling_backend.py",
         "test_server_args.py",
         "test_skip_tokenizer_init.py",
-        "test_srt_engine.py",
         "test_srt_endpoint.py",
         "test_torch_compile.py",
         "test_torchao.py",
         "test_triton_attn_backend.py",
         "test_update_weights.py",
         "test_vision_openai_server.py",
+        "sampling/penaltylib",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True
@@ -75,7 +75,11 @@ if __name__ == "__main__":
     else:
         files = suites[args.suite]
 
+    print(files)
+
     files = files[args.range_begin : args.range_end]
+
+    print("The running tests are ", files)
 
     exit_code = run_unittest_files(files, args.timeout_per_file)
     exit(exit_code)
