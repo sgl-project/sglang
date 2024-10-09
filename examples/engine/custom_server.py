@@ -47,9 +47,7 @@ async def generate_stream(request):
 
 def run_server():
     global engine
-    engine = sgl.Engine(
-        model_path="meta-llama/Meta-Llama-3.1-8B-Instruct"
-    )
+    engine = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
     app.run(host="0.0.0.0", port=8000, single_process=True)
 
 
