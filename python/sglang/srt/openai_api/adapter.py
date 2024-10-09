@@ -924,7 +924,7 @@ def v1_chat_generate_request(
         else:
             prompt_kwargs = {"input_ids": input_ids}
         sampling_params_list = sampling_params_list[0]
-        image_data = image_data_list[0]
+        image_data_list = image_data_list[0]
         return_logprobs = return_logprobs[0]
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
@@ -937,7 +937,7 @@ def v1_chat_generate_request(
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
-        image_data=image_data,
+        image_data=image_data_list,
         sampling_params=sampling_params_list,
         return_logprob=return_logprobs,
         logprob_start_len=logprob_start_lens,
