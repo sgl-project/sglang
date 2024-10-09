@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
+from xgrammar import GrammarStateMatcher
 
 from sglang.global_config import global_config
 from sglang.srt.constrained import RegexGuide
@@ -231,6 +232,9 @@ class Req:
         self.regex_fsm_state: int = 0
         self.jump_forward_map: JumpForwardMap = None
 
+        self.regex_bnf: Optional[GrammarStateMatcher] = None
+        self.allow_jump_forward: bool = False
+
     # whether request reached finished condition
     def finished(self) -> bool:
         return self.finished_reason is not None
@@ -387,6 +391,66 @@ class Req:
 
         return True
 
+    def jump_forward_and_retokenize_bnf(self, jump_forward_str):
+        if self.origin_input_text is None:
+            # Recovering text can only use unpadded ids
+            self.origin_input_text = self.tokenizer.decode(
+                self.origin_input_ids_unpadded
+            )
+
+        all_text = self.origin_input_text + self.decoded_text + jump_forward_str
+        all_ids = self.tokenizer.encode(all_text)
+        if not all_ids:
+            logger.warning("Encoded all_text resulted in empty all_ids")
+            return False
+
+        prompt_tokens = len(self.origin_input_ids_unpadded)
+        if prompt_tokens > len(all_ids):
+            logger.warning("prompt_tokens is larger than encoded all_ids")
+            return False
+
+        if all_ids[prompt_tokens - 1] != self.origin_input_ids_unpadded[-1]:
+            # TODO(lsyin): fix token fusion
+            logger.warning(
+                "Token fusion between input and output, try to avoid this by removing the space at the end of the input."
+            )
+            return False
+
+        old_output_ids = self.output_ids
+        self.output_ids = all_ids[prompt_tokens:]
+        self.decoded_text = self.decoded_text + jump_forward_str
+        self.surr_offset = prompt_tokens
+        self.read_offset = len(all_ids)
+
+        # NOTE: A trick to reduce the surrouding tokens decoding overhead
+        for i in range(0, INIT_INCREMENTAL_DETOKENIZATION_OFFSET):
+            surr_text_ = self.tokenizer.decode(
+                all_ids[self.read_offset - i : self.read_offset]
+            )
+            if not surr_text_.endswith("�"):
+                self.surr_offset = self.read_offset - i
+                break
+
+        k = 0
+        for i, old_id in enumerate(old_output_ids):
+            if old_id == self.output_ids[i]:
+                k = i + 1
+            else:
+                break
+
+        for i in range(k, len(self.output_ids)):
+            assert self.regex_bnf is not None, "regex_bnf is None"
+            self.regex_bnf.accept_token(self.output_ids[i])
+
+        if self.return_logprob:
+            # For fast-forward part's logprobs
+            self.output_token_logprobs = self.output_token_logprobs[:k]
+            self.output_top_logprobs = self.output_top_logprobs[:k]
+            self.logprob_start_len = prompt_tokens + k
+            self.last_update_decode_tokens = len(self.output_ids) - k
+
+        return True
+
     def __repr__(self):
         return f"rid(n={self.rid}, " f"input_ids={self.origin_input_ids}, "
 
@@ -430,7 +494,8 @@ class ScheduleBatch:
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
         return_logprob = any(req.return_logprob for req in reqs)
         has_stream = any(req.stream for req in reqs)
-        has_regex = any(req.regex_fsm for req in reqs)
+        # has_regex = any(req.regex_fsm for req in reqs)
+        has_regex = any(req.regex_bnf for req in reqs)
 
         return cls(
             reqs=reqs,
@@ -695,6 +760,33 @@ class ScheduleBatch:
                         req.output_ids = cur_output_ids
                         continue
 
+                    print(f"Jump forward: {jump_forward_str}")
+
+                    # The decode status has diverged from detokenizer_manager
+                    req.vid += 1
+
+                    # insert the old request into tree_cache
+                    self.tree_cache.cache_finished_req(req, cur_all_ids)
+
+                    # re-applying image padding
+                    if req.image_inputs is not None:
+                        req.origin_input_ids = pad_input_ids_func(
+                            req.origin_input_ids_unpadded, req.image_inputs
+                        )
+
+                    jump_forward_reqs.append(req)
+                    filter_indices.remove(i)
+
+            if req.allow_jump_forward and req.regex_bnf is not None:
+                jump_forward_str = req.regex_bnf.find_jump_forward_string()
+                if len(jump_forward_str) > 1:
+                    cur_all_ids = tuple(req.origin_input_ids + req.output_ids)[:-1]
+                    cur_output_ids = req.output_ids
+                    if not req.jump_forward_and_retokenize_bnf(jump_forward_str):
+                        # Failed to jump forward, revert
+                        req.output_ids = cur_output_ids
+                        continue
+
                     # The decode status has diverged from detokenizer_manager
                     req.vid += 1
 
@@ -762,7 +854,8 @@ class ScheduleBatch:
             self.top_logprobs_nums = None
 
         self.has_stream = any(req.stream for req in self.reqs)
-        self.has_regex = any(req.regex_fsm for req in self.reqs)
+        # self.has_regex = any(req.regex_fsm for req in self.reqs)
+        self.has_regex = any(req.regex_bnf for req in self.reqs)
 
         self.sampling_info.filter_batch(unfinished_indices, new_indices)
 
@@ -806,6 +899,9 @@ class ScheduleBatch:
             self.sampling_info.regex_fsm_states = [
                 req.regex_fsm_state for req in self.reqs
             ]
+
+            # TODO(dark): remove the above and use the below
+            self.sampling_info.regex_bnfs = [req.regex_bnf for req in self.reqs]
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,

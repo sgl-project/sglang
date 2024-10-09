@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
+from xgrammar import GrammarStateMatcher
 
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.constrained import RegexGuide
@@ -26,11 +27,14 @@ class SamplingBatchInfo:
     # Bias Tensors
     vocab_size: int
     logit_bias: torch.Tensor = None
-    vocab_mask: torch.Tensor = None
+    vocab_mask: Optional[torch.Tensor] = None
 
     # FSM states
     regex_fsms: List[RegexGuide] = None
     regex_fsm_states: List[int] = None
+
+    # TODO(dark): remove the above and use the regex_bnf instead
+    regex_bnfs: Optional[List[Optional[GrammarStateMatcher]]] = None
 
     # Penalizer
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
@@ -127,6 +131,27 @@ class SamplingBatchInfo:
                     self.vocab_mask[i][
                         regex_fsm.get_next_instruction(self.regex_fsm_states[i]).tokens
                     ] = 0
+
+    # TODO(dark): rename this to update_regex_vocab_mask after removing the old one
+    def update_regex_vocab_mask_bnf(self):
+        # Reset the vocab mask
+        self.vocab_mask = None
+
+        if self.regex_bnfs and any(regex_bnf for regex_bnf in self.regex_bnfs):
+            # If has regex, then we need to update the vocab mask
+            self.vocab_mask = torch.zeros(
+                len(self.temperatures), self.vocab_size, dtype=torch.bool, device="cuda"
+            )
+            for i, regex_bnf in enumerate(self.regex_bnfs):
+                if regex_bnf is not None:
+                    # Note that this bitmask is a bitset, not bool
+                    bitmask = regex_bnf.find_next_token_bitmask()
+                    # Mask the tokens that are not allowed
+                    self.vocab_mask[i][
+                        regex_bnf.get_rejected_tokens_from_bitmask(
+                            bitmask, self.vocab_size
+                        )
+                    ] = 1
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
         self.penalizer_orchestrator.filter(unfinished_indices, new_indices)

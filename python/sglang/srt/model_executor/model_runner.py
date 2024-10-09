@@ -522,6 +522,7 @@ class ModelRunner:
     ) -> torch.Tensor:
         # Put CPU-heavy tasks here. They will be overlapped with the forward pass.
         sampling_info = forward_batch.sampling_info
+        sampling_info.update_regex_vocab_mask_bnf()
         sampling_info.update_regex_vocab_mask()
         sampling_info.update_penalties()
         logits = self.apply_logits_bias(logits_output.next_token_logits, sampling_info)
@@ -550,6 +551,7 @@ class ModelRunner:
         # Apply regex vocab_mask
         if sampling_info.vocab_mask is not None:
             logits = logits.masked_fill(sampling_info.vocab_mask, float("-inf"))
+            # TODO(dark): add some custom cuda kernel for bnf bitmask here
 
         return logits
 
