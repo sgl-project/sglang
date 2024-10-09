@@ -752,13 +752,12 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        # TODO: is strip needed?
                         data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])                    
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
                         yield data
             # we cannot yield in the scope of generate() because python does not allow yield + return in the same function
-            # however, it allows to wrapper the generator as a subfunction and return
+            # however, it allows to wrap the generator as a subfunction and return
             return generator_wrapper()
         else:
             return ret
@@ -805,7 +804,6 @@ class Engine:
                     if chunk.startswith(STREAM_END_SYMBOL):
                         break
                     else:
-                        # TODO: is strip needed?
                         data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])                    
                         data["text"] = data["text"][offset:]
                         offset += len(data["text"])
@@ -818,4 +816,4 @@ class Engine:
     def shutdown(self):
         kill_child_process(os.getpid(), including_parent=False)
 
-    # TODO (ByronHsu): encode and async generate
+    # TODO (ByronHsu): encode
