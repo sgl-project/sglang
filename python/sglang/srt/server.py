@@ -200,7 +200,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 out = {"error": {"message": str(e)}}
                 yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
-
+        
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
@@ -209,6 +209,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     else:
         try:
             ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+            # ret is a json
             return ret
         except ValueError as e:
             return JSONResponse(
@@ -716,7 +717,11 @@ class Engine:
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
+        stream: bool = True,
     ):
+        if stream is True:
+            assert not isinstance(prompt, list), "streaming is not supported for batch requests"
+
         obj = GenerateReqInput(
             text=prompt,
             sampling_params=sampling_params,
@@ -724,11 +729,48 @@ class Engine:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             lora_path=lora_path,
+            stream=stream,
         )
 
         # get the current event loop
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(generate_request(obj, None))
+        ret = loop.run_until_complete(generate_request(obj, None))
+
+        STREAM_END_SYMBOL = "data: [DONE]"
+        STREAM_CHUNK_START_SYMBOL = "data:"
+
+        offset = 0
+
+        if stream is True:
+            loop = asyncio.get_event_loop()
+            generator = ret.body_iterator
+
+            while True:
+                chunk = loop.run_until_complete(generator.__anext__())
+
+                if chunk.startswith(STREAM_END_SYMBOL):
+                    break
+                else:
+                    # # ANSI color codes
+                    # GREEN = '\033[92m'
+                    # RED = '\033[91m'
+                    # RESET = '\033[0m'  # This resets the color
+
+                    # print(f"{GREEN}chunk{RESET}", chunk)
+                                        
+                    data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :].strip("\n"))
+                    
+                    # return only the lastest chunk of text 
+                    
+                    data["text"] = data["text"][offset:]
+
+                    offset += len(data["text"])
+
+                    yield data
+                
+        else:
+            return ret
+
 
     def shutdown(self):
         kill_child_process(os.getpid(), including_parent=False)
