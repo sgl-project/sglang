@@ -392,6 +392,8 @@ class Req:
         return True
 
     def jump_forward_and_retokenize_bnf(self, jump_forward_str):
+        assert self.regex_bnf is not None, "should be a regex request"
+
         if self.origin_input_text is None:
             # Recovering text can only use unpadded ids
             self.origin_input_text = self.tokenizer.decode(
@@ -438,8 +440,10 @@ class Req:
             else:
                 break
 
+        # rollback to the last token that is the same
+        self.regex_bnf.rollback(len(old_output_ids) - k)
+
         for i in range(k, len(self.output_ids)):
-            assert self.regex_bnf is not None, "regex_bnf is None"
             self.regex_bnf.accept_token(self.output_ids[i])
 
         if self.return_logprob:
