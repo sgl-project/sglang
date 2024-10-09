@@ -9,7 +9,6 @@ suites = {
         "models/test_generation_models.py",
         "models/test_lora.py",
         "models/test_reward_models.py",
-        "sampling/penaltylib",
         "test_chunked_prefill.py",
         "test_embedding_openai_server.py",
         "test_srt_engine.py",
@@ -26,6 +25,7 @@ suites = {
         "test_triton_attn_backend.py",
         "test_update_weights.py",
         "test_vision_openai_server.py",
+        "sampling/penaltylib",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True
@@ -74,6 +74,8 @@ if __name__ == "__main__":
         files = glob.glob("**/test_*.py", recursive=True)
     else:
         files = suites[args.suite]
+
+    print(files)
 
     files = files[args.range_begin : args.range_end]
 
