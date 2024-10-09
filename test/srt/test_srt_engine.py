@@ -7,16 +7,18 @@ import sglang as sgl
 from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
+DEFAULT_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/"
+
 
 class TestSRTBackend(unittest.TestCase):
 
-    def test_engine_runtime_consistency(self):
+    def test_1_engine_runtime_consistency(self):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_MODEL_NAME_FOR_TEST
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
-        engine = sgl.Engine(model_path=model_path, random_seed=42, log_levl="error")
+        engine = sgl.Engine(model_path=model_path, random_seed=42, log_level="error")
         out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 
@@ -31,7 +33,7 @@ class TestSRTBackend(unittest.TestCase):
         print(out2)
         assert out1 == out2, f"{out1} != {out2}"
 
-    def test_engine_multiple_generate(self):
+    def test_2_engine_multiple_generate(self):
         # just to ensure there is no issue running multiple generate calls
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_MODEL_NAME_FOR_TEST
@@ -43,7 +45,7 @@ class TestSRTBackend(unittest.TestCase):
         engine.generate(prompt, sampling_params)
         engine.shutdown()
 
-    def test_sync_streaming_combination(self):
+    def test_3_sync_streaming_combination(self):
 
         prompt = "AI safety is..."
         sampling_params = {"temperature": 0.8, "top_p": 0.95}
@@ -89,11 +91,11 @@ class TestSRTBackend(unittest.TestCase):
 
         llm.shutdown()
 
-    def test_gsm8k(self):
+    def test_4_gsm8k(self):
 
         args = SimpleNamespace(
             model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-            # local_data_path="/home/jobuser/sglang/data/test.jsonl",
+            local_data_path="/home/jobuser/sglang/data/test.jsonl",
             num_shots=5,
             num_questions=200,
         )
