@@ -30,7 +30,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import ImageInputs
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 # TODO: This should be a config in huggingface...
@@ -343,7 +343,7 @@ class MolmoAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        input_metadata: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -411,7 +411,7 @@ class MolmoDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        input_metadata: ForwardBatch,
         residual: Optional[torch.Tensor] = None,
     ):
         if self.norm_after:
@@ -476,7 +476,7 @@ class MolmoModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        input_metadata: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
@@ -637,7 +637,7 @@ class MolmoForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        input_metadata: ForwardBatch,
     ) -> torch.Tensor:
         image_inputs = input_metadata.image_inputs
 
@@ -738,6 +738,20 @@ class MolmoForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         embedding_weight = {}
         projector_weight = {}
+        language_model_weights_mapping = {
+            "model.transformer": "model",
+            "blocks": "layers",
+            "ln_f": "norm",
+            "attn_out": "self_attn.o_proj",
+            "att_proj": "self_attn.qkv_proj",
+            "q_norm": "self_attn.q_norm",
+            "k_norm": "self_attn.k_norm",
+            "attn_norm": "input_layernorm",
+            "ff_norm": "post_attention_layernorm",
+        }
+        projector_weights_mapping = {
+            "w2": "down_proj",
+        }
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 log.info(f"Skipping {name}")
@@ -760,50 +774,28 @@ class MolmoForCausalLM(nn.Module):
                 if "image_projector" in name:
                     if "w1" in name:
                         projector_weight["gate_proj"] = loaded_weight
-                    elif "w3" in name:
-                        projector_weight["up_proj"] = loaded_weight
                     elif "w2" in name:
                         projector_weight["down_proj"] = loaded_weight
-                    else:
-                        raise ValueError(f"Unexpected projector weight: {name}")
+                    elif "w3" in name:
+                        projector_weight["up_proj"] = loaded_weight
                     continue
             else:
-                if "ln_f.weight" in name:
-                    name = "model.norm.weight"
-
-                if "transformer.blocks" in name:
-                    name = name.replace("transformer.blocks", "layers")
-
-                if "attn_out" in name:
-                    name = name.replace("attn_out", "self_attn.o_proj")
-
-                if "att_proj" in name:
-                    name = name.replace("att_proj", "self_attn.qkv_proj")
-
-                if "q_norm" in name:
-                    name = name.replace("q_norm", "self_attn.q_norm")
-
-                if "k_norm" in name:
-                    name = name.replace("k_norm", "self_attn.k_norm")
-
                 if "ff_proj" in name:
                     name = name.replace("ff_proj", "mlp.gate_up_proj")
                     assert "weight" in name
                     up_weight, gate_weight = loaded_weight.chunk(2, dim=0)
                     loaded_weight = torch.cat([gate_weight, up_weight], dim=0)
 
+                for k, v in language_model_weights_mapping.items():
+                    if k in name:
+                        name = name.replace(k, v)
+
                 if "ff_out" in name:
                     if "layers" in name:
                         name = name.replace("ff_out", "mlp.down_proj")
                     else:
                         # lm head
-                        name = name.replace("model.transformer.ff_out", "lm_head")
-
-                if "attn_norm" in name:
-                    name = name.replace("attn_norm", "input_layernorm")
-
-                if "ff_norm" in name:
-                    name = name.replace("ff_norm", "post_attention_layernorm")
+                        name = name.replace("model.ff_out", "lm_head")
 
             if name.endswith(".bias") and name not in params_dict:
                 continue
@@ -828,50 +820,3 @@ class MolmoForCausalLM(nn.Module):
 
 
 EntryClass = [MolmoForCausalLM]
-
-if __name__ == "__main__":
-    processor = AutoProcessor.from_pretrained(
-        "allenai/Molmo-7B-D-0924",
-        trust_remote_code=True,
-        torch_dtype="auto",
-        device_map="auto",
-    )
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     "allenai/Molmo-7B-D-0924",
-    #     trust_remote_code=True,
-    #     torch_dtype="auto",
-    #     device_map="auto",
-    # )
-    # model = CLIPVisionModel.from_pretrained(
-    #         "openai/clip-vit-large-patch14-336", torch_dtype=torch.float16
-    #     )
-    # breakpoint()
-    # inputs = processor.process(
-    #     images=[
-    #         Image.open(
-    #             requests.get("https://picsum.photos/id/237/536/354", stream=True).raw
-    #         )
-    #     ],
-    #     text="Describe this image.",
-    # )
-    # print(inputs)
-    # qwen2config = Qwen2Config.from_pretrained("allenai/Molmo-7B-D-0924")
-    # vision_config = MolmoVisionBackboneConfig()
-    # model = MolmoModel(qwen2config, vision_config)
-    # model.eval()
-    # print(model)
-
-    # input_metadata = InputMetadata(
-    #     forward_mode=ForwardMode.EXTEND,
-    #     batch_size=1,
-    #     image_inputs=inputs,
-    # )
-    # Takes in bs, num_crops, num_patches_h * num_patches_w, patch_size * patch_size * 3
-    #                  -> bs, num_crops, num_patches_h * num_patches_w, image_embed_dim * 2
-    # input_embeds = model(
-    #     inputs["input_ids"],
-    #     None,
-    #     input_metadata,
-    # )
-    # print(input_embeds.shape)
-    # print(cls_embed.shape)

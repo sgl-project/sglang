@@ -128,6 +128,7 @@ class ImageInputs:
     aspect_ratio_ids: Optional[List[torch.Tensor]] = None
     aspect_ratio_mask: Optional[List[torch.Tensor]] = None
 
+    # For Molmo
     input_ids: Optional[List[torch.Tensor]] = None
     image_input_idx: Optional[List[torch.Tensor]] = None
     image_masks: Optional[List[torch.Tensor]] = None
@@ -148,10 +149,15 @@ class ImageInputs:
         ]
         ret.image_sizes = obj["image_sizes"]
         # Only when pixel values is not None we have modalities
-        ret.input_ids = obj["input_ids"]
-        ret.image_input_idx = obj["image_input_idx"]
-        ret.image_masks = obj["image_masks"]
         ret.modalities = obj["modalities"] or ["image"]
+
+        # For Molmo
+        if "input_ids" in obj:
+            ret.input_ids = obj["input_ids"]
+        if "image_input_idx" in obj:
+            ret.image_input_idx = obj["image_input_idx"]
+        if "image_masks" in obj:
+            ret.image_masks = obj["image_masks"]
         return ret
 
 

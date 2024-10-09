@@ -221,9 +221,11 @@ class MolmoImageProcessor(BaseImageProcessor):
         #   image_masks
         images = []
         image_sizes = []
+        image_hashes = []
         for image_data in image_data_list:
             image, image_size = load_image(image_data)
             image = image.convert("RGB")
+            image_hashes.append(hash(image_data))
             images.append(np.array(image))
             image_sizes.append(image_size)
         hf_dict = global_processor.image_processor.multimodal_preprocess(
@@ -255,7 +257,7 @@ class MolmoImageProcessor(BaseImageProcessor):
         for k, v in hf_dict.items():
             hf_dict[k] = torch.from_numpy(v)
 
-        hf_dict["image_hashes"] = [hash(image_data)]
+        hf_dict["image_hashes"] = image_hashes
         hf_dict["pixel_values"] = hf_dict["images"]
         hf_dict["image_sizes"] = image_sizes
 
@@ -311,7 +313,7 @@ class MolmoImageProcessor(BaseImageProcessor):
 
 
 def get_image_processor(
-    hf_config, server_args: ServerArgs, _processor
+    hf_config, server_args: ServerArgs, _image_processor
 ) -> BaseImageProcessor:
     if "MolmoForCausalLM" in hf_config.architectures:
         return MolmoImageProcessor(hf_config, server_args, _processor)
