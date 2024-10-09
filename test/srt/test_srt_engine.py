@@ -95,7 +95,7 @@ class TestSRTBackend(unittest.TestCase):
 
         args = SimpleNamespace(
             model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-            # local_data_path="/home/jobuser/sglang/data/test.jsonl",
+            local_data_path=None,  # "/home/jobuser/sglang/data/test.jsonl",
             num_shots=5,
             num_questions=200,
         )
