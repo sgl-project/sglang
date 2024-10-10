@@ -20,11 +20,11 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
-
 
 @dataclass
 class GenerateReqInput:
@@ -346,7 +346,6 @@ class AbortReq:
     rid: str
 
 
-@dataclass
-class ProfileReq:
+class ProfileReq(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
