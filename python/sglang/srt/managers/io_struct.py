@@ -344,3 +344,9 @@ class UpdateWeightReqOutput:
 class AbortReq:
     # The request id
     rid: str
+
+
+@dataclass
+class ProfileReq:
+    START_PROFILE = 1
+    STOP_PROFILE = 2

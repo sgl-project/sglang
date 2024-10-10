@@ -42,6 +42,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedRewardReqInput,
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
+    ProfileReq,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -229,6 +230,21 @@ class Scheduler:
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.batch_is_full = False
 
+        if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
+            self.profiler = None
+        else:
+            torch_profiler_trace_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "")
+            logger.info("Profiling enabled. Traces will be saved to: %s",
+                        torch_profiler_trace_dir)
+            self.profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                with_stack=True,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    torch_profiler_trace_dir, use_gzip=True))
+
     @torch.inference_mode()
     def event_loop(self):
         while True:
@@ -271,6 +287,11 @@ class Scheduler:
             elif isinstance(recv_req, UpdateWeightReqInput):
                 success, message = self.update_weights(recv_req)
                 self.out_pyobjs.append(UpdateWeightReqOutput(success, message))
+            elif isinstance(recv_req, ProfileReq):
+                if recv_req == ProfileReq.START_PROFILE:
+                    self.start_profile()
+                else:
+                    self.stop_profile()
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 
@@ -999,6 +1020,16 @@ class Scheduler:
         else:
             logger.error(message)
         return success, message
+
+    def start_profile(self) -> None:
+        if self.profiler is None:
+            raise RuntimeError("Profiler is not enabled.")
+        self.profiler.start()
+
+    def stop_profile(self) -> None:
+        if self.profiler is None:
+            raise RuntimeError("Profiler is not enabled.")
+        self.profiler.stop()
 
 
 def run_scheduler_process(

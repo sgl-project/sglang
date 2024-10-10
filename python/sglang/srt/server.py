@@ -144,6 +144,23 @@ async def flush_cache():
         status_code=200,
     )
 
+@app.get("/start_profile")
+async def start_profile():
+    """Start profiling."""
+    tokenizer_manager.start_profile()
+    return Response(
+        content="Start profiling.\n",
+        status_code=200,
+    )
+
+@app.get("/stop_profile")
+async def stop_profile():
+    """Stop profiling."""
+    tokenizer_manager.stop_profile()
+    return Response(
+        content="Stop profiling. This will take some time.\n",
+        status_code=200,
+    )
 
 @app.post("/update_weights")
 async def update_weights(obj: UpdateWeightReqInput, request: Request):

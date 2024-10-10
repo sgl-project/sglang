@@ -52,6 +52,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedRewardReqInput,
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
+    ProfileReq,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -510,6 +511,14 @@ class TokenizerManager:
             return
         del self.rid_to_state[rid]
         req = AbortReq(rid)
+        self.send_to_scheduler.send_pyobj(req)
+
+    def start_profile(self):
+        req = ProfileReq.START_PROFILE
+        self.send_to_scheduler.send_pyobj(req)
+
+    def stop_profile(self):
+        req = ProfileReq.STOP_PROFILE
         self.send_to_scheduler.send_pyobj(req)
 
     async def update_weights(
