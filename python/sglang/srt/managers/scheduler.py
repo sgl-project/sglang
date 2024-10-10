@@ -433,6 +433,9 @@ class Scheduler:
                         result = self.run_batch(batch)
                         self.process_batch_result(batch, result)
 
+                    if self.running_batch.is_empty():
+                        self.running_batch = None
+
                     if self.running_batch is None:
                         break
 
@@ -771,9 +774,6 @@ class Scheduler:
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
             self.print_decode_stats()
-
-        if self.running_batch.is_empty():
-            self.running_batch = None
 
     def add_logprob_return_values(
         self,
