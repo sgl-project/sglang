@@ -145,6 +145,7 @@ async def flush_cache():
     )
 
 @app.get("/start_profile")
+@app.post("/start_profile")
 async def start_profile():
     """Start profiling."""
     tokenizer_manager.start_profile()
@@ -154,6 +155,7 @@ async def start_profile():
     )
 
 @app.get("/stop_profile")
+@app.post("/stop_profile")
 async def stop_profile():
     """Stop profiling."""
     tokenizer_manager.stop_profile()
