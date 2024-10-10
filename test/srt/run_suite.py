@@ -5,6 +5,7 @@ from sglang.test.test_utils import run_unittest_files
 
 suites = {
     "minimal": [
+        "test_vision_openai_server.py",
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
         "models/test_lora.py",
@@ -25,7 +26,6 @@ suites = {
         "test_torchao.py",
         "test_triton_attn_backend.py",
         "test_update_weights.py",
-        "test_vision_openai_server.py",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True
