@@ -1030,6 +1030,9 @@ class Scheduler:
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
         self.profiler.stop()
+        logger.info("Profiler is stopping")
+        self.profiler.export_chrome_trace("./trace.json")
+        logger.info("trace.json done")
 
 
 def run_scheduler_process(
