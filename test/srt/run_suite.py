@@ -76,6 +76,5 @@ if __name__ == "__main__":
         files = suites[args.suite]
 
     files = files[args.range_begin : args.range_end]
-
     exit_code = run_unittest_files(files, args.timeout_per_file)
     exit(exit_code)
