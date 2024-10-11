@@ -63,6 +63,9 @@ class ForwardMode(IntEnum):
             ForwardMode.SPECVERIFY,
         )
 
+    def is_spec_verify(self):
+        return self == ForwardMode.SPECVERIFY
+
     def is_mixed(self):
         return self == ForwardMode.MIXED
 

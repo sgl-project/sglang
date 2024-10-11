@@ -37,7 +37,7 @@ __global__ void build_tree(Tensor<long, 1> parent_list, Tensor<long, 1> selected
         int position = 0;
         if (tid==0){
             positions[bid*draft_token_num] = seq_len;
-            retrive_index[bid][0][0] = 0;
+            retrive_index[bid][0][0] = bid * draft_token_num;
             return;
         }
         
@@ -70,9 +70,9 @@ __global__ void build_tree(Tensor<long, 1> parent_list, Tensor<long, 1> selected
         }
         if(is_leaf==1){
             for(int i=0; i<position; i++){
-                retrive_index[bid][tid][position-i] = depends_order[i];
+                retrive_index[bid][tid][position-i] = depends_order[i] + bid * draft_token_num;
             }
-            retrive_index[bid][tid][0] = 0;
+            retrive_index[bid][tid][0] = bid*draft_token_num;
         }
 
 
@@ -110,8 +110,14 @@ def build_tree_kernel(parent_list, top_score_index, seq_lens, topk, depth, draft
         grid=(bs, 1, 1),
         block=(64, 1, 1),
     )
-    retrive_index = retrive_index[retrive_index.sum(dim=-1) != -depth - 2]
-    return tree_mask, positions, retrive_index
+    index = retrive_index.sum(dim=-1) != -depth - 2
+    cum_len = torch.cumsum(torch.sum(index, dim=-1), dim=-1)
+    retrive_cum_len = torch.zeros(
+        (cum_len.numel() + 1,), dtype=torch.int32, device="cuda"
+    )
+    retrive_cum_len[1:] = cum_len
+    retrive_index = retrive_index[index]
+    return tree_mask, positions, retrive_index, retrive_cum_len
 
 
 if __name__ == "__main__":

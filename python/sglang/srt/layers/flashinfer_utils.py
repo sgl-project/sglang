@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.managers.speculative_utils import EAGLEDraftInput
+from sglang.srt.managers.speculative_utils import EAGLEDraftInput, EagleVerifyInput
 
 
 @triton.jit
@@ -91,10 +91,10 @@ class FlashinferUpdater:
             paged_kernel_lens = self.seq_lens
 
         if (
-            isinstance(self.spec_draft_input, EAGLEDraftInput)
+            isinstance(self.spec_draft_input, (EAGLEDraftInput, EagleVerifyInput))
             and self.forward_mode.is_decode()
         ):
-            self.kv_indices, self.kv_indptr, self.kv_last_page_len = (
+            self.kv_indices, self.kv_indptr, self.kv_last_page_len, self.qo_indptr = (
                 self.spec_draft_input.generate_attn_arg(
                     self.req_pool_indices,
                     paged_kernel_lens,
@@ -203,8 +203,9 @@ class FlashinferUpdater:
 
     def update_indices_no_sliding_window(self):
         self._init_indices_no_sliding_window()
-
-        if self.forward_mode.is_decode():
+        if self.forward_mode.is_spec_verify():
+            self._update_verify_indices(self.prefill_wrapper_paged)
+        elif self.forward_mode.is_decode():
             self._update_decode_indices(self.decode_wrapper)
         else:
             self._update_extend_indices(
@@ -224,6 +225,23 @@ class FlashinferUpdater:
                     None,
                     self.prefill_wrapper_paged[wrapper_id],
                 )
+
+    def _update_verify_indices(self, paged_wrapper):
+
+        custom_mask = getattr(self.spec_draft_input, "custom_mask", None)
+
+        paged_wrapper.end_forward()
+        paged_wrapper.begin_forward(
+            self.qo_indptr,
+            self.kv_indptr,
+            self.kv_indices,
+            self.kv_last_page_len,
+            self.num_qo_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            1,
+            custom_mask=custom_mask,
+        )
 
 
 def update_flashinfer_indices(

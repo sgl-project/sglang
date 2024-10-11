@@ -323,10 +323,6 @@ class LlamaForCausalLMEagle(nn.Module):
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
     ) -> LogitsProcessorOutput:
-        print("*" * 100)
-        print(input_metadata.forward_mode)
-        print(input_ids)
-        print(positions)
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
         input_metadata.spec_draft_input.hidden_states = hidden_states
         logits_output = self.logits_processor(

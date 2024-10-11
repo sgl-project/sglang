@@ -236,7 +236,6 @@ class ControllerSingleSpecDraft(ControllerSingle):
         self.dp_worker_id = dp_worker_id
 
         self.spec_queue = spec_queue
-        self.mp_queue = spec_queue.draft_extend_input_queue
         self.spec_server = SpecDraftServer(
             gpu_ids[0],
             0,
@@ -247,8 +246,10 @@ class ControllerSingleSpecDraft(ControllerSingle):
 
     def loop_for_forward(self):
         while True:
-            if not self.mp_queue.empty():
-                recv_reqs = self.mp_queue.get()
+            if not self.spec_queue.draft_extend_input_queue.empty():
+                recv_reqs = self.spec_queue.draft_extend_input_queue.get()
+            elif not self.spec_queue.draft_decode_input_queue.empty():
+                recv_reqs = self.spec_queue.draft_decode_input_queue.get()
             self.spec_server.exposed_step(recv_reqs)
 
 

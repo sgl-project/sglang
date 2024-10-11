@@ -54,6 +54,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.speculative_utils import SpecInfoPipline
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -275,15 +276,15 @@ class ModelTpServer:
                 self.spec_queue.draft_extend_input_queue.put_nowait(
                     new_batch.spec_draft_input
                 )
-            else:
-                if not new_batch.is_empty():
-                    if self.running_batch is None:
-                        self.running_batch = new_batch
-                    else:
-                        self.running_batch.merge(new_batch)
+
+            if not new_batch.is_empty():
+                if self.running_batch is None:
+                    self.running_batch = new_batch
+                else:
+                    self.running_batch.merge(new_batch)
         else:
             # Run a decode batch
-            if self.running_batch is not None:
+            if self.running_batch is not None and not self.is_spec_worker:
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(global_config.num_continue_decode_steps):
                     self.num_generated_tokens += len(self.running_batch.reqs)
@@ -299,8 +300,13 @@ class ModelTpServer:
 
                     if self.out_pyobjs and self.running_batch.has_stream:
                         break
-            elif self.is_spec_worker and not self.spec_queue.draft_output_queue.empty():
-                self.forward_verify_batch()
+            # for speculative inference verify stage
+            elif (
+                self.is_spec_worker
+                and not self.spec_queue.draft_output_queue.empty()
+                and self.running_batch is not None
+            ):
+                self.forward_verify_batch(self.running_batch)
             else:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
@@ -837,16 +843,21 @@ class ModelTpServer:
             )
         verify_input = self.spec_queue.draft_output_queue.get()
 
-        verify_input.prepare_model_input(batch)
+        verify_input.prepare_for_verify(batch)
         batch.spec_draft_input = verify_input
+        batch.forward_mode = ForwardMode.SPECVERIFY
 
         # Forward and sample the next tokens
         logits_output = self.model_runner.forward(batch)
-        verified_token_ids, draft_input = batch.spec_draft_input.verify(logits_output)
-        # next_token_ids = self.model_runner.sample(logits_output, batch)
+        verified_token_ids = verify_input.verify(batch, logits_output)
+
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             verified_token_ids
         )
+
+        self.spec_queue.draft_decode_input_queue.put_nowait(batch.spec_draft_input)
+
+        self.handle_finished_requests(batch)
 
     def handle_finished_requests(self, batch: ScheduleBatch):
         output_rids = []

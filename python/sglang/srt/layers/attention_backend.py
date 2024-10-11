@@ -65,6 +65,11 @@ class AttentionBackend(ABC):
 
     def forward(self, q, k, v, layer: nn.Module, input_metadata: InputMetadata):
         """Run forward on an attention layer."""
+        if (
+            input_metadata.spec_algorithm == "EAGLE"
+            and input_metadata.forward_mode.is_spec_verify()
+        ):
+            return self.forward_extend(q, k, v, layer, input_metadata)
         if input_metadata.forward_mode.is_decode():
             return self.forward_decode(q, k, v, layer, input_metadata)
         else:
@@ -271,10 +276,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 input_metadata.token_to_kv_pool.set_kv_buffer(
                     layer.layer_id, input_metadata.out_cache_loc, k, v
                 )
+            casual = True
+            if (
+                input_metadata.spec_algorithm == "EAGLE"
+                and input_metadata.forward_mode == ForwardMode.SPECVERIFY
+            ):
+                causal = False
+
             o = prefill_wrapper_paged.forward(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 input_metadata.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=True,
+                causal=casual,
                 sm_scale=layer.scaling,
                 window_left=layer.sliding_window_size,
                 logits_soft_cap=layer.logit_cap,
@@ -316,9 +328,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrapper = decode_wrapper[0]
             else:
                 decode_wrapper = decode_wrapper[1]
-        if input_metadata.spec_draft_input is not None:
-            print("save kv pos")
-            print(input_metadata.out_cache_loc)
         if k is not None:
             assert v is not None
             input_metadata.token_to_kv_pool.set_kv_buffer(

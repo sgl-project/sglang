@@ -62,7 +62,7 @@ class SpecDraftServer(ModelTpServer):
                     self.forward_extend_step()
                     break
                 elif isinstance(recv_req, SpecDraftInput):
-                    self.forward_draft_step()
+                    self.forward_draft_step(recv_req)
                     break
                 else:
                     raise ValueError(f"Invalid request: {recv_req}")
@@ -103,10 +103,6 @@ class SpecDraftServer(ModelTpServer):
             self.num_generated_tokens += len(self.running_batch.reqs)
             self.forward_decode_batch(self.running_batch)
 
-            # Print stats
-            if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
-                self.print_decode_stats()
-
             if self.running_batch.is_empty():
                 self.running_batch = None
                 break
@@ -117,6 +113,13 @@ class SpecDraftServer(ModelTpServer):
             self.running_batch
         )
         self.spec_queue.draft_output_queue.put_nowait(verify_input)
+
+    @torch.inference_mode()
+    def forward_draft_step(self, draft_input: SpecDraftInput):
+        draft_input.init(self.server_args)
+        draft_input.preapre_new_draft_stage(self.running_batch)
+
+        self.forward_decode_step()
 
     def forward_prefill_batch(self, batch: ScheduleBatch):
         # Only implement EAGLE currently.
