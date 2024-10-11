@@ -1031,7 +1031,7 @@ class Scheduler:
             raise RuntimeError("Profiler is not enabled.")
         self.profiler.stop()
         logger.info("Profiler is stopping")
-        self.profiler.export_chrome_trace("./trace.json")
+        self.profiler.export_chrome_trace(os.getenv("SGLANG_TORCH_PROFILER_DIR", ".") + "/trace.json")
         logger.info("trace.json done")
 
 
