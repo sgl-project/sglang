@@ -423,6 +423,9 @@ class ScheduleBatch:
     # Stream
     has_stream: bool = False
 
+    # device
+    device: str = "cuda"
+
     # Has regex
     has_regex: bool = False
 
@@ -439,6 +442,7 @@ class ScheduleBatch:
             tree_cache=tree_cache,
             return_logprob=return_logprob,
             has_stream=has_stream,
+            device=req_to_token_pool.device,
             has_regex=has_regex,
         )
 
