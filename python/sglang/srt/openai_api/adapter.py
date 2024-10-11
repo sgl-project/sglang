@@ -302,7 +302,12 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
             if not isinstance(ret, list):
                 ret = [ret]
             if end_point == "/v1/chat/completions":
-                responses = v1_chat_generate_response(request, ret, to_file=True)
+                responses = v1_chat_generate_response(
+                    request,
+                    ret,
+                    to_file=True,
+                    cache_report=tokenizer_manager.server_args.enable_cache_report,
+                )
             else:
                 responses = v1_generate_response(
                     request, ret, tokenizer_manager, to_file=True
@@ -1245,7 +1250,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
         ret = [ret]
 
     response = v1_chat_generate_response(
-        request, ret, cache_report=tokenizer_manager.server_args.activate_cache_report
+        request, ret, cache_report=tokenizer_manager.server_args.enable_cache_report
     )
 
     return response

@@ -25,8 +25,7 @@ class TestCacheReport(unittest.TestCase):
             timeout=300,
             other_args=[
                 "--chunked-prefill-size=40",
-                "--disable-cuda-graph",
-                "--activate-cache-report",
+                "--enable-cache-report",
             ],
         )
         cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
