@@ -241,9 +241,7 @@ class Scheduler:
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
-                with_stack=True,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir, use_gzip=True))
+                with_stack=True)
 
     @torch.inference_mode()
     def event_loop(self):
@@ -1030,6 +1028,8 @@ class Scheduler:
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
         self.profiler.stop()
+        self.profiler.export_chrome_trace(
+            os.getenv("SGLANG_TORCH_PROFILER_DIR", ".") + str(time.time()) + "/trace.json.gz")
         logger.info("Profiler is done")
 
 
