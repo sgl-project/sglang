@@ -141,7 +141,7 @@ class ModelRunner:
             self.init_attention_backend()
 
     def init_torch_distributed(self):
-        logger.info("Init torch distributed  begin.")
+        logger.info("Init torch distributed begin.")
         # Init torch distributed
         if self.device == "cuda":
             torch.cuda.set_device(self.gpu_id)

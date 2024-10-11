@@ -142,7 +142,7 @@ class Scheduler:
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             server_args=server_args,
-            nccl_port=port_args.nccl_ports[0],
+            nccl_port=port_args.nccl_port,
         )
         self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
 
@@ -1042,9 +1042,14 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    dp_rank: Optional[int],
     pipe_writer,
 ):
-    configure_logger(server_args, prefix=f" TP{tp_rank}")
+    if dp_rank is None:
+        configure_logger(server_args, prefix=f" TP{tp_rank}")
+    else:
+        configure_logger(server_args, prefix=f" DP{dp_rank} TP{tp_rank}")
+
     suppress_other_loggers()
 
     try:
