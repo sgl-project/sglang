@@ -31,6 +31,18 @@ class TestCacheReport(unittest.TestCase):
         cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
         cls.aclient = openai.AsyncClient(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
 
+        usage = cls.run_openai(cls, "1").usage
+        # we can assume that our request is of size 1, plus the total template size
+        # ideally we would like to know the begin size / end size of the template to be more precise
+        total_template_size = usage.prompt_tokens - 1
+        print(f"template size: {total_template_size}")
+        usage2 = cls.run_openai(cls, "2").usage
+        assert usage2.prompt_tokens_details.cached_tokens <= total_template_size
+        cls.min_cached = max(
+            usage2.prompt_tokens_details.cached_tokens,
+            total_template_size - usage2.prompt_tokens_details.cached_tokens,
+        )
+
     @classmethod
     def tearDownClass(cls):
         kill_child_process(cls.process.pid)
@@ -88,7 +100,6 @@ class TestCacheReport(unittest.TestCase):
         assert first_cached_tokens < self.min_cached
         response = self.run_openai(message)
         cached_tokens = int(response.usage.prompt_tokens_details.cached_tokens)
-        print(f"openai second request usage: {response.usage}")
         print(f"openai second request cached_tokens: {cached_tokens}")
         assert cached_tokens > 0
         assert cached_tokens == int(response.usage.prompt_tokens) - 1
@@ -101,9 +112,9 @@ class TestCacheReport(unittest.TestCase):
         return cached_tokens, prompt_tokens
 
     def test_generate(self):
+        print("=" * 100)
         response = self.run_decode()
         # print(response.json())
-        # print("=" * 100)
         cached_tokens = int(response.json()["meta_info"]["cached_tokens"])
         print(f"sglang first request cached_tokens: {cached_tokens}")
         print(
@@ -120,6 +131,7 @@ class TestCacheReport(unittest.TestCase):
         assert cached_tokens == int(response.json()["meta_info"]["prompt_tokens"]) - 1
 
     def test_cache_split_prefill_openai(self):
+        print("=" * 100)
         self.cache_report_openai(
             "€ This is a very long and unique text that should not be already cached, the twist is"
             " that it should be longer than the chunked-prefill-size, so it should be split among"
@@ -127,18 +139,33 @@ class TestCacheReport(unittest.TestCase):
         )
 
     def test_cache_report_openai(self):
-        self.cache_report_openai("Introduce the capital of France.")
+        print("=" * 100)
+        # warm up the cache, for the template
+        self.run_openai("Introduce the capital of France.")
 
-        first_cached_tokens_1 = self.cache_report_openai(
+        first_cached_tokens_1 = self.run_openai(
             "How many sparrow do you need to lift a coconut?"
-        )
+        ).usage.prompt_tokens_details.cached_tokens
 
-        first_cached_tokens_2 = self.cache_report_openai("* sing something about cats")
+        usage_2 = self.run_openai("* sing something about cats").usage
+        first_cached_tokens_2 = usage_2.prompt_tokens_details.cached_tokens
         # first request may not have 0 cached tokens, but if they only have the template in common they
         # should be the same once the cache is warmed up
         assert first_cached_tokens_1 == first_cached_tokens_2
 
+        resp = self.run_openai("* sing something about cats and dogs")
+        print(resp.usage)
+
+        resp = self.run_openai("* sing something about cats, please")
+        print(resp.usage)
+        assert (
+            resp.usage.prompt_tokens_details.cached_tokens
+            >= usage_2.prompt_tokens - self.min_cached
+        )
+
     def test_cache_report_openai_async(self):
+        print("=" * 100)
+
         async def run_test():
             task0 = asyncio.create_task(
                 self.cache_report_openai_async(

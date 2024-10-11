@@ -242,12 +242,9 @@ class Req:
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
-            matched_prefix_indices, self.last_node = tree_cache.match_prefix(
+            self.prefix_indices, self.last_node = tree_cache.match_prefix(
                 rid=self.rid, key=self.adjust_max_prefix_ids()
             )
-            # The number of new cached tokens, is the number of matched prefix indices
-            self.cached_tokens += len(matched_prefix_indices)
-            self.prefix_indices = matched_prefix_indices
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -502,6 +499,13 @@ class ScheduleBatch:
 
         pt = 0
         for i, req in enumerate(reqs):
+            already_computed = (
+                req.extend_logprob_start_len + 1 + req.cached_tokens
+                if req.extend_logprob_start_len > 0
+                else 0
+            )
+            req.cached_tokens += len(req.prefix_indices) - already_computed
+
             req.req_pool_idx = req_pool_indices[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
