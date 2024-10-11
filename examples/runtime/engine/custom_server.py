@@ -3,8 +3,6 @@ from sanic.response import json
 
 import sglang as sgl
 
-# from sanic.response import stream
-
 engine = None
 
 # Create an instance of the Sanic app
