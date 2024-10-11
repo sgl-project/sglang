@@ -20,12 +20,12 @@ suites = {
         "test_server_args.py",
         "test_skip_tokenizer_init.py",
         "test_srt_endpoint.py",
-        "test_srt_engine.py",
         "test_torch_compile.py",
         "test_torchao.py",
         "test_triton_attn_backend.py",
         "test_update_weights.py",
         "test_vision_openai_server.py",
+        "test_srt_engine.py",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True
