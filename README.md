@@ -1,4 +1,4 @@
-<div align="center">
+<div align="center"  id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
 [![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
@@ -588,3 +588,15 @@ Learn more at this [blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/).
 ## Citation And Acknowledgment
 Please cite our paper, [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), if you find the project useful.
 We also learned from the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+
+
+
+<p align="center">
+  <a href="https://github.com/sgl-project/sglang" target="_blank">
+    <img src="https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub">
+  </a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="#sglangtop" target="_blank">
+    <img src="https://img.shields.io/badge/Back%20to%20Top-000000?style=for-the-badge" alt="Back to Top">
+  </a>
+</p>
