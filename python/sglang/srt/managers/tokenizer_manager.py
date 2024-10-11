@@ -46,13 +46,13 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
+    ProfileReq,
     RewardReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     TokenizedRewardReqInput,
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
-    ProfileReq,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs

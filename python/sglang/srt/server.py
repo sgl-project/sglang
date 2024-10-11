@@ -144,6 +144,7 @@ async def flush_cache():
         status_code=200,
     )
 
+
 @app.get("/start_profile")
 @app.post("/start_profile")
 async def start_profile():
@@ -154,6 +155,7 @@ async def start_profile():
         status_code=200,
     )
 
+
 @app.get("/stop_profile")
 @app.post("/stop_profile")
 async def stop_profile():
@@ -163,6 +165,7 @@ async def stop_profile():
         content="Stop profiling. This will take some time.\n",
         status_code=200,
     )
+
 
 @app.post("/update_weights")
 async def update_weights(obj: UpdateWeightReqInput, request: Request):

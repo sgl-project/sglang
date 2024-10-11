@@ -37,12 +37,12 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchTokenIDOut,
     FlushCacheReq,
+    ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     TokenizedRewardReqInput,
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
-    ProfileReq,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -234,14 +234,17 @@ class Scheduler:
             self.profiler = None
         else:
             self.torch_profiler_trace_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
-            logger.info("Profiling enabled. Traces will be saved to: %s",
-                        self.torch_profiler_trace_dir)
+            logger.info(
+                "Profiling enabled. Traces will be saved to: %s",
+                self.torch_profiler_trace_dir,
+            )
             self.profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
-                with_stack=True)
+                with_stack=True,
+            )
 
     @torch.inference_mode()
     def event_loop(self):
@@ -1029,7 +1032,8 @@ class Scheduler:
             raise RuntimeError("Profiler is not enabled.")
         self.profiler.stop()
         self.profiler.export_chrome_trace(
-            self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz")
+            self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz"
+        )
         logger.info("Profiler is done")
 
 
