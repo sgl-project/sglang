@@ -233,9 +233,9 @@ class Scheduler:
         if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
             self.profiler = None
         else:
-            torch_profiler_trace_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "")
+            self.torch_profiler_trace_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
             logger.info("Profiling enabled. Traces will be saved to: %s",
-                        torch_profiler_trace_dir)
+                        self.torch_profiler_trace_dir)
             self.profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
@@ -1029,7 +1029,7 @@ class Scheduler:
             raise RuntimeError("Profiler is not enabled.")
         self.profiler.stop()
         self.profiler.export_chrome_trace(
-            os.getenv("SGLANG_TORCH_PROFILER_DIR", ".") + "/" + str(time.time()) + ".trace.json.gz")
+            self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz")
         logger.info("Profiler is done")
 
 
