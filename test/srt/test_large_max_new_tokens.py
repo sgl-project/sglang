@@ -1,6 +1,4 @@
-import json
 import os
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestOpenAIServer(unittest.TestCase):
+class TestLargeMaxNewTokens(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -57,7 +55,7 @@ class TestOpenAIServer(unittest.TestCase):
         num_requests = 4
 
         futures = []
-        with ThreadPoolExecutor(16) as executor:
+        with ThreadPoolExecutor(num_requests) as executor:
             for i in range(num_requests):
                 futures.append(executor.submit(self.run_chat_completion))
 
