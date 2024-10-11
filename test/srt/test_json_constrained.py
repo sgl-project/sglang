@@ -71,7 +71,7 @@ class TestJSONConstrained(unittest.TestCase):
         assert isinstance(js_obj["population"], int)
 
     def test_json_generate(self):
-        self.run_decode(json_scheme=self.json_schema)
+        self.run_decode(json_schema=self.json_schema)
 
     def test_json_openai(self):
         client = openai.Client(api_key="EMPTY", base_url=f"{self.base_url}/v1")
