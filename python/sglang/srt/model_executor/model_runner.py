@@ -97,7 +97,7 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
-            logger.info("MLA optimization is tunred on. Use triton backend.")
+            logger.info("MLA optimization is turned on. Use triton backend.")
             self.server_args.attention_backend = "triton"
 
         if self.is_multimodal_model:
