@@ -30,10 +30,6 @@ class SamplingBatchInfo:
     vocab_mask: Optional[torch.Tensor] = None
 
     # FSM states
-    regex_fsms: List[RegexGuide] = None
-    regex_fsm_states: List[int] = None
-
-    # TODO(dark): remove the above and use the regex_bnf instead
     regex_bnfs: Optional[List[Optional[GrammarStateMatcher]]] = None
 
     # Penalizer
@@ -114,23 +110,6 @@ class SamplingBatchInfo:
                             device="cuda",
                         )
                     self.linear_penalties = penalizer.apply(self.linear_penalties)
-
-    def update_regex_vocab_mask(self):
-        has_regex = self.regex_fsms and any(regex_fsm for regex_fsm in self.regex_fsms)
-
-        # Reset the vocab mask
-        self.vocab_mask = None
-
-        if has_regex:
-            self.vocab_mask = torch.zeros(
-                len(self.temperatures), self.vocab_size, dtype=torch.bool, device="cuda"
-            )
-            for i, regex_fsm in enumerate(self.regex_fsms):
-                if regex_fsm is not None:
-                    self.vocab_mask[i].fill_(1)
-                    self.vocab_mask[i][
-                        regex_fsm.get_next_instruction(self.regex_fsm_states[i]).tokens
-                    ] = 0
 
     # TODO(dark): rename this to update_regex_vocab_mask after removing the old one
     def update_regex_vocab_mask_bnf(self):

@@ -523,7 +523,6 @@ class ModelRunner:
         # Put CPU-heavy tasks here. They will be overlapped with the forward pass.
         sampling_info = forward_batch.sampling_info
         sampling_info.update_regex_vocab_mask_bnf()
-        sampling_info.update_regex_vocab_mask()
         sampling_info.update_penalties()
         logits = self.apply_logits_bias(logits_output.next_token_logits, sampling_info)
 
