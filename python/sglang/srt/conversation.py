@@ -70,6 +70,9 @@ class Conversation:
     sep2: str = None
     # Stop criteria (the default one is EOS token)
     stop_str: Union[str, List[str]] = None
+    # The string that represents an image token in the prompt
+    image_token: str = "<image>"
+
     image_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
 
@@ -334,6 +337,7 @@ class Conversation:
             sep=self.sep,
             sep2=self.sep2,
             stop_str=self.stop_str,
+            image_token=self.image_token,
         )
 
     def dict(self):
@@ -381,6 +385,7 @@ def generate_chat_conv(
         stop_str=conv.stop_str,
         image_data=[],
         modalities=[],
+        image_token=conv.image_token,
     )
 
     if isinstance(request.messages, str):
@@ -412,9 +417,13 @@ def generate_chat_conv(
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
                 if num_image_url > 1:
-                    image_token = "<image>"
+                    image_token = conv.image_token
                 else:
-                    image_token = "<image>\n"
+                    image_token = (
+                        conv.image_token + "\n"
+                        if conv.name != "qwen2-vl"
+                        else conv.image_token
+                    )
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
