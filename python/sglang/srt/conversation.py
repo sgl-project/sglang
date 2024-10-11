@@ -70,10 +70,11 @@ class Conversation:
     sep2: str = None
     # Stop criteria (the default one is EOS token)
     stop_str: Union[str, List[str]] = None
+    # The string that represents an image token in the prompt
+    image_token: str = "<image>"
 
     image_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
-    image_token: str = "<image>"
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
