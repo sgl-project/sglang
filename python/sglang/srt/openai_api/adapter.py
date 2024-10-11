@@ -117,7 +117,9 @@ def create_streaming_error_response(
 def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
     global chat_template_name
 
-    logger.info(f"Use chat template: {chat_template_arg}")
+    logger.info(
+        f"Use chat template for the OpenAI-compatible API server: {chat_template_arg}"
+    )
     if not chat_template_exists(chat_template_arg):
         if not os.path.exists(chat_template_arg):
             raise RuntimeError(
