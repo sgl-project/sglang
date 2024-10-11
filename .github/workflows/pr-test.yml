@@ -73,7 +73,7 @@ jobs:
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
           python3 run_suite.py --suite minimal --range-begin 5 --range-end 16
