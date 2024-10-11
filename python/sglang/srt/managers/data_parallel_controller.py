@@ -13,69 +13,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""A scheduler that manages a tensor parallel GPU worker."""
+"""A controller that dispatches requests to multiple data parallel workers."""
 
-import json
 import logging
-import multiprocessing
 import multiprocessing as mp
-import os
-import time
-import warnings
-from typing import List, Optional, Union
+from enum import Enum, auto
 
-import torch
 import zmq
 
-from sglang.global_config import global_config
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.fsm_cache import FSMCache
-from sglang.srt.constrained.jump_forward import JumpForwardCache
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
-    AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
-    FlushCacheReq,
-    ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     TokenizedRewardReqInput,
-    UpdateWeightReqInput,
-    UpdateWeightReqOutput,
-)
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    BaseFinishReason,
-    ImageInputs,
-    Req,
-    ScheduleBatch,
-)
-from sglang.srt.managers.schedule_policy import (
-    AddReqResult,
-    PrefillAdder,
-    SchedulePolicy,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    broadcast_pyobj,
     configure_logger,
-    is_generation_model,
-    is_multimodal_model,
     kill_parent_process,
-    pytorch_profile,
-    set_random_seed,
     suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-from enum import Enum, auto
 
 
 class LoadBalanceMethod(Enum):
@@ -94,6 +54,8 @@ class LoadBalanceMethod(Enum):
 
 
 class DataParallelController:
+    """A controller that dispatches requests to multiple data parallel workers."""
+
     def __init__(self, server_args, port_args) -> None:
         # Parse args
         self.server_args = server_args
@@ -104,7 +66,6 @@ class DataParallelController:
 
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
-
         self.recv_from_tokenizer = self.context.socket(zmq.PULL)
         self.recv_from_tokenizer.bind(f"ipc://{port_args.scheduler_input_ipc_name}")
 
