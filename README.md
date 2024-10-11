@@ -592,11 +592,7 @@ We also learned from the design and reused code from the following projects: [Gu
 
 
 <p align="center">
-  <a href="https://github.com/sgl-project/sglang" target="_blank">
-    <img src="https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub">
-  </a>
-  &nbsp;&nbsp;&nbsp;
   <a href="#sglangtop" target="_blank">
-    <img src="https://img.shields.io/badge/Back%20to%20Top-000000?style=for-the-badge" alt="Back to Top">
+  <bold>Back To Top </bold>
   </a>
 </p>
