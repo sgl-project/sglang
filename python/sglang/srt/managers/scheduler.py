@@ -17,7 +17,6 @@ limitations under the License.
 
 import json
 import logging
-import multiprocessing
 import os
 import time
 import warnings

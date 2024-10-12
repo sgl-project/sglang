@@ -405,9 +405,9 @@ class ScheduleBatch:
     sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
-    input_ids: List[int] = None
-    req_pool_indices: List[int] = None
-    seq_lens: List[int] = None
+    input_ids: torch.Tensor = None
+    req_pool_indices: torch.Tensor = None
+    seq_lens: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
 
     # For processing logprobs
