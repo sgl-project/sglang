@@ -910,6 +910,7 @@ def v1_chat_generate_request(
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
             "n": request.n,
+            "ignore_eos": request.ignore_eos,
         }
         if request.response_format and request.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
