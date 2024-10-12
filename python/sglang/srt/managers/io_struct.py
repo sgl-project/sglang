@@ -20,6 +20,7 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -119,8 +120,7 @@ class GenerateReqInput:
             elif not isinstance(self.image_data, list):
                 self.image_data = [self.image_data] * num
             elif isinstance(self.image_data, list):
-                # FIXME incorrect order for duplication
-                self.image_data = self.image_data * num
+                pass
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * num
@@ -344,3 +344,8 @@ class UpdateWeightReqOutput:
 class AbortReq:
     # The request id
     rid: str
+
+
+class ProfileReq(Enum):
+    START_PROFILE = 1
+    STOP_PROFILE = 2

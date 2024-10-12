@@ -574,7 +574,7 @@ class ServerArgs:
             self.tp_size % self.nnodes == 0
         ), "tp_size must be divisible by number of nodes"
         assert not (
-            self.dp_size > 1 and self.node_rank is not None
+            self.dp_size > 1 and self.nnodes != 1
         ), "multi-node data parallel is not supported"
         assert (
             self.max_loras_per_batch > 0
@@ -582,11 +582,6 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
-
-        assert self.dp_size == 1, (
-            "The support for data parallelism is temporarily disabled during refactor. "
-            "Please use sglang<=0.3.2 or wait for later updates."
-        )
 
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths
@@ -626,11 +621,11 @@ class PortArgs:
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
 
-    # The port for nccl initialization for multiple TP groups (torch.dist)
-    nccl_ports: List[int]
+    # The port for nccl initialization (torch.dist)
+    nccl_port: int
 
-    @classmethod
-    def init_new(self, server_args):
+    @staticmethod
+    def init_new(server_args) -> "PortArgs":
         port = server_args.port + 1
         while True:
             if is_port_available(port):
@@ -641,7 +636,7 @@ class PortArgs:
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
             scheduler_input_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
             detokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            nccl_ports=[port],
+            nccl_port=port,
         )
 
 

@@ -82,7 +82,7 @@ class ModelRunner:
         # Parse args
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
-        self.device = device
+        self.device = server_args.device
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -142,12 +142,13 @@ class ModelRunner:
             self.init_attention_backend()
 
     def init_torch_distributed(self):
-        logger.info("Init torch distributed  begin.")
+        logger.info("Init torch distributed begin.")
         # Init torch distributed
         if self.device == "cuda":
             torch.cuda.set_device(self.gpu_id)
             backend = "nccl"
-        # ToDO(liangan1):Just use gloo to bypass the initilization fail,need to use ccl for xpu backend
+        #ToDO(liangan1):Just use gloo to bypass the initilization fail
+        #Need to use xccl for xpu backend in the future
         elif device_type == "xpu":
             torch.xpu.set_device(self.gpu_id)
             backend = "gloo"

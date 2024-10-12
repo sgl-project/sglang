@@ -810,6 +810,8 @@ class ScheduleBatch:
             self.sampling_info.regex_fsm_states = [
                 req.regex_fsm_state for req in self.reqs
             ]
+        else:
+            self.sampling_info.regex_fsms = None
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
