@@ -242,7 +242,7 @@ class ServerArgs:
             "--device",
             type=str,
             default="cuda",
-            choices=["cuda"],
+            choices=["cuda", "xpu"],
             help="The device type.",
         )
         parser.add_argument(
