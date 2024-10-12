@@ -116,15 +116,12 @@ class BaseTokenToKVPool:
     ) -> None:
         raise NotImplementedError()
 
-    @abstractmethod
     def get_key_scales_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
 
-    @abstractmethod
     def get_value_scales_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
 
-    @abstractmethod
     def get_kv_scales_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
 
