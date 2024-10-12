@@ -15,6 +15,13 @@ if TYPE_CHECKING:
 
 class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
+        self.kv_int8 = False
+        self.kv_int4 = False
+        if model_runner.server_args.kv_cache_dtype == "int8":
+            self.kv_int8 = True
+        if model_runner.server_args.kv_cache_dtype == "int4":
+            self.kv_int4 = True
+            self.quant_group_size = model_runner.server_args.kvint4_groupsize
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
@@ -25,8 +32,28 @@ class TritonAttnBackend(AttentionBackend):
 
         super().__init__()
 
-        self.decode_attention_fwd = decode_attention_fwd
-        self.extend_attention_fwd = extend_attention_fwd
+        if self.kv_int8:
+            from sglang.srt.layers.attention.triton_ops.decode_attention_int8kv import (
+                decode_attention_fwd_int8kv,
+            )
+            from sglang.srt.layers.attention.triton_ops.extend_attention_int8kv import (
+                extend_attention_fwd_int8kv,
+            )
+            self.decode_attention_fwd = decode_attention_fwd_int8kv
+            self.extend_attention_fwd = extend_attention_fwd_int8kv
+        elif self.kv_int4:
+            from sglang.srt.layers.attention.triton_ops.decode_attention_int4kv import (
+                decode_attention_fwd_int4kv,
+            )
+            from sglang.srt.layers.attention.triton_ops.extend_attention_int4kv import (
+                extend_attention_fwd_int4kv,
+            )
+            self.decode_attention_fwd = decode_attention_fwd_int4kv
+            self.extend_attention_fwd = extend_attention_fwd_int4kv
+        else:
+            self.decode_attention_fwd = decode_attention_fwd
+            self.extend_attention_fwd = extend_attention_fwd
+            
         self.num_head = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
         )
@@ -109,22 +136,62 @@ class TritonAttnBackend(AttentionBackend):
         )
 
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
-        self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous(),
-            v.contiguous(),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.extend_seq_lens,
-            forward_batch.extend_start_loc,
-            max_extend_len,
-            layer.scaling,
-            layer.logit_cap,
-        )
+        if self.kv_int8:
+            self.extend_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_key_scales_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_scales_buffer(layer.layer_id),
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_start_loc,
+                max_extend_len,
+                layer.scaling,
+                layer.logit_cap,
+            )
+        elif self.kv_int4:
+            self.extend_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_key_scales_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_scales_buffer(layer.layer_id),
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_start_loc,
+                max_extend_len,
+                self.quant_group_size,
+                layer.scaling,               
+                layer.logit_cap,
+            )
+        else:
+            self.extend_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_start_loc,
+                max_extend_len,
+                layer.scaling,
+                layer.logit_cap,
+            )
         return o
 
     def forward_decode(self, q, k, v, layer: nn.Module, forward_batch: ForwardBatch):
@@ -143,19 +210,55 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch.token_to_kv_pool.set_kv_buffer(
             layer.layer_id, forward_batch.out_cache_loc, k, v
         )
-
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            start_loc,
-            forward_batch.seq_lens,
-            attn_logits,
-            max_seq_len,
-            layer.scaling,
-            layer.logit_cap,
-        )
+        
+        if self.kv_int8:
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_key_scales_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_scales_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                start_loc,
+                forward_batch.seq_lens,
+                attn_logits,
+                max_seq_len,
+                layer.scaling,
+                layer.logit_cap,
+            )
+        elif self.kv_int4:
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_key_scales_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_scales_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                start_loc,
+                forward_batch.seq_lens,
+                attn_logits,
+                max_seq_len,
+                layer.scaling,
+                self.quant_group_size,                
+                layer.logit_cap,
+            )
+        else:
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                start_loc,
+                forward_batch.seq_lens,
+                attn_logits,
+                max_seq_len,
+                layer.scaling,
+                layer.logit_cap,
+            )
         return o

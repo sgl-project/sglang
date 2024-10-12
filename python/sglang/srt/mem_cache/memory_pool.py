@@ -115,6 +115,18 @@ class BaseTokenToKVPool:
         cache_v: torch.Tensor,
     ) -> None:
         raise NotImplementedError()
+    
+    @abstractmethod
+    def get_key_scales_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_value_scales_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_kv_scales_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError()
 
 
 class MHATokenToKVPool(BaseTokenToKVPool):
@@ -127,27 +139,70 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         head_dim: int,
         layer_num: int,
         device: str,
+        kv_cache_dtype_str: str,
+        kvint4_groupsize: int,
+        torch_dtype: torch.dtype,
     ):
         super().__init__(size, dtype, device)
 
-        # [size, head_num, head_dim] for each layer
-        # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.k_buffer = [
-            torch.empty(
-                (size + 1, head_num, head_dim),
-                dtype=self.store_dtype,
-                device=device,
-            )
-            for _ in range(layer_num)
-        ]
-        self.v_buffer = [
-            torch.empty(
-                (size + 1, head_num, head_dim),
-                dtype=self.store_dtype,
-                device=device,
-            )
-            for _ in range(layer_num)
-        ]
+        self.kv_cache_dtype_str = kv_cache_dtype_str
+        if kv_cache_dtype_str == "int4":
+            # [size, head_num, head_dim] for each layer
+            self.k_buffer = [
+                torch.empty(
+                    (size + 1, head_num, head_dim // 2), dtype=torch.int8, device="cuda"
+                )
+                for _ in range(layer_num)
+            ]
+            self.v_buffer = [
+                torch.empty(
+                    (size + 1, head_num, head_dim // 2), dtype=torch.int8, device="cuda"
+                )
+                for _ in range(layer_num)
+            ]
+        else:
+            # [size, head_num, head_dim] for each layer
+            self.k_buffer = [
+                torch.empty(
+                    (size + 1, head_num, head_dim), dtype=self.store_dtype, device="cuda"
+                )
+                for _ in range(layer_num)
+            ]
+            self.v_buffer = [
+                torch.empty(
+                    (size + 1, head_num, head_dim), dtype=self.store_dtype, device="cuda"
+                )
+                for _ in range(layer_num)
+            ]
+        if dtype == torch.int8:
+            if kv_cache_dtype_str == "int4":
+                self.quant_group_size = kvint4_groupsize
+                assert head_dim % self.quant_group_size == 0, "error head dim, can not allocate int4 kv scales"
+                self.k_scales_buffer = [
+                    torch.empty(
+                        (size + 1, head_num, head_dim // self.quant_group_size), dtype=torch_dtype, device="cuda"
+                    )
+                    for _ in range(layer_num)
+                ]
+                self.v_scales_buffer = [
+                    torch.empty(
+                        (size + 1, head_num, head_dim // self.quant_group_size), dtype=torch_dtype, device="cuda"
+                    )
+                    for _ in range(layer_num)
+                ]
+            else:
+                self.k_scales_buffer = [
+                    torch.empty(
+                        (size + 1, head_num, 1), dtype=torch_dtype, device="cuda"
+                    )
+                    for _ in range(layer_num)
+                ]
+                self.v_scales_buffer = [
+                    torch.empty(
+                        (size + 1, head_num, 1), dtype=torch_dtype, device="cuda"
+                    )
+                    for _ in range(layer_num)
+                ]
 
     def get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
@@ -161,6 +216,24 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+    
+    def get_key_scales_buffer(self, layer_id: int):
+        if self.dtype == torch.int8:
+            return self.k_scales_buffer[layer_id]
+        else:
+            return None
+
+    def get_value_scales_buffer(self, layer_id: int):
+        if self.dtype == torch.int8:
+            return self.v_scales_buffer[layer_id]
+        else:
+            return None
+
+    def get_kv_scales_buffer(self, layer_id: int):
+        if self.dtype == torch.int8:
+            return self.get_key_scales_buffer(layer_id), self.get_value_scales_buffer(layer_id)
+        else:
+            return None
 
     def set_kv_buffer(
         self,
@@ -169,16 +242,30 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
-        if cache_v.dtype != self.dtype:
-            cache_v = cache_v.to(self.dtype)
-        if self.store_dtype != self.dtype:
-            self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
-            self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
+        if self.dtype == torch.int8:
+            if self.kv_cache_dtype_str == "int4":
+                from sglang.srt.layers.attention.triton_ops.decode_attention_int4kv import (
+                    destindex_copy_quantize_int4kv,
+                )
+                destindex_copy_quantize_int4kv(cache_k, loc, self.k_buffer[layer_id], self.k_scales_buffer[layer_id], self.quant_group_size)
+                destindex_copy_quantize_int4kv(cache_v, loc, self.v_buffer[layer_id], self.v_scales_buffer[layer_id], self.quant_group_size)
+            else:
+                from sglang.srt.layers.attention.triton_ops.decode_attention_int8kv import (
+                    destindex_copy_quantize_kv,
+                )
+                destindex_copy_quantize_kv(cache_k, loc, self.k_buffer[layer_id], self.k_scales_buffer[layer_id])
+                destindex_copy_quantize_kv(cache_v, loc, self.v_buffer[layer_id], self.v_scales_buffer[layer_id])
         else:
-            self.k_buffer[layer_id][loc] = cache_k
-            self.v_buffer[layer_id][loc] = cache_v
+            if cache_k.dtype != self.dtype:
+                cache_k = cache_k.to(self.dtype)
+            if cache_v.dtype != self.dtype:
+                cache_v = cache_v.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
+                self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
+            else:
+                self.k_buffer[layer_id][loc] = cache_k
+                self.v_buffer[layer_id][loc] = cache_v
 
 
 class MLATokenToKVPool(BaseTokenToKVPool):

@@ -38,6 +38,7 @@ class ServerArgs:
     dtype: str = "auto"
     device: str = "cuda"
     kv_cache_dtype: str = "auto"
+    kvint4_groupsize: int = 32
     trust_remote_code: bool = True
     context_length: Optional[int] = None
     quantization: Optional[str] = None
@@ -249,8 +250,15 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2"],
+            choices=["auto", "fp8_e5m2", "int8", "int4"],
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" is supported for CUDA 11.8+.',
+        )
+        parser.add_argument(
+            "--kvint4-groupsize",
+            type=int,
+            default=ServerArgs.kvint4_groupsize,
+            choices=[8, 16, 32, 64, 128],
+            help="Kv cache int4 quantization group size, more smaller, acc more higher, mem occupancy of scales more higher. Defaults to 32",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -275,6 +283,7 @@ class ServerArgs:
                 "gptq_marlin",
                 "awq_marlin",
                 "bitsandbytes",
+                "compressed-tensors"
             ],
             help="The quantization method.",
         )

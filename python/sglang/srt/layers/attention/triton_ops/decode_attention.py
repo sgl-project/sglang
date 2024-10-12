@@ -167,6 +167,7 @@ def _fwd_kernel_stage2(
         v = tl.load(
             v_ptrs + v_index[:, None] * stride_buf_vbs, mask=(offs_d[None, :] < Lv)
         )
+        p = p.to(v.dtype)
         acc = acc * old_scale + tl.sum(p[:, None] * v, 0)
         e_max = n_e_max
 
