@@ -72,7 +72,6 @@ class ModelRunner:
         self,
         model_config: ModelConfig,
         mem_fraction_static: float,
-        device: str,
         gpu_id: int,
         tp_rank: int,
         tp_size: int,
@@ -147,8 +146,8 @@ class ModelRunner:
         if self.device == "cuda":
             torch.cuda.set_device(self.gpu_id)
             backend = "nccl"
-        #ToDO(liangan1):Just use gloo to bypass the initilization fail
-        #Need to use xccl for xpu backend in the future
+        # ToDO(liangan1):Just use gloo to bypass the initilization fail
+        # Need to use xccl for xpu backend in the future
         elif device_type == "xpu":
             torch.xpu.set_device(self.gpu_id)
             backend = "gloo"
