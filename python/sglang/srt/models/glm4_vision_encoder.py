@@ -25,13 +25,13 @@ from torch import nn
 from torch.nn import LayerNorm
 
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import SiluAndMul, get_act_fn
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+from sglang.srt.layers.activation import SiluAndMul, get_act_fn
+from sglang.srt.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.quantization.base_config import (
+from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig)
 
 
