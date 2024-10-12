@@ -23,29 +23,31 @@ from typing import Optional
 import torch
 from torch import nn
 from torch.nn import LayerNorm
-
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import SiluAndMul, get_act_fn
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               MergedColumnParallelLinear,
-                                               QKVParallelLinear,
-                                               ReplicatedLinear,
-                                               RowParallelLinear)
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+
+from sglang.srt.layers.activation import SiluAndMul, get_act_fn
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
 class PatchEmbedding(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.proj = nn.Conv2d(config.in_channels,
-                              config.hidden_size,
-                              kernel_size=config.patch_size,
-                              stride=config.patch_size)
+        self.proj = nn.Conv2d(
+            config.in_channels,
+            config.hidden_size,
+            kernel_size=config.patch_size,
+            stride=config.patch_size,
+        )
         self.cls_embedding = nn.Parameter(torch.zeros(1, config.hidden_size))
-        self.position_embedding = nn.Embedding(config.num_positions,
-                                               config.hidden_size)
+        self.position_embedding = nn.Embedding(config.num_positions, config.hidden_size)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -98,19 +100,19 @@ class Attention(nn.Module):
         B, L, _ = x.shape
         qkv, _ = self.query_key_value(x)  # B, L, 3 * H * D
         q, k, v = qkv.chunk(3, dim=-1)
-        q = q.reshape(B, L, self.num_heads_per_rank,
-                      self.head_dim).permute(0, 2, 1, 3)  # B, H, L, D
-        k = k.reshape(B, L, self.num_heads_per_rank,
-                      self.head_dim).permute(0, 2, 1, 3)  # B, H, L, D
-        v = v.reshape(B, L, self.num_heads_per_rank,
-                      self.head_dim).permute(0, 2, 1, 3)  # B, H, L, D
+        q = q.reshape(B, L, self.num_heads_per_rank, self.head_dim).permute(
+            0, 2, 1, 3
+        )  # B, H, L, D
+        k = k.reshape(B, L, self.num_heads_per_rank, self.head_dim).permute(
+            0, 2, 1, 3
+        )  # B, H, L, D
+        v = v.reshape(B, L, self.num_heads_per_rank, self.head_dim).permute(
+            0, 2, 1, 3
+        )  # B, H, L, D
 
-        out = torch.nn.functional.scaled_dot_product_attention(q,
-                                                               k,
-                                                               v,
-                                                               attn_mask=None,
-                                                               dropout_p=0.,
-                                                               is_causal=False)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False
+        )
 
         output, _ = self.dense(out.transpose(1, 2).view(B, L, -1))
         output = self.output_dropout(output)
@@ -153,17 +155,16 @@ class TransformerLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.input_layernorm = LayerNorm(config.hidden_size,
-                                         eps=config.layer_norm_eps)
+        self.input_layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.attention = Attention(config, quant_config=quant_config)
         self.mlp = MLP(config, quant_config=quant_config)
-        self.post_attention_layernorm = LayerNorm(config.hidden_size,
-                                                  eps=config.layer_norm_eps)
+        self.post_attention_layernorm = LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
 
     def forward(self, hidden_states):
         attention_input = hidden_states
-        attention_output = self.input_layernorm(
-            self.attention(attention_input))
+        attention_output = self.input_layernorm(self.attention(attention_input))
         hidden_states = attention_input + attention_output
         mlp_input = hidden_states
         mlp_output = self.post_attention_layernorm(self.mlp(mlp_input))
@@ -179,10 +180,12 @@ class Transformer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.layers = nn.ModuleList([
-            TransformerLayer(config, quant_config=quant_config)
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                TransformerLayer(config, quant_config=quant_config)
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
 
     def forward(self, hidden_states):
         for layer_module in self.layers:
@@ -235,23 +238,26 @@ class GLU(nn.Module):
         ```
         """
         super().__init__()
-        self.linear_proj = ReplicatedLinear(in_features,
-                                            config.hidden_size,
-                                            bias=False,
-                                            quant_config=quant_config)
+        self.linear_proj = ReplicatedLinear(
+            in_features, config.hidden_size, bias=False, quant_config=quant_config
+        )
         self.norm1 = nn.LayerNorm(config.hidden_size)
         self.act1 = nn.GELU()
         self.act2 = SiluAndMul()
 
         self.merged_proj = MergedColumnParallelLinear(
-            config.hidden_size, [config.ffn_hidden_size] * 2,
+            config.hidden_size,
+            [config.ffn_hidden_size] * 2,
             bias=False,
-            quant_config=quant_config)
+            quant_config=quant_config,
+        )
 
-        self.dense_4h_to_h = RowParallelLinear(config.ffn_hidden_size,
-                                               config.hidden_size,
-                                               bias=False,
-                                               quant_config=quant_config)
+        self.dense_4h_to_h = RowParallelLinear(
+            config.ffn_hidden_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+        )
 
     def forward(self, x):
         x, _ = self.linear_proj(x)
@@ -272,15 +278,16 @@ class EVA2CLIPModel(nn.Module):
         super().__init__()
         vision_config = Namespace(**config.vision_config)
         self.patch_embedding = PatchEmbedding(vision_config)
-        self.transformer = Transformer(vision_config,
-                                       quant_config=quant_config)
-        self.linear_proj = GLU(config,
-                               in_features=config.hidden_size,
-                               quant_config=quant_config)
-        self.conv = nn.Conv2d(in_channels=vision_config.hidden_size,
-                              out_channels=config.hidden_size,
-                              kernel_size=2,
-                              stride=2)
+        self.transformer = Transformer(vision_config, quant_config=quant_config)
+        self.linear_proj = GLU(
+            config, in_features=config.hidden_size, quant_config=quant_config
+        )
+        self.conv = nn.Conv2d(
+            in_channels=vision_config.hidden_size,
+            out_channels=config.hidden_size,
+            kernel_size=2,
+            stride=2,
+        )
         self.boi = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
         self.eoi = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
         self.scaling_factor = vision_config.scaling_factor
