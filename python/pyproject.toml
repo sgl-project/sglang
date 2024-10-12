@@ -20,13 +20,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-torch = ["torch"]
 runtime_common = ["aiohttp", "decord", "fastapi", "hf_transfer", "huggingface_hub", "interegular",
        "packaging", "pillow", "psutil", "pydantic", "python-multipart",
        "torchao", "uvicorn", "uvloop", "zmq",
        "outlines>=0.0.44", "modelscope"]
-#xpu is not enabled in public vllm and torch whl,
-#need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
+torch = ["torch"]
+# xpu is not enabled in public vllm and torch whl,
+# need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
 vllm = ["vllm==0.5.5"]
 srt = ["sglang[runtime_common]", "torch", "vllm"]
 srt_xpu = ["sglang[runtime_common]"]
@@ -36,7 +36,7 @@ anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
 test = ["jsonlines", "matplotlib", "pandas", "sentence_transformers", "accelerate", "peft"]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
-all_xpu=["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 dev = ["sglang[all]", "sglang[test]"]
 dev_xpu = ["sglang[all_xpu]", "sglang[test]"]
 
