@@ -20,6 +20,8 @@ from xgrammar import BuiltinGrammar, GrammarStateMatcher
 
 from sglang.srt.constrained.base_tool_cache import BaseToolCache
 
+MAX_ROLLBACK_STEPS = 10
+
 
 class BNFCache(BaseToolCache):
     def __init__(
@@ -41,7 +43,7 @@ class BNFCache(BaseToolCache):
         key_type, key_string = key
 
         if key_type == "json":
-            grammar = BuiltinGrammar.json_schema(key_string)
+            grammar = BuiltinGrammar.json_schema(key_string, indent=None)
         elif key_type == "regex":
             assert False, "Not supported by xgrammar yet"
         else:
@@ -51,7 +53,9 @@ class BNFCache(BaseToolCache):
 
     def query(self, key):
         grammar = super().query(key)
-        return GrammarStateMatcher(grammar, self.tokenizer)
+        return GrammarStateMatcher(
+            grammar, self.tokenizer, max_rollback_steps=MAX_ROLLBACK_STEPS
+        )
 
 
 # class BNFCache(BaseToolCache):

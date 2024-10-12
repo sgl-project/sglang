@@ -330,6 +330,7 @@ class Req:
 
     def jump_forward_and_retokenize_bnf(self, jump_forward_str):
         assert self.regex_bnf is not None, "should be a regex request"
+        assert self.tokenizer is not None, "should have a tokenizer"
 
         if self.origin_input_text is None:
             # Recovering text can only use unpadded ids
@@ -378,10 +379,11 @@ class Req:
                 break
 
         # rollback to the last token that is the same
-        self.regex_bnf.rollback(len(old_output_ids) - k)
+        if k < len(old_output_ids):
+            self.regex_bnf.rollback(len(old_output_ids) - k)
 
         for i in range(k, len(self.output_ids)):
-            self.regex_bnf.accept_token(self.output_ids[i])
+            assert self.regex_bnf.accept_token(self.output_ids[i])
 
         if self.return_logprob:
             # For fast-forward part's logprobs
@@ -661,6 +663,12 @@ class ScheduleBatch:
                 if len(jump_forward_str) > 1:
                     cur_all_ids = tuple(req.origin_input_ids + req.output_ids)[:-1]
                     cur_output_ids = req.output_ids
+                    decode_res, new_text = req.get_next_inc_detokenization()
+                    if not decode_res:
+                        req.output_ids = cur_output_ids
+                        continue
+
+                    jump_forward_str = new_text + jump_forward_str
                     if not req.jump_forward_and_retokenize_bnf(jump_forward_str):
                         # Failed to jump forward, revert
                         req.output_ids = cur_output_ids
