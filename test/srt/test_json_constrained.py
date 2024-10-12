@@ -59,15 +59,11 @@ class TestJSONConstrained(unittest.TestCase):
         response = self.run_decode(prompt, json_schema)
         print(json.dumps(response.json()))
         print("=" * 100)
-        try:
-            js_obj = json.loads(response.json()["text"])
-        except (TypeError, json.decoder.JSONDecodeError):
-            raise
+        js_obj = json.loads(response.json()["text"])
         assert isinstance(js_obj["name"], str)
         assert isinstance(js_obj["population"], int)
 
     def test_json_generate_complex(self):
-        # TODO(dark): Fix this test. $definitions is not supported by xgrammar yet.
         prompt = "Please create a character named Komeiji Satori:"
         json_schema = """{
     "title": "Character",
@@ -81,15 +77,15 @@ class TestJSONConstrained(unittest.TestCase):
             "title": "Age",
             "type": "integer"
         },
-        "armor": {"$ref": "#/$definitions/Armor"},
-        "weapon": {"$ref": "#/$definitions/Weapon"},
+        "armor": {"$ref": "#/$defs/Armor"},
+        "weapon": {"$ref": "#/$defs/Weapon"},
         "strength": {
             "title": "Strength",
             "type": "integer"
         }
     },
     "required": ["name", "age", "armor", "weapon", "strength"],
-    "definitions": {
+    "$defs": {
         "Armor": {
             "title": "Armor",
             "description": "An enumeration.",
@@ -107,10 +103,7 @@ class TestJSONConstrained(unittest.TestCase):
         response = self.run_decode(prompt, json_schema)
         print(json.dumps(response.json()))
         print("=" * 100)
-        try:
-            js_obj = json.loads(response.json()["text"])
-        except (TypeError, json.decoder.JSONDecodeError):
-            raise
+        js_obj = json.loads(response.json()["text"])
         assert isinstance(js_obj["name"], str)
         assert isinstance(js_obj["age"], int)
         assert js_obj["armor"] in ["skirt", "leather", "chainmail", "plate"]
