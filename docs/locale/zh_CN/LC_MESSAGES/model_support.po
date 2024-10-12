@@ -1,0 +1,152 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../model_support.md:1
+msgid "How to Support a New Model"
+msgstr "如何在 SGLang 中支持新模型"
+
+#: ../../model_support.md:3
+msgid ""
+"To support a new model in SGLang, you only need to add a single file under "
+"[SGLang Models Directory](https://github.com/sgl-"
+"project/sglang/tree/main/python/sglang/srt/models). You can learn from "
+"existing model implementations and create new files for the new models. For "
+"most models, you should be able to find a similar model to start with (e.g.,"
+" starting from Llama)."
+msgstr ""
+"在 SGLang 中支持新模型，你只需要在 [SGLang 模型目录](https://github.com/sgl-"
+"project/sglang/tree/main/python/sglang/srt/models) "
+"下添加一个文件。你可以参考现有模型的实现，为新模型创建新的文件。对于大多数模型，你应该能够找到一个类似的模型作为起点（例如，从 Llama 开始）。"
+
+#: ../../model_support.md:7
+msgid "Test the correctness"
+msgstr "测试正确性"
+
+#: ../../model_support.md:9
+msgid "Interactive debugging"
+msgstr "交互式调试"
+
+#: ../../model_support.md:10
+msgid ""
+"For interactive debugging, you can compare the outputs of "
+"huggingface/transformers and SGLang. The following two commands should give "
+"the same text output and very similar prefill logits."
+msgstr ""
+"对于交互式调试，你可以比较 huggingface/transformers 和 SGLang "
+"的输出。以下两个命令应该给出相同的文本输出和非常相似的预填充 logits。"
+
+#: ../../model_support.md:13
+msgid ""
+"Get the reference output by `python3 scripts/playground/reference_hf.py "
+"--model [new model]`"
+msgstr "通过 `python3 scripts/playground/reference_hf.py --model [新模型]` 获取参考输出"
+
+#: ../../model_support.md:14
+msgid ""
+"Get the SGLang output by `python3 -m sglang.bench_latency --correct --model "
+"[new model]`"
+msgstr ""
+"通过 `python3 -m sglang.bench_latency --correct --model [新模型]` 获取 SGLang 输出"
+
+#: ../../model_support.md:16
+msgid "Add the model to the test suite"
+msgstr "将模型添加到测试套件"
+
+#: ../../model_support.md:17
+msgid ""
+"To make sure the new model is well maintained in the future, it is better to"
+" add it to the test suite. You can add it to the `ALL_OTHER_MODELS` list in "
+"the [test_generation_models.py](https://github.com/sgl-"
+"project/sglang/blob/main/test/srt/models/test_generation_models.py) and run "
+"the following command to test it."
+msgstr ""
+"为了确保新模型在未来得到良好的维护，最好将其添加到测试套件中。你可以将其添加到 "
+"[test_generation_models.py](https://github.com/sgl-"
+"project/sglang/blob/main/test/srt/models/test_generation_models.py) 中的 "
+"`ALL_OTHER_MODELS` 列表中，并运行以下命令进行测试。"
+
+#: ../../model_support.md:20
+msgid "For example, if the model is Qwen/Qwen2-1.5B"
+msgstr "例如，如果模型是 Qwen/Qwen2-1.5B"
+
+#: ../../model_support.md:25
+msgid "Port a model from vLLM to SGLang"
+msgstr "将模型从 vLLM 移植到 SGLang"
+
+#: ../../model_support.md:26
+msgid ""
+"Another valuable resource is the [vLLM Models "
+"Directory](https://github.com/vllm-"
+"project/vllm/tree/main/vllm/model_executor/models). vLLM has extensive "
+"coverage of models, and SGLang reuses vLLM's interface and some layers to "
+"implement the models. This similarity makes it easy to port many models from"
+" vLLM to SGLang."
+msgstr ""
+"另一个有价值的资源是 [vLLM 模型目录](https://github.com/vllm-"
+"project/vllm/tree/main/vllm/model_executor/models)。vLLM 涵盖了大量的模型，SGLang 重用了 "
+"vLLM 的接口和一些层来实现这些模型。这种相似性使得将许多模型从 vLLM 移植到 SGLang 变得容易。"
+
+#: ../../model_support.md:28
+msgid ""
+"To port a model from vLLM to SGLang, you can compare these two files [SGLang"
+" Llama Implementation](https://github.com/sgl-"
+"project/sglang/blob/main/python/sglang/srt/models/llama.py) and [vLLM Llama "
+"Implementation](https://github.com/vllm-"
+"project/vllm/blob/main/vllm/model_executor/models/llama.py). This comparison"
+" will help you understand how to convert a model implementation from vLLM to"
+" SGLang. The major difference is the replacement of Attention with "
+"RadixAttention. The other parts are almost identical. Specifically,"
+msgstr ""
+"要将模型从 vLLM 移植到 SGLang，你可以比较这两个文件：[SGLang Llama 实现](https://github.com/sgl-"
+"project/sglang/blob/main/python/sglang/srt/models/llama.py) 和 [vLLM Llama "
+"实现](https://github.com/vllm-"
+"project/vllm/blob/main/vllm/model_executor/models/llama.py)。这个比较将帮助你理解如何将模型实现从"
+" vLLM 转换为 SGLang。主要区别是将 Attention 替换为 RadixAttention。其他部分几乎相同。具体来说，"
+
+#: ../../model_support.md:29
+msgid ""
+"Replace vllm's `Attention` with `RadixAttention`. Note that you need to pass"
+" `layer_id` all the way to `RadixAttention`."
+msgstr ""
+"用 SGLang 的 `RadixAttention` 替换 vllm 的 `Attention`。请注意，你需要将 `layer_id` 传递给 "
+"`RadixAttention`。"
+
+#: ../../model_support.md:30
+msgid "Replace vllm's `LogitsProcessor` with SGLang's `LogitsProcessor`."
+msgstr "用 SGLang 的 `LogitsProcessor` 替换 vllm 的 `LogitsProcessor`。"
+
+#: ../../model_support.md:31
+msgid ""
+"Replace other vLLM layers with SGLang layers (e.g., `RMSNorm`, "
+"`SiluAndMul`)."
+msgstr "用 SGLang 层替换其他 vLLM 层（例如，`RMSNorm`、`SiluAndMul`）。"
+
+#: ../../model_support.md:32
+msgid "Remove `Sample`."
+msgstr "删除 `Sample`。"
+
+#: ../../model_support.md:33
+msgid "Change `forward()` functions, and add `input_metadata`."
+msgstr "更改 `forward()` 函数，并添加 `input_metadata`。"
+
+#: ../../model_support.md:34
+msgid "Add `EntryClass` at the end."
+msgstr "在最后添加 `EntryClass`。"

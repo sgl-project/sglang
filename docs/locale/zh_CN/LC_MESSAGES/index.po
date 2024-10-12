@@ -1,0 +1,75 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../index.rst:13
+msgid "Getting Started"
+msgstr "开始使用"
+
+#: ../../index.rst:21
+msgid "References"
+msgstr "参考资料"
+
+#: ../../index.rst:2
+msgid "SGLang Documentation"
+msgstr "SGLang 文档"
+
+#: ../../index.rst:4
+msgid ""
+"SGLang is a fast serving framework for large language models and vision "
+"language models. It makes your interaction with models faster and more "
+"controllable by co-designing the backend runtime and frontend language. The "
+"core features include:"
+msgstr ""
+"SGLang 是一个用于大型语言模型和视觉语言模型的快速服务框架。它通过共同设计后端运行时和前端语言，使你与模型的交互更快、更可控。其核心功能包括："
+
+#: ../../index.rst:8
+msgid ""
+"**Fast Backend Runtime**: Provides efficient serving with RadixAttention for"
+" prefix caching, jump-forward constrained decoding, continuous batching, "
+"token attention (paged attention), tensor parallelism, FlashInfer kernels, "
+"chunked prefill, and quantization (INT4/FP8/AWQ/GPTQ)."
+msgstr ""
+"**快速后端运行时**: 提供高效的服务，包括 RadixAttention "
+"用于前缀缓存、跳跃式约束解码、连续批处理、令牌注意力（分页注意力）、张量并行、FlashInfer "
+"内核、分块预填充和量化（INT4/FP8/AWQ/GPTQ）。"
+
+#: ../../index.rst:9
+msgid ""
+"**Flexible Frontend Language**: Offers an intuitive interface for "
+"programming LLM applications, including chained generation calls, advanced "
+"prompting, control flow, multi-modal inputs, parallelism, and external "
+"interactions."
+msgstr "**灵活的前端语言**: 提供直观的界面用于编程 LLM 应用程序，包括链式生成调用、高级提示、控制流、多模态输入、并行性和外部交互。"
+
+#: ../../index.rst:10
+msgid ""
+"**Extensive Model Support**: Supports a wide range of generative models "
+"(Llama 3, Gemma 2, Mistral, QWen, DeepSeek, LLaVA, etc.) and embedding "
+"models (e5-mistral), with easy extensibility for integrating new models."
+msgstr ""
+"**广泛的模型支持**: 支持各种生成模型（Llama 3、Gemma 2、Mistral、QWen、DeepSeek、LLaVA "
+"等）和嵌入模型（e5-mistral），并易于扩展以集成新模型。"
+
+#: ../../index.rst:11
+msgid ""
+"**Active Community**: SGLang is open-source and backed by an active "
+"community with industry adoption."
+msgstr "**活跃的社区**: SGLang 是开源的，并由一个活跃的社区支持，并在行业中得到应用。"
