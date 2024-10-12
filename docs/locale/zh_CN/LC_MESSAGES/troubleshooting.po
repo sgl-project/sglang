@@ -1,0 +1,70 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../troubleshooting.md:1
+msgid "Troubleshooting"
+msgstr "故障排除"
+
+#: ../../troubleshooting.md:3
+msgid "This page lists some common errors and tips for fixing them."
+msgstr "本页面列出了一些常见错误以及修复它们的提示。"
+
+#: ../../troubleshooting.md:5
+msgid "CUDA error: an illegal memory access was encountered"
+msgstr "CUDA 错误：遇到非法内存访问"
+
+#: ../../troubleshooting.md:6
+msgid "This error may be due to kernel errors or out-of-memory issues."
+msgstr "此错误可能是由于内核错误或内存不足问题导致的。"
+
+#: ../../troubleshooting.md:7
+msgid "If it is a kernel error, it is not easy to fix."
+msgstr "如果是内核错误，则很难修复。"
+
+#: ../../troubleshooting.md:8
+msgid ""
+"If it is out-of-memory, sometimes it will report this error instead of "
+"\"Out-of-memory.\" In this case, try setting a smaller value for `--mem-"
+"fraction-static`. The default value of `--mem-fraction-static` is around 0.8"
+" - 0.9. https://github.com/sgl-"
+"project/sglang/blob/1edd4e07d6ad52f4f63e7f6beaa5987c1e1cf621/python/sglang/srt/server_args.py#L92-L102"
+msgstr ""
+"如果是内存不足，有时它会报告此错误而不是“内存不足”。在这种情况下，尝试为 `--mem-fraction-static` 设置更小的值。`--mem-"
+"fraction-static` 的默认值约为 0.8 - 0.9。https://github.com/sgl-"
+"project/sglang/blob/1edd4e07d6ad52f4f63e7f6beaa5987c1e1cf621/python/sglang/srt/server_args.py#L92-L102"
+
+#: ../../troubleshooting.md:10
+msgid "The server hangs"
+msgstr "服务器挂起"
+
+#: ../../troubleshooting.md:11
+msgid ""
+"If the server hangs, try disabling some optimizations when launching the "
+"server."
+msgstr "如果服务器挂起，请尝试在启动服务器时禁用一些优化。"
+
+#: ../../troubleshooting.md:12
+msgid "Add `--disable-cuda-graph`."
+msgstr "添加 `--disable-cuda-graph`。"
+
+#: ../../troubleshooting.md:13
+msgid "Add `--disable-flashinfer-sampling`."
+msgstr "添加 `--disable-flashinfer-sampling`。"

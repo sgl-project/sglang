@@ -1,0 +1,43 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../contributor_guide.md:1
+msgid "Contributor Guide"
+msgstr "贡献者指南"
+
+#: ../../contributor_guide.md:3
+msgid "Format Your Code"
+msgstr "代码格式"
+
+#: ../../contributor_guide.md:4
+msgid "Use these commands to format your code and pass CI linting tests."
+msgstr "使用以下命令格式化代码并通过 CI 代码风格检查测试。"
+
+#: ../../contributor_guide.md:13
+msgid "Add Unit Tests"
+msgstr "添加单元测试"
+
+#: ../../contributor_guide.md:14
+msgid ""
+"Add unit tests under [sglang/test](../../test). You can learn how to add and"
+" run tests from the README.md in that folder."
+msgstr ""
+"在 [sglang/test](../../test) 下添加单元测试。你可以从该文件夹中的 README.md 中了解如何添加和运行测试。"

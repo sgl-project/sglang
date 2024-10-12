@@ -1,0 +1,86 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../setup_github_runner.md:1
+msgid "Set Up Self-hosted Runners for GitHub Action"
+msgstr "为 GitHub Action 设置自托管运行器"
+
+#: ../../setup_github_runner.md:3
+msgid "Add a Runner"
+msgstr "添加运行器"
+
+#: ../../setup_github_runner.md:5
+msgid "Step 1: Start a docker container."
+msgstr "步骤 1：启动 Docker 容器。"
+
+#: ../../setup_github_runner.md:7
+msgid ""
+"You can mount a folder for the shared huggingface model weights cache. The "
+"command below uses `/tmp/huggingface` as an example."
+msgstr "你可以挂载一个文件夹用于共享的 Hugging Face 模型权重缓存。以下命令使用 `/tmp/huggingface` 作为示例。"
+
+#: ../../setup_github_runner.md:17
+msgid "Step 2: Configure the runner by `config.sh`"
+msgstr "步骤 2：通过 `config.sh` 配置运行器"
+
+#: ../../setup_github_runner.md:19
+msgid "Run these commands inside the container."
+msgstr "在容器内运行以下命令。"
+
+#: ../../setup_github_runner.md:26
+msgid ""
+"Then follow https://github.com/sgl-"
+"project/sglang/settings/actions/runners/new?arch=x64&os=linux to run "
+"`config.sh`"
+msgstr ""
+"然后按照 https://github.com/sgl-"
+"project/sglang/settings/actions/runners/new?arch=x64&os=linux 运行 `config.sh`"
+
+#: ../../setup_github_runner.md:28
+msgid "**Notes**"
+msgstr "**注意**"
+
+#: ../../setup_github_runner.md:29
+msgid "Do not need to specify the runner group"
+msgstr "无需指定运行器组"
+
+#: ../../setup_github_runner.md:30
+msgid ""
+"Give it a name (e.g., `test-sgl-gpu-0`) and some labels (e.g., `1-gpu-"
+"runner`). The labels can be editted later in Github Settings."
+msgstr ""
+"为其命名（例如，`test-sgl-gpu-0`）并添加一些标签（例如，`1-gpu-runner`）。标签可以在 Github 设置中稍后编辑。"
+
+#: ../../setup_github_runner.md:31
+msgid "Do not need to change the work folder."
+msgstr "无需更改工作文件夹。"
+
+#: ../../setup_github_runner.md:33
+msgid "Step 3: Run the runner by `run.sh`"
+msgstr "步骤 3：通过 `run.sh` 运行运行器"
+
+#: ../../setup_github_runner.md:35
+msgid "Set up environment variables"
+msgstr "设置环境变量"
+
+#: ../../setup_github_runner.md:44
+msgid "Run it forever"
+msgstr "永远运行它"

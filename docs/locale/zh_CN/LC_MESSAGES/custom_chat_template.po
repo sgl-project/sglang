@@ -1,0 +1,59 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../custom_chat_template.md:1
+msgid "Custom Chat Template in SGLang Runtime"
+msgstr "自定义聊天模板在 SGLang 运行时"
+
+#: ../../custom_chat_template.md:3
+msgid ""
+"**NOTE**: There are two chat template systems in SGLang project. This "
+"document is about setting a custom chat template for the OpenAI-compatible "
+"API server (defined at "
+"[conversation.py](../../python/sglang/srt/conversation.py)). It is NOT "
+"related to the chat template used in the SGLang language frontend (defined "
+"at [chat_template.py](../../python/sglang/lang/chat_template.py))."
+msgstr ""
+"**注意**: SGLang 项目中存在两个聊天模板系统。本文档介绍了为 OpenAI 兼容 API 服务器设置自定义聊天模板（定义在 "
+"[conversation.py](../../python/sglang/srt/conversation.py) 中）。它与 SGLang "
+"语言前端使用的聊天模板（定义在 "
+"[chat_template.py](../../python/sglang/lang/chat_template.py) 中）无关。"
+
+#: ../../custom_chat_template.md:5
+msgid ""
+"By default, the server uses the chat template specified in the model "
+"tokenizer from Hugging Face. It should just work for most official models "
+"such as Llama-2/Llama-3."
+msgstr ""
+"默认情况下，服务器使用 Hugging Face 中模型标记器中指定的聊天模板。它应该适用于大多数官方模型，例如 Llama-2/Llama-3。"
+
+#: ../../custom_chat_template.md:8
+msgid ""
+"If needed, you can also override the chat template when launching the "
+"server:"
+msgstr "如果需要，您也可以在启动服务器时覆盖聊天模板："
+
+#: ../../custom_chat_template.md:14
+msgid ""
+"If the chat template you are looking for is missing, you are welcome to "
+"contribute it. Meanwhile, you can also temporarily register your chat "
+"template as follows:"
+msgstr "如果您正在寻找的聊天模板丢失，欢迎您贡献它。同时，您也可以暂时注册您的聊天模板，如下所示："
