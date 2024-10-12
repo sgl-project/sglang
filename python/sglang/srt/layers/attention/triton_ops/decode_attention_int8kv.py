@@ -49,7 +49,7 @@ def _fwd_kernel_stage1(
     stride_buf_kbs,
     stride_buf_kh,
     stride_scales_buf_kbs,  # New stride for K scales bs
-    stride_scales_buf_kh,   # New stride for K scales head
+    stride_scales_buf_kh,  # New stride for K scales head
     att_stride_h,
     kv_group_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -100,11 +100,12 @@ def _fwd_kernel_stage1(
         )
         # Load K scales and dequantize
         offs_scales_k = (
-            k_loc[:, None] * stride_scales_buf_kbs
-            + cur_kv_head * stride_scales_buf_kh
+            k_loc[:, None] * stride_scales_buf_kbs + cur_kv_head * stride_scales_buf_kh
         )
         k_scales = tl.load(
-            K_Scales_Buffer + offs_scales_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=1.0
+            K_Scales_Buffer + offs_scales_k,
+            mask=offs_n_new[:, None] < cur_batch_end_index,
+            other=1.0,
         )
         k = (k_int8.to(scales_dtype) * k_scales).to(reduce_dtype)  # Dequantize K
         att_value = tl.sum(q[None, :] * k, 1)
@@ -131,7 +132,7 @@ def _fwd_kernel_stage2(
     stride_buf_vbs,
     stride_buf_vh,
     stride_scales_buf_vbs,  # New stride for V scales bs
-    stride_scales_buf_vh,   # New stride for V scales head
+    stride_scales_buf_vh,  # New stride for V scales head
     stride_obs,
     stride_oh,
     stride_req_to_token_b,
@@ -325,7 +326,7 @@ def _fwd_grouped_kernel_stage1(
     stride_buf_kbs,
     stride_buf_kh,
     stride_scales_buf_kbs,  # New stride for K scales bs
-    stride_scales_buf_kh,   # New stride for K scales head
+    stride_scales_buf_kh,  # New stride for K scales head
     att_stride_h,
     kv_group_num: tl.constexpr,
     q_head_num: tl.constexpr,
@@ -383,11 +384,12 @@ def _fwd_grouped_kernel_stage1(
         )
         # Load K scales and dequantize
         offs_scales_k = (
-            k_loc[None, :] * stride_scales_buf_kbs
-            + cur_kv_head * stride_scales_buf_kh
+            k_loc[None, :] * stride_scales_buf_kbs + cur_kv_head * stride_scales_buf_kh
         )
         k_scales = tl.load(
-            K_Scales_Buffer + offs_scales_k, mask=offs_n_new[None, :] < cur_batch_end_index, other=1.0
+            K_Scales_Buffer + offs_scales_k,
+            mask=offs_n_new[None, :] < cur_batch_end_index,
+            other=1.0,
         )
         k = (k_int8.to(scales_dtype) * k_scales).to(reduce_dtype)  # Dequantize K
         qk = tl.dot(q, k)
@@ -421,7 +423,7 @@ def _fwd_grouped_kernel_stage2(
     stride_buf_vbs,
     stride_buf_vh,
     stride_scales_buf_vbs,  # New stride for V scales bs
-    stride_scales_buf_vh,   # New stride for V scales head
+    stride_scales_buf_vh,  # New stride for V scales head
     stride_obs,
     stride_oh,
     stride_req_to_token_b,
@@ -681,27 +683,50 @@ def decode_attention_fwd_int8kv(
             b_seq_len,
         )
 
+
 @triton.jit
 def _fwd_kernel_destindex_copy_quantize_kv(
-    K, Dest_loc, Out, Out_scale,
-    stride_k_bs, stride_k_h, stride_k_d,
-    stride_o_bs, stride_o_h, stride_o_d,
-    stride_os_bs, stride_os_h, stride_os_d,
+    K,
+    Dest_loc,
+    Out,
+    Out_scale,
+    stride_k_bs,
+    stride_k_h,
+    stride_k_d,
+    stride_o_bs,
+    stride_o_h,
+    stride_o_d,
+    stride_os_bs,
+    stride_os_h,
+    stride_os_d,
     head_num,
     BLOCK_DMODEL: tl.constexpr,
-    BLOCK_HEAD: tl.constexpr
+    BLOCK_HEAD: tl.constexpr,
 ):
     cur_index = tl.program_id(0)
     offs_h = tl.arange(0, BLOCK_HEAD)
     offs_d = tl.arange(0, BLOCK_DMODEL)
 
     dest_index = tl.load(Dest_loc + cur_index)
-    src_data = tl.load(K + cur_index * stride_k_bs + offs_h[:, None] * stride_k_h + stride_k_d * offs_d[None, :], 
-                       mask=offs_h[:, None] < head_num, other=0.0)
+    src_data = tl.load(
+        K
+        + cur_index * stride_k_bs
+        + offs_h[:, None] * stride_k_h
+        + stride_k_d * offs_d[None, :],
+        mask=offs_h[:, None] < head_num,
+        other=0.0,
+    )
     abs_data = tl.abs(src_data)
-    data_scale = (tl.max(abs_data, axis=1) / 127.).to(Out_scale.dtype.element_ty)[:, None]
+    data_scale = (tl.max(abs_data, axis=1) / 127.0).to(Out_scale.dtype.element_ty)[
+        :, None
+    ]
     q_src_data = (src_data / data_scale).to(tl.int8)
-    o_ptrs = Out + dest_index * stride_o_bs + stride_o_h * offs_h[:, None] + stride_o_d * offs_d[None, :]
+    o_ptrs = (
+        Out
+        + dest_index * stride_o_bs
+        + stride_o_h * offs_h[:, None]
+        + stride_o_d * offs_d[None, :]
+    )
     os_ptrs = Out_scale + dest_index * stride_os_bs + stride_os_h * offs_h[:, None]
     tl.store(o_ptrs, q_src_data, mask=offs_h[:, None] < head_num)
     tl.store(os_ptrs, data_scale, mask=offs_h[:, None] < head_num)
@@ -718,10 +743,19 @@ def destindex_copy_quantize_kv(K, DestLoc, Out, Out_scale):
     num_warps = 1
 
     _fwd_kernel_destindex_copy_quantize_kv[grid](
-        K, DestLoc, Out, Out_scale,
-        K.stride(0), K.stride(1), K.stride(2),
-        Out.stride(0), Out.stride(1), Out.stride(2),
-        Out_scale.stride(0), Out_scale.stride(1), Out_scale.stride(2),
+        K,
+        DestLoc,
+        Out,
+        Out_scale,
+        K.stride(0),
+        K.stride(1),
+        K.stride(2),
+        Out.stride(0),
+        Out.stride(1),
+        Out.stride(2),
+        Out_scale.stride(0),
+        Out_scale.stride(1),
+        Out_scale.stride(2),
         head_num,
         BLOCK_DMODEL=head_dim,
         BLOCK_HEAD=BLOCK_HEAD,

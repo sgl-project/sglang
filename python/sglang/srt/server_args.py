@@ -283,7 +283,7 @@ class ServerArgs:
                 "gptq_marlin",
                 "awq_marlin",
                 "bitsandbytes",
-                "compressed-tensors"
+                "compressed-tensors",
             ],
             help="The quantization method.",
         )

@@ -24,6 +24,7 @@ import triton.language as tl
 
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
+
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
@@ -60,9 +61,9 @@ def _fwd_kernel_in8kv(
     stride_buf_vbs,
     stride_buf_vh,
     stride_scales_buf_kbs,  # New stride for K scales bs
-    stride_scales_buf_kh,   # New stride for K scales head
+    stride_scales_buf_kh,  # New stride for K scales head
     stride_scales_buf_vbs,  # New stride for V scales bs
-    stride_scales_buf_vh,   # New stride for V scales head
+    stride_scales_buf_vh,  # New stride for V scales head
     stride_req_to_tokens_b,
     logit_cap: tl.constexpr,
     Lq: tl.constexpr,
@@ -105,7 +106,6 @@ def _fwd_kernel_in8kv(
         Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
     )
 
-
     # stage 1: compute scores with prefix
     offs_n = tl.arange(0, BLOCK_N)
 
@@ -141,7 +141,7 @@ def _fwd_kernel_in8kv(
         k = k_int8.to(scales_dtype) * k_scales  # Dequantize K
 
         qk = tl.dot(q.to(k.dtype), k)
-        
+
         qk *= sm_scale
 
         if logit_cap > 0:
@@ -337,5 +337,3 @@ def extend_attention_fwd_int8kv(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-
-

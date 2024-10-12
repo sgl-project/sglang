@@ -39,6 +39,7 @@ class TritonAttnBackend(AttentionBackend):
             from sglang.srt.layers.attention.triton_ops.extend_attention_int8kv import (
                 extend_attention_fwd_int8kv,
             )
+
             self.decode_attention_fwd = decode_attention_fwd_int8kv
             self.extend_attention_fwd = extend_attention_fwd_int8kv
         elif self.kv_int4:
@@ -48,12 +49,13 @@ class TritonAttnBackend(AttentionBackend):
             from sglang.srt.layers.attention.triton_ops.extend_attention_int4kv import (
                 extend_attention_fwd_int4kv,
             )
+
             self.decode_attention_fwd = decode_attention_fwd_int4kv
             self.extend_attention_fwd = extend_attention_fwd_int4kv
         else:
             self.decode_attention_fwd = decode_attention_fwd
             self.extend_attention_fwd = extend_attention_fwd
-            
+
         self.num_head = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
         )
@@ -172,7 +174,7 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.extend_start_loc,
                 max_extend_len,
                 self.quant_group_size,
-                layer.scaling,               
+                layer.scaling,
                 layer.logit_cap,
             )
         else:
@@ -210,7 +212,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch.token_to_kv_pool.set_kv_buffer(
             layer.layer_id, forward_batch.out_cache_loc, k, v
         )
-        
+
         if self.kv_int8:
             self.decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -243,7 +245,7 @@ class TritonAttnBackend(AttentionBackend):
                 attn_logits,
                 max_seq_len,
                 layer.scaling,
-                self.quant_group_size,                
+                self.quant_group_size,
                 layer.logit_cap,
             )
         else:

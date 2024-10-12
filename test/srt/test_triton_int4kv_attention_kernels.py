@@ -1,19 +1,22 @@
 import random
+import time
 import unittest
 
 import torch
-import time
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.triton_ops.extend_attention_int4kv import (
-    extend_attention_fwd_int4kv,
-)
 from sglang.srt.layers.attention.triton_ops.extend_attention import (
     extend_attention_fwd,
     redundant_attention,
 )
-from sglang.srt.layers.attention.triton_ops.prefill_attention import context_attention_fwd
+from sglang.srt.layers.attention.triton_ops.extend_attention_int4kv import (
+    extend_attention_fwd_int4kv,
+)
+from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+    context_attention_fwd,
+)
+
 
 @triton.jit
 def _fwd_kernel_destindex_copy_quantize_int4_kv(
@@ -44,12 +47,21 @@ def _fwd_kernel_destindex_copy_quantize_int4_kv(
     dest_index = cur_index
 
     src_data_0 = tl.load(
-        K + cur_index * stride_k_bs + cur_head * stride_k_h + offs_g[:, None] * stride_k_g + offs_d[None, :] * 2,
+        K
+        + cur_index * stride_k_bs
+        + cur_head * stride_k_h
+        + offs_g[:, None] * stride_k_g
+        + offs_d[None, :] * 2,
         mask=offs_g[:, None] < group_size,
         other=0.0,
     )
     src_data_1 = tl.load(
-        K + cur_index * stride_k_bs + cur_head * stride_k_h + offs_g[:, None] * stride_k_g + offs_d[None, :] * 2 + 1,
+        K
+        + cur_index * stride_k_bs
+        + cur_head * stride_k_h
+        + offs_g[:, None] * stride_k_g
+        + offs_d[None, :] * 2
+        + 1,
         mask=offs_g[:, None] < group_size,
         other=0.0,
     )
@@ -57,23 +69,31 @@ def _fwd_kernel_destindex_copy_quantize_int4_kv(
     abs_data_0 = tl.abs(src_data_0)
     abs_data_1 = tl.abs(src_data_1)
 
-    data_scale = (tl.maximum(tl.max(abs_data_0, axis=1), tl.max(abs_data_1, axis=1)) / 7.0).to(Out_scale.dtype.element_ty)
+    data_scale = (
+        tl.maximum(tl.max(abs_data_0, axis=1), tl.max(abs_data_1, axis=1)) / 7.0
+    ).to(Out_scale.dtype.element_ty)
     q_src_data_0 = (src_data_0 / data_scale[:, None]).to(tl.int8)
     q_src_data_0 = tl.where(q_src_data_0 > 7, 7, q_src_data_0)
     q_src_data_0 = tl.where(q_src_data_0 < -7, -7, q_src_data_0)
-    q_src_data_0 = q_src_data_0 + 8 # easy for dequant
+    q_src_data_0 = q_src_data_0 + 8  # easy for dequant
 
     q_src_data_1 = (src_data_1 / data_scale[:, None]).to(tl.int8)
     q_src_data_1 = tl.where(q_src_data_1 > 7, 7, q_src_data_1)
     q_src_data_1 = tl.where(q_src_data_1 < -7, -7, q_src_data_1)
-    q_src_data_1 = q_src_data_1 + 8 # easy for dequant
+    q_src_data_1 = q_src_data_1 + 8  # easy for dequant
 
     low_4 = q_src_data_0 & 0xF
     high_4 = (q_src_data_1 & 0xF) << 4
 
     out_data = low_4 | high_4
 
-    o_ptrs = Out + dest_index * stride_o_bs + cur_head * stride_o_h + offs_g[:, None] * stride_o_g + offs_d[None, :]
+    o_ptrs = (
+        Out
+        + dest_index * stride_o_bs
+        + cur_head * stride_o_h
+        + offs_g[:, None] * stride_o_g
+        + offs_d[None, :]
+    )
     os_ptrs = Out_scale + dest_index * stride_os_bs + cur_head * stride_os_h + offs_g
     tl.store(o_ptrs, out_data, mask=offs_g[:, None] < group_size)
     tl.store(os_ptrs, data_scale, mask=offs_g < group_size)
@@ -86,7 +106,9 @@ def destindex_copy_quantize_int4kv(K, Out, Out_scale, quant_group_dim):
     head_num = K.shape[1]
     head_dim = K.shape[2]
 
-    assert head_dim % quant_group_dim == 0, "error head dim, can not been supported to copy quant kv"
+    assert (
+        head_dim % quant_group_dim == 0
+    ), "error head dim, can not been supported to copy quant kv"
     grid = (bs_seq, head_num)
     num_warps = 1
 
@@ -121,6 +143,7 @@ def destindex_copy_quantize_int4kv(K, Out, Out_scale, quant_group_dim):
     )
     return
 
+
 @triton.jit
 def _bwd_kernel_destindex_dequantize_int4_kv(
     Quantized,
@@ -151,7 +174,11 @@ def _bwd_kernel_destindex_dequantize_int4_kv(
 
     # 加载量化数据
     q_data = tl.load(
-        Quantized + cur_index * stride_q_bs + cur_head * stride_q_h + offs_g[:, None] * stride_q_g + offs_d[None, :],
+        Quantized
+        + cur_index * stride_q_bs
+        + cur_head * stride_q_h
+        + offs_g[:, None] * stride_q_g
+        + offs_d[None, :],
         mask=offs_g[:, None] < group_size,
         other=0.0,
     )
@@ -165,15 +192,31 @@ def _bwd_kernel_destindex_dequantize_int4_kv(
     src_data_1 = high_4.to(tl.int8) - 8
 
     # 加载反量化比例因子（scale）
-    scale = tl.load(Scale + dest_index * stride_s_bs + cur_head * stride_s_h + offs_g, mask=offs_g < group_size)
+    scale = tl.load(
+        Scale + dest_index * stride_s_bs + cur_head * stride_s_h + offs_g,
+        mask=offs_g < group_size,
+    )
 
     # 反量化
     dequant_data_0 = src_data_0 * scale[:, None]
     dequant_data_1 = src_data_1 * scale[:, None]
 
     # 存储反量化的 float 数据
-    o_ptrs_0 = Out + dest_index * stride_o_bs + cur_head * stride_o_h + offs_g[:, None] * stride_o_g + offs_d[None, :] * 2
-    o_ptrs_1 = Out + dest_index * stride_o_bs + cur_head * stride_o_h + offs_g[:, None] * stride_o_g + offs_d[None, :] * 2 + 1
+    o_ptrs_0 = (
+        Out
+        + dest_index * stride_o_bs
+        + cur_head * stride_o_h
+        + offs_g[:, None] * stride_o_g
+        + offs_d[None, :] * 2
+    )
+    o_ptrs_1 = (
+        Out
+        + dest_index * stride_o_bs
+        + cur_head * stride_o_h
+        + offs_g[:, None] * stride_o_g
+        + offs_d[None, :] * 2
+        + 1
+    )
 
     tl.store(o_ptrs_0, dequant_data_0, mask=offs_g[:, None] < group_size)
     tl.store(o_ptrs_1, dequant_data_1, mask=offs_g[:, None] < group_size)
@@ -186,14 +229,18 @@ def destindex_dequantize_int4kv(Quantized, Scale, Out, quant_group_dim):
     head_num = Quantized.shape[1]
     head_dim = Out.shape[2]
 
-    assert head_dim % quant_group_dim == 0, "error head dim, can not been supported to copy dequant kv"
+    assert (
+        head_dim % quant_group_dim == 0
+    ), "error head dim, can not been supported to copy dequant kv"
     grid = (bs_seq, head_num)
     num_warps = 1
 
     group_size = head_dim // quant_group_dim
     group_dim = quant_group_dim
 
-    Quantized = Quantized.view((Quantized.shape[0], Quantized.shape[1], group_size, group_dim // 2))
+    Quantized = Quantized.view(
+        (Quantized.shape[0], Quantized.shape[1], group_size, group_dim // 2)
+    )
     Scale = Scale.view((Scale.shape[0], Scale.shape[1], group_size))
     Out = Out.view(
         Out.shape[0], Out.shape[1], group_size, group_dim
@@ -222,6 +269,7 @@ def destindex_dequantize_int4kv(Quantized, Scale, Out, quant_group_dim):
     )
     return
 
+
 class TestExtendAttention(unittest.TestCase):
 
     def _set_all_seeds(self, seed):
@@ -241,17 +289,13 @@ class TestExtendAttention(unittest.TestCase):
         dtype = torch.float16
 
         if N_CTX_PRE == 0:
-            b_seq_len_prefix = torch.zeros(
-                (B,), dtype=torch.int32, device="cuda"
-            )
+            b_seq_len_prefix = torch.zeros((B,), dtype=torch.int32, device="cuda")
         else:
             b_seq_len_prefix = torch.full(
                 (B,), N_CTX_PRE, dtype=torch.int32, device="cuda"
             )
-        
-        b_seq_len_extend = torch.full(
-            (B,), N_CTX_EXT, dtype=torch.int32, device="cuda"
-        )
+
+        b_seq_len_extend = torch.full((B,), N_CTX_EXT, dtype=torch.int32, device="cuda")
 
         b_seq_len = b_seq_len_prefix + b_seq_len_extend
         max_len_in_batch = torch.max(b_seq_len, 0)[0].item()
@@ -366,16 +410,17 @@ class TestExtendAttention(unittest.TestCase):
         )
 
         self.assertTrue(torch.allclose(o_extend, o_redundant, atol=5e-2, rtol=5e-2))
- 
 
     def test_extend_attention(self):
 
         configs = [
             (2, 8, 16, 32, 32, 128),
         ]
-        
+
         for B, SEQ_PRE, SEQ_EXT, H_Q, H_KV, D in configs:
-            print(f"B, SEQ_PRE, SEQ_EXT, H_Q, H_KV, D: {B} {SEQ_PRE} {SEQ_EXT} {H_Q} {H_KV} {D}")
+            print(
+                f"B, SEQ_PRE, SEQ_EXT, H_Q, H_KV, D: {B} {SEQ_PRE} {SEQ_EXT} {H_Q} {H_KV} {D}"
+            )
             self._test_extend_attention_once(B, SEQ_PRE, SEQ_EXT, H_Q, H_KV, D)
 
 

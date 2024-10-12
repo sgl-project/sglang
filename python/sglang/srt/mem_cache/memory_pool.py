@@ -115,7 +115,7 @@ class BaseTokenToKVPool:
         cache_v: torch.Tensor,
     ) -> None:
         raise NotImplementedError()
-    
+
     @abstractmethod
     def get_key_scales_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -164,29 +164,39 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             # [size, head_num, head_dim] for each layer
             self.k_buffer = [
                 torch.empty(
-                    (size + 1, head_num, head_dim), dtype=self.store_dtype, device="cuda"
+                    (size + 1, head_num, head_dim),
+                    dtype=self.store_dtype,
+                    device="cuda",
                 )
                 for _ in range(layer_num)
             ]
             self.v_buffer = [
                 torch.empty(
-                    (size + 1, head_num, head_dim), dtype=self.store_dtype, device="cuda"
+                    (size + 1, head_num, head_dim),
+                    dtype=self.store_dtype,
+                    device="cuda",
                 )
                 for _ in range(layer_num)
             ]
         if dtype == torch.int8:
             if kv_cache_dtype_str == "int4":
                 self.quant_group_size = kvint4_groupsize
-                assert head_dim % self.quant_group_size == 0, "error head dim, can not allocate int4 kv scales"
+                assert (
+                    head_dim % self.quant_group_size == 0
+                ), "error head dim, can not allocate int4 kv scales"
                 self.k_scales_buffer = [
                     torch.empty(
-                        (size + 1, head_num, head_dim // self.quant_group_size), dtype=torch_dtype, device="cuda"
+                        (size + 1, head_num, head_dim // self.quant_group_size),
+                        dtype=torch_dtype,
+                        device="cuda",
                     )
                     for _ in range(layer_num)
                 ]
                 self.v_scales_buffer = [
                     torch.empty(
-                        (size + 1, head_num, head_dim // self.quant_group_size), dtype=torch_dtype, device="cuda"
+                        (size + 1, head_num, head_dim // self.quant_group_size),
+                        dtype=torch_dtype,
+                        device="cuda",
                     )
                     for _ in range(layer_num)
                 ]
@@ -216,7 +226,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
-    
+
     def get_key_scales_buffer(self, layer_id: int):
         if self.dtype == torch.int8:
             return self.k_scales_buffer[layer_id]
@@ -231,7 +241,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def get_kv_scales_buffer(self, layer_id: int):
         if self.dtype == torch.int8:
-            return self.get_key_scales_buffer(layer_id), self.get_value_scales_buffer(layer_id)
+            return self.get_key_scales_buffer(layer_id), self.get_value_scales_buffer(
+                layer_id
+            )
         else:
             return None
 
@@ -247,14 +259,38 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 from sglang.srt.layers.attention.triton_ops.decode_attention_int4kv import (
                     destindex_copy_quantize_int4kv,
                 )
-                destindex_copy_quantize_int4kv(cache_k, loc, self.k_buffer[layer_id], self.k_scales_buffer[layer_id], self.quant_group_size)
-                destindex_copy_quantize_int4kv(cache_v, loc, self.v_buffer[layer_id], self.v_scales_buffer[layer_id], self.quant_group_size)
+
+                destindex_copy_quantize_int4kv(
+                    cache_k,
+                    loc,
+                    self.k_buffer[layer_id],
+                    self.k_scales_buffer[layer_id],
+                    self.quant_group_size,
+                )
+                destindex_copy_quantize_int4kv(
+                    cache_v,
+                    loc,
+                    self.v_buffer[layer_id],
+                    self.v_scales_buffer[layer_id],
+                    self.quant_group_size,
+                )
             else:
                 from sglang.srt.layers.attention.triton_ops.decode_attention_int8kv import (
                     destindex_copy_quantize_kv,
                 )
-                destindex_copy_quantize_kv(cache_k, loc, self.k_buffer[layer_id], self.k_scales_buffer[layer_id])
-                destindex_copy_quantize_kv(cache_v, loc, self.v_buffer[layer_id], self.v_scales_buffer[layer_id])
+
+                destindex_copy_quantize_kv(
+                    cache_k,
+                    loc,
+                    self.k_buffer[layer_id],
+                    self.k_scales_buffer[layer_id],
+                )
+                destindex_copy_quantize_kv(
+                    cache_v,
+                    loc,
+                    self.v_buffer[layer_id],
+                    self.v_scales_buffer[layer_id],
+                )
         else:
             if cache_k.dtype != self.dtype:
                 cache_k = cache_k.to(self.dtype)

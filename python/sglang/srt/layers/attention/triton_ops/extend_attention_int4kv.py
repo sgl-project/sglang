@@ -24,6 +24,7 @@ import triton.language as tl
 
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
+
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
@@ -45,7 +46,7 @@ def _fwd_kernel_in4kv(
     B_Seq_Len_Extend,
     K_Scales_Buffer,  # New argument for K scales
     V_Scales_Buffer,  # New argument for V scales
-    quant_group_size: tl.constexpr, # quant_group_size
+    quant_group_size: tl.constexpr,  # quant_group_size
     sm_scale,
     kv_group_num,
     stride_qbs,
@@ -61,9 +62,9 @@ def _fwd_kernel_in4kv(
     stride_buf_vbs,
     stride_buf_vh,
     stride_scales_buf_kbs,  # New stride for K scales bs
-    stride_scales_buf_kh,   # New stride for K scales head
+    stride_scales_buf_kh,  # New stride for K scales head
     stride_scales_buf_vbs,  # New stride for V scales bs
-    stride_scales_buf_vh,   # New stride for V scales head
+    stride_scales_buf_vh,  # New stride for V scales head
     stride_req_to_tokens_b,
     logit_cap: tl.constexpr,
     Lq: tl.constexpr,
@@ -148,7 +149,11 @@ def _fwd_kernel_in4kv(
         k_scales = tl.load(
             K_Scales_Buffer + offs_scales_k, mask=mask_n[None, :], other=1.0
         )
-        k_tmp = k_int8.to(scales_dtype).reshape(k_int8.shape[0] // quant_group_size, quant_group_size, k_int8.shape[1]) * k_scales.reshape(k_scales.shape[0], 1, k_scales.shape[1])  # Dequantize K
+        k_tmp = k_int8.to(scales_dtype).reshape(
+            k_int8.shape[0] // quant_group_size, quant_group_size, k_int8.shape[1]
+        ) * k_scales.reshape(
+            k_scales.shape[0], 1, k_scales.shape[1]
+        )  # Dequantize K
         k = k_tmp.reshape(k_tmp.shape[0] * k_tmp.shape[1], k_tmp.shape[2])
 
         qk = tl.dot(q.to(k.dtype), k)
@@ -188,7 +193,11 @@ def _fwd_kernel_in4kv(
         v_scales = tl.load(
             V_Scales_Buffer + offs_scales_v, mask=mask_n[:, None], other=1.0
         )
-        v_tmp = v_int8.to(scales_dtype).reshape(v_int8.shape[0], v_int8.shape[1] // quant_group_size, quant_group_size) * v_scales.reshape(v_scales.shape[0], v_scales.shape[1], 1)  # Dequantize V
+        v_tmp = v_int8.to(scales_dtype).reshape(
+            v_int8.shape[0], v_int8.shape[1] // quant_group_size, quant_group_size
+        ) * v_scales.reshape(
+            v_scales.shape[0], v_scales.shape[1], 1
+        )  # Dequantize V
         v = v_tmp.reshape(v_tmp.shape[0], v_tmp.shape[1] * v_tmp.shape[2])
 
         p = p.to(v.dtype)
@@ -356,5 +365,3 @@ def extend_attention_fwd_int4kv(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-
-
