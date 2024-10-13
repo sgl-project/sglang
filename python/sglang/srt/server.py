@@ -718,6 +718,8 @@ class Engine:
         lora_path: Optional[List[Optional[str]]] = None,
         stream: bool = False,
     ):
+        # TODO (ByronHsu): refactor to reduce the duplicated code
+
         obj = GenerateReqInput(
             text=prompt,
             sampling_params=sampling_params,
