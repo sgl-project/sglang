@@ -294,7 +294,7 @@ class LlamaForCausalLM(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
     ) -> None:
         super().__init__()
         self.config = config

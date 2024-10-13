@@ -107,7 +107,7 @@ class MiniCPM3Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
     ) -> None:
@@ -251,7 +251,7 @@ class MiniCPM3AttentionMLA(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
     ) -> None:
@@ -408,7 +408,7 @@ class MiniCPM3DecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -500,7 +500,7 @@ class MiniCPM3Model(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -551,7 +551,7 @@ class MiniCPM3ForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()

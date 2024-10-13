@@ -51,7 +51,7 @@ class GLMAttention(nn.Module):
         self,
         config,
         layer_id: int = 0,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -187,7 +187,7 @@ class GLMBlock(nn.Module):
         self,
         config,
         layer_id: int,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -259,7 +259,7 @@ class GLMTransformer(nn.Module):
     def __init__(
         self,
         config,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -307,7 +307,7 @@ class ChatGLMModel(nn.Module):
     def __init__(
         self,
         config,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -358,7 +358,7 @@ class ChatGLMForCausalLM(nn.Module):
     def __init__(
         self,
         config: ChatGLMConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoraConfig] = None,
     ):

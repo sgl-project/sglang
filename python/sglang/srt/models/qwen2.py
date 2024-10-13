@@ -267,7 +267,7 @@ class Qwen2ForCausalLM(nn.Module):
         self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
     ) -> None:
         super().__init__()
         self.config = config

@@ -159,7 +159,7 @@ class Qwen2MoeAttention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -235,7 +235,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -305,7 +305,7 @@ class Qwen2MoeModel(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -354,7 +354,7 @@ class Qwen2MoeForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()

@@ -329,7 +329,7 @@ class BaiChuanBaseForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         position_embedding: str,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -403,7 +403,7 @@ class BaichuanForCausalLM(BaiChuanBaseForCausalLM):
     def __init__(
         self,
         config,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         if config.hidden_size == 4096:  # baichuan2 7b

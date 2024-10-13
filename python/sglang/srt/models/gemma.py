@@ -279,7 +279,7 @@ class GemmaForCausalLM(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config = None,
     ) -> None:
         del lora_config  # Unused.
         super().__init__()
