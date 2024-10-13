@@ -56,6 +56,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.speculative.speculative_worker import spec_worker_factory
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -145,7 +146,17 @@ class Scheduler:
             nccl_port=port_args.nccl_port,
         )
         self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
-
+        
+        # Launch Speculative worker if need
+        if self.server_args.speculative_algorithm is not None:
+            self.draft_worker = spec_worker_factory.get(self.server_args.speculative_algorithm)(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker
+            )
+            
         # Get token and memory info from the model worker
         (
             self.max_total_num_tokens,
@@ -594,6 +605,7 @@ class Scheduler:
             self.req_to_token_pool,
             self.token_to_kv_pool,
             self.tree_cache,
+            self.server_args.speculative_algorithm
         )
         new_batch.prepare_for_extend(self.model_config.vocab_size)
 
@@ -644,10 +656,15 @@ class Scheduler:
     def run_batch(self, batch: ScheduleBatch):
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                model_worker_batch = batch.get_model_worker_batch()
-                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-                    model_worker_batch
-                )
+                if self.server_args.speculative_algorithm:
+                    logits_output, next_token_ids, spec_info = self.draft_worker.forward_batch_speculative_generate(
+                        batch
+                    )
+                else:
+                    model_worker_batch = batch.get_model_worker_batch()
+                    logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+                        model_worker_batch
+                    )
             else:
                 logits_output = None
                 if self.tokenizer is not None:

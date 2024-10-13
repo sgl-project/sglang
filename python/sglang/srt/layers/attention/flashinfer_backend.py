@@ -133,6 +133,7 @@ class FlashInferAttnBackend(AttentionBackend):
             forward_batch.seq_lens,
             prefix_lens,
             use_ragged=use_ragged,
+            spec_info=forward_batch.spec_info,
         )
 
         self.forward_metadata = (

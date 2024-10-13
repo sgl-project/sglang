@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,7 +31,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
@@ -43,6 +45,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.speculative_utils import SpecInput
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -428,9 +433,13 @@ class ScheduleBatch:
 
     # Has regex
     has_regex: bool = False
+    
+    # speculative decoding
+    spec_info: SpecInput = None
+    spec_algorithm: str = None
 
     @classmethod
-    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache, speculative_algorithm):
         return_logprob = any(req.return_logprob for req in reqs)
         has_stream = any(req.stream for req in reqs)
         has_regex = any(req.regex_fsm for req in reqs)
@@ -444,6 +453,7 @@ class ScheduleBatch:
             has_stream=has_stream,
             device=req_to_token_pool.device,
             has_regex=has_regex,
+            spec_algorithm=speculative_algorithm
         )
 
     def batch_size(self):
@@ -827,6 +837,8 @@ class ScheduleBatch:
             image_inputs=image_inputs,
             lora_paths=lora_paths,
             sampling_info=self.sampling_info,
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info
         )
 
 
@@ -860,3 +872,7 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+    
+    # Speclulative decoding
+    spec_algorithm: str = None
+    spec_info: SpecInput = None

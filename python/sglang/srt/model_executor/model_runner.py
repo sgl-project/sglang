@@ -77,6 +77,7 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        is_draft_runner: bool
     ):
         # Parse args
         self.model_config = model_config
@@ -90,6 +91,7 @@ class ModelRunner:
         self.is_multimodal_model = is_multimodal_model(
             self.model_config.hf_config.architectures
         )
+        self.is_draft_runner = is_draft_runner
 
         # Model-specific adjustment
         if (
@@ -150,9 +152,9 @@ class ModelRunner:
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
         if self.server_args.dist_init_addr:
-            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
+            dist_init_method = f"tcp://{self.server_args.dist_init_addr[1 if self.is_draft_runner else 0]}"
         else:
-            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
+            dist_init_method = f"tcp://127.0.0.1:{self.dist_port[1 if self.is_draft_runner else 0]}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         init_distributed_environment(
             backend=backend,
@@ -161,7 +163,9 @@ class ModelRunner:
             local_rank=self.gpu_id,
             distributed_init_method=dist_init_method,
         )
-        initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+        # draft model is not support parallel currently
+        if not self.is_draft_runner:
+            initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
@@ -207,7 +211,7 @@ class ModelRunner:
         monkey_patch_vllm_dummy_weight_loader()
         self.load_config = LoadConfig(load_format=self.server_args.load_format)
         self.vllm_model_config = VllmModelConfig(
-            model=self.server_args.model_path,
+            model=self.server_args.model_path if not self.is_draft_runner else self.server_args.draft_model_path,
             quantization=self.server_args.quantization,
             tokenizer=None,
             tokenizer_mode=None,
@@ -390,6 +394,12 @@ class ModelRunner:
             )
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        if self.is_draft_runner:
+            self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+        else:
+            self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+            
+        
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(

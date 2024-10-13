@@ -168,7 +168,9 @@ class LogitsProcessor(nn.Module):
         weight,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
     ):
+        spec_info = None
         if isinstance(logits_metadata, ForwardBatch):
+            spec_info = getattr(logits_metadata, 'spec_info', None)
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
         assert isinstance(logits_metadata, LogitsMetadata)
 
@@ -179,6 +181,9 @@ class LogitsProcessor(nn.Module):
         else:
             last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             last_hidden = hidden_states[last_index]
+
+        if spec_info:
+            spec_info.hidden_states = last_hidden
 
         last_logits = torch.matmul(last_hidden, weight.T)
         if self.do_tensor_parallel_all_gather:

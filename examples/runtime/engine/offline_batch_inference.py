@@ -4,17 +4,13 @@ import sglang as sgl
 def main():
     # Sample prompts.
     prompts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
+        "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Where is the capital city of France? ASSISTANT:"
     ]
     # Create a sampling params object.
-    sampling_params = {"temperature": 0.8, "top_p": 0.95}
+    sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
     # Create an LLM.
-    llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
-
+    llm = sgl.Engine(model_path="Llama-2-7b-chat-hf", draft_model_path='EAGLE-llama2-chat-7B', disable_cuda_graph=True, num_speculative_steps=5, num_draft_tokens=64, speculative_algorithm='EAGLE', mem_fraction_static=0.60)
     outputs = llm.generate(prompts, sampling_params)
     # Print the outputs.
     for prompt, output in zip(prompts, outputs):

@@ -79,7 +79,7 @@ class ServerArgs:
     load_balance_method: str = "round_robin"
 
     # Distributed args
-    dist_init_addr: Optional[str] = None
+    dist_init_addr: Optional[List[str]] = None
     nnodes: int = 1
     node_rank: int = 0
 
@@ -109,6 +109,13 @@ class ServerArgs:
     # LoRA
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
+
+    #speculative decoding
+    draft_model_path: str = None
+    speculative_algorithm: str = None
+    num_speculative_steps: int = None
+    num_draft_tokens: int = None
+    draft_runner_cache_size: int = None
 
     def __post_init__(self):
         # Set missing default values
@@ -422,8 +429,9 @@ class ServerArgs:
         parser.add_argument(
             "--dist-init-addr",
             "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
-            type=str,
-            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
+            type=List[str],
+            help="""The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). Shoule provide
+                two host address if use speculative decoding""",
         )
         parser.add_argument(
             "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
@@ -555,6 +563,33 @@ class ServerArgs:
             default=8,
             help="Maximum number of adapters for a running batch, include base-only request",
         )
+        parser.add_argument(
+            "--draft-model-path",
+            type=str,
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+            required=False,
+        )
+        parser.add_argument(
+            "--speculative-algorithm",
+            type=str,
+            choices=["EAGLE"],
+            help="Speculative algorithm.",
+            required=False,
+        )
+        parser.add_argument(
+            "--num-speculative-steps",
+            type=int,
+            help="The number of steps sampled from draft model in Speculative Decoding.",
+            required=False,
+            default=5,
+        )
+        parser.add_argument(
+            "--num-draft-tokens",
+            type=int,
+            help="The number of token sampled from draft model in Speculative Decoding.",
+            required=False,
+            default=5,
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -622,13 +657,17 @@ class PortArgs:
     detokenizer_ipc_name: str
 
     # The port for nccl initialization (torch.dist)
-    nccl_port: int
+    # [port] if don't use speculative decoding else [tp worker port, draft worker, port]
+    nccl_port: List[int]
 
     @staticmethod
     def init_new(server_args) -> "PortArgs":
+        all_port = []
         port = server_args.port + 1
         while True:
             if is_port_available(port):
+                all_port.append(port)
+            if len(all_port) == 2 if server_args.speculative_algorithm is not None else 1:
                 break
             port += 1
 
@@ -636,7 +675,7 @@ class PortArgs:
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
             scheduler_input_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
             detokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            nccl_port=port,
+            nccl_port=all_port,
         )
 
 

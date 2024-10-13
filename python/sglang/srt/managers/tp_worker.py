@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +17,8 @@ limitations under the License.
 
 """A tensor parallel worker."""
 
+from typing import TYPE_CHECKING
+
 import json
 import logging
 
@@ -27,12 +31,14 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import broadcast_pyobj, is_multimodal_model, set_random_seed
 
+if TYPE_CHECKING:
+    from sglang.srt.speculative.speculative_worker import SpeculativeWorker
+
 logger = logging.getLogger(__name__)
 
 
 class TpModelWorker:
     """A tensor parallel model worker."""
-
     def __init__(
         self,
         gpu_id: int,
@@ -42,14 +48,17 @@ class TpModelWorker:
     ):
         # Parse args
         self.tp_rank = tp_rank
+        self.server_args = server_args
+        is_draft_worker = getattr(self, 'is_draft_worker', False)
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
-            server_args.model_path,
+            server_args.model_path if not is_draft_worker else server_args.draft_model_path,
             server_args.trust_remote_code,
             context_length=server_args.context_length,
             model_override_args=json.loads(server_args.json_model_override_args),
         )
+
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -58,6 +67,7 @@ class TpModelWorker:
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
+            is_draft_runner=is_draft_worker
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -113,6 +123,7 @@ class TpModelWorker:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
         next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+        model_worker_batch.spec_info = forward_batch.spec_info
         return logits_output, next_token_ids
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
