@@ -109,8 +109,17 @@ class TestJSONConstrained(unittest.TestCase):
         assert isinstance(js_obj["name"], str)
         assert isinstance(js_obj["age"], int)
         assert js_obj["armor"] in ["leather", "chainmail", "plate"]
-        assert js_obj["weapon"] in ["third eye", "sword", "axe", "mace", "spear", "bow", "crossbow"]
+        assert js_obj["weapon"] in [
+            "third eye",
+            "sword",
+            "axe",
+            "mace",
+            "spear",
+            "bow",
+            "crossbow",
+        ]
         assert isinstance(js_obj["strength"], int)
+
 
 if __name__ == "__main__":
     unittest.main()

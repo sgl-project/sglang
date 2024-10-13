@@ -133,7 +133,10 @@ class SamplingBatchInfo:
         if self.regex_bnfs and any(regex_bnf for regex_bnf in self.regex_bnfs):
             # If has regex, then we need to update the vocab mask
             self.vocab_mask = torch.zeros(
-                len(self.temperatures), self.vocab_size, dtype=torch.bool, device=self.device
+                len(self.temperatures),
+                self.vocab_size,
+                dtype=torch.bool,
+                device=self.device,
             )
             for i, regex_bnf in enumerate(self.regex_bnfs):
                 if regex_bnf is not None:
