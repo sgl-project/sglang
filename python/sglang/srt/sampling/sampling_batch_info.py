@@ -126,22 +126,25 @@ class SamplingBatchInfo:
                         )
                     self.linear_penalties = penalizer.apply(self.linear_penalties)
 
-    def update_regex_vocab_mask(self):
-        has_regex = self.regex_fsms and any(regex_fsm for regex_fsm in self.regex_fsms)
-
+    def update_regex_vocab_mask_bnf(self):
         # Reset the vocab mask
         self.vocab_mask = None
 
-        if has_regex:
+        if self.regex_bnfs and any(regex_bnf for regex_bnf in self.regex_bnfs):
+            # If has regex, then we need to update the vocab mask
             self.vocab_mask = torch.zeros(
-                len(self.temperatures), self.vocab_size, dtype=torch.bool, device="cuda"
+                len(self.temperatures), self.vocab_size, dtype=torch.bool, device=self.device
             )
-            for i, regex_fsm in enumerate(self.regex_fsms):
-                if regex_fsm is not None:
-                    self.vocab_mask[i].fill_(1)
+            for i, regex_bnf in enumerate(self.regex_bnfs):
+                if regex_bnf is not None:
+                    # Note that this bitmask is a bitset, not bool
+                    bitmask = regex_bnf.find_next_token_bitmask()
+                    # Mask the tokens that are not allowed
                     self.vocab_mask[i][
-                        regex_fsm.get_next_instruction(self.regex_fsm_states[i]).tokens
-                    ] = 0
+                        regex_bnf.get_rejected_tokens_from_bitmask(
+                            bitmask, self.vocab_size
+                        )
+                    ] = 1
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
         if self.penalizer_orchestrator:
