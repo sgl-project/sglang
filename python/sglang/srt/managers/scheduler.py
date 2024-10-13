@@ -633,6 +633,8 @@ class Scheduler:
         if not self.disable_regex_jump_forward:
             jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
             self.waiting_queue.extend(jump_forward_reqs)
+            if jump_forward_reqs:
+                self.batch_is_full = False
             if batch.is_empty():
                 return None
 
