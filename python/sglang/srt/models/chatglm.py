@@ -22,7 +22,6 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from torch.nn import LayerNorm
-from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (

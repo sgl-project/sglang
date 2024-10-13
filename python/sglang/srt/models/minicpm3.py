@@ -21,7 +21,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
