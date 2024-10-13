@@ -831,6 +831,22 @@ class ScheduleBatch:
             sampling_info=self.sampling_info,
         )
 
+    def copy(self):
+        return ScheduleBatch(
+            reqs=self.reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            tree_cache=self.tree_cache,
+            forward_mode=self.forward_mode,
+            output_token_ids=self.output_token_ids,
+        )
+
+    def __str__(self):
+        return (
+            f"ScheduleBatch(forward_mode={self.forward_mode.name}, "
+            f"#req={(len(self.reqs))})"
+        )
+
 
 @dataclass
 class ModelWorkerBatch:
