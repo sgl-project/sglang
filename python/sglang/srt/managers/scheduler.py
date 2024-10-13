@@ -733,7 +733,7 @@ class Scheduler:
                     )
         else:  # embedding or reward model
             assert batch.extend_num_tokens != 0
-            embeddings = result.to_list()
+            embeddings = result.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
