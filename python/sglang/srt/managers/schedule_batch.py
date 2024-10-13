@@ -144,9 +144,9 @@ class ImageInputs:
             (image_hash >> 64) % vocab_size,
         ]
 
-        if hasattr(obj, "image_sizes"):
+        if "image_sizes" in obj:
             ret.image_sizes = obj["image_sizes"]
-        if hasattr(obj, "modalities"):
+        if "modalities" in obj:
             # Only when pixel values is not None we have modalities
             ret.modalities = obj["modalities"]
 

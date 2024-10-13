@@ -126,21 +126,13 @@ class FlashInferAttnBackend(AttentionBackend):
             total_num_tokens = torch.sum(forward_batch.seq_lens).item()
             extend_no_prefix = not torch.any(forward_batch.extend_prefix_lens).item()
 
-        encoder_lens = [
-            im.num_image_tokens if im is not None else 0
-            for im in forward_batch.image_inputs
-        ]
-        encoder_lens = torch.tensor(
-            encoder_lens, device="cuda", dtype=forward_batch.seq_lens.dtype
-        )
-
         update_flashinfer_indices(
             forward_batch.forward_mode,
             self.model_runner,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             prefix_lens,
-            encoder_lens=encoder_lens,
+            encoder_lens=forward_batch.encoder_lens,
             use_ragged=use_ragged,
         )
 

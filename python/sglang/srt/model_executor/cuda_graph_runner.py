@@ -251,17 +251,11 @@ class CudaGraphRunner:
         self.out_cache_loc[:raw_bs] = forward_batch.out_cache_loc
 
         # Encoder lens to initialize the attention wrappers
-        encoder_lens = [
-            im.num_image_tokens if im is not None else 0
-            for im in forward_batch.image_inputs
-        ]
-        encoder_lens = torch.tensor(
-            encoder_lens, device="cuda", dtype=forward_batch.seq_lens.dtype
-        )
+        encoder_lens = forward_batch.encoder_lens
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs, self.req_pool_indices, self.seq_lens, encoder_lens=encoder_lens
+            bs, self.req_pool_indices, self.seq_lens, encoder_lens
         )
 
         # Replay

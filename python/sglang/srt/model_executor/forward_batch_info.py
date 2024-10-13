@@ -100,6 +100,7 @@ class ForwardBatch:
 
     # For multimodal
     image_inputs: Optional[List[ImageInputs]] = None
+    encoder_lens: Optional[torch.Tensor] = None  # Batched params
 
     # For LoRA
     lora_paths: Optional[List[str]] = None
@@ -111,6 +112,22 @@ class ForwardBatch:
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: BaseTokenToKVPool = None
     attn_backend: AttentionBackend = None
+
+    def init_batched_multimodal_params(self, model_runner: ModelRunner):
+        if not model_runner.has_cross_attention:
+            self.encoder_lens = None
+        else:
+            encoder_lens = [
+                (
+                    im.num_image_tokens
+                    if (im is not None and im.num_image_tokens is not None)
+                    else 0
+                )
+                for im in self.image_inputs
+            ]
+            self.encoder_lens = torch.tensor(
+                encoder_lens, device="cuda", dtype=self.seq_lens.dtype
+            )
 
     @classmethod
     def init_new(
@@ -165,6 +182,9 @@ class ForwardBatch:
         ret.token_to_kv_pool = model_runner.token_to_kv_pool
         ret.attn_backend = model_runner.attn_backend
         model_runner.attn_backend.init_forward_metadata(ret)
+
+        # Init batched multimodal params
+        ret.init_batched_multimodal_params(model_runner)
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
