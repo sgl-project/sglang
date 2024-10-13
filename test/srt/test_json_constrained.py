@@ -91,7 +91,7 @@ class TestJSONConstrained(unittest.TestCase):
         "Armor": {
             "title": "Armor",
             "description": "An enumeration.",
-            "enum": ["skirt", "leather", "chainmail", "plate"],
+            "enum": ["leather", "chainmail", "plate"],
             "type": "string"
         },
         "Weapon": {
@@ -107,8 +107,10 @@ class TestJSONConstrained(unittest.TestCase):
         print("=" * 100)
         js_obj = json.loads(response.json()["text"])
         assert isinstance(js_obj["name"], str)
-        assert isinstance(js_obj["population"], int)
-
+        assert isinstance(js_obj["age"], int)
+        assert js_obj["armor"] in ["leather", "chainmail", "plate"]
+        assert js_obj["weapon"] in ["third eye", "sword", "axe", "mace", "spear", "bow", "crossbow"]
+        assert isinstance(js_obj["strength"], int)
 
 if __name__ == "__main__":
     unittest.main()
