@@ -563,6 +563,7 @@ class ServerArgs:
         parser.add_argument(
             "--num-continuous-decode-steps",
             type=int,
+            default=ServerArgs.num_continuous_decode_steps,
             help="Run multiple continuous decoding steps to reduce scheduling overhead. "
             "This can potentially increase throughput but may also increase time-to-first-token latency. "
             "The default value is 1, meaning only run one decoding step at a time.",
