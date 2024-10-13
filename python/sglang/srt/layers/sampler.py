@@ -7,10 +7,9 @@ from torch import nn
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_flashinfer_available
 
-# ROCm: flashinfer available later
-if not is_hip():
+if is_flashinfer_available():
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
         top_k_renorm_prob,
@@ -43,7 +42,10 @@ class Sampler(nn.Module):
                 torch.isnan(probs), torch.full_like(probs, 1e-10), probs
             )
 
-        if global_server_args_dict["sampling_backend"] == "flashinfer":
+        if sampling_info.top_ks.max().item() <= 1:
+            # Use torch.argmax if all requests use greedy sampling
+            batch_next_token_ids = torch.argmax(probs, -1)
+        elif global_server_args_dict["sampling_backend"] == "flashinfer":
             max_top_k_round, batch_size = 32, probs.shape[0]
             uniform_samples = torch.rand(
                 (max_top_k_round, batch_size), device=probs.device

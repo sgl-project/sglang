@@ -81,10 +81,11 @@ class ModelRunner:
         # Parse args
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
+        self.device = server_args.device
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.nccl_port = nccl_port
+        self.dist_port = nccl_port
         self.server_args = server_args
         self.is_multimodal_model = is_multimodal_model(
             self.model_config.hf_config.architectures
@@ -95,7 +96,7 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
-            logger.info("MLA optimization is tunred on. Use triton backend.")
+            logger.info("MLA optimization is turned on. Use triton backend.")
             self.server_args.attention_backend = "triton"
 
         if self.is_multimodal_model:
@@ -118,6 +119,7 @@ class ModelRunner:
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
+                "disable_penalizer": server_args.disable_penalizer,
             }
         )
 
@@ -132,39 +134,51 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
         )
-        self.init_cublas()
-        self.init_attention_backend()
-        self.init_cuda_graphs()
+        if self.device == "cuda":
+            self.init_cublas()
+            self.init_attention_backend()
+            self.init_cuda_graphs()
+        else:
+            self.cuda_graph_runner = None
+            self.init_attention_backend()
 
     def init_torch_distributed(self):
+        logger.info("Init torch distributed begin.")
         # Init torch distributed
-        torch.cuda.set_device(self.gpu_id)
-        logger.info("Init nccl begin.")
+        if self.device == "cuda":
+            torch.cuda.set_device(self.gpu_id)
+            backend = "nccl"
+        # ToDO(liangan1):Just use gloo to bypass the initilization fail
+        # Need to use xccl for xpu backend in the future
+        elif self.device == "xpu":
+            torch.xpu.set_device(self.gpu_id)
+            backend = "gloo"
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
-
         if self.server_args.dist_init_addr:
-            nccl_init_method = f"tcp://{self.server_args.dist_init_addr}"
+            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
-            nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port}"
+            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         init_distributed_environment(
-            backend="nccl",
+            backend=backend,
             world_size=self.tp_size,
             rank=self.tp_rank,
             local_rank=self.gpu_id,
-            distributed_init_method=nccl_init_method,
+            distributed_init_method=dist_init_method,
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         min_per_gpu_memory = get_available_gpu_memory(
-            self.gpu_id, distributed=self.tp_size > 1
+            self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         self.tp_group = get_tp_group()
 
         # Currently, there is a bug with mulit-node tensor parallelsim + padded cuda graph,
         # so we disable padding in cuda graph.
-        if not all(in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)):
+        if self.device == "cuda" and not all(
+            in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)
+        ):
             self.server_args.disable_cuda_graph_padding = True
             logger.info(
                 "Setting disable_cuda_graph_padding to True because of multi-node tensor parallelism."
@@ -172,7 +186,7 @@ class ModelRunner:
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
-            local_gpu_memory = get_available_gpu_memory(self.gpu_id)
+            local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
@@ -182,23 +196,22 @@ class ModelRunner:
 
     def load_model(self):
         logger.info(
-            f"Load weight begin. avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         # This can reduce thread conflicts and speed up weight loading.
         torch.set_num_threads(1)
-
-        if torch.cuda.get_device_capability()[0] < 8:
-            logger.info(
-                "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
-            )
-            self.server_args.dtype = "float16"
-            if torch.cuda.get_device_capability()[1] < 5:
-                raise RuntimeError("SGLang only supports sm75 and above.")
+        if self.device == "cuda":
+            if torch.cuda.get_device_capability()[0] < 8:
+                logger.info(
+                    "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
+                )
+                self.server_args.dtype = "float16"
+                if torch.cuda.get_device_capability()[1] < 5:
+                    raise RuntimeError("SGLang only supports sm75 and above.")
 
         # Prepare the vllm model config
         monkey_patch_vllm_dummy_weight_loader()
-        self.device_config = DeviceConfig()
         self.load_config = LoadConfig(load_format=self.server_args.load_format)
         self.vllm_model_config = VllmModelConfig(
             model=self.server_args.model_path,
@@ -220,7 +233,7 @@ class ModelRunner:
         self.model = get_model(
             model_config=self.vllm_model_config,
             load_config=self.load_config,
-            device_config=self.device_config,
+            device_config=DeviceConfig(self.device),
             parallel_config=None,
             scheduler_config=None,
             lora_config=None,
@@ -240,7 +253,7 @@ class ModelRunner:
             f"Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
-            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
     def update_weights(self, model_path: str, load_format: str):
@@ -254,10 +267,10 @@ class ModelRunner:
 
         logger.info(
             f"Update weights begin. "
-            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-        target_device = torch.device(self.device_config.device)
+        target_device = torch.device(self.device)
 
         try:
             # TODO: Use a better method to check this
@@ -343,7 +356,7 @@ class ModelRunner:
 
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(
-            self.gpu_id, distributed=self.tp_size > 1
+            self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -410,7 +423,9 @@ class ModelRunner:
             )
 
         self.req_to_token_pool = ReqToTokenPool(
-            max_num_reqs + 1, self.model_config.context_len + 4, device="cuda"
+            size=max_num_reqs + 1,
+            max_context_len=self.model_config.context_len + 4,
+            device=self.device,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -422,6 +437,7 @@ class ModelRunner:
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
+                device=self.device,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
@@ -430,10 +446,11 @@ class ModelRunner:
                 head_num=self.model_config.get_num_kv_heads(self.tp_size),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
+                device=self.device,
             )
         logger.info(
             f"Memory pool end. "
-            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
     def init_cublas(self):

@@ -40,6 +40,8 @@ class TritonAttnBackend(AttentionBackend):
 
         self.cuda_graph_max_seq_len = model_runner.model_config.context_len
 
+        self.device = model_runner.device
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
@@ -51,7 +53,7 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = torch.empty(
                 (self.num_head, total_num_tokens),
                 dtype=self.reduce_dtype,
-                device="cuda",
+                device=self.device,
             )
 
             max_seq_len = torch.max(forward_batch.seq_lens).item()
@@ -67,7 +69,7 @@ class TritonAttnBackend(AttentionBackend):
         self.cuda_graph_max_total_num_tokens = max_bs * self.cuda_graph_max_seq_len
 
         self.cuda_graph_start_loc = torch.zeros(
-            (max_bs,), dtype=torch.int32, device="cuda"
+            (max_bs,), dtype=torch.int32, device=self.device
         )
         self.cuda_graph_attn_logits = torch.empty(
             (

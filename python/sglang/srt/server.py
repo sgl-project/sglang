@@ -19,11 +19,13 @@ SRT = SGLang Runtime.
 """
 
 import asyncio
+import atexit
 import dataclasses
 import json
 import logging
 import multiprocessing as mp
 import os
+import random
 import threading
 import time
 from http import HTTPStatus
@@ -42,6 +44,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.managers.data_parallel_controller import (
+    run_data_parallel_controller_process,
+)
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
@@ -68,9 +73,9 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
-    allocate_init_ports,
     assert_pkg_version,
     configure_logger,
+    is_port_available,
     kill_child_process,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
@@ -118,6 +123,7 @@ async def health_generate(request: Request) -> Response:
 
 @app.get("/get_model_info")
 async def get_model_info():
+    """Get the model information."""
     result = {
         "model_path": tokenizer_manager.model_path,
         "is_generation": tokenizer_manager.is_generation,
@@ -127,11 +133,13 @@ async def get_model_info():
 
 @app.get("/get_server_args")
 async def get_server_args():
+    """Get the server arguments."""
     return dataclasses.asdict(tokenizer_manager.server_args)
 
 
 @app.get("/flush_cache")
 async def flush_cache():
+    """Flush the radix cache."""
     tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
@@ -140,9 +148,31 @@ async def flush_cache():
     )
 
 
+@app.get("/start_profile")
+@app.post("/start_profile")
+async def start_profile():
+    """Start profiling."""
+    tokenizer_manager.start_profile()
+    return Response(
+        content="Start profiling.\n",
+        status_code=200,
+    )
+
+
+@app.get("/stop_profile")
+@app.post("/stop_profile")
+async def stop_profile():
+    """Stop profiling."""
+    tokenizer_manager.stop_profile()
+    return Response(
+        content="Stop profiling. This will take some time.\n",
+        status_code=200,
+    )
+
+
 @app.post("/update_weights")
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
-
+    """Update the weights inplace without re-launching the server."""
     success, message = await tokenizer_manager.update_weights(obj, request)
     content = {"success": success, "message": message}
     if success:
@@ -157,6 +187,7 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
         )
 
 
+# fastapi implicitly converts json in the request to obj (dataclass)
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if obj.stream:
@@ -205,7 +236,7 @@ app.put("/encode")(encode_request)
 
 
 async def judge_request(obj: RewardReqInput, request: Request):
-    """Handle an embedding request."""
+    """Handle a reward model request."""
     try:
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
@@ -286,11 +317,13 @@ async def retrieve_file_content(file_id: str):
     return await v1_retrieve_file_content(file_id)
 
 
-def launch_server(
+def launch_engine(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[mp.connection.Connection] = None,
 ):
-    """Launch an HTTP server."""
+    """
+    Launch the Tokenizer Manager in the main process, the Scheduler in a subprocess, and the Detokenizer Manager in another subprocess.
+    """
+
     global tokenizer_manager
 
     # Configure global environment
@@ -299,18 +332,7 @@ def launch_server(
     _set_envs_and_config(server_args)
 
     # Allocate ports for inter-process communications
-    server_args.port, server_args.additional_ports = allocate_init_ports(
-        server_args.port,
-        server_args.additional_ports,
-        server_args.dp_size,
-    )
-    ports = server_args.additional_ports
-    port_args = PortArgs(
-        tokenizer_port=ports[0],
-        scheduler_port=ports[1],
-        detokenizer_port=ports[2],
-        nccl_ports=ports[3:],
-    )
+    port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
     # If using model from www.modelscope.cn, first download the model.
@@ -318,30 +340,40 @@ def launch_server(
         server_args.model_path, server_args.tokenizer_path
     )
 
-    # Launch tensor parallel scheduler processes
-    scheduler_procs = []
-    scheduler_pipe_readers = []
-    tp_size_per_node = server_args.tp_size // server_args.nnodes
-    tp_rank_range = range(
-        tp_size_per_node * server_args.node_rank,
-        tp_size_per_node * (server_args.node_rank + 1),
-    )
-    for tp_rank in tp_rank_range:
+    if server_args.dp_size == 1:
+        # Launch tensor parallel scheduler processes
+        scheduler_procs = []
+        scheduler_pipe_readers = []
+        tp_size_per_node = server_args.tp_size // server_args.nnodes
+        tp_rank_range = range(
+            tp_size_per_node * server_args.node_rank,
+            tp_size_per_node * (server_args.node_rank + 1),
+        )
+        for tp_rank in tp_rank_range:
+            reader, writer = mp.Pipe(duplex=False)
+            gpu_id = tp_rank % tp_size_per_node
+            proc = mp.Process(
+                target=run_scheduler_process,
+                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+            )
+            proc.start()
+            scheduler_procs.append(proc)
+            scheduler_pipe_readers.append(reader)
+
+        if server_args.node_rank >= 1:
+            # For other nodes, they do not need to run tokenizer or detokenizer,
+            # so they can just wait here.
+            while True:
+                pass
+    else:
+        # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)
-        gpu_id = tp_rank % tp_size_per_node
+        scheduler_pipe_readers = [reader]
         proc = mp.Process(
-            target=run_scheduler_process,
-            args=(server_args, port_args, gpu_id, tp_rank, writer),
+            target=run_data_parallel_controller_process,
+            args=(server_args, port_args, writer),
         )
         proc.start()
-        scheduler_procs.append(proc)
-        scheduler_pipe_readers.append(reader)
-
-    if server_args.node_rank >= 1:
-        # For other nodes, they do not need to run tokenizer or detokenizer,
-        # so they can just wait here.
-        while True:
-            pass
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -361,6 +393,29 @@ def launch_server(
     # Wait for model to finish loading
     for i in range(len(scheduler_pipe_readers)):
         scheduler_pipe_readers[i].recv()
+
+
+def launch_server(
+    server_args: ServerArgs,
+    pipe_finish_writer: Optional[mp.connection.Connection] = None,
+):
+    """
+    Launch SRT (SGLang Runtime) Server
+
+    The SRT server consists of an HTTP server and the SRT engine.
+
+    1. HTTP server: A FastAPI server that routes requests to the engine.
+    2. SRT engine:
+        1. Tokenizer Manager: Tokenizes the requests and sends them to the scheduler.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
+        3. Detokenizer Manager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+
+    Note:
+    1. The HTTP server and Tokenizer Manager both run in the main process.
+    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+    """
+
+    launch_engine(server_args=server_args)
 
     # Add api key authorization
     if server_args.api_key:
@@ -442,7 +497,6 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         return
 
     model_info = res.json()
-
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
@@ -495,18 +549,20 @@ class Runtime:
         """See the arguments in server_args.py::ServerArgs"""
         self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
 
+        # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
+        atexit.register(self.shutdown)
+
         # Pre-allocate ports
-        self.server_args.port, self.server_args.additional_ports = allocate_init_ports(
-            self.server_args.port,
-            self.server_args.additional_ports,
-            self.server_args.dp_size,
-        )
+        for port in range(10000, 40000):
+            if is_port_available(port):
+                break
+            port += 1
+        self.server_args.port = port
 
         self.url = self.server_args.url()
-        self.generate_url = (
-            f"http://{self.server_args.host}:{self.server_args.port}/generate"
-        )
+        self.generate_url = self.url + "/generate"
 
+        # NOTE: We store pid instead of proc to fix some issues during __delete__
         self.pid = None
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
 
@@ -634,3 +690,131 @@ class Runtime:
 
     def __del__(self):
         self.shutdown()
+
+
+class Engine:
+    """
+    SRT Engine without an HTTP server layer.
+
+    This class provides a direct inference engine without the need for an HTTP server. It is designed for use cases where
+    launching the HTTP server adds unnecessary complexity or overhead,
+    """
+
+    def __init__(self, *args, **kwargs):
+
+        # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
+        atexit.register(self.shutdown)
+
+        server_args = ServerArgs(*args, **kwargs)
+        launch_engine(server_args=server_args)
+
+    def generate(
+        self,
+        prompt: Union[str, List[str]],
+        sampling_params: Optional[Dict] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        stream: bool = False,
+    ):
+        # TODO (ByronHsu): refactor to reduce the duplicated code
+
+        obj = GenerateReqInput(
+            text=prompt,
+            sampling_params=sampling_params,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            lora_path=lora_path,
+            stream=stream,
+        )
+
+        # get the current event loop
+        loop = asyncio.get_event_loop()
+        ret = loop.run_until_complete(generate_request(obj, None))
+
+        if stream is True:
+            STREAM_END_SYMBOL = "data: [DONE]"
+            STREAM_CHUNK_START_SYMBOL = "data:"
+
+            def generator_wrapper():
+                offset = 0
+                loop = asyncio.get_event_loop()
+                generator = ret.body_iterator
+                while True:
+                    chunk = loop.run_until_complete(generator.__anext__())
+
+                    if chunk.startswith(STREAM_END_SYMBOL):
+                        break
+                    else:
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
+                        data["text"] = data["text"][offset:]
+                        offset += len(data["text"])
+                        yield data
+
+            # we cannot yield in the scope of generate() because python does not allow yield + return in the same function
+            # however, it allows to wrap the generator as a subfunction and return
+            return generator_wrapper()
+        else:
+            return ret
+
+    async def async_generate(
+        self,
+        prompt: Union[str, List[str]],
+        sampling_params: Optional[Dict] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        stream: bool = False,
+    ):
+        obj = GenerateReqInput(
+            text=prompt,
+            sampling_params=sampling_params,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            lora_path=lora_path,
+            stream=stream,
+        )
+
+        ret = await generate_request(obj, None)
+
+        if stream is True:
+            STREAM_END_SYMBOL = "data: [DONE]"
+            STREAM_CHUNK_START_SYMBOL = "data:"
+
+            generator = ret.body_iterator
+
+            async def generator_wrapper():
+
+                offset = 0
+
+                while True:
+                    chunk = await generator.__anext__()
+
+                    if chunk.startswith(STREAM_END_SYMBOL):
+                        break
+                    else:
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
+                        data["text"] = data["text"][offset:]
+                        offset += len(data["text"])
+                        yield data
+
+            return generator_wrapper()
+        else:
+            return ret
+
+    def shutdown(self):
+        kill_child_process(os.getpid(), including_parent=False)
+
+    def get_tokenizer(self):
+        global tokenizer_manager
+
+        if tokenizer_manager is None:
+            raise ReferenceError("Tokenizer Manager is not initialized.")
+        else:
+            return tokenizer_manager.tokenizer
+
+    # TODO (ByronHsu): encode

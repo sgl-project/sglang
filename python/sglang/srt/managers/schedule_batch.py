@@ -410,9 +410,9 @@ class ScheduleBatch:
     sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
-    input_ids: List[int] = None
-    req_pool_indices: List[int] = None
-    seq_lens: List[int] = None
+    input_ids: torch.Tensor = None
+    req_pool_indices: torch.Tensor = None
+    seq_lens: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
 
     # For processing logprobs
@@ -428,10 +428,17 @@ class ScheduleBatch:
     # Stream
     has_stream: bool = False
 
+    # device
+    device: str = "cuda"
+
+    # Has regex
+    has_regex: bool = False
+
     @classmethod
     def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
         return_logprob = any(req.return_logprob for req in reqs)
         has_stream = any(req.stream for req in reqs)
+        has_regex = any(req.regex_fsm for req in reqs)
 
         return cls(
             reqs=reqs,
@@ -440,6 +447,8 @@ class ScheduleBatch:
             tree_cache=tree_cache,
             return_logprob=return_logprob,
             has_stream=has_stream,
+            device=req_to_token_pool.device,
+            has_regex=has_regex,
         )
 
     def batch_size(self):
@@ -514,9 +523,10 @@ class ScheduleBatch:
             pt += req.extend_input_len
 
         # Set fields
-        self.input_ids = sum(input_ids, [])
-        self.req_pool_indices = torch.tensor(req_pool_indices, device="cuda")
-        self.seq_lens = torch.tensor(seq_lens, device="cuda")
+        with out_cache_loc.device:
+            self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
+            self.req_pool_indices = torch.tensor(req_pool_indices)
+            self.seq_lens = torch.tensor(seq_lens)
 
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
@@ -526,7 +536,9 @@ class ScheduleBatch:
         self.extend_lens = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
 
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self, vocab_size, global_server_args_dict["disable_penalizer"]
+        )
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
@@ -536,7 +548,7 @@ class ScheduleBatch:
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.extend_input_len = 1
 
-        input_ids = self.input_ids + running_batch.input_ids
+        input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
         extend_num_tokens = self.extend_num_tokens + running_bs
 
@@ -722,7 +734,9 @@ class ScheduleBatch:
                 for r in self.reqs
             ]
 
-        self.input_ids = input_ids
+        self.input_ids = torch.tensor(
+            input_ids, dtype=torch.int32, device=self.seq_lens.device
+        )
         self.seq_lens.add_(1)
 
         # Alloc mem
@@ -744,7 +758,9 @@ class ScheduleBatch:
             return
 
         self.reqs = [self.reqs[i] for i in unfinished_indices]
-        new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cuda")
+        new_indices = torch.tensor(
+            unfinished_indices, dtype=torch.int32, device=self.seq_lens.device
+        )
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
         self.out_cache_loc = None
@@ -755,7 +771,9 @@ class ScheduleBatch:
             ]
         else:
             self.top_logprobs_nums = None
+
         self.has_stream = any(req.stream for req in self.reqs)
+        self.has_regex = any(req.regex_fsm for req in self.reqs)
 
         self.sampling_info.filter_batch(unfinished_indices, new_indices)
 
@@ -776,9 +794,11 @@ class ScheduleBatch:
             self.top_logprobs_nums.extend([0] * len(other.reqs))
         elif other.return_logprob:
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
-        self.has_stream = any(req.stream for req in self.reqs)
         self.reqs.extend(other.reqs)
+
         self.return_logprob = self.return_logprob or other.return_logprob
+        self.has_stream = self.has_stream or other.has_stream
+        self.has_regex = self.has_regex or other.has_regex
 
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode():
@@ -791,7 +811,13 @@ class ScheduleBatch:
         # NOTE: decode also has image_inputs
         image_inputs = [r.image_inputs for r in self.reqs]
         lora_paths = [req.lora_path for req in self.reqs]
-        self.sampling_info.regex_fsm_states = [req.regex_fsm_state for req in self.reqs]
+        if self.has_regex:
+            self.sampling_info.regex_fsms = [req.regex_fsm for req in self.reqs]
+            self.sampling_info.regex_fsm_states = [
+                req.regex_fsm_state for req in self.reqs
+            ]
+        else:
+            self.sampling_info.regex_fsms = None
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
@@ -809,13 +835,29 @@ class ScheduleBatch:
             sampling_info=self.sampling_info,
         )
 
+    def copy(self):
+        return ScheduleBatch(
+            reqs=self.reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            tree_cache=self.tree_cache,
+            forward_mode=self.forward_mode,
+            output_token_ids=self.output_token_ids,
+        )
+
+    def __str__(self):
+        return (
+            f"ScheduleBatch(forward_mode={self.forward_mode.name}, "
+            f"#req={(len(self.reqs))})"
+        )
+
 
 @dataclass
 class ModelWorkerBatch:
     # The forward mode
     forward_mode: ForwardMode
     # The input ids
-    input_ids: List[int]
+    input_ids: torch.Tensor
     # The indices of requests in the req_to_token_pool
     req_pool_indices: torch.Tensor
     # The sequence length

@@ -93,6 +93,15 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-0:50000 --nnodes 2 --node-rank 1
 ```
 
+### SRT Engine: Direct Inference Without HTTP
+
+SGLang provides a direct inference engine **without an HTTP server**. This can be used for:
+
+1. **Offline Batch Inference**
+2. **Building Custom Servers**
+
+We provide usage examples [here](https://github.com/sgl-project/sglang/tree/main/examples/runtime/engine)
+
 ### Supported Models
 
 **Generative Models**

@@ -7,6 +7,7 @@ from sglang.test.test_programs import (
     test_dtype_gen,
     test_expert_answer,
     test_few_shot_qa,
+    test_gen_min_new_tokens,
     test_hellaswag_select,
     test_mt_bench,
     test_parallel_decoding,
@@ -68,6 +69,9 @@ class TestSRTBackend(unittest.TestCase):
         for _ in range(2):
             accuracy, latency = test_hellaswag_select()
             assert accuracy > 0.71, f"{accuracy=}"
+
+    def test_gen_min_new_tokens(self):
+        test_gen_min_new_tokens()
 
 
 if __name__ == "__main__":

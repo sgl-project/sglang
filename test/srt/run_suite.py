@@ -19,6 +19,7 @@ suites = {
         "test_pytorch_sampling_backend.py",
         "test_server_args.py",
         "test_skip_tokenizer_init.py",
+        "test_srt_engine.py",
         "test_srt_endpoint.py",
         "test_torch_compile.py",
         "test_torchao.py",
@@ -75,6 +76,8 @@ if __name__ == "__main__":
         files = suites[args.suite]
 
     files = files[args.range_begin : args.range_end]
+
+    print("The running tests are ", files)
 
     exit_code = run_unittest_files(files, args.timeout_per_file)
     exit(exit_code)

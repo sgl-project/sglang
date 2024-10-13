@@ -1,7 +1,7 @@
 import argparse
 import os
 
-NUM_LORAS = 128
+NUM_LORAS = 8
 LORA_PATH = {
     "base": "mistralai/Mistral-7B-Instruct-v0.3",
     "lora": "/home/ying/test_lora",
@@ -11,12 +11,11 @@ LORA_PATH = {
 def launch_server(args):
     base_path = LORA_PATH["base"]
     lora_path = LORA_PATH["lora"]
-    max_loras_per_batch = 4
 
     if args.base_only:
-        cmd = f"python -m sglang.launch_server --model {base_path} "
+        cmd = f"python3 -m sglang.launch_server --model {base_path} "
     else:
-        cmd = f"python -m sglang.launch_server --model {base_path} --lora-paths "
+        cmd = f"python3 -m sglang.launch_server --model {base_path} --lora-paths "
         for i in range(NUM_LORAS):
             lora_name = f"lora{i}"
             cmd += f"{lora_name}={lora_path} "
@@ -29,11 +28,6 @@ def launch_server(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--num-loras",
-        type=int,
-        default=128,
-    )
     parser.add_argument(
         "--base-only",
         action="store_true",

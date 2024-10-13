@@ -47,6 +47,7 @@ I'm going to the park
 import argparse
 import dataclasses
 import itertools
+import json
 import logging
 import multiprocessing
 import os
@@ -66,9 +67,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server import _set_envs_and_config
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    allocate_init_ports,
     configure_logger,
     kill_child_process,
     suppress_other_loggers,
@@ -123,19 +123,15 @@ class BenchArgs:
         )
 
 
-def load_model(server_args, tp_rank):
+def load_model(server_args, port_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
-    server_args.port, server_args.additional_ports = allocate_init_ports(
-        server_args.port,
-        server_args.additional_ports,
-        server_args.dp_size,
-    )
     model_config = ModelConfig(
         server_args.model_path,
         server_args.trust_remote_code,
         context_length=server_args.context_length,
+        model_override_args=json.loads(server_args.json_model_override_args),
     )
     model_runner = ModelRunner(
         model_config=model_config,
@@ -143,7 +139,7 @@ def load_model(server_args, tp_rank):
         gpu_id=tp_rank,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
-        nccl_port=server_args.additional_ports[-1],
+        nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
@@ -224,6 +220,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
     return reqs
 
 
+@torch.inference_mode()
 def extend(reqs, model_runner):
     batch = ScheduleBatch.init_new(
         reqs=reqs,
@@ -239,6 +236,7 @@ def extend(reqs, model_runner):
     return next_token_ids, logits_output.next_token_logits, batch
 
 
+@torch.inference_mode()
 def decode(input_token_ids, batch, model_runner):
     batch.prepare_for_decode(input_token_ids)
     model_worker_batch = batch.get_model_worker_batch()
@@ -248,16 +246,16 @@ def decode(input_token_ids, batch, model_runner):
     return next_token_ids, logits_output.next_token_logits
 
 
-@torch.inference_mode()
 def correctness_test(
     server_args,
+    port_args,
     bench_args,
     tp_rank,
 ):
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
 
     # Prepare inputs
     input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
@@ -290,9 +288,15 @@ def correctness_test(
         rank_print(tokenizer.decode(output_ids[i]), "\n")
 
 
-@torch.inference_mode()
+def synchronize(device):
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "xpu":
+        torch.xpu.synchronize()
+
+
 def latency_test_run_once(
-    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len
+    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
@@ -315,10 +319,10 @@ def latency_test_run_once(
     tot_latency = 0
 
     # Prefill
-    torch.cuda.synchronize()
+    synchronize(device)
     tic = time.time()
     next_token_ids, _, batch = extend(reqs, model_runner)
-    torch.cuda.synchronize()
+    synchronize(device)
     prefill_latency = time.time() - tic
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
@@ -331,10 +335,10 @@ def latency_test_run_once(
     # Decode
     decode_latencies = []
     for i in range(output_len - 1):
-        torch.cuda.synchronize()
+        synchronize(device)
         tic = time.time()
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-        torch.cuda.synchronize()
+        synchronize(device)
         latency = time.time() - tic
         tot_latency += latency
         throughput = batch_size / latency
@@ -343,13 +347,16 @@ def latency_test_run_once(
             rank_print(
                 f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
-    med_decode_latency = np.median(decode_latencies)
-    med_decode_throughput = batch_size / med_decode_latency
-    rank_print(
-        f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
-    )
-    measurement_results["median_decode_latency"] = med_decode_latency
-    measurement_results["median_decode_throughput"] = med_decode_throughput
+
+    # record decode timing from 2nd output
+    if output_len > 1:
+        med_decode_latency = np.median(decode_latencies)
+        med_decode_throughput = batch_size / med_decode_latency
+        rank_print(
+            f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
+        )
+        measurement_results["median_decode_latency"] = med_decode_latency
+        measurement_results["median_decode_throughput"] = med_decode_throughput
 
     throughput = (input_len + output_len) * batch_size / tot_latency
     rank_print(
@@ -362,6 +369,7 @@ def latency_test_run_once(
 
 def latency_test(
     server_args,
+    port_args,
     bench_args,
     tp_rank,
 ):
@@ -369,7 +377,7 @@ def latency_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
@@ -385,7 +393,8 @@ def latency_test(
         reqs,
         bench_args.batch_size[0],
         bench_args.input_len[0],
-        4,  # shorter decoding to speed up the warmup
+        8,  # shorter decoding to speed up the warmup
+        server_args.device,
     )
     rank_print("Benchmark ...")
 
@@ -396,7 +405,14 @@ def latency_test(
     ):
         reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
         ret = latency_test_run_once(
-            bench_args.run_name, model_runner, rank_print, reqs, bs, il, ol
+            bench_args.run_name,
+            model_runner,
+            rank_print,
+            reqs,
+            bs,
+            il,
+            ol,
+            server_args.device,
         )
         if ret is not None:
             result_list.append(ret)
@@ -487,8 +503,10 @@ def main(server_args, bench_args):
             "provide --result-filename for plotting the results"
         )
 
+    port_args = PortArgs.init_new(server_args)
+
     if server_args.tp_size == 1:
-        work_func(server_args, bench_args, 0)
+        work_func(server_args, port_args, bench_args, 0)
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
@@ -496,6 +514,7 @@ def main(server_args, bench_args):
                 target=work_func,
                 args=(
                     server_args,
+                    port_args,
                     bench_args,
                     tp_rank,
                 ),

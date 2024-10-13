@@ -16,9 +16,9 @@ limitations under the License.
 """Memory pool."""
 
 import logging
-from abc import ABC, abstractmethod
 from typing import List, Tuple, Union
 
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -29,10 +29,15 @@ class ReqToTokenPool:
 
     def __init__(self, size: int, max_context_len: int, device: str):
         self.size = size
-        self.free_slots = list(range(size))
+        self.max_context_len = max_context_len
+        self.device = device
         self.req_to_token = torch.empty(
             (size, max_context_len), dtype=torch.int32, device=device
         )
+        self.free_slots = list(range(size))
+
+    def available_size(self):
+        return len(self.free_slots)
 
     def alloc(self, need_size: int) -> List[int]:
         if need_size > len(self.free_slots):
@@ -53,86 +58,55 @@ class ReqToTokenPool:
         self.free_slots = list(range(self.size))
 
 
-class BaseTokenToKVPool(ABC):
+class BaseTokenToKVPool:
     """A memory pool that maps a token to its kv cache locations"""
 
     def __init__(
         self,
         size: int,
         dtype: torch.dtype,
+        device: str,
     ):
         self.size = size
         self.dtype = dtype
+        self.device = device
         if dtype == torch.float8_e5m2:
             # NOTE: Store as torch.uint8 because Tensor index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
             self.store_dtype = dtype
 
-        # We also add one slot. This slot is used for writing dummy output from padded tokens.
-        self.mem_state = torch.ones((self.size + 1,), dtype=torch.bool, device="cuda")
-
-        # Prefetch buffer
-        self.prefetch_buffer = torch.empty(0, device="cuda", dtype=torch.int32)
-        self.prefetch_chunk_size = 512
-
-        self.can_use_mem_size = self.size
+        self.free_slots = None
         self.clear()
 
     def available_size(self):
-        return self.can_use_mem_size + len(self.prefetch_buffer)
+        return len(self.free_slots)
 
     def alloc(self, need_size: int):
-        buffer_len = len(self.prefetch_buffer)
-        if need_size <= buffer_len:
-            select_index = self.prefetch_buffer[:need_size]
-            self.prefetch_buffer = self.prefetch_buffer[need_size:]
-            return select_index
-
-        addition_size = need_size - buffer_len
-        alloc_size = max(addition_size, self.prefetch_chunk_size)
-        select_index = (
-            torch.nonzero(self.mem_state).squeeze(1)[:alloc_size].to(torch.int32)
-        )
-
-        if select_index.shape[0] < addition_size:
+        if need_size > len(self.free_slots):
             return None
 
-        self.mem_state[select_index] = False
-        self.can_use_mem_size -= len(select_index)
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
 
-        self.prefetch_buffer = torch.cat((self.prefetch_buffer, select_index))
-        ret_index = self.prefetch_buffer[:need_size]
-        self.prefetch_buffer = self.prefetch_buffer[need_size:]
-
-        return ret_index
+        return torch.tensor(select_index, dtype=torch.int32, device=self.device)
 
     def free(self, free_index: torch.Tensor):
-        self.mem_state[free_index] = True
-        self.can_use_mem_size += len(free_index)
+        self.free_slots = np.concatenate((self.free_slots, free_index.cpu().numpy()))
 
     def clear(self):
-        self.prefetch_buffer = torch.empty(0, device="cuda", dtype=torch.int32)
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        self.free_slots = np.arange(1, self.size + 1)
 
-        self.mem_state.fill_(True)
-        self.can_use_mem_size = self.size
-
-        # We also add one slot. This slot is used for writing dummy output from padded tokens.
-        self.mem_state[0] = False
-
-    @abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
 
-    @abstractmethod
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
 
-    @abstractmethod
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
 
-    @abstractmethod
     def set_kv_buffer(
         self,
         layer_id: int,
@@ -152,19 +126,25 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         head_num: int,
         head_dim: int,
         layer_num: int,
+        device: str,
     ):
-        super().__init__(size, dtype)
+        super().__init__(size, dtype, device)
 
         # [size, head_num, head_dim] for each layer
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.k_buffer = [
             torch.empty(
-                (size + 1, head_num, head_dim), dtype=self.store_dtype, device="cuda"
+                (size + 1, head_num, head_dim),
+                dtype=self.store_dtype,
+                device=device,
             )
             for _ in range(layer_num)
         ]
         self.v_buffer = [
             torch.empty(
-                (size + 1, head_num, head_dim), dtype=self.store_dtype, device="cuda"
+                (size + 1, head_num, head_dim),
+                dtype=self.store_dtype,
+                device=device,
             )
             for _ in range(layer_num)
         ]
@@ -210,15 +190,17 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         layer_num: int,
+        device: str,
     ):
-        super().__init__(size, dtype)
+        super().__init__(size, dtype, device)
 
         self.kv_lora_rank = kv_lora_rank
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.kv_buffer = [
             torch.empty(
                 (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
                 dtype=self.store_dtype,
-                device="cuda",
+                device=device,
             )
             for _ in range(layer_num)
         ]

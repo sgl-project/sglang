@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.3.2"
+version = "0.3.3.post1"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -16,27 +16,17 @@ classifiers = [
 dependencies = ["requests", "tqdm", "numpy"]
 
 [project.optional-dependencies]
-srt = [
-    "aiohttp",
-    "decord",
-    "fastapi",
-    "hf_transfer",
-    "huggingface_hub",
-    "interegular",
-    "packaging",
-    "pillow",
-    "psutil",
-    "pydantic",
-    "python-multipart",
-    "torch",
-    "torchao",
-    "uvicorn",
-    "uvloop",
-    "zmq",
-    "vllm==0.5.5",
-    "outlines>=0.0.44",
-    "modelscope",
-]
+runtime_common = ["aiohttp", "decord", "fastapi", "hf_transfer", "huggingface_hub", "interegular",
+    "packaging", "pillow", "psutil", "pydantic", "python-multipart",
+    "torchao", "uvicorn", "uvloop", "zmq",
+    "outlines>=0.0.44", "modelscope"]
+torch = ["torch"]
+# xpu is not enabled in public vllm and torch whl,
+# need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
+vllm = ["vllm==0.5.5"]
+srt = ["sglang[runtime_common]", "torch", "vllm"]
+srt_xpu = ["sglang[runtime_common]"]
+
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
@@ -49,7 +39,9 @@ test = [
     "peft",
 ]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 dev = ["sglang[all]", "sglang[test]"]
+dev_xpu = ["sglang[all_xpu]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

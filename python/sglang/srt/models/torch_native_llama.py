@@ -17,10 +17,12 @@ limitations under the License.
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
+import types
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.nn.parameter import Parameter
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -33,17 +35,39 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.torchao_utils import apply_torchao_config_
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+def gate_up_proj_weight_loader(
+    self,
+    param: Parameter,
+    loaded_weight: torch.Tensor,
+    loaded_shard_id: Optional[int] = None,
+):
+    if loaded_shard_id is None:
+        shard_offsets: List[Tuple[int, int, int]] = []
+        for i, output_size in enumerate(self.output_sizes):
+            shard_offsets.append((i, current_shard_offset, output_size))
+            current_shard_offset += output_size
+        for shard_id, shard_offset, shard_size in shard_offsets:
+            loaded_weight_shard = loaded_weight.narrow(
+                output_dim, shard_offset, shard_size
+            )
+            self.weight_loader(param, loaded_weight_shard, shard_id)
+    else:
+        assert loaded_shard_id < len(self.output_sizes)
+        param_data = param.data
+        shard_size = loaded_weight.shape[0]
+        shard_offset = loaded_shard_id * shard_size
+        param_data = param_data.narrow(0, shard_offset, shard_size)
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
+    return
 
 
 class LlamaMLP(nn.Module):
@@ -56,20 +80,17 @@ class LlamaMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj = torch.nn.Linear(
             hidden_size,
-            [intermediate_size] * 2,
+            intermediate_size * 2,
             bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
         )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+        self.gate_up_proj.output_sizes = [intermediate_size] * 2
+        self.gate_up_proj.weight_loader = types.MethodType(
+            gate_up_proj_weight_loader, self.gate_up_proj
         )
+        self.gate_up_proj.weight.weight_loader = self.gate_up_proj.weight_loader
+        self.down_proj = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -78,10 +99,65 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x = self.down_proj(x)
         return x
+
+
+def _get_shard_offset_mapping(self, loaded_shard_id: str):
+    shard_offset_mapping = {
+        "q": 0,
+        "k": self.num_heads * self.head_size,
+        "v": (self.num_heads + self.num_kv_heads) * self.head_size,
+        "total": (self.num_heads + 2 * self.num_kv_heads) * self.head_size,
+    }
+    return shard_offset_mapping.get(loaded_shard_id)
+
+
+def _get_shard_size_mapping(self, loaded_shard_id: str):
+    shard_size_mapping = {
+        "q": self.num_heads * self.head_size,
+        "k": self.num_kv_heads * self.head_size,
+        "v": self.num_kv_heads * self.head_size,
+    }
+    return shard_size_mapping.get(loaded_shard_id)
+
+
+def qkv_proj_weight_loader(
+    self,
+    param: Parameter,
+    loaded_weight: torch.Tensor,
+    loaded_shard_id: Optional[str] = None,
+):
+    if loaded_shard_id is None:
+        shard_offsets = [
+            # (shard_id, shard_offset, shard_size)
+            ("q", 0, self.total_num_heads * self.head_size),
+            (
+                "k",
+                self.total_num_heads * self.head_size,
+                self.total_num_kv_heads * self.head_size,
+            ),
+            (
+                "v",
+                (self.total_num_heads + self.total_num_kv_heads) * self.head_size,
+                self.total_num_kv_heads * self.head_size,
+            ),
+        ]
+        for shard_id, shard_offset, shard_size in shard_offsets:
+            loaded_weight_shard = loaded_weight.narrow(
+                param.output_dim, shard_offset, shard_size
+            )
+            self.weight_loader(param, loaded_weight_shard, shard_id)
+    else:
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        param_data = param.data
+        param_data = param_data.narrow(0, shard_offset, shard_size)
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
+    return
 
 
 class LlamaAttention(nn.Module):
@@ -125,23 +201,32 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = torch.nn.Linear(
             hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
+            (self.total_num_heads + 2 * self.total_num_kv_heads) * self.head_dim,
             bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = RowParallelLinear(
+        self.qkv_proj.total_num_heads = self.total_num_heads
+        self.qkv_proj.head_size = self.head_dim
+        self.qkv_proj.total_num_kv_heads = self.total_num_kv_heads
+        self.qkv_proj.num_heads = self.total_num_heads
+        self.qkv_proj.num_kv_heads = self.total_num_kv_heads
+        self.qkv_proj.weight_loader = types.MethodType(
+            qkv_proj_weight_loader, self.qkv_proj
+        )
+        self.qkv_proj._get_shard_offset_mapping = types.MethodType(
+            _get_shard_offset_mapping, self.qkv_proj
+        )
+        self.qkv_proj._get_shard_size_mapping = types.MethodType(
+            _get_shard_size_mapping, self.qkv_proj
+        )
+        self.qkv_proj.weight.weight_loader = self.qkv_proj.weight_loader
+        self.qkv_proj.weight.output_dim = 0
+        self.o_proj = torch.nn.Linear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
         )
-
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -164,11 +249,11 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        output = self.o_proj(attn_output)
         return output
 
 
@@ -290,7 +375,7 @@ class LlamaModel(nn.Module):
         return hidden_states
 
 
-class LlamaForCausalLM(nn.Module):
+class TorchNativeLlamaForCausalLM(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
@@ -319,7 +404,6 @@ class LlamaForCausalLM(nn.Module):
         )
 
     def get_hidden_dim(self, module_name):
-        # return input_dim, output_dim
         if module_name in ["q_proj", "o_proj", "qkv_proj"]:
             return self.config.hidden_size, self.config.hidden_size
         elif module_name in ["kv_proj"]:
@@ -400,9 +484,6 @@ class LlamaForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip loading kv_scale from ckpts towards new design.
-                if name.endswith(".kv_scale") and name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -418,8 +499,8 @@ class LlamaForCausalLM(nn.Module):
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
 
-class Phi3ForCausalLM(LlamaForCausalLM):
+class TorchNativePhi3ForCausalLM(TorchNativeLlamaForCausalLM):
     pass
 
 
-EntryClass = [LlamaForCausalLM, Phi3ForCausalLM]
+EntryClass = [TorchNativeLlamaForCausalLM, TorchNativePhi3ForCausalLM]
