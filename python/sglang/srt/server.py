@@ -809,4 +809,12 @@ class Engine:
     def shutdown(self):
         kill_child_process(os.getpid(), including_parent=False)
 
+    def get_tokenizer(self):
+        global tokenizer_manager
+
+        if tokenizer_manager is None:
+            raise ReferenceError("Tokenizer Manager is not initialized.")
+        else:
+            return tokenizer_manager.tokenizer
+
     # TODO (ByronHsu): encode
