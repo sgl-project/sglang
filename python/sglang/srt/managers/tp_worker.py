@@ -118,7 +118,7 @@ class TpModelWorker:
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
-        embeddings = logits_output.embeddings.tolist()
+        embeddings = logits_output.embeddings
         return embeddings
 
     def update_weights(self, recv_req: UpdateWeightReqInput):
