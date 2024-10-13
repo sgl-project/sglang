@@ -31,7 +31,7 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config = None,
+        cache_config=None,
     ) -> None:
         super().__init__(config, quant_config, cache_config)
 

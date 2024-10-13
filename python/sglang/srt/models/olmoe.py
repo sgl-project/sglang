@@ -297,7 +297,7 @@ class OlmoeForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()

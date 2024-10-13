@@ -44,7 +44,7 @@ class GPTBigCodeAttention(nn.Module):
         self,
         layer_id: int,
         config: GPTBigCodeConfig,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -145,7 +145,7 @@ class GPTBigCodeBlock(nn.Module):
         self,
         layer_id: int,
         config: GPTBigCodeConfig,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -183,7 +183,7 @@ class GPTBigCodeModel(nn.Module):
     def __init__(
         self,
         config: GPTBigCodeConfig,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
     ):
@@ -243,7 +243,7 @@ class GPTBigCodeForCausalLM(nn.Module):
     def __init__(
         self,
         config: GPTBigCodeConfig,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
     ):

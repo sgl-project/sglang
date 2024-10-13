@@ -187,7 +187,7 @@ class DeepseekV2Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
     ) -> None:
@@ -335,7 +335,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
     ) -> None:
@@ -497,7 +497,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -593,7 +593,7 @@ class DeepseekV2Model(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -639,7 +639,7 @@ class DeepseekV2ForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()

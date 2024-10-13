@@ -367,7 +367,7 @@ class DbrxForCausalLM(nn.Module):
         self,
         config: DbrxConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config = None,
+        cache_config=None,
     ):
         super().__init__()
         self.config = config

@@ -296,7 +296,7 @@ class XverseForCausalLM(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config = None,
+        cache_config=None,
         efficient_weight_load=False,
     ) -> None:
         super().__init__()

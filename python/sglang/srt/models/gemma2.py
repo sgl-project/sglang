@@ -105,7 +105,7 @@ class Gemma2Attention(nn.Module):
         head_dim: int,
         max_position_embeddings: int,
         rope_theta: float,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -190,7 +190,7 @@ class Gemma2DecoderLayer(nn.Module):
         self,
         layer_idx: int,
         config: PretrainedConfig,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -257,7 +257,7 @@ class Gemma2Model(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -336,7 +336,7 @@ class Gemma2ForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
     ) -> None:

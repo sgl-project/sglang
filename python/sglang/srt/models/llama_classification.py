@@ -31,7 +31,7 @@ class LlamaForClassification(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config

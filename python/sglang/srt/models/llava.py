@@ -449,7 +449,7 @@ class LlavaLlamaForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
 
@@ -471,7 +471,7 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
 
@@ -504,7 +504,7 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
 
