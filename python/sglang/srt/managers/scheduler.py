@@ -260,6 +260,17 @@ class Scheduler:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
 
+                # Decode multiple steps to reduce the overhead
+                if batch.forward_mode.is_decode():
+                    for _ in range(global_config.num_continue_decode_steps - 1):
+                        if not self.running_batch:
+                            break
+                        self.update_running_batch()
+                        if not self.running_batch:
+                            break
+                        result = self.run_batch(batch)
+                        self.process_batch_result(batch, result)
+
             self.last_batch = batch
 
     def recv_requests(self):
@@ -450,8 +461,8 @@ class Scheduler:
         # Run decode
         if self.running_batch is not None:
             self.update_running_batch()
-            if self.running_batch.is_empty():
-                self.running_batch = None
+            if not self.running_batch:
+                return None
             return self.running_batch
         else:
             self.check_memory()
@@ -624,9 +635,10 @@ class Scheduler:
         if not self.disable_regex_jump_forward:
             jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
             self.waiting_queue.extend(jump_forward_reqs)
-            # if jump_forward_reqs:
-            #    self.batch_is_full = False
+            if jump_forward_reqs:
+                self.batch_is_full = False
             if batch.is_empty():
+                self.running_batch = None
                 return
 
         # Update batch tensors
