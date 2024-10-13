@@ -111,6 +111,7 @@ class ServerArgs:
     torchao_config: str = ""
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
+    num_continuous_decode_steps: int = 1
 
     def __post_init__(self):
         # Set missing default values
@@ -558,6 +559,14 @@ class ServerArgs:
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
+        )
+        parser.add_argument(
+            "--num-continuous-decode-steps",
+            type=int,
+            default=ServerArgs.num_continuous_decode_steps,
+            help="Run multiple continuous decoding steps to reduce scheduling overhead. "
+            "This can potentially increase throughput but may also increase time-to-first-token latency. "
+            "The default value is 1, meaning only run one decoding step at a time.",
         )
 
     @classmethod

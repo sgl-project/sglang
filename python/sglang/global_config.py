@@ -19,7 +19,6 @@ class GlobalConfig:
         self.new_token_ratio_decay = 0.001
 
         # Runtime constants: others
-        self.num_continue_decode_steps = 10
         self.retract_decode_steps = 20
         self.flashinfer_workspace_size = os.environ.get(
             "FLASHINFER_WORKSPACE_SIZE", 384 * 1024 * 1024
