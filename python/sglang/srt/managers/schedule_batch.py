@@ -531,7 +531,9 @@ class ScheduleBatch:
         self.extend_lens = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
 
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self, vocab_size, global_server_args_dict["disable_penalizer"]
+        )
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
