@@ -262,7 +262,7 @@ class Scheduler:
 
                 # Decode multiple steps to reduce the overhead
                 if batch.forward_mode.is_decode():
-                    for _ in range(global_config.num_continue_decode_steps - 1):
+                    for _ in range(global_config.num_continue_decode_steps):
                         if not self.running_batch:
                             break
                         self.update_running_batch()
@@ -733,7 +733,7 @@ class Scheduler:
                     )
         else:  # embedding or reward model
             assert batch.extend_num_tokens != 0
-            embeddings = result
+            embeddings = result.to_list()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
