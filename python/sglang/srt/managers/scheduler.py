@@ -671,9 +671,10 @@ class Scheduler:
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
         if self.is_generation:
             logits_output, next_token_ids = result
-            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                next_token_ids
-            )
+            if batch.sampling_info.penalizer_orchestrator:
+                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                    next_token_ids
+                )
 
             if logits_output:
                 # Move logprobs to cpu
@@ -755,9 +756,10 @@ class Scheduler:
 
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
         logits_output, next_token_ids = result
-        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            next_token_ids
-        )
+        if batch.sampling_info.penalizer_orchestrator:
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                next_token_ids
+            )
         self.num_generated_tokens += len(batch.reqs)
 
         # Move logprobs to cpu

@@ -35,12 +35,12 @@ class ServerArgs:
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
-    dtype: str = "auto"
-    device: str = "cuda"
-    kv_cache_dtype: str = "auto"
     trust_remote_code: bool = True
-    context_length: Optional[int] = None
+    dtype: str = "auto"
+    kv_cache_dtype: str = "auto"
     quantization: Optional[str] = None
+    context_length: Optional[int] = None
+    device: str = "cuda"
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
     is_embedding: bool = False
@@ -86,10 +86,15 @@ class ServerArgs:
     # Model override args in JSON
     json_model_override_args: str = "{}"
 
-    # Optimization/debug options
+    # LoRA
+    lora_paths: Optional[List[str]] = None
+    max_loras_per_batch: int = 8
+
+    # Kernel backend
     attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
 
+    # Optimization/debug options
     disable_flashinfer: bool = False
     disable_flashinfer_sampling: bool = False
     disable_radix_cache: bool = False
@@ -99,16 +104,13 @@ class ServerArgs:
     disable_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
+    disable_penalizer: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     max_torch_compile_bs: int = 32
     torchao_config: str = ""
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
-
-    # LoRA
-    lora_paths: Optional[List[str]] = None
-    max_loras_per_batch: int = 8
 
     def __post_init__(self):
         # Set missing default values
@@ -225,6 +227,11 @@ class ServerArgs:
             "which is mainly for profiling.",
         )
         parser.add_argument(
+            "--trust-remote-code",
+            action="store_true",
+            help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+        )
+        parser.add_argument(
             "--dtype",
             type=str,
             default=ServerArgs.dtype,
@@ -239,29 +246,11 @@ class ServerArgs:
             '* "float32" for FP32 precision.',
         )
         parser.add_argument(
-            "--device",
-            type=str,
-            default="cuda",
-            choices=["cuda", "xpu"],
-            help="The device type.",
-        )
-        parser.add_argument(
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2"],
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" is supported for CUDA 11.8+.',
-        )
-        parser.add_argument(
-            "--trust-remote-code",
-            action="store_true",
-            help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
-        )
-        parser.add_argument(
-            "--context-length",
-            type=int,
-            default=ServerArgs.context_length,
-            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
         )
         parser.add_argument(
             "--quantization",
@@ -277,6 +266,19 @@ class ServerArgs:
                 "bitsandbytes",
             ],
             help="The quantization method.",
+        )
+        parser.add_argument(
+            "--context-length",
+            type=int,
+            default=ServerArgs.context_length,
+            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
+        )
+        parser.add_argument(
+            "--device",
+            type=str,
+            default="cuda",
+            choices=["cuda", "xpu"],
+            help="The device type.",
         )
         parser.add_argument(
             "--served-model-name",
@@ -440,7 +442,23 @@ class ServerArgs:
             default=ServerArgs.json_model_override_args,
         )
 
-        # Optimization/debug options
+        # LoRA
+        parser.add_argument(
+            "--lora-paths",
+            type=str,
+            nargs="*",
+            default=None,
+            action=LoRAPathAction,
+            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
+        )
+        parser.add_argument(
+            "--max-loras-per-batch",
+            type=int,
+            default=8,
+            help="Maximum number of adapters for a running batch, include base-only request",
+        )
+
+        # Kernel backend
         parser.add_argument(
             "--attention-backend",
             type=str,
@@ -455,6 +473,8 @@ class ServerArgs:
             default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
         )
+
+        # Optimization/debug options
         parser.add_argument(
             "--disable-flashinfer",
             action="store_true",
@@ -502,6 +522,11 @@ class ServerArgs:
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
+            "--disable-penalizer",
+            action="store_true",
+            help="Disable the logit penalizer (e.g., frequency and repetition penalty).",
+        )
+        parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
@@ -533,27 +558,6 @@ class ServerArgs:
             action="store_true",
             help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
-        )
-        parser.add_argument(
-            "--efficient-weight-load",
-            action="store_true",
-            help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
-        )
-
-        # LoRA options
-        parser.add_argument(
-            "--lora-paths",
-            type=str,
-            nargs="*",
-            default=None,
-            action=LoRAPathAction,
-            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
-        )
-        parser.add_argument(
-            "--max-loras-per-batch",
-            type=int,
-            default=8,
-            help="Maximum number of adapters for a running batch, include base-only request",
         )
 
     @classmethod
