@@ -262,7 +262,7 @@ class Scheduler:
 
                 # Decode multiple steps to reduce the overhead
                 if batch.forward_mode.is_decode():
-                    for _ in range(global_config.num_continue_decode_steps):
+                    for _ in range(self.server_args.num_continuous_decode_steps - 1):
                         if not self.running_batch:
                             break
                         self.update_running_batch()
