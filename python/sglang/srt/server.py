@@ -44,6 +44,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.managers.data_parallel_controller import (
+    run_data_parallel_controller_process,
+)
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
@@ -141,6 +144,28 @@ async def flush_cache():
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
+        status_code=200,
+    )
+
+
+@app.get("/start_profile")
+@app.post("/start_profile")
+async def start_profile():
+    """Start profiling."""
+    tokenizer_manager.start_profile()
+    return Response(
+        content="Start profiling.\n",
+        status_code=200,
+    )
+
+
+@app.get("/stop_profile")
+@app.post("/stop_profile")
+async def stop_profile():
+    """Stop profiling."""
+    tokenizer_manager.stop_profile()
+    return Response(
+        content="Stop profiling. This will take some time.\n",
         status_code=200,
     )
 
@@ -315,30 +340,40 @@ def launch_engine(
         server_args.model_path, server_args.tokenizer_path
     )
 
-    # Launch tensor parallel scheduler processes
-    scheduler_procs = []
-    scheduler_pipe_readers = []
-    tp_size_per_node = server_args.tp_size // server_args.nnodes
-    tp_rank_range = range(
-        tp_size_per_node * server_args.node_rank,
-        tp_size_per_node * (server_args.node_rank + 1),
-    )
-    for tp_rank in tp_rank_range:
+    if server_args.dp_size == 1:
+        # Launch tensor parallel scheduler processes
+        scheduler_procs = []
+        scheduler_pipe_readers = []
+        tp_size_per_node = server_args.tp_size // server_args.nnodes
+        tp_rank_range = range(
+            tp_size_per_node * server_args.node_rank,
+            tp_size_per_node * (server_args.node_rank + 1),
+        )
+        for tp_rank in tp_rank_range:
+            reader, writer = mp.Pipe(duplex=False)
+            gpu_id = tp_rank % tp_size_per_node
+            proc = mp.Process(
+                target=run_scheduler_process,
+                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+            )
+            proc.start()
+            scheduler_procs.append(proc)
+            scheduler_pipe_readers.append(reader)
+
+        if server_args.node_rank >= 1:
+            # For other nodes, they do not need to run tokenizer or detokenizer,
+            # so they can just wait here.
+            while True:
+                pass
+    else:
+        # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)
-        gpu_id = tp_rank % tp_size_per_node
+        scheduler_pipe_readers = [reader]
         proc = mp.Process(
-            target=run_scheduler_process,
-            args=(server_args, port_args, gpu_id, tp_rank, writer),
+            target=run_data_parallel_controller_process,
+            args=(server_args, port_args, writer),
         )
         proc.start()
-        scheduler_procs.append(proc)
-        scheduler_pipe_readers.append(reader)
-
-    if server_args.node_rank >= 1:
-        # For other nodes, they do not need to run tokenizer or detokenizer,
-        # so they can just wait here.
-        while True:
-            pass
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -681,6 +716,58 @@ class Engine:
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
+        stream: bool = False,
+    ):
+        # TODO (ByronHsu): refactor to reduce the duplicated code
+
+        obj = GenerateReqInput(
+            text=prompt,
+            sampling_params=sampling_params,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            lora_path=lora_path,
+            stream=stream,
+        )
+
+        # get the current event loop
+        loop = asyncio.get_event_loop()
+        ret = loop.run_until_complete(generate_request(obj, None))
+
+        if stream is True:
+            STREAM_END_SYMBOL = "data: [DONE]"
+            STREAM_CHUNK_START_SYMBOL = "data:"
+
+            def generator_wrapper():
+                offset = 0
+                loop = asyncio.get_event_loop()
+                generator = ret.body_iterator
+                while True:
+                    chunk = loop.run_until_complete(generator.__anext__())
+
+                    if chunk.startswith(STREAM_END_SYMBOL):
+                        break
+                    else:
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
+                        data["text"] = data["text"][offset:]
+                        offset += len(data["text"])
+                        yield data
+
+            # we cannot yield in the scope of generate() because python does not allow yield + return in the same function
+            # however, it allows to wrap the generator as a subfunction and return
+            return generator_wrapper()
+        else:
+            return ret
+
+    async def async_generate(
+        self,
+        prompt: Union[str, List[str]],
+        sampling_params: Optional[Dict] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        stream: bool = False,
     ):
         obj = GenerateReqInput(
             text=prompt,
@@ -689,13 +776,45 @@ class Engine:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             lora_path=lora_path,
+            stream=stream,
         )
 
-        # get the current event loop
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(generate_request(obj, None))
+        ret = await generate_request(obj, None)
+
+        if stream is True:
+            STREAM_END_SYMBOL = "data: [DONE]"
+            STREAM_CHUNK_START_SYMBOL = "data:"
+
+            generator = ret.body_iterator
+
+            async def generator_wrapper():
+
+                offset = 0
+
+                while True:
+                    chunk = await generator.__anext__()
+
+                    if chunk.startswith(STREAM_END_SYMBOL):
+                        break
+                    else:
+                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
+                        data["text"] = data["text"][offset:]
+                        offset += len(data["text"])
+                        yield data
+
+            return generator_wrapper()
+        else:
+            return ret
 
     def shutdown(self):
         kill_child_process(os.getpid(), including_parent=False)
 
-    # TODO (ByronHsu): encode and async generate
+    def get_tokenizer(self):
+        global tokenizer_manager
+
+        if tokenizer_manager is None:
+            raise ReferenceError("Tokenizer Manager is not initialized.")
+        else:
+            return tokenizer_manager.tokenizer
+
+    # TODO (ByronHsu): encode

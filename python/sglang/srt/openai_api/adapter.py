@@ -117,7 +117,9 @@ def create_streaming_error_response(
 def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
     global chat_template_name
 
-    logger.info(f"Use chat template: {chat_template_arg}")
+    logger.info(
+        f"Use chat template for the OpenAI-compatible API server: {chat_template_arg}"
+    )
     if not chat_template_exists(chat_template_arg):
         if not os.path.exists(chat_template_arg):
             raise RuntimeError(
@@ -908,6 +910,7 @@ def v1_chat_generate_request(
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
             "n": request.n,
+            "ignore_eos": request.ignore_eos,
         }
         if request.response_format and request.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
@@ -924,7 +927,7 @@ def v1_chat_generate_request(
         else:
             prompt_kwargs = {"input_ids": input_ids}
         sampling_params_list = sampling_params_list[0]
-        image_data = image_data_list[0]
+        image_data_list = image_data_list[0]
         return_logprobs = return_logprobs[0]
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
@@ -937,7 +940,7 @@ def v1_chat_generate_request(
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
-        image_data=image_data,
+        image_data=image_data_list,
         sampling_params=sampling_params_list,
         return_logprob=return_logprobs,
         logprob_start_len=logprob_start_lens,

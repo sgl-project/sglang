@@ -17,7 +17,6 @@ limitations under the License.
 
 import json
 import logging
-import multiprocessing
 import os
 import time
 import warnings
@@ -36,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchTokenIDOut,
     FlushCacheReq,
+    ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     TokenizedRewardReqInput,
@@ -140,7 +140,7 @@ class Scheduler:
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             server_args=server_args,
-            nccl_port=port_args.nccl_ports[0],
+            nccl_port=port_args.nccl_port,
         )
         self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
 
@@ -226,6 +226,22 @@ class Scheduler:
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.batch_is_full = False
 
+        if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
+            self.profiler = None
+        else:
+            self.torch_profiler_trace_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+            logger.info(
+                "Profiling enabled. Traces will be saved to: %s",
+                self.torch_profiler_trace_dir,
+            )
+            self.profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                with_stack=True,
+            )
+
     @torch.inference_mode()
     def event_loop(self):
         while True:
@@ -268,6 +284,11 @@ class Scheduler:
             elif isinstance(recv_req, UpdateWeightReqInput):
                 success, message = self.update_weights(recv_req)
                 self.out_pyobjs.append(UpdateWeightReqOutput(success, message))
+            elif isinstance(recv_req, ProfileReq):
+                if recv_req == ProfileReq.START_PROFILE:
+                    self.start_profile()
+                else:
+                    self.stop_profile()
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 
@@ -427,6 +448,9 @@ class Scheduler:
                         # )
                         result = self.run_batch(batch)
                         self.process_batch_result(batch, result)
+
+                    if self.running_batch.is_empty():
+                        self.running_batch = None
 
                     if self.running_batch is None:
                         break
@@ -604,6 +628,8 @@ class Scheduler:
         if not self.disable_regex_jump_forward:
             jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
             self.waiting_queue.extend(jump_forward_reqs)
+            if jump_forward_reqs:
+                self.batch_is_full = False
             if batch.is_empty():
                 return None
 
@@ -642,9 +668,10 @@ class Scheduler:
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
         if self.is_generation:
             logits_output, next_token_ids = result
-            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                next_token_ids
-            )
+            if batch.sampling_info.penalizer_orchestrator:
+                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                    next_token_ids
+                )
 
             if logits_output:
                 # Move logprobs to cpu
@@ -724,9 +751,10 @@ class Scheduler:
 
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
         logits_output, next_token_ids = result
-        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            next_token_ids
-        )
+        if batch.sampling_info.penalizer_orchestrator:
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                next_token_ids
+            )
         self.num_generated_tokens += len(batch.reqs)
 
         # Move logprobs to cpu
@@ -762,9 +790,6 @@ class Scheduler:
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
             self.print_decode_stats()
-
-        if self.running_batch.is_empty():
-            self.running_batch = None
 
     def add_logprob_return_values(
         self,
@@ -991,15 +1016,34 @@ class Scheduler:
             logger.error(message)
         return success, message
 
+    def start_profile(self) -> None:
+        if self.profiler is None:
+            raise RuntimeError("Profiler is not enabled.")
+        self.profiler.start()
+
+    def stop_profile(self) -> None:
+        if self.profiler is None:
+            raise RuntimeError("Profiler is not enabled.")
+        self.profiler.stop()
+        self.profiler.export_chrome_trace(
+            self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz"
+        )
+        logger.info("Profiler is done")
+
 
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    dp_rank: Optional[int],
     pipe_writer,
 ):
-    configure_logger(server_args, prefix=f" TP{tp_rank}")
+    if dp_rank is None:
+        configure_logger(server_args, prefix=f" TP{tp_rank}")
+    else:
+        configure_logger(server_args, prefix=f" DP{dp_rank} TP{tp_rank}")
+
     suppress_other_loggers()
 
     try:

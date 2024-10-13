@@ -1,5 +1,5 @@
-<div align="center">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400"></img>
+<div align="center"  id="sglangtop">
+<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
 [![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
 ![PyPI - Downloads](https://img.shields.io/pypi/dm/sglang)
@@ -11,10 +11,9 @@
 
 --------------------------------------------------------------------------------
 
-| [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/) | [**Paper**](https://arxiv.org/abs/2312.07104) | [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2ngly9muu-t37XiH87qvD~6rVBTkTEHw) | [**Join Bi-Weekly Development Meeting (Oct. 19)**](https://calendar.app.google/GYW7S8QGoanCuaxW6) |
+| [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/) | [**Paper**](https://arxiv.org/abs/2312.07104) | [**Slides**](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_dev_day_v2.pptx) | [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2ngly9muu-t37XiH87qvD~6rVBTkTEHw) | [**Join Bi-Weekly Development Meeting (Oct. 19)**](https://calendar.app.google/GYW7S8QGoanCuaxW6) |
 
 ## Upcoming Events
-- [Oct. 11, 2024] Invited talks at [AMD Advancing AI](https://www.amd.com/en/corporate/events/advancing-ai.html) Developer Day.
 - [Oct. 16, 2024] Online meetup for efficient LLM deployment and serving, co-hosted by SGLang, FlashInfer, and MLC LLM! Fill out the [Google form](https://forms.gle/B3YeedLxmrrhL1NM8) to receive the invite link.
 
 ## News
@@ -65,7 +64,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.3.3 https://github.com/sgl-project/sglang.git
+git clone -b v0.3.3.post1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -589,3 +588,11 @@ Learn more at this [blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/).
 ## Citation And Acknowledgment
 Please cite our paper, [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), if you find the project useful.
 We also learned from the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+
+
+
+<p align="center">
+  <a href="#sglangtop" target="_blank">
+  <bold>Back To Top </bold>
+  </a>
+</p>

@@ -1,5 +1,6 @@
 import json
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import openai
 import requests
@@ -35,6 +36,7 @@ class TestJSONConstrained(unittest.TestCase):
                     "max_new_tokens": 128,
                     "n": n,
                     "stop_token_ids": [119690],
+                    "json_schema": json_schema,
                     "json_schema": json_schema,
                 },
                 "stream": False,
@@ -105,18 +107,7 @@ class TestJSONConstrained(unittest.TestCase):
         print("=" * 100)
         js_obj = json.loads(response.json()["text"])
         assert isinstance(js_obj["name"], str)
-        assert isinstance(js_obj["age"], int)
-        assert js_obj["armor"] in ["skirt", "leather", "chainmail", "plate"]
-        assert js_obj["weapon"] in [
-            "third eye",
-            "sword",
-            "axe",
-            "mace",
-            "spear",
-            "bow",
-            "crossbow",
-        ]
-        assert isinstance(js_obj["strength"], int)
+        assert isinstance(js_obj["population"], int)
 
 
 if __name__ == "__main__":

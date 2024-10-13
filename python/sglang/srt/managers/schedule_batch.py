@@ -412,9 +412,9 @@ class ScheduleBatch:
     sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
-    input_ids: List[int] = None
-    req_pool_indices: List[int] = None
-    seq_lens: List[int] = None
+    input_ids: torch.Tensor = None
+    req_pool_indices: torch.Tensor = None
+    seq_lens: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
 
     # For processing logprobs
@@ -429,6 +429,9 @@ class ScheduleBatch:
 
     # Stream
     has_stream: bool = False
+
+    # device
+    device: str = "cuda"
 
     # Has regex
     has_regex: bool = False
@@ -446,6 +449,7 @@ class ScheduleBatch:
             tree_cache=tree_cache,
             return_logprob=return_logprob,
             has_stream=has_stream,
+            device=req_to_token_pool.device,
             has_regex=has_regex,
         )
 
@@ -534,7 +538,9 @@ class ScheduleBatch:
         self.extend_lens = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
 
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self, vocab_size, global_server_args_dict["disable_penalizer"]
+        )
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
@@ -782,6 +788,8 @@ class ScheduleBatch:
         lora_paths = [req.lora_path for req in self.reqs]
         if self.has_regex:
             self.sampling_info.regex_bnfs = [req.regex_bnf for req in self.reqs]
+        else:
+            self.sampling_info.regex_bnfs = None
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
