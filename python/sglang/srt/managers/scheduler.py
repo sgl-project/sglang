@@ -452,13 +452,8 @@ class Scheduler:
             and not self.last_batch.forward_mode.is_decode()
             and not self.last_batch.is_empty()
         ):
-            reqs = self.last_batch.reqs
-            unfinished_indices = [
-                i
-                for i in range(len(reqs))
-                if not reqs[i].finished() and reqs[i] is not self.current_inflight_req
-            ]
-            self.last_batch.filter_batch(unfinished_indices)
+            if self.current_inflight_req:
+                self.last_batch.filter_batch(self.current_inflight_req)
             if not self.last_batch.is_empty():
                 if self.running_batch is None:
                     self.running_batch = self.last_batch
@@ -475,18 +470,6 @@ class Scheduler:
             self.check_memory()
             self.new_token_ratio = global_config.init_new_token_ratio
             return
-
-        # Filter finished requests
-        reqs = self.running_batch.reqs
-        unfinished_indices = [
-            i
-            for i in range(len(reqs))
-            if not reqs[i].finished() and reqs[i] is not self.current_inflight_req
-        ]
-        self.running_batch.filter_batch(unfinished_indices)
-        if self.running_batch.is_empty():
-            self.running_batch = None
-            return None
 
         # Run decode
         self.update_running_batch()
@@ -638,6 +621,11 @@ class Scheduler:
     def update_running_batch(self):
         global test_retract
         batch = self.running_batch
+
+        batch.filter_batch(None)
+        if batch.is_empty():
+            self.running_batch = None
+            return
 
         # Check if decode out of memory
         if not batch.check_decode_mem() or (test_retract and batch.batch_size() > 10):
@@ -914,12 +902,9 @@ class Scheduler:
             output_no_stop_trim = []
         else:  # embedding or reward model
             output_embeddings = []
-        unfinished_indices = []
 
-        for i, req in enumerate(batch.reqs):
-            if not req.finished() and req is not self.current_inflight_req:
-                unfinished_indices.append(i)
-            else:
+        for req in batch.reqs:
+            if req.finished() or req is self.current_inflight_req:
                 self.batch_is_full = False
 
             if req.finished() or (

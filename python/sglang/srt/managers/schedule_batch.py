@@ -740,7 +740,13 @@ class ScheduleBatch:
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
 
-    def filter_batch(self, unfinished_indices: List[int]):
+    def filter_batch(self, current_inflight_req: Req):
+        unfinished_indices = [
+            i
+            for i in range(len(self.reqs))
+            if not self.reqs[i].finished() and self.reqs[i] is not current_inflight_req
+        ]
+
         if unfinished_indices is None or len(unfinished_indices) == 0:
             # Filter out all requests
             self.reqs = []
