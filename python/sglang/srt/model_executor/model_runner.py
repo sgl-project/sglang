@@ -102,6 +102,19 @@ class ModelRunner:
             logger.info("MLA optimization is turned on. Use triton backend.")
             self.server_args.attention_backend = "triton"
 
+        if self.server_args.enable_double_sparsity:
+            logger.info(
+                "Double sparsity optimization is turned on. Use triton backend."
+            )
+            self.server_args.attention_backend = "triton"
+            if self.server_args.ds_heavy_channel_type is None:
+                raise ValueError(
+                    "Please specify the heavy channel type for double sparsity optimization."
+                )
+            self.init_double_sparsity_channel_config(
+                self.server_args.ds_heavy_channel_type
+            )
+
         if self.is_multimodal_model:
             logger.info(
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
@@ -125,11 +138,6 @@ class ModelRunner:
                 "disable_penalizer": server_args.disable_penalizer,
             }
         )
-
-        if self.server_args.enable_double_sparsity:
-            self.init_double_sparsity_channel_config(
-                self.server_args.ds_heavy_channel_type
-            )
 
         # Init componnets
         min_per_gpu_memory = self.init_torch_distributed()

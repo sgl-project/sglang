@@ -19,14 +19,13 @@ class TestDoubleSparsity(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         dirpath = os.path.dirname(__file__)
         config_file = os.path.join(dirpath, "Llama-3.1-8B-Instruct.json")
+        # NOTE: Generate the config file by running https://github.com/andy-yang-1/DoubleSparse/blob/main/evaluation/group_channel_config.py
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--enable-double-sparsity",
-                "--attention-backend",
-                "triton",
                 "--disable-cuda-graph",
                 "--ds-channel-config-path",
                 config_file,
