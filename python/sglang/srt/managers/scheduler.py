@@ -622,7 +622,7 @@ class Scheduler:
         global test_retract
         batch = self.running_batch
 
-        has_filtered = batch.filter_batch(None)
+        has_filtered = batch.filter_batch()
         if has_filtered:
             self.batch_is_full = False
 
