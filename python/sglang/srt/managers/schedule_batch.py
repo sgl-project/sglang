@@ -417,6 +417,8 @@ class ScheduleBatch:
     seq_lens: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
 
+    output_ids: torch.Tensor = None
+
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
@@ -595,9 +597,11 @@ class ScheduleBatch:
 
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
+        first_iter = True
         while (
             self.token_to_kv_pool.available_size()
             < len(sorted_indices) * global_config.retract_decode_steps
+            or first_iter
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
@@ -606,6 +610,7 @@ class ScheduleBatch:
                 ), "No space left for only one request"
                 break
 
+            first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
@@ -661,7 +666,7 @@ class ScheduleBatch:
 
     def check_for_jump_forward(self, pad_input_ids_func):
         jump_forward_reqs = []
-        filter_indices = [i for i in range(len(self.reqs))]
+        keep_indices = set(i for i in range(len(self.reqs)))
 
         for i, req in enumerate(self.reqs):
             if req.allow_jump_forward and req.regex_bnf is not None:
@@ -693,25 +698,18 @@ class ScheduleBatch:
                         )
 
                     jump_forward_reqs.append(req)
-                    filter_indices.remove(i)
+                    keep_indices.remove(i)
 
-        self.filter_batch(filter_indices)
+        self.filter_batch(keep_indices=list(keep_indices))
 
         return jump_forward_reqs
 
-    def prepare_for_decode(self, input_ids=None):
+    def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
 
-        if input_ids is None:
-            input_ids = [
-                r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
-                for r in self.reqs
-            ]
-
-        self.input_ids = torch.tensor(
-            input_ids, dtype=torch.int32, device=self.seq_lens.device
-        )
+        self.input_ids = self.output_ids
         self.seq_lens.add_(1)
+        self.output_ids = None
 
         # Alloc mem
         bs = len(self.reqs)
@@ -721,35 +719,46 @@ class ScheduleBatch:
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
 
-    def filter_batch(self, unfinished_indices: List[int]):
-        if unfinished_indices is None or len(unfinished_indices) == 0:
+    def filter_batch(
+        self,
+        current_inflight_req: Optional[Req] = None,
+        keep_indices: Optional[List[int]] = None,
+    ):
+        if keep_indices is None:
+            keep_indices = [
+                i
+                for i in range(len(self.reqs))
+                if not self.reqs[i].finished()
+                and self.reqs[i] is not current_inflight_req
+            ]
+
+        if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
             return
 
-        if len(unfinished_indices) == len(self.reqs):
+        if len(keep_indices) == len(self.reqs):
             # No need to filter
             return
 
-        self.reqs = [self.reqs[i] for i in unfinished_indices]
+        self.reqs = [self.reqs[i] for i in keep_indices]
         new_indices = torch.tensor(
-            unfinished_indices, dtype=torch.int32, device=self.seq_lens.device
+            keep_indices, dtype=torch.int32, device=self.seq_lens.device
         )
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
         self.out_cache_loc = None
+        self.output_ids = self.output_ids[new_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
-            self.top_logprobs_nums = [
-                self.top_logprobs_nums[i] for i in unfinished_indices
-            ]
+            self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
         else:
             self.top_logprobs_nums = None
 
         self.has_stream = any(req.stream for req in self.reqs)
         self.has_regex = any(req.regex_bnf for req in self.reqs)
 
-        self.sampling_info.filter_batch(unfinished_indices, new_indices)
+        self.sampling_info.filter_batch(keep_indices, new_indices)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -762,6 +771,8 @@ class ScheduleBatch:
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
+        if self.output_ids is not None:
+            self.output_ids = torch.concat([self.output_ids, other.output_ids])
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
         elif self.return_logprob:
@@ -805,6 +816,24 @@ class ScheduleBatch:
             image_inputs=image_inputs,
             lora_paths=lora_paths,
             sampling_info=self.sampling_info,
+        )
+
+    def copy(self):
+        return ScheduleBatch(
+            reqs=self.reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            tree_cache=self.tree_cache,
+            forward_mode=self.forward_mode,
+            output_ids=self.output_ids,
+            sampling_info=self.sampling_info,
+            decoding_reqs=self.decoding_reqs,
+        )
+
+    def __str__(self):
+        return (
+            f"ScheduleBatch(forward_mode={self.forward_mode.name}, "
+            f"#req={(len(self.reqs))})"
         )
 
 
