@@ -1,0 +1,73 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../benchmark_and_profiling.md:1
+msgid "Benchmark and Profiling"
+msgstr "基准测试和分析"
+
+#: ../../benchmark_and_profiling.md:3
+msgid "Benchmark"
+msgstr "基准测试"
+
+#: ../../benchmark_and_profiling.md:4
+msgid ""
+"Benchmark a single static batch by running the following command without "
+"launching a server. The arguments are the same as for `launch_server.py`. "
+"Note that this is not a dynamic batching server, so it may run out of memory"
+" for a batch size that a real server can handle. A real server truncates the"
+" prefill into several batches, while this unit test does not. For accurate "
+"large batch testing, consider using `sglang.bench_serving`."
+msgstr ""
+"通过运行以下命令而不启动服务器来对单个静态批次进行基准测试。参数与 `launch_server.py` "
+"相同。请注意，这不是动态批处理服务器，因此它可能会在真实服务器可以处理的批次大小下耗尽内存。真实服务器将预填充截断为多个批次，而此单元测试不会。为了进行准确的大批次测试，请考虑使用"
+" `sglang.bench_serving`。"
+
+#: ../../benchmark_and_profiling.md:8
+msgid ""
+"Benchmark online serving. Launch a server first and run the following "
+"command."
+msgstr "基准测试在线服务。首先启动服务器，然后运行以下命令。"
+
+#: ../../benchmark_and_profiling.md:13
+msgid "Profile with Nsight"
+msgstr "使用 Nsight 进行分析"
+
+#: ../../benchmark_and_profiling.md:14
+msgid "Prerequisite"
+msgstr "先决条件"
+
+#: ../../benchmark_and_profiling.md:26
+msgid ""
+"To profile a single batch, use `nsys profile --trace-fork-before-exec=true "
+"--cuda-graph-trace=node python3 -m sglang.bench_latency --model meta-"
+"llama/Meta-Llama-3-8B --batch-size 64 --input-len 512`"
+msgstr ""
+"要分析单个批次，请使用 `nsys profile --trace-fork-before-exec=true --cuda-graph-"
+"trace=node python3 -m sglang.bench_latency --model meta-llama/Meta-"
+"Llama-3-8B --batch-size 64 --input-len 512`"
+
+#: ../../benchmark_and_profiling.md:28
+msgid "To profile a server, e.g."
+msgstr "要分析服务器，例如"
+
+#: ../../benchmark_and_profiling.md:39
+msgid "Use NVTX, e.g."
+msgstr "使用 NVTX，例如："

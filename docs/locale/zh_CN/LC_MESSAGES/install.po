@@ -1,0 +1,138 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../install.md:1
+msgid "Install SGLang"
+msgstr "安装 SGLang"
+
+#: ../../install.md:3
+msgid "You can install SGLang using any of the methods below."
+msgstr "你可以使用以下任何方法安装 SGLang。"
+
+#: ../../install.md:5
+msgid "Method 1: With pip"
+msgstr "方法 1：使用 pip"
+
+#: ../../install.md:14
+msgid "Method 2: From source"
+msgstr "方法 2：从源代码安装"
+
+#: ../../install.md:27
+msgid "Method 3: Using docker"
+msgstr "方法 3：使用 Docker"
+
+#: ../../install.md:28
+msgid ""
+"The docker images are available on Docker Hub as "
+"[lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from"
+" [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker). "
+"Replace `<secret>` below with your huggingface hub "
+"[token](https://huggingface.co/docs/hub/en/security-tokens)."
+msgstr ""
+"Docker 镜像在 Docker Hub 上以 "
+"[lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags) 的形式提供，构建自 "
+"[Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker)。将下面的 "
+"`<secret>` 替换为你的 huggingface hub "
+"[token](https://huggingface.co/docs/hub/en/security-tokens)。"
+
+#: ../../install.md:41
+msgid "Method 4: Using docker compose"
+msgstr "方法 4：使用 Docker Compose"
+
+#: ../../install.md:46
+msgid ""
+"This method is recommended if you plan to serve it as a service. A better "
+"approach is to use the [k8s-sglang-service.yaml](./docker/k8s-sglang-"
+"service.yaml)."
+msgstr ""
+"如果你打算将其作为服务提供，建议使用此方法。更好的方法是使用 [k8s-sglang-"
+"service.yaml](./docker/k8s-sglang-service.yaml)。"
+
+#: ../../install.md:49
+msgid "Copy the [compose.yml](./docker/compose.yaml) to your local machine"
+msgstr "将 [compose.yml](./docker/compose.yaml) 复制到你的本地机器"
+
+#: ../../install.md:50
+msgid "Execute the command `docker compose up -d` in your terminal."
+msgstr "在你的终端中执行命令 `docker compose up -d`。"
+
+#: ../../install.md:53
+msgid "Method 5: Run on Kubernetes or Clouds with SkyPilot"
+msgstr "方法 5：在 Kubernetes 或云上使用 SkyPilot 运行"
+
+#: ../../install.md:58
+msgid ""
+"To deploy on Kubernetes or 12+ clouds, you can use "
+"[SkyPilot](https://github.com/skypilot-org/skypilot)."
+msgstr ""
+"要部署到 Kubernetes 或 12+ 云，你可以使用 [SkyPilot](https://github.com/skypilot-"
+"org/skypilot)。"
+
+#: ../../install.md:60
+msgid ""
+"Install SkyPilot and set up Kubernetes cluster or cloud access: see "
+"[SkyPilot's "
+"documentation](https://skypilot.readthedocs.io/en/latest/getting-"
+"started/installation.html)."
+msgstr ""
+"安装 SkyPilot 并设置 Kubernetes 集群或云访问：请参阅 [SkyPilot "
+"文档](https://skypilot.readthedocs.io/en/latest/getting-"
+"started/installation.html)。"
+
+#: ../../install.md:61
+msgid ""
+"Deploy on your own infra with a single command and get the HTTP API "
+"endpoint:"
+msgstr "使用单个命令在你的基础设施上部署并获取 HTTP API 端点："
+
+#: ../../install.md:91
+msgid ""
+"To further scale up your deployment with autoscaling and failure recovery, "
+"check out the [SkyServe + SGLang guide](https://github.com/skypilot-"
+"org/skypilot/tree/master/llm/sglang#serving-llama-2-with-sglang-for-more-"
+"traffic-using-skyserve)."
+msgstr ""
+"要使用自动缩放和故障恢复进一步扩展你的部署，请查看 [SkyServe + SGLang "
+"指南](https://github.com/skypilot-org/skypilot/tree/master/llm/sglang#serving-"
+"llama-2-with-sglang-for-more-traffic-using-skyserve)。"
+
+#: ../../install.md:94
+msgid "Common Notes"
+msgstr "常见说明"
+
+#: ../../install.md:95
+msgid ""
+"[FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default "
+"attention kernel backend. It only supports sm75 and above. If you encounter "
+"any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, "
+"L40S, H100), please switch to other kernels by adding `--attention-backend "
+"triton --sampling-backend pytorch` and open an issue on GitHub."
+msgstr ""
+"[FlashInfer](https://github.com/flashinfer-ai/flashinfer) 是默认的注意力内核后端。它只支持 "
+"sm75 及更高版本。如果你在 sm75+ 设备（例如 T4、A10、A100、L4、L40S、H100）上遇到任何与 FlashInfer "
+"相关的問題，请通过添加 `--attention-backend triton --sampling-backend pytorch` "
+"切换到其他内核，并在 GitHub 上打开一个问题。"
+
+#: ../../install.md:96
+msgid ""
+"If you only need to use the OpenAI backend, you can avoid installing other "
+"dependencies by using `pip install \"sglang[openai]\"`."
+msgstr "如果你只需要使用 OpenAI 后端，你可以使用 `pip install \"sglang[openai]\"` 来避免安装其他依赖项。"

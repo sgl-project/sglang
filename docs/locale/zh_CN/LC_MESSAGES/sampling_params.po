@@ -1,0 +1,198 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../sampling_params.md:1
+msgid "Sampling Parameters in SGLang Runtime"
+msgstr "SGLang 运行时的采样参数"
+
+#: ../../sampling_params.md:2
+msgid ""
+"This doc describes the sampling parameters of the SGLang Runtime. It is the "
+"low-level endpoint of the runtime. If you want a high-level endpoint that "
+"can automatically handle chat templates, consider using the [OpenAI "
+"Compatible API ](https://github.com/sgl-project/sglang?tab=readme-ov-"
+"file#openai-compatible-api)."
+msgstr ""
+"本文档介绍了 SGLang 运行时的采样参数。它是运行时的底层端点。如果你想要一个可以自动处理聊天模板的高级端点，请考虑使用 [OpenAI 兼容 "
+"API](https://github.com/sgl-project/sglang?tab=readme-ov-file#openai-"
+"compatible-api)。"
+
+#: ../../sampling_params.md:7
+msgid ""
+"The `/generate` endpoint accepts the following arguments in the JSON format."
+msgstr "`/generate` 端点接受 JSON 格式的以下参数。"
+
+#: ../../sampling_params.md:36
+msgid "The `sampling_params` follows this format"
+msgstr "`sampling_params` 遵循以下格式"
+
+#: ../../sampling_params.md:90
+msgid "Examples"
+msgstr "示例"
+
+#: ../../sampling_params.md:92
+msgid "Normal"
+msgstr "正常"
+
+#: ../../sampling_params.md:93 ../../sampling_params.md:148
+msgid "Launch a server"
+msgstr "启动服务器"
+
+#: ../../sampling_params.md:98 ../../sampling_params.md:158
+msgid "Send a request"
+msgstr "发送请求"
+
+#: ../../sampling_params.md:115
+msgid "Streaming"
+msgstr "流式"
+
+#: ../../sampling_params.md:116
+msgid "Send a request and stream the output"
+msgstr "发送请求并流式输出"
+
+#: ../../sampling_params.md:146
+msgid "Multi modal"
+msgstr "多模态"
+
+#: ../../sampling_params.md:153
+msgid "Download an image"
+msgstr "下载图像"
+
+#: ../../sampling_params.md:178
+msgid ""
+"The `image_data` can be a file name, a URL, or a base64 encoded string. See "
+"also `python/sglang/srt/utils.py:load_image`. Streaming is supported in a "
+"similar manner as [above](#streaming)."
+msgstr ""
+"`image_data` 可以是文件名、URL 或 base64 编码的字符串。另请参见 "
+"`python/sglang/srt/utils.py:load_image`。流式传输以类似于 [上面](#streaming) 的方式支持。"
+
+#: ../../sampling_params.md:181
+msgid "Performance Implications on Penalties"
+msgstr "对惩罚的性能影响"
+
+#: ../../sampling_params.md:183
+msgid ""
+"While you can apply penalties by supplying relevant `sampling_params`, this "
+"comes with some drawbacks."
+msgstr "虽然你可以通过提供相关的 `sampling_params` 来应用惩罚，但这会带来一些缺点。"
+
+#: ../../sampling_params.md:185
+msgid ""
+"These drawbacks will be applied to every single requests in the same batch, "
+"as penalizers also applies in batch."
+msgstr "这些缺点将应用于同一批次中的每个请求，因为惩罚器也应用于批次。"
+
+#: ../../sampling_params.md:187
+msgid "Latency"
+msgstr "延迟"
+
+#: ../../sampling_params.md:189
+msgid ""
+"While we try to compute penalty algorithms through CUDA, it is still "
+"additional computation on top of the basic sampling logic. For detailed "
+"overhead, we recommend you to run your own benchmarks, but you can find "
+"samples below to get a glimpse."
+msgstr ""
+"虽然我们尝试通过 CUDA "
+"计算惩罚算法，但这仍然是在基本采样逻辑之上进行的额外计算。有关详细的开销，我们建议你运行自己的基准测试，但你可以找到以下示例以了解概况。"
+
+#: ../../sampling_params.md:191
+msgid "Memory"
+msgstr "内存"
+
+#: ../../sampling_params.md:193
+msgid ""
+"Since we compute penalty algorithms through CUDA, the logic stores relevant "
+"parameters on GPU. This is usually in a scale of `vocab_size` multiplied by "
+"`running_requests`."
+msgstr ""
+"由于我们通过 CUDA 计算惩罚算法，因此该逻辑将相关参数存储在 GPU 上。这通常是 `vocab_size` 乘以 "
+"`running_requests` 的规模。"
+
+#: ../../sampling_params.md:195
+msgid ""
+"You can run your own benchmark with desired parameters on your own hardware "
+"to make sure it's not OOMing before using."
+msgstr "你可以在自己的硬件上使用所需的参数运行自己的基准测试，以确保在使用之前不会出现 OOM。"
+
+#: ../../sampling_params.md:197
+msgid ""
+"Tuning `--mem-fraction-static` and/or `--max-running-requests` will help. "
+"See [here](hyperparameter_tuning.md#minor-tune---max-prefill-tokens---mem-"
+"fraction-static---max-running-requests) for more information."
+msgstr ""
+"调整 `--mem-fraction-static` 和/或 `--max-running-requests` 将有所帮助。有关更多信息，请参见 "
+"[此处](hyperparameter_tuning.md#minor-tune---max-prefill-tokens---mem-"
+"fraction-static---max-running-requests)。"
+
+#: ../../sampling_params.md:199
+msgid "Benchmarks"
+msgstr "基准测试"
+
+#: ../../sampling_params.md:201
+msgid "All the benchmarks below were ran on NVIDIA H100 SXM5."
+msgstr "以下所有基准测试都在 NVIDIA H100 SXM5 上运行。"
+
+#: ../../sampling_params.md:205
+msgid "Baseline"
+msgstr "基线"
+
+#: ../../sampling_params.md:207
+msgid ""
+"Measured at "
+"[dc9d06d886151707f97d0b78095df9de262fd3c9](https://github.com/sgl-"
+"project/sglang/commit/dc9d06d886151707f97d0b78095df9de262fd3c9)."
+msgstr ""
+"在 [dc9d06d886151707f97d0b78095df9de262fd3c9](https://github.com/sgl-"
+"project/sglang/commit/dc9d06d886151707f97d0b78095df9de262fd3c9) 处测量。"
+
+#: ../../sampling_params.md:241
+msgid "All Together"
+msgstr "全部"
+
+#: ../../sampling_params.md:280
+msgid "Frequency Penalty"
+msgstr "频率惩罚"
+
+#: ../../sampling_params.md:316
+msgid "Presence Penalty"
+msgstr "存在惩罚"
+
+#: ../../sampling_params.md:352
+msgid "Repetition Penalty"
+msgstr "重复惩罚"
+
+#: ../../sampling_params.md:388
+msgid "Min New Tokens"
+msgstr "最小新词元"
+
+#: ../../sampling_params.md:390
+msgid ""
+"The min new tokens penalizer computes until generation process reaches given"
+" `min_new_tokens`."
+msgstr "最小新词元惩罚器计算直到生成过程达到给定的 `min_new_tokens`。"
+
+#: ../../sampling_params.md:392
+msgid ""
+"Dislike other penalizers, setting this to higher value will have more "
+"latency implications."
+msgstr "与其他惩罚器不同，将此值设置为更高值将具有更多延迟影响。"

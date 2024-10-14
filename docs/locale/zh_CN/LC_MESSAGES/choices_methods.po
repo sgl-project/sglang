@@ -1,0 +1,108 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../choices_methods.md:1
+msgid "Choices Methods in SGLang"
+msgstr "SGLang 中的选择方法"
+
+#: ../../choices_methods.md:2
+msgid "This doc describes the choices methods supported by SGLang."
+msgstr "本文档介绍了 SGLang 支持的选择方法。"
+
+#: ../../choices_methods.md:4
+msgid ""
+"The optional `choices_method` arg determines how options supplied to "
+"SGLang's `choices` primitive are selected. Only the `RuntimeEndpoint` "
+"backend supports the `choices_method` arg. Other backends, such as `OpenAI`,"
+" have bespoke selection implementations due to API limitations."
+msgstr ""
+"可选的 `choices_method` 参数决定了如何选择提供给 SGLang 的 `choices` 原语的选项。只有 "
+"`RuntimeEndpoint` 后端支持 `choices_method` 参数。其他后端，例如 `OpenAI`，由于 API "
+"限制，具有定制的选择实现。"
+
+#: ../../choices_methods.md:6
+msgid "Methods"
+msgstr "方法"
+
+#: ../../choices_methods.md:8
+msgid "Token Length Normalized"
+msgstr "令牌长度归一化"
+
+#: ../../choices_methods.md:10
+msgid ""
+"Token length normalized is the default SGLang choices method. It selects the"
+" option with the highest average logprob across all of its tokens."
+msgstr "令牌长度归一化是 SGLang 默认的选择方法。它选择所有令牌的平均对数概率最高的选项。"
+
+#: ../../choices_methods.md:12
+msgid "Usage example (alternatively, simply omit the `choices_method` arg):"
+msgstr "使用示例（或者，只需省略 `choices_method` 参数）："
+
+#: ../../choices_methods.md:27
+msgid ""
+"This can perform poorly if an option contains many tokens, where its later "
+"tokens are predicted with high confidence based on its earlier tokens. For "
+"instance, even strong models will fail the above example if the specified "
+"options are `[\"Paris\", \"Antidisestablishmentarianism\"]`."
+msgstr ""
+"如果一个选项包含许多令牌，而其后面的令牌基于其前面的令牌以高置信度预测，则此方法可能表现不佳。例如，即使是强大的模型，如果指定的选项是 "
+"`[\"Paris\", \"Antidisestablishmentarianism\"]`，也会在上述示例中失败。"
+
+#: ../../choices_methods.md:29
+msgid "Greedy Token Selection"
+msgstr "贪婪令牌选择"
+
+#: ../../choices_methods.md:31
+msgid ""
+"Greedy token selection simply selects the option with the highest logprob "
+"for its initial token. For overlapping options where one option is a subset "
+"of a longer option, the logprobs of the shorter option are extended using "
+"its average logprob for comparison against the longer option."
+msgstr ""
+"贪婪令牌选择简单地选择其初始令牌的对数概率最高的选项。对于重叠选项，其中一个选项是较长选项的子集，则使用较短选项的平均对数概率来扩展其对数概率，以便与较长选项进行比较。"
+
+#: ../../choices_methods.md:33 ../../choices_methods.md:65
+msgid "Usage example:"
+msgstr "使用示例："
+
+#: ../../choices_methods.md:47
+msgid ""
+"This can perform poorly if an option misleads the model down a bad path "
+"based on an attractive initial token. For instance, greedy selection will "
+"result in an incorrect response for this example:"
+msgstr "如果一个选项基于一个有吸引力的初始令牌将模型误导到错误的路径上，则此方法可能表现不佳。例如，贪婪选择将导致此示例的错误响应："
+
+#: ../../choices_methods.md:61
+msgid "Unconditional Likelihood Normalized"
+msgstr "无条件似然归一化"
+
+#: ../../choices_methods.md:63
+msgid ""
+"Unconditional likelihood normalized selects the option with the highest "
+"average token logprob once normalized by the unconditional token logprobs, "
+"as described in [this EleutherAI "
+"blogpost](https://blog.eleuther.ai/multiple-choice-normalization/). This "
+"method incurs an additional LLM call to obtain the unconditional "
+"likelihoods."
+msgstr ""
+"无条件似然归一化选择平均令牌对数概率最高的选项，该选项通过无条件令牌对数概率进行归一化，如 [这篇 EleutherAI "
+"博客文章](https://blog.eleuther.ai/multiple-choice-normalization/) 中所述。此方法需要额外的 "
+"LLM 调用来获取无条件似然。"

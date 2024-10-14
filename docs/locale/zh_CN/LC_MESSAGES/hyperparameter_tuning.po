@@ -1,0 +1,138 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../hyperparameter_tuning.md:1
+msgid "Guide on Hyperparameter Tuning"
+msgstr "超参数调优指南"
+
+#: ../../hyperparameter_tuning.md:3
+msgid "Achieving Peak Throughput"
+msgstr "实现峰值吞吐量"
+
+#: ../../hyperparameter_tuning.md:5
+msgid ""
+"Achieving a large batch size is the most important thing for attaining high "
+"throughput."
+msgstr "实现较大的批次大小是获得高吞吐量的最重要因素。"
+
+#: ../../hyperparameter_tuning.md:7
+msgid ""
+"When the server is running at full load, look for the following in the log:"
+msgstr "当服务器满负荷运行时，在日志中查找以下内容："
+
+#: ../../hyperparameter_tuning.md:9
+msgid ""
+"```Decode batch. #running-req: 233, #token: 370959, token usage: 0.82, gen "
+"throughput (token/s): 4594.01, #queue-req: 417```"
+msgstr ""
+"```解码批次。#正在运行的请求：233，#令牌：370959，令牌使用率：0.82，生成吞吐量（令牌/秒）：4594.01，#队列请求：417```"
+
+#: ../../hyperparameter_tuning.md:11
+msgid "Tune Your Request Submission Speed"
+msgstr "调整你的请求提交速度"
+
+#: ../../hyperparameter_tuning.md:12
+msgid ""
+"`#queue-req` indicates the number of requests in the queue. If you "
+"frequently see `#queue-req == 0`, it suggests you are bottlenecked by the "
+"request submission speed. A healthy range for `#queue-req` is `50 - 1000`. "
+"On the other hand, do not make `#queue-req` too large because it will also "
+"increase the scheduling overhead on the server."
+msgstr ""
+"`#队列请求` 表示队列中的请求数量。如果你经常看到 `#队列请求 == 0`，这表明你受到请求提交速度的限制。`#队列请求` 的健康范围是 `50 -"
+" 1000`。另一方面，不要使 `#队列请求` 太大，因为它也会增加服务器上的调度开销。"
+
+#: ../../hyperparameter_tuning.md:16
+msgid "Tune `--schedule-conservativeness`"
+msgstr "调整 `--schedule-conservativeness`"
+
+#: ../../hyperparameter_tuning.md:17
+msgid ""
+"`token usage` indicates the KV cache memory utilization of the server. "
+"`token usage > 0.9` means good utilization. If you frequently see `token "
+"usage < 0.9` and `#queue-req > 0`, it means the server is too conservative "
+"about taking in new requests. You can decrease `--schedule-conservativeness`"
+" to a value like 0.3. The case of serving being too conservative can happen "
+"when users send many requests with a large `max_new_tokens` but the requests"
+" stop very early due to EOS or stop strings."
+msgstr ""
+"`令牌使用率` 表示服务器的 KV 缓存内存利用率。`令牌使用率 > 0.9` 表示良好的利用率。如果你经常看到 `令牌使用率 < 0.9` 且 "
+"`#队列请求 > 0`，这意味着服务器在接收新请求方面过于保守。你可以将 `--schedule-conservativeness` 降低到 0.3 "
+"之类的值。当用户发送许多具有较大 `max_new_tokens` 的请求，但这些请求由于 EOS "
+"或停止字符串而过早停止时，可能会出现服务过于保守的情况。"
+
+#: ../../hyperparameter_tuning.md:21
+msgid ""
+"On the other hand, if you see `token usage` very high and you frequently see"
+" warnings like `decode out of memory happened, #retracted_reqs: 1, "
+"#new_token_ratio: 0.9998 -> 1.0000`, you can increase `--schedule-"
+"conservativeness` to a value like 1.3. If you see `decode out of memory "
+"happened` occasionally but not frequently, it is okay."
+msgstr ""
+"另一方面，如果你看到 `令牌使用率` 非常高，并且你经常看到类似 `解码内存不足，#撤回的请求：1，#新令牌比率：0.9998 -> 1.0000` "
+"的警告，你可以将 `--schedule-conservativeness` 增加到 1.3 之类的值。如果你偶尔看到 "
+"`解码内存不足`，但并不频繁，这是可以的。"
+
+#: ../../hyperparameter_tuning.md:25
+msgid "Tune `--dp-size` and `--tp-size`"
+msgstr "调整 `--dp-size` 和 `--tp-size`"
+
+#: ../../hyperparameter_tuning.md:26
+msgid ""
+"Data parallelism is better for throughput. When there is enough GPU memory, "
+"always favor data parallelism for throughput."
+msgstr "数据并行性更适合吞吐量。当有足够的 GPU 内存时，始终优先考虑数据并行性以获得吞吐量。"
+
+#: ../../hyperparameter_tuning.md:28
+msgid ""
+"Avoid out-of-memory by tuning `--chunked-prefill-size`, `--mem-fraction-"
+"static`, `--max-running-requests`"
+msgstr ""
+"通过调整 `--chunked-prefill-size`、`--mem-fraction-static`、`--max-running-"
+"requests` 来避免内存不足"
+
+#: ../../hyperparameter_tuning.md:29
+msgid ""
+"If you see out of memory (OOM) errors, you can decrease these parameters.   "
+"If OOM happens during prefill, try to decrease `--chunked-prefill-size` to "
+"`4096` or `2048`.   If OOM happens during decoding, try to decrease `--max-"
+"running-requests`.   You can also try to decrease `--mem-fraction-static`, "
+"which reduces the memory usage of the KV cache memory pool and helps both "
+"prefill and decoding."
+msgstr ""
+"如果你遇到内存不足 (OOM) 错误，可以降低这些参数。如果 OOM 发生在预填充期间，尝试将 `--chunked-prefill-size` 降低到"
+" `4096` 或 `2048`。如果 OOM 发生在解码期间，尝试降低 `--max-running-requests`。你也可以尝试降低 "
+"`--mem-fraction-static`，这将减少 KV 缓存内存池的内存使用量，并有助于预填充和解码。"
+
+#: ../../hyperparameter_tuning.md:34
+msgid "(Minor) Tune `--schedule-policy`"
+msgstr "（次要）调整 `--schedule-policy`"
+
+#: ../../hyperparameter_tuning.md:35
+msgid ""
+"If you have many shared prefixes, use the default `--schedule-policy lpm`. "
+"`lpm` stands for longest prefix match. When you have no shared prefixes at "
+"all or you always send the requests with the shared prefixes together, you "
+"can try `--schedule-policy fcfs`. `fcfs` stands for first come first serve."
+msgstr ""
+"如果你有很多共享前缀，请使用默认的 `--schedule-policy lpm`。`lpm` "
+"代表最长前缀匹配。当你没有任何共享前缀，或者你总是将带有共享前缀的请求一起发送时，你可以尝试使用 `--schedule-policy "
+"fcfs`。`fcfs` 代表先到先得。"

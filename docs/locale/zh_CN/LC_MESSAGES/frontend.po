@@ -1,0 +1,224 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../frontend.md:1
+msgid "Frontend: Structured Generation Language (SGLang)"
+msgstr "前端：结构化生成语言 (SGLang)"
+
+#: ../../frontend.md:2
+msgid ""
+"The frontend language can be used with local models or API models. It is an "
+"alternative to the OpenAI API. You may found it easier to use for complex "
+"prompting workflow."
+msgstr "前端语言可与本地模型或 API 模型一起使用。它是 OpenAI API 的替代方案。你可能会发现它更易于用于复杂的提示工作流程。"
+
+#: ../../frontend.md:4
+msgid "Quick Start"
+msgstr "快速入门"
+
+#: ../../frontend.md:5
+msgid ""
+"The example below shows how to use sglang to answer a mulit-turn question."
+msgstr "以下示例展示了如何使用 sglang 来回答多轮问题。"
+
+#: ../../frontend.md:7
+msgid "Using Local Models"
+msgstr "使用本地模型"
+
+#: ../../frontend.md:8
+msgid "First, launch a server with"
+msgstr "首先，使用以下命令启动服务器："
+
+#: ../../frontend.md:13
+msgid "Then, connect to the server and answer a multi-turn question."
+msgstr "然后，连接到服务器并回答多轮问题。"
+
+#: ../../frontend.md:39
+msgid "Using OpenAI Models"
+msgstr "使用 OpenAI 模型"
+
+#: ../../frontend.md:40
+msgid "Set the OpenAI API Key"
+msgstr "设置 OpenAI API 密钥"
+
+#: ../../frontend.md:45
+msgid "Then, answer a multi-turn question."
+msgstr "然后，回答多轮问题。"
+
+#: ../../frontend.md:70
+msgid "More Examples"
+msgstr "更多示例"
+
+#: ../../frontend.md:72
+msgid ""
+"Anthropic and VertexAI (Gemini) models are also supported. You can find more"
+" examples at [examples/quick_start](https://github.com/sgl-"
+"project/sglang/tree/main/examples/frontend_language/quick_start)."
+msgstr ""
+"Anthropic 和 VertexAI (Gemini) 模型也受支持。你可以在 "
+"[examples/quick_start](https://github.com/sgl-"
+"project/sglang/tree/main/examples/frontend_language/quick_start) 中找到更多示例。"
+
+#: ../../frontend.md:75
+msgid "Language Feature"
+msgstr "语言功能"
+
+#: ../../frontend.md:76
+msgid "To begin with, import sglang."
+msgstr "首先，导入 sglang。"
+
+#: ../../frontend.md:81
+msgid ""
+"`sglang` provides some simple primitives such as `gen`, `select`, `fork`, "
+"`image`. You can implement your prompt flow in a function decorated by "
+"`sgl.function`. You can then invoke the function with `run` or `run_batch`. "
+"The system will manage the state, chat template, parallelism and batching "
+"for you."
+msgstr ""
+"`sglang` 提供了一些简单的原语，例如 `gen`、`select`、`fork`、`image`。你可以在用 `sgl.function` "
+"装饰的函数中实现你的提示流程。然后，你可以使用 `run` 或 `run_batch` 调用该函数。系统将为你管理状态、聊天模板、并行性和批处理。"
+
+#: ../../frontend.md:86
+msgid ""
+"The complete code for the examples below can be found at "
+"[readme_examples.py](https://github.com/sgl-"
+"project/sglang/blob/main/examples/frontend_language/usage/readme_examples.py)"
+msgstr ""
+"以下示例的完整代码可以在 [readme_examples.py](https://github.com/sgl-"
+"project/sglang/blob/main/examples/frontend_language/usage/readme_examples.py)"
+" 中找到。"
+
+#: ../../frontend.md:88
+msgid "Control Flow"
+msgstr "控制流"
+
+#: ../../frontend.md:89
+msgid ""
+"You can use any Python code within the function body, including control "
+"flow, nested function calls, and external libraries."
+msgstr "你可以在函数体中使用任何 Python 代码，包括控制流、嵌套函数调用和外部库。"
+
+#: ../../frontend.md:103
+msgid "Parallelism"
+msgstr "并行性"
+
+#: ../../frontend.md:104
+msgid ""
+"Use `fork` to launch parallel prompts. Because `sgl.gen` is non-blocking, "
+"the for loop below issues two generation calls in parallel."
+msgstr "使用 `fork` 启动并行提示。因为 `sgl.gen` 是非阻塞的，所以下面的 for 循环并行发出两个生成调用。"
+
+#: ../../frontend.md:125
+msgid "Multi-Modality"
+msgstr "多模态"
+
+#: ../../frontend.md:126
+msgid "Use `sgl.image` to pass an image as input."
+msgstr "使用 `sgl.image` 将图像作为输入传递。"
+
+#: ../../frontend.md:135
+msgid ""
+"See also [local_example_llava_next.py](https://github.com/sgl-"
+"project/sglang/blob/main/examples/frontend_language/quick_start/local_example_llava_next.py)."
+msgstr ""
+"另请参阅 [local_example_llava_next.py](https://github.com/sgl-"
+"project/sglang/blob/main/examples/frontend_language/quick_start/local_example_llava_next.py)。"
+
+#: ../../frontend.md:137
+msgid "Constrained Decoding"
+msgstr "约束解码"
+
+#: ../../frontend.md:138
+msgid ""
+"Use `regex` to specify a regular expression as a decoding constraint. This "
+"is only supported for local models."
+msgstr "使用 `regex` 指定正则表达式作为解码约束。这仅适用于本地模型。"
+
+#: ../../frontend.md:152
+msgid "JSON Decoding"
+msgstr "JSON 解码"
+
+#: ../../frontend.md:153
+msgid "Use `regex` to specify a JSON schema with a regular expression."
+msgstr "使用 `regex` 指定带有正则表达式的 JSON 模式。"
+
+#: ../../frontend.md:179
+msgid ""
+"See also [json_decode.py](https://github.com/sgl-"
+"project/sglang/blob/main/examples/frontend_language/usage/json_decode.py) "
+"for an additional example of specifying formats with Pydantic models."
+msgstr ""
+"请参阅 [json_decode.py](https://github.com/sgl-"
+"project/sglang/blob/main/examples/frontend_language/usage/json_decode.py) "
+"以获取使用 Pydantic 模型指定格式的另一个示例。"
+
+#: ../../frontend.md:181
+msgid "Batching"
+msgstr "批处理"
+
+#: ../../frontend.md:182
+msgid "Use `run_batch` to run a batch of requests with continuous batching."
+msgstr "使用 `run_batch` 以连续批处理方式运行一批请求。"
+
+#: ../../frontend.md:200
+msgid "Streaming"
+msgstr "流式传输"
+
+#: ../../frontend.md:201
+msgid "Add `stream=True` to enable streaming."
+msgstr "添加 `stream=True` 以启用流式传输。"
+
+#: ../../frontend.md:219
+msgid "Roles"
+msgstr "角色"
+
+#: ../../frontend.md:221
+msgid ""
+"Use `sgl.system`， `sgl.user` and `sgl.assistant` to set roles when using "
+"Chat models. You can also define more complex role prompts using begin and "
+"end tokens."
+msgstr ""
+"使用 `sgl.system`、`sgl.user` 和 `sgl.assistant` "
+"在使用聊天模型时设置角色。你也可以使用开始和结束标记定义更复杂的角色提示。"
+
+#: ../../frontend.md:237
+msgid "Tips and Implementation Details"
+msgstr "提示和实现细节"
+
+#: ../../frontend.md:238
+msgid ""
+"The `choices` argument in `sgl.gen` is implemented by computing the [token-"
+"length normalized log probabilities](https://blog.eleuther.ai/multiple-"
+"choice-normalization/) of all choices and selecting the one with the highest"
+" probability."
+msgstr ""
+"`sgl.gen` 中的 `choices` 参数通过计算所有选项的 "
+"[令牌长度归一化对数概率](https://blog.eleuther.ai/multiple-choice-normalization/) "
+"并选择概率最高的选项来实现。"
+
+#: ../../frontend.md:239
+msgid ""
+"The `regex` argument in `sgl.gen` is implemented through autoregressive "
+"decoding with logit bias masking, according to the constraints set by the "
+"regex. It is compatible with `temperature=0` and `temperature != 0`."
+msgstr ""
+"`sgl.gen` 中的 `regex` 参数通过根据正则表达式设置的约束，使用带有 logits 偏差掩码的自回归解码来实现。它与 "
+"`temperature=0` 和 `temperature != 0` 兼容。"

@@ -1,0 +1,46 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023-2024, SGLang
+# This file is distributed under the same license as the SGLang package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2024.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: SGLang 0.3.1.post3\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-25 22:11+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: Babel 2.16.0\n"
+
+#: ../../release_process.md:1
+msgid "PyPI Package Release Process"
+msgstr "PyPI 包发布流程"
+
+#: ../../release_process.md:3
+msgid "Update the version in code"
+msgstr "更新代码中的版本号"
+
+#: ../../release_process.md:4
+msgid ""
+"Update the package version in `python/pyproject.toml` and "
+"`python/sglang/__init__.py`."
+msgstr "更新 `python/pyproject.toml` 和 `python/sglang/__init__.py` 中的包版本号。"
+
+#: ../../release_process.md:6
+msgid "Upload the PyPI package"
+msgstr "上传 PyPI 包"
+
+#: ../../release_process.md:17
+msgid "Make a release in GitHub"
+msgstr "在 GitHub 上发布"
+
+#: ../../release_process.md:18
+msgid "Make a new release https://github.com/sgl-project/sglang/releases/new."
+msgstr "创建一个新的发布版本 https://github.com/sgl-project/sglang/releases/new。"
