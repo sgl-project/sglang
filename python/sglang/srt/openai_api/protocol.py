@@ -174,7 +174,7 @@ class CompletionRequest(BaseModel):
     min_tokens: int = 0
     repetition_penalty: Optional[float] = 1.0
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
-    no_eos_trim: Union[bool, List[bool]] = False
+    no_stop_trim: Union[bool, List[bool]] = False
 
 
 class CompletionResponseChoice(BaseModel):

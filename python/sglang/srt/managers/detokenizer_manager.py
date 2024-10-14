@@ -75,8 +75,8 @@ class DetokenizerManager:
 
         self.decode_status = LimitedCapacityDict()
 
-    def trim_eos(self, output: Union[str, List[int]], finished_reason, no_eos_trim):
-        if no_eos_trim:
+    def trim_eos(self, output: Union[str, List[int]], finished_reason, no_stop_trim):
+        if no_stop_trim:
             return output
 
         # Trim stop str. TODO(lmzheng): handle the case where multiple stop strs are hit
@@ -141,7 +141,7 @@ class DetokenizerManager:
                     self.trim_eos(
                         s.decode_ids[s.surr_offset :],
                         recv_obj.finished_reason[i],
-                        recv_obj.no_eos_trim[i],
+                        recv_obj.no_stop_trim[i],
                     )
                 )
                 surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
@@ -177,7 +177,7 @@ class DetokenizerManager:
                     self.trim_eos(
                         s.decoded_text + new_text,
                         recv_obj.finished_reason[i],
-                        recv_obj.no_eos_trim[i],
+                        recv_obj.no_stop_trim[i],
                     )
                 )
 
