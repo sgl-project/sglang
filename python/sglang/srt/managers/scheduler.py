@@ -195,7 +195,6 @@ class Scheduler:
         # Init running status
         self.waiting_queue: List[Req] = []
         self.running_batch: Optional[ScheduleBatch] = None
-        self.cur_batch: Optional[ScheduleBatch] = None
         self.decode_forward_ct = 0
         self.stream_interval = server_args.stream_interval
         self.num_generated_tokens = 0
