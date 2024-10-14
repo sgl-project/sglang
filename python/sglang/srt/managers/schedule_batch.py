@@ -779,7 +779,7 @@ class ScheduleBatch:
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
-        if self.output_ids:
+        if self.output_ids is not None:
             self.output_ids = torch.concat([self.output_ids, other.output_ids])
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
@@ -837,6 +837,7 @@ class ScheduleBatch:
             tree_cache=self.tree_cache,
             forward_mode=self.forward_mode,
             output_ids=self.output_ids,
+            sampling_info=self.sampling_info,
         )
 
     def __str__(self):

@@ -754,7 +754,7 @@ class Scheduler:
                     # Inflight request would get a new req idx
                     self.req_to_token_pool.free(req.req_pool_idx)
 
-        self.handle_finished_requests(batch)
+        self.stream_output(batch)
 
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
         logits_output, next_token_ids = result
@@ -794,7 +794,7 @@ class Scheduler:
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
 
-        self.handle_finished_requests(batch)
+        self.stream_output(batch)
 
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
@@ -873,7 +873,7 @@ class Scheduler:
 
         return num_input_logprobs
 
-    def handle_finished_requests(self, batch: ScheduleBatch):
+    def stream_output(self, batch: ScheduleBatch):
         output_rids = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
@@ -950,6 +950,9 @@ class Scheduler:
                     }
                     output_meta_info.append(meta_info)
 
+        # Remove finished reqs: update batch tensors
+        batch.filter_batch(unfinished_indices)
+
         # Send to detokenizer
         if output_rids:
             if self.is_generation:
@@ -976,9 +979,6 @@ class Scheduler:
                         output_finished_reason,
                     )
                 )
-
-        # Remove finished reqs: update batch tensors
-        batch.filter_batch(unfinished_indices)
 
     def flush_cache(self):
         if len(self.waiting_queue) == 0 and (
