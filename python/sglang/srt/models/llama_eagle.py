@@ -326,6 +326,7 @@ class LlamaForCausalLMEagle(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> LogitsProcessorOutput:
+        print(forward_batch.out_cache_loc)
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, forward_batch

@@ -222,10 +222,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer.layer_id, forward_batch.out_cache_loc, k, v
                 )
+            causal = True
+            if (
+                forward_batch.spec_algorithm == "EAGLE"
+                and forward_batch.forward_mode == ForwardMode.SPECVERIFY
+            ):
+                causal = False
             o = prefill_wrapper_paged.forward(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=True,
+                causal=causal,
                 sm_scale=layer.scaling,
                 window_left=layer.sliding_window_size,
                 logits_soft_cap=layer.logit_cap,

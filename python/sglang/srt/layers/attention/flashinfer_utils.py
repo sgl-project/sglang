@@ -91,6 +91,8 @@ class FlashinferUpdater:
 
     def _update_decode_indices(self, decode_wrapper):
         assert not isinstance(decode_wrapper, list)
+        print('decode update')
+        print(self.kv_indices)
         decode_wrapper.end_forward()
         decode_wrapper.begin_forward(
             self.kv_indptr,
@@ -114,6 +116,9 @@ class FlashinferUpdater:
         )
         qo_indptr[1:] = torch.cumsum(self.seq_lens - self.prefix_lens, dim=0)
 
+        print('extend update')
+        print(self.kv_indices)
+
         if self.use_ragged:
             ragged_wrapper.end_forward()
             ragged_wrapper.begin_forward(
@@ -135,6 +140,23 @@ class FlashinferUpdater:
             self.num_kv_heads,
             self.head_dim,
             1,
+        )
+        
+    def _update_verify_indices(self, paged_wrapper):
+        custom_mask = getattr(self.spec_info, "custom_mask", None)
+        paged_wrapper.end_forward()
+        print('verify update')
+        print(self.kv_indices)
+        paged_wrapper.begin_forward(
+            self.qo_indptr,
+            self.kv_indptr,
+            self.kv_indices,
+            self.kv_last_page_len,
+            self.num_qo_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            1,
+            custom_mask=custom_mask,
         )
 
     def _get_indices(self, dispatch_reason: WrapperDispatch = None, wrapper_id=0):
@@ -193,8 +215,9 @@ class FlashinferUpdater:
 
     def _update_indicess_single_wrapper(self):
         self._get_indices()
-
-        if self.forward_mode.is_decode():
+        if self.forward_mode.is_verify():
+            self._update_verify_indices(self.prefill_wrappers_paged[0])
+        elif self.forward_mode.is_decode():
             self._update_decode_indices(self.decode_wrappers[0])
         else:
             self._update_extend_indices(

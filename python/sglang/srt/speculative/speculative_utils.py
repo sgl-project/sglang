@@ -170,16 +170,36 @@ class EAGLEDraftInput(SpecDraftInput):
         self.root_token: int = None
         assert self.topk <= 10, "topk should <= 10"
 
-    def prepare_for_extend(self, forward_batch: ForwardBatch):
-        seq_lens = [0] + forward_batch.extend_seq_lens_cpu
-        input_ids = forward_batch.input_ids.tolist()
-        verified_id = forward_batch.spec_info.verified_id.tolist()
+    def prepare_for_extend(self, batch: ForwardBatch):
+        req_pool_indices = batch.alloc_req_slots(len(batch.reqs))
+        out_cache_loc = batch.alloc_token_slots(batch.input_ids.numel())
+        
+        pt=0
+        for i, req in enumerate(batch.reqs):
+            req.req_pool_idx = req_pool_indices[i]
+            pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
+            assert seq_len - pre_len == req.extend_input_len
+
+            if pre_len > 0:
+                batch.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    :pre_len
+                ] = req.prefix_indices
+
+            batch.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
+                out_cache_loc[pt : pt + req.extend_input_len]
+            )
+
+            pt += req.extend_input_len
+        
+        seq_lens = [0] + batch.extend_lens
+        input_ids = batch.input_ids.tolist()
+        verified_id = batch.spec_info.verified_id.tolist()
         model_input_ids = []
         for i in range(len(seq_lens) - 1):
             model_input_ids.extend(
                 input_ids[seq_lens[i] + 1 : seq_lens[i + 1]] + [verified_id[i]]
             )
-        forward_batch.input_ids = torch.tensor(
+        batch.input_ids = torch.tensor(
             model_input_ids, dtype=torch.int32, device="cuda"
         )
 
@@ -231,7 +251,7 @@ class EAGLEDraftInput(SpecDraftInput):
         self.cache_list.append(batch.out_cache_loc)
         self.positions = (
             batch.seq_lens[:, None]
-            + torch.ones([1, self.topk], device="cuda") * self.iter
+            + torch.ones([1, self.topk], device="cuda", dtype=torch.long) * self.iter - 1
         ).flatten()
 
         batch.req_to_token_pool.req_to_token[
@@ -265,14 +285,14 @@ class EAGLEDraftInput(SpecDraftInput):
             self.num_verify_token,
         )
 
-        out_cache = torch.cat(self.cache_list, dim=0)
-        mem_need_free_idx = out_cache[top_scores_index]
-
-        batch.token_to_kv_pool.free(mem_need_free_idx)
+        # out_cache = torch.cat(self.cache_list, dim=0)
+        # mem_need_free_idx = out_cache[top_scores_index]
+        # batch.token_to_kv_pool.free(mem_need_free_idx)
+        
         return EagleVerifyInput(
             draft_tokens,
             tree_mask,
-            position,
+            position-1,
             retrive_index,
             retrive_cum_len,
             self.num_verify_token,
@@ -336,8 +356,6 @@ class EagleVerifyInput(SpecVerifyInput):
         self.draft_token_num = draft_token_num
 
     def prepare_for_verify(self, batch: ScheduleBatch):
-        batch_size = self.retrive_cum_len.numel()
-
         batch.input_ids = self.draft_token
         batch.out_cache_loc = batch.alloc_token_slots(batch.input_ids.numel())
         batch.req_to_token_pool.req_to_token[
@@ -363,12 +381,14 @@ class EagleVerifyInput(SpecVerifyInput):
         cum_kv_seq_len = torch.zeros(
             (batch_size + 1,), dtype=torch.int32, device="cuda"
         )
+        
         paged_kernel_lens = paged_kernel_lens.add_(self.draft_token_num)
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
 
         kv_indices = torch.empty(cum_kv_seq_len[-1], dtype=torch.int32, device="cuda")
+        
         create_flashinfer_kv_indices_triton[(batch_size,)](
             req_to_token_pool.req_to_token,
             req_pool_indices,
@@ -419,13 +439,13 @@ class EagleVerifyInput(SpecVerifyInput):
 
         accept_length_cpu = accept_length.tolist()
         verified_id_cpu = predict[accept_index].tolist()
+        print(verified_id_cpu)
 
         low = 0
         for req, verified_len in zip(batch.reqs, accept_length_cpu):
             req.output_ids.extend(verified_id_cpu[low : low + verified_len + 1])
             low += verified_len
 
-        # TODO: have memory leak, fix it @kavioyu
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
         mem_need_free_idx = batch.out_cache_loc[evict_mask]

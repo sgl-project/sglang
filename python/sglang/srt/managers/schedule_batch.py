@@ -730,6 +730,8 @@ class ScheduleBatch:
 
     def prepare_for_decode(self, input_ids=None):
         self.forward_mode = ForwardMode.DECODE
+        if self.spec_algorithm == 'EAGLE':
+            return
 
         if input_ids is None:
             input_ids = [
