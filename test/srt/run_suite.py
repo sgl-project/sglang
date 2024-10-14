@@ -17,6 +17,7 @@ suites = {
         "test_large_max_new_tokens.py",
         "test_openai_server.py",
         "test_pytorch_sampling_backend.py",
+        "test_retract_decode.py",
         "test_server_args.py",
         "test_skip_tokenizer_init.py",
         "test_srt_engine.py",
