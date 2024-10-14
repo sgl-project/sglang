@@ -3,7 +3,7 @@
 """PyTorch Mllama model."""
 import math
 from array import array
-from typing import Iterable, List, Literal, Mapping, Optional, Tuple, TypedDict, Union
+from typing import Iterable, List, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -43,20 +43,6 @@ from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
 logger = init_logger(__name__)
 MLLAMA_IMAGE_TOKEN_ID = 128256
 MLLAMA_IMAGE_TOKEN = "<|image|>"
-
-
-class MllamaImagePixelInputs(TypedDict):
-    type: Literal["pixel_values"]
-    data: torch.Tensor
-    """Shape: """
-    """(batch_size, max_num_image, max_num_chunk, num_channel, height, width)"""
-    aspect_ratio_ids: torch.Tensor
-    """Shape: `(batch_size, max_num_image)`"""
-    aspect_ratio_mask: torch.Tensor
-    """Shape: `(batch_size, max_num_image, max_num_tiles)`"""
-
-
-# TODO: support LlamaImageEmbeddingInputs
 
 
 def input_processor_for_mllama(ctx: InputContext, llm_inputs: LLMInputs):
@@ -296,7 +282,6 @@ class MllamaPrecomputedPositionEmbedding(nn.Module):
         return hidden_state
 
 
-# TODO: support other attention backends for attention in vision model
 class MllamaVisionSdpaAttention(nn.Module):
 
     def __init__(self, config: config_mllama.MllamaVisionConfig):
@@ -710,13 +695,13 @@ class MllamaTextCrossAttention(nn.Module):
         self.k_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.scaling = self.head_dim**-0.5
 
-        # TODO: impl cross attention
         self.attn = RadixAttention(
             self.num_local_heads,
             self.head_dim,
             self.scaling,
             self.num_local_key_value_heads,
             layer_id=layer_id,
+            is_cross_attention=True,
         )
 
     def forward(
@@ -946,6 +931,7 @@ class MllamaForConditionalGeneration(nn.Module):
             config.pad_token_id if config.pad_token_id is not None else -1
         )
         self.image_size = config.vision_config.image_size
+        self.has_cross_attention = True
 
         self.vision_model = MllamaVisionModel(config.vision_config)
         self.language_model = MllamaForCausalLM(
@@ -967,6 +953,7 @@ class MllamaForConditionalGeneration(nn.Module):
         num_concurrent_media, num_tiles = pixel_values.shape[1:3]
         num_patches = self.vision_model.num_patches
         image_len = num_concurrent_media * num_tiles * num_patches
+        image_inputs.num_image_tokens = image_len
 
         pad_ids = pad_values * ((image_len + len(pad_values)) // len(pad_values))
 
