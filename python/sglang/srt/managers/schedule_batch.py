@@ -421,6 +421,7 @@ class ScheduleBatch:
     extend_lens: List[int] = None
     extend_num_tokens: int = None
     running_bs: int = None
+    decoding_reqs: List[Req] = None
 
     # Stream
     has_stream: bool = False
