@@ -20,12 +20,13 @@ from typing import List, Tuple, Union
 
 import numpy as np
 import torch
+
 from sglang.srt.layers.attention.triton_ops.decode_attention_int4kv import (
-                    destindex_copy_quantize_int4kv,
-                )
+    destindex_copy_quantize_int4kv,
+)
 from sglang.srt.layers.attention.triton_ops.decode_attention_int8kv import (
-                    destindex_copy_quantize_kv,
-                )
+    destindex_copy_quantize_kv,
+)
 
 logger = logging.getLogger(__name__)
 
