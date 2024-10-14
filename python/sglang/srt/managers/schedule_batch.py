@@ -838,6 +838,7 @@ class ScheduleBatch:
             forward_mode=self.forward_mode,
             output_ids=self.output_ids,
             sampling_info=self.sampling_info,
+            decoding_reqs=self.decoding_reqs,
         )
 
     def __str__(self):

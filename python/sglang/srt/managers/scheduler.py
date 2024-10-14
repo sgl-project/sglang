@@ -411,9 +411,10 @@ class Scheduler:
         throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
+        num_running_reqs = len(self.running_batch.reqs) if self.running_batch else 0
         logger.info(
             f"Decode batch. "
-            f"#running-req: {len(self.running_batch.reqs)}, "
+            f"#running-req: {num_running_reqs}, "
             f"#token: {num_used}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             f"gen throughput (token/s): {throughput:.2f}, "
