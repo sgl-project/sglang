@@ -452,10 +452,18 @@ class Scheduler:
             and not self.last_batch.forward_mode.is_decode()
             and not self.last_batch.is_empty()
         ):
-            if self.running_batch is None:
-                self.running_batch = self.last_batch
-            else:
-                self.running_batch.merge_batch(self.last_batch)
+            reqs = self.last_batch.reqs
+            unfinished_indices = [
+                i
+                for i in range(len(reqs))
+                if not reqs[i].finished() and reqs[i] is not self.current_inflight_req
+            ]
+            self.last_batch.filter_batch(unfinished_indices)
+            if not self.last_batch.is_empty():
+                if self.running_batch is None:
+                    self.running_batch = self.last_batch
+                else:
+                    self.running_batch.merge_batch(self.last_batch)
 
         # Prefill first
         new_batch = self.get_new_batch_prefill()
