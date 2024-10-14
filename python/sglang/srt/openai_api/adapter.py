@@ -494,7 +494,7 @@ def v1_generate_request(
             request.logprobs if request.logprobs is not None else 0
         )
         sampling_params = []
-        if isinstance(request.no_eos_trim, list):
+        if isinstance(request.no_stop_trim, list):
             num_reqs = len(request.prompt)
         else:
             num_reqs = 1
@@ -514,10 +514,10 @@ def v1_generate_request(
                     "json_schema": request.json_schema,
                     "n": request.n,
                     "ignore_eos": request.ignore_eos,
-                    "no_eos_trim": (
-                        request.no_eos_trim
-                        if not isinstance(request.no_eos_trim, list)
-                        else request.no_eos_trim[i]
+                    "no_stop_trim": (
+                        request.no_stop_trim
+                        if not isinstance(request.no_stop_trim, list)
+                        else request.no_stop_trim[i]
                     ),
                 }
             )
