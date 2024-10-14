@@ -738,7 +738,7 @@ class Scheduler:
 
                 if req.finished():
                     self.tree_cache.cache_finished_req(req)
-                elif req not in batch.decoding_reqs:
+                elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                     # To reduce overhead, only cache prefill reqs
                     self.tree_cache.cache_unfinished_req(req)
 
