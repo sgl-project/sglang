@@ -77,6 +77,9 @@ logger = logging.getLogger(__name__)
 # Crash on warning if we are running CI tests
 crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
 
+# Test retract decode
+test_retract = os.getenv("SGLANG_TEST_RETRACT", "false") == "true"
+
 
 class Scheduler:
     """A scheduler that manages a tensor parallel GPU worker."""
@@ -611,10 +614,11 @@ class Scheduler:
         return new_batch
 
     def update_running_batch(self):
+        global test_retract
         batch = self.running_batch
 
         # Check if decode out of memory
-        if not batch.check_decode_mem():
+        if not batch.check_decode_mem() or (test_retract and batch.batch_size() > 10):
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio = batch.retract_decode()
