@@ -273,7 +273,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 
 ### Engine Without HTTP Server
 
-SGLang Engine is an inference engine **without an HTTP server**. For example,
+SGLang Engine is an inference engine **without a HTTP server**. For example,
 
 ```python
 import sglang as sgl
