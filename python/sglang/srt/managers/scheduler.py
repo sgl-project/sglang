@@ -883,7 +883,7 @@ class Scheduler:
             output_read_offsets = []
             output_skip_special_tokens = []
             output_spaces_between_special_tokens = []
-            output_no_eos_trim = []
+            output_no_stop_trim = []
         else:  # embedding or reward model
             output_embeddings = []
         unfinished_indices = []
@@ -915,7 +915,7 @@ class Scheduler:
                     output_spaces_between_special_tokens.append(
                         req.sampling_params.spaces_between_special_tokens
                     )
-                    output_no_eos_trim.append(req.sampling_params.no_eos_trim)
+                    output_no_stop_trim.append(req.sampling_params.no_stop_trim)
 
                     meta_info = {
                         "prompt_tokens": len(req.origin_input_ids),
@@ -963,7 +963,7 @@ class Scheduler:
                         output_spaces_between_special_tokens,
                         output_meta_info,
                         output_finished_reason,
-                        output_no_eos_trim,
+                        output_no_stop_trim,
                     )
                 )
             else:  # embedding or reward model
