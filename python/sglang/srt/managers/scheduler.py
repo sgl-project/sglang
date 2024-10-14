@@ -986,7 +986,8 @@ class Scheduler:
         ):
             self.tree_cache.reset()
             self.tree_cache_metrics = {"total": 0, "hit": 0}
-            self.regex_bnf_cache.reset()
+            # TODO(dark): How to reset bnf cache?
+            # self.regex_bnf_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()
