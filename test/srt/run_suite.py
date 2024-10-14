@@ -11,6 +11,7 @@ suites = {
         "models/test_reward_models.py",
         "sampling/penaltylib",
         "test_chunked_prefill.py",
+        "test_double_sparsity.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",
         "test_json_constrained.py",
@@ -26,7 +27,6 @@ suites = {
         "test_triton_attn_backend.py",
         "test_update_weights.py",
         "test_vision_openai_server.py",
-        "test_double_sparsity.py",
     ],
     "sampling/penaltylib": glob.glob(
         "sampling/penaltylib/**/test_*.py", recursive=True

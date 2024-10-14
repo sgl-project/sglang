@@ -104,9 +104,10 @@ class ModelRunner:
 
         if self.server_args.enable_double_sparsity:
             logger.info(
-                "Double sparsity optimization is turned on. Use triton backend."
+                "Double sparsity optimization is turned on. Use triton backend without CUDA graph."
             )
             self.server_args.attention_backend = "triton"
+            self.server_args.disable_cuda_graph = True
             if self.server_args.ds_heavy_channel_type is None:
                 raise ValueError(
                     "Please specify the heavy channel type for double sparsity optimization."

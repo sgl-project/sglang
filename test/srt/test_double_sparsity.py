@@ -26,7 +26,6 @@ class TestDoubleSparsity(unittest.TestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--enable-double-sparsity",
-                "--disable-cuda-graph",
                 "--ds-channel-config-path",
                 config_file,
                 "--ds-heavy-channel-num",
