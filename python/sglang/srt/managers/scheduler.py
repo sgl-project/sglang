@@ -446,7 +446,7 @@ class Scheduler:
             exit(1) if crash_on_warning else None
 
     def get_next_batch_to_run(self):
-        # Merge prefill to the running batch
+        # Merge the prefill batch into the running batch
         if (
             self.last_batch
             and not self.last_batch.forward_mode.is_decode()
@@ -462,15 +462,29 @@ class Scheduler:
         if new_batch is not None:
             return new_batch
 
-        # Run decode
-        if self.running_batch is not None:
-            self.update_running_batch()
-            if not self.running_batch:
-                return None
-            return self.running_batch
-        else:
+        # Check memory
+        if self.running_batch is None:
             self.check_memory()
             self.new_token_ratio = global_config.init_new_token_ratio
+            return
+
+        # Filter finished requests
+        reqs = self.running_batch.reqs
+        unfinished_indices = [
+            i
+            for i in range(len(reqs))
+            if not reqs[i].finished() and reqs[i] is not self.current_inflight_req
+        ]
+        self.running_batch.filter_batch(unfinished_indices)
+        if self.running_batch.is_empty():
+            self.running_batch = None
+            return None
+
+        # Run decode
+        self.update_running_batch()
+        if not self.running_batch:
+            return None
+        return self.running_batch
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Handle the cases where prefill is not allowed
@@ -954,9 +968,6 @@ class Scheduler:
                         "prompt_tokens": len(req.origin_input_ids),
                     }
                     output_meta_info.append(meta_info)
-
-        # Remove finished reqs: update batch tensors
-        batch.filter_batch(unfinished_indices)
 
         # Send to detokenizer
         if output_rids:
