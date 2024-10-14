@@ -772,6 +772,8 @@ class Scheduler:
 
                 if req.finished():
                     self.tree_cache.cache_finished_req(req)
+                else:
+                    self.tree_cache.cache_unfinished_req(req)
 
         self.stream_output(batch)
 
