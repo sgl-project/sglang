@@ -590,9 +590,11 @@ class ScheduleBatch:
 
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
+        first_iter = True
         while (
             self.token_to_kv_pool.available_size()
             < len(sorted_indices) * global_config.retract_decode_steps
+            or first_iter
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
@@ -601,6 +603,7 @@ class ScheduleBatch:
                 ), "No space left for only one request"
                 break
 
+            first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
