@@ -126,6 +126,11 @@ class ModelRunner:
             }
         )
 
+        if self.server_args.enable_double_sparsity:
+            self.init_double_sparsity_channel_config(
+                self.server_args.ds_heavy_channel_type
+            )
+
         # Init componnets
         min_per_gpu_memory = self.init_torch_distributed()
         self.sampler = Sampler()
@@ -144,11 +149,6 @@ class ModelRunner:
         else:
             self.cuda_graph_runner = None
             self.init_attention_backend()
-
-        if self.server_args.enable_double_sparsity:
-            self.init_double_sparsity_channel_config(
-                self.server_args.ds_heavy_channel_type
-            )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")

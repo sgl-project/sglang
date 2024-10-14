@@ -32,6 +32,15 @@ class DoubleSparseAttnBackend(AttentionBackend):
         self.num_head = model_runner.model_config.num_attention_heads
         self.head_dim = model_runner.model_config.hidden_size // self.num_head
         self.heavy_token_num = model_runner.server_args.ds_heavy_token_num
+
+        self.sorted_channels = model_runner.sorted_channels
+        self.sparse_decode_thresold = (
+            model_runner.server_args.ds_sparse_decode_threshold
+        )
+        self.att_out_approx: torch.Tensor = None
+        self.mid_out: torch.Tensor = None
+        self.mid_o_logexpsum: torch.Tensor = None
+
         # TODO: Change the hard-coded block_seq_num
         self.BLOCK_SEQ = 128
 
@@ -86,9 +95,9 @@ class DoubleSparseAttnBackend(AttentionBackend):
             mid_o_logexpsum = torch.empty(
                 [bsz, self.num_head, block_seq_num], dtype=torch.float32, device="cuda"
             )
-            forward_batch.att_out_approx = att_out_approx
-            forward_batch.mid_out = mid_out
-            forward_batch.mid_o_logexpsum = mid_o_logexpsum
+            self.att_out_approx = att_out_approx
+            self.mid_out = mid_out
+            self.mid_o_logexpsum = mid_o_logexpsum
 
         else:
             start_loc = attn_logits = max_seq_len = min_seq_len = None
@@ -153,7 +162,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
         k_label = torch.gather(
             k,
             2,
-            forward_batch.sorted_channels[layer.layer_id]
+            self.sorted_channels[layer.layer_id]
             .unsqueeze(0)
             .expand(k.shape[0], -1, -1),
         )
@@ -212,7 +221,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
         k_label = torch.gather(
             k,
             2,
-            forward_batch.sorted_channels[layer.layer_id]
+            self.sorted_channels[layer.layer_id]
             .unsqueeze(0)
             .expand(k.shape[0], -1, -1),
         )
@@ -224,8 +233,8 @@ class DoubleSparseAttnBackend(AttentionBackend):
         # NOTE(Andy) shouldn't be used when max_len_in_batch < heavy_token_num
         #            and set a minimum value for sparse_decode
         if (
-            min_seq_len < forward_batch.heavy_token_num
-            or max_seq_len < forward_batch.sparse_decode_thresold
+            min_seq_len < self.heavy_token_num
+            or max_seq_len < self.sparse_decode_thresold
         ):
             self.decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -246,7 +255,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
             q_label = torch.gather(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 2,
-                forward_batch.sorted_channels[layer.layer_id]
+                self.sorted_channels[layer.layer_id]
                 .unsqueeze(0)
                 .expand(q.shape[0], -1, -1),
             )
@@ -262,10 +271,10 @@ class DoubleSparseAttnBackend(AttentionBackend):
                 max_seq_len,
                 layer.scaling,
                 layer.logit_cap,
-                forward_batch.heavy_token_num,
-                forward_batch.att_out_approx,
-                forward_batch.mid_out,
-                forward_batch.mid_o_logexpsum,
+                self.heavy_token_num,
+                self.att_out_approx,
+                self.mid_out,
+                self.mid_o_logexpsum,
                 self.BLOCK_SEQ,
             )
 
