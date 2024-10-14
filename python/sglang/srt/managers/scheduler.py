@@ -519,7 +519,7 @@ class Scheduler:
                 self.current_inflight_req
             )
 
-        if self.lora_paths is not None:
+        if self.lora_paths:
             lora_set = (
                 set([req.lora_path for req in self.running_batch.reqs])
                 if self.running_batch is not None
@@ -528,7 +528,7 @@ class Scheduler:
 
         for req in self.waiting_queue:
             if (
-                self.lora_paths is not None
+                self.lora_paths
                 and len(
                     lora_set
                     | set([req.lora_path for req in adder.can_run_list])
@@ -550,16 +550,20 @@ class Scheduler:
                     self.batch_is_full = True
                 break
 
+        # Update waiting queue
         can_run_list = adder.can_run_list
+        if len(can_run_list) == 0:
+            return None
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
 
         if adder.new_inflight_req is not None:
             assert self.current_inflight_req is None
             self.current_inflight_req = adder.new_inflight_req
 
-        if len(can_run_list) == 0:
-            return None
-
-        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
+        if self.current_inflight_req:
+            self.current_inflight_req.is_inflight_req += 1
 
         # Print stats
         if self.tp_rank == 0:
@@ -738,11 +742,11 @@ class Scheduler:
                 if req.finished():
                     self.tree_cache.cache_finished_req(req)
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                    # To reduce overhead, only cache prefill reqs
                     self.tree_cache.cache_unfinished_req(req)
 
-                if req is self.current_inflight_req:
+                if req.is_inflight_req > 0:
                     # Inflight request would get a new req idx
+                    req.is_inflight_req -= 1
                     self.req_to_token_pool.free(req.req_pool_idx)
 
                 if req.return_logprob:
@@ -767,8 +771,9 @@ class Scheduler:
                 else:
                     self.tree_cache.cache_unfinished_req(req)
 
-                if req is self.current_inflight_req:
+                if req.is_inflight_req > 0:
                     # Inflight request would get a new req idx
+                    req.is_inflight_req -= 1
                     self.req_to_token_pool.free(req.req_pool_idx)
 
         self.stream_output(batch)

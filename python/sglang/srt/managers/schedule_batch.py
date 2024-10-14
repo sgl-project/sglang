@@ -203,6 +203,7 @@ class Req:
         self.prefix_indices = []
         self.extend_input_len = 0
         self.last_node = None
+        self.is_inflight_req = 0
 
         # Logprobs (arguments)
         self.return_logprob = False
