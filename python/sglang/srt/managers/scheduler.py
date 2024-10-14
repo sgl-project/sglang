@@ -247,7 +247,7 @@ class Scheduler:
             )
 
     @torch.inference_mode()
-    def event_loop(self):
+    def event_loop_normal(self):
         self.last_batch = None
 
         while True:
@@ -1061,7 +1061,7 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank)
         pipe_writer.send("ready")
-        scheduler.event_loop()
+        scheduler.event_loop_normal()
     except Exception:
         msg = get_exception_traceback()
         logger.error(msg)
