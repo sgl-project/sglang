@@ -659,7 +659,7 @@ class ScheduleBatch:
 
     def check_for_jump_forward(self, pad_input_ids_func):
         jump_forward_reqs = []
-        filter_indices = [i for i in range(len(self.reqs))]
+        keep_indices = set(i for i in range(len(self.reqs)))
 
         for i, req in enumerate(self.reqs):
             if req.jump_forward_map is not None:
@@ -719,9 +719,9 @@ class ScheduleBatch:
                         )
 
                     jump_forward_reqs.append(req)
-                    filter_indices.remove(i)
+                    keep_indices.remove(i)
 
-        self.filter_batch(filter_indices)
+        self.filter_batch(keep_indices=list(keep_indices))
 
         return jump_forward_reqs
 
@@ -740,19 +740,31 @@ class ScheduleBatch:
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
 
-    def filter_batch(self, unfinished_indices: List[int]):
-        if unfinished_indices is None or len(unfinished_indices) == 0:
+    def filter_batch(
+        self,
+        current_inflight_req: Optional[Req] = None,
+        keep_indices: Optional[List[int]] = None,
+    ):
+        if keep_indices is None:
+            keep_indices = [
+                i
+                for i in range(len(self.reqs))
+                if not self.reqs[i].finished()
+                and self.reqs[i] is not current_inflight_req
+            ]
+
+        if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
             return
 
-        if len(unfinished_indices) == len(self.reqs):
+        if len(keep_indices) == len(self.reqs):
             # No need to filter
             return
 
-        self.reqs = [self.reqs[i] for i in unfinished_indices]
+        self.reqs = [self.reqs[i] for i in keep_indices]
         new_indices = torch.tensor(
-            unfinished_indices, dtype=torch.int32, device=self.seq_lens.device
+            keep_indices, dtype=torch.int32, device=self.seq_lens.device
         )
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
@@ -760,16 +772,14 @@ class ScheduleBatch:
         self.output_ids = self.output_ids[new_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
-            self.top_logprobs_nums = [
-                self.top_logprobs_nums[i] for i in unfinished_indices
-            ]
+            self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
         else:
             self.top_logprobs_nums = None
 
         self.has_stream = any(req.stream for req in self.reqs)
         self.has_regex = any(req.regex_fsm for req in self.reqs)
 
-        self.sampling_info.filter_batch(unfinished_indices, new_indices)
+        self.sampling_info.filter_batch(keep_indices, new_indices)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
