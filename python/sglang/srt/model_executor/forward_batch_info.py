@@ -181,10 +181,11 @@ class ForwardBatch:
         ret.req_to_token_pool = model_runner.req_to_token_pool
         ret.token_to_kv_pool = model_runner.token_to_kv_pool
         ret.attn_backend = model_runner.attn_backend
-        model_runner.attn_backend.init_forward_metadata(ret)
 
         # Init batched multimodal params
         ret.init_batched_multimodal_params(model_runner)
+
+        model_runner.attn_backend.init_forward_metadata(ret)
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
