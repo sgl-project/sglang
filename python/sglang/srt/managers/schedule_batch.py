@@ -747,14 +747,16 @@ class ScheduleBatch:
             if not self.reqs[i].finished() and self.reqs[i] is not current_inflight_req
         ]
 
+        has_filtered = len(unfinished_indices) == len(self.reqs)
+
         if unfinished_indices is None or len(unfinished_indices) == 0:
             # Filter out all requests
             self.reqs = []
-            return
+            return has_filtered
 
         if len(unfinished_indices) == len(self.reqs):
             # No need to filter
-            return
+            return has_filtered
 
         self.reqs = [self.reqs[i] for i in unfinished_indices]
         new_indices = torch.tensor(
@@ -776,6 +778,8 @@ class ScheduleBatch:
         self.has_regex = any(req.regex_fsm for req in self.reqs)
 
         self.sampling_info.filter_batch(unfinished_indices, new_indices)
+
+        return has_filtered
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
