@@ -20,6 +20,12 @@ from typing import List, Tuple, Union
 
 import numpy as np
 import torch
+from sglang.srt.layers.attention.triton_ops.decode_attention_int4kv import (
+                    destindex_copy_quantize_int4kv,
+                )
+from sglang.srt.layers.attention.triton_ops.decode_attention_int8kv import (
+                    destindex_copy_quantize_kv,
+                )
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +151,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self.kv_cache_dtype_str = kv_cache_dtype_str
         if kv_cache_dtype_str == "int4":
             # [size, head_num, head_dim] for each layer
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.k_buffer = [
                 torch.empty(
                     (size + 1, head_num, head_dim // 2), dtype=torch.int8, device="cuda"
@@ -159,6 +166,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             ]
         else:
             # [size, head_num, head_dim] for each layer
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.k_buffer = [
                 torch.empty(
                     (size + 1, head_num, head_dim),
@@ -253,10 +261,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     ):
         if self.dtype == torch.int8:
             if self.kv_cache_dtype_str == "int4":
-                from sglang.srt.layers.attention.triton_ops.decode_attention_int4kv import (
-                    destindex_copy_quantize_int4kv,
-                )
-
                 destindex_copy_quantize_int4kv(
                     cache_k,
                     loc,
@@ -272,10 +276,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                     self.quant_group_size,
                 )
             else:
-                from sglang.srt.layers.attention.triton_ops.decode_attention_int8kv import (
-                    destindex_copy_quantize_kv,
-                )
-
                 destindex_copy_quantize_kv(
                     cache_k,
                     loc,
