@@ -259,7 +259,9 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
 
         # [size, head_num, heavy_channel_num] for each layer
         self.label_buffer = [
-            torch.empty((size + 1, head_num, heavy_channel_num), dtype=dtype, device=device)
+            torch.empty(
+                (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
+            )
             for _ in range(layer_num)
         ]
 

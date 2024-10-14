@@ -85,7 +85,7 @@ class ServerArgs:
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
-    
+
     # Double Sparsity
     enable_double_sparsity: bool = False
     ds_channel_config_path: str = None
@@ -450,7 +450,7 @@ class ServerArgs:
             help="A dictionary in JSON string format used to override default model configurations.",
             default=ServerArgs.json_model_override_args,
         )
-        
+
         # Double Sparsity
         parser.add_argument(
             "--enable-double-sparsity",

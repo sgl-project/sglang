@@ -40,17 +40,17 @@ from vllm.model_executor.models import ModelRegistry
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.constrained import disable_cache
+from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
+    DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    DoubleSparseTokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -146,7 +146,9 @@ class ModelRunner:
             self.init_attention_backend()
 
         if self.server_args.enable_double_sparsity:
-            self.init_double_sparsity_channel_config(self.server_args.ds_heavy_channel_type)
+            self.init_double_sparsity_channel_config(
+                self.server_args.ds_heavy_channel_type
+            )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -501,17 +503,21 @@ class ModelRunner:
             )
 
     def init_double_sparsity_channel_config(self, selected_channel):
-        
+
         selected_channel = "." + selected_channel + "_proj"
         self.sorted_channels = []
         # load channel config
         with open(self.server_args.ds_channel_config_path, "r") as f:
             channel_config = json.load(f)
-        
+
         for i in range(self.model_config.num_hidden_layers):
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
-                torch.tensor(channel_config[key])[:,:self.server_args.ds_heavy_channel_num].contiguous().cuda()
+                torch.tensor(channel_config[key])[
+                    :, : self.server_args.ds_heavy_channel_num
+                ]
+                .contiguous()
+                .cuda()
             )
 
     def init_cuda_graphs(self):

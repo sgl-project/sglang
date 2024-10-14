@@ -116,9 +116,9 @@ class ForwardBatch:
     sorted_channels: List[torch.Tensor] = None
     heavy_token_num: int = 256
     sparse_decode_thresold: int = 4096
-    att_out_approx: torch.Tensor=None
-    mid_out: torch.Tensor=None
-    mid_o_logexpsum: torch.Tensor=None
+    att_out_approx: torch.Tensor = None
+    mid_out: torch.Tensor = None
+    mid_o_logexpsum: torch.Tensor = None
 
     @classmethod
     def init_new(
@@ -177,10 +177,12 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
-            
+
         if model_runner.server_args.enable_double_sparsity:
             ret.sorted_channels = model_runner.sorted_channels
             ret.heavy_token_num = model_runner.server_args.ds_heavy_token_num
-            ret.sparse_decode_thresold = model_runner.server_args.ds_sparse_decode_threshold
+            ret.sparse_decode_thresold = (
+                model_runner.server_args.ds_sparse_decode_threshold
+            )
 
         return ret
