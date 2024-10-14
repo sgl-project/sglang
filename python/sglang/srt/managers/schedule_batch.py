@@ -410,6 +410,8 @@ class ScheduleBatch:
     seq_lens: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
 
+    output_ids: torch.Tensor = None
+
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
@@ -720,19 +722,12 @@ class ScheduleBatch:
 
         return jump_forward_reqs
 
-    def prepare_for_decode(self, input_ids=None):
+    def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
 
-        if input_ids is None:
-            input_ids = [
-                r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
-                for r in self.reqs
-            ]
-
-        self.input_ids = torch.tensor(
-            input_ids, dtype=torch.int32, device=self.seq_lens.device
-        )
+        self.input_ids = self.output_ids
         self.seq_lens.add_(1)
+        self.output_ids = None
 
         # Alloc mem
         bs = len(self.reqs)
@@ -759,6 +754,7 @@ class ScheduleBatch:
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
         self.out_cache_loc = None
+        self.output_ids = self.output_ids[new_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [
@@ -783,6 +779,7 @@ class ScheduleBatch:
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
+        self.output_ids = torch.concat([self.output_ids, other.output_ids])
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
         elif self.return_logprob:
@@ -838,7 +835,7 @@ class ScheduleBatch:
             token_to_kv_pool=self.token_to_kv_pool,
             tree_cache=self.tree_cache,
             forward_mode=self.forward_mode,
-            output_token_ids=self.output_token_ids,
+            output_ids=self.output_ids,
         )
 
     def __str__(self):

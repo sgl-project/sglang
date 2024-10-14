@@ -659,6 +659,7 @@ class Scheduler:
                     )
                 else:
                     next_token_ids = torch.full((batch.batch_size(),), 0)
+            batch.output_ids = next_token_ids
             ret = logits_output, next_token_ids
         else:  # embedding or reward model
             assert batch.extend_num_tokens != 0
