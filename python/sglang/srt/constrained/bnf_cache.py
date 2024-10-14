@@ -16,14 +16,16 @@ limitations under the License.
 """Cache for the compressed finite state machine."""
 
 from transformers import AutoTokenizer
-from xgrammar import BuiltinGrammar, GrammarStateMatcher
-
-from sglang.srt.constrained.base_tool_cache import BaseToolCache
+from xgrammar import (
+    GrammarMatcher,
+    GrammarMatcherInitContext,
+    GrammarMatcherInitContextCache,
+)
 
 MAX_ROLLBACK_STEPS = 10
 
 
-class BNFCache(BaseToolCache):
+class BNFCache:
     def __init__(
         self,
         tokenizer_path,
@@ -31,58 +33,25 @@ class BNFCache(BaseToolCache):
         skip_tokenizer_init=False,
         enable=True,
     ):
-        super().__init__(enable=enable)
-        if skip_tokenizer_init:
-            return
+        # TODO(dark): determine how to handle with `skip_tokenizer_init`
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path, **tokenizer_args_dict
         )
+        self.grammar_cache = GrammarMatcherInitContextCache(
+            tokenizer_or_vocab=self.tokenizer
+        )
 
-    def init_value(self, key):
+    def get_context(self, key) -> GrammarMatcherInitContext:
         key_type, key_string = key
 
         if key_type == "json":
-            grammar = BuiltinGrammar.json_schema(key_string, indent=None)
+            return self.grammar_cache.get_init_context_for_json_schema(key_string)
         elif key_type == "regex":
-            assert False, "Not supported by xgrammar yet"
+            raise ValueError(f"regex hasn't been supported by xgrammar yet")
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
-        return grammar
-
-    def query(self, key):
-        grammar = super().query(key)
-        return GrammarStateMatcher(
-            grammar, self.tokenizer, max_rollback_steps=MAX_ROLLBACK_STEPS
-        )
-
-
-# class BNFCache(BaseToolCache):
-#     def __init__(
-#         self,
-#         tokenizer_path,
-#         tokenizer_args_dict,
-#         enable=True,
-#         skip_tokenizer_init=False,
-#         constrained_json_whitespace_pattern=None,
-#     ):
-#         super().__init__(enable=enable)
-
-#         if skip_tokenizer_init:
-#             return
-
-#         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_args_dict)
-#         self.tokenizer = tokenizer
-#         self.constrained_json_whitespace_pattern = constrained_json_whitespace_pattern
-
-#     def init_value(self, key):
-#         key_type, key_string = key
-#         if key_type == "json":
-#             grammar = BuiltinGrammar.json_schema(key_string)
-#         elif key_type == "regex":
-#             assert False, "Not supported yet"
-#         else:
-#             raise ValueError(f"Invalid key_type: {key_type}")
-
-#         return GrammarStateMatcher(grammar, self.tokenizer)
+    def query(self, key) -> GrammarMatcher:
+        ctx = self.get_context(key)
+        return GrammarMatcher(ctx, max_rollback_steps=MAX_ROLLBACK_STEPS)

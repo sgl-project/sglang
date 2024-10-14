@@ -4,7 +4,7 @@ import dataclasses
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
-from xgrammar import GrammarStateMatcher
+from xgrammar import GrammarMatcher
 
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.constrained import RegexGuide
@@ -30,7 +30,7 @@ class SamplingBatchInfo:
     vocab_mask: Optional[torch.Tensor] = None
 
     # FSM states
-    regex_bnfs: Optional[List[Optional[GrammarStateMatcher]]] = None
+    regex_bnfs: Optional[List[Optional[GrammarMatcher]]] = None
 
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None

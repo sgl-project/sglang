@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
-from xgrammar import GrammarStateMatcher
+from xgrammar import GrammarMatcher
 
 from sglang.global_config import global_config
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -226,7 +226,7 @@ class Req:
         self.embedding = None
 
         # Constrained decoding
-        self.regex_bnf: Optional[GrammarStateMatcher] = None
+        self.regex_bnf: Optional[GrammarMatcher] = None
         self.allow_jump_forward: bool = False
 
     # whether request reached finished condition
