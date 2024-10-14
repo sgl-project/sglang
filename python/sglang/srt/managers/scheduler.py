@@ -454,6 +454,7 @@ class Scheduler:
         ):
             if self.current_inflight_req:
                 self.last_batch.filter_batch(self.current_inflight_req)
+                self.batch_is_full = False
             if not self.last_batch.is_empty():
                 if self.running_batch is None:
                     self.running_batch = self.last_batch
@@ -472,9 +473,13 @@ class Scheduler:
             return
 
         # Run decode
+        before_bs = self.running_batch.batch_size()
         self.update_running_batch()
         if not self.running_batch:
+            self.batch_is_full = False
             return None
+        if before_bs != self.running_batch.batch_size():
+            self.batch_is_full = False
         return self.running_batch
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -622,10 +627,7 @@ class Scheduler:
         global test_retract
         batch = self.running_batch
 
-        has_filtered = batch.filter_batch()
-        if has_filtered:
-            self.batch_is_full = False
-
+        batch.filter_batch()
         if batch.is_empty():
             self.running_batch = None
             return
@@ -653,8 +655,6 @@ class Scheduler:
         if not self.disable_regex_jump_forward:
             jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
             self.waiting_queue.extend(jump_forward_reqs)
-            if jump_forward_reqs:
-                self.batch_is_full = False
             if batch.is_empty():
                 self.running_batch = None
                 return
@@ -907,9 +907,6 @@ class Scheduler:
             output_embeddings = []
 
         for req in batch.reqs:
-            if req.finished() or req is self.current_inflight_req:
-                self.batch_is_full = False
-
             if req.finished() or (
                 req.stream
                 and (
