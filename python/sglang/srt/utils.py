@@ -690,3 +690,10 @@ def pytorch_profile(name, func, *args, data_size=-1):
     prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
     step_counter += 1
     return result
+
+
+def first_rank_print(*args, **kwargs):
+    if torch.cuda.current_device() == 0:
+        print(*args, **kwargs)
+    else:
+        pass

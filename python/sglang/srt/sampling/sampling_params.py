@@ -40,6 +40,7 @@ class SamplingParams:
         regex: Optional[str] = None,
         n: int = 1,
         json_schema: Optional[str] = None,
+        no_eos_trim: bool = False,
     ) -> None:
         self.temperature = temperature
         self.top_p = top_p
@@ -60,6 +61,7 @@ class SamplingParams:
         self.regex = regex
         self.n = n
         self.json_schema = json_schema
+        self.no_eos_trim = no_eos_trim
 
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:

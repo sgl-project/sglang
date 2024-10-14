@@ -405,9 +405,9 @@ class ScheduleBatch:
     sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
-    input_ids: List[int] = None
-    req_pool_indices: List[int] = None
-    seq_lens: List[int] = None
+    input_ids: torch.Tensor = None
+    req_pool_indices: torch.Tensor = None
+    seq_lens: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
 
     # For processing logprobs
@@ -531,7 +531,9 @@ class ScheduleBatch:
         self.extend_lens = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
 
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self, vocab_size, global_server_args_dict["disable_penalizer"]
+        )
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
@@ -827,6 +829,22 @@ class ScheduleBatch:
             image_inputs=image_inputs,
             lora_paths=lora_paths,
             sampling_info=self.sampling_info,
+        )
+
+    def copy(self):
+        return ScheduleBatch(
+            reqs=self.reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            tree_cache=self.tree_cache,
+            forward_mode=self.forward_mode,
+            output_token_ids=self.output_token_ids,
+        )
+
+    def __str__(self):
+        return (
+            f"ScheduleBatch(forward_mode={self.forward_mode.name}, "
+            f"#req={(len(self.reqs))})"
         )
 
 
