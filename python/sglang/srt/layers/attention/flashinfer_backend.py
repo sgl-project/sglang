@@ -112,6 +112,11 @@ class FlashInferAttnBackend(AttentionBackend):
             use_ragged = False
             extend_no_prefix = False
             total_num_tokens = None
+        elif forward_batch.forward_mode.is_spec_extend():
+            use_ragged = False
+            total_num_tokens = forward_batch.spec_info.verified_id.numel()
+            extend_no_prefix = True
+            prefix_lens = None
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 

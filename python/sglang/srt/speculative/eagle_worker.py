@@ -22,10 +22,10 @@ class EAGLEWorker(SpeculativeWorker):
         self.model_runner.model.set_embed_and_head(embed, head)
     
     def forward_draft_decode(self, batch: ScheduleBatch):
-        
         batch.spec_info.prepare_for_decode(batch)
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        forward_batch.is_draft_batch = True
         self.model_runner.forward(forward_batch)
     
     def forward_draft_extend(self, batch: ScheduleBatch):
@@ -33,9 +33,7 @@ class EAGLEWorker(SpeculativeWorker):
         batch.spec_info.prepare_for_extend(batch)
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)  
-        #forward_batch.spec_info.prepare_for_extend(forward_batch)
         logits_output = self.model_runner.forward(forward_batch)
-        #next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         self._swap_mem_pool(batch, self.target_worker.model_runner)
 
     def forward_batch_speculative_generate(self, batch: ScheduleBatch):
@@ -43,8 +41,15 @@ class EAGLEWorker(SpeculativeWorker):
             self._swap_mem_pool(batch, self.model_runner)
             for i in range(self.server_args.num_speculative_steps):
                 self.forward_draft_decode(batch)
+            batch.spec_info.clear_draft_cache(batch)
             self._swap_mem_pool(batch, self.target_worker.model_runner)
-            self.verify(batch)
+            next_draft_input, logits_output = self.verify(batch)
+            verified_id = next_draft_input.verified_id
+            next_draft_input.init(self.server_args)
+            batch.spec_info = next_draft_input
+            self.forward_extend_after_decode(batch)
+            return logits_output, verified_id
+            
         else:
             batch.spec_info = EAGLEDraftInput()
             batch.spec_info.init(self.server_args)
@@ -55,17 +60,32 @@ class EAGLEWorker(SpeculativeWorker):
             return logits_output, next_token_ids
         
     def verify(self, batch: ScheduleBatch):
-        print('*'*100)
         verify_input = batch.spec_info.prepare_for_verify(batch)
         batch.forward_mode = ForwardMode.SPECVERIFY
         verify_input.prepare_for_verify(batch)
         batch.spec_info = verify_input
         model_worker_batch = batch.get_model_worker_batch()
         logits_output, next_token_ids = self.target_worker.forward_batch_generation(model_worker_batch)
-        verify_input.verify(batch, logits_output)
+        res = verify_input.verify(batch, logits_output)
+        batch.forward_mode = ForwardMode.DECODE
+        return res
         
     def _swap_mem_pool(self, batch: ScheduleBatch, runner: ModelRunner):
         batch.token_to_kv_pool = runner.token_to_kv_pool
         batch.req_to_token_pool = runner.req_to_token_pool
         
+    def forward_extend_after_decode(self, batch: ScheduleBatch):
+        self._swap_mem_pool(batch, self.model_runner)
+        batch.forward_mode = ForwardMode.SPECEXTEND 
+        batch.spec_info.prepare_extend_after_decode(batch)
+        model_worker_batch = batch.get_model_worker_batch()
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        forward_batch.is_draft_batch = True
+        logits_output = self.model_runner.forward(forward_batch)
+        batch.forward_mode = ForwardMode.DECODE 
+        self._swap_mem_pool(batch, self.model_runner)
+        
+    def post_decode_process(self, batch):
+        return self.forward_extend_after_decode(batch)
+
         

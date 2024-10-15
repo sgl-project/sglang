@@ -59,6 +59,8 @@ class LogitsMetadata:
 
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
+    
+    is_draft_batch: bool = False
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -67,7 +69,7 @@ class LogitsMetadata:
         else:
             return_top_logprob = False
 
-        if forward_batch.forward_mode.is_extend():
+        if forward_batch.forward_mode.is_extend() and not forward_batch.is_draft_batch:
             extend_logprob_pruned_lens_cpu = [
                 extend_len - start_len
                 for extend_len, start_len in zip(
@@ -75,6 +77,7 @@ class LogitsMetadata:
                     forward_batch.extend_logprob_start_lens_cpu,
                 )
             ]
+        
         else:
             extend_logprob_pruned_lens_cpu = None
         return cls(
@@ -86,6 +89,7 @@ class LogitsMetadata:
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
+            is_draft_batch=forward_batch.is_draft_batch
         )
 
 
@@ -196,7 +200,7 @@ class LogitsProcessor(nn.Module):
             last_logits.mul_(self.config.final_logit_softcapping)
 
         # Return only last_logits if logprob is not requested
-        if not logits_metadata.return_logprob:
+        if not logits_metadata.return_logprob or logits_metadata.is_draft_batch:
             return LogitsProcessorOutput(
                 next_token_logits=last_logits,
                 next_token_logprobs=None,

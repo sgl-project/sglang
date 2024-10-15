@@ -21,6 +21,9 @@ class SpeculativeWorker(TpModelWorker):
     def forward_batch_speculative_generate(self, batch: ScheduleBatch):
         raise NotImplementedError()
     
+    def post_decode_process(self, batch: ScheduleBatch):
+        # do nothing by default
+        pass
     
 class SpecWorkerFactory:
     def __init__(self):

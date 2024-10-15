@@ -790,8 +790,9 @@ class Scheduler:
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req.completion_tokens_wo_jump_forward += 1
-            req.output_ids.append(next_token_id)
-            req.check_finished()
+            if batch.spec_algorithm is None: # speculative worker will solve the output_ids in speculative decoding
+                req.output_ids.append(next_token_id)
+            req.check_finished() # TODO: SUPPORT IT @kavioyu
 
             if req.regex_fsm is not None:
                 req.regex_fsm_state = req.regex_fsm.get_next_state(

@@ -55,12 +55,14 @@ class ForwardMode(IntEnum):
     MIXED = auto()
     # Speculative Verify stage
     SPECVERIFY = auto()
+    # Speculative draft Extend stage which after verify stage
+    SPECEXTEND = auto()
 
     def is_prefill(self):
         return self == ForwardMode.PREFILL
 
     def is_extend(self):
-        return self == ForwardMode.EXTEND or self == ForwardMode.MIXED
+        return self in (ForwardMode.EXTEND, self == ForwardMode.MIXED, ForwardMode.SPECEXTEND)
 
     def is_decode(self):
         return self in (ForwardMode.DECODE, ForwardMode.SPECVERIFY)
@@ -70,6 +72,9 @@ class ForwardMode(IntEnum):
     
     def is_verify(self):
         return self == ForwardMode.SPECVERIFY
+    
+    def is_spec_extend(self):
+        return self == ForwardMode.SPECEXTEND
 
 
 @dataclass
@@ -120,6 +125,7 @@ class ForwardBatch:
     # Speculative decoding
     spec_info: SpecInput = None
     spec_algorithm: str = None
+    is_draft_batch: bool = False
 
     @classmethod
     def init_new(
@@ -162,6 +168,7 @@ class ForwardBatch:
                 device=device,
             ).to(torch.int64)
 
+        if not ret.forward_mode.is_decode():
             ret.image_inputs = batch.image_inputs
             ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device=device)
             ret.extend_prefix_lens = torch.tensor(
