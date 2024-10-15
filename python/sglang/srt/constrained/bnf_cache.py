@@ -54,4 +54,4 @@ class BNFCache:
 
     def query(self, key) -> GrammarMatcher:
         ctx = self.get_context(key)
-        return GrammarMatcher(ctx, max_rollback_steps=MAX_ROLLBACK_STEPS)
+        return GrammarMatcher(ctx, max_rollback_tokens=MAX_ROLLBACK_STEPS)
