@@ -499,7 +499,7 @@ class GLMTransformer(nn.Module):
         return hidden_states
 
 
-class ChatGLMModel(nn.Module):
+class ChatGLMM(nn.Module):
 
     def __init__(
         self,
@@ -618,7 +618,7 @@ class ChatGLMForCausalLM(nn.Module):
 
         self.quant_config = quant_config
         self.max_position_embeddings = getattr(config, "max_sequence_length", 8192)
-        self.transformer = ChatGLMModel(config, quant_config)
+        self.transformer = ChatGLMM(config, quant_config)
         if self.config.tie_word_embeddings:
             self.transformer.output_layer.weight = self.transformer.embedding.weight
         self.lm_head = self.transformer.output_layer
@@ -686,5 +686,7 @@ class ChatGLMForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, combined_weight)
 
+class ChatGLMModel(ChatGLMForCausalLM):
+    pass
 
-EntryClass = [ChatGLMForCausalLM]
+EntryClass = [ChatGLMModel]
