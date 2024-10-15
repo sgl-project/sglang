@@ -295,6 +295,7 @@ class BatchTokenIDOut:
     spaces_between_special_tokens: List[bool]
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
+    no_stop_trim: List[bool]
 
 
 @dataclass

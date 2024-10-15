@@ -23,7 +23,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.config import CacheConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -289,7 +288,7 @@ class Grok1ForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config
