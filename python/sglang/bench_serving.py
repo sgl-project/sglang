@@ -587,6 +587,8 @@ async def benchmark(
     else:
         print("Initial test run completed. Starting main benchmark run...")
 
+    time.sleep(1.5)
+
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
     benchmark_start_time = time.perf_counter()
