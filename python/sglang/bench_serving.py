@@ -343,7 +343,7 @@ def get_tokenizer(
 
 
 ASYNC_REQUEST_FUNCS = {
-    "sglang": async_request_openai_completions,
+    "sglang": async_request_sglang_generate,
     "sglang-native": async_request_sglang_generate,
     "sglang-oai": async_request_openai_completions,
     "vllm": async_request_openai_completions,
@@ -881,13 +881,13 @@ def run_benchmark(args_: argparse.Namespace):
         else f"http://{args.host}:{args.port}/v1/models"
     )
 
-    if args.backend == "sglang-native":
+    if args.backend in ["sglang", "sglang-native"]:
         api_url = (
             f"{args.base_url}/generate"
             if args.base_url
             else f"http://{args.host}:{args.port}/generate"
         )
-    elif args.backend in ["sglang-oai", "sglang", "vllm", "lmdeploy"]:
+    elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
         api_url = (
             f"{args.base_url}/v1/completions"
             if args.base_url
