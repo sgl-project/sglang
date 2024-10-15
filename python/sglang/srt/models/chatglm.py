@@ -378,7 +378,6 @@ class GLMBlock(nn.Module):
         self,
         config,
         layer_id: int = 0,
-        # cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -456,7 +455,6 @@ class GLMTransformer(nn.Module):
     def __init__(
         self,
         config,
-        # cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -492,7 +490,6 @@ class GLMTransformer(nn.Module):
             hidden_states = layer(
                 hidden_states=hidden_states,
                 position_ids=position_ids,
-                # kv_cache=kv_caches[i],
                 forward_batch=forward_batch,
             )
         # Final layer norm.
@@ -627,7 +624,6 @@ class ChatGLMForCausalLM(nn.Module):
         self.lm_head = self.transformer.output_layer
         self.logits_processor = LogitsProcessor(config)
         self.logits_processor.config.vocab_size = config.padded_vocab_size
-        # self.sampler = Sampler()
 
     @torch.no_grad()
     def forward(

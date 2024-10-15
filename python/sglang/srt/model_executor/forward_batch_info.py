@@ -118,7 +118,7 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
-        device = "cuda"
+        device = model_runner.device
 
         ret = cls(
             forward_mode=batch.forward_mode,

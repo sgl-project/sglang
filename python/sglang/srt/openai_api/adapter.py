@@ -493,23 +493,38 @@ def v1_generate_request(
         top_logprobs_nums.append(
             request.logprobs if request.logprobs is not None else 0
         )
-        sampling_params_list.append(
-            {
-                "temperature": request.temperature,
-                "max_new_tokens": request.max_tokens,
-                "min_new_tokens": request.min_tokens,
-                "stop": request.stop,
-                "stop_token_ids": request.stop_token_ids,
-                "top_p": request.top_p,
-                "presence_penalty": request.presence_penalty,
-                "frequency_penalty": request.frequency_penalty,
-                "repetition_penalty": request.repetition_penalty,
-                "regex": request.regex,
-                "json_schema": request.json_schema,
-                "n": request.n,
-                "ignore_eos": request.ignore_eos,
-            }
-        )
+        sampling_params = []
+        if isinstance(request.no_stop_trim, list):
+            num_reqs = len(request.prompt)
+        else:
+            num_reqs = 1
+        for i in range(num_reqs):
+            sampling_params.append(
+                {
+                    "temperature": request.temperature,
+                    "max_new_tokens": request.max_tokens,
+                    "min_new_tokens": request.min_tokens,
+                    "stop": request.stop,
+                    "stop_token_ids": request.stop_token_ids,
+                    "top_p": request.top_p,
+                    "presence_penalty": request.presence_penalty,
+                    "frequency_penalty": request.frequency_penalty,
+                    "repetition_penalty": request.repetition_penalty,
+                    "regex": request.regex,
+                    "json_schema": request.json_schema,
+                    "n": request.n,
+                    "ignore_eos": request.ignore_eos,
+                    "no_stop_trim": (
+                        request.no_stop_trim
+                        if not isinstance(request.no_stop_trim, list)
+                        else request.no_stop_trim[i]
+                    ),
+                }
+            )
+        if num_reqs == 1:
+            sampling_params_list.append(sampling_params[0])
+        else:
+            sampling_params_list.append(sampling_params)
 
     if len(all_requests) == 1:
         prompt = prompts[0]
@@ -910,6 +925,7 @@ def v1_chat_generate_request(
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
             "n": request.n,
+            "ignore_eos": request.ignore_eos,
         }
         if request.response_format and request.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
