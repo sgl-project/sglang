@@ -304,6 +304,7 @@ You can view the full example [here](https://github.com/sgl-project/sglang/tree/
 - MiniCPM / MiniCPM 3
 - XVERSE / XVERSE MoE
 - SmolLM
+- GLM-4v
 
 **Embedding Models**
 
