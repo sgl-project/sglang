@@ -25,8 +25,6 @@ import torch
 from PIL import Image
 from torch import nn
 from torch.nn import LayerNorm
-
-# from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig, MultiModalConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.inputs import INPUT_REGISTRY, InputContext, LLMInputs
@@ -51,10 +49,9 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler, SamplerOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_vision_encoder import EVA2CLIPModel
 
@@ -239,8 +236,9 @@ class GLMAttention(nn.Module):
     def __init__(
         self,
         config,
-        cache_config: Optional[CacheConfig] = None,
+        layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -275,12 +273,14 @@ class GLMAttention(nn.Module):
             self.total_num_kv_heads,
             bias=config.add_bias_linear or config.add_qkv_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
         self.dense = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=config.add_bias_linear,
             quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
         )
 
         # https://huggingface.co/THUDM/chatglm3-6b-32k/blob/e210410255278dd9d74463cf396ba559c0ef801c/modeling_chatglm.py#L141
@@ -298,15 +298,13 @@ class GLMAttention(nn.Module):
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
+            layer_id=layer_id,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_cache: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)
@@ -316,7 +314,6 @@ class GLMAttention(nn.Module):
             q,
             k,
             v,
-            kv_cache,
             forward_batch,
         )
         attn_output, _ = self.dense(context_layer)
@@ -335,6 +332,7 @@ class GLMMLP(nn.Module):
         self,
         config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -346,6 +344,7 @@ class GLMMLP(nn.Module):
             [config.ffn_hidden_size] * 2,
             bias=config.add_bias_linear,
             quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
 
         self.activation_func = SiluAndMul()
@@ -356,6 +355,7 @@ class GLMMLP(nn.Module):
             config.hidden_size,
             bias=config.add_bias_linear,
             quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
 
     def forward(self, hidden_states):
@@ -377,8 +377,10 @@ class GLMBlock(nn.Module):
     def __init__(
         self,
         config,
-        cache_config: Optional[CacheConfig] = None,
+        layer_id: int = 0,
+        # cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.apply_residual_connection_post_layernorm = (
@@ -394,7 +396,12 @@ class GLMBlock(nn.Module):
         )
 
         # Self attention.
-        self.self_attention = GLMAttention(config, cache_config, quant_config)
+        self.self_attention = GLMAttention(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+        )
         self.hidden_dropout = config.hidden_dropout
 
         # Layernorm on the attention output
@@ -403,13 +410,12 @@ class GLMBlock(nn.Module):
         )
 
         # MLP
-        self.mlp = GLMMLP(config, quant_config)
+        self.mlp = GLMMLP(config, quant_config, prefix=f"{prefix}.mlp")
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_cache: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # hidden_states: [num_tokens, h]
@@ -419,7 +425,6 @@ class GLMBlock(nn.Module):
         attention_output = self.self_attention(
             hidden_states=layernorm_output,
             position_ids=position_ids,
-            kv_cache=kv_cache,
             forward_batch=forward_batch,
         )
 
@@ -451,7 +456,7 @@ class GLMTransformer(nn.Module):
     def __init__(
         self,
         config,
-        cache_config: Optional[CacheConfig] = None,
+        # cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -463,7 +468,7 @@ class GLMTransformer(nn.Module):
         # Transformer layers.
         self.layers = nn.ModuleList(
             [
-                GLMBlock(config, cache_config, quant_config)
+                GLMBlock(config, i, quant_config, prefix=f"model.layers.{i}")
                 for i in range(self.num_layers)
             ]
         )
@@ -479,15 +484,15 @@ class GLMTransformer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_caches: List[torch.Tensor],
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         for i in range(self.num_layers):
             layer = self.layers[i]
             hidden_states = layer(
                 hidden_states=hidden_states,
                 position_ids=position_ids,
-                kv_cache=kv_caches[i],
+                # kv_cache=kv_caches[i],
                 forward_batch=forward_batch,
             )
         # Final layer norm.
@@ -502,7 +507,6 @@ class ChatGLMModel(nn.Module):
     def __init__(
         self,
         config,
-        cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -516,7 +520,7 @@ class ChatGLMModel(nn.Module):
         self.num_layers = config.num_layers
         self.multi_query_group_num = config.multi_query_group_num
         self.kv_channels = config.kv_channels
-        self.encoder = GLMTransformer(config, cache_config, quant_config)
+        self.encoder = GLMTransformer(config, quant_config)
 
         self.output_layer = ParallelLMHead(
             config.padded_vocab_size, config.hidden_size, quant_config=quant_config
@@ -550,9 +554,8 @@ class ChatGLMModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
         forward_batch: ForwardBatch,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
+        input_embeds: torch.Tensor = None,
         **kwargs: object,
     ) -> torch.Tensor:
 
@@ -578,7 +581,6 @@ class ChatGLMModel(nn.Module):
         hidden_states = self.encoder(
             hidden_states=inputs_embeds,
             position_ids=positions,
-            kv_caches=kv_caches,
             forward_batch=forward_batch,
         )
         return hidden_states
@@ -619,26 +621,29 @@ class ChatGLMForCausalLM(nn.Module):
 
         self.quant_config = quant_config
         self.max_position_embeddings = getattr(config, "max_sequence_length", 8192)
-        self.transformer = ChatGLMModel(config, cache_config, quant_config)
+        self.transformer = ChatGLMModel(config, quant_config)
         if self.config.tie_word_embeddings:
             self.transformer.output_layer.weight = self.transformer.embedding.weight
         self.lm_head = self.transformer.output_layer
-        self.logits_processor = LogitsProcessor(config.padded_vocab_size)
-        self.sampler = Sampler()
+        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor.config.vocab_size = config.padded_vocab_size
+        # self.sampler = Sampler()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
         forward_batch: ForwardBatch,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
+        input_embeds: torch.Tensor = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> LogitsProcessorOutput:
         hidden_states = self.transformer(
-            input_ids, positions, kv_caches, forward_batch, **kwargs
+            input_ids, positions, forward_batch, input_embeds, **kwargs
         )
-        return hidden_states
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
+        )
 
     def compute_logits(
         self,
@@ -686,8 +691,4 @@ class ChatGLMForCausalLM(nn.Module):
                 weight_loader(param, combined_weight)
 
 
-class ChatGLMModel(ChatGLMForCausalLM):
-    pass
-
-
-EntryClass = [ChatGLMForCausalLM, ChatGLMModel]
+EntryClass = [ChatGLMForCausalLM]
