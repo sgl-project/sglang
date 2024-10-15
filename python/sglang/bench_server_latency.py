@@ -17,7 +17,7 @@ import json
 import multiprocessing
 import os
 import time
-from typing import Optional, Tuple
+from typing import Tuple
 
 import numpy as np
 import requests
