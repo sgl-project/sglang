@@ -195,6 +195,7 @@ class Scheduler:
         # Init running status
         self.waiting_queue: List[Req] = []
         self.running_batch: Optional[ScheduleBatch] = None
+        self.cur_batch: Optional[ScheduleBatch] = None
         self.decode_forward_ct = 0
         self.stream_interval = server_args.stream_interval
         self.num_generated_tokens = 0
@@ -274,6 +275,38 @@ class Scheduler:
                         result = self.run_batch(batch)
                         self.process_batch_result(batch, result)
             else:
+                self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
+
+            self.last_batch = batch
+
+    @torch.inference_mode()
+    def event_loop_overlap(self):
+        from queue import Queue
+
+        result_queue = Queue()
+
+        self.last_batch = None
+        self.running_batch = None
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+            if batch:
+                # logger.info(f"Run batch {str(batch)} begin")
+                result = self.run_batch(batch)
+                result_queue.put((batch.copy(), result))
+                # logger.info(f"Run batch {str(batch)} end")
+
+            if self.last_batch:
+                tmp_batch, tmp_result = result_queue.get()
+                # logger.info(f"Process batch {str(tmp_batch)} begin")
+                self.process_batch_result(tmp_batch, tmp_result)
+                # logger.info(f"Process batch {str(tmp_batch)} end")
+            elif batch is None:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
 
@@ -742,7 +775,10 @@ class Scheduler:
                     req.check_finished()
 
                     if req.finished():
-                        self.tree_cache.cache_finished_req(req)
+                        if self.running_batch and req in self.cur_batch.reqs:
+                            self.tree_cache.cache_finished_req(req, free_delta=1)
+                        else:
+                            self.tree_cache.cache_finished_req(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
 
@@ -796,6 +832,9 @@ class Scheduler:
 
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            if req.finished():
+                continue
+
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
             req.check_finished()
@@ -806,7 +845,10 @@ class Scheduler:
                 )
 
             if req.finished():
-                self.tree_cache.cache_finished_req(req)
+                if self.running_batch and req in self.cur_batch.reqs:
+                    self.tree_cache.cache_finished_req(req, free_delta=1)
+                else:
+                    self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob:
                 req.output_token_logprobs.append(
@@ -1072,7 +1114,7 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank)
         pipe_writer.send("ready")
-        scheduler.event_loop_normal()
+        scheduler.event_loop_overlap()
     except Exception:
         msg = get_exception_traceback()
         logger.error(msg)

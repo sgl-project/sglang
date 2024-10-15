@@ -583,7 +583,7 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
 
 
 def configure_logger(server_args, prefix: str = ""):
-    format = f"[%(asctime)s{prefix}] %(message)s"
+    format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format=format,

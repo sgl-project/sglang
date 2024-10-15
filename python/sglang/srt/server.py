@@ -528,6 +528,8 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         kill_child_process(pid, including_parent=False)
         return
 
+    print(f"{res.json()=}")
+
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
         pipe_finish_writer.send("ready")

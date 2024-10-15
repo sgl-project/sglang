@@ -97,7 +97,9 @@ class RadixCache(BasePrefixCache):
             value = [x for x in key]
         return self._insert_helper(self.root_node, key, value)
 
-    def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
+    def cache_finished_req(
+        self, req: Req, token_ids: Optional[List[int]] = None, free_delta: int = 0
+    ):
         """Cache request when it finishes."""
         if token_ids is None:
             token_ids = (req.origin_input_ids + req.output_ids)[:-1]
@@ -112,7 +114,14 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(token_ids, kv_indices.clone())
+        # print(f"cache_finished_req {token_ids=} {len(req.prefix_indices)=} {new_prefix_len=} {free_delta=}")
         self.token_to_kv_pool.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
+        if free_delta:
+            self.token_to_kv_pool.free(
+                self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, len(token_ids) : len(token_ids) + 1
+                ]
+            )
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -122,6 +131,7 @@ class RadixCache(BasePrefixCache):
         """Cache request when it is unfinished."""
         if self.disable:
             return
+        return
 
         if token_ids is None:
             token_ids = req.fill_ids
