@@ -302,7 +302,12 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
             if not isinstance(ret, list):
                 ret = [ret]
             if end_point == "/v1/chat/completions":
-                responses = v1_chat_generate_response(request, ret, to_file=True)
+                responses = v1_chat_generate_response(
+                    request,
+                    ret,
+                    to_file=True,
+                    cache_report=tokenizer_manager.server_args.enable_cache_report,
+                )
             else:
                 responses = v1_generate_response(
                     request, ret, tokenizer_manager, to_file=True
@@ -970,7 +975,7 @@ def v1_chat_generate_request(
     return adapted_request, all_requests
 
 
-def v1_chat_generate_response(request, ret, to_file=False):
+def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
     choices = []
 
     for idx, ret_item in enumerate(ret):
@@ -1067,6 +1072,7 @@ def v1_chat_generate_response(request, ret, to_file=False):
             ret[i]["meta_info"]["prompt_tokens"] for i in range(0, len(ret), request.n)
         )
         completion_tokens = sum(item["meta_info"]["completion_tokens"] for item in ret)
+        cached_tokens = sum(item["meta_info"].get("cached_tokens", 0) for item in ret)
         response = ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             model=request.model,
@@ -1075,6 +1081,9 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
+                prompt_tokens_details=(
+                    {"cached_tokens": cached_tokens} if cache_report else None
+                ),
             ),
         )
         return response
@@ -1240,7 +1249,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     if not isinstance(ret, list):
         ret = [ret]
 
-    response = v1_chat_generate_response(request, ret)
+    response = v1_chat_generate_response(
+        request, ret, cache_report=tokenizer_manager.server_args.enable_cache_report
+    )
 
     return response
 
