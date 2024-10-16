@@ -20,6 +20,7 @@ import logging
 import os
 import time
 import warnings
+from collections import deque
 from types import SimpleNamespace
 from typing import List, Optional, Union
 
@@ -292,9 +293,7 @@ class Scheduler:
 
     @torch.inference_mode()
     def event_loop_overlap(self):
-        from queue import Queue
-
-        result_queue = Queue()
+        result_queue = deque()
 
         self.last_batch = None
         self.running_batch = None
@@ -307,10 +306,10 @@ class Scheduler:
             self.cur_batch = batch
             if batch:
                 result = self.run_batch(batch)
-                result_queue.put((batch.copy(), result))
+                result_queue.append((batch.copy(), result))
 
             if self.last_batch:
-                tmp_batch, tmp_result = result_queue.get()
+                tmp_batch, tmp_result = result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.check_memory()
