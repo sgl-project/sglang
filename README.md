@@ -14,7 +14,7 @@
 | [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/) | [**Paper**](https://arxiv.org/abs/2312.07104) | [**Slides**](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_dev_day_v2.pptx) | [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2ngly9muu-t37XiH87qvD~6rVBTkTEHw) | [**Join Bi-Weekly Development Meeting (Oct. 19)**](https://calendar.app.google/GYW7S8QGoanCuaxW6) |
 
 ## Upcoming Events
-- [Oct. 16, 2024] Online meetup for efficient LLM deployment and serving, co-hosted by SGLang, FlashInfer, and MLC LLM! Fill out the [Google form](https://forms.gle/B3YeedLxmrrhL1NM8) to receive the invite link.
+- [Oct. 16, 2024] Online meetup for efficient LLM deployment and serving, co-hosted by SGLang, FlashInfer, and MLC LLM! Fill out the [Google form](https://forms.gle/B3YeedLxmrrhL1NM8) to receive the invite link. (Directly join the [Meeting link](https://us06web.zoom.us/j/81267838086?pwd=qz1s2pktTsl9xNPg2lXM7fMR2A0mOm.1) if you are too late to register.)
 
 ## News
 - [2024/09] 🔥 SGLang v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
