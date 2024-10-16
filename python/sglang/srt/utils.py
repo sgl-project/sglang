@@ -587,7 +587,7 @@ def configure_logger(server_args, prefix: str = ""):
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
-        datefmt="%H:%M:%S",
+        datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
 

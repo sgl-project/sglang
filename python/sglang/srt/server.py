@@ -428,7 +428,11 @@ def launch_server(
     t.start()
 
     try:
+        from uvicorn.config import LOGGING_CONFIG
         # Listen for HTTP requests
+        LOGGING_CONFIG["formatters"]["default"]["fmt"] = "%(asctime)s [%(name)s] %(levelprefix)s %(message)s"
+        LOGGING_CONFIG["formatters"]["access"][
+                    "fmt"] = '%(asctime)s [%(name)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
         uvicorn.run(
             app,
             host=server_args.host,
