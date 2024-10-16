@@ -655,7 +655,7 @@ class ScheduleBatch:
             req.last_update_decode_tokens = 0
             req.logprob_start_len = 10**9
 
-        self.filter_batch(sorted_indices)
+        self.filter_batch(keep_indices=sorted_indices)
 
         # Reqs in batch are filtered
         total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
@@ -742,6 +742,10 @@ class ScheduleBatch:
         self.input_ids = self.output_ids
         self.seq_lens.add_(1)
         self.output_ids = None
+        if self.sampling_info.penalizer_orchestrator:
+            self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                self.input_ids
+            )
 
         # Alloc mem
         bs = len(self.reqs)
