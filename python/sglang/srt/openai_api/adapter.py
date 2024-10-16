@@ -624,32 +624,16 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 "index": 0,
                 "text": text,
                 "logprobs": logprobs,
-                "finish_reason": (
-                    finish_reason["type"]
-                    if finish_reason
-                    else ""
-                ),
-                "stop_reason": (
-                    finish_reason["matched"]
-                    if finish_reason
-                    else ""
-                ),
+                "finish_reason": (finish_reason["type"] if finish_reason else ""),
+                "stop_reason": (finish_reason["matched"] if finish_reason else ""),
             }
         else:
             choice_data = CompletionResponseChoice(
                 index=idx,
                 text=text,
                 logprobs=logprobs,
-                finish_reason=(
-                    finish_reason["type"]
-                    if finish_reason
-                    else ""
-                ),
-                stop_reason=(
-                    finish_reason["matched"]
-                    if finish_reason
-                    else ""
-                ),
+                finish_reason=(finish_reason["type"] if finish_reason else ""),
+                stop_reason=(finish_reason["matched"] if finish_reason else ""),
             )
 
         choices.append(choice_data)
@@ -783,16 +767,8 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         index=index,
                         text=delta,
                         logprobs=logprobs,
-                        finish_reason=(
-                            finish_reason["type"]
-                            if finish_reason
-                            else ""
-                        ),
-                        stop_reason=(
-                            finish_reason["matched"]
-                            if finish_reason
-                            else ""
-                        )
+                        finish_reason=(finish_reason["type"] if finish_reason else ""),
+                        stop_reason=(finish_reason["matched"] if finish_reason else ""),
                     )
                     chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
@@ -1037,32 +1013,16 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 "index": 0,
                 "message": {"role": "assistant", "content": ret_item["text"]},
                 "logprobs": choice_logprobs,
-                "finish_reason": (
-                    finish_reason["type"]
-                    if finish_reason
-                    else ""
-                ),
-                "stop_reason": (
-                    finish_reason["matched"]
-                    if finish_reason
-                    else ""
-                ),
+                "finish_reason": (finish_reason["type"] if finish_reason else ""),
+                "stop_reason": (finish_reason["matched"] if finish_reason else ""),
             }
         else:
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(role="assistant", content=ret_item["text"]),
                 logprobs=choice_logprobs,
-                finish_reason=(
-                    finish_reason["type"]
-                    if finish_reason
-                    else ""
-                ),
-                stop_reason=(
-                    finish_reason["matched"]
-                    if finish_reason
-                    else ""
-                )
+                finish_reason=(finish_reason["type"] if finish_reason else ""),
+                stop_reason=(finish_reason["matched"] if finish_reason else ""),
             )
 
         choices.append(choice_data)
@@ -1189,14 +1149,10 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             index=index,
                             delta=DeltaMessage(role="assistant"),
                             finish_reason=(
-                                finish_reason["type"]
-                                if finish_reason
-                                else ""
+                                finish_reason["type"] if finish_reason else ""
                             ),
                             stop_reason=(
-                                finish_reason["matched"]
-                                if finish_reason
-                                else ""
+                                finish_reason["matched"] if finish_reason else ""
                             ),
                             logprobs=choice_logprobs,
                         )
@@ -1213,16 +1169,8 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=index,
                         delta=DeltaMessage(content=delta),
-                        finish_reason=(
-                            finish_reason["type"]
-                            if finish_reason
-                            else ""
-                        ),
-                        stop_reason=(
-                            finish_reason["matched"]
-                            if finish_reason
-                            else ""
-                        ),
+                        finish_reason=(finish_reason["type"] if finish_reason else ""),
+                        stop_reason=(finish_reason["matched"] if finish_reason else ""),
                         logprobs=choice_logprobs,
                     )
                     chunk = ChatCompletionStreamResponse(
