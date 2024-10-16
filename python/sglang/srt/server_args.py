@@ -113,6 +113,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_penalizer: bool = False
+    enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     max_torch_compile_bs: int = 32
@@ -571,6 +572,11 @@ class ServerArgs:
             "--disable-penalizer",
             action="store_true",
             help="Disable the logit penalizer (e.g., frequency and repetition penalty).",
+        )
+        parser.add_argument(
+            "--enable-overlap-schedule",
+            action="store_true",
+            help="Overlap the CPU scheduler with GPU model worker. Experimental feature.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",
