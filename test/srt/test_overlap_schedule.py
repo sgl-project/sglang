@@ -56,7 +56,7 @@ class TestOverlapSchedule(unittest.TestCase):
 
     @unittest.skip("did not support")
     def test_radix_attention_chunked_prefill(self):
-        print("test_radix_attention_no_chunked_prefill")
+        print("test_radix_attention_chunked_prefill")
         self.run_mmlu(disable_radix_cache=False, chunked_prefill_size=32)
 
 
