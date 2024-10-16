@@ -296,16 +296,12 @@ class Scheduler:
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             if batch:
-                # logger.info(f"Run batch {str(batch)} begin")
                 result = self.run_batch(batch)
                 result_queue.put((batch.copy(), result))
-                # logger.info(f"Run batch {str(batch)} end")
 
             if self.last_batch:
                 tmp_batch, tmp_result = result_queue.get()
-                # logger.info(f"Process batch {str(tmp_batch)} begin")
                 self.process_batch_result(tmp_batch, tmp_result)
-                # logger.info(f"Process batch {str(tmp_batch)} end")
             elif batch is None:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
@@ -738,11 +734,6 @@ class Scheduler:
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
         if self.is_generation:
             logits_output, next_token_ids = result
-            if batch.sampling_info.penalizer_orchestrator:
-                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                    next_token_ids
-                )
-
             if batch.return_logprob:
                 # Move logprobs to cpu
                 if logits_output.next_token_logprobs is not None:
@@ -815,10 +806,6 @@ class Scheduler:
 
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
         logits_output, next_token_ids = result
-        if batch.sampling_info.penalizer_orchestrator:
-            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                next_token_ids
-            )
         self.num_generated_tokens += len(batch.reqs)
 
         # Move logprobs to cpu
@@ -1114,7 +1101,10 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank)
         pipe_writer.send("ready")
-        scheduler.event_loop_overlap()
+        if server_args.enable_overlap_schedule:
+            scheduler.event_loop_overlap()
+        else:
+            scheduler.event_loop_normal()
     except Exception:
         msg = get_exception_traceback()
         logger.error(msg)

@@ -114,7 +114,6 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(token_ids, kv_indices.clone())
-        # print(f"cache_finished_req {token_ids=} {len(req.prefix_indices)=} {new_prefix_len=} {free_delta=}")
         self.token_to_kv_pool.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
         if free_delta:
             self.token_to_kv_pool.free(
@@ -131,7 +130,6 @@ class RadixCache(BasePrefixCache):
         """Cache request when it is unfinished."""
         if self.disable:
             return
-        return
 
         if token_ids is None:
             token_ids = req.fill_ids
