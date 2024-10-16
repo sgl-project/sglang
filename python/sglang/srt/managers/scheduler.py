@@ -353,11 +353,11 @@ class Scheduler:
         ):
             if req.sampling_params.json_schema is not None:
                 req.regex_bnf = self.regex_bnf_cache.query(
-                    ("json", req.sampling_params.json_schema)
+                    "json", req.sampling_params.json_schema, self.model_config.vocab_size
                 )
             elif req.sampling_params.regex is not None:
                 req.regex_bnf = self.regex_bnf_cache.query(
-                    ("regex", req.sampling_params.regex)
+                    "regex", req.sampling_params.regex, self.model_config.vocab_size 
                 )
             if not self.disable_regex_jump_forward:
                 req.allow_jump_forward = True

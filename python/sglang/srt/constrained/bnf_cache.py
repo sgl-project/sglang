@@ -42,16 +42,14 @@ class BNFCache:
             tokenizer_or_vocab=self.tokenizer
         )
 
-    def get_context(self, key) -> GrammarMatcherInitContext:
-        key_type, key_string = key
-
+    def get_context(self, key_type, key_str) -> GrammarMatcherInitContext:
         if key_type == "json":
-            return self.grammar_cache.get_init_context_for_json_schema(key_string)
+            return self.grammar_cache.get_init_context_for_json_schema(key_str)
         elif key_type == "regex":
             raise ValueError(f"regex hasn't been supported by xgrammar yet")
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
-    def query(self, key) -> GrammarMatcher:
-        ctx = self.get_context(key)
-        return GrammarMatcher(ctx, max_rollback_tokens=MAX_ROLLBACK_STEPS)
+    def query(self, key_type: str, key_str : str, vocab_size : int) -> GrammarMatcher:
+        ctx = self.get_context(key_type, key_str)
+        return GrammarMatcher(ctx, max_rollback_tokens=MAX_ROLLBACK_STEPS, mask_vocab_size=vocab_size)
