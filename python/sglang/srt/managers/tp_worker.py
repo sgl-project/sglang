@@ -217,7 +217,7 @@ class TpModelWorker:
         ) % self.future_token_ids_limit
         ret = future_logits_output, future_next_token_ids
 
-        self.event_map[model_worker_batch.bid] = threading.Event()
+        self.future_event_map[model_worker_batch.bid] = threading.Event()
         self.forward_queue.put(
             (model_worker_batch.copy(), future_logits_output, future_next_token_ids)
         )
