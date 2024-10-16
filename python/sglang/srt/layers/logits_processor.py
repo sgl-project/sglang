@@ -184,6 +184,11 @@ class LogitsProcessor(nn.Module):
             last_hidden = hidden_states
         else:
             last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+            # print('&&&')
+            # print(logits_metadata.extend_seq_lens)
+            # print(last_index)
+            # print(hidden_states.shape)
+            # print('&&&')
             last_hidden = hidden_states[last_index]
 
         if spec_info:

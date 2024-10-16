@@ -76,15 +76,27 @@ def eagle_verify_retrive(
     accept_len_list = tl.load(
         accept_ptr + accept_offset, mask=accept_load_mask, other=-1
     )
-    max_index = tl.argmax(accept_len_list, axis=0)
+
     accept_len = tl.max(accept_len_list)
+    max_index = tl.argmax(accept_len_list, axis=0, tie_break_left=True)
+    # triton is not support argmax with tie_break_right, so I need implement it by some way
+    mask_max = accept_len_list == accept_len
+    
+    count_mask = tl.full(shape=[draft_token_num], value=0, dtype=tl.int32)
+    
+    count = tl.sum(tl.where(mask_max, 1, count_mask))
+    if count>1:
+        index = tl.arange(0, draft_token_num)
+        mask_left = index != max_index
+        remained_index = tl.where(mask_max and mask_left, index, 0)
+        max_index = tl.max(remained_index)
 
     tl.store(accept_length + pid, accept_len)
     retrive_index_ptr = retrive_index + (retrive_start + max_index) * max_len
     retrive_offset = tl.arange(0, max_len_upper)
     retrive_load_mask = retrive_offset < accept_len + 1
     data = tl.load(retrive_index_ptr + retrive_offset, mask=retrive_load_mask)
-
+    
     tl.store(
         accept_index + pid * max_len + retrive_offset, data, mask=retrive_load_mask
     )
@@ -488,6 +500,7 @@ class EagleVerifyInput(SpecVerifyInput):
 
     def verify(self, batch: ScheduleBatch, logits_output: torch.Tensor) -> torch.Tensor:
         predict = torch.argmax(logits_output.next_token_logits, dim=-1)
+        predict = torch.cat([predict, torch.full([1], -1, dtype=torch.long, device='cuda')], dim=-1)
         target_predict = predict[self.retrive_index]
         candidates = self.draft_token[self.retrive_index]
         # logits = logits_output.next_token_logits[self.retrive_index]
@@ -514,6 +527,7 @@ class EagleVerifyInput(SpecVerifyInput):
             self.draft_token_num,
             triton.next_power_of_2(max_draft_len),
         )
+        old_accept_index = accept_index
         accept_index = accept_index[accept_index != -1]
         #extract_index = extract_index[extract_index != 0]
         
@@ -527,6 +541,16 @@ class EagleVerifyInput(SpecVerifyInput):
             accept_index
         ]
         draft_input.accept_length = accept_length
+        
+        
+        if accept_length.item() != accept_index.numel()-1:
+            print(target_predict)
+            print(candidates)
+            print(accept_index)
+            print(old_accept_index)
+            print(accept_length)
+            print(self.retrive_index)
+            print(accept_mask)
         
 
         
