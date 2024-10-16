@@ -626,7 +626,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 "logprobs": logprobs,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
                 "stop_reason": (
-                    finish_reason["matched"] if "matched" in finish_reason else ""
+                    finish_reason["matched"] if "matched" in finish_reason else None
                 ),
             }
         else:
@@ -636,7 +636,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 logprobs=logprobs,
                 finish_reason=(finish_reason["type"] if finish_reason else ""),
                 stop_reason=(
-                    finish_reason["matched"] if "matched" in finish_reason else ""
+                    finish_reason["matched"] if "matched" in finish_reason else None
                 ),
             )
 
@@ -775,7 +775,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         stop_reason=(
                             finish_reason["matched"]
                             if "matched" in finish_reason
-                            else ""
+                            else None
                         ),
                     )
                     chunk = CompletionStreamResponse(
@@ -1023,7 +1023,7 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 "logprobs": choice_logprobs,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
                 "stop_reason": (
-                    finish_reason["matched"] if "matched" in finish_reason else ""
+                    finish_reason["matched"] if "matched" in finish_reason else None
                 ),
             }
         else:
@@ -1033,7 +1033,7 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 logprobs=choice_logprobs,
                 finish_reason=(finish_reason["type"] if finish_reason else ""),
                 stop_reason=(
-                    finish_reason["matched"] if "matched" in finish_reason else ""
+                    finish_reason["matched"] if "matched" in finish_reason else None
                 ),
             )
 
@@ -1166,7 +1166,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             stop_reason=(
                                 finish_reason["matched"]
                                 if "matched" in finish_reason
-                                else ""
+                                else None
                             ),
                             logprobs=choice_logprobs,
                         )
@@ -1187,7 +1187,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         stop_reason=(
                             finish_reason["matched"]
                             if "matched" in finish_reason
-                            else ""
+                            else None
                         ),
                         logprobs=choice_logprobs,
                     )

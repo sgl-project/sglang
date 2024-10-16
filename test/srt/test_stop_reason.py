@@ -128,10 +128,10 @@ class TestJSONConstrained(unittest.TestCase):
 
     def test_finish_length(self):
         self.run_completions_generation(
-            max_tokens=5, finish_reason="length", stop_reason=""
+            max_tokens=5, finish_reason="length", stop_reason=None
         )
         self.run_chat_completions_generation(
-            max_tokens=5, finish_reason="length", stop_reason=""
+            max_tokens=5, finish_reason="length", stop_reason=None
         )
 
 
