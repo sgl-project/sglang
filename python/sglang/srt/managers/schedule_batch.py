@@ -736,6 +736,10 @@ class ScheduleBatch:
         self.input_ids = self.output_ids
         self.seq_lens.add_(1)
         self.output_ids = None
+        if self.sampling_info.penalizer_orchestrator:
+            self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                self.input_ids
+            )
 
         # Alloc mem
         bs = len(self.reqs)
