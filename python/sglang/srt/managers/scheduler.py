@@ -257,6 +257,9 @@ class Scheduler:
             self.forward_batch_generation = (
                 self.tp_worker.forward_batch_generation_non_blocking
             )
+            self.resolve_next_token_ids = (
+                lambda bid, x: self.tp_worker.resolve_future_token_ids(bid)
+            )
 
             def cache_finished_req(req):
                 free_delta = int(self.running_batch and req in self.cur_batch.reqs)
@@ -265,6 +268,7 @@ class Scheduler:
             self.cache_finished_req = cache_finished_req
         else:
             self.forward_batch_generation = self.tp_worker.forward_batch_generation
+            self.resolve_next_token_ids = lambda bid, x: x.tolist()
             self.cache_finished_req = self.tree_cache.cache_finished_req
 
     @torch.inference_mode()
@@ -767,7 +771,7 @@ class Scheduler:
                         logits_output.normalized_prompt_logprobs.tolist()
                     )
 
-            next_token_ids = next_token_ids.tolist()
+            next_token_ids = self.resolve_next_token_ids(bid, next_token_ids)
 
             # Check finish conditions
             logprob_pt = 0
@@ -828,7 +832,7 @@ class Scheduler:
                 next_token_ids,
             ].tolist()
 
-        next_token_ids = next_token_ids.tolist()
+        next_token_ids = self.resolve_next_token_ids(bid, next_token_ids)
 
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):

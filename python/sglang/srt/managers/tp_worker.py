@@ -186,6 +186,15 @@ class TpModelWorker:
                         f"{self.acc_time_with_waiting=:.3f}, {self.acc_time_without_waiting=:.3f}, {self.forward_queue.qsize()=}"
                     )
 
+    def resolve_future_token_ids(self, bid: int):
+        self.future_event_map[bid].wait()
+        ret = self.future_token_ids_output[bid]
+        del self.future_event_map[bid]
+        return ret
+
+    def resolve_future_logits_output(self, future_obj):
+        return self.future_logits_output_dict.pop(future_obj)
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
