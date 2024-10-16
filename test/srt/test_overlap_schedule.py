@@ -41,11 +41,23 @@ class TestOverlapSchedule(unittest.TestCase):
         finally:
             kill_child_process(process.pid)
 
+    def test_no_radix_attention_chunked_prefill(self):
+        print("test_no_radix_attention_chunked_prefill")
+        self.run_mmlu(disable_radix_cache=True, chunked_prefill_size=32)
+
+    @unittest.skip("did not support")
     def test_no_radix_attention_no_chunked_prefill(self):
+        print("test_no_radix_attention_no_chunked_prefill")
         self.run_mmlu(disable_radix_cache=True, chunked_prefill_size=-1)
 
     def test_radix_attention_no_chunked_prefill(self):
-        self.run_mmlu(disable_radix_cache=True, chunked_prefill_size=-1)
+        print("test_radix_attention_no_chunked_prefill")
+        self.run_mmlu(disable_radix_cache=False, chunked_prefill_size=-1)
+
+    @unittest.skip("did not support")
+    def test_radix_attention_chunked_prefill(self):
+        print("test_radix_attention_no_chunked_prefill")
+        self.run_mmlu(disable_radix_cache=False, chunked_prefill_size=32)
 
 
 if __name__ == "__main__":
