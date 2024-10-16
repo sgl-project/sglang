@@ -508,29 +508,35 @@ cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal):
+    def calculate_num_image_tokens(self, image_grid_thw: Tuple[int, int, int]):
+        processor = cached_get_processor(self.config._name_or_path)
+        grid_t, grid_h, grid_w = image_grid_thw
+        num_image_tokens = (
+            grid_t
+            * grid_h
+            * grid_w
+            // processor.image_processor.merge_size
+            // processor.image_processor.merge_size
+        )
+        return num_image_tokens
+
     # Use grid_t * grid_w * grid_h to pad tokens for each image
     # and replaced padding by unique image hash
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
-        pixel_values = image_inputs.pixel_values
         image_grid_thws = image_inputs.image_grid_thws
-        # TODO: very slow, find a better way to get image hash
-        image_hash = hash(pixel_values.tobytes()) % self.config.vocab_size
+        pad_values = image_inputs.pad_values
+
         image_indices = [
             idx
             for idx, token in enumerate(input_ids)
             if token == self.config.image_token_id
         ]
-        processor = cached_get_processor(self.config._name_or_path)
+        image_inputs.image_offsets = []
 
         input_ids_with_image = []
         for image_cnt, _ in enumerate(image_grid_thws):
-            grid_t, grid_h, grid_w = image_grid_thws[image_cnt]
-            num_image_tokens = (
-                grid_t
-                * grid_h
-                * grid_w
-                // processor.image_processor.merge_size
-                // processor.image_processor.merge_size
+            num_image_tokens = self.calculate_num_image_tokens(
+                image_grid_thws[image_cnt]
             )
             if image_cnt == 0:
                 non_image_tokens = input_ids[: image_indices[image_cnt]]
@@ -539,7 +545,11 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal):
                     image_indices[image_cnt - 1] + 1 : image_indices[image_cnt]
                 ]
             input_ids_with_image.extend(non_image_tokens)
-            input_ids_with_image.extend(image_hash for _ in range(num_image_tokens))
+            image_inputs.image_offsets.append(len(input_ids_with_image))
+            pad_ids = pad_values * (
+                (num_image_tokens + len(pad_values)) // len(pad_values)
+            )
+            input_ids_with_image.extend(pad_ids[:num_image_tokens])
         input_ids_with_image.extend(input_ids[image_indices[-1] + 1 :])
 
         return input_ids_with_image
@@ -587,17 +597,6 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal):
         )
         return video_embeds
 
-    def _merge_multimodal_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        inputs_embeds: torch.Tensor,
-        multimodal_embeddings: torch.Tensor,
-        placeholder_token_id: int,
-    ) -> torch.Tensor:
-        mask = input_ids == placeholder_token_id
-        inputs_embeds[mask, :] = multimodal_embeddings
-        return inputs_embeds
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -628,7 +627,7 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         positions = forward_batch.mrope_positions
         if image_inputs is None or len(image_inputs) == 0:
-            inputs_embeds = None
+            inputs_embeds = self.model.embed_tokens(input_ids)
         else:
             if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
                 assert positions.ndim == 2 and positions.size(0) == 3, (
@@ -637,34 +636,39 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal):
                 )
 
             inputs_embeds = self.model.embed_tokens(input_ids)
+            extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
+            prefix_lens_cpu = forward_batch.extend_prefix_lens.cpu().numpy()
+            for i, image in enumerate(forward_batch.image_inputs):
+                if image == None:
+                    continue
+                start_idx = extend_start_loc_cpu[i]
+                prefix_len = prefix_lens_cpu[i]
 
-            pixel_values_list = [
-                image_input.pixel_values
-                for image_input in image_inputs
-                if image_input is not None
-            ]
-            image_grid_thws_list = [
-                image_input.image_grid_thws
-                for image_input in image_inputs
-                if image_input is not None
-            ]
-            for pixel_values, image_grid_thws in zip(
-                pixel_values_list, image_grid_thws_list
-            ):
-                # TODO: very slow, find a better way to get image hash
-                image_hash = hash(pixel_values.tobytes()) % self.config.vocab_size
-                pixel_values = torch.tensor(pixel_values, device="cuda")
-                image_grid_thws = torch.tensor(np.array(image_grid_thws), device="cuda")
+                pixel_values = torch.tensor(image.pixel_values, device="cuda")
+                image_grid_thws = torch.tensor(
+                    np.array(image.image_grid_thws), device="cuda"
+                )
+                image_offsets = image.image_offsets
                 image_input = Qwen2VLImageInputs(
                     pixel_values=pixel_values, image_grid_thw=image_grid_thws
                 )
                 image_embeds = self._process_image_input(image_input)
-                inputs_embeds = self._merge_multimodal_embeddings(
-                    input_ids,
-                    inputs_embeds,
-                    image_embeds,
-                    placeholder_token_id=image_hash,
-                )
+
+                image_embeds_offset = 0
+                for idx, image_offset in enumerate(image_offsets):
+                    if image_offset < prefix_len:
+                        continue
+                    num_image_tokens = self.calculate_num_image_tokens(
+                        image_grid_thws[idx]
+                    )
+                    left_idx = start_idx + (image_offset - prefix_len)
+                    right_idx = (
+                        start_idx + (image_offset - prefix_len) + num_image_tokens
+                    )
+                    inputs_embeds[left_idx:right_idx] = image_embeds[
+                        image_embeds_offset : image_embeds_offset + num_image_tokens
+                    ]
+                    image_embeds_offset += num_image_tokens
 
             input_ids = None
 

@@ -303,7 +303,6 @@ class TestQWen2VLServer(TestOpenAIVisionServer):
             other_args=[
                 "--chat-template",
                 "qwen2-vl",
-                "--disable-radix-cache",
                 "--disable-cuda-graph",
             ],
         )

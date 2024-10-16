@@ -138,9 +138,10 @@ class ForwardBatch:
                     mrope_positions = [[i for i in range(self.seq_lens[i])]] * 3
                     mrope_position_delta = 0
                 else:
-                    extend_start_loc, extend_seq_len = (
+                    extend_start_loc, extend_seq_len, extend_prefix_len = (
                         self.extend_start_loc[i],
                         self.extend_seq_lens[i],
+                        self.extend_prefix_lens[i],
                     )
                     mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
@@ -155,6 +156,7 @@ class ForwardBatch:
                             vision_end_token_id=hf_config.vision_end_token_id,
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
                             context_len=0,
+                            extend_prefix_len=extend_prefix_len.item(),
                         )
                     )
                 mrope_positions_list[i] = mrope_positions
