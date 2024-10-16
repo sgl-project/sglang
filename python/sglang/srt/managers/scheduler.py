@@ -193,16 +193,6 @@ class Scheduler:
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.policy = SchedulePolicy(self.schedule_policy, self.tree_cache)
 
-        if self.server_args.enable_overlap_schedule:
-
-            def cache_finished_req(req):
-                free_delta = int(self.running_batch and req in self.cur_batch.reqs)
-                self.tree_cache.cache_finished_req(req, free_delta=free_delta)
-
-        else:
-            cache_finished_req = self.tree_cache.cache_finished_req
-        self.cache_finished_req = cache_finished_req
-
         # Init running status
         self.waiting_queue: List[Req] = []
         self.running_batch: Optional[ScheduleBatch] = None
@@ -245,6 +235,7 @@ class Scheduler:
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.batch_is_full = False
 
+        # Init profiler
         if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
             self.profiler = None
         else:
@@ -260,6 +251,21 @@ class Scheduler:
                 ],
                 with_stack=True,
             )
+
+        # Init states for overlap schedule
+        if self.server_args.enable_overlap_schedule:
+            self.forward_batch_generation = (
+                self.tp_worker.forward_batch_generation_non_blocking
+            )
+
+            def cache_finished_req(req):
+                free_delta = int(self.running_batch and req in self.cur_batch.reqs)
+                self.tree_cache.cache_finished_req(req, free_delta=free_delta)
+
+            self.cache_finished_req = cache_finished_req
+        else:
+            self.forward_batch_generation = self.tp_worker.forward_batch_generation
+            self.cache_finished_req = self.tree_cache.cache_finished_req
 
     @torch.inference_mode()
     def event_loop_normal(self):
@@ -712,7 +718,7 @@ class Scheduler:
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
                 model_worker_batch = batch.get_model_worker_batch()
-                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+                logits_output, next_token_ids = self.forward_batch_generation(
                     model_worker_batch
                 )
             else:
