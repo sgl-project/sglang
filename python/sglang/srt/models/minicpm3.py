@@ -21,7 +21,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -108,7 +107,7 @@ class MiniCPM3Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
     ) -> None:
@@ -252,7 +251,7 @@ class MiniCPM3AttentionMLA(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
     ) -> None:
@@ -409,7 +408,7 @@ class MiniCPM3DecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -501,7 +500,7 @@ class MiniCPM3Model(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -552,7 +551,7 @@ class MiniCPM3ForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
