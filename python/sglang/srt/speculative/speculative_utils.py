@@ -83,7 +83,6 @@ def eagle_verify_retrive(
     mask_max = accept_len_list == accept_len
     
     count_mask = tl.full(shape=[draft_token_num], value=0, dtype=tl.int32)
-    
     count = tl.sum(tl.where(mask_max, 1, count_mask))
     if count>1:
         index = tl.arange(0, draft_token_num)
@@ -185,7 +184,7 @@ class EAGLEDraftInput(SpecDraftInput):
     def init(self, server_args: ServerArgs):
         self.prev_mode = ForwardMode.DECODE
         self.sample_output = None
-        self.topk: int = 10
+        self.topk: int = 8
         self.num_verify_token: int = server_args.num_draft_tokens
         self.spec_steps = server_args.num_speculative_steps
 
@@ -501,8 +500,9 @@ class EagleVerifyInput(SpecVerifyInput):
     def verify(self, batch: ScheduleBatch, logits_output: torch.Tensor) -> torch.Tensor:
         predict = torch.argmax(logits_output.next_token_logits, dim=-1)
         predict = torch.cat([predict, torch.full([1], -1, dtype=torch.long, device='cuda')], dim=-1)
+        draft_token = torch.cat([self.draft_token, torch.full([1], -1, dtype=torch.long, device='cuda')], dim=-1)
         target_predict = predict[self.retrive_index]
-        candidates = self.draft_token[self.retrive_index]
+        candidates = draft_token[self.retrive_index]
         # logits = logits_output.next_token_logits[self.retrive_index]
         # target_predict = torch.argmax(logits[:, :-1], dim=-1)
         accept_mask = candidates[:, 1:] == target_predict[:, :-1]
@@ -515,7 +515,6 @@ class EagleVerifyInput(SpecVerifyInput):
         )
         accept_length = torch.empty((bs,), dtype=torch.int, device="cuda")
         extract_index = torch.full((bs * 2,), 0, dtype=torch.int, device="cuda")
-
         eagle_verify_retrive[(bs,)](
             self.retrive_index.contiguous(),
             accept_mask.contiguous(),
@@ -541,18 +540,6 @@ class EagleVerifyInput(SpecVerifyInput):
             accept_index
         ]
         draft_input.accept_length = accept_length
-        
-        
-        if accept_length.item() != accept_index.numel()-1:
-            print(target_predict)
-            print(candidates)
-            print(accept_index)
-            print(old_accept_index)
-            print(accept_length)
-            print(self.retrive_index)
-            print(accept_mask)
-        
-
         
         verified_id_cpu = draft_input.verified_id.tolist()
 
