@@ -766,10 +766,13 @@ class Scheduler:
                     req.check_finished()
 
                     if req.finished():
-                        if self.running_batch and req in self.cur_batch.reqs:
-                            self.tree_cache.cache_finished_req(req, free_delta=1)
-                        else:
+                        if not self.server_args.enable_overlap_schedule:
                             self.tree_cache.cache_finished_req(req)
+                        else:
+                            if self.running_batch and req in self.cur_batch.reqs:
+                                self.tree_cache.cache_finished_req(req, free_delta=1)
+                            else:
+                                self.tree_cache.cache_finished_req(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
 
@@ -798,7 +801,13 @@ class Scheduler:
                     req.check_finished()
 
                 if req.finished():
-                    self.tree_cache.cache_finished_req(req)
+                    if not self.server_args.enable_overlap_schedule:
+                        self.tree_cache.cache_finished_req(req)
+                    else:
+                        if self.running_batch and req in self.cur_batch.reqs:
+                            self.tree_cache.cache_finished_req(req, free_delta=1)
+                        else:
+                            self.tree_cache.cache_finished_req(req)
                 else:
                     self.tree_cache.cache_unfinished_req(req)
 
@@ -819,7 +828,7 @@ class Scheduler:
 
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-            if req.finished():
+            if self.server_args.enable_overlap_schedule and req.finished():
                 continue
 
             req.completion_tokens_wo_jump_forward += 1
