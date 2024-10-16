@@ -53,6 +53,7 @@ ALL_OTHER_MODELS = [
     ModelCase("Qwen/Qwen2-1.5B"),
     ModelCase("Qwen/Qwen2.5-14B-Instruct"),
     ModelCase("HuggingFaceTB/SmolLM-135M-Instruct"),
+    ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2),
 ]
 
 TORCH_DTYPES = [torch.float16]
@@ -153,7 +154,10 @@ class TestGenerationModels(unittest.TestCase):
 
             # Skip long prompts for models that does not have a long context
             prompts = DEFAULT_PROMPTS
-            if model_case.model_path in ["HuggingFaceTB/SmolLM-135M-Instruct"]:
+            if model_case.model_path in [
+                "HuggingFaceTB/SmolLM-135M-Instruct",
+                "allenai/OLMo-1B-0724-hf",
+            ]:
                 prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
 
             # Assert the logits and output strs are close
