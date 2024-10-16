@@ -841,10 +841,13 @@ class Scheduler:
                 )
 
             if req.finished():
-                if self.running_batch and req in self.cur_batch.reqs:
-                    self.tree_cache.cache_finished_req(req, free_delta=1)
-                else:
+                if not self.server_args.enable_overlap_schedule:
                     self.tree_cache.cache_finished_req(req)
+                else:
+                    if self.running_batch and req in self.cur_batch.reqs:
+                        self.tree_cache.cache_finished_req(req, free_delta=1)
+                    else:
+                        self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob:
                 req.output_token_logprobs.append(
