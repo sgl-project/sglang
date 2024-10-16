@@ -1,3 +1,9 @@
+"""
+Usage:
+SGLANG_IS_IN_CI=true python3 -m unittest test_overlap_schedule.TestOverlapSchedule.test_radix_attention_chunked_prefill
+SGLANG_IS_IN_CI=true python3 test_overlap_schedule.py
+"""
+
 import unittest
 from types import SimpleNamespace
 
@@ -42,22 +48,18 @@ class TestOverlapSchedule(unittest.TestCase):
             kill_child_process(process.pid)
 
     def test_no_radix_attention_chunked_prefill(self):
-        print("test_no_radix_attention_chunked_prefill")
         self.run_mmlu(disable_radix_cache=True, chunked_prefill_size=32)
 
     def test_no_radix_attention_no_chunked_prefill(self):
-        print("test_no_radix_attention_no_chunked_prefill")
         self.run_mmlu(disable_radix_cache=True, chunked_prefill_size=-1)
 
-    def test_radix_attention_no_chunked_prefill(self):
-        print("test_radix_attention_no_chunked_prefill")
-        self.run_mmlu(disable_radix_cache=False, chunked_prefill_size=-1)
-
-    @unittest.skip("did not support")
     def test_radix_attention_chunked_prefill(self):
-        print("test_radix_attention_chunked_prefill")
         self.run_mmlu(disable_radix_cache=False, chunked_prefill_size=32)
+
+    def test_radix_attention_no_chunked_prefill(self):
+        self.run_mmlu(disable_radix_cache=False, chunked_prefill_size=-1)
 
 
 if __name__ == "__main__":
     unittest.main()
+    # @unittest.skip("did not support")
