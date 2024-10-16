@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestChunkedPrefill(unittest.TestCase):
+class TestOverlapSchedule(unittest.TestCase):
     def run_mmlu(self, disable_radix_cache, chunked_prefill_size=32):
         other_args = ["--chunked-prefill-size", str(chunked_prefill_size)]
         if disable_radix_cache:
