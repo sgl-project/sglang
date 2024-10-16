@@ -50,6 +50,8 @@ class BNFCache:
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
-    def query(self, key_type: str, key_str : str, vocab_size : int) -> GrammarMatcher:
+    def query(self, key_type: str, key_str: str, vocab_size: int) -> GrammarMatcher:
         ctx = self.get_context(key_type, key_str)
-        return GrammarMatcher(ctx, max_rollback_tokens=MAX_ROLLBACK_STEPS, mask_vocab_size=vocab_size)
+        return GrammarMatcher(
+            ctx, max_rollback_tokens=MAX_ROLLBACK_STEPS, mask_vocab_size=vocab_size
+        )
