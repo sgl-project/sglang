@@ -117,10 +117,9 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
-    def init_multimuldal_info(self, batch: ScheduleBatch):
-        self.image_inputs = [r.image_inputs for r in batch.reqs]
-
-    def compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
+    def compute_mrope_positions(
+        self, model_runner: ModelRunner, batch: ModelWorkerBatch
+    ):
         device = model_runner.device
         hf_config = model_runner.model_config.hf_config
         mrope_positions_list = [None] * self.seq_lens.shape[0]
@@ -147,7 +146,7 @@ class ForwardBatch:
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=self.input_ids[
                                 extend_start_loc : extend_start_loc + extend_seq_len
-                            ],
+                            ].tolist(),
                             image_grid_thw=image_inputs.image_grid_thws,
                             video_grid_thw=None,
                             image_token_id=hf_config.image_token_id,
@@ -171,7 +170,7 @@ class ForwardBatch:
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
-    def compute_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
+    def compute_positions(self, model_runner: ModelRunner, batch: ModelWorkerBatch):
         device = model_runner.device
         if self.forward_mode.is_decode():
             self.positions = (self.seq_lens - 1).to(torch.int64)
@@ -189,16 +188,6 @@ class ForwardBatch:
                 device=device,
             ).to(torch.int64)
 
-    def compute_extend_infos(self, model_runner: ModelRunner, batch: ScheduleBatch):
-        device = model_runner.device
-        self.extend_seq_lens = torch.tensor(batch.extend_lens_cpu, device=device)
-        self.extend_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device=device)
-        self.extend_start_loc = torch.zeros_like(self.extend_seq_lens)
-        self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
-        self.extend_no_prefix = all(x == 0 for x in batch.prefix_lens_cpu)
-        self.extend_seq_lens_cpu = batch.extend_lens_cpu
-        self.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens_cpu
-    
     @classmethod
     def init_new(
         cls,
@@ -206,6 +195,7 @@ class ForwardBatch:
         model_runner: ModelRunner,
     ):
 
+        device = model_runner.device
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -221,9 +211,9 @@ class ForwardBatch:
 
         if not batch.forward_mode.is_decode():
             ret.image_inputs = batch.image_inputs
-            ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device="cuda")
+            ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device=device)
             ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, device="cuda"
+                batch.extend_prefix_lens, device=device
             )
             ret.extend_start_loc = torch.zeros_like(ret.extend_seq_lens)
             ret.extend_start_loc[1:] = torch.cumsum(ret.extend_seq_lens[:-1], dim=0)
@@ -236,10 +226,6 @@ class ForwardBatch:
             ret.compute_mrope_positions(model_runner, batch)
         else:
             ret.compute_positions(model_runner, batch)
-            
-        if not batch.forward_mode.is_decode():
-            ret.init_multimuldal_info(batch)
-            ret.compute_extend_infos(model_runner, batch)
 
         # Init attention information
         ret.req_to_token_pool = model_runner.req_to_token_pool

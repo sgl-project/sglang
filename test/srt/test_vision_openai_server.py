@@ -303,7 +303,6 @@ class TestQWen2VLServer(TestOpenAIVisionServer):
             other_args=[
                 "--chat-template",
                 "qwen2-vl",
-                "--disable-cuda-graph",
             ],
         )
         cls.base_url += "/v1"
