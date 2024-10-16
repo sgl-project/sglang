@@ -616,6 +616,8 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
         else:
             logprobs = None
 
+        finish_reason = ret_item["meta_info"]["finish_reason"]
+
         if to_file:
             # to make the choise data json serializable
             choice_data = {
@@ -623,8 +625,13 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 "text": text,
                 "logprobs": logprobs,
                 "finish_reason": (
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
+                    finish_reason["type"]
+                    if finish_reason
+                    else ""
+                ),
+                "stop_reason": (
+                    finish_reason["matched"]
+                    if finish_reason
                     else ""
                 ),
             }
@@ -634,8 +641,13 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 text=text,
                 logprobs=logprobs,
                 finish_reason=(
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
+                    finish_reason["type"]
+                    if finish_reason
+                    else ""
+                ),
+                stop_reason=(
+                    finish_reason["matched"]
+                    if finish_reason
                     else ""
                 ),
             )
@@ -766,15 +778,21 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
                     delta = text[len(stream_buffer) :]
                     stream_buffer = stream_buffer + delta
+                    finish_reason = content["meta_info"]["finish_reason"]
                     choice_data = CompletionResponseStreamChoice(
                         index=index,
                         text=delta,
                         logprobs=logprobs,
                         finish_reason=(
-                            content["meta_info"]["finish_reason"]["type"]
-                            if content["meta_info"]["finish_reason"]
+                            finish_reason["type"]
+                            if finish_reason
                             else ""
                         ),
+                        stop_reason=(
+                            finish_reason["matched"]
+                            if finish_reason
+                            else ""
+                        )
                     )
                     chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
@@ -1011,6 +1029,8 @@ def v1_chat_generate_response(request, ret, to_file=False):
         else:
             choice_logprobs = None
 
+        finish_reason = ret_item["meta_info"]["finish_reason"]
+
         if to_file:
             # to make the choice data json serializable
             choice_data = {
@@ -1018,8 +1038,13 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 "message": {"role": "assistant", "content": ret_item["text"]},
                 "logprobs": choice_logprobs,
                 "finish_reason": (
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
+                    finish_reason["type"]
+                    if finish_reason
+                    else ""
+                ),
+                "stop_reason": (
+                    finish_reason["matched"]
+                    if finish_reason
                     else ""
                 ),
             }
@@ -1029,10 +1054,15 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 message=ChatMessage(role="assistant", content=ret_item["text"]),
                 logprobs=choice_logprobs,
                 finish_reason=(
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
+                    finish_reason["type"]
+                    if finish_reason
                     else ""
                 ),
+                stop_reason=(
+                    finish_reason["matched"]
+                    if finish_reason
+                    else ""
+                )
             )
 
         choices.append(choice_data)
@@ -1150,6 +1180,8 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     else:
                         choice_logprobs = None
 
+                    finish_reason = content["meta_info"]["finish_reason"]
+
                     if is_first:
                         # First chunk with role
                         is_first = False
@@ -1157,8 +1189,13 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             index=index,
                             delta=DeltaMessage(role="assistant"),
                             finish_reason=(
-                                content["meta_info"]["finish_reason"]["type"]
-                                if content["meta_info"]["finish_reason"]
+                                finish_reason["type"]
+                                if finish_reason
+                                else ""
+                            ),
+                            stop_reason=(
+                                finish_reason["matched"]
+                                if finish_reason
                                 else ""
                             ),
                             logprobs=choice_logprobs,
@@ -1177,8 +1214,13 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         index=index,
                         delta=DeltaMessage(content=delta),
                         finish_reason=(
-                            content["meta_info"]["finish_reason"]["type"]
-                            if content["meta_info"]["finish_reason"]
+                            finish_reason["type"]
+                            if finish_reason
+                            else ""
+                        ),
+                        stop_reason=(
+                            finish_reason["matched"]
+                            if finish_reason
                             else ""
                         ),
                         logprobs=choice_logprobs,
