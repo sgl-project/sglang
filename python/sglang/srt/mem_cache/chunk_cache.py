@@ -42,10 +42,12 @@ class ChunkCache(BasePrefixCache):
         self, req: Req, token_ids: Optional[List[int]] = None, free_delta: int = 0
     ):
         if token_ids is None:
-            token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+            token_id_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        else:
+            token_id_len = len(token_ids)
 
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids) + free_delta
+            req.req_pool_idx, : token_id_len + free_delta
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool.free(kv_indices)
@@ -55,10 +57,12 @@ class ChunkCache(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         if token_ids is None:
-            token_ids = req.fill_ids
+            token_id_len = len(req.fill_ids)
+        else:
+            token_id_len = len(token_ids)
 
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :token_id_len
         ]
 
         if req.rid not in self.entries:
