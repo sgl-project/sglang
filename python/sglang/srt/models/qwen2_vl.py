@@ -45,7 +45,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2Model
 
 logger = init_logger(__name__)
@@ -602,7 +602,7 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ):
         """Run forward pass for Qwen2-VL.
 
@@ -621,12 +621,12 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal):
                 `None` if no images are passed.
         """
         image_inputs = None
-        if input_metadata.image_inputs is not None:
+        if forward_batch.image_inputs is not None:
             image_inputs = [
-                img for img in input_metadata.image_inputs if img is not None
+                img for img in forward_batch.image_inputs if img is not None
             ]
 
-        positions = input_metadata.mrope_positions
+        positions = forward_batch.mrope_positions
         if image_inputs is None or len(image_inputs) == 0:
             inputs_embeds = None
         else:
@@ -671,11 +671,11 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal):
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
             input_embeds=inputs_embeds,
         )
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

@@ -32,11 +32,11 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 
 import numpy as np
 import torch
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
+
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention import AttentionBackend
@@ -123,26 +123,31 @@ class ForwardBatch:
     def compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
         device = model_runner.device
         hf_config = model_runner.model_config.hf_config
-        reqs = batch.reqs
-        mrope_positions_list = [None] * len(reqs)
+        mrope_positions_list = [None] * self.seq_lens.shape[0]
         if self.forward_mode.is_decode():
-            for i, req in enumerate(reqs):
+            for i, _ in enumerate(mrope_positions_list):
                 mrope_positions_list[i] = MRotaryEmbedding.get_next_input_positions(
-                    req.mrope_positions_delta,
+                    batch.mrope_positions_delta[i][0],
                     int(self.seq_lens[i]) - 1,
                     int(self.seq_lens[i]),
                 )
         elif self.forward_mode.is_extend():
-            for i, req in enumerate(reqs):
-                if req.image_inputs is None:
+            for i, image_inputs in enumerate(batch.image_inputs):
+                if image_inputs is None:
                     # text only
                     mrope_positions = [[i for i in range(self.seq_lens[i])]] * 3
                     mrope_position_delta = 0
                 else:
+                    extend_start_loc, extend_seq_len = (
+                        self.extend_start_loc[i],
+                        self.extend_seq_lens[i],
+                    )
                     mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
-                            input_tokens=req.fill_ids,
-                            image_grid_thw=req.image_inputs.image_grid_thws,
+                            input_tokens=self.input_ids[
+                                extend_start_loc : extend_start_loc + extend_seq_len
+                            ],
+                            image_grid_thw=image_inputs.image_grid_thws,
                             video_grid_thw=None,
                             image_token_id=hf_config.image_token_id,
                             video_token_id=hf_config.video_token_id,
@@ -153,7 +158,7 @@ class ForwardBatch:
                         )
                     )
                 mrope_positions_list[i] = mrope_positions
-                req.mrope_positions_delta = mrope_position_delta
+                batch.mrope_positions_delta[i].append(mrope_position_delta)
 
         self.mrope_positions = torch.tensor(
             np.concatenate(
@@ -172,8 +177,10 @@ class ForwardBatch:
             self.positions = torch.tensor(
                 np.concatenate(
                     [
-                        np.arange(batch.prefix_lens_cpu[i], len(req.fill_ids))
-                        for i, req in enumerate(batch.reqs)
+                        np.arange(prefix_len, prefix_len + extend_len)
+                        for prefix_len, extend_len in zip(
+                            batch.extend_prefix_lens, batch.extend_seq_lens
+                        )
                     ],
                     axis=0,
                 ),
@@ -210,6 +217,17 @@ class ForwardBatch:
             sampling_info=batch.sampling_info,
         )
 
+        if not batch.forward_mode.is_decode():
+            ret.image_inputs = batch.image_inputs
+            ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device="cuda")
+            ret.extend_prefix_lens = torch.tensor(
+                batch.extend_prefix_lens, device="cuda"
+            )
+            ret.extend_start_loc = torch.zeros_like(ret.extend_seq_lens)
+            ret.extend_start_loc[1:] = torch.cumsum(ret.extend_seq_lens[:-1], dim=0)
+            ret.extend_seq_lens_cpu = batch.extend_seq_lens
+            ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
+
         # Init position information
         is_mrope = model_runner.model_is_mrope
         if is_mrope:
@@ -220,7 +238,7 @@ class ForwardBatch:
         if not batch.forward_mode.is_decode():
             ret.init_multimuldal_info(batch)
             ret.compute_extend_infos(model_runner, batch)
-        
+
         # Init attention information
         ret.req_to_token_pool = model_runner.req_to_token_pool
         ret.token_to_kv_pool = model_runner.token_to_kv_pool
