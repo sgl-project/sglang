@@ -493,6 +493,8 @@ class Qwen2VisionTransformer(nn.Module):
 cached_get_processor = lru_cache(get_processor)
 
 class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal):
+    # Use grid_t * grid_w * grid_h to pad tokens for each image
+    # and replaced padding by unique image hash
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         pixel_values = image_inputs.pixel_values
         image_grid_thws = image_inputs.image_grid_thws
