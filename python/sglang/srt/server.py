@@ -40,7 +40,7 @@ import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -176,12 +176,12 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
     success, message = await tokenizer_manager.update_weights(obj, request)
     content = {"success": success, "message": message}
     if success:
-        return JSONResponse(
+        return ORJSONResponse(
             content,
             status_code=HTTPStatus.OK,
         )
     else:
-        return JSONResponse(
+        return ORJSONResponse(
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
@@ -211,7 +211,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await tokenizer_manager.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:
-            return JSONResponse(
+            return ORJSONResponse(
                 {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
             )
 
@@ -226,7 +226,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return JSONResponse(
+        return ORJSONResponse(
             {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
         )
 
@@ -241,7 +241,7 @@ async def judge_request(obj: RewardReqInput, request: Request):
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        return JSONResponse(
+        return ORJSONResponse(
             {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
         )
 
