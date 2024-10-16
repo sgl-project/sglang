@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     GenerateReqInput,
     ProfileReq,
+    RewardReqConv,
     RewardReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -173,9 +174,7 @@ class TokenizerManager:
                 if hasattr(obj, "conv"):
                     # reward model
                     conv = obj.conv
-                    input_text = self.tokenizer.apply_chat_template(
-                        conv, tokenize=False
-                    )
+                    input_text = self._apply_chat_template(conv)
                     input_ids = self.tokenizer.encode(input_text)
                 elif obj.input_ids is None:
                     input_text = obj.text
@@ -197,9 +196,7 @@ class TokenizerManager:
                 if hasattr(obj, "conv"):
                     # reward model
                     conv = obj.conv[index]
-                    input_text = self.tokenizer.apply_chat_template(
-                        conv, tokenize=False
-                    )
+                    input_text = self._apply_chat_template(conv)
                     input_ids = self.tokenizer.encode(input_text)
                 elif obj.input_ids is None:
                     input_text = obj.text[input_id_index]
@@ -425,6 +422,15 @@ class TokenizerManager:
                 f"The input ({len(input_ids)} tokens) is longer than the "
                 f"model's context length ({self.context_len} tokens)."
             )
+
+    def _apply_chat_template(self, conv: RewardReqConv) -> Union[str, List[str]]:
+        if isinstance(conv, str):
+            return conv
+        elif isinstance(conv, list):
+            if isinstance(conv[0], str):
+                return conv
+            else:
+                return self.tokenizer.apply_chat_template(conv, tokenize=False)
 
     def _get_sampling_params(self, sampling_params_data: dict):
         sampling_params = SamplingParams(**sampling_params_data)
@@ -656,7 +662,7 @@ class TokenizerManager:
         token_texts = self.tokenizer.batch_decode(token_ids)
         return [
             (logprob, token_id, token_text)
-            for (logprob, token_id), token_text, in zip(token_logprobs, token_texts)
+            for (logprob, token_id), token_text in zip(token_logprobs, token_texts)
         ]
 
     def detokenize_top_logprobs_tokens(self, top_logprobs, decode_to_text: bool):

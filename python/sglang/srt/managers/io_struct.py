@@ -238,10 +238,13 @@ class TokenizedEmbeddingReqInput:
     sampling_params: SamplingParams
 
 
+RewardReqConv = Union[List[List[Dict]], List[Dict], str, List[str]]
+
+
 @dataclass
 class RewardReqInput:
-    # The input prompt in the chat format. It can be a single prompt or a batch of prompts.
-    conv: Union[List[List[Dict]], List[Dict]]
+    # The input prompt. It can be a single prompt or a batch of prompts. Can be either chat format or a string.
+    conv: RewardReqConv
     # The request id.
     rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
