@@ -41,6 +41,9 @@ from vllm.model_executor.models.interfaces import SupportsMultiModal
 
 from sglang.srt.configs import Qwen2VLConfig, Qwen2VLVisionConfig
 from sglang.srt.hf_transformers_utils import get_processor
+from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+    context_attention_fwd,
+)
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -179,9 +182,6 @@ class Qwen2VisionAttention(nn.Module):
             input_size=projection_size, output_size=embed_dim, quant_config=quant_config
         )
 
-        # Detect attention implementation.
-        self._use_flash_attn = True
-
     def forward(
         self,
         x: torch.Tensor,
@@ -207,37 +207,16 @@ class Qwen2VisionAttention(nn.Module):
             q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
             k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
-        if self._use_flash_attn:
-            # from vllm_flash_attn.flash_attn_interface import (
-            #   flash_attn_varlen_func)
-            from flash_attn import flash_attn_varlen_func
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = (seq_lens).max().item()
+        q, k, v = [rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v]]
 
-            q, k, v = [rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v]]
+        output = torch.empty_like(q)
+        context_attention_fwd(
+            q, k, v, output, cu_seqlens, seq_lens, max_seqlen, is_causal=False
+        )
 
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-            output = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                dropout_p=0,
-                causal=False,
-            )
-
-            context_layer = rearrange(output, "(b s) ... -> b s ...", b=batch_size)
-        else:
-            from xformers import ops as xops
-            from xformers.ops.fmha.attn_bias import BlockDiagonalMask
-
-            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-            attn_bias = BlockDiagonalMask.from_seqlens(q_seqlen=seqlens, kv_seqlen=None)
-
-            context_layer = xops.memory_efficient_attention_forward(
-                q, k, v, attn_bias=attn_bias, p=0, scale=None
-            )
+        context_layer = rearrange(output, "(b s) ... -> b s ...", b=batch_size)
         context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
 
         output, _ = self.proj(context_layer)
