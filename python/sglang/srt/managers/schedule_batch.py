@@ -127,6 +127,8 @@ class ImageInputs:
     image_embeds: Optional[List[torch.Tensor]] = None
     aspect_ratio_ids: Optional[List[torch.Tensor]] = None
     aspect_ratio_mask: Optional[List[torch.Tensor]] = None
+    # QWen2-VL related
+    image_grid_thws: List[Tuple[int, int, int]] = None
 
     @staticmethod
     def from_dict(obj, vocab_size):
@@ -134,6 +136,7 @@ class ImageInputs:
         ret = ImageInputs(
             pixel_values=obj["pixel_values"],
             image_hash=hash(tuple(obj["image_hashes"])),
+            image_grid_thws=obj.get("image_grid_thws")
         )
         image_hash = ret.image_hash
         ret.pad_values = [
