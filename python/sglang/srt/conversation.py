@@ -540,6 +540,6 @@ register_conv_template(
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         sep="<|im_end|>\n",
         sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
-        stop_str=["<|im_end|>"]
+        stop_str=["<|im_end|>"],
     )
 )

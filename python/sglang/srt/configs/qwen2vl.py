@@ -52,13 +52,14 @@ class Qwen2VLVisionConfig(PretrainedConfig):
         self.temporal_patch_size = temporal_patch_size
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: Union[str,
-                                                                  os.PathLike],
-                        **kwargs) -> "PretrainedConfig":
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: Union[str, os.PathLike], **kwargs
+    ) -> "PretrainedConfig":
         cls._set_token_in_kwargs(kwargs)
 
         config_dict, kwargs = cls.get_config_dict(
-            pretrained_model_name_or_path, **kwargs)
+            pretrained_model_name_or_path, **kwargs
+        )
 
         if config_dict.get("model_type") == "qwen2_vl":
             config_dict = config_dict["vision_config"]

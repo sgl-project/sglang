@@ -622,6 +622,7 @@ class ModelRunner:
             return False
         return rope_scaling.get("type", None) == "mrope"
 
+
 @lru_cache()
 def import_model_classes():
     model_arch_name_to_cls = {}

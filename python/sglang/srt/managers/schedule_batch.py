@@ -136,7 +136,7 @@ class ImageInputs:
         ret = ImageInputs(
             pixel_values=obj["pixel_values"],
             image_hash=hash(tuple(obj["image_hashes"])),
-            image_grid_thws=obj.get("image_grid_thws")
+            image_grid_thws=obj.get("image_grid_thws"),
         )
         image_hash = ret.image_hash
         ret.pad_values = [

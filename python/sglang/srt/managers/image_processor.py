@@ -176,6 +176,7 @@ class LlavaImageProcessor(BaseImageProcessor):
             "modalities": request_obj.modalities,
         }
 
+
 class Qwen2VLImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _image_processor):
         self.hf_config = hf_config
@@ -244,7 +245,12 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         if isinstance(image_data, list) and len(image_data) > 0:
             # Multiple images
             if len(image_data) > 1:
-                pixel_values, image_hashes, image_sizes, image_grid_thws = [], [], [], []
+                pixel_values, image_hashes, image_sizes, image_grid_thws = (
+                    [],
+                    [],
+                    [],
+                    [],
+                )
                 res = []
                 for img_data in image_data:
                     res.append(self._process_single_image(img_data))
@@ -292,6 +298,7 @@ def get_image_processor(
         return Qwen2VLImageProcessor(hf_config, server_args, _image_processor)
     else:
         return LlavaImageProcessor(hf_config, server_args, _image_processor)
+
 
 def get_dummy_image_processor():
     return DummyImageProcessor()
