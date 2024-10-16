@@ -447,7 +447,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
 
     # Set ulimit
     set_ulimit()
@@ -528,7 +528,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         kill_child_process(pid, including_parent=False)
         return
 
-    # print(f"{res.json()=}")
+    print(f"{res.json()=}")
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
