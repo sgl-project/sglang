@@ -6,6 +6,8 @@ It accepts arguments similar to those of launch_server.py.
 Usage:
 
 python3 -m sglang.bench_server_latency --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
+
+python3 -m sglang.bench_server_latency --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
 """
 
 import argparse
@@ -32,6 +34,8 @@ class BenchArgs:
     input_len: Tuple[int] = (1024,)
     output_len: Tuple[int] = (16,)
     result_filename: str = "result.jsonl"
+    base_url: str = ""
+    skip_warmup: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -48,6 +52,8 @@ class BenchArgs:
         parser.add_argument(
             "--result-filename", type=str, default=BenchArgs.result_filename
         )
+        parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
+        parser.add_argument("--skip-warmup", action="store_true")
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -139,17 +145,21 @@ def run_one_case(
 
 
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
-    proc, base_url = launch_server_process(server_args)
+    if bench_args.base_url:
+        proc, base_url = None, bench_args.base_url
+    else:
+        proc, base_url = launch_server_process(server_args)
 
     # warmup
-    run_one_case(
-        base_url,
-        batch_size=16,
-        input_len=1024,
-        output_len=16,
-        run_name="",
-        result_filename="",
-    )
+    if not bench_args.skip_warmup:
+        run_one_case(
+            base_url,
+            batch_size=16,
+            input_len=1024,
+            output_len=16,
+            run_name="",
+            result_filename="",
+        )
 
     # benchmark
     try:
@@ -165,7 +175,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 bench_args.result_filename,
             )
     finally:
-        kill_child_process(proc.pid)
+        if proc:
+            kill_child_process(proc.pid)
 
     print(f"\nResults are saved to {bench_args.result_filename}")
 

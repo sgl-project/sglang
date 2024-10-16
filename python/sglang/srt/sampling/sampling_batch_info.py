@@ -7,7 +7,6 @@ import torch
 from xgrammar import GrammarMatcher
 
 import sglang.srt.sampling.penaltylib as penaltylib
-from sglang.srt.constrained import RegexGuide
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -205,4 +204,15 @@ class SamplingBatchInfo:
 
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device
+        )
+
+    def copy(self):
+        return SamplingBatchInfo(
+            temperatures=self.temperatures,
+            top_ps=self.top_ps,
+            top_ks=self.top_ks,
+            min_ps=self.min_ps,
+            need_min_p_sampling=self.need_min_p_sampling,
+            vocab_size=self.vocab_size,
+            device=self.device,
         )

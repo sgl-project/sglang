@@ -202,6 +202,7 @@ class Req:
         self.prefix_indices = []
         self.extend_input_len = 0
         self.last_node = None
+        self.is_inflight_req = 0
 
         # Logprobs (arguments)
         self.return_logprob = False
@@ -398,6 +399,9 @@ class Req:
         return f"rid(n={self.rid}, " f"input_ids={self.origin_input_ids}, "
 
 
+bid = 0
+
+
 @dataclass
 class ScheduleBatch:
     """Store all inforamtion of a batch."""
@@ -428,6 +432,7 @@ class ScheduleBatch:
     extend_lens: List[int] = None
     extend_num_tokens: int = None
     running_bs: int = None
+    decoding_reqs: List[Req] = None
 
     # Stream
     has_stream: bool = False
@@ -651,7 +656,7 @@ class ScheduleBatch:
             req.last_update_decode_tokens = 0
             req.logprob_start_len = 10**9
 
-        self.filter_batch(sorted_indices)
+        self.filter_batch(keep_indices=sorted_indices)
 
         # Reqs in batch are filtered
         total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
@@ -802,7 +807,11 @@ class ScheduleBatch:
         else:
             self.sampling_info.regex_bnfs = None
 
+        global bid
+        bid += 1
+
         return ModelWorkerBatch(
+            bid=bid,
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
@@ -839,6 +848,8 @@ class ScheduleBatch:
 
 @dataclass
 class ModelWorkerBatch:
+    # The batch id
+    bid: int
     # The forward mode
     forward_mode: ForwardMode
     # The input ids
@@ -867,3 +878,21 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    def copy(self):
+        return ModelWorkerBatch(
+            bid=self.bid,
+            forward_mode=self.forward_mode,
+            input_ids=self.input_ids.clone(),
+            req_pool_indices=self.req_pool_indices,
+            seq_lens=self.seq_lens,
+            out_cache_loc=self.out_cache_loc,
+            return_logprob=self.return_logprob,
+            top_logprobs_nums=self.top_logprobs_nums,
+            extend_seq_lens=self.extend_seq_lens,
+            extend_prefix_lens=self.extend_prefix_lens,
+            extend_logprob_start_lens=self.extend_logprob_start_lens,
+            image_inputs=self.image_inputs,
+            lora_paths=self.lora_paths,
+            sampling_info=self.sampling_info.copy(),
+        )
