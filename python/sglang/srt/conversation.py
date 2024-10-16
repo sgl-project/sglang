@@ -76,6 +76,8 @@ class Conversation:
     image_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
 
+    image_token: str = "<image>"
+
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
         system_prompt = self.system_template.format(system_message=self.system_message)
@@ -541,5 +543,6 @@ register_conv_template(
         sep="<|im_end|>\n",
         sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
         stop_str=["<|im_end|>"],
+        image_token="<|vision_start|><|image_pad|><|vision_end|>",
     )
 )
