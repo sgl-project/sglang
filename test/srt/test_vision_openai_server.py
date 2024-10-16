@@ -292,7 +292,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
 class TestQWen2VLServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen2-VL-7B-Instruct/"
+        cls.model = "Qwen/Qwen2-VL-7B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
