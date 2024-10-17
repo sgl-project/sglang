@@ -199,6 +199,9 @@ class Req:
         # this does not include the jump forward tokens.
         self.completion_tokens_wo_jump_forward = 0
 
+        # The number of cached tokens, that were already cached in the KV store
+        self.cached_tokens = 0
+
         # For vision inputs
         self.image_inputs: Optional[ImageInputs] = None
 
@@ -505,6 +508,13 @@ class ScheduleBatch:
 
         pt = 0
         for i, req in enumerate(reqs):
+            already_computed = (
+                req.extend_logprob_start_len + 1 + req.cached_tokens
+                if req.extend_logprob_start_len > 0
+                else 0
+            )
+            req.cached_tokens += len(req.prefix_indices) - already_computed
+
             req.req_pool_idx = req_pool_indices[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)

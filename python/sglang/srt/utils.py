@@ -35,7 +35,7 @@ import psutil
 import requests
 import torch
 import torch.distributed as dist
-from fastapi.responses import JSONResponse
+from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
@@ -567,7 +567,7 @@ def add_api_key_middleware(app, api_key: str):
         if request.url.path.startswith("/health"):
             return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
-            return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+            return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
 
 
@@ -589,7 +589,7 @@ def configure_logger(server_args, prefix: str = ""):
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
-        datefmt="%H:%M:%S",
+        datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
 
