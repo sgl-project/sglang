@@ -76,8 +76,6 @@ class Conversation:
     image_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
 
-    image_token: str = "<image>"
-
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
         system_prompt = self.system_template.format(system_message=self.system_message)
