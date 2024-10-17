@@ -294,7 +294,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert isinstance(js_obj["color"], str)
         assert isinstance(js_obj["number_of_cars"], int)
 
-    def run_decode(self, image_id):
+    def run_decode_with_image(self, image_id):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         content = []
@@ -341,7 +341,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
     def test_mixed_batch(self):
         image_ids = [0, 1, 2] * 4
         with ThreadPoolExecutor(4) as executor:
-            list(executor.map(self.run_decode, image_ids))
+            list(executor.map(self.run_decode_with_image, image_ids))
 
 
 if __name__ == "__main__":
