@@ -431,10 +431,10 @@ def launch_server(
         # Listen for HTTP requests
         LOGGING_CONFIG["formatters"]["default"][
             "fmt"
-        ] = "%(asctime)s [%(name)s] %(levelprefix)s %(message)s"
+        ] = "[%(asctime)s] %(levelprefix)s %(message)s"
         LOGGING_CONFIG["formatters"]["access"][
             "fmt"
-        ] = '%(asctime)s [%(name)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+        ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
         uvicorn.run(
             app,
             host=server_args.host,
