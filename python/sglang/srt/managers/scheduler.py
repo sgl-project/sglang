@@ -20,6 +20,7 @@ import logging
 import os
 import time
 import warnings
+from collections import deque
 from types import SimpleNamespace
 from typing import List, Optional, Union
 
@@ -195,6 +196,7 @@ class Scheduler:
         # Init running status
         self.waiting_queue: List[Req] = []
         self.running_batch: Optional[ScheduleBatch] = None
+        self.cur_batch: Optional[ScheduleBatch] = None
         self.decode_forward_ct = 0
         self.stream_interval = server_args.stream_interval
         self.num_generated_tokens = 0
@@ -233,6 +235,7 @@ class Scheduler:
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.batch_is_full = False
 
+        # Init profiler
         if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
             self.profiler = None
         else:
@@ -248,6 +251,25 @@ class Scheduler:
                 ],
                 with_stack=True,
             )
+
+        # Init states for overlap schedule
+        if self.server_args.enable_overlap_schedule:
+            self.forward_batch_generation = (
+                self.tp_worker.forward_batch_generation_non_blocking
+            )
+            self.resolve_next_token_ids = (
+                lambda bid, x: self.tp_worker.resolve_future_token_ids(bid)
+            )
+
+            def cache_finished_req(req):
+                free_delta = int(self.running_batch and req in self.cur_batch.reqs)
+                self.tree_cache.cache_finished_req(req, free_delta=free_delta)
+
+            self.cache_finished_req = cache_finished_req
+        else:
+            self.forward_batch_generation = self.tp_worker.forward_batch_generation
+            self.resolve_next_token_ids = lambda bid, x: x.tolist()
+            self.cache_finished_req = self.tree_cache.cache_finished_req
 
     @torch.inference_mode()
     def event_loop_normal(self):
@@ -274,6 +296,32 @@ class Scheduler:
                         result = self.run_batch(batch)
                         self.process_batch_result(batch, result)
             else:
+                self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
+
+            self.last_batch = batch
+
+    @torch.inference_mode()
+    def event_loop_overlap(self):
+        result_queue = deque()
+
+        self.last_batch = None
+        self.running_batch = None
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+            if batch:
+                result = self.run_batch(batch)
+                result_queue.append((batch.copy(), result))
+
+            if self.last_batch:
+                tmp_batch, tmp_result = result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+            elif batch is None:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
 
@@ -456,7 +504,12 @@ class Scheduler:
             and not self.last_batch.is_empty()
         ):
             if self.current_inflight_req:
-                self.last_batch.filter_batch(self.current_inflight_req)
+                self.last_batch.filter_batch(
+                    current_inflight_req=self.current_inflight_req
+                )
+                self.tree_cache.cache_unfinished_req(self.current_inflight_req)
+                # Inflight request keeps its rid but will get a new req_pool_idx.
+                self.req_to_token_pool.free(self.current_inflight_req.req_pool_idx)
                 self.batch_is_full = False
             if not self.last_batch.is_empty():
                 if self.running_batch is None:
@@ -669,7 +722,7 @@ class Scheduler:
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
                 model_worker_batch = batch.get_model_worker_batch()
-                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+                logits_output, next_token_ids = self.forward_batch_generation(
                     model_worker_batch
                 )
             else:
@@ -681,12 +734,12 @@ class Scheduler:
                 else:
                     next_token_ids = torch.full((batch.batch_size(),), 0)
             batch.output_ids = next_token_ids
-            ret = logits_output, next_token_ids
+            ret = logits_output, next_token_ids, model_worker_batch.bid
         else:  # embedding or reward model
             assert batch.extend_num_tokens != 0
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
-            ret = embeddings
+            ret = embeddings, model_worker_batch.bid
         return ret
 
     def process_batch_result(self, batch: ScheduleBatch, result):
@@ -699,13 +752,8 @@ class Scheduler:
 
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
         if self.is_generation:
-            logits_output, next_token_ids = result
-            if batch.sampling_info.penalizer_orchestrator:
-                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                    next_token_ids
-                )
-
-            if logits_output:
+            logits_output, next_token_ids, bid = result
+            if batch.return_logprob:
                 # Move logprobs to cpu
                 if logits_output.next_token_logprobs is not None:
                     logits_output.next_token_logprobs = (
@@ -723,31 +771,28 @@ class Scheduler:
                         logits_output.normalized_prompt_logprobs.tolist()
                     )
 
-            next_token_ids = next_token_ids.tolist()
+            next_token_ids = self.resolve_next_token_ids(bid, next_token_ids)
 
             # Check finish conditions
             logprob_pt = 0
             for i, req in enumerate(batch.reqs):
-                if req is not self.current_inflight_req:
+                if req.is_inflight_req > 0:
+                    req.is_inflight_req -= 1
+                else:
                     # Inflight reqs' prefill is not finished
                     req.completion_tokens_wo_jump_forward += 1
                     req.output_ids.append(next_token_ids[i])
                     req.check_finished()
 
+                    if req.finished():
+                        self.cache_finished_req(req)
+                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                        self.tree_cache.cache_unfinished_req(req)
+
                 if req.regex_fsm is not None:
                     req.regex_fsm_state = req.regex_fsm.get_next_state(
                         req.regex_fsm_state, next_token_ids[i]
                     )
-
-                if req.finished():
-                    self.tree_cache.cache_finished_req(req)
-                elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                    self.tree_cache.cache_unfinished_req(req)
-
-                if req.is_inflight_req > 0:
-                    # Inflight request would get a new req idx
-                    req.is_inflight_req -= 1
-                    self.req_to_token_pool.free(req.req_pool_idx)
 
                 if req.return_logprob:
                     logprob_pt += self.add_logprob_return_values(
@@ -755,48 +800,45 @@ class Scheduler:
                     )
         else:  # embedding or reward model
             assert batch.extend_num_tokens != 0
-            embeddings = result.tolist()
+            embeddings, bid = result
+            embeddings = embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
                 req.embedding = embeddings[i]
-                if req is not self.current_inflight_req:
+                if req.is_inflight_req > 0:
+                    req.is_inflight_req -= 1
+                else:
                     # Inflight reqs' prefill is not finished
                     # dummy output token for embedding models
                     req.output_ids.append(0)
                     req.check_finished()
 
                 if req.finished():
-                    self.tree_cache.cache_finished_req(req)
+                    self.cache_finished_req(req)
                 else:
                     self.tree_cache.cache_unfinished_req(req)
 
-                if req.is_inflight_req > 0:
-                    # Inflight request would get a new req idx
-                    req.is_inflight_req -= 1
-                    self.req_to_token_pool.free(req.req_pool_idx)
-
-        self.stream_output(batch)
+        self.stream_output(batch.reqs)
 
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
-        logits_output, next_token_ids = result
-        if batch.sampling_info.penalizer_orchestrator:
-            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                next_token_ids
-            )
+        logits_output, next_token_ids, bid = result
         self.num_generated_tokens += len(batch.reqs)
 
         # Move logprobs to cpu
-        if logits_output.next_token_logprobs is not None:
+        if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs[
                 torch.arange(len(next_token_ids), device=next_token_ids.device),
                 next_token_ids,
             ].tolist()
 
-        next_token_ids = next_token_ids.tolist()
+        next_token_ids = self.resolve_next_token_ids(bid, next_token_ids)
 
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            if self.server_args.enable_overlap_schedule and req.finished():
+                continue
+
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
             req.check_finished()
@@ -807,7 +849,7 @@ class Scheduler:
                 )
 
             if req.finished():
-                self.tree_cache.cache_finished_req(req)
+                self.cache_finished_req(req)
 
             if req.return_logprob:
                 req.output_token_logprobs.append(
@@ -816,7 +858,7 @@ class Scheduler:
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
 
-        self.stream_output(batch)
+        self.stream_output(batch.reqs)
 
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
@@ -895,7 +937,7 @@ class Scheduler:
 
         return num_input_logprobs
 
-    def stream_output(self, batch: ScheduleBatch):
+    def stream_output(self, reqs: List[Req]):
         output_rids = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
@@ -912,7 +954,7 @@ class Scheduler:
 
         is_stream_iter = self.decode_forward_ct % self.stream_interval == 0
 
-        for req in batch.reqs:
+        for req in reqs:
             if req.finished() or (
                 req.stream and (is_stream_iter or len(req.output_ids) == 1)
             ):
@@ -936,6 +978,7 @@ class Scheduler:
                         "prompt_tokens": len(req.origin_input_ids),
                         "completion_tokens": len(req.output_ids),
                         "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
+                        "cached_tokens": req.cached_tokens,
                         "finish_reason": (
                             req.finished_reason.to_json()
                             if req.finished_reason is not None
@@ -1026,8 +1069,9 @@ class Scheduler:
         # Delete requests in the running batch
         if self.running_batch:
             for req in self.running_batch.reqs:
-                if req.rid == recv_req.rid:
+                if req.rid == recv_req.rid and not req.finished():
                     req.finished_reason = FINISH_ABORT()
+                    self.cache_finished_req(req)
                     break
 
     def update_weights(self, recv_req: UpdateWeightReqInput):
@@ -1072,7 +1116,10 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank)
         pipe_writer.send("ready")
-        scheduler.event_loop_normal()
+        if server_args.enable_overlap_schedule:
+            scheduler.event_loop_overlap()
+        else:
+            scheduler.event_loop_normal()
     except Exception:
         msg = get_exception_traceback()
         logger.error(msg)

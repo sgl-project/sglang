@@ -20,7 +20,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from vllm.config import CacheConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -368,7 +367,7 @@ class DbrxForCausalLM(nn.Module):
         self,
         config: DbrxConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ):
         super().__init__()
         self.config = config

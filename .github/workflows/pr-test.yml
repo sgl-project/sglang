@@ -29,7 +29,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e "python[dev]"
-          pip install transformers==4.44
+          pip install transformers==4.45.2
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Run test
@@ -49,7 +49,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e "python[dev]"
-          pip install transformers==4.44
+          pip install transformers==4.45.2
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Run test
@@ -69,14 +69,14 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e "python[dev]"
-          pip install transformers==4.44
+          pip install transformers==4.45.2
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Run test
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 5 --range-end 16
+          python3 run_suite.py --suite minimal --range-begin 5 --range-end 17
 
   unit-test-backend-part-3:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -89,14 +89,14 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e "python[dev]"
-          pip install transformers==4.44
+          pip install transformers==4.45.2
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Run test
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 16
+          python3 run_suite.py --suite minimal --range-begin 17
 
   performance-test-1-gpu-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -109,7 +109,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e "python[all]"
-          pip install transformers==4.44
+          pip install transformers==4.45.2
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Benchmark Single Latency
@@ -147,7 +147,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e "python[all]"
-          pip install transformers==4.44
+          pip install transformers==4.45.2
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Benchmark Offline Throughput (w/o RadixAttention)
@@ -179,7 +179,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e "python[all]"
-          pip install transformers==4.44
+          pip install transformers==4.45.2
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Benchmark Offline Throughput (TP=2)
@@ -211,7 +211,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e "python[all]"
-          pip install transformers==4.44
+          pip install transformers==4.45.2
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
           git clone https://github.com/merrymercy/human-eval.git
@@ -235,7 +235,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e "python[all]"
-          pip install transformers==4.44
+          pip install transformers==4.45.2
           pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
           git clone https://github.com/merrymercy/human-eval.git

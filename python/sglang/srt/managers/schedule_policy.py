@@ -51,6 +51,7 @@ class SchedulePolicy:
                 r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
                     rid=r.rid, key=r.adjust_max_prefix_ids()
                 )
+
             prefix_computed = True
 
         if self.policy == "lpm":

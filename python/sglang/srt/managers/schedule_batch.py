@@ -196,6 +196,9 @@ class Req:
         # this does not include the jump forward tokens.
         self.completion_tokens_wo_jump_forward = 0
 
+        # The number of cached tokens, that were already cached in the KV store
+        self.cached_tokens = 0
+
         # For vision inputs
         self.image_inputs: Optional[ImageInputs] = None
 
@@ -392,6 +395,9 @@ class Req:
         return f"rid(n={self.rid}, " f"input_ids={self.origin_input_ids}, "
 
 
+bid = 0
+
+
 @dataclass
 class ScheduleBatch:
     """Store all inforamtion of a batch."""
@@ -496,6 +502,13 @@ class ScheduleBatch:
 
         pt = 0
         for i, req in enumerate(reqs):
+            already_computed = (
+                req.extend_logprob_start_len + 1 + req.cached_tokens
+                if req.extend_logprob_start_len > 0
+                else 0
+            )
+            req.cached_tokens += len(req.prefix_indices) - already_computed
+
             req.req_pool_idx = req_pool_indices[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
@@ -646,7 +659,7 @@ class ScheduleBatch:
             req.last_update_decode_tokens = 0
             req.logprob_start_len = 10**9
 
-        self.filter_batch(sorted_indices)
+        self.filter_batch(keep_indices=sorted_indices)
 
         # Reqs in batch are filtered
         total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
@@ -733,6 +746,10 @@ class ScheduleBatch:
         self.input_ids = self.output_ids
         self.seq_lens.add_(1)
         self.output_ids = None
+        if self.sampling_info.penalizer_orchestrator:
+            self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                self.input_ids
+            )
 
         # Alloc mem
         bs = len(self.reqs)
@@ -828,7 +845,11 @@ class ScheduleBatch:
         else:
             self.sampling_info.regex_fsms = None
 
+        global bid
+        bid += 1
+
         return ModelWorkerBatch(
+            bid=bid,
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
@@ -865,6 +886,8 @@ class ScheduleBatch:
 
 @dataclass
 class ModelWorkerBatch:
+    # The batch id
+    bid: int
     # The forward mode
     forward_mode: ForwardMode
     # The input ids
@@ -893,3 +916,21 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    def copy(self):
+        return ModelWorkerBatch(
+            bid=self.bid,
+            forward_mode=self.forward_mode,
+            input_ids=self.input_ids.clone(),
+            req_pool_indices=self.req_pool_indices,
+            seq_lens=self.seq_lens,
+            out_cache_loc=self.out_cache_loc,
+            return_logprob=self.return_logprob,
+            top_logprobs_nums=self.top_logprobs_nums,
+            extend_seq_lens=self.extend_seq_lens,
+            extend_prefix_lens=self.extend_prefix_lens,
+            extend_logprob_start_lens=self.extend_logprob_start_lens,
+            image_inputs=self.image_inputs,
+            lora_paths=self.lora_paths,
+            sampling_info=self.sampling_info.copy(),
+        )
