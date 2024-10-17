@@ -25,7 +25,6 @@ import json
 import logging
 import multiprocessing as mp
 import os
-import random
 import threading
 import time
 from http import HTTPStatus
@@ -41,6 +40,7 @@ import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from uvicorn.config import LOGGING_CONFIG
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -429,6 +429,12 @@ def launch_server(
 
     try:
         # Listen for HTTP requests
+        LOGGING_CONFIG["formatters"]["default"][
+            "fmt"
+        ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+        LOGGING_CONFIG["formatters"]["access"][
+            "fmt"
+        ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
         uvicorn.run(
             app,
             host=server_args.host,
