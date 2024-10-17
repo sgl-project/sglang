@@ -625,8 +625,10 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 "text": text,
                 "logprobs": logprobs,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
-                "stop_reason": (
-                    finish_reason["matched"] if "matched" in finish_reason else None
+                "matched_stop": (
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             }
         else:
@@ -635,8 +637,10 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 text=text,
                 logprobs=logprobs,
                 finish_reason=(finish_reason["type"] if finish_reason else ""),
-                stop_reason=(
-                    finish_reason["matched"] if "matched" in finish_reason else None
+                matched_stop=(
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             )
 
@@ -772,9 +776,9 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         text=delta,
                         logprobs=logprobs,
                         finish_reason=(finish_reason["type"] if finish_reason else ""),
-                        stop_reason=(
+                        matched_stop=(
                             finish_reason["matched"]
-                            if "matched" in finish_reason
+                            if finish_reason and "matched" in finish_reason
                             else None
                         ),
                     )
@@ -1022,8 +1026,10 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 "message": {"role": "assistant", "content": ret_item["text"]},
                 "logprobs": choice_logprobs,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
-                "stop_reason": (
-                    finish_reason["matched"] if "matched" in finish_reason else None
+                "matched_stop": (
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             }
         else:
@@ -1032,8 +1038,10 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 message=ChatMessage(role="assistant", content=ret_item["text"]),
                 logprobs=choice_logprobs,
                 finish_reason=(finish_reason["type"] if finish_reason else ""),
-                stop_reason=(
-                    finish_reason["matched"] if "matched" in finish_reason else None
+                matched_stop=(
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             )
 
@@ -1163,9 +1171,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             finish_reason=(
                                 finish_reason["type"] if finish_reason else ""
                             ),
-                            stop_reason=(
+                            matched_stop=(
                                 finish_reason["matched"]
-                                if "matched" in finish_reason
+                                if finish_reason and "matched" in finish_reason
                                 else None
                             ),
                             logprobs=choice_logprobs,
@@ -1184,9 +1192,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         index=index,
                         delta=DeltaMessage(content=delta),
                         finish_reason=(finish_reason["type"] if finish_reason else ""),
-                        stop_reason=(
+                        matched_stop=(
                             finish_reason["matched"]
-                            if "matched" in finish_reason
+                            if finish_reason and "matched" in finish_reason
                             else None
                         ),
                         logprobs=choice_logprobs,

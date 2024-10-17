@@ -40,7 +40,7 @@ class TestJSONConstrained(unittest.TestCase):
         max_tokens=1,
         stop=None,
         finish_reason=None,
-        stop_reason=None,
+        matched_stop=None,
     ):
         payload = {
             "prompt": prompt,
@@ -63,7 +63,7 @@ class TestJSONConstrained(unittest.TestCase):
         assert (
             response_completions.json()["choices"][0]["finish_reason"] == finish_reason
         )
-        assert response_completions.json()["choices"][0]["stop_reason"] == stop_reason
+        assert response_completions.json()["choices"][0]["matched_stop"] == matched_stop
 
     def run_chat_completions_generation(
         self,
@@ -71,7 +71,7 @@ class TestJSONConstrained(unittest.TestCase):
         max_tokens=1,
         stop=None,
         finish_reason=None,
-        stop_reason=None,
+        matched_stop=None,
     ):
         chat_payload = {
             "model": self.model,
@@ -95,14 +95,14 @@ class TestJSONConstrained(unittest.TestCase):
         print("=" * 100)
 
         assert response_chat.json()["choices"][0]["finish_reason"] == finish_reason
-        assert response_chat.json()["choices"][0]["stop_reason"] == stop_reason
+        assert response_chat.json()["choices"][0]["matched_stop"] == matched_stop
 
     def test_finish_stop_str(self):
         self.run_completions_generation(
-            max_tokens=1000, stop="\n", finish_reason="stop", stop_reason="\n"
+            max_tokens=1000, stop="\n", finish_reason="stop", matched_stop="\n"
         )
         self.run_chat_completions_generation(
-            max_tokens=1000, stop="\n", finish_reason="stop", stop_reason="\n"
+            max_tokens=1000, stop="\n", finish_reason="stop", matched_stop="\n"
         )
 
     def test_finish_stop_eos(self):
@@ -117,21 +117,21 @@ class TestJSONConstrained(unittest.TestCase):
             prompt=llama_format_prompt,
             max_tokens=1000,
             finish_reason="stop",
-            stop_reason=eos_token_id,
+            matched_stop=eos_token_id,
         )
         self.run_chat_completions_generation(
             prompt="What is 2 + 2?",
             max_tokens=1000,
             finish_reason="stop",
-            stop_reason=eos_token_id,
+            matched_stop=eos_token_id,
         )
 
     def test_finish_length(self):
         self.run_completions_generation(
-            max_tokens=5, finish_reason="length", stop_reason=None
+            max_tokens=5, finish_reason="length", matched_stop=None
         )
         self.run_chat_completions_generation(
-            max_tokens=5, finish_reason="length", stop_reason=None
+            max_tokens=5, finish_reason="length", matched_stop=None
         )
 
 
