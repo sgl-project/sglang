@@ -229,9 +229,6 @@ app.put("/generate")(generate_request)
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
-        assert (
-            not tokenizer_manager.is_generation
-        ), "This model does not appear to be an embedding model by default. Please add `--is-embedding` when launching the server or try another model."
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
