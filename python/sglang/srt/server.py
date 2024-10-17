@@ -229,6 +229,9 @@ app.put("/generate")(generate_request)
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
+        assert (
+            not tokenizer_manager.is_generation
+        ), "This model does not support embedding endpoint. Please try another model or add `--is-embedding` when launching the server."
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
@@ -541,8 +544,6 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_child_process(pid, including_parent=False)
         return
-
-    print(f"{res.json()=}")
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:

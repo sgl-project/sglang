@@ -136,8 +136,16 @@ class TestGenerationModels(unittest.TestCase):
     def test_ci_models(self):
         for model_case in CI_MODELS:
             for torch_dtype in TORCH_DTYPES:
+
+                # Skip long prompts for models that does not have a long context
+                prompts = DEFAULT_PROMPTS
+                if model_case.model_path in [
+                    "google/gemma-2-2b",  # There is a bug with new transformers library. This can only run with transformers==4.44
+                ]:
+                    prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
+
                 self.assert_close_logits_and_output_strs(
-                    DEFAULT_PROMPTS, model_case, torch_dtype
+                    prompts, model_case, torch_dtype
                 )
 
     def test_others(self):
@@ -152,12 +160,11 @@ class TestGenerationModels(unittest.TestCase):
             ):
                 continue
 
-            # Skip long prompts for models that does not have a long context
+            # Skip long prompts for models that do not have a long context
             prompts = DEFAULT_PROMPTS
             if model_case.model_path in [
                 "HuggingFaceTB/SmolLM-135M-Instruct",
                 "allenai/OLMo-1B-0724-hf",
-                "google/gemma-2-2b",  # There is a bug with new transformers library. This can only run with transformers==4.44
             ]:
                 prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
 
