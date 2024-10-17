@@ -122,6 +122,11 @@ class ModelRunner:
             )
             server_args.chunked_prefill_size = None
             server_args.mem_fraction_static *= 0.95
+            # TODO: qwen2-vl does not support cuda graph now, set disable-graph=True automatically
+            if self.model_config.hf_config.architectures == [
+                "Qwen2VLForConditionalGeneration"
+            ]:
+                server_args.disable_cuda_graph = True
 
         # Global vars
         if server_args.show_time_cost:
@@ -612,6 +617,15 @@ class ModelRunner:
             logits = logits.masked_fill(sampling_info.vocab_mask, float("-inf"))
 
         return logits
+
+    @property
+    def model_is_mrope(self) -> bool:
+        """Detect if the model has "mrope" rope_scaling type.
+        mrope requires keep "rope_deltas" between prompt and decoding phases."""
+        rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
+        if rope_scaling is None:
+            return False
+        return rope_scaling.get("type", None) == "mrope"
 
 
 @lru_cache()
