@@ -706,6 +706,10 @@ class Runtime:
         self.shutdown()
 
 
+STREAM_END_SYMBOL = b"data: [DONE]"
+STREAM_CHUNK_START_SYMBOL = b"data:"
+
+
 class Engine:
     """
     SRT Engine without an HTTP server layer.
@@ -749,8 +753,6 @@ class Engine:
         ret = loop.run_until_complete(generate_request(obj, None))
 
         if stream is True:
-            STREAM_END_SYMBOL = "data: [DONE]"
-            STREAM_CHUNK_START_SYMBOL = "data:"
 
             def generator_wrapper():
                 offset = 0
@@ -796,9 +798,6 @@ class Engine:
         ret = await generate_request(obj, None)
 
         if stream is True:
-            STREAM_END_SYMBOL = "data: [DONE]"
-            STREAM_CHUNK_START_SYMBOL = "data:"
-
             generator = ret.body_iterator
 
             async def generator_wrapper():

@@ -1,3 +1,8 @@
+"""
+Usage:
+python3 -m unittest test_srt_engine.TestSRTEngine.test_3_sync_streaming_combination
+"""
+
 import asyncio
 import json
 import unittest
@@ -8,7 +13,7 @@ from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
 
-class TestSRTBackend(unittest.TestCase):
+class TestSRTEngine(unittest.TestCase):
 
     def test_1_engine_runtime_consistency(self):
         prompt = "Today is a sunny day and I like"
