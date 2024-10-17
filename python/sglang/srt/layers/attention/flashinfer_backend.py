@@ -132,6 +132,7 @@ class FlashInferAttnBackend(AttentionBackend):
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             prefix_lens,
+            encoder_lens=forward_batch.encoder_lens,
             use_ragged=use_ragged,
         )
 
@@ -186,7 +187,8 @@ class FlashInferAttnBackend(AttentionBackend):
             req_pool_indices,
             seq_lens,
             None,
-            decode_wrappers,
+            encoder_lens=torch.zeros_like(seq_lens),
+            decode_wrappers=decode_wrappers,
         )
 
         self.cuda_graph_metadata[bs] = decode_wrappers
@@ -194,7 +196,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata = (False, False, None, decode_wrappers)
 
     def init_forward_metadata_replay_cuda_graph(
-        self, bs: int, req_pool_indices, seq_lens
+        self, bs: int, req_pool_indices, seq_lens, encoder_lens=None
     ):
         update_flashinfer_indices(
             ForwardMode.DECODE,
@@ -202,7 +204,8 @@ class FlashInferAttnBackend(AttentionBackend):
             req_pool_indices[:bs],
             seq_lens[:bs],
             None,
-            self.cuda_graph_metadata[bs],
+            encoder_lens=encoder_lens,
+            decode_wrappers=self.cuda_graph_metadata[bs],
         )
 
     def get_cuda_graph_seq_len_fill_value(self):

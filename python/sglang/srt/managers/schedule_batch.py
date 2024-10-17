@@ -118,11 +118,12 @@ class ImageInputs:
     """The image related inputs."""
 
     pixel_values: torch.Tensor
-    image_hash: int
+    image_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
     pad_values: Optional[list] = None
     modalities: Optional[list] = None
+    num_image_tokens: Optional[int] = None
 
     image_embeds: Optional[List[torch.Tensor]] = None
     aspect_ratio_ids: Optional[List[torch.Tensor]] = None
@@ -133,18 +134,22 @@ class ImageInputs:
         # Use image hash as fake token_ids, which is then used for prefix matching
         ret = ImageInputs(
             pixel_values=obj["pixel_values"],
-            image_hash=hash(tuple(obj["image_hashes"])),
+            image_hashes=hash(tuple(obj["image_hashes"])),
         )
-        image_hash = ret.image_hash
+        image_hash = ret.image_hashes
         ret.pad_values = [
             (image_hash) % vocab_size,
             (image_hash >> 16) % vocab_size,
             (image_hash >> 32) % vocab_size,
             (image_hash >> 64) % vocab_size,
         ]
-        ret.image_sizes = obj["image_sizes"]
-        # Only when pixel values is not None we have modalities
-        ret.modalities = obj["modalities"] or ["image"]
+
+        if "image_sizes" in obj:
+            ret.image_sizes = obj["image_sizes"]
+        if "modalities" in obj:
+            # Only when pixel values is not None we have modalities
+            ret.modalities = obj["modalities"]
+
         return ret
 
 
@@ -827,15 +832,14 @@ class ScheduleBatch:
 
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode():
-            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = (
-                image_inputs
-            ) = None
+            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
-            image_inputs = [r.image_inputs for r in self.reqs]
 
+        # NOTE: decode also has image_inputs
+        image_inputs = [r.image_inputs for r in self.reqs]
         lora_paths = [req.lora_path for req in self.reqs]
         if self.has_regex:
             self.sampling_info.regex_fsms = [req.regex_fsm for req in self.reqs]

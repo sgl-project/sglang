@@ -100,6 +100,7 @@ class ForwardBatch:
 
     # For multimodal
     image_inputs: Optional[List[ImageInputs]] = None
+    encoder_lens: Optional[torch.Tensor] = None  # Batched params
 
     # For LoRA
     lora_paths: Optional[List[str]] = None
@@ -111,6 +112,22 @@ class ForwardBatch:
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: BaseTokenToKVPool = None
     attn_backend: AttentionBackend = None
+
+    def init_batched_multimodal_params(self, model_runner: ModelRunner):
+        if not model_runner.has_cross_attention:
+            self.encoder_lens = None
+        else:
+            encoder_lens = [
+                (
+                    im.num_image_tokens
+                    if (im is not None and im.num_image_tokens is not None)
+                    else 0
+                )
+                for im in self.image_inputs
+            ]
+            self.encoder_lens = torch.tensor(
+                encoder_lens, device="cuda", dtype=self.seq_lens.dtype
+            )
 
     @classmethod
     def init_new(
@@ -127,6 +144,7 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            image_inputs=batch.image_inputs,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             lora_paths=batch.lora_paths,
@@ -150,7 +168,6 @@ class ForwardBatch:
                 device=device,
             ).to(torch.int64)
 
-            ret.image_inputs = batch.image_inputs
             ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device=device)
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, device=device
@@ -164,6 +181,10 @@ class ForwardBatch:
         ret.req_to_token_pool = model_runner.req_to_token_pool
         ret.token_to_kv_pool = model_runner.token_to_kv_pool
         ret.attn_backend = model_runner.attn_backend
+
+        # Init batched multimodal params
+        ret.init_batched_multimodal_params(model_runner)
+
         model_runner.attn_backend.init_forward_metadata(ret)
 
         # Init lora information
