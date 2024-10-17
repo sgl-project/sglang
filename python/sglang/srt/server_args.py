@@ -73,6 +73,7 @@ class ServerArgs:
     # Other
     api_key: Optional[str] = None
     file_storage_pth: str = "SGLang_storage"
+    enable_cache_report: bool = False
 
     # Data parallelism
     dp_size: int = 1
@@ -113,6 +114,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_penalizer: bool = False
+    enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     max_torch_compile_bs: int = 32
@@ -409,6 +411,11 @@ class ServerArgs:
             default=ServerArgs.file_storage_pth,
             help="The path of the file storage in backend.",
         )
+        parser.add_argument(
+            "--enable-cache-report",
+            action="store_true",
+            help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
 
         # Data parallelism
         parser.add_argument(
@@ -571,6 +578,11 @@ class ServerArgs:
             "--disable-penalizer",
             action="store_true",
             help="Disable the logit penalizer (e.g., frequency and repetition penalty).",
+        )
+        parser.add_argument(
+            "--enable-overlap-schedule",
+            action="store_true",
+            help="Overlap the CPU scheduler with GPU model worker. Experimental feature.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",
