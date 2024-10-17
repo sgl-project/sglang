@@ -198,12 +198,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             try:
                 async for out in tokenizer_manager.generate_request(obj, request):
                     yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
+                        out, option=orjson.OPT_NON_STR_KEYS
                     ) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
                 yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
+                    out, option=orjson.OPT_NON_STR_KEYS
                 ) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
