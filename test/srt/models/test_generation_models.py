@@ -157,7 +157,7 @@ class TestGenerationModels(unittest.TestCase):
             if model_case.model_path in [
                 "HuggingFaceTB/SmolLM-135M-Instruct",
                 "allenai/OLMo-1B-0724-hf",
-                "google/gemma-2-2b",
+                "google/gemma-2-2b",  # There is a bug with new transformers library. This can only run with transformers==4.44
             ]:
                 prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
 
