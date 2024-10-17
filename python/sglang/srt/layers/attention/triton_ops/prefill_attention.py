@@ -112,12 +112,17 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
         qk *= sm_scale
-        qk += tl.where(
-            (start_n + offs_n[None, :]) < cur_batch_seq_len, 0, float("-inf")
-        )
+
         if IS_CAUSAL:
             qk += tl.where(
-                offs_m[:, None] >= (start_n + offs_n[None, :]), 0, float("-inf")
+                (start_n + offs_n[None, :] < cur_batch_seq_len)
+                & (offs_m[:, None] >= (start_n + offs_n[None, :])),
+                0,
+                float("-inf"),
+            )
+        else:
+            qk += tl.where(
+                (start_n + offs_n[None, :]) < cur_batch_seq_len, 0, float("-inf")
             )
 
         # -- compute m_ij, p, l_ij
