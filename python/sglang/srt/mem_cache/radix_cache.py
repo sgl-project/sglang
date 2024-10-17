@@ -245,7 +245,7 @@ class RadixCache(BasePrefixCache):
     def _split_node(self, key, child: TreeNode, split_len: int):
         # new_node -> child
         new_node = TreeNode()
-        new_node.children = {key[split_len:][0]: child}
+        new_node.children = {key[split_len]: child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
@@ -253,7 +253,7 @@ class RadixCache(BasePrefixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:]
-        new_node.parent.children[key[:split_len][0]] = new_node
+        new_node.parent.children[key[0]] = new_node
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: List, value):
