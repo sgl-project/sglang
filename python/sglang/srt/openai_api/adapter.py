@@ -25,7 +25,7 @@ from http import HTTPStatus
 from typing import Dict, List
 
 from fastapi import HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 try:
@@ -101,7 +101,7 @@ def create_error_response(
     status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
 ):
     error = ErrorResponse(message=message, type=err_type, code=status_code.value)
-    return JSONResponse(content=error.model_dump(), status_code=error.code)
+    return ORJSONResponse(content=error.model_dump(), status_code=error.code)
 
 
 def create_streaming_error_response(
