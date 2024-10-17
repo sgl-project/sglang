@@ -4,9 +4,9 @@ import dataclasses
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+from xgrammar import GrammarMatcher
 
 import sglang.srt.sampling.penaltylib as penaltylib
-from sglang.srt.constrained import RegexGuide
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -26,11 +26,10 @@ class SamplingBatchInfo:
     # Bias Tensors
     vocab_size: int
     logit_bias: torch.Tensor = None
-    vocab_mask: torch.Tensor = None
+    vocab_mask: Optional[torch.Tensor] = None
 
     # FSM states
-    regex_fsms: List[RegexGuide] = None
-    regex_fsm_states: List[int] = None
+    regex_bnfs: Optional[List[Optional[GrammarMatcher]]] = None
 
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
@@ -126,24 +125,28 @@ class SamplingBatchInfo:
                         )
                     self.linear_penalties = penalizer.apply(self.linear_penalties)
 
-    def update_regex_vocab_mask(self):
-        has_regex = self.regex_fsms and any(regex_fsm for regex_fsm in self.regex_fsms)
-        if not has_regex:
-            self.vocab_mask = None
-            return
+    def update_regex_vocab_mask_bnf(self):
+        # Reset the vocab mask
+        self.vocab_mask = None
 
-        self.vocab_mask = torch.zeros(
-            len(self.temperatures),
-            self.vocab_size,
-            dtype=torch.bool,
-            device=self.device,
-        )
-        for i, regex_fsm in enumerate(self.regex_fsms):
-            if regex_fsm is not None:
-                self.vocab_mask[i].fill_(1)
-                self.vocab_mask[i][
-                    regex_fsm.get_next_instruction(self.regex_fsm_states[i]).tokens
-                ] = 0
+        if self.regex_bnfs and any(regex_bnf for regex_bnf in self.regex_bnfs):
+            # If has regex, then we need to update the vocab mask
+            self.vocab_mask = torch.zeros(
+                len(self.temperatures),
+                self.vocab_size,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            for i, regex_bnf in enumerate(self.regex_bnfs):
+                if regex_bnf is not None:
+                    # Note that this bitmask is a bitset, not bool
+                    bitmask = regex_bnf.find_next_token_bitmask()
+                    # Mask the tokens that are not allowed
+                    self.vocab_mask[i][
+                        regex_bnf.get_rejected_tokens_from_bitmask(
+                            bitmask, self.vocab_size
+                        )
+                    ] = 1
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
         if self.penalizer_orchestrator:

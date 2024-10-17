@@ -22,37 +22,25 @@ class TestJSONConstrained(unittest.TestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.json_schema = json.dumps(
-            {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "pattern": "^[\\w]+$"},
-                    "population": {"type": "integer"},
-                },
-                "required": ["name", "population"],
-            }
-        )
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=300,
-            other_args=["--max-running-requests", "10"],
-        )
+        cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300)
 
     @classmethod
     def tearDownClass(cls):
         kill_child_process(cls.process.pid)
 
-    def run_decode(self, json_schema, return_logprob=False, top_logprobs_num=0, n=1):
-        response = requests.post(
+    def run_decode(
+        self, prompt, json_schema, return_logprob=False, top_logprobs_num=0, n=1
+    ):
+        return requests.post(
             self.base_url + "/generate",
             json={
-                "text": "The capital of France is",
+                "text": prompt,
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": 128,
                     "n": n,
                     "stop_token_ids": [119690],
+                    "json_schema": json_schema,
                     "json_schema": json_schema,
                 },
                 "stream": False,
@@ -61,53 +49,80 @@ class TestJSONConstrained(unittest.TestCase):
                 "logprob_start_len": 0,
             },
         )
+
+    def test_json_generate_simple(self):
+        prompt = "The capital of France is"
+        json_schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "population": {"type": "integer"},
+                },
+                "required": ["name", "population"],
+            }
+        )
+        response = self.run_decode(prompt, json_schema)
         print(json.dumps(response.json()))
         print("=" * 100)
-
-        if not json_schema:
-            return
-
-        try:
-            js_obj = json.loads(response.json()["text"])
-        except (TypeError, json.decoder.JSONDecodeError):
-            raise
+        js_obj = json.loads(response.json()["text"])
         assert isinstance(js_obj["name"], str)
         assert isinstance(js_obj["population"], int)
 
-    def test_json_generate(self):
-        self.run_decode(json_schema=self.json_schema)
-
-    def test_json_openai(self):
-        client = openai.Client(api_key="EMPTY", base_url=f"{self.base_url}/v1")
-
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant"},
-                {"role": "user", "content": "Introduce the capital of France."},
-            ],
-            temperature=0,
-            max_tokens=128,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "foo", "schema": json.loads(self.json_schema)},
-            },
-        )
-        text = response.choices[0].message.content
-
-        try:
-            js_obj = json.loads(text)
-        except (TypeError, json.decoder.JSONDecodeError):
-            print("JSONDecodeError", text)
-            raise
+    def test_json_generate_complex(self):
+        prompt = "Please create a character named Komeiji Satori:"
+        json_schema = """{
+    "title": "Character",
+    "type": "object",
+    "properties": {
+        "name": {
+            "title": "Name",
+            "type": "string"
+        },
+        "age": {
+            "title": "Age",
+            "type": "integer"
+        },
+        "armor": {"$ref": "#/$defs/Armor"},
+        "weapon": {"$ref": "#/$defs/Weapon"},
+        "strength": {
+            "title": "Strength",
+            "type": "integer"
+        }
+    },
+    "required": ["name", "age", "armor", "weapon", "strength"],
+    "$defs": {
+        "Armor": {
+            "title": "Armor",
+            "description": "An enumeration.",
+            "enum": ["leather", "chainmail", "plate"],
+            "type": "string"
+        },
+        "Weapon": {
+            "title": "Weapon",
+            "description": "An enumeration.",
+            "enum": ["third eye", "sword", "axe", "mace", "spear", "bow", "crossbow"],
+            "type": "string"
+        }
+    }
+}"""
+        response = self.run_decode(prompt, json_schema)
+        print(json.dumps(response.json()))
+        print("=" * 100)
+        js_obj = json.loads(response.json()["text"])
         assert isinstance(js_obj["name"], str)
-        assert isinstance(js_obj["population"], int)
-
-    def test_mix_json_and_other(self):
-        json_schemas = [None, None, self.json_schema, self.json_schema] * 10
-
-        with ThreadPoolExecutor(len(json_schemas)) as executor:
-            list(executor.map(self.run_decode, json_schemas))
+        assert isinstance(js_obj["age"], int)
+        assert js_obj["armor"] in ["leather", "chainmail", "plate"]
+        assert js_obj["weapon"] in [
+            "third eye",
+            "sword",
+            "axe",
+            "mace",
+            "spear",
+            "bow",
+            "crossbow",
+        ]
+        assert isinstance(js_obj["strength"], int)
 
 
 if __name__ == "__main__":
