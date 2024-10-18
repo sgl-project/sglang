@@ -284,6 +284,7 @@ class FlashInferIndicesUpdaterDecode:
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.max_context_len = model_runner.req_to_token_pool.req_to_token.size(1)
+        self.sliding_window_size = model_runner.sliding_window_size
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -300,39 +301,63 @@ class FlashInferIndicesUpdaterDecode:
             assert attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
 
-    def update_sliding_window(self):
-        raise NotImplementedError()
+    def update_single_wrapper(self, req_pool_indices, seq_lens, decode_wrappers=None):
+        decode_wrappers = decode_wrappers or self.decode_wrappers
+        self.call_begin_forward(
+            decode_wrappers[0], req_pool_indices, seq_lens, self.kv_indptr[0], None
+        )
+
+    def update_sliding_window(self, req_pool_indices, seq_lens, decode_wrappers=None):
+        decode_wrappers = decode_wrappers or self.decode_wrappers
+
+        for wrapper_id in range(2):
+            if wrapper_id == 0:
+                # Sliding window attention
+                paged_kernel_lens = torch.minimum(  # TODO: replace this with clamp
+                    seq_lens,
+                    torch.tensor(self.sliding_window_size + 1),
+                )
+            else:
+                # Full attention
+                paged_kernel_lens = seq_lens
+
+            kv_start_idx = seq_lens - paged_kernel_lens
+
+            self.call_begin_forward(
+                decode_wrappers[wrapper_id],
+                req_pool_indices,
+                paged_kernel_lens,
+                self.kv_indptr[wrapper_id],
+                kv_start_idx,
+            )
 
     def update_cross_attention(self):
         raise NotImplementedError()
 
-    def update_single_wrapper(self, req_pool_indices, seq_lens, decode_wrappers=None):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
-
-        bs = len(seq_lens)
-        kv_indptr = self.kv_indptr[0][: bs + 1]
-        kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+    def call_begin_forward(
+        self, wrapper, req_pool_indices, paged_kernel_lens, kv_indptr, kv_start_idx
+    ):
+        bs = len(req_pool_indices)
+        kv_indptr = kv_indptr[: bs + 1]
         # TODO: optimize the blocking call on kv_indptr[-1]
+        kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
         kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
+
         create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
             req_pool_indices,
-            seq_lens,
+            paged_kernel_lens,
             kv_indptr,
-            None,
+            kv_start_idx,
             kv_indices,
             self.max_context_len,
         )
-        self.call_begin_forward(
-            decode_wrappers[0], kv_indptr, kv_indices, self.kv_last_page_len[:bs]
-        )
 
-    def call_begin_forward(self, wrapper, kv_indptr, kv_indices, kv_last_page_len):
         wrapper.end_forward()
         wrapper.begin_forward(
             kv_indptr,
             kv_indices,
-            kv_last_page_len,
+            self.kv_last_page_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
@@ -355,6 +380,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.max_context_len = model_runner.req_to_token_pool.req_to_token.size(1)
+        self.sliding_window_size = model_runner.sliding_window_size
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -373,12 +399,6 @@ class FlashInferIndicesUpdaterPrefill:
             assert attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
 
-    def update_sliding_window(self):
-        raise NotImplementedError()
-
-    def update_cross_attention(self):
-        raise NotImplementedError()
-
     def update_single_wrapper(
         self, req_pool_indices, seq_lens, prefix_lens, use_ragged
     ):
@@ -387,43 +407,81 @@ class FlashInferIndicesUpdaterPrefill:
         else:
             paged_kernel_lens = seq_lens
 
-        bs = len(seq_lens)
-        kv_indptr = self.kv_indptr[0][: bs + 1]
+        self.call_begin_forward(
+            self.wrapper_ragged,
+            self.wrappers_paged[0],
+            req_pool_indices,
+            paged_kernel_lens,
+            seq_lens,
+            prefix_lens,
+            None,
+            self.kv_indptr[0],
+            self.qo_indptr[0],
+            use_ragged,
+        )
+
+    def update_sliding_window(
+        self, req_pool_indices, seq_lens, prefix_lens, use_ragged
+    ):
+        for wrapper_id in range(2):
+            if wrapper_id == 0:
+                # window attention use paged only
+                paged_kernel_lens = torch.minimum(
+                    seq_lens,
+                    torch.tensor(self.sliding_window_size) + seq_lens - prefix_lens,
+                )
+            else:
+                # full attention
+                paged_kernel_lens = seq_lens
+            kv_start_idx = seq_lens - paged_kernel_lens
+
+            self.call_begin_forward(
+                self.wrapper_ragged,
+                self.wrappers_paged[wrapper_id],
+                req_pool_indices,
+                paged_kernel_lens,
+                seq_lens,
+                prefix_lens,
+                kv_start_idx,
+                self.kv_indptr[wrapper_id],
+                self.qo_indptr[wrapper_id],
+                use_ragged,
+            )
+
+    def update_cross_attention(self):
+        raise NotImplementedError()
+
+    def call_begin_forward(
+        self,
+        wrapper_ragged,
+        wrapper_paged,
+        req_pool_indices,
+        paged_kernel_lens,
+        seq_lens,
+        prefix_lens,
+        kv_start_idx,
+        kv_indptr,
+        qo_indptr,
+        use_ragged,
+    ):
+        bs = len(req_pool_indices)
+        kv_indptr = kv_indptr[: bs + 1]
         kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-        # TODO: optimize the blocking call on kv_indptr[-1]
         kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
         create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
             req_pool_indices,
             paged_kernel_lens,
             kv_indptr,
-            None,
+            kv_start_idx,
             kv_indices,
             self.max_context_len,
         )
 
-        qo_indptr = self.qo_indptr[0][: bs + 1]
+        qo_indptr = qo_indptr[: bs + 1]
         qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
-        self.call_begin_forward(
-            self.wrapper_ragged,
-            self.wrappers_paged[0],
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            use_ragged,
-        )
 
-    def call_begin_forward(
-        self,
-        wrapper_ragged,
-        wrapper_paged,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_len,
-        use_ragged,
-    ):
+        # extend part
         if use_ragged:
             wrapper_ragged.end_forward()
             wrapper_ragged.begin_forward(
@@ -440,7 +498,7 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr,
             kv_indptr,
             kv_indices,
-            kv_last_page_len,
+            self.kv_last_page_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
