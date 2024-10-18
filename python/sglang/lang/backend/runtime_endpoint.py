@@ -169,6 +169,10 @@ class RuntimeEndpoint(BaseBackend):
         self._assert_success(res)
 
         obj = res.json()
+
+        if obj is None:
+            return "", {}
+
         comp = obj["text"]
         return comp, obj["meta_info"]
 
