@@ -49,9 +49,9 @@ def run_eval(args):
     set_default_backend(RuntimeEndpoint(f"{args.host}:{args.port}"))
 
     # Read data
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    filename = download_and_cache_file(url)
-    lines = list(read_jsonl(filename))
+    # url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+    # filename = download_and_cache_file(url)
+    lines = list(read_jsonl(args.data_path))
 
     # Construct prompts
     num_questions = args.num_questions
@@ -131,11 +131,11 @@ def run_eval(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-shots", type=int, default=5)
-    parser.add_argument("--data-path", type=str, default="test.jsonl")
-    parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument("--data-path", type=str, default="/home/jobuser/resources/sglang/python/sglang/srt/router/test.jsonl")
+    parser.add_argument("--num-questions", type=int, default=1024)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--parallel", type=int, default=128)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
-    parser.add_argument("--port", type=int, default=30000)
+    parser.add_argument("--port", type=int, default=3000)
     args = parser.parse_args()
     run_eval(args)
