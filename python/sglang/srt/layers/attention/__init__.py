@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
 from torch import nn
@@ -25,7 +26,11 @@ class AttentionBackend(ABC):
         raise NotImplementedError()
 
     def init_forward_metadata_replay_cuda_graph(
-        self, bs: int, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor] = None,
     ):
         """Init the metadata for a forward pass for replying a cuda graph."""
         raise NotImplementedError()
