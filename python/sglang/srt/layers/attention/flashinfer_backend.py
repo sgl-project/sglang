@@ -17,9 +17,8 @@ from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_utils import (
     WrapperDispatch,
     create_flashinfer_kv_indices_triton,
-    update_flashinfer_indices,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_flashinfer_available
 
 if TYPE_CHECKING:
@@ -42,7 +41,6 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
 
         # Parse constants
-        self.model_runner = model_runner  # TODO: remove this
         if not _grouped_size_compiled_for_decode_kernels(
             model_runner.model_config.num_attention_heads // model_runner.tp_size,
             model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
@@ -50,6 +48,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.decode_use_tensor_cores = True
         else:
             self.decode_use_tensor_cores = False
+        self.max_context_len = model_runner.model_config.context_len
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -80,6 +79,10 @@ class FlashInferAttnBackend(AttentionBackend):
         self.kv_last_page_len = torch.ones(
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
+        self.qo_indptr = [
+            torch.zeros((max_bs + 1,), dtype=torch.int32, device=model_runner.device)
+            for _ in range(self.num_wrappers)
+        ]
 
         # Create wrappers
         # NOTE: we do not use ragged attention when there are multiple wrappers
@@ -106,7 +109,10 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
         # Create indices updater
-        self.indices_updater_decode = FlashInferIndicesUpdaterDecode(self)
+        self.indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
+        self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
+            model_runner, self
+        )
 
         # Other metadata
         self.forward_metadata = None
@@ -132,14 +138,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
             extend_no_prefix = not torch.any(forward_batch.extend_prefix_lens).item()
 
-            update_flashinfer_indices(
-                forward_batch.forward_mode,
-                self.model_runner,
+            self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 prefix_lens,
-                use_ragged=use_ragged,
+                use_ragged,
             )
+
             self.forward_metadata = (
                 use_ragged,
                 extend_no_prefix,
@@ -147,7 +152,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int):
         cuda_graph_kv_indices = torch.zeros(
-            (max_bs * self.model_runner.model_config.context_len,),
+            (max_bs * self.max_context_len,),
             dtype=torch.int32,
             device="cuda",
         )
@@ -156,7 +161,7 @@ class FlashInferAttnBackend(AttentionBackend):
         ]
 
     def init_forward_metadata_capture_cuda_graph(
-        self, bs: int, req_pool_indices, seq_lens
+        self, bs: int, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
     ):
         decode_wrappers = []
         for i in range(self.num_wrappers):
@@ -177,7 +182,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata = (decode_wrappers,)
 
     def init_forward_metadata_replay_cuda_graph(
-        self, bs: int, req_pool_indices, seq_lens
+        self, bs: int, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
     ):
         self.indices_updater_decode.update(
             req_pool_indices[:bs], seq_lens[:bs], self.cuda_graph_metadata[bs]
@@ -267,9 +272,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
 
 class FlashInferIndicesUpdaterDecode:
-    def __init__(self, attn_backend):
+    def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Constants
-        model_runner = attn_backend.model_runner
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
         )
@@ -281,7 +285,7 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.max_context_len = model_runner.req_to_token_pool.req_to_token.size(1)
 
-        # Buffers
+        # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -335,4 +339,110 @@ class FlashInferIndicesUpdaterDecode:
             1,
             data_type=self.data_type,
             q_data_type=self.q_data_type,
+        )
+
+
+class FlashInferIndicesUpdaterPrefill:
+    def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
+        # Constants
+        self.num_qo_heads = (
+            model_runner.model_config.num_attention_heads // model_runner.tp_size
+        )
+        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            model_runner.tp_size
+        )
+        self.head_dim = model_runner.model_config.head_dim
+        self.data_type = model_runner.kv_cache_dtype
+        self.q_data_type = model_runner.dtype
+        self.max_context_len = model_runner.req_to_token_pool.req_to_token.size(1)
+
+        # Buffers and wrappers
+        self.kv_indptr = attn_backend.kv_indptr
+        self.kv_last_page_len = attn_backend.kv_last_page_len
+        self.qo_indptr = attn_backend.qo_indptr
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        self.wrappers_paged = attn_backend.prefill_wrappers_paged
+
+        # Dispatch
+        if attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+            self.update = self.update_sliding_window
+        elif attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
+            self.update = self.update_cross_attention
+        else:
+            assert attn_backend.num_wrappers == 1
+            self.update = self.update_single_wrapper
+
+    def update_sliding_window(self):
+        raise NotImplementedError()
+
+    def update_cross_attention(self):
+        raise NotImplementedError()
+
+    def update_single_wrapper(
+        self, req_pool_indices, seq_lens, prefix_lens, use_ragged
+    ):
+        if use_ragged:
+            paged_kernel_lens = prefix_lens
+        else:
+            paged_kernel_lens = seq_lens
+
+        bs = len(seq_lens)
+        kv_indptr = self.kv_indptr[0][: bs + 1]
+        kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+        # TODO: optimize the blocking call on kv_indptr[-1]
+        kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.max_context_len,
+        )
+
+        qo_indptr = self.qo_indptr[0][: bs + 1]
+        qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+        self.call_begin_forward(
+            self.wrapper_ragged,
+            self.wrappers_paged[0],
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            self.kv_last_page_len[:bs],
+            use_ragged,
+        )
+
+    def call_begin_forward(
+        self,
+        wrapper_ragged,
+        wrapper_paged,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        use_ragged,
+    ):
+        if use_ragged:
+            wrapper_ragged.end_forward()
+            wrapper_ragged.begin_forward(
+                qo_indptr,
+                qo_indptr,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+
+        # cached part
+        wrapper_paged.end_forward()
+        wrapper_paged.begin_forward(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            self.num_qo_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            1,
         )
