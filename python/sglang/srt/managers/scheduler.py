@@ -789,15 +789,15 @@ class Scheduler:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
 
-                if req.regex_fsm is not None:
-                    req.regex_fsm_state = req.regex_fsm.get_next_state(
-                        req.regex_fsm_state, next_token_ids[i]
-                    )
+                    if req.regex_fsm is not None:
+                        req.regex_fsm_state = req.regex_fsm.get_next_state(
+                            req.regex_fsm_state, next_token_ids[i]
+                        )
 
-                if req.return_logprob:
-                    logprob_pt += self.add_logprob_return_values(
-                        i, req, logprob_pt, next_token_ids, logits_output
-                    )
+                    if req.return_logprob:
+                        logprob_pt += self.add_logprob_return_values(
+                            i, req, logprob_pt, next_token_ids, logits_output
+                        )
         else:  # embedding or reward model
             assert batch.extend_num_tokens != 0
             embeddings, bid = result
