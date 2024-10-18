@@ -4,6 +4,11 @@ from typing import Dict, List
 
 import httpx
 from worker import Worker
+from sglang.srt.router.utils import configure_logger
+import logging
+
+logger = logging.getLogger(__name__)
+configure_logger(logging.INFO, " [Router]")
 
 
 class BaseRouter:
@@ -15,16 +20,16 @@ class BaseRouter:
     ####################
     # Public Method
     ####################
-    def get_worker(self, server_url: str):
-        if server_url in self.server_url_to_worker:
-            return self.server_url_to_worker[server_url]
-        raise ValueError(f"Worker with url {server_url} not found")
+    def if_exist(self, server_url: str) -> bool:
+        return server_url in self.server_url_to_worker
 
     # scale down the workers / fault happens on the worker
     def remove_worker(self, server_url: str):
-        worker = self.get_worker(server_url)
-        self.worker_list.remove(worker)
-        del self.server_url_to_worker[server_url]
+        for worker in self.worker_list:
+            if worker.server_url == server_url:
+                self.worker_list.remove(worker)
+
+        self.server_url_to_worker.pop(server_url, None)
 
     # scale up the workers / init
     def add_worker(self, server_url: str):
@@ -58,11 +63,11 @@ class RandomRouter(BaseRouter):
 class RoundRobinRouter(BaseRouter):
     def __init__(self, server_urls: List[str]):
         super().__init__(server_urls)
-        self.idx = 0
+        self.idx = -1
 
     def calc_priority(self) -> Worker:
-        worker = self.worker_list[self.idx]
         self.idx = (self.idx + 1) % len(self.worker_list)
+        worker = self.worker_list[self.idx]
         return worker
 
 

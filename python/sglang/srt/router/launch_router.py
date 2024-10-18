@@ -52,6 +52,13 @@ from sglang.srt.router.router import get_router_class
 from sglang.srt.router.utils import WorkerInfo, configure_logger
 import json
 
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+)
+from fastapi import Request, Response
+from dataclasses import asdict
+
+
 logger = logging.getLogger(__name__)
 configure_logger(logging.INFO, " [Router]")
 
@@ -63,10 +70,14 @@ router = None
 
 
 async def is_healthy_or_remove(worker):
+
+    # If worker is not in the list, no need to perform the check
+    if router.if_exist(worker.server_url) is False:
+        return
+
     try:
         res = await worker.client.get("/health")
-        if res.status_code != 200:
-            raise Exception(f"Worker {worker.server_url} is unhealthy")
+        res.raise_for_status()
     except Exception as e:
         # either disconnected or unhealthy
         router.remove_worker(worker.server_url)
@@ -100,7 +111,7 @@ async def lifespan(app: FastAPI):
     task.cancel()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI() # lifespan=lifespan)
 
 
 ################################
@@ -139,20 +150,15 @@ async def get_model_info():
 
     for _ in range(max_retries):
         try:
-            ret = await first_worker.client.get("/get_model_info")
+            res = await first_worker.client.get("/get_model_info")
+            res.raise_for_status()
         except Exception as e:
             logger.warning(f"Error getting server args: {e}")
             await is_healthy_or_remove(first_worker)
             continue
 
         # convert bytes to dictionary
-        return json.loads(ret.content)
-
-from sglang.srt.managers.io_struct import (
-    GenerateReqInput,
-)
-from fastapi import Request, Response
-from dataclasses import asdict
+        return json.loads(res.content)
 
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate(obj: GenerateReqInput, request: Request):
@@ -165,14 +171,17 @@ async def generate(obj: GenerateReqInput, request: Request):
     for _ in range(max_retries):
         try:
             selected_worker = router.calc_priority()
-            ret = await selected_worker.client.post("/generate", json=asdict(obj))
+            res = await selected_worker.client.post("/generate", json=asdict(obj))
+            res.raise_for_status()
         except Exception as e:
             logger.warning(f"Error generating token: {e}")
             print(f"Error generating token: {str(e)}")
             await is_healthy_or_remove(selected_worker)
             continue
-        return Response(content=ret.content, media_type="application/json")
 
+        return Response(content=res.content, media_type="application/json")
+
+    return Response(status_code=500, content=f"Failed to generate token after {max_retries} retries")
 
 ####################
 ## Dynamic Scaling
@@ -261,4 +270,18 @@ Send /generate 5 times, ensure the new worker is included
 Router === current DP
 multithread => async
 how to cal avrage cache hit rate
+when one worker crashes => nested role happens
+text == None
+local router (assume no FT)
+design diagram
+reduce overhead
+"""
+
+
+"""
+TODO:
+
+1. Polish design doc -> maybe use github issue as the design doc
+2. Add tests with fake workers
+3. Fix fault tolerance issue
 """

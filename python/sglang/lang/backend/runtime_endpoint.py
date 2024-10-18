@@ -166,12 +166,16 @@ class RuntimeEndpoint(BaseBackend):
             api_key=self.api_key,
             verify=self.verify,
         )
+
+        # import pdb; pdb.set_trace()
+
         self._assert_success(res)
+
 
         obj = res.json()
 
-        if obj is None:
-            return "", {}
+        # if obj is None:
+        #     return "", {}
 
         comp = obj["text"]
         return comp, obj["meta_info"]
@@ -321,4 +325,5 @@ class RuntimeEndpoint(BaseBackend):
 
     def _assert_success(self, res):
         if res.status_code != 200:
+            # print("assertion fucks!!")
             raise RuntimeError(res.json())
