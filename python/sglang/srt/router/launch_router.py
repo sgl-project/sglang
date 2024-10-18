@@ -45,16 +45,13 @@ import argparse
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import Dict, List
 
-import httpx
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import Response
 
-from sglang.srt.router.router import BaseRouter, get_router_class
+from sglang.srt.router.router import get_router_class
 from sglang.srt.router.utils import WorkerInfo, configure_logger
-from sglang.srt.router.worker import Worker
 
 logger = logging.getLogger(__name__)
 configure_logger(logging.INFO, " [Router]")
