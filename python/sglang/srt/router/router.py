@@ -32,7 +32,8 @@ class BaseRouter:
             raise ValueError(f"Worker with url {server_url} already exists")
         worker = Worker()
         worker.server_url = server_url
-        worker.client = httpx.AsyncClient(base_url=server_url)
+        # disable timeout == setting timeout as inf
+        worker.client = httpx.AsyncClient(base_url=server_url, timeout=None)
         # TODO: ensure the worker is healthy before adding to the list, maybe by sending a health check request
         self.worker_list.append(worker)
         self.server_url_to_worker[server_url] = worker

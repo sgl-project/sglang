@@ -120,7 +120,6 @@ def main(args):
     )
     latency = time.time() - tic
 
-   #  import pdb; pdb.set_trace()
     answers_text = []
     for s in states:
         answers_text.append([x for xs in s.ret_value for x in xs])
@@ -168,7 +167,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data-path",
         type=str,
-        default="/home/jobuser/resources/sglang/python/sglang/srt/router/test.jsonl",
+        default="/home/jobuser/resources/data/test.jsonl",
     )
     parser.add_argument("--num-questions", type=int, default=128)
     args = add_common_sglang_args_and_parse(parser)

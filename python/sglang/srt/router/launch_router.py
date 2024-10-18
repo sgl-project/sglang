@@ -34,11 +34,9 @@ Key Features:
 2. Dynamic Scaling: Supports adding or removing Workers dynamically.
 3. Flexible Routing: Implements multiple routing policies (e.g., round-robin, random).
 
-Usage:
-python -m sglang.launch_router --host <router_host> --port <router_port> --policy <policy_name> --server-urls <url_1> <url_2> ... <url_n>
 
 Example:
-python -m sglang.launch_router --host 127.0.0.1 --port 8080 --policy round-robin --server-urls 127.0.0.1:8081 127.0.0.1:8082 127.0.0.1:8083
+python launch_router.py --host 127.0.0.1 --port 8080 --policy round_robin --worker-urls http://127.0.0.1:9000 http://127.0.0.1:9002 http://127.0.0.1:9004 http://127.0.0.1:9006
 """
 
 import argparse
@@ -88,7 +86,7 @@ async def health_check_loop():
 
         responses = await asyncio.gather(*tasks)
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(4)
 
 
 # https://fastapi.tiangolo.com/advanced/events/#lifespan-function
@@ -102,7 +100,7 @@ async def lifespan(app: FastAPI):
     task.cancel()
 
 
-app = FastAPI() # lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
 
 
 ################################
@@ -163,19 +161,17 @@ async def generate(obj: GenerateReqInput, request: Request):
     """
 
     max_retries = 5
-    selected_worker = router.calc_priority()
-    ret = await selected_worker.client.post("/generate", json=asdict(obj), timeout=60)
-    return Response(content=ret.content, media_type="application/json")
     
-    # for _ in range(max_retries):
-    #     try:
-    #         ret = await selected_worker.client.post("/generate", json=asdict(obj))
-    #     except Exception as e:
-    #         logger.warning(f"Error generating token: {e}")
-    #         print(f"Error generating token: {str(e)}")
-    #         await is_healthy_or_remove(selected_worker)
-    #         continue
-    #     return Response(content=ret.content, media_type="application/json")
+    for _ in range(max_retries):
+        try:
+            selected_worker = router.calc_priority()
+            ret = await selected_worker.client.post("/generate", json=asdict(obj))
+        except Exception as e:
+            logger.warning(f"Error generating token: {e}")
+            print(f"Error generating token: {str(e)}")
+            await is_healthy_or_remove(selected_worker)
+            continue
+        return Response(content=ret.content, media_type="application/json")
 
 
 ####################
@@ -259,4 +255,10 @@ Send /generate 4 times, ensure the evicted worker is not selected.
 Run 4 workers, each on a different port.
 Add one worker.
 Send /generate 5 times, ensure the new worker is included
+"""
+
+"""
+Router === current DP
+multithread => async
+how to cal avrage cache hit rate
 """
