@@ -279,6 +279,9 @@ class Scheduler:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
+            if recv_reqs:
+                print(f"Recv requests {time.time()=}")
+
             batch = self.get_next_batch_to_run()
 
             if batch:
@@ -295,6 +298,7 @@ class Scheduler:
                             break
                         result = self.run_batch(batch)
                         self.process_batch_result(batch, result)
+                print(f"Finish requests {time.time()=}")
             else:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
@@ -312,6 +316,9 @@ class Scheduler:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
+            if recv_reqs:
+                print(f"Recv requests {time.time()=}")
+
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             if batch:
@@ -321,6 +328,7 @@ class Scheduler:
             if self.last_batch:
                 tmp_batch, tmp_result = result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
+                print(f"Finish requests {time.time()=}")
             elif batch is None:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
