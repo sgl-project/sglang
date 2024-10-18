@@ -18,7 +18,6 @@ limitations under the License.
 import logging
 from typing import List, Tuple, Union
 
-import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -77,6 +76,8 @@ class BaseTokenToKVPool:
             self.store_dtype = dtype
 
         self.free_slots = None
+        self.is_not_in_free_group = True
+        self.free_group = []
         self.clear()
 
     def available_size(self):
@@ -89,14 +90,28 @@ class BaseTokenToKVPool:
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
-        return torch.tensor(select_index, dtype=torch.int32, device=self.device)
+        return select_index.to(self.device)
 
     def free(self, free_index: torch.Tensor):
-        self.free_slots = np.concatenate((self.free_slots, free_index.cpu().numpy()))
+        if self.is_not_in_free_group:
+            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
+        else:
+            self.free_group.append(free_index)
+
+    def free_group_begin(self):
+        self.is_not_in_free_group = False
+        self.free_group = []
+
+    def free_group_end(self):
+        self.is_not_in_free_group = True
+        if self.free_group:
+            self.free(torch.concat(self.free_group))
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = np.arange(1, self.size + 1)
+        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
+        self.is_in_free_group = False
+        self.free_group = []
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()

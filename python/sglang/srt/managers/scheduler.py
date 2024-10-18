@@ -834,6 +834,8 @@ class Scheduler:
 
         next_token_ids = self.resolve_next_token_ids(bid, next_token_ids)
 
+        self.token_to_kv_pool.free_group_begin()
+
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if self.server_args.enable_overlap_schedule and req.finished():
@@ -859,6 +861,8 @@ class Scheduler:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
 
         self.stream_output(batch.reqs)
+
+        self.token_to_kv_pool.free_group_end()
 
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
