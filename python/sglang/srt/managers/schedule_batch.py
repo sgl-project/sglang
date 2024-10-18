@@ -535,15 +535,14 @@ class ScheduleBatch:
             pt += req.extend_input_len
 
         # Set fields
-        dev = out_cache_loc.device
         self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
-            dev, non_blocking=True
+            self.device, non_blocking=True
         )
         self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32).to(
-            dev, non_blocking=True
+            self.device, non_blocking=True
         )
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
-            dev, non_blocking=True
+            self.device, non_blocking=True
         )
 
         self.extend_num_tokens = extend_num_tokens
@@ -788,8 +787,8 @@ class ScheduleBatch:
             return
 
         self.reqs = [self.reqs[i] for i in keep_indices]
-        new_indices = torch.tensor(
-            keep_indices, dtype=torch.int32, device=self.seq_lens.device
+        new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(
+            self.device, non_blocking=True
         )
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
