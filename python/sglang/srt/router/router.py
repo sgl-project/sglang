@@ -5,38 +5,41 @@ from fastapi.responses import Response
 from typing import List, Dict
 import httpx
 import asyncio
-
+from worker import Worker
+from enum import Enum, auto
 
 class BaseRouter:
     def __init__(self, server_urls: List[str]):
-        self.worker_list: List[Worker] = None
-        
+        self.worker_list: List[Worker] = []
+        self.server_url_to_worker: Dict[str, Worker] = {}
         self._init_worker_list(server_urls)
-        
-        self.server_url_to_worker: Dict[str, Worker] = {worker.url: worker for worker in self.worker_list}
 
     ####################
     # Public Method
     ####################
     def get_worker(self, server_url: str):
-        for worker in self.worker_list:
-            if worker.url == server_url:
-                return worker
+        if server_url in self.server_url_to_worker:
+            return self.server_url_to_worker[server_url]
         raise ValueError(f"Worker with url {server_url} not found")
 
     # scale down the workers / fault happens on the worker
     def remove_worker(self, server_url: str):
         worker = self.get_worker(server_url)
-        worker.client.close()
         self.worker_list.remove(worker)
+        del self.server_url_to_worker[server_url]
     
     # scale up the workers / init
-    def add_worker(self, server_url: str):
+    async def async_add_worker(self, server_url: str):
         worker = Worker()
         worker.server_url = server_url
         worker.client = httpx.AsyncClient(base_url=server_url)
-        #TODO: make a call to fill in more worker info, but need to ensure performance
+        try:
+            res = await worker.client.get("/health")c
+        
+
+        #TODO: ensure the worker is healthy before adding to the list, maybe by sending a health check request
         self.worker_list.append(worker)
+        self.server_url_to_worker[server_url] = worker
 
     def calc_priority(self) -> Worker:
         raise NotImplementedError
@@ -44,8 +47,8 @@ class BaseRouter:
     ####################
     # Private Method
     ####################
-    def _init_worker_list(self):
-        for server_url in self.server_urls:
+    def _init_worker_list(self, server_urls):
+        for server_url in server_urls:
             self.add_worker(server_url)
     
 class RandomRouter(BaseRouter):
@@ -64,7 +67,8 @@ class RoundRobinRouter(BaseRouter):
         return worker
 
 
-# Make a enum for routing policy
+from enum import Enum, auto
+
 class RoutingPolicy(Enum):
     ROUND_ROBIN = auto()
     RANDOM = auto()
@@ -75,7 +79,8 @@ class RoutingPolicy(Enum):
         try:
             return cls[policy]
         except KeyError as exc:
-            raise ValueError(f"Invalid routing policy: {policy}") from exc
+            valid_options = ", ".join(member.name for member in cls)
+            raise ValueError(f"Invalid routing policy: {policy}. The valid options are {valid_options}") from exc
 
 def get_router_class(policy_name: str):
     policy = RoutingPolicy.from_str(policy_name)
