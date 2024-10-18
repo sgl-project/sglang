@@ -122,6 +122,9 @@ class BatchedPenalizerOrchestrator:
             indices_to_keep (typing.List[int]): List of indices to keep in the batch.
             indices_tensor_to_keep (torch.Tensor = None): Tensor of indices to keep in the batch. If not None, it will be used instead of converting indices_to_keep to a tensor.
         """
+        if not self.is_required:
+            return
+
         empty_indices = len(indices_to_keep) == 0
 
         is_required = False
