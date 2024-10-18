@@ -150,6 +150,7 @@ class Scheduler:
             nccl_port=port_args.nccl_port,
         )
         self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
+        self.device = self.tp_worker.device
 
         # Get token and memory info from the model worker
         (
