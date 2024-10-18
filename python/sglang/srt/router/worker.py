@@ -1,12 +1,13 @@
 from dataclasses import dataclass
+import httpx
+from typing import Optional
 
 # Store worker config and the client to talk to the worker
 @dataclass
 class Worker:
     # static server configs
-    max_running_request: int
+    max_running_request: Optional[int] = None
     # the server url for the DP worker
-    server_url: str
-
+    server_url: Optional[str] = None
     # the client to interact the the DP server
-    client: httpx.AsyncClient
+    client: Optional[httpx.AsyncClient] = None
