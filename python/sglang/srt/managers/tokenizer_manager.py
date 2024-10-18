@@ -150,9 +150,13 @@ class TokenizerManager:
         while self.model_update_lock.locked():
             await asyncio.sleep(0.001)
 
+        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+            raise ValueError(
+                "This model does not appear to be an embedding model by default. Please add `--is-embedding` when launching the server or try another model."
+            )
+
         obj.post_init()
         is_single = obj.is_single
-
         if is_single:
             async for response in self._handle_single_request(obj, request):
                 yield response

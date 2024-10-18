@@ -255,7 +255,7 @@ class CudaGraphRunner:
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs, self.req_pool_indices, self.seq_lens, encoder_lens
+            bs, self.req_pool_indices, self.seq_lens
         )
 
         # Replay

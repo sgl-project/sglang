@@ -73,6 +73,7 @@ class ServerArgs:
     # Other
     api_key: Optional[str] = None
     file_storage_pth: str = "SGLang_storage"
+    enable_cache_report: bool = False
 
     # Data parallelism
     dp_size: int = 1
@@ -85,6 +86,14 @@ class ServerArgs:
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
+
+    # Double Sparsity
+    enable_double_sparsity: bool = False
+    ds_channel_config_path: str = None
+    ds_heavy_channel_num: int = 32
+    ds_heavy_token_num: int = 256
+    ds_heavy_channel_type: str = "qk"
+    ds_sparse_decode_threshold: int = 4096
 
     # LoRA
     lora_paths: Optional[List[str]] = None
@@ -105,6 +114,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_penalizer: bool = False
+    enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     max_torch_compile_bs: int = 32
@@ -401,6 +411,11 @@ class ServerArgs:
             default=ServerArgs.file_storage_pth,
             help="The path of the file storage in backend.",
         )
+        parser.add_argument(
+            "--enable-cache-report",
+            action="store_true",
+            help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
 
         # Data parallelism
         parser.add_argument(
@@ -441,6 +456,43 @@ class ServerArgs:
             type=str,
             help="A dictionary in JSON string format used to override default model configurations.",
             default=ServerArgs.json_model_override_args,
+        )
+
+        # Double Sparsity
+        parser.add_argument(
+            "--enable-double-sparsity",
+            action="store_true",
+            help="Enable double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-channel-config-path",
+            type=str,
+            default=ServerArgs.ds_channel_config_path,
+            help="The path of the double sparsity channel config",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-num",
+            type=int,
+            default=ServerArgs.ds_heavy_channel_num,
+            help="The number of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-token-num",
+            type=int,
+            default=ServerArgs.ds_heavy_token_num,
+            help="The number of heavy tokens in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-type",
+            type=str,
+            default=ServerArgs.ds_heavy_channel_type,
+            help="The type of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-sparse-decode-threshold",
+            type=int,
+            default=ServerArgs.ds_sparse_decode_threshold,
+            help="The type of heavy channels in double sparsity attention",
         )
 
         # LoRA
@@ -526,6 +578,11 @@ class ServerArgs:
             "--disable-penalizer",
             action="store_true",
             help="Disable the logit penalizer (e.g., frequency and repetition penalty).",
+        )
+        parser.add_argument(
+            "--enable-overlap-schedule",
+            action="store_true",
+            help="Overlap the CPU scheduler with GPU model worker. Experimental feature.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",

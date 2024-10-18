@@ -57,7 +57,7 @@ class SamplingBatchInfo:
                 [r.sampling_params.top_p for r in reqs], dtype=torch.float
             )
             top_ks = torch.tensor(
-                [r.sampling_params.top_k for r in reqs], dtype=torch.int
+                [r.sampling_params.top_k for r in reqs], dtype=torch.int32
             )
             min_ps = torch.tensor(
                 [r.sampling_params.min_p for r in reqs], dtype=torch.float
@@ -201,4 +201,15 @@ class SamplingBatchInfo:
 
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device
+        )
+
+    def copy(self):
+        return SamplingBatchInfo(
+            temperatures=self.temperatures,
+            top_ps=self.top_ps,
+            top_ks=self.top_ks,
+            min_ps=self.min_ps,
+            need_min_p_sampling=self.need_min_p_sampling,
+            vocab_size=self.vocab_size,
+            device=self.device,
         )

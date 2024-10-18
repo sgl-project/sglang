@@ -18,7 +18,6 @@ limitations under the License.
 import logging
 from typing import List, Tuple, Union
 
-import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -77,6 +76,8 @@ class BaseTokenToKVPool:
             self.store_dtype = dtype
 
         self.free_slots = None
+        self.is_not_in_free_group = True
+        self.free_group = []
         self.clear()
 
     def available_size(self):
@@ -89,14 +90,28 @@ class BaseTokenToKVPool:
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
-        return torch.tensor(select_index, dtype=torch.int32, device=self.device)
+        return select_index.to(self.device)
 
     def free(self, free_index: torch.Tensor):
-        self.free_slots = np.concatenate((self.free_slots, free_index.cpu().numpy()))
+        if self.is_not_in_free_group:
+            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
+        else:
+            self.free_group.append(free_index)
+
+    def free_group_begin(self):
+        self.is_not_in_free_group = False
+        self.free_group = []
+
+    def free_group_end(self):
+        self.is_not_in_free_group = True
+        if self.free_group:
+            self.free(torch.concat(self.free_group))
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = np.arange(1, self.size + 1)
+        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
+        self.is_in_free_group = False
+        self.free_group = []
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -231,3 +246,61 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             self.kv_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
         else:
             self.kv_buffer[layer_id][loc] = cache_k
+
+
+class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
+
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        heavy_channel_num: int,
+    ):
+        super().__init__(size, dtype, device)
+
+        # [size, head_num, head_dim] for each layer
+        self.k_buffer = [
+            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+            for _ in range(layer_num)
+        ]
+        self.v_buffer = [
+            torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+            for _ in range(layer_num)
+        ]
+
+        # [size, head_num, heavy_channel_num] for each layer
+        self.label_buffer = [
+            torch.empty(
+                (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
+            )
+            for _ in range(layer_num)
+        ]
+
+    def get_key_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id]
+
+    def get_value_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id]
+
+    def get_label_buffer(self, layer_id: int):
+        return self.label_buffer[layer_id]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id], self.v_buffer[layer_id]
+
+    def set_kv_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_label: torch.Tensor,
+    ):
+        # NOTE(Andy): ignore the dtype check
+        self.k_buffer[layer_id][loc] = cache_k
+        self.v_buffer[layer_id][loc] = cache_v
+        self.label_buffer[layer_id][loc] = cache_label

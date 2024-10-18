@@ -13,15 +13,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Adapted from:
-# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/stablelm.py#L1
-"""Inference-only StableLM-2 (https://huggingface.co/stabilityai/stablelm-2-1_6b)
-model compatible with HuggingFace weights."""
-from typing import Iterable, Optional, Tuple
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/olmo.py#L1
+"""Inference-only OLMo model compatible with HuggingFace weights."""
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import OlmoConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -42,102 +41,63 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-class StablelmMLP(nn.Module):
+class OlmoAttention(nn.Module):
+    """
+    This is the attention block where the output is computed as
+    ``Attention(LN(x))`` in ``MLP(LN(x + Attention(LN(x))))``
+    (plus another skip connection).
+    """
+
     def __init__(
         self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_up_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [config.intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-        )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-        )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
-
-
-class StablelmAttention(nn.Module):
-    def __init__(
-        self,
-        config: PretrainedConfig,
+        config: OlmoConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
+    ):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
-        self.num_heads = self.total_num_heads // tp_size
 
-        self.total_num_key_value_heads = config.num_key_value_heads
-        if self.total_num_key_value_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_key_value_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_key_value_heads == 0
-        self.num_key_value_heads = max(1, self.total_num_key_value_heads // tp_size)
+        assert self.hidden_size % self.total_num_heads == 0
+        assert self.total_num_heads % tensor_model_parallel_world_size == 0
+
+        self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
         self.head_dim = self.hidden_size // self.total_num_heads
         self.max_position_embeddings = config.max_position_embeddings
-        rope_pct = getattr(
-            config, "rope_pct", getattr(config, "partial_rotary_factor", 1)
-        )
-        self.rotary_ndims = int(self.head_dim * rope_pct)
-        self.scaling = self.head_dim**-0.5
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_key_value_heads * self.head_dim
-        self.qkv_bias = getattr(config, "use_qkv_bias", False)
-        if (self.head_dim * self.num_heads * tp_size) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads "
-                f"(got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
+        self.rope_theta = config.rope_theta
+        self.clip_qkv = config.clip_qkv
 
+        # Attention input projection. Projects x -> (q, k, v)
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
-            self.total_num_key_value_heads,
-            self.qkv_bias,
+            bias=config.attention_bias,
         )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
-            bias=False,
-        )
+
+        # Rotary embeddings.
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.rotary_ndims,
-            max_position=self.config.max_position_embeddings,
-            base=self.config.rope_theta,
+            rotary_dim=self.head_dim,
+            max_position=self.max_position_embeddings,
+            base=self.rope_theta,
         )
+        self.scaling = self.head_dim**-0.5
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
-            num_kv_heads=self.num_key_value_heads,
+            num_kv_heads=self.num_heads,
             layer_id=layer_id,
+        )
+
+        # Attention output projection.
+        self.o_proj = RowParallelLinear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=config.attention_bias,
         )
 
     def forward(
@@ -147,71 +107,129 @@ class StablelmAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.clip_qkv is not None:
+            qkv.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
+        q, k, v = qkv.chunk(chunks=3, dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
 
-class StablelmDecoderLayer(nn.Module):
+class OlmoMLP(nn.Module):
+    """
+    This is the MLP block where the output is computed as
+    ``MLP(LN(x))`` in ``MLP(LN(x + Attention(LN(x))))``
+    (plus another skip connection).
+    """
+
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: OlmoConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+
+        # Feed-forward input projection.
+        self.gate_up_proj = MergedColumnParallelLinear(
+            self.hidden_size,
+            [self.intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+        )
+
+        # Activation function.
+        self.act_fn = SiluAndMul()
+
+        # Feed-forward output projection.
+        self.down_proj = RowParallelLinear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class OlmoDecoderLayer(nn.Module):
+    """
+    This is a typical transformer block where the output is
+    computed as ``MLP(LN(x + Attention(LN(x))))``
+    (plus another skip connection).
+    """
+
+    def __init__(
+        self,
+        config: OlmoConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
+    ):
         super().__init__()
-        self.self_attn = StablelmAttention(config, layer_id=layer_id)
-        self.mlp = StablelmMLP(config, quant_config=quant_config)
-        norm_eps = getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-05))
-        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=norm_eps)
-        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=norm_eps)
+        # Attention block.
+        self.self_attn = OlmoAttention(config, layer_id, quant_config)
+
+        # MLP block.
+        self.mlp = OlmoMLP(config, quant_config)
+
+        # LayerNorm
+        self.input_layernorm = nn.LayerNorm(
+            config.hidden_size, elementwise_affine=False, bias=False
+        )
+        self.post_attention_layernorm = nn.LayerNorm(
+            config.hidden_size, elementwise_affine=False, bias=False
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        # Attention block.
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
-        hidden_states = residual + hidden_states
+        hidden_states = self.self_attn(positions, hidden_states, forward_batch)
+        hidden_states = hidden_states + residual
 
-        # Fully Connected
+        # MLP block.
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        return hidden_states
 
-        return hidden_states, residual
 
+class OlmoModel(nn.Module):
 
-class StableLMEpochModel(nn.Module):
     def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
+        self, config: OlmoConfig, quant_config: Optional[QuantizationConfig] = None
+    ):
         super().__init__()
+        self.config = config
+
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
+            config.vocab_size, config.hidden_size
         )
         self.layers = nn.ModuleList(
             [
-                StablelmDecoderLayer(config, i, quant_config=quant_config)
-                for i in range(config.num_hidden_layers)
+                OlmoDecoderLayer(config, layer_idx, quant_config)
+                for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        norm_eps = getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-05))
-        self.norm = nn.LayerNorm(config.hidden_size, eps=norm_eps)
+        self.norm = nn.LayerNorm(
+            config.hidden_size, elementwise_affine=False, bias=False
+        )
 
     def forward(
         self,
@@ -220,36 +238,58 @@ class StableLMEpochModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        """
+        :param input_ids: A tensor of shape `(batch_size, seq_len)`.
+        """
+        # Get embeddings of input.
+        # shape: (batch_size, seq_len, d_model)
+
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
+
+        # Apply blocks one-by-one.
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            # shape: (batch_size, seq_len, d_model)
+            hidden_states = decoder_layer(
                 positions,
                 hidden_states,
                 forward_batch,
             )
+
+        # Apply final layer norm.
+        # shape: (batch_size, seq_len or 1, d_model)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
-class StableLmForCausalLM(nn.Module):
+class OlmoForCausalLM(nn.Module):
+    """
+    Extremely barebones HF model wrapper.
+    """
+
     def __init__(
         self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        config: OlmoConfig,
         cache_config=None,
-    ) -> None:
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
         super().__init__()
         self.config = config
-        self.quant_config = quant_config
-        self.model = StableLMEpochModel(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.model = OlmoModel(config, quant_config)
+        if config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.unpadded_vocab_size = config.vocab_size
+            self.lm_head = ParallelLMHead(
+                self.unpadded_vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                quant_config=quant_config,
+            )
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -257,7 +297,12 @@ class StableLmForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+        )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
@@ -271,13 +316,18 @@ class StableLmForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        params_dict = dict(self.named_parameters())
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
+                continue
+            # With tie_word_embeddings, we can skip lm_head.weight
+            # The weight might appear unnecessarily in the files if the model is
+            # processed with quantization, LoRA, fine-tuning, etc.
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -299,4 +349,4 @@ class StableLmForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = StableLmForCausalLM
+EntryClass = OlmoForCausalLM
