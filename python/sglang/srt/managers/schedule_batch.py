@@ -515,11 +515,11 @@ class ScheduleBatch:
             assert seq_len - pre_len == req.extend_input_len
 
             if pre_len > 0:
-                self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    :pre_len
-                ] = req.prefix_indices
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, :pre_len] = (
+                    req.prefix_indices
+                )
 
-            self.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
+            self.req_to_token_pool.req_to_token[req.req_pool_idx, pre_len:seq_len] = (
                 out_cache_loc[pt : pt + req.extend_input_len]
             )
 
