@@ -145,8 +145,9 @@ class ForwardBatch:
                     ],
                     axis=0,
                 ),
+                dtype=torch.int64,
                 device=device,
-            ).to(torch.int64)
+            )
 
             ret.image_inputs = batch.image_inputs
             ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device=device)
