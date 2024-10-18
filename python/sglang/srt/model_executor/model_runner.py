@@ -59,6 +59,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
+    is_embedding_model,
     is_generation_model,
     is_multimodal_model,
     monkey_patch_vllm_dummy_weight_loader,
@@ -262,6 +263,9 @@ class ModelRunner:
             else None
         )
         self.has_cross_attention = getattr(self.model, "has_cross_attention", False)
+        self.is_embedding = is_embedding_model(
+            self.model_config.hf_config.architectures, self.server_args.is_embedding
+        )
         self.is_generation = is_generation_model(
             self.model_config.hf_config.architectures, self.server_args.is_embedding
         )
@@ -512,7 +516,6 @@ class ModelRunner:
             )
 
     def init_double_sparsity_channel_config(self, selected_channel):
-
         selected_channel = "." + selected_channel + "_proj"
         self.sorted_channels = []
         # load channel config
@@ -556,17 +559,17 @@ class ModelRunner:
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):
-        if self.is_generation:
-            return self.model.forward(
-                forward_batch.input_ids, forward_batch.positions, forward_batch
-            )
-        else:
+        if self.is_embedding:
             # Only embedding models have get_embedding parameter
             return self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 get_embedding=True,
+            )
+        else:
+            return self.model.forward(
+                forward_batch.input_ids, forward_batch.positions, forward_batch
             )
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:

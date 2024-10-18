@@ -215,20 +215,29 @@ def is_multimodal_model(model_architectures):
         return False
 
 
+def is_embedding_model(model_architectures, is_embedding: bool = False):
+    if ("LlamaEmbeddingModel" in model_architectures) or is_embedding:
+        return True
+    else:
+        return False
+
+
 def is_generation_model(model_architectures, is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
-    # 1. Check the model architectue
-    # 2. check the `is_embedding` server args
+    # 1. Check if it is an embedding model
+    # 2. Check if it is a specific model architecture that is not a generative model
+
+    if is_embedding_model(model_architectures, is_embedding):
+        return False
 
     if (
-        "LlamaEmbeddingModel" in model_architectures
-        or "MistralModel" in model_architectures
+        "MistralModel" in model_architectures
         or "LlamaForSequenceClassification" in model_architectures
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
     ):
         return False
     else:
-        return not is_embedding
+        return True
 
 
 def decode_video_base64(video_base64):
@@ -522,7 +531,6 @@ def maybe_set_triton_cache_manager() -> None:
 class CustomCacheManager(FileCacheManager):
     # Adapted from: https://github.com/tdoublep/vllm/blob/3307522289fdfefe323b6c00d0db696651989a2f/vllm/triton_utils/custom_cache_manager.py
     def __init__(self, key, override=False, dump=False):
-
         self.key = key
         self.lock_path = None
         if dump:
