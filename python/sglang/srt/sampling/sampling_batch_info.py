@@ -48,20 +48,24 @@ class SamplingBatchInfo:
         disable_penalizer: bool,
     ):
         reqs = batch.reqs
-        with batch.input_ids.device:
-            temperatures = torch.tensor(
+        device = batch.input_ids.device
+        temperatures = (
+            torch.tensor(
                 [r.sampling_params.temperature for r in reqs],
                 dtype=torch.float,
-            ).view(-1, 1)
-            top_ps = torch.tensor(
-                [r.sampling_params.top_p for r in reqs], dtype=torch.float
             )
-            top_ks = torch.tensor(
-                [r.sampling_params.top_k for r in reqs], dtype=torch.int32
-            )
-            min_ps = torch.tensor(
-                [r.sampling_params.min_p for r in reqs], dtype=torch.float
-            )
+            .view(-1, 1)
+            .to(device, non_blocking=True)
+        )
+        top_ps = torch.tensor(
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
+        top_ks = torch.tensor(
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int32
+        ).to(device, non_blocking=True)
+        min_ps = torch.tensor(
+            [r.sampling_params.min_p for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
 
         ret = cls(
             temperatures=temperatures,

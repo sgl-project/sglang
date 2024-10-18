@@ -136,9 +136,9 @@ class ForwardBatch:
         # Init position information
         if not ret.forward_mode.is_decode():
             ret.positions = torch.tensor(
-                np.concatenate(
+                torch.concat(
                     [
-                        np.arange(prefix_len, prefix_len + extend_len)
+                        torch.arange(prefix_len, prefix_len + extend_len)
                         for prefix_len, extend_len in zip(
                             batch.extend_prefix_lens, batch.extend_seq_lens
                         )
@@ -146,14 +146,15 @@ class ForwardBatch:
                     axis=0,
                 ),
                 dtype=torch.int64,
-                device=device,
-            )
+            ).to(device, non_blocking=True)
 
             ret.image_inputs = batch.image_inputs
-            ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device=device)
+            ret.extend_seq_lens = torch.tensor(
+                batch.extend_seq_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
             ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, device=device
-            )
+                batch.extend_prefix_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
             ret.extend_start_loc = torch.zeros_like(ret.extend_seq_lens)
             ret.extend_start_loc[1:] = torch.cumsum(ret.extend_seq_lens[:-1], dim=0)
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
