@@ -26,7 +26,8 @@ runtime_common = ["aiohttp", "decord", "fastapi", "hf_transfer", "huggingface_hu
     "outlines>=0.0.44", "modelscope"]
 # xpu is not enabled in public vllm and torch whl,
 # need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
-srt = ["sglang[runtime_common]", "torch", "vllm==0.5.5"]
+
+srt = ["sglang[runtime_common]", "torch", "vllm==0.6.3.post1"]
 srt_xpu = ["sglang[runtime_common]"]
 
 openai = ["openai>=1.0", "tiktoken"]
