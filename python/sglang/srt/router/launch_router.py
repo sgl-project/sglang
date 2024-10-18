@@ -88,7 +88,7 @@ async def health_check_loop():
 
         responses = await asyncio.gather(*tasks)
 
-        await asyncio.sleep(10)
+        await asyncio.sleep(60)
 
 
 # https://fastapi.tiangolo.com/advanced/events/#lifespan-function
@@ -102,7 +102,7 @@ async def lifespan(app: FastAPI):
     task.cancel()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI() # lifespan=lifespan)
 
 
 ################################
@@ -153,7 +153,7 @@ async def get_model_info():
 from sglang.srt.managers.io_struct import (
     GenerateReqInput,
 )
-from fastapi import Request
+from fastapi import Request, Response
 from dataclasses import asdict
 
 @app.api_route("/generate", methods=["POST", "PUT"])
@@ -164,15 +164,18 @@ async def generate(obj: GenerateReqInput, request: Request):
 
     max_retries = 5
     selected_worker = router.calc_priority()
-
-    for _ in range(max_retries):
-        try:
-            ret = await selected_worker.client.post("/generate", json=asdict(obj))
-        except Exception as e:
-            logger.warning(f"Error generating token: {e}")
-            await is_healthy_or_remove(selected_worker)
-            continue
-        return json.loads(ret.content)
+    ret = await selected_worker.client.post("/generate", json=asdict(obj), timeout=60)
+    return Response(content=ret.content, media_type="application/json")
+    
+    # for _ in range(max_retries):
+    #     try:
+    #         ret = await selected_worker.client.post("/generate", json=asdict(obj))
+    #     except Exception as e:
+    #         logger.warning(f"Error generating token: {e}")
+    #         print(f"Error generating token: {str(e)}")
+    #         await is_healthy_or_remove(selected_worker)
+    #         continue
+    #     return Response(content=ret.content, media_type="application/json")
 
 
 ####################
