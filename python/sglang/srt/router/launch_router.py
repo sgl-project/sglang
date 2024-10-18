@@ -41,107 +41,81 @@ Example:
 python -m sglang.launch_router --host 127.0.0.1 --port 8080 --policy round-robin --server-urls 127.0.0.1:8081 127.0.0.1:8082 127.0.0.1:8083
 """
 
-from fastapi import FastAPI
-import uvicorn
 import argparse
-from fastapi.responses import Response
-from typing import List, Dict
-import httpx
 import asyncio
-from sglang.srt.router.router import get_router_class, BaseRouter
-from contextlib import asynccontextmanager
 import logging
+from contextlib import asynccontextmanager
+from typing import Dict, List
+
+import httpx
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import Response
+
+from sglang.srt.router.router import BaseRouter, get_router_class
+from sglang.srt.router.utils import WorkerInfo, configure_logger
 from sglang.srt.router.worker import Worker
-
-
-def configure_logger(log_level, prefix: str = ""):
-    # add level to the format
-    format = f"[%(asctime)s{prefix}] %(levelname)s: %(message)s"
-
-    # format = f"[%(asctime)s{prefix}] %(message)s"
-    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
-    logging.basicConfig(
-        level=log_level,
-        format=format,
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
 
 logger = logging.getLogger(__name__)
 configure_logger(logging.INFO, " [Router]")
 
 router = None
 
+##############
+# Local utils
+##############
+
+
+async def is_healthy_or_remove(worker):
+    try:
+        res = await worker.client.get("/health")
+        if res.status_code != 200:
+            raise Exception(f"Worker {worker.server_url} is unhealthy")
+    except Exception as e:
+        # either disconnected or unhealthy
+        router.remove_worker(worker.server_url)
+        logger.warning(
+            f"Worker {worker.server_url} is unhealthy and was removed. Error: {e}"
+        )
+
+
 # run a non-blocking event loop to check the healthiness of the workers and kick out the unhealthy one
-async def health_check():
-
-    async def handler(worker: Worker):
-        try:
-            res = await worker.client.get("/health")
-            if res.status_code != 200:
-                raise Exception(f"Worker {worker.server_url} is unhealthy")
-        # if disconnected or not status 200
-        except Exception as e:
-            router.remove_worker(worker.server_url)
-            logger.warning(f"Worker {worker.server_url} is unhealthy and was removed: {e}")
-
-
+async def health_check_loop():
     while True:
         logger.info("Checking worker health...")
 
         tasks = []
         for server_url, worker in router.server_url_to_worker.items():
-            tasks.append(handler(worker))
-        
+            tasks.append(is_healthy_or_remove(worker))
+
         responses = await asyncio.gather(*tasks)
 
         await asyncio.sleep(10)
+
 
 # https://fastapi.tiangolo.com/advanced/events/#lifespan-function
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # startup event
     # kick off a non-blocking event loop to monitor the healthiness of the workers
-    task = asyncio.create_task(health_check())
-    
+    task = asyncio.create_task(health_check_loop())
     yield
     # shutdown event
     task.cancel()
 
+
 app = FastAPI(lifespan=lifespan)
 
-from dataclasses import dataclass
 
-@dataclass
-class WorkerInfo:
-    server_url: str
-
-@app.post("/add_worker")
-async def add_worker(worker_info: WorkerInfo):
-    server_url = worker_info.server_url
-    try:
-        # TODO: this should be async and wait until the worker is healthy
-        router.add_worker(server_url)
-        return Response(status_code=200, content=f"Worker {server_url} was added succesfully")
-    except Exception as e:
-        return Response(status_code=500, content=str(e))
-
-@app.post("/remove_worker")
-async def remove_worker(worker_info: WorkerInfo):
-    server_url = worker_info.server_url
-    try:
-        router.remove_worker(server_url)
-        return Response(status_code=200, content=f"Worker {server_url} was removed succesfully")
-    except Exception as e:
-        return Response(status_code=500, content=str(e))
+################################
+## SGLang server compatible APIs
+################################
 
 
 @app.get("/get_server_args")
 async def get_server_args():
     """
     Returns the server arguments of the first worker.
-    If run into errors, check whether the worker is healthy.
-    If not, kick the worker out, and rerun the get_server_args function
     """
     tasks = []
     first_worker = router.worker_list[0]
@@ -150,22 +124,15 @@ async def get_server_args():
         ret = await first_worker.client.get("/get_server_args")
         return ret.content
     except Exception as e:
-        ret = await first_worker.client.get("/health")
-        if ret.status_code != 200:
-            # the error is because the worker is unhealthy
-            # kick the worker out, and select the worker again
-            router.remove_worker(first_worker.server_url)
-            return await get_server_args()
-        else:
-            # the error is due to other reasons, just return the error
-            return Response(status_code=500, content=str(e))
+        logger.warning(f"Error getting server args: {e}")
+        await is_healthy_or_remove(first_worker)
+        return await get_server_args()
+
 
 @app.post("/generate")
 async def generate():
     """
-    Generates a token from the selected worker.
-    If run into errors, check whether the worker is healthy.
-    If not, kick the worker out, and rerun the generate function
+    Generates response from the selected worker.
     """
     selected_worker = router.calc_priority()
 
@@ -173,15 +140,38 @@ async def generate():
         ret = await selected_worker.client.post("/generate")
         return ret.content
     except Exception as e:
-        ret = await selected_worker.client.get("/health")
-        if ret.status_code != 200:
-            # the error is because the worker is unhealthy
-            # kick the worker out, and select the worker again
-            router.remove_worker(selected_worker.server_url)
-            return await generate()
-        else:
-            # the error is due to other reasons, just return the error
-            return Response(status_code=500, content=str(e))
+        logger.warning(f"Error generating token: {e}")
+        await is_healthy_or_remove(selected_worker)
+        return await generate()
+
+
+####################
+## Dynamic Scaling
+####################
+
+
+@app.post("/add_worker")
+async def add_worker(worker_info: WorkerInfo):
+    server_url = worker_info.server_url
+    try:
+        router.add_worker(server_url)
+        return Response(
+            status_code=200, content=f"Worker {server_url} was added succesfully"
+        )
+    except Exception as e:
+        return Response(status_code=500, content=str(e))
+
+
+@app.post("/remove_worker")
+async def remove_worker(worker_info: WorkerInfo):
+    server_url = worker_info.server_url
+    try:
+        router.remove_worker(server_url)
+        return Response(
+            status_code=200, content=f"Worker {server_url} was removed succesfully"
+        )
+    except Exception as e:
+        return Response(status_code=500, content=str(e))
 
 
 # add arg parser
@@ -189,10 +179,19 @@ def parse_args():
     parser = argparse.ArgumentParser(description="SGLang Router")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Router host")
     parser.add_argument("--port", type=int, default=8080, help="Router port")
-    parser.add_argument("--policy", type=str, default="round_robin", help="Routing policy")
+    parser.add_argument(
+        "--policy", type=str, default="round_robin", help="Routing policy"
+    )
     # + means the args are gathered to a list, and #args must >= 1
-    parser.add_argument("--worker-urls", required=True, nargs="+", type=str, help="Space-separated list of DP workers' URLs")
+    parser.add_argument(
+        "--worker-urls",
+        required=True,
+        nargs="+",
+        type=str,
+        help="Space-separated list of DP workers' URLs",
+    )
     return parser.parse_args()
+
 
 def launch_router():
     global router
