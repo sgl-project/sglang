@@ -1,6 +1,8 @@
 from dataclasses import dataclass
-import httpx
 from typing import Optional
+
+import httpx
+
 
 # Store worker config and the client to talk to the worker
 @dataclass

@@ -1,12 +1,14 @@
-from fastapi import FastAPI
-import uvicorn
 import argparse
-from fastapi.responses import Response
-from typing import List, Dict
-import httpx
 import asyncio
-from worker import Worker
 from enum import Enum, auto
+from typing import Dict, List
+
+import httpx
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import Response
+from worker import Worker
+
 
 class BaseRouter:
     def __init__(self, server_urls: List[str]):
@@ -27,17 +29,15 @@ class BaseRouter:
         worker = self.get_worker(server_url)
         self.worker_list.remove(worker)
         del self.server_url_to_worker[server_url]
-    
+
     # scale up the workers / init
-    async def async_add_worker(self, server_url: str):
+    def add_worker(self, server_url: str):
+        if server_url in self.server_url_to_worker:
+            raise ValueError(f"Worker with url {server_url} already exists")
         worker = Worker()
         worker.server_url = server_url
         worker.client = httpx.AsyncClient(base_url=server_url)
-        try:
-            res = await worker.client.get("/health")c
-        
-
-        #TODO: ensure the worker is healthy before adding to the list, maybe by sending a health check request
+        # TODO: ensure the worker is healthy before adding to the list, maybe by sending a health check request
         self.worker_list.append(worker)
         self.server_url_to_worker[server_url] = worker
 
@@ -50,11 +50,13 @@ class BaseRouter:
     def _init_worker_list(self, server_urls):
         for server_url in server_urls:
             self.add_worker(server_url)
-    
+
+
 class RandomRouter(BaseRouter):
     def calc_priority(self) -> Worker:
         idx = random.choice(self.worker_list)
         return self.worker_list[idx]
+
 
 class RoundRobinRouter(BaseRouter):
     def __init__(self, server_urls: List[str]):
@@ -69,6 +71,7 @@ class RoundRobinRouter(BaseRouter):
 
 from enum import Enum, auto
 
+
 class RoutingPolicy(Enum):
     ROUND_ROBIN = auto()
     RANDOM = auto()
@@ -80,7 +83,10 @@ class RoutingPolicy(Enum):
             return cls[policy]
         except KeyError as exc:
             valid_options = ", ".join(member.name for member in cls)
-            raise ValueError(f"Invalid routing policy: {policy}. The valid options are {valid_options}") from exc
+            raise ValueError(
+                f"Invalid routing policy: {policy}. The valid options are {valid_options}"
+            ) from exc
+
 
 def get_router_class(policy_name: str):
     policy = RoutingPolicy.from_str(policy_name)
@@ -89,4 +95,3 @@ def get_router_class(policy_name: str):
         return RoundRobinRouter
     elif policy == RoutingPolicy.RANDOM:
         return RandomRouter
- 
