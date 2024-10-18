@@ -52,6 +52,7 @@ from fastapi.responses import Response
 
 from sglang.srt.router.router import get_router_class
 from sglang.srt.router.utils import WorkerInfo, configure_logger
+import json
 
 logger = logging.getLogger(__name__)
 configure_logger(logging.INFO, " [Router]")
@@ -117,29 +118,61 @@ async def get_server_args():
     tasks = []
     first_worker = router.worker_list[0]
 
-    try:
-        ret = await first_worker.client.get("/get_server_args")
-        return ret.content
-    except Exception as e:
-        logger.warning(f"Error getting server args: {e}")
-        await is_healthy_or_remove(first_worker)
-        return await get_server_args()
+    max_retries = 5
 
+    for _ in range(max_retries):
+        try:
+            ret = await first_worker.client.get("/get_server_args")
+        except Exception as e:
+            logger.warning(f"Error getting server args: {e}")
+            await is_healthy_or_remove(first_worker)
+            continue
+        return json.loads(ret.content)
 
-@app.post("/generate")
-async def generate():
+@app.get("/get_model_info")
+async def get_model_info():
+    """
+    Returns the model info of the first worker.
+    """
+    tasks = []
+    first_worker = router.worker_list[0]
+
+    max_retries = 5
+
+    for _ in range(max_retries):
+        try:
+            ret = await first_worker.client.get("/get_model_info")
+        except Exception as e:
+            logger.warning(f"Error getting server args: {e}")
+            await is_healthy_or_remove(first_worker)
+            continue
+
+        # convert bytes to dictionary
+        return json.loads(ret.content)
+
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+)
+from fastapi import Request
+from dataclasses import asdict
+
+@app.api_route("/generate", methods=["POST", "PUT"])
+async def generate(obj: GenerateReqInput, request: Request):
     """
     Generates response from the selected worker.
     """
+
+    max_retries = 5
     selected_worker = router.calc_priority()
 
-    try:
-        ret = await selected_worker.client.post("/generate")
-        return ret.content
-    except Exception as e:
-        logger.warning(f"Error generating token: {e}")
-        await is_healthy_or_remove(selected_worker)
-        return await generate()
+    for _ in range(max_retries):
+        try:
+            ret = await selected_worker.client.post("/generate", json=asdict(obj))
+        except Exception as e:
+            logger.warning(f"Error generating token: {e}")
+            await is_healthy_or_remove(selected_worker)
+            continue
+        return json.loads(ret.content)
 
 
 ####################
