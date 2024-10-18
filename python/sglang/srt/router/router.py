@@ -1,12 +1,8 @@
-import argparse
-import asyncio
+import random
 from enum import Enum, auto
 from typing import Dict, List
 
 import httpx
-import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import Response
 from worker import Worker
 
 
@@ -67,9 +63,6 @@ class RoundRobinRouter(BaseRouter):
         worker = self.worker_list[self.idx]
         self.idx = (self.idx + 1) % len(self.worker_list)
         return worker
-
-
-from enum import Enum, auto
 
 
 class RoutingPolicy(Enum):
