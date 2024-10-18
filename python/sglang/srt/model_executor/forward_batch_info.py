@@ -135,19 +135,15 @@ class ForwardBatch:
 
         # Init position information
         if not ret.forward_mode.is_decode():
-            ret.positions = torch.tensor(
-                torch.concat(
-                    [
-                        torch.arange(prefix_len, prefix_len + extend_len)
-                        for prefix_len, extend_len in zip(
-                            batch.extend_prefix_lens, batch.extend_seq_lens
-                        )
-                    ],
-                    axis=0,
-                ),
-                dtype=torch.int64,
-            ).to(device, non_blocking=True)
-
+            ret.positions = torch.concat(
+                [
+                    torch.arange(prefix_len, prefix_len + extend_len, device=device)
+                    for prefix_len, extend_len in zip(
+                        batch.extend_prefix_lens, batch.extend_seq_lens
+                    )
+                ],
+                axis=0,
+            )
             ret.image_inputs = batch.image_inputs
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
