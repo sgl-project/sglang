@@ -80,7 +80,7 @@ class SamplingBatchInfo:
         #
         # While we choose not to even create the class instances if they are not required, this
         # could add additional complexity to the {ScheduleBatch} class, especially we need to
-        # handle {filter_batch()} and {merge()} cases as well.
+        # handle {filter_batch()} and {merge_batch()} cases as well.
         if disable_penalizer:
             ret.penalizer_orchestrator = None
         else:
@@ -112,19 +112,20 @@ class SamplingBatchInfo:
         self.linear_penalties = None
 
         for penalizer in self.penalizer_orchestrator.penalizers.values():
+            if not penalizer.is_prepared():
+                continue
+
             if isinstance(penalizer, penaltylib.BatchedRepetitionPenalizer):
-                if penalizer.is_prepared():
-                    self.scaling_penalties = penalizer.cumulated_repetition_penalties
+                self.scaling_penalties = penalizer.cumulated_repetition_penalties
             else:
-                if penalizer.is_prepared():
-                    if self.linear_penalties is None:
-                        bs = self.penalizer_orchestrator.batch.batch_size()
-                        self.linear_penalties = torch.zeros(
-                            (bs, self.vocab_size),
-                            dtype=torch.float32,
-                            device=self.device,
-                        )
-                    self.linear_penalties = penalizer.apply(self.linear_penalties)
+                if self.linear_penalties is None:
+                    bs = self.penalizer_orchestrator.batch.batch_size()
+                    self.linear_penalties = torch.zeros(
+                        (bs, self.vocab_size),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                self.linear_penalties = penalizer.apply(self.linear_penalties)
 
     def update_regex_vocab_mask(self):
         has_regex = self.regex_fsms and any(regex_fsm for regex_fsm in self.regex_fsms)
