@@ -21,7 +21,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import GPTBigCodeConfig
-from vllm.config import CacheConfig, LoRAConfig
+from vllm.config import LoRAConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -44,7 +44,7 @@ class GPTBigCodeAttention(nn.Module):
         self,
         layer_id: int,
         config: GPTBigCodeConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -145,7 +145,7 @@ class GPTBigCodeBlock(nn.Module):
         self,
         layer_id: int,
         config: GPTBigCodeConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -183,7 +183,7 @@ class GPTBigCodeModel(nn.Module):
     def __init__(
         self,
         config: GPTBigCodeConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
     ):
@@ -243,7 +243,7 @@ class GPTBigCodeForCausalLM(nn.Module):
     def __init__(
         self,
         config: GPTBigCodeConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
     ):

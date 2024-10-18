@@ -31,7 +31,6 @@ from transformers import (
     SiglipVisionModel,
 )
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
-from vllm.config import CacheConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -160,9 +159,6 @@ class LlavaBaseForCausalLM(nn.Module):
                 ]
                 image_sizes = [
                     image_inputs[i].image_sizes for i in range(bs) if need_vision[i]
-                ]
-                image_offsets = [
-                    image_inputs[i].image_offsets for i in range(bs) if need_vision[i]
                 ]
 
                 ########## Encode Image ########
@@ -359,7 +355,7 @@ class LlavaBaseForCausalLM(nn.Module):
                     prefix_len = prefix_lens_cpu[i]
 
                     # Multiple images
-                    for j, image_offset in enumerate(image_offsets[i]):
+                    for j, image_offset in enumerate(image_inputs[i].image_offsets):
                         if image_offset < prefix_len:
                             continue
 
@@ -450,7 +446,7 @@ class LlavaLlamaForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
 
@@ -472,7 +468,7 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
 
@@ -505,7 +501,7 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
 

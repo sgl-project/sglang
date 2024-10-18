@@ -56,6 +56,9 @@ class GenerateReqInput:
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
+    # Whether it is a single request or a batch request
+    is_single: bool = True
+
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (
             self.text is not None and self.input_ids is not None
@@ -295,7 +298,7 @@ class BatchTokenIDOut:
     spaces_between_special_tokens: List[bool]
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
-    no_eos_trim: List[bool]
+    no_stop_trim: List[bool]
 
 
 @dataclass

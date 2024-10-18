@@ -20,7 +20,7 @@ def image_qa(s, image_file, question):
 
 
 def main(args):
-    lines = read_jsonl(args.question_file)[: args.num_questions]
+    lines = list(read_jsonl(args.question_file))[: args.num_questions]
     arguments = [
         {
             "image_file": os.path.abspath(args.image_folder + "/" + l["image"]),

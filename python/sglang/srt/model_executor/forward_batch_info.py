@@ -152,9 +152,7 @@ class ForwardBatch:
         )
 
         # Init position information
-        if ret.forward_mode.is_decode():
-            ret.positions = (ret.seq_lens - 1).to(torch.int64)
-        else:
+        if not ret.forward_mode.is_decode():
             ret.positions = torch.tensor(
                 np.concatenate(
                     [
@@ -165,8 +163,9 @@ class ForwardBatch:
                     ],
                     axis=0,
                 ),
+                dtype=torch.int64,
                 device=device,
-            ).to(torch.int64)
+            )
 
             ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device=device)
             ret.extend_prefix_lens = torch.tensor(
@@ -184,8 +183,6 @@ class ForwardBatch:
 
         # Init batched multimodal params
         ret.init_batched_multimodal_params(model_runner)
-
-        model_runner.attn_backend.init_forward_metadata(ret)
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:

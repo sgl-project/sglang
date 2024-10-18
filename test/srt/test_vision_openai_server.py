@@ -1,8 +1,14 @@
+"""
+Usage:
+python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_mixed_batch
+"""
+
 import base64
 import io
 import json
 import os
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import openai
@@ -287,6 +293,55 @@ class TestOpenAIVisionServer(unittest.TestCase):
             raise
         assert isinstance(js_obj["color"], str)
         assert isinstance(js_obj["number_of_cars"], int)
+
+    def run_decode_with_image(self, image_id):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        content = []
+        if image_id == 0:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+                    },
+                }
+            )
+        elif image_id == 1:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
+                    },
+                }
+            )
+        else:
+            pass
+
+        content.append(
+            {
+                "type": "text",
+                "text": "Describe this image in a very short sentence.",
+            }
+        )
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {"role": "user", "content": content},
+            ],
+            temperature=0,
+        )
+
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+
+    def test_mixed_batch(self):
+        image_ids = [0, 1, 2] * 4
+        with ThreadPoolExecutor(4) as executor:
+            list(executor.map(self.run_decode_with_image, image_ids))
 
 
 if __name__ == "__main__":
