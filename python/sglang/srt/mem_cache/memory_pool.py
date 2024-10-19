@@ -90,7 +90,7 @@ class BaseTokenToKVPool:
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
-        return select_index.to(self.device)
+        return select_index.to(self.device, non_blocking=True)
 
     def free(self, free_index: torch.Tensor):
         if self.is_not_in_free_group:
