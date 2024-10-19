@@ -149,14 +149,12 @@ class TpModelWorker:
             )
 
             # Resolve future tokens in the input
-            # logger.info(f"raw input {model_worker_batch.input_ids=}")
             tic2 = time.time()
             resolved_input_ids = model_worker_batch.input_ids
             future_mask = resolved_input_ids < 0
             resolved_input_ids[future_mask] = self.future_token_ids_map[
                 -resolved_input_ids[future_mask]
             ]
-            # logger.info(f"resolved input {model_worker_batch.input_ids=}")
 
             # Run forward
             logits_output, next_token_ids = self.forward_batch_generation(
@@ -215,12 +213,13 @@ class TpModelWorker:
         self.future_logits_output_ct += 1
 
         bs = len(model_worker_batch.seq_lens)
-        future_next_token_ids = -torch.arange(
-            self.future_token_ids_ct + 1,
-            self.future_token_ids_ct + 1 + bs,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        with torch.cuda.stream(self.forward_stream):
+            future_next_token_ids = -torch.arange(
+                self.future_token_ids_ct + 1,
+                self.future_token_ids_ct + 1 + bs,
+                dtype=torch.int32,
+                device=self.device,
+            )
         self.future_token_ids_ct = (
             self.future_token_ids_ct + bs
         ) % self.future_token_ids_limit
