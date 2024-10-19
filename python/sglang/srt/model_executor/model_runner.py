@@ -316,11 +316,13 @@ class ModelRunner:
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
-                config.model,
-                config.revision,
-                fall_back_to_pt=getattr(
-                    self.model, "fall_back_to_pt_during_load", True
-                ),
+                DefaultModelLoader.Source(
+                    config.model,
+                    revision=config.revision,
+                    fall_back_to_pt=getattr(
+                        self.model, "fall_back_to_pt_during_load", True
+                    ),
+                )
             )
             return iter
 
