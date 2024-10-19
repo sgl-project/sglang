@@ -13,8 +13,10 @@ limitations under the License.
 
 """Cache for the compressed finite state machine."""
 
-from transformers import AutoTokenizer
 from typing import Tuple
+
+from transformers import AutoTokenizer
+
 from sglang.srt.constrained import (
     GrammarMatcher,
     GrammarMatcherInitContext,
@@ -24,8 +26,8 @@ from sglang.srt.constrained import (
 MAX_ROLLBACK_TOKENS = 10
 
 
-class BNFCache():
-    grammar_cache : GrammarMatcherInitContextCache
+class BNFCache:
+    grammar_cache: GrammarMatcherInitContextCache
 
     def __init__(
         self,
@@ -38,14 +40,12 @@ class BNFCache():
         if skip_tokenizer_init:
             return
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path, **tokenizer_args_dict
-        )
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_args_dict)
         self.grammar_cache = GrammarMatcherInitContextCache(
             tokenizer_or_vocab=tokenizer
         )
 
-    def get_context(self, key : Tuple[str, str]) -> GrammarMatcherInitContext:
+    def get_context(self, key: Tuple[str, str]) -> GrammarMatcherInitContext:
         key_type, key_string = key
         if key_type == "json":
             return self.grammar_cache.get_init_context_for_json_schema(key_string)
@@ -54,7 +54,7 @@ class BNFCache():
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
-    def query(self, key : Tuple[str, str], vocab_size: int) -> GrammarMatcher:
+    def query(self, key: Tuple[str, str], vocab_size: int) -> GrammarMatcher:
         ctx = self.get_context(key)
         return GrammarMatcher(
             ctx, max_rollback_tokens=MAX_ROLLBACK_TOKENS, mask_vocab_size=vocab_size
