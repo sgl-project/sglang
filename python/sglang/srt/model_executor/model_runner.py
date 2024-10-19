@@ -59,8 +59,11 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
+    is_attention_free_model,
+    is_embedding_model,
     is_generation_model,
     is_multimodal_model,
+    model_has_inner_state,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
 )
@@ -664,3 +667,7 @@ def load_model_cls_srt(model_arch: str) -> Optional[Type[nn.Module]]:
 
 # Monkey patch model loader
 setattr(ModelRegistry, "_try_load_model_cls", load_model_cls_srt)
+setattr(ModelRegistry, "is_multimodal_model", is_multimodal_model)
+setattr(ModelRegistry, "is_attention_free_model", is_attention_free_model)
+setattr(ModelRegistry, "model_has_inner_state", model_has_inner_state)
+setattr(ModelRegistry, "is_embedding_model", is_embedding_model)
