@@ -926,7 +926,7 @@ class ModelWorkerBatch:
             forward_mode=self.forward_mode,
             input_ids=self.input_ids.clone(),
             req_pool_indices=self.req_pool_indices,
-            seq_lens=self.seq_lens,
+            seq_lens=self.seq_lens.clone(),
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
