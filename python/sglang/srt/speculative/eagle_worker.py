@@ -4,7 +4,8 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.speculative.speculative_worker import SpeculativeWorker, spec_worker_factory
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.speculative_utils import EAGLEDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_utils import EAGLEDraftInput, EagleVerifyInput
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 @spec_worker_factory.register('EAGLE')
@@ -17,16 +18,21 @@ class EAGLEWorker(SpeculativeWorker):
         nccl_port: int,
         target_worker: TpModelWorker
     ): 
+        disable_cuda_graph = server_args.disable_cuda_graph
+        server_args.disable_cuda_graph = True
         super().__init__(gpu_id=gpu_id, tp_rank=tp_rank, server_args=server_args, nccl_port=nccl_port, target_worker=target_worker)
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         self.model_runner.model.set_embed_and_head(embed, head)
+        self.model_runner.server_args.disable_cuda_graph = disable_cuda_graph
+        self.model_runner.init_cuda_graphs()
     
     def forward_draft_decode(self, batch: ScheduleBatch):
         batch.spec_info.prepare_for_decode(batch)
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         forward_batch.is_draft_batch = True
-        self.model_runner.forward(forward_batch)
+        logits_output = self.model_runner.forward(forward_batch)
+        self.capture_for_decode(logits_output, forward_batch)
     
     def forward_draft_extend(self, batch: ScheduleBatch):
         self._swap_mem_pool(batch, self.model_runner)
@@ -34,6 +40,7 @@ class EAGLEWorker(SpeculativeWorker):
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)  
         logits_output = self.model_runner.forward(forward_batch)
+        self.capture_for_decode(logits_output, forward_batch)
         self._swap_mem_pool(batch, self.target_worker.model_runner)
 
     def forward_batch_speculative_generate(self, batch: ScheduleBatch):
@@ -82,10 +89,25 @@ class EAGLEWorker(SpeculativeWorker):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         forward_batch.is_draft_batch = True
         logits_output = self.model_runner.forward(forward_batch)
+        self.capture_for_decode(logits_output, forward_batch)
         batch.forward_mode = ForwardMode.DECODE 
         self._swap_mem_pool(batch, self.model_runner)
         
     def post_decode_process(self, batch):
         return self.forward_extend_after_decode(batch)
 
+    def capture_for_decode(self, hidden_states, forward_batch):
+        # lm head is not support cuda graph currently. But it could be support theoretically.
+        # TODO: Support it. @kavioyu
+        logits_output = self.model_runner.model.logits_processor(
+            None, hidden_states, self.model_runner.model.lm_head.weight, forward_batch
+        )
+        if isinstance(logits_output, LogitsProcessorOutput):
+            logits = logits_output.next_token_logits
+        sample_output = torch.softmax(
+            logits, dim=-1
+        )  # TODO: Support more sampling method @kavioyu
+        forward_batch.spec_info.capture_for_decode(
+            sample_output, forward_batch.forward_mode
+        )
         

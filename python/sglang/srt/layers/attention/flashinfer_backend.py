@@ -170,7 +170,7 @@ class FlashInferAttnBackend(AttentionBackend):
         ]
 
     def init_forward_metadata_capture_cuda_graph(
-        self, bs: int, req_pool_indices, seq_lens
+        self, num_token: int, req_pool_indices, seq_lens, spec_info
     ):
         decode_wrappers = []
         for i in range(self.num_wrappers):
@@ -180,9 +180,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     "NHD",
                     use_cuda_graph=True,
                     use_tensor_cores=self.decode_use_tensor_cores,
-                    paged_kv_indptr_buffer=self.cuda_graph_kv_indptr[i][: bs + 1],
+                    paged_kv_indptr_buffer=self.cuda_graph_kv_indptr[i][: num_token + 1],
                     paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                    paged_kv_last_page_len_buffer=self.cuda_graph_kv_last_page_len[:bs],
+                    paged_kv_last_page_len_buffer=self.cuda_graph_kv_last_page_len[:num_token],
                 )
             )
 
@@ -193,22 +193,25 @@ class FlashInferAttnBackend(AttentionBackend):
             seq_lens,
             None,
             decode_wrappers,
+            spec_info=spec_info
         )
 
-        self.cuda_graph_metadata[bs] = decode_wrappers
+        self.cuda_graph_metadata[num_token] = decode_wrappers
 
         self.forward_metadata = (False, False, None, decode_wrappers)
 
     def init_forward_metadata_replay_cuda_graph(
-        self, bs: int, req_pool_indices, seq_lens
+        self, bs: int, num_token: int, req_pool_indices, seq_lens, spec_info
     ):
+        # num_token == bs if not use speculative decoding with eagle2
         update_flashinfer_indices(
             ForwardMode.DECODE,
             self.model_runner,
             req_pool_indices[:bs],
             seq_lens[:bs],
             None,
-            self.cuda_graph_metadata[bs],
+            self.cuda_graph_metadata[num_token],
+            spec_info=spec_info
         )
 
     def get_cuda_graph_seq_len_fill_value(self):

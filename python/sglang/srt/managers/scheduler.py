@@ -138,6 +138,7 @@ class Scheduler:
             self.model_config.hf_config.architectures, self.server_args.is_embedding
         )
 
+
         # Launch a tensor parallel worker
         self.tp_worker = TpModelWorker(
             gpu_id=gpu_id,

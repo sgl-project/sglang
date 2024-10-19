@@ -33,6 +33,7 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import monkey_patch_vllm_all_gather
+from sglang.srt.speculative.speculative_utils import DraftInfoFactory
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -107,6 +108,7 @@ class CudaGraphRunner:
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
 
         # Batch sizes to capture
+        # For speculative decoding, it means number of input token
         if self.model_runner.server_args.disable_cuda_graph_padding:
             self.capture_bs = list(range(1, 32)) + [64, 128]
         else:
@@ -115,10 +117,17 @@ class CudaGraphRunner:
         self.capture_bs = [
             bs for bs in self.capture_bs if bs <= model_runner.req_to_token_pool.size
         ]
+        
+        if model_runner.server_args.speculative_algorithm == 'EAGLE' and model_runner.is_draft_runner:
+            # TODO: Support edit top_k in config  @kavioyu
+            self.num_tokens = [bs * 8 for bs in self.capture_bs]
+        else:
+            self.num_tokens = [bs for bs in self.capture_bs]
+                
         self.compile_bs = (
             [
                 bs
-                for bs in self.capture_bs
+                for bs in self.num_tokens
                 if bs <= self.model_runner.server_args.max_torch_compile_bs
             ]
             if self.use_torch_compile
@@ -127,7 +136,8 @@ class CudaGraphRunner:
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
-        self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
+        self.max_num_token = max(self.num_tokens)
+        self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
@@ -137,12 +147,17 @@ class CudaGraphRunner:
 
         # Common inputs
         with torch.device("cuda"):
-            self.input_ids = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int32)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int32)
+            self.positions = torch.zeros((self.max_num_token, ), dtype=torch.int64)
+            
+            # speculative_inference
+            if self.model_runner.server_args.speculative_algorithm == 'EAGLE':
+                self.hidden_states = torch.zeros((self.max_num_token, self.model_runner.model_config.hidden_size), dtype=self.model_runner.dtype)
 
         # Capture
         try:
@@ -166,7 +181,7 @@ class CudaGraphRunner:
     def capture(self):
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
-            for bs in self.capture_bs:
+            for bs, num_token in zip(self.capture_bs, self.num_tokens):
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
@@ -175,23 +190,31 @@ class CudaGraphRunner:
                     (
                         graph,
                         output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward)
+                    ) = self.capture_one_batch_size(bs, num_token, forward)
                     self.graphs[bs] = graph
                     self.output_buffers[bs] = output_buffers
 
-    def capture_one_batch_size(self, bs: int, forward: Callable):
+    def capture_one_batch_size(self, bs: int, num_token: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
 
         # Common inputs
-        input_ids = self.input_ids[:bs]
+        input_ids = self.input_ids[:num_token]
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
-        out_cache_loc = self.out_cache_loc[:bs]
-
+        out_cache_loc = self.out_cache_loc[:num_token]
+        positions = self.positions[:num_token]
+        
+        spec_info = None
+        if self.model_runner.server_args.speculative_algorithm == 'EAGLE' and self.model_runner.is_draft_runner:
+            spec_info = DraftInfoFactory.get(self.model_runner.server_args.speculative_algorithm)()
+            spec_info.hidden_states = self.hidden_states[:num_token]
+            spec_info.positions = positions
+            spec_info.init(self.model_runner.server_args)
+        
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs, req_pool_indices, seq_lens
+            num_token, req_pool_indices, seq_lens, spec_info
         )
 
         # Run and capture
@@ -207,8 +230,10 @@ class CudaGraphRunner:
                 attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
                 return_logprob=False,
-                top_logprobs_nums=[0] * bs,
-                positions=torch.clamp((seq_lens - 1), min=0).to(torch.int64),
+                top_logprobs_nums=[0] * num_token,
+                positions=positions,
+                #positions=torch.clamp((seq_lens - 1), min=0).to(torch.int64),
+                spec_info=spec_info,
             )
             return forward(input_ids, forward_batch.positions, forward_batch)
 
@@ -236,23 +261,33 @@ class CudaGraphRunner:
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         raw_bs = forward_batch.batch_size
+        # In most case, raw_bs == num_token in decode stage. 
+        # But for speculative, the token num maybe large than raw_bs
+        raw_num_token = forward_batch.input_ids.numel()
 
         # Pad
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
-        if bs != raw_bs:
+        index = bisect.bisect_left(self.num_tokens, raw_bs)
+        num_token = self.num_tokens[index] 
+        if bs != raw_num_token:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
 
         # Common inputs
-        self.input_ids[:raw_bs] = forward_batch.input_ids
+        self.input_ids[:num_token] = forward_batch.input_ids
         self.req_pool_indices[:raw_bs] = forward_batch.req_pool_indices
         self.seq_lens[:raw_bs] = forward_batch.seq_lens
-        self.out_cache_loc[:raw_bs] = forward_batch.out_cache_loc
+        self.out_cache_loc[:num_token] = forward_batch.out_cache_loc
+        self.positions[:num_token] = forward_batch.positions
+        
+        # EAGLE speculative decoding
+        if isinstance(forward_batch.spec_info, DraftInfoFactory.get('EAGLE')):
+            self.hidden_states[:num_token] = forward_batch.spec_info.hidden_states
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs, self.req_pool_indices, self.seq_lens
+            bs, num_token, self.req_pool_indices, self.seq_lens, forward_batch.spec_info
         )
 
         # Replay
@@ -260,9 +295,9 @@ class CudaGraphRunner:
         logits_output = self.output_buffers[bs]
 
         # Unpad
-        if bs != raw_bs:
+        if raw_num_token != num_token:
             logits_output = LogitsProcessorOutput(
-                next_token_logits=logits_output.next_token_logits[:raw_bs],
+                next_token_logits=logits_output.next_token_logits[:num_token],
                 next_token_logprobs=None,
                 normalized_prompt_logprobs=None,
                 input_token_logprobs=None,

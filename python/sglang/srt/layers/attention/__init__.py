@@ -18,13 +18,13 @@ class AttentionBackend(ABC):
         raise NotImplementedError()
 
     def init_forward_metadata_capture_cuda_graph(
-        self, bs: int, req_pool_indices, seq_lens
+        self, num_token: int, req_pool_indices, seq_lens
     ):
         """Init the metadata for a forward pass for capturing a cuda graph."""
         raise NotImplementedError()
 
     def init_forward_metadata_replay_cuda_graph(
-        self, bs: int, req_pool_indices, seq_lens
+        self, bs: int, num_token: int, req_pool_indices, seq_lens, spec_info
     ):
         """Init the metadata for a forward pass for replying a cuda graph."""
         raise NotImplementedError()

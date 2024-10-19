@@ -290,6 +290,7 @@ class LlamaModel(nn.Module):
                 (hidden_states, forward_batch.spec_info.hidden_states), dim=-1
             )
         )
+        #hidden_states = forward_batch.spec_info.hidden_states
 
         residual = None
         for i in range(len(self.layers)):
@@ -300,7 +301,6 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
-        # hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -327,18 +327,7 @@ class LlamaForCausalLMEagle(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        logits_output = self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, forward_batch
-        )
-        if isinstance(logits_output, LogitsProcessorOutput):
-            logits = logits_output.next_token_logits
-        sample_output = torch.softmax(
-            logits, dim=-1
-        )  # TODO: Support more sampling method @kavioyu
-        forward_batch.spec_info.capture_for_decode(
-            sample_output, forward_batch.forward_mode
-        )
-        return logits_output
+        return hidden_states
     
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim

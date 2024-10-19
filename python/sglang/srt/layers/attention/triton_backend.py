@@ -79,7 +79,7 @@ class TritonAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_capture_cuda_graph(
-        self, bs: int, req_pool_indices, seq_lens
+        self, num_token: int, req_pool_indices, seq_lens
     ):
         self.forward_metadata = (
             self.cuda_graph_start_loc,
@@ -89,7 +89,7 @@ class TritonAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_replay_cuda_graph(
-        self, bs: int, req_pool_indices, seq_lens
+        self, bs: int, num_token: int, req_pool_indices, seq_lens, spec_info
     ):
         self.cuda_graph_start_loc.zero_()
         self.cuda_graph_start_loc[1:bs] = torch.cumsum(seq_lens[: bs - 1], dim=0)

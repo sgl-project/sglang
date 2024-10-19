@@ -75,6 +75,9 @@ class ForwardMode(IntEnum):
     
     def is_spec_extend(self):
         return self == ForwardMode.SPECEXTEND
+    
+    def is_cuda_graph(self):
+        return self == ForwardMode.DECODE
 
 
 @dataclass
@@ -183,7 +186,9 @@ class ForwardBatch:
         ret.req_to_token_pool = model_runner.req_to_token_pool
         ret.token_to_kv_pool = model_runner.token_to_kv_pool
         ret.attn_backend = model_runner.attn_backend
-        model_runner.attn_backend.init_forward_metadata(ret)
+
+        if not batch.forward_mode.is_decode():
+            model_runner.attn_backend.init_forward_metadata(ret)
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
