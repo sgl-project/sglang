@@ -29,6 +29,7 @@ import zmq
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constrained.bnf_cache import BNFCache
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -211,16 +212,31 @@ class Scheduler:
         )
 
         # Init the FSM cache for constrained generation
+        self.regex_fsm_cache = None
+        self.regex_bnf_cache = None
+
         if not server_args.skip_tokenizer_init:
-            self.regex_fsm_cache = FSMCache(
-                server_args.tokenizer_path,
-                {
-                    "tokenizer_mode": server_args.tokenizer_mode,
-                    "trust_remote_code": server_args.trust_remote_code,
-                },
-                skip_tokenizer_init=server_args.skip_tokenizer_init,
-                constrained_json_whitespace_pattern=server_args.constrained_json_whitespace_pattern,
-            )
+            if server_args.grammar_backend == "xgrammar":
+                self.regex_bnf_cache = BNFCache(
+                    server_args.tokenizer_path,
+                    {
+                        "tokenizer_mode": server_args.tokenizer_mode,
+                        "trust_remote_code": server_args.trust_remote_code,
+                    },
+                    skip_tokenizer_init=server_args.skip_tokenizer_init,
+                    whitespace_patterns=server_args.constrained_json_whitespace_pattern,
+                )
+            else:
+                self.regex_fsm_cache = FSMCache(
+                    server_args.tokenizer_path,
+                    {
+                        "tokenizer_mode": server_args.tokenizer_mode,
+                        "trust_remote_code": server_args.trust_remote_code,
+                    },
+                    skip_tokenizer_init=server_args.skip_tokenizer_init,
+                    constrained_json_whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+                )
+
         self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
@@ -401,23 +417,40 @@ class Scheduler:
             # By default, only return the logprobs for output tokens
             req.logprob_start_len = len(recv_req.input_ids) - 1
 
-        # Init regex FSM
+        # Init regex FSM or BNF
         if (
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
         ):
-            if req.sampling_params.json_schema is not None:
-                req.regex_fsm, computed_regex_string = self.regex_fsm_cache.query(
-                    ("json", req.sampling_params.json_schema)
-                )
-            elif req.sampling_params.regex is not None:
-                req.regex_fsm, computed_regex_string = self.regex_fsm_cache.query(
-                    ("regex", req.sampling_params.regex)
-                )
-            if not self.disable_regex_jump_forward:
-                req.jump_forward_map = self.jump_forward_cache.query(
-                    computed_regex_string
-                )
+            if self.regex_fsm_cache is not None:
+                # FSM cache
+                assert self.regex_bnf_cache is None
+                if req.sampling_params.json_schema is not None:
+                    req.regex_fsm, computed_regex_string = self.regex_fsm_cache.query(
+                        ("json", req.sampling_params.json_schema)
+                    )
+                elif req.sampling_params.regex is not None:
+                    req.regex_fsm, computed_regex_string = self.regex_fsm_cache.query(
+                        ("regex", req.sampling_params.regex)
+                    )
+                if not self.disable_regex_jump_forward:
+                    req.jump_forward_map = self.jump_forward_cache.query(
+                        computed_regex_string
+                    )
+            else:
+                # BNF cache
+                assert self.regex_bnf_cache is not None
+                vocab_size = self.model_config.vocab_size
+                if req.sampling_params.json_schema is not None:
+                    req.regex_bnf = self.regex_bnf_cache.query(
+                        ("json", req.sampling_params.json_schema), vocab_size
+                    )
+                elif req.sampling_params.regex is not None:
+                    req.regex_bnf = self.regex_bnf_cache.query(
+                        ("regex", req.sampling_params.regex), vocab_size
+                    )
+                if not self.disable_regex_jump_forward:
+                    req.allow_jump_forward = True
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) >= self.max_req_input_len:
@@ -789,9 +822,13 @@ class Scheduler:
                         self.tree_cache.cache_unfinished_req(req)
 
                     if req.regex_fsm is not None:
+                        assert req.regex_bnf is None
                         req.regex_fsm_state = req.regex_fsm.get_next_state(
                             req.regex_fsm_state, next_token_ids[i]
                         )
+                    if req.regex_bnf is not None:
+                        assert req.regex_fsm is None
+                        assert req.regex_bnf.accept_token(next_token_ids[i])
 
                     if req.return_logprob:
                         logprob_pt += self.add_logprob_return_values(
@@ -845,9 +882,13 @@ class Scheduler:
             req.check_finished()
 
             if req.regex_fsm is not None:
+                assert req.regex_bnf is None
                 req.regex_fsm_state = req.regex_fsm.get_next_state(
                     req.regex_fsm_state, next_token_id
                 )
+            if req.regex_bnf is not None:
+                assert req.regex_fsm is None
+                assert req.regex_bnf.accept_token(next_token_id)
 
             if req.finished():
                 self.cache_finished_req(req)
@@ -1043,7 +1084,9 @@ class Scheduler:
         ):
             self.tree_cache.reset()
             self.tree_cache_metrics = {"total": 0, "hit": 0}
-            self.regex_fsm_cache.reset()
+            if self.regex_fsm_cache is not None:
+                self.regex_fsm_cache.reset()
+            # TODO(dark): reset the bnf cache
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()

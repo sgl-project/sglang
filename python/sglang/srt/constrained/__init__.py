@@ -51,6 +51,19 @@ except ImportError:
         return build_regex_from_schema(schema, whitespace_pattern)
 
 
+try:
+    from xgrammar import (
+        GrammarMatcher,
+        GrammarMatcherInitContext,
+        GrammarMatcherInitContextCache,
+    )
+except ImportError as e:
+    print(
+        f'\nError: {e}. Please install a new version of xgrammar by `pip install "xgrammar>=0.0.12"`\n'
+    )
+    raise
+
+
 __all__ = [
     "RegexGuide",
     "FSMInfo",
@@ -60,4 +73,7 @@ __all__ = [
     "disk_cache",
     "disable_cache",
     "make_byte_level_fsm",
+    "GrammarMatcher",
+    "GrammarMatcherInitContext",
+    "GrammarMatcherInitContextCache",
 ]
