@@ -219,6 +219,7 @@ class SamplingBatchInfo:
             top_ps=self.top_ps,
             top_ks=self.top_ks,
             min_ps=self.min_ps,
+            is_all_greedy=self.is_all_greedy,
             need_min_p_sampling=self.need_min_p_sampling,
             vocab_size=self.vocab_size,
             device=self.device,
