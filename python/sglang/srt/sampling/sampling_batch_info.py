@@ -140,7 +140,6 @@ class SamplingBatchInfo:
 
     def _update_regex_vocab_mask_fsm(self):
         if not self.regex_fsms or not any(regex_fsm for regex_fsm in self.regex_fsms):
-            self.vocab_mask = None
             return
 
         self.vocab_mask = torch.zeros(
@@ -158,7 +157,6 @@ class SamplingBatchInfo:
 
     def _update_regex_vocab_mask_bnf(self):
         if not self.regex_bnfs or not any(regex_bnf for regex_bnf in self.regex_bnfs):
-            self.vocab_mask = None
             return
 
         self.vocab_mask = torch.zeros(
@@ -177,6 +175,7 @@ class SamplingBatchInfo:
                 ] = 1
 
     def update_regex_vocab_mask(self):
+        self.vocab_mask = None
         self._update_regex_vocab_mask_fsm()
         self._update_regex_vocab_mask_bnf()
 
