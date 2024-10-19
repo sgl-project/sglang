@@ -18,11 +18,11 @@ from vllm.distributed import (
 
 # workaround
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.parameter import (
-    BasevLLMParameter,
-    PackedvLLMParameter,
-    PerTensorScaleParameter,
-)
+from vllm.model_executor.parameter import (BasevLLMParameter,
+                                           PackedColumnParameter,
+                                           PackedvLLMParameter,
+                                           PerTensorScaleParameter,
+                                           RowvLLMParameter)
 
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -39,6 +39,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
     "MarlinLinearMethod",
+    "GPTQLinearMethod",
 ]
 
 
@@ -595,7 +596,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             # If quantized, we need to adjust the offset and size to account
             # for the packing.
             if (
-                isinstance(param, PackedvLLMParameter)
+                isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
                 and param.packed_dim == param.output_dim
             ):
                 shard_size, shard_offset = param.adjust_shard_indexes_for_packing(
@@ -617,7 +618,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             if isinstance(param, PerTensorScaleParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
                 return
-            elif type(param) is BasevLLMParameter:
+            elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight)
                 return
             self._load_fused_module_from_checkpoint(param, loaded_weight)
@@ -760,7 +761,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             # If quantized, we need to adjust the offset and size to account
             # for the packing.
             if (
-                isinstance(param, PackedvLLMParameter)
+                isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
                 and param.packed_dim == param.output_dim
             ):
                 shard_size, shard_offset = param.adjust_shard_indexes_for_packing(
@@ -780,10 +781,10 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
+                param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
                 return
-            elif type(param) is BasevLLMParameter:
-                param.load_merged_column_weight(loaded_weight=loaded_weight)
+            elif type(param) in (RowvLLMParameter, BasevLLMParameter):
+                param.load_qkv_weight(loaded_weight=loaded_weight)
                 return
             self._load_fused_module_from_checkpoint(param, loaded_weight)
             return
