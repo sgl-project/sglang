@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_flashinfer_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 if is_flashinfer_available():
@@ -195,7 +196,9 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
 
-    def forward_extend(self, q, k, v, layer: nn.Module, forward_batch: ForwardBatch):
+    def forward_extend(
+        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+    ):
         prefill_wrapper_paged = self.prefill_wrappers_paged[
             self._get_wrapper_idx(layer)
         ]
@@ -206,7 +209,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is not None:
                 assert v is not None
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer.layer_id, forward_batch.out_cache_loc, k, v
+                    layer, forward_batch.out_cache_loc, k, v
                 )
             o = prefill_wrapper_paged.forward(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -240,18 +243,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer.layer_id, forward_batch.out_cache_loc, k, v
+                layer, forward_batch.out_cache_loc, k, v
             )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
-    def forward_decode(self, q, k, v, layer: nn.Module, forward_batch: ForwardBatch):
+    def forward_decode(
+        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+    ):
         decode_wrapper = self.forward_metadata[0][self._get_wrapper_idx(layer)]
 
         if k is not None:
             assert v is not None
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer.layer_id, forward_batch.out_cache_loc, k, v
+                layer, forward_batch.out_cache_loc, k, v
             )
 
         o = decode_wrapper.forward(
@@ -263,7 +268,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
-    def _get_wrapper_idx(self, layer: nn.Module):
+    def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
             return 0
 
