@@ -149,8 +149,6 @@ class Scheduler:
             server_args=server_args,
             nccl_port=port_args.nccl_port,
         )
-        self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
-        self.device = self.tp_worker.device
 
         # Get token and memory info from the model worker
         (
@@ -159,11 +157,11 @@ class Scheduler:
             self.max_running_requests,
             self.max_req_input_len,
             self.random_seed,
+            self.device,
         ) = self.tp_worker.get_token_and_memory_info()
+        self.tp_cpu_group = self.tp_worker.get_tp_cpu_group()
+        self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
-        self.pad_input_ids_func = getattr(
-            self.tp_worker.model_runner.model, "pad_input_ids", None
-        )
 
         # Print debug info
         logger.info(
@@ -173,9 +171,8 @@ class Scheduler:
             f"context_len={self.model_config.context_len}"
         )
 
-        # Init cache
-        self.req_to_token_pool = self.tp_worker.model_runner.req_to_token_pool
-        self.token_to_kv_pool = self.tp_worker.model_runner.token_to_kv_pool
+        # Init memory pool and cache
+        self.req_to_token_pool, self.token_to_kv_pool = self.tp_worker.get_memory_pool()
 
         if (
             server_args.chunked_prefill_size is not None
