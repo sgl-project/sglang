@@ -145,11 +145,15 @@ class ImageInputs:
             (image_hash >> 64) % vocab_size,
         ]
 
-        if "image_sizes" in obj:
-            ret.image_sizes = obj["image_sizes"]
-        if "modalities" in obj:
-            # Only when pixel values is not None we have modalities
-            ret.modalities = obj["modalities"]
+        optional_args = [
+            "image_sizes",
+            "modalities",
+            "aspect_ratio_ids",
+            "aspect_ratio_mask",
+        ]
+        for arg in optional_args:
+            if arg in obj:
+                setattr(ret, arg, obj[arg])
 
         return ret
 
