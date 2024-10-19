@@ -114,6 +114,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_penalizer: bool = False
+    disable_nan_detection: bool = False
     enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
@@ -577,7 +578,12 @@ class ServerArgs:
         parser.add_argument(
             "--disable-penalizer",
             action="store_true",
-            help="Disable the logit penalizer (e.g., frequency and repetition penalty).",
+            help="Disable the logit penalizers (e.g., frequency and repetition penalty) for better performance if they are not used in any requests.",
+        )
+        parser.add_argument(
+            "--disable-nan-detection",
+            action="store_true",
+            help="Disable the NaN detection for better performance.",
         )
         parser.add_argument(
             "--enable-overlap-schedule",
