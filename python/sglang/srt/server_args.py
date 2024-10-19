@@ -578,7 +578,7 @@ class ServerArgs:
         parser.add_argument(
             "--disable-penalizer",
             action="store_true",
-            help="Disable the logit penalizer (e.g., frequency and repetition penalty) for better performance if they are not used in any requests.",
+            help="Disable the logit penalizers (e.g., frequency and repetition penalty) for better performance if they are not used in any requests.",
         )
         parser.add_argument(
             "--disable-nan-detection",
