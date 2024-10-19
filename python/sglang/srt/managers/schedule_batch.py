@@ -53,6 +53,7 @@ global_server_args_dict = {
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
     "disable_mla": ServerArgs.disable_mla,
     "torchao_config": ServerArgs.torchao_config,
+    "disable_nan_detection": ServerArgs.disable_nan_detection,
 }
 
 
@@ -409,9 +410,9 @@ class ScheduleBatch:
 
     # Request, memory pool, and cache
     reqs: List[Req]
-    req_to_token_pool: ReqToTokenPool
-    token_to_kv_pool: BaseTokenToKVPool
-    tree_cache: BasePrefixCache
+    req_to_token_pool: ReqToTokenPool = None
+    token_to_kv_pool: BaseTokenToKVPool = None
+    tree_cache: BasePrefixCache = None
 
     forward_mode: ForwardMode = None
     sampling_info: SamplingBatchInfo = None
@@ -520,11 +521,11 @@ class ScheduleBatch:
             assert seq_len - pre_len == req.extend_input_len
 
             if pre_len > 0:
-                self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    :pre_len
-                ] = req.prefix_indices
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, :pre_len] = (
+                    req.prefix_indices
+                )
 
-            self.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
+            self.req_to_token_pool.req_to_token[req.req_pool_idx, pre_len:seq_len] = (
                 out_cache_loc[pt : pt + req.extend_input_len]
             )
 
@@ -540,10 +541,15 @@ class ScheduleBatch:
             pt += req.extend_input_len
 
         # Set fields
-        with out_cache_loc.device:
-            self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
-            self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32)
-            self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
 
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
@@ -787,8 +793,8 @@ class ScheduleBatch:
             return
 
         self.reqs = [self.reqs[i] for i in keep_indices]
-        new_indices = torch.tensor(
-            keep_indices, dtype=torch.int32, device=self.seq_lens.device
+        new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(
+            self.device, non_blocking=True
         )
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
@@ -872,12 +878,9 @@ class ScheduleBatch:
     def copy(self):
         return ScheduleBatch(
             reqs=self.reqs,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool=self.token_to_kv_pool,
-            tree_cache=self.tree_cache,
             forward_mode=self.forward_mode,
-            output_ids=self.output_ids,
-            sampling_info=self.sampling_info,
+            out_cache_loc=self.out_cache_loc,
+            return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
         )
 
@@ -927,7 +930,7 @@ class ModelWorkerBatch:
             forward_mode=self.forward_mode,
             input_ids=self.input_ids.clone(),
             req_pool_indices=self.req_pool_indices,
-            seq_lens=self.seq_lens,
+            seq_lens=self.seq_lens.clone(),
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,

@@ -37,12 +37,16 @@ class BatchedPenalizerOrchestrator:
 
         self.penalizers = {Penalizer: Penalizer(self) for Penalizer in Penalizers}
 
+        is_required = False
         for penalizer in self.penalizers.values():
-            penalizer.prepare_if_required()
+            pen_is_required = penalizer.prepare_if_required()
+            is_required |= pen_is_required
+        self.is_required = is_required
 
-        self.cumulate_input_tokens(
-            input_ids=[req.origin_input_ids for req in self.reqs()]
-        )
+        if self.is_required:
+            self.cumulate_input_tokens(
+                input_ids=[req.origin_input_ids for req in self.reqs()]
+            )
 
     def reqs(self):
         return self.batch.reqs
@@ -79,6 +83,9 @@ class BatchedPenalizerOrchestrator:
         Args:
             output_ids (typing.Union[typing.List[torch.Tensor], typing.List[typing.List[int]]]): The output tokens.
         """
+        if not self.is_required:
+            return
+
         token_ids = _TokenIDs(orchestrator=self, token_ids=output_ids)
 
         for penalizer in self.penalizers.values():
@@ -95,6 +102,9 @@ class BatchedPenalizerOrchestrator:
         Returns:
             torch.Tensor: The logits after applying the penalizers.
         """
+        if not self.is_required:
+            return
+
         for penalizer in self.penalizers.values():
             logits = penalizer.apply(logits)
 
@@ -112,10 +122,16 @@ class BatchedPenalizerOrchestrator:
             indices_to_keep (typing.List[int]): List of indices to keep in the batch.
             indices_tensor_to_keep (torch.Tensor = None): Tensor of indices to keep in the batch. If not None, it will be used instead of converting indices_to_keep to a tensor.
         """
+        if not self.is_required:
+            return
+
         empty_indices = len(indices_to_keep) == 0
 
+        is_required = False
         for penalizer in self.penalizers.values():
-            if not penalizer.is_required() or empty_indices:
+            tmp_is_required = penalizer.is_required()
+            is_required = is_required or tmp_is_required
+            if not tmp_is_required or empty_indices:
                 penalizer.teardown()
             else:
                 # create tensor index only when it's needed
@@ -128,6 +144,7 @@ class BatchedPenalizerOrchestrator:
                     indices_to_keep=indices_to_keep,
                     indices_tensor_to_keep=indices_tensor_to_keep,
                 )
+        self.is_required = is_required
 
     def merge(self, their: "BatchedPenalizerOrchestrator"):
         """
@@ -140,11 +157,10 @@ class BatchedPenalizerOrchestrator:
         Args:
             their (BatchedPenalizerOrchestrator): The orchestrator to merge into this one.
         """
-        if self.vocab_size != their.vocab_size:
-            raise ValueError(
-                f"vocab_size mismatch: {self.vocab_size} != {their.vocab_size}"
-            )
+        if not self.is_required and not their.is_required:
+            return
 
+        self.is_required |= their.is_required
         for Penalizer, their_penalizer in their.penalizers.items():
             if Penalizer not in self.penalizers:
                 raise ValueError(f"Penalizer {Penalizer} not found in self.penalizers")
@@ -250,6 +266,9 @@ class _BatchedPenalizer(abc.ABC):
     def prepare_if_required(self):
         if self.is_required():
             self.prepare()
+            return True
+        else:
+            return False
 
     def teardown(self):
         if self.is_prepared():

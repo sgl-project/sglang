@@ -245,10 +245,10 @@ class CudaGraphRunner:
             self.out_cache_loc.zero_()
 
         # Common inputs
-        self.input_ids[:raw_bs] = forward_batch.input_ids
-        self.req_pool_indices[:raw_bs] = forward_batch.req_pool_indices
-        self.seq_lens[:raw_bs] = forward_batch.seq_lens
-        self.out_cache_loc[:raw_bs] = forward_batch.out_cache_loc
+        self.input_ids[:raw_bs].copy_(forward_batch.input_ids)
+        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        self.out_cache_loc[:raw_bs].copy_(forward_batch.out_cache_loc)
 
         # Encoder lens to initialize the attention wrappers
         encoder_lens = forward_batch.encoder_lens

@@ -150,6 +150,7 @@ class Scheduler:
             nccl_port=port_args.nccl_port,
         )
         self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
+        self.device = self.tp_worker.device
 
         # Get token and memory info from the model worker
         (
@@ -260,12 +261,7 @@ class Scheduler:
             self.resolve_next_token_ids = (
                 lambda bid, x: self.tp_worker.resolve_future_token_ids(bid)
             )
-
-            def cache_finished_req(req):
-                free_delta = int(self.running_batch and req in self.cur_batch.reqs)
-                self.tree_cache.cache_finished_req(req, free_delta=free_delta)
-
-            self.cache_finished_req = cache_finished_req
+            self.cache_finished_req = self.tree_cache.cache_finished_req
         else:
             self.forward_batch_generation = self.tp_worker.forward_batch_generation
             self.resolve_next_token_ids = lambda bid, x: x.tolist()
@@ -758,9 +754,7 @@ class Scheduler:
                 if logits_output.next_token_logprobs is not None:
                     logits_output.next_token_logprobs = (
                         logits_output.next_token_logprobs[
-                            torch.arange(
-                                len(next_token_ids), device=next_token_ids.device
-                            ),
+                            torch.arange(len(next_token_ids), device=self.device),
                             next_token_ids,
                         ].tolist()
                     )
@@ -799,7 +793,6 @@ class Scheduler:
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
         else:  # embedding or reward model
-            assert batch.extend_num_tokens != 0
             embeddings, bid = result
             embeddings = embeddings.tolist()
 
@@ -828,7 +821,7 @@ class Scheduler:
         # Move logprobs to cpu
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs[
-                torch.arange(len(next_token_ids), device=next_token_ids.device),
+                torch.arange(len(next_token_ids), device=self.device),
                 next_token_ids,
             ].tolist()
 
@@ -839,6 +832,7 @@ class Scheduler:
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if self.server_args.enable_overlap_schedule and req.finished():
+                self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
             req.completion_tokens_wo_jump_forward += 1

@@ -20,6 +20,9 @@ class SamplingBatchInfo:
     top_ks: torch.Tensor
     min_ps: torch.Tensor
 
+    # All requests use greedy sampling
+    is_all_greedy: bool
+
     # Dispatch in CUDA graph
     need_min_p_sampling: bool
 
@@ -48,20 +51,24 @@ class SamplingBatchInfo:
         disable_penalizer: bool,
     ):
         reqs = batch.reqs
-        with batch.input_ids.device:
-            temperatures = torch.tensor(
+        device = batch.input_ids.device
+        temperatures = (
+            torch.tensor(
                 [r.sampling_params.temperature for r in reqs],
                 dtype=torch.float,
-            ).view(-1, 1)
-            top_ps = torch.tensor(
-                [r.sampling_params.top_p for r in reqs], dtype=torch.float
             )
-            top_ks = torch.tensor(
-                [r.sampling_params.top_k for r in reqs], dtype=torch.int32
-            )
-            min_ps = torch.tensor(
-                [r.sampling_params.min_p for r in reqs], dtype=torch.float
-            )
+            .view(-1, 1)
+            .to(device, non_blocking=True)
+        )
+        top_ps = torch.tensor(
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
+        top_ks = torch.tensor(
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int32
+        ).to(device, non_blocking=True)
+        min_ps = torch.tensor(
+            [r.sampling_params.min_p for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
 
         ret = cls(
             temperatures=temperatures,
@@ -69,6 +76,7 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+            is_all_greedy=top_ks.max().item() <= 1,
             vocab_size=vocab_size,
             device=batch.input_ids.device,
         )
@@ -80,7 +88,7 @@ class SamplingBatchInfo:
         #
         # While we choose not to even create the class instances if they are not required, this
         # could add additional complexity to the {ScheduleBatch} class, especially we need to
-        # handle {filter_batch()} and {merge()} cases as well.
+        # handle {filter_batch()} and {merge_batch()} cases as well.
         if disable_penalizer:
             ret.penalizer_orchestrator = None
         else:
@@ -112,19 +120,20 @@ class SamplingBatchInfo:
         self.linear_penalties = None
 
         for penalizer in self.penalizer_orchestrator.penalizers.values():
+            if not penalizer.is_prepared():
+                continue
+
             if isinstance(penalizer, penaltylib.BatchedRepetitionPenalizer):
-                if penalizer.is_prepared():
-                    self.scaling_penalties = penalizer.cumulated_repetition_penalties
+                self.scaling_penalties = penalizer.cumulated_repetition_penalties
             else:
-                if penalizer.is_prepared():
-                    if self.linear_penalties is None:
-                        bs = self.penalizer_orchestrator.batch.batch_size()
-                        self.linear_penalties = torch.zeros(
-                            (bs, self.vocab_size),
-                            dtype=torch.float32,
-                            device=self.device,
-                        )
-                    self.linear_penalties = penalizer.apply(self.linear_penalties)
+                if self.linear_penalties is None:
+                    bs = self.penalizer_orchestrator.batch.batch_size()
+                    self.linear_penalties = torch.zeros(
+                        (bs, self.vocab_size),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                self.linear_penalties = penalizer.apply(self.linear_penalties)
 
     def update_regex_vocab_mask(self):
         has_regex = self.regex_fsms and any(regex_fsm for regex_fsm in self.regex_fsms)
@@ -199,6 +208,7 @@ class SamplingBatchInfo:
             other_val = getattr(other, item, None)
             setattr(self, item, torch.concat([self_val, other_val]))
 
+        self.is_all_greedy = self.is_all_greedy and other.is_all_greedy
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device
         )
@@ -209,6 +219,7 @@ class SamplingBatchInfo:
             top_ps=self.top_ps,
             top_ks=self.top_ks,
             min_ps=self.min_ps,
+            is_all_greedy=self.is_all_greedy,
             need_min_p_sampling=self.need_min_p_sampling,
             vocab_size=self.vocab_size,
             device=self.device,
