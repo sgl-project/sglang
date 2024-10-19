@@ -11,7 +11,6 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
 import triton
 import triton.language as tl
 

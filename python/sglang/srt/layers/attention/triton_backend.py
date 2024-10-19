@@ -120,7 +120,7 @@ class TritonAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer.layer_id, forward_batch.out_cache_loc, k, v
+            layer, forward_batch.out_cache_loc, k, v
         )
 
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
