@@ -18,11 +18,13 @@ from vllm.distributed import (
 
 # workaround
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.parameter import (BasevLLMParameter,
-                                           PackedColumnParameter,
-                                           PackedvLLMParameter,
-                                           PerTensorScaleParameter,
-                                           RowvLLMParameter)
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    PackedColumnParameter,
+    PackedvLLMParameter,
+    PerTensorScaleParameter,
+    RowvLLMParameter,
+)
 
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
