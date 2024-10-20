@@ -344,5 +344,24 @@ class TestOpenAIVisionServer(unittest.TestCase):
             list(executor.map(self.run_decode_with_image, image_ids))
 
 
+class TestQWen2VLServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen2-VL-7B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--chat-template",
+                "qwen2-vl",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
 if __name__ == "__main__":
     unittest.main()
