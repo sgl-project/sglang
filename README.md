@@ -12,7 +12,7 @@
 --------------------------------------------------------------------------------
 
 | [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/) | [**Paper**](https://arxiv.org/abs/2312.07104) | [**Slides**](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_dev_day_v2.pdf) | [**Learn More**](https://github.com/sgl-project/sgl-learning-materials) | [**Join Slack**](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2ngly9muu-t37XiH87qvD~6rVBTkTEHw) |
-[**Join Bi-Weekly Development Meeting (Oct. 19)**](https://calendar.app.google/GYW7S8QGoanCuaxW6) |
+[**Join Bi-Weekly Development Meeting**](https://docs.google.com/document/d/1xEow4eIM152xNcRxqZz9VEcOiTQo8-CEuuQ5qTmkt-E/edit?usp=sharing) |
 
 ## News
 - [2024/10] 🔥 The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).

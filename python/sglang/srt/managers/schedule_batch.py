@@ -23,6 +23,8 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 - ScheduleBatch is managed by `scheduler.py::Scheduler`.
   It contains high-level scheduling data. Most of the data is on the CPU.
 - ModelWorkerBatch is managed by `tp_worker.py::TpModelWorker`.
+  It is a subset of `ScheduleBatch` that only contains data related to the model forward on GPU.
+  It will be transformed from CPU scheduler to GPU model runner.
 - ForwardBatch is managed by `model_runner.py::ModelRunner`.
   It contains low-level tensor data. Most of the data consists of GPU tensors.
 """
@@ -130,6 +132,8 @@ class ImageInputs:
     image_embeds: Optional[List[torch.Tensor]] = None
     aspect_ratio_ids: Optional[List[torch.Tensor]] = None
     aspect_ratio_mask: Optional[List[torch.Tensor]] = None
+    # QWen2-VL related
+    image_grid_thws: List[Tuple[int, int, int]] = None
 
     @staticmethod
     def from_dict(obj, vocab_size):
@@ -151,6 +155,7 @@ class ImageInputs:
             "modalities",
             "aspect_ratio_ids",
             "aspect_ratio_mask",
+            "image_grid_thws",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -245,6 +250,9 @@ class Req:
         self.regex_fsm: RegexGuide = None
         self.regex_fsm_state: int = 0
         self.jump_forward_map: JumpForwardMap = None
+
+        # For Qwen2-VL
+        self.mrope_position_delta = []  # use mutable object
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -614,12 +622,12 @@ class ScheduleBatch:
             assert seq_len - pre_len == req.extend_input_len
 
             if pre_len > 0:
-                self.req_to_token_pool.req_to_token[req.req_pool_idx, :pre_len] = (
-                    req.prefix_indices
+                self.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
-
-            self.req_to_token_pool.req_to_token[req.req_pool_idx, pre_len:seq_len] = (
-                out_cache_loc[pt : pt + req.extend_input_len]
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(pre_len, seq_len)),
+                out_cache_loc[pt : pt + req.extend_input_len],
             )
 
             # Compute the relative logprob_start_len in an extend batch
@@ -734,8 +742,8 @@ class ScheduleBatch:
 
             if isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
-                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    : seq_lens_cpu[idx]
+                token_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : seq_lens_cpu[idx]
                 ]
                 self.token_to_kv_pool.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
@@ -743,8 +751,8 @@ class ScheduleBatch:
             else:
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = len(req.prefix_indices)
-                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    last_uncached_pos : seq_lens_cpu[idx]
+                token_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
                 ]
                 self.token_to_kv_pool.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
@@ -873,9 +881,7 @@ class ScheduleBatch:
         else:
             locs = self.seq_lens
 
-        self.req_to_token_pool.req_to_token[self.req_pool_indices, locs] = (
-            self.out_cache_loc
-        )
+        self.req_to_token_pool.write((self.req_pool_indices, locs), self.out_cache_loc)
         self.seq_lens.add_(1)
 
     def filter_batch(
@@ -952,9 +958,6 @@ class ScheduleBatch:
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        # NOTE: decode also has image_inputs
-        image_inputs = [r.image_inputs for r in self.reqs]
-        lora_paths = [req.lora_path for req in self.reqs]
         if self.has_regex:
             self.sampling_info.regex_fsms = [req.regex_fsm for req in self.reqs]
             self.sampling_info.regex_fsm_states = [
@@ -966,6 +969,8 @@ class ScheduleBatch:
         global bid
         bid += 1
 
+        mrope_positions_delta = [req.mrope_position_delta for req in self.reqs]
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -973,18 +978,20 @@ class ScheduleBatch:
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
+            req_to_token_pool_records=self.req_to_token_pool.get_write_records(),
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
-            image_inputs=image_inputs,
+            image_inputs=[r.image_inputs for r in self.reqs],
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
-            lora_paths=lora_paths,
+            lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
+            mrope_positions_delta=mrope_positions_delta,
         )
 
     def copy(self):
@@ -1019,6 +1026,9 @@ class ModelWorkerBatch:
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
 
+    # The memory pool operation records
+    req_to_token_pool_records: Optional[List[Tuple[Tuple, torch.Tensor]]]
+
     # For logprob
     return_logprob: bool
     top_logprobs_nums: Optional[List[int]]
@@ -1043,6 +1053,9 @@ class ModelWorkerBatch:
     # Sampling info
     sampling_info: SamplingBatchInfo
 
+    # For Qwen2-VL
+    mrope_positions_delta: List[List[int]]
+
     def copy(self):
         return ModelWorkerBatch(
             bid=self.bid,
@@ -1051,6 +1064,7 @@ class ModelWorkerBatch:
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens.clone(),
             out_cache_loc=self.out_cache_loc,
+            req_to_token_pool_records=self.req_to_token_pool_records,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             extend_seq_lens=self.extend_seq_lens,
@@ -1063,4 +1077,16 @@ class ModelWorkerBatch:
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_paths=self.lora_paths,
             sampling_info=self.sampling_info.copy(),
+            mrope_positions_delta=self.mrope_positions_delta,
         )
+
+    def to(self, device: str):
+        self.input_ids = self.input_ids.to(device, non_blocking=True)
+        self.req_pool_indices = self.req_pool_indices.to(device, non_blocking=True)
+        self.seq_lens = self.seq_lens.to(device, non_blocking=True)
+        self.out_cache_loc = self.out_cache_loc.to(device, non_blocking=True)
+        self.req_to_token_pool_records = [
+            (x, y.to(device, non_blocking=True))
+            for x, y in self.req_to_token_pool_records
+        ]
+        self.sampling_info.to(device)

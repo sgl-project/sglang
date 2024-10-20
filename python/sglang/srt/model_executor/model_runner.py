@@ -59,8 +59,11 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
+    is_attention_free_model,
+    is_embedding_model,
     is_generation_model,
     is_multimodal_model,
+    model_has_inner_state,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
 )
@@ -122,6 +125,18 @@ class ModelRunner:
             )
             server_args.chunked_prefill_size = None
             server_args.mem_fraction_static *= 0.95
+            # TODO: qwen2-vl does not support cuda graph now, set disable-graph=True automatically
+            if self.model_config.hf_config.architectures == [
+                "Qwen2VLForConditionalGeneration"
+            ]:
+                server_args.disable_cuda_graph = True
+
+        if self.server_args.enable_overlap_schedule:
+            logger.warning(
+                "Overlap scheduler is enabled. This is an experimental feature. "
+                "Sampling penalizer (e.g., frequency and repetition penalty), constrained decoding (e.g., regex, JSON), "
+                "and embedding APIs are not supported and will lead to wrong results."
+            )
 
         # Global vars
         if server_args.show_time_cost:
@@ -315,11 +330,13 @@ class ModelRunner:
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
-                config.model,
-                config.revision,
-                fall_back_to_pt=getattr(
-                    self.model, "fall_back_to_pt_during_load", True
-                ),
+                DefaultModelLoader.Source(
+                    config.model,
+                    revision=config.revision,
+                    fall_back_to_pt=getattr(
+                        self.model, "fall_back_to_pt_during_load", True
+                    ),
+                )
             )
             return iter
 
@@ -443,6 +460,7 @@ class ModelRunner:
             size=max_num_reqs + 1,
             max_context_len=self.model_config.context_len + 4,
             device=self.device,
+            use_records=False,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -616,6 +634,15 @@ class ModelRunner:
 
         return logits
 
+    @property
+    def model_is_mrope(self) -> bool:
+        """Detect if the model has "mrope" rope_scaling type.
+        mrope requires keep "rope_deltas" between prompt and decoding phases."""
+        rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
+        if rope_scaling is None:
+            return False
+        return rope_scaling.get("type", None) == "mrope"
+
 
 @lru_cache()
 def import_model_classes():
@@ -661,3 +688,7 @@ def load_model_cls_srt(model_arch: str) -> Optional[Type[nn.Module]]:
 
 # Monkey patch model loader
 setattr(ModelRegistry, "_try_load_model_cls", load_model_cls_srt)
+setattr(ModelRegistry, "is_multimodal_model", is_multimodal_model)
+setattr(ModelRegistry, "is_attention_free_model", is_attention_free_model)
+setattr(ModelRegistry, "model_has_inner_state", model_has_inner_state)
+setattr(ModelRegistry, "is_embedding_model", is_embedding_model)
