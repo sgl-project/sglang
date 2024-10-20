@@ -3,7 +3,7 @@ from enum import Enum, auto
 from typing import Dict, List
 
 import httpx
-from worker import Worker
+from sglang.srt.router.worker import Worker
 from sglang.srt.router.utils import configure_logger
 import logging
 
@@ -23,7 +23,6 @@ class BaseRouter:
     def if_exist(self, server_url: str) -> bool:
         return server_url in self.server_url_to_worker
 
-    # scale down the workers / fault happens on the worker
     def remove_worker(self, server_url: str):
         for worker in self.worker_list:
             if worker.server_url == server_url:
@@ -31,7 +30,6 @@ class BaseRouter:
 
         self.server_url_to_worker.pop(server_url, None)
 
-    # scale up the workers / init
     def add_worker(self, server_url: str):
         if server_url in self.server_url_to_worker:
             raise ValueError(f"Worker with url {server_url} already exists")
@@ -70,6 +68,7 @@ class RoundRobinRouter(BaseRouter):
         worker = self.worker_list[self.idx]
         return worker
 
+# Extend your router here
 
 class RoutingPolicy(Enum):
     ROUND_ROBIN = auto()

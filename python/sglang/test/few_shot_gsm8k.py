@@ -131,8 +131,8 @@ def run_eval(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-shots", type=int, default=5)
-    parser.add_argument("--data-path", type=str, default="/home/jobuser/resources/sglang/python/sglang/srt/router/test.jsonl")
-    parser.add_argument("--num-questions", type=int, default=1024)
+    parser.add_argument("--data-path", type=str, default="/home/jobuser/resources/data/test.jsonl")
+    parser.add_argument("--num-questions", type=int, default=256)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--parallel", type=int, default=128)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")

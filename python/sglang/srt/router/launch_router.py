@@ -36,7 +36,7 @@ Key Features:
 
 
 Example:
-python launch_router.py --host 127.0.0.1 --port 8080 --policy round_robin --worker-urls http://127.0.0.1:9000 http://127.0.0.1:9002 http://127.0.0.1:9004 http://127.0.0.1:9006
+python launch_router.py --host 127.0.0.1 --port 8080 --policy round_robin --worker-urls http://127.0.0.1:9000 http://127.0.0.1:9002
 """
 
 import argparse
@@ -97,13 +97,52 @@ async def health_check_loop():
 
         responses = await asyncio.gather(*tasks)
 
-        await asyncio.sleep(4)
+        await asyncio.sleep(60) # 1 min
+
+import time
+
+async def wait_until_ready():
+    timeout = 120 # 2 mins
+    start_time = time.time()
+
+    while True:
+        tasks = []
+        success = True
+        for server_url, worker in router.server_url_to_worker.items():
+            try: 
+                res = await worker.client.get("/health")
+                res.raise_for_status()
+            except:
+                # if any exception happens, we will retry
+                success = False
+                logger.warning(f"Worker {server_url} is not ready yet")
+                break
+
+        if success is False:
+            if time.time() - start_time > timeout:
+                raise Exception("Timeout waiting for workers to be ready")
+        else:
+            break
+        await asyncio.sleep(10) # every 10 sec
+       
+
+    logger.info("All workers are ready and the router is ready to serve!")
+
+import sys
+def receive_signal(signalNumber, frame):
+    print('Received:', signalNumber)
+    sys.exit()
 
 
 # https://fastapi.tiangolo.com/advanced/events/#lifespan-function
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # to hack around hanging issue: https://github.com/encode/uvicorn/issues/1301
+    import signal
+    signal.signal(signal.SIGINT, receive_signal)
     # startup event
+    # wait until all init workers are ready
+    await wait_until_ready()
     # kick off a non-blocking event loop to monitor the healthiness of the workers
     task = asyncio.create_task(health_check_loop())
     yield
@@ -111,13 +150,19 @@ async def lifespan(app: FastAPI):
     task.cancel()
 
 
-app = FastAPI() # lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
 
 
 ################################
 ## SGLang server compatible APIs
 ################################
 
+@app.get("/health")
+async def health():
+    """
+    Returns the health status of the router.
+    """
+    return Response(status_code=200, content="OK")
 
 @app.get("/get_server_args")
 async def get_server_args():
@@ -131,12 +176,14 @@ async def get_server_args():
 
     for _ in range(max_retries):
         try:
-            ret = await first_worker.client.get("/get_server_args")
+            res = await first_worker.client.get("/get_server_args")
+            res.raise_for_status()
         except Exception as e:
             logger.warning(f"Error getting server args: {e}")
             await is_healthy_or_remove(first_worker)
             continue
-        return json.loads(ret.content)
+        return Response(content=res.content, media_type="application/json")
+    return Response(status_code=500, content=f"Failed to generate token after {max_retries} retries")
 
 @app.get("/get_model_info")
 async def get_model_info():
@@ -157,8 +204,9 @@ async def get_model_info():
             await is_healthy_or_remove(first_worker)
             continue
 
-        # convert bytes to dictionary
-        return json.loads(res.content)
+        return Response(content=res.content, media_type="application/json")
+
+    return Response(status_code=500, content=f"Failed to generate token after {max_retries} retries")
 
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate(obj: GenerateReqInput, request: Request):
@@ -175,7 +223,6 @@ async def generate(obj: GenerateReqInput, request: Request):
             res.raise_for_status()
         except Exception as e:
             logger.warning(f"Error generating token: {e}")
-            print(f"Error generating token: {str(e)}")
             await is_healthy_or_remove(selected_worker)
             continue
 
@@ -186,7 +233,6 @@ async def generate(obj: GenerateReqInput, request: Request):
 ####################
 ## Dynamic Scaling
 ####################
-
 
 @app.post("/add_worker")
 async def add_worker(worker_info: WorkerInfo):
@@ -232,6 +278,7 @@ def parse_args():
 
 
 def launch_router():
+
     global router
     args = parse_args()
     router_class = get_router_class(args.policy)

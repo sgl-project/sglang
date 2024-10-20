@@ -341,6 +341,11 @@ def launch_engine(
     port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
+
+    import os
+    cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+    print(f"CUDA_VISIBLE_DEVICES: {cuda_visible_devices}")
+
     # If using model from www.modelscope.cn, first download the model.
     server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
         server_args.model_path, server_args.tokenizer_path
