@@ -291,7 +291,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             return self._process_single_image_task(image_data)
 
     async def process_images_async(
-        self, image_data: List[Union[str, bytes]], request_obj
+        self, image_data: List[Union[str, bytes]], input_text, request_obj
     ):
         if not image_data:
             return None
