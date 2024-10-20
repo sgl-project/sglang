@@ -639,8 +639,8 @@ class ScheduleBatch:
 
             if isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
-                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    : seq_lens_cpu[idx]
+                token_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : seq_lens_cpu[idx]
                 ]
                 self.token_to_kv_pool.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
@@ -648,8 +648,8 @@ class ScheduleBatch:
             else:
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = len(req.prefix_indices)
-                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    last_uncached_pos : seq_lens_cpu[idx]
+                token_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
                 ]
                 self.token_to_kv_pool.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
