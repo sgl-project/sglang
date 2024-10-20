@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
 )
 
-DEFAULT_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/"
+# DEFAULT_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/"
 
 
 def find_available_port():
@@ -133,7 +133,8 @@ class TestRouter(unittest.TestCase):
 
         args = SimpleNamespace(
             num_shots=5,
-            data_path="/home/jobuser/resources/data/test.jsonl",
+            # data_path="/home/jobuser/resources/data/test.jsonl",
+            data_path="test.jsonl",
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
