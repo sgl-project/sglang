@@ -351,7 +351,9 @@ class LoRAAdapter(nn.Module):
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
         for name, loaded_weight in loader._get_weights_iterator(
-            model_path, revision=revision, fall_back_to_pt=True
+            DefaultModelLoader.Source(
+                model_path, revision=revision, fall_back_to_pt=True
+            )
         ):
             match = re.search(r"layers\.(\d+)\.", name)
             if match is not None:
