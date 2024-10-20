@@ -20,6 +20,7 @@ import logging
 import threading
 import time
 from queue import Queue
+from typing import Optional
 
 import torch
 
@@ -40,9 +41,10 @@ class TpModelWorker:
 
     def __init__(
         self,
+        server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
-        server_args: ServerArgs,
+        dp_rank: Optional[int],
         nccl_port: int,
     ):
         # Parse args
@@ -116,6 +118,19 @@ class TpModelWorker:
             self.max_running_requests,
             self.max_req_input_len,
             self.random_seed,
+            self.device,
+        )
+
+    def get_pad_input_ids_func(self):
+        return getattr(self.model_runner.model, "pad_input_ids", None)
+
+    def get_tp_cpu_group(self):
+        return self.model_runner.tp_group.cpu_group
+
+    def get_memory_pool(self):
+        return (
+            self.model_runner.req_to_token_pool,
+            self.model_runner.token_to_kv_pool,
         )
 
     def init_overlap_status(self):
