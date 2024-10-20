@@ -461,6 +461,7 @@ class ModelRunner:
             size=max_num_reqs + 1,
             max_context_len=self.model_config.context_len + 4,
             device=self.device,
+            use_records=False,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
