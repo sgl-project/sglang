@@ -38,16 +38,14 @@ class ChunkCache(BasePrefixCache):
         max_prefix_len = len(key)
         return entry.value[:max_prefix_len], entry
 
-    def cache_finished_req(
-        self, req: Req, token_ids: Optional[List[int]] = None, free_delta: int = 0
-    ):
+    def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         if token_ids is None:
             token_id_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         else:
             token_id_len = len(token_ids)
 
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : token_id_len + free_delta
+            req.req_pool_idx, :token_id_len
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool.free(kv_indices)

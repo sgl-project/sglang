@@ -209,6 +209,27 @@ def is_multimodal_model(model_architectures):
         or "LlavaQwenForCausalLM" in model_architectures
         or "LlavaMistralForCausalLM" in model_architectures
         or "LlavaVidForCausalLM" in model_architectures
+        or "Qwen2VLForConditionalGeneration" in model_architectures
+    ):
+        return True
+    else:
+        return False
+
+
+def is_attention_free_model(model_architectures):
+    return False
+
+
+def model_has_inner_state(model_architectures):
+    return False
+
+
+def is_embedding_model(model_architectures):
+    if (
+        "LlamaEmbeddingModel" in model_architectures
+        or "MistralModel" in model_architectures
+        or "LlamaForSequenceClassification" in model_architectures
+        or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
     ):
         return True
     else:

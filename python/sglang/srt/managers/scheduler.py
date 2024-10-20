@@ -52,6 +52,7 @@ from sglang.srt.managers.schedule_batch import (
     ImageInputs,
     Req,
     ScheduleBatch,
+    global_server_args_dict,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -59,6 +60,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -92,6 +94,7 @@ class Scheduler:
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
+        dp_rank: Optional[int],
     ):
         # Parse args
         self.server_args = server_args
@@ -144,14 +147,22 @@ class Scheduler:
         )
 
         # Launch a tensor parallel worker
-        self.tp_worker = TpModelWorker(
+        if self.server_args.enable_overlap_schedule:
+            TpWorkerClass = TpModelWorkerClient
+            self.resolve_next_token_ids = (
+                lambda bid, x: self.tp_worker.resolve_future_token_ids(bid)
+            )
+        else:
+            TpWorkerClass = TpModelWorker
+            self.resolve_next_token_ids = lambda bid, x: x.tolist()
+
+        self.tp_worker = TpWorkerClass(
+            server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
-            server_args=server_args,
+            dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
-        self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
-        self.device = self.tp_worker.device
 
         # Get token and memory info from the model worker
         (
@@ -160,11 +171,16 @@ class Scheduler:
             self.max_running_requests,
             self.max_req_input_len,
             self.random_seed,
-        ) = self.tp_worker.get_token_and_memory_info()
+            self.device,
+            worker_global_server_args_dict,
+            _,
+            _,
+            _,
+        ) = self.tp_worker.get_worker_info()
+        self.tp_cpu_group = self.tp_worker.get_tp_cpu_group()
+        self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
+        global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
-        self.pad_input_ids_func = getattr(
-            self.tp_worker.model_runner.model, "pad_input_ids", None
-        )
 
         # Print debug info
         logger.info(
@@ -174,9 +190,8 @@ class Scheduler:
             f"context_len={self.model_config.context_len}"
         )
 
-        # Init cache
-        self.req_to_token_pool = self.tp_worker.model_runner.req_to_token_pool
-        self.token_to_kv_pool = self.tp_worker.model_runner.token_to_kv_pool
+        # Init memory pool and cache
+        self.req_to_token_pool, self.token_to_kv_pool = self.tp_worker.get_memory_pool()
 
         if (
             server_args.chunked_prefill_size is not None
@@ -269,27 +284,9 @@ class Scheduler:
                 with_stack=True,
             )
 
-        # Init states for overlap schedule
-        if self.server_args.enable_overlap_schedule:
-            self.forward_batch_generation = (
-                self.tp_worker.forward_batch_generation_non_blocking
-            )
-            self.resolve_next_token_ids = (
-                lambda bid, x: self.tp_worker.resolve_future_token_ids(bid)
-            )
-
-            def cache_finished_req(req):
-                free_delta = int(self.running_batch and req in self.cur_batch.reqs)
-                self.tree_cache.cache_finished_req(req, free_delta=free_delta)
-
-            self.cache_finished_req = cache_finished_req
-        else:
-            self.forward_batch_generation = self.tp_worker.forward_batch_generation
-            self.resolve_next_token_ids = lambda bid, x: x.tolist()
-            self.cache_finished_req = self.tree_cache.cache_finished_req
-
     @torch.inference_mode()
     def event_loop_normal(self):
+        """A normal blocking scheduler loop."""
         self.last_batch = None
 
         while True:
@@ -320,6 +317,7 @@ class Scheduler:
 
     @torch.inference_mode()
     def event_loop_overlap(self):
+        """A scheduler loop that overlaps the CPU processing and GPU computation."""
         result_queue = deque()
 
         self.last_batch = None
@@ -613,6 +611,7 @@ class Scheduler:
                 else set([])
             )
 
+        # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if (
                 self.lora_paths
@@ -714,6 +713,7 @@ class Scheduler:
         return new_batch
 
     def update_running_batch(self):
+        """Update the current running decoding batch."""
         global test_retract
         batch = self.running_batch
 
@@ -753,10 +753,11 @@ class Scheduler:
         batch.prepare_for_decode()
 
     def run_batch(self, batch: ScheduleBatch):
+        """Run a batch."""
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
                 model_worker_batch = batch.get_model_worker_batch()
-                logits_output, next_token_ids = self.forward_batch_generation(
+                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
             else:
@@ -817,7 +818,7 @@ class Scheduler:
                     req.check_finished()
 
                     if req.finished():
-                        self.cache_finished_req(req)
+                        self.tree_cache.cache_finished_req(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
 
@@ -835,7 +836,6 @@ class Scheduler:
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
         else:  # embedding or reward model
-            assert batch.extend_num_tokens != 0
             embeddings, bid = result
             embeddings = embeddings.tolist()
 
@@ -851,7 +851,7 @@ class Scheduler:
                     req.check_finished()
 
                 if req.finished():
-                    self.cache_finished_req(req)
+                    self.tree_cache.cache_finished_req(req)
                 else:
                     self.tree_cache.cache_unfinished_req(req)
 
@@ -875,6 +875,7 @@ class Scheduler:
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if self.server_args.enable_overlap_schedule and req.finished():
+                self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
             req.completion_tokens_wo_jump_forward += 1
@@ -891,7 +892,7 @@ class Scheduler:
                 assert req.regex_bnf.accept_token(next_token_id)
 
             if req.finished():
-                self.cache_finished_req(req)
+                self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob:
                 req.output_token_logprobs.append(
@@ -982,6 +983,7 @@ class Scheduler:
         return num_input_logprobs
 
     def stream_output(self, reqs: List[Req]):
+        """Stream the output to detokenizer."""
         output_rids = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
@@ -1079,6 +1081,7 @@ class Scheduler:
                 )
 
     def flush_cache(self):
+        """Flush the memory pool and cache."""
         if len(self.waiting_queue) == 0 and (
             self.running_batch is None or len(self.running_batch.reqs) == 0
         ):
@@ -1117,10 +1120,11 @@ class Scheduler:
             for req in self.running_batch.reqs:
                 if req.rid == recv_req.rid and not req.finished():
                     req.finished_reason = FINISH_ABORT()
-                    self.cache_finished_req(req)
+                    self.tree_cache.cache_finished_req(req)
                     break
 
     def update_weights(self, recv_req: UpdateWeightReqInput):
+        """In-place update of the weights."""
         success, message = self.tp_worker.update_weights(recv_req)
         if success:
             flash_cache_success = self.flush_cache()
@@ -1160,7 +1164,7 @@ def run_scheduler_process(
     suppress_other_loggers()
 
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank)
+        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
         pipe_writer.send("ready")
         if server_args.enable_overlap_schedule:
             scheduler.event_loop_overlap()

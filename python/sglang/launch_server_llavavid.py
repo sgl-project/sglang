@@ -14,7 +14,7 @@ if __name__ == "__main__":
     model_override_args["num_frames"] = 16
     model_override_args["model_type"] = "llavavid"
     if model_override_args["num_frames"] == 32:
-        model_override_args["rope_scaling"] = {"factor": 2.0, "type": "linear"}
+        model_override_args["rope_scaling"] = {"factor": 2.0, "rope_type": "linear"}
         model_override_args["max_sequence_length"] = 4096 * 2
         model_override_args["tokenizer_model_max_length"] = 4096 * 2
         model_override_args["model_max_length"] = 4096 * 2
