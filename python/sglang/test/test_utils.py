@@ -397,7 +397,6 @@ def popen_launch_server(
     model: str,
     base_url: str,
     timeout: float,
-    device_id,
     api_key: Optional[str] = None,
     other_args: tuple = (),
     env: Optional[dict] = None,
@@ -407,8 +406,7 @@ def popen_launch_server(
     host = host[2:]
 
     command = [
-        f"export CUDA_VISIBLE_DEVICES={device_id};",
-        "python",
+        "python3",
         "-m",
         "sglang.launch_server",
         "--model-path",
@@ -422,8 +420,6 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
-    # env = {"CUDA_VISIBLE_DEVICES": device_id}
-
     if return_stdout_stderr:
         process = subprocess.Popen(
             command,
@@ -431,14 +427,9 @@ def popen_launch_server(
             stderr=subprocess.PIPE,
             env=env,
             text=True,
-            shell=True,
         )
     else:
-        concat_cmd = " ".join(command)
-        print(concat_cmd)
-        process = subprocess.Popen(
-            concat_cmd, stdout=None, stderr=None, env=env, shell=True
-        )
+        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     start_time = time.time()
     while time.time() - start_time < timeout:
