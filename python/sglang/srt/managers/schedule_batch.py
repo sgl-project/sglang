@@ -906,6 +906,10 @@ class ScheduleBatch:
             # No need to filter
             return
 
+        if self.model_config.is_encoder_decoder:
+            self.encoder_lens = self.encoder_lens[keep_indices]
+            self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
+
         self.reqs = [self.reqs[i] for i in keep_indices]
         new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(
             self.device, non_blocking=True
@@ -930,6 +934,11 @@ class ScheduleBatch:
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
         self.sampling_info.merge_batch(other.sampling_info)
+
+        # Encoder-decoder infos
+        if self.model_config.is_encoder_decoder:
+            self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
+            self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
 
         self.req_pool_indices = torch.concat(
             [self.req_pool_indices, other.req_pool_indices]

@@ -921,6 +921,9 @@ class MllamaForConditionalGeneration(nn.Module):
         if self.capture_mode:
             skip_cross_attention = False
         else:
+            # NOTE: we do not need image_inputs when prefill
+            assert len(forward_batch.encoder_lens) == len(forward_batch.seq_lens)
+            assert len(forward_batch.encoder_lens_cpu) == len(forward_batch.seq_lens)
             skip_cross_attention = forward_batch.encoder_lens.max() == 0
 
         if batched_images is None:
