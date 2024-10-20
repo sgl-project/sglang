@@ -39,7 +39,7 @@ Features:
 
 
 Example:
-python launch_router.py --host 127.0.0.1 --port 8080 --policy round_robin --worker-urls http://127.0.0.1:9000 http://127.0.0.1:9002
+python -m sglang.srt.router.launch_router --host 127.0.0.1 --port 8080 --policy round_robin --worker-urls http://127.0.0.1:9000 http://127.0.0.1:9002
 """
 
 import argparse
