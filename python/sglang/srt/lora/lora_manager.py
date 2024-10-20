@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 if is_flashinfer_available():
     from flashinfer import SegmentGEMMWrapper
+from sglang.srt.lora.triton_ops.lora_expand import segment_gemm_expand
 
 
 def get_module_name(name):
@@ -93,6 +94,7 @@ class LoRAManager:
         max_loras_per_batch,
         load_config,
         dtype,
+        lora_backend,
     ):
         self.base_model = base_model
         self.lora_paths = lora_paths
@@ -100,9 +102,13 @@ class LoRAManager:
         self.max_loras_per_batch = max_loras_per_batch
         self.load_config = load_config
         self.dtype = dtype
+        self.lora_backend = lora_backend
 
         workspace_buffer = torch.empty(1 * 1024 * 1024, dtype=torch.int8, device="cuda")
+        # waiting for flashinfer's updates on grouped gemm
         self.segment_gemm = SegmentGEMMWrapper(workspace_buffer)
+
+        self.gemm_expand = segment_gemm_expand if lora_backend == "triton" else None
 
         self.init_loras()
         self.init_lora_memory_pool()
@@ -123,7 +129,11 @@ class LoRAManager:
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(
-            module, self.segment_gemm, self.max_lora_dim, self.scaling
+            module,
+            self.segment_gemm,
+            self.max_lora_dim,
+            self.scaling,
+            gemm_expand=self.gemm_expand,
         )
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
@@ -162,7 +172,11 @@ class LoRAManager:
             self.lora_id[name] = len(self.loras)
             self.loras.append(
                 LoRAAdapter(
-                    name, self.configs[name], self.base_hf_config, self.load_config
+                    name,
+                    self.configs[name],
+                    self.base_hf_config,
+                    self.load_config,
+                    self.lora_backend,
                 )
             )
             self.loras[-1].initialize_weights()
@@ -223,18 +237,34 @@ class LoRAManager:
                 _, hidden_dim_B = get_hidden_dim(module_B, self.base_hf_config)
             c = self.loras[-1].get_stacked_multiply(module_B)
             if module_B not in self.B_buffer:
-                self.B_buffer[module_B] = [
-                    torch.empty(
-                        (
-                            self.max_loras_per_batch,
-                            hidden_dim_B * c,
-                            self.max_lora_dim,
-                        ),
-                        dtype=self.dtype,
-                        device="cuda",
-                    )
-                    for i in range(num_layer)
-                ]
+                if self.lora_backend == "triton":
+                    self.B_buffer[module_B] = [
+                        torch.empty(
+                            (
+                                c,
+                                self.max_loras_per_batch,
+                                hidden_dim_B,
+                                self.max_lora_dim,
+                            ),
+                            dtype=self.dtype,
+                            device="cuda",
+                        )
+                        for i in range(num_layer)
+                    ]
+                else:
+                    self.B_buffer[module_B] = [
+                        torch.empty(
+                            (
+                                c,
+                                self.max_loras_per_batch,
+                                hidden_dim_B,
+                                self.max_lora_dim,
+                            ),
+                            dtype=self.dtype,
+                            device="cuda",
+                        )
+                        for i in range(num_layer)
+                    ]
 
     def init_lora_batch(self):
         self.active_uids = set()  # set of active loras
@@ -263,7 +293,16 @@ class LoRAManager:
                 else:
                     lora_weight_name = self.get_weight_name(name, 1)
                     if lora_weight_name:
-                        self.B_buffer[lora_weight_name][i][buffer_id].copy_(weights)
+                        c = self.loras[-1].get_stacked_multiply(lora_weight_name)
+                        if c > 1:
+                            for j in range(c):
+                                self.B_buffer[lora_weight_name][i][j][buffer_id].copy_(
+                                    weights[j]
+                                )
+                        else:
+                            self.B_buffer[lora_weight_name][i][0][buffer_id].copy_(
+                                weights
+                            )
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # load active loras into lora memory pool
@@ -302,6 +341,7 @@ class LoRAManager:
         # FIXME: reuse the data rather than recompute
         seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+        max_len = int(torch.max(seg_lens))
         weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
         for i, lora_path in enumerate(forward_batch.lora_paths):
             weight_indices[i] = self.buffer_id[lora_path]
@@ -326,4 +366,6 @@ class LoRAManager:
                     bs,
                     seg_indptr,
                     weight_indices,
+                    seg_lens=seg_lens,
+                    max_len=max_len,
                 )
