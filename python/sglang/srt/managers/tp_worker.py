@@ -27,7 +27,7 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import UpdateWeightReqInput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
@@ -111,7 +111,7 @@ class TpModelWorker:
         if server_args.enable_overlap_schedule:
             self.init_overlap_status()
 
-    def get_token_and_memory_info(self):
+    def get_worker_info(self):
         return (
             self.max_total_num_tokens,
             self.max_prefill_tokens,
@@ -119,6 +119,10 @@ class TpModelWorker:
             self.max_req_input_len,
             self.random_seed,
             self.device,
+            global_server_args_dict,
+            self.model_runner.req_to_token_pool.size,
+            self.model_runner.req_to_token_pool.max_context_len,
+            self.model_runner.token_to_kv_pool.size,
         )
 
     def get_pad_input_ids_func(self):
