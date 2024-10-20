@@ -146,7 +146,8 @@ class CudaGraphRunner:
 
         # Capture
         try:
-            self.capture()
+            with self.model_capture_mode():
+                self.capture()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n"
@@ -156,6 +157,16 @@ class CudaGraphRunner:
                 "3. disable torch compile by not using --enable-torch-compile\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
+
+    @contextmanager
+    def model_capture_mode(self):
+        if hasattr(self.model_runner.model, "capture_mode"):
+            self.model_runner.model.capture_mode = True
+
+        yield
+
+        if hasattr(self.model_runner.model, "capture_mode"):
+            self.model_runner.model.capture_mode = False
 
     def can_run(self, batch_size: int):
         if self.disable_padding:
@@ -190,7 +201,6 @@ class CudaGraphRunner:
         out_cache_loc = self.out_cache_loc[:bs]
 
         # Fake encoder lens: just to initialize the attention wrappers
-        # TODO: support encoder-decode in cuda graph
         encoder_lens = torch.zeros_like(seq_lens)
 
         # Attention backend

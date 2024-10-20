@@ -796,6 +796,7 @@ class MllamaForConditionalGeneration(nn.Module):
             bias=True,
         )
         self.logits_processor = LogitsProcessor(config.text_config)
+        self.capture_mode = False
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         pixel_values = image_inputs.pixel_values
@@ -917,13 +918,17 @@ class MllamaForConditionalGeneration(nn.Module):
         # TODO: support multi-image by this mask
         cross_attention_mask = None
 
+        if self.capture_mode:
+            skip_cross_attention = False
+        else:
+            skip_cross_attention = forward_batch.encoder_lens.max() == 0
+
         if batched_images is None:
             # For 1) text-only prefill and decode, 2) image-present decode.
             full_text_row_masked_out_mask = (
                 (forward_batch.encoder_lens != 0).reshape(-1, 1).to(input_ids.device)
             )
             cross_attention_states = None
-            skip_cross_attention = forward_batch.encoder_lens.max() == 0
         else:
             # NOTE: llama's reference implementation runs vision model on CPU
             cross_attention_states = self.vision_model(
@@ -942,7 +947,6 @@ class MllamaForConditionalGeneration(nn.Module):
             full_text_row_masked_out_mask = self.get_full_text_row_masked_out_mask(
                 forward_batch
             )
-            skip_cross_attention = False
 
         hidden_states = self.language_model(
             input_ids=input_ids,
