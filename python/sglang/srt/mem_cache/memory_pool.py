@@ -43,12 +43,13 @@ class ReqToTokenPool:
         )
         self.free_slots = list(range(size))
         self.write_records = []
+        self.use_records = use_records
 
-        if use_records:
-            # records all write operations
-            self.write = self.write_with_records
+    def write(self, indices, values):
+        if self.use_records:
+            return self.write_with_records(indices, values)
         else:
-            self.write = self.write_without_records
+            return self.write_without_records(indices, values)
 
     def available_size(self):
         return len(self.free_slots)
