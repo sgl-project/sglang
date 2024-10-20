@@ -274,6 +274,7 @@ class Scheduler:
 
     @torch.inference_mode()
     def event_loop_normal(self):
+        """A normal blocking scheduler loop."""
         self.last_batch = None
 
         while True:
@@ -304,6 +305,7 @@ class Scheduler:
 
     @torch.inference_mode()
     def event_loop_overlap(self):
+        """A scheduler loop that overlaps the CPU processing and GPU computation."""
         result_queue = deque()
 
         self.last_batch = None
@@ -580,6 +582,7 @@ class Scheduler:
                 else set([])
             )
 
+        # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if (
                 self.lora_paths
@@ -681,6 +684,7 @@ class Scheduler:
         return new_batch
 
     def update_running_batch(self):
+        """Update the current running decoding batch."""
         global test_retract
         batch = self.running_batch
 
@@ -720,6 +724,7 @@ class Scheduler:
         batch.prepare_for_decode()
 
     def run_batch(self, batch: ScheduleBatch):
+        """Run a batch."""
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
                 model_worker_batch = batch.get_model_worker_batch()
@@ -941,6 +946,7 @@ class Scheduler:
         return num_input_logprobs
 
     def stream_output(self, reqs: List[Req]):
+        """Stream the output to detokenizer."""
         output_rids = []
         output_meta_info = []
         output_finished_reason: List[BaseFinishReason] = []
@@ -1038,6 +1044,7 @@ class Scheduler:
                 )
 
     def flush_cache(self):
+        """Flush the memory pool and cache."""
         if len(self.waiting_queue) == 0 and (
             self.running_batch is None or len(self.running_batch.reqs) == 0
         ):
@@ -1078,6 +1085,7 @@ class Scheduler:
                     break
 
     def update_weights(self, recv_req: UpdateWeightReqInput):
+        """In-place update of the weights."""
         success, message = self.tp_worker.update_weights(recv_req)
         if success:
             flash_cache_success = self.flush_cache()
