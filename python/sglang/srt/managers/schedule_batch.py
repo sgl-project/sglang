@@ -1072,7 +1072,9 @@ class ModelWorkerBatch:
             extend_logprob_start_lens=self.extend_logprob_start_lens,
             image_inputs=self.image_inputs,
             encoder_cached=self.encoder_cached,
-            encoder_lens=self.encoder_lens.clone(),
+            encoder_lens=(
+                None if self.encoder_lens is None else self.encoder_lens.clone()
+            ),
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_paths=self.lora_paths,

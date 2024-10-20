@@ -351,7 +351,7 @@ def get_image_processor(
     if "MllamaForConditionalGeneration" in hf_config.architectures:
         return MllamaImageProcessor(hf_config, server_args, processor)
     elif "Qwen2VLForConditionalGeneration" in hf_config.architectures:
-        return Qwen2VLImageProcessor(hf_config, server_args, _image_processor)
+        return Qwen2VLImageProcessor(hf_config, server_args, processor.image_processor)
     else:
         return LlavaImageProcessor(hf_config, server_args, processor.image_processor)
 
