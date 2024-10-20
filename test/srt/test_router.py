@@ -1,3 +1,4 @@
+import os
 import socket
 import subprocess
 import time
@@ -15,7 +16,14 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
 )
 
-# DEFAULT_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/"
+
+def is_local():
+    # see if IS_LOCAL env is set
+    return os.environ.get("IS_LOCAL") is not None
+
+
+if is_local() is True:
+    DEFAULT_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/"
 
 
 def find_available_port():
@@ -36,7 +44,11 @@ def popen_launch_server(model, url, device_id, timeout):
     host = parsed_url.hostname
     port = parsed_url.port
 
-    command = f"export CUDA_VISIBLE_DEVICES={device_id}; python3 -m sglang.launch_server --model-path {model} --host {host} --port {port}"
+    print(is_local())
+    if is_local() is True:
+        command = f"export CUDA_VISIBLE_DEVICES={device_id}; python -m sglang.launch_server --model-path {model} --host {host} --port {port}"
+    else:
+        command = f"export CUDA_VISIBLE_DEVICES={device_id}; python3 -m sglang.launch_server --model-path {model} --host {host} --port {port}"
 
     process = subprocess.Popen(command, stdout=None, stderr=None, shell=True)
 
@@ -64,7 +76,10 @@ def popen_launch_router(
     host = parsed_url.hostname
     port = parsed_url.port
 
-    command = f"python3 -m sglang.srt.router.launch_router --host {host} --port {port} --policy {policy} --worker-urls {' '.join(worker_urls)}"
+    if is_local() is True:
+        command = f"python -m sglang.srt.router.launch_router --host {host} --port {port} --policy {policy} --worker-urls {' '.join(worker_urls)}"
+    else:
+        command = f"python3 -m sglang.srt.router.launch_router --host {host} --port {port} --policy {policy} --worker-urls {' '.join(worker_urls)}"
 
     process = subprocess.Popen(command, stdout=None, stderr=None, shell=True)
 
@@ -131,10 +146,14 @@ class TestRouter(unittest.TestCase):
         host = parsed_url.hostname
         port = parsed_url.port
 
+        data_path = "test.jsonl"
+
+        if is_local() is True:
+            data_path = "/home/jobuser/resources/data/test.jsonl"
+
         args = SimpleNamespace(
             num_shots=5,
-            # data_path="/home/jobuser/resources/data/test.jsonl",
-            data_path="test.jsonl",
+            data_path=data_path,
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
@@ -148,4 +167,5 @@ class TestRouter(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    # print(os.environ.get("IS_LOCAL"))
     unittest.main()
