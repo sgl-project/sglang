@@ -436,7 +436,9 @@ def popen_launch_server(
     else:
         concat_cmd = " ".join(command)
         print(concat_cmd)
-        process = subprocess.Popen(concat_cmd, stdout=None, stderr=None, env=env, shell=True)
+        process = subprocess.Popen(
+            concat_cmd, stdout=None, stderr=None, env=env, shell=True
+        )
 
     start_time = time.time()
     while time.time() - start_time < timeout:
@@ -476,7 +478,7 @@ def popen_launch_router(
         "--policy",
         policy,
         "--worker-urls",
-        *worker_urls
+        *worker_urls,
     ]
 
     print(command)
@@ -502,6 +504,7 @@ def popen_launch_router(
             pass
         time.sleep(10)
     raise TimeoutError("Router failed to start within the timeout period.")
+
 
 def run_with_timeout(
     func: Callable,

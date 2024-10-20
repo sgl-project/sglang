@@ -1,14 +1,13 @@
+import logging
 import random
 from enum import Enum, auto
 from typing import Dict, List
 
 import httpx
+
 from sglang.srt.router.worker import Worker
-from sglang.srt.router.utils import configure_logger
-import logging
 
 logger = logging.getLogger(__name__)
-configure_logger(logging.INFO, " [Router]")
 
 
 class BaseRouter:
@@ -35,9 +34,9 @@ class BaseRouter:
             raise ValueError(f"Worker with url {server_url} already exists")
         worker = Worker()
         worker.server_url = server_url
-        # disable timeout == setting timeout as inf
+
+        # disable timeout (setting to None)
         worker.client = httpx.AsyncClient(base_url=server_url, timeout=None)
-        # TODO: ensure the worker is healthy before adding to the list, maybe by sending a health check request
         self.worker_list.append(worker)
         self.server_url_to_worker[server_url] = worker
 
@@ -68,8 +67,8 @@ class RoundRobinRouter(BaseRouter):
         worker = self.worker_list[self.idx]
         return worker
 
-# Extend your router here
 
+# Extend your router here
 class RoutingPolicy(Enum):
     ROUND_ROBIN = auto()
     RANDOM = auto()

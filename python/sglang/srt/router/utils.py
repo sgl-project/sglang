@@ -1,19 +1,13 @@
 import logging
-from dataclasses import dataclass
 
 
-def configure_logger(log_level, prefix: str = ""):
+def configure_logger(log_level: str = "INFO"):
     # add level to the format
-    format = f"[%(asctime)s{prefix}] %(levelname)s: %(message)s"
+    format = "[%(asctime)s] %(name)s - %(levelname)s: %(message)s"
 
     logging.basicConfig(
-        level=log_level,
+        level=getattr(logging, log_level),
         format=format,
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
-
-
-@dataclass
-class WorkerInfo:
-    server_url: str

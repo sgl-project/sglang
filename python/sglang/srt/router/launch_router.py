@@ -3,7 +3,7 @@ SGLang Router manages DP workers and routes requests to them based on a routing 
 
 Glossary:
 
-- Worker (DP Worker): A server hosting an SGLang backend, consisting of a server,
+- Worker (DP Worker): An SGLang instance hosting an SGLang backend, consisting of a server,
   tokenizer, scheduler, and detokenizer. It can have Tensor Parallelism (TP) > 1.
   Also referred to as a DP Worker because the routing performs Data Parallelism.
 - Worker Server: The server component of an SGLang Worker instance.
@@ -14,11 +14,13 @@ Glossary:
 - Router Server: The server hosting the Router service.
 
 Notes:
+
 - We assume all workers are configured identically. We don't support heterogeneous workers yet.
 - The Router performs data parallelism, distributing requests across multiple DP Workers.
 
 
 Router APIs:
+
 1. /generate: Selects a Worker based on the routing policy and forwards the request.
 2. /health: Returns the Router's health status.
 3. /health_generate: Checks Router health by generating one token.
@@ -29,7 +31,8 @@ Router APIs:
 8. /remove_worker: Removes a Worker from the Router.
 ...more
 
-Key Features:
+Features:
+
 1. Fault Tolerance: Periodically checks Worker health and removes unhealthy instances.
 2. Dynamic Scaling: Supports adding or removing Workers dynamically.
 3. Flexible Routing: Implements multiple routing policies (e.g., round-robin, random).
@@ -42,39 +45,37 @@ python launch_router.py --host 127.0.0.1 --port 8080 --policy round_robin --work
 import argparse
 import asyncio
 import logging
+import signal
+import sys
+import time
 from contextlib import asynccontextmanager
-
-import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import Response
-
-from sglang.srt.router.router import get_router_class
-from sglang.srt.router.utils import WorkerInfo, configure_logger
-import json
-
-from sglang.srt.managers.io_struct import (
-    GenerateReqInput,
-)
-from fastapi import Request, Response
 from dataclasses import asdict
 
+import uvicorn
+from fastapi import FastAPI, Request, Response
+
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.router.router import get_router_class
+from sglang.srt.router.utils import configure_logger
+from sglang.srt.router.worker import WorkerUpdateReq
 
 logger = logging.getLogger(__name__)
-configure_logger(logging.INFO, " [Router]")
 
 router = None
 
 ##############
-# Local utils
+# Worker Health Check
 ##############
 
 
 async def is_healthy_or_remove(worker):
+    """
+    Check if the worker is healthy or remove it from the router
+    """
 
     # If worker is not in the list, no need to perform the check
     if router.if_exist(worker.server_url) is False:
         return
-
     try:
         res = await worker.client.get("/health")
         res.raise_for_status()
@@ -86,66 +87,71 @@ async def is_healthy_or_remove(worker):
         )
 
 
-# run a non-blocking event loop to check the healthiness of the workers and kick out the unhealthy one
 async def health_check_loop():
+    """
+    a non-blocking event loop to check the health of the workers and remove the unhealthy one
+    """
     while True:
         logger.info("Checking worker health...")
-
         tasks = []
         for server_url, worker in router.server_url_to_worker.items():
             tasks.append(is_healthy_or_remove(worker))
 
-        responses = await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(60)
 
-        await asyncio.sleep(60) # 1 min
-
-import time
 
 async def wait_until_ready():
-    timeout = 120 # 2 mins
+    """
+    Before the http server starts, we wait until all workers are ready
+    """
+    timeout = 120  # seconds
     start_time = time.time()
 
     while True:
-        tasks = []
         success = True
         for server_url, worker in router.server_url_to_worker.items():
-            try: 
+            try:
                 res = await worker.client.get("/health")
                 res.raise_for_status()
-            except:
-                # if any exception happens, we will retry
+            except Exception:
+                # if any exception happens, we will break and retry
                 success = False
                 logger.warning(f"Worker {server_url} is not ready yet")
                 break
 
         if success is False:
             if time.time() - start_time > timeout:
-                raise Exception("Timeout waiting for workers to be ready")
+                raise Exception(
+                    f"Timeout {timeout} seconds waiting for workers to be ready"
+                )
         else:
             break
-        await asyncio.sleep(10) # every 10 sec
-       
+
+        await asyncio.sleep(10)
 
     logger.info("All workers are ready and the router is ready to serve!")
 
-import sys
-def receive_signal(signalNumber, frame):
-    print('Received:', signalNumber)
-    sys.exit()
 
-
-# https://fastapi.tiangolo.com/advanced/events/#lifespan-function
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # to hack around hanging issue: https://github.com/encode/uvicorn/issues/1301
-    import signal
-    signal.signal(signal.SIGINT, receive_signal)
-    # startup event
+    """
+    https://fastapi.tiangolo.com/advanced/events/#lifespan-function
+
+    1. The code before "yield" is executed before the server starts.
+    2. The code after "yield" is executed after the server ends.
+    """
+
+    # to hack around hanging issue on SIGINT: https://github.com/encode/uvicorn/issues/1301
+    signal.signal(signal.SIGINT, lambda signalNumber, frame: sys.exit())
     # wait until all init workers are ready
     await wait_until_ready()
-    # kick off a non-blocking event loop to monitor the healthiness of the workers
+    # kick off a non-blocking event loop to monitor the health of the workers
     task = asyncio.create_task(health_check_loop())
+
+    # separator
     yield
+
     # shutdown event
     task.cancel()
 
@@ -154,8 +160,11 @@ app = FastAPI(lifespan=lifespan)
 
 
 ################################
-## SGLang server compatible APIs
+## SGLang instance compatible routes
 ################################
+
+# TODO: `/flush_cache`, `/health_generate``
+
 
 @app.get("/health")
 async def health():
@@ -164,12 +173,12 @@ async def health():
     """
     return Response(status_code=200, content="OK")
 
+
 @app.get("/get_server_args")
 async def get_server_args():
     """
     Returns the server arguments of the first worker.
     """
-    tasks = []
     first_worker = router.worker_list[0]
 
     max_retries = 5
@@ -183,14 +192,17 @@ async def get_server_args():
             await is_healthy_or_remove(first_worker)
             continue
         return Response(content=res.content, media_type="application/json")
-    return Response(status_code=500, content=f"Failed to generate token after {max_retries} retries")
+    return Response(
+        status_code=500,
+        content=f"Failed to get server args after {max_retries} retries",
+    )
+
 
 @app.get("/get_model_info")
 async def get_model_info():
     """
     Returns the model info of the first worker.
     """
-    tasks = []
     first_worker = router.worker_list[0]
 
     max_retries = 5
@@ -203,10 +215,12 @@ async def get_model_info():
             logger.warning(f"Error getting server args: {e}")
             await is_healthy_or_remove(first_worker)
             continue
-
         return Response(content=res.content, media_type="application/json")
 
-    return Response(status_code=500, content=f"Failed to generate token after {max_retries} retries")
+    return Response(
+        status_code=500, content=f"Failed to generate token after {max_retries} retries"
+    )
+
 
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate(obj: GenerateReqInput, request: Request):
@@ -215,27 +229,32 @@ async def generate(obj: GenerateReqInput, request: Request):
     """
 
     max_retries = 5
-    
+
     for _ in range(max_retries):
         try:
             selected_worker = router.calc_priority()
             res = await selected_worker.client.post("/generate", json=asdict(obj))
             res.raise_for_status()
         except Exception as e:
-            logger.warning(f"Error generating token: {e}")
+            logger.warning(f"Error generating response: {e}")
             await is_healthy_or_remove(selected_worker)
             continue
 
         return Response(content=res.content, media_type="application/json")
 
-    return Response(status_code=500, content=f"Failed to generate token after {max_retries} retries")
+    return Response(
+        status_code=500,
+        content=f"Failed to generate response after {max_retries} retries",
+    )
+
 
 ####################
-## Dynamic Scaling
+## Worker Management
 ####################
+
 
 @app.post("/add_worker")
-async def add_worker(worker_info: WorkerInfo):
+async def add_worker(worker_info: WorkerUpdateReq):
     server_url = worker_info.server_url
     try:
         router.add_worker(server_url)
@@ -247,7 +266,7 @@ async def add_worker(worker_info: WorkerInfo):
 
 
 @app.post("/remove_worker")
-async def remove_worker(worker_info: WorkerInfo):
+async def remove_worker(worker_info: WorkerUpdateReq):
     server_url = worker_info.server_url
     try:
         router.remove_worker(server_url)
@@ -258,7 +277,6 @@ async def remove_worker(worker_info: WorkerInfo):
         return Response(status_code=500, content=str(e))
 
 
-# add arg parser
 def parse_args():
     parser = argparse.ArgumentParser(description="SGLang Router")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Router host")
@@ -274,13 +292,21 @@ def parse_args():
         type=str,
         help="Space-separated list of DP workers' URLs",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level",
+    )
     return parser.parse_args()
 
 
 def launch_router():
-
     global router
     args = parse_args()
+
+    configure_logger(args.log_level)
+
     router_class = get_router_class(args.policy)
     router = router_class(args.worker_urls)
     uvicorn.run(app, host=args.host, port=args.port)
@@ -288,47 +314,3 @@ def launch_router():
 
 if __name__ == "__main__":
     launch_router()
-
-
-"""
-Test
-
-1. Basic
-
-Run 4 workers, each on a different port. 
-Run a router with the round-robin policy and add all 4 workers to the router.
-
-Send /generate 8 times, the output should be [0, 1, 2, 3, 0, 1, 2, 3]
-Send /get_server_args, the output should be the arg from 0
-
-2. Fault Tolerance
-
-Run 4 workers, each on a different port.
-Tear down one worker.
-Send /generate 4 times, ensure the evicted worker is not selected.
-
-
-Run 4 workers, each on a different port.
-Add one worker.
-Send /generate 5 times, ensure the new worker is included
-"""
-
-"""
-Router === current DP
-multithread => async
-how to cal avrage cache hit rate
-when one worker crashes => nested role happens
-text == None
-local router (assume no FT)
-design diagram
-reduce overhead
-"""
-
-
-"""
-TODO:
-
-1. Polish design doc -> maybe use github issue as the design doc
-2. Add tests with fake workers
-3. Fix fault tolerance issue
-"""
