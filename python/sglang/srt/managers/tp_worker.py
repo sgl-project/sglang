@@ -20,6 +20,7 @@ import logging
 import threading
 import time
 from queue import Queue
+from typing import Optional
 
 import torch
 
@@ -40,9 +41,10 @@ class TpModelWorker:
 
     def __init__(
         self,
+        server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
-        server_args: ServerArgs,
+        dp_rank: Optional[int],
         nccl_port: int,
     ):
         # Parse args
