@@ -128,6 +128,8 @@ class ImageInputs:
     image_embeds: Optional[List[torch.Tensor]] = None
     aspect_ratio_ids: Optional[List[torch.Tensor]] = None
     aspect_ratio_mask: Optional[List[torch.Tensor]] = None
+    # QWen2-VL related
+    image_grid_thws: List[Tuple[int, int, int]] = None
 
     @staticmethod
     def from_dict(obj, vocab_size):
@@ -135,6 +137,7 @@ class ImageInputs:
         ret = ImageInputs(
             pixel_values=obj["pixel_values"],
             image_hash=hash(tuple(obj["image_hashes"])),
+            image_grid_thws=obj.get("image_grid_thws"),
         )
         image_hash = ret.image_hash
         ret.pad_values = [
@@ -235,6 +238,9 @@ class Req:
         self.regex_fsm: RegexGuide = None
         self.regex_fsm_state: int = 0
         self.jump_forward_map: JumpForwardMap = None
+
+        # For Qwen2-VL
+        self.mrope_position_delta = []  # use mutable object
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -854,6 +860,8 @@ class ScheduleBatch:
         global bid
         bid += 1
 
+        mrope_positions_delta = [req.mrope_position_delta for req in self.reqs]
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -869,6 +877,7 @@ class ScheduleBatch:
             image_inputs=image_inputs,
             lora_paths=lora_paths,
             sampling_info=self.sampling_info,
+            mrope_positions_delta=mrope_positions_delta,
         )
 
     def copy(self):
@@ -920,6 +929,9 @@ class ModelWorkerBatch:
     # Sampling info
     sampling_info: SamplingBatchInfo
 
+    # For Qwen2-VL
+    mrope_positions_delta: List[List[int]]
+
     def copy(self):
         return ModelWorkerBatch(
             bid=self.bid,
@@ -936,4 +948,5 @@ class ModelWorkerBatch:
             image_inputs=self.image_inputs,
             lora_paths=self.lora_paths,
             sampling_info=self.sampling_info.copy(),
+            mrope_positions_delta=self.mrope_positions_delta,
         )
