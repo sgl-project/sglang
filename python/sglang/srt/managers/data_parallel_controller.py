@@ -67,6 +67,8 @@ class DataParallelController:
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
         self.recv_from_tokenizer = self.context.socket(zmq.PULL)
+        # set timeout to avoid blocking forever
+        self.recv_from_tokenizer.setsockopt(zmq.RCVTIMEO, 100)
         self.recv_from_tokenizer.bind(f"ipc://{port_args.scheduler_input_ipc_name}")
 
         # Dispatch method
@@ -140,7 +142,10 @@ class DataParallelController:
         while True:
             while True:
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = self.recv_from_tokenizer.recv_pyobj()
+                except zmq.Again:
+                    # skip if no more requests
+                    break
                 except zmq.ZMQError:
                     break
 

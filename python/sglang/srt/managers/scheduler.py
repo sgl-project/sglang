@@ -109,6 +109,8 @@ class Scheduler:
 
         if self.tp_rank == 0:
             self.recv_from_tokenizer = context.socket(zmq.PULL)
+            # set timeout to avoid blocking forever
+            self.recv_from_tokenizer.setsockopt(zmq.RCVTIMEO, 100)
             self.recv_from_tokenizer.bind(f"ipc://{port_args.scheduler_input_ipc_name}")
 
             self.send_to_detokenizer = context.socket(zmq.PUSH)
@@ -332,7 +334,10 @@ class Scheduler:
 
             while True:
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = self.recv_from_tokenizer.recv_pyobj()
+                except zmq.Again:
+                    # skip if no more requests
+                    break
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
