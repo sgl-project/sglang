@@ -56,13 +56,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
         assert not (
             model_runner.sliding_window_size is not None
-            and model_runner.has_cross_attention
+            and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
         if model_runner.sliding_window_size is not None:
             self.num_wrappers = 2
             self.dispatch_reason = WrapperDispatch.SLIDING_WINDOW
-        elif model_runner.has_cross_attention:
+        elif model_runner.model_config.is_encoder_decoder:
             self.num_wrappers = 2
             self.dispatch_reason = WrapperDispatch.CROSS_ATTENTION
         else:
@@ -127,6 +127,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
+                encoder_lens=forward_batch.encoder_lens,
             )
             self.forward_metadata = (self.decode_wrappers,)
         else:
@@ -146,13 +147,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 prefix_lens,
-                use_ragged,
+                use_ragged=use_ragged,
+                encoder_lens=forward_batch.encoder_lens,
             )
 
-            self.forward_metadata = (
-                use_ragged,
-                extend_no_prefix,
-            )
+            self.forward_metadata = (use_ragged, extend_no_prefix)
 
     def init_cuda_graph_state(self, max_bs: int):
         cuda_graph_kv_indices = torch.zeros(
@@ -165,7 +164,11 @@ class FlashInferAttnBackend(AttentionBackend):
         ]
 
     def init_forward_metadata_capture_cuda_graph(
-        self, bs: int, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: torch.Tensor = None,
     ):
         decode_wrappers = []
         for i in range(self.num_wrappers):
@@ -181,15 +184,27 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
 
-        self.indices_updater_decode.update(req_pool_indices, seq_lens, decode_wrappers)
+        self.indices_updater_decode.update(
+            req_pool_indices,
+            seq_lens,
+            decode_wrappers=decode_wrappers,
+            encoder_lens=encoder_lens,
+        )
         self.cuda_graph_metadata[bs] = decode_wrappers
         self.forward_metadata = (decode_wrappers,)
 
     def init_forward_metadata_replay_cuda_graph(
-        self, bs: int, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: torch.Tensor = None,
     ):
         self.indices_updater_decode.update(
-            req_pool_indices[:bs], seq_lens[:bs], self.cuda_graph_metadata[bs]
+            req_pool_indices[:bs],
+            seq_lens[:bs],
+            decode_wrappers=self.cuda_graph_metadata[bs],
+            encoder_lens=encoder_lens,
         )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -203,17 +218,21 @@ class FlashInferAttnBackend(AttentionBackend):
         ]
 
         use_ragged, extend_no_prefix = self.forward_metadata
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
 
         if not use_ragged:
             if k is not None:
                 assert v is not None
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
-                )
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+
             o = prefill_wrapper_paged.forward(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=True,
+                causal=not layer.is_cross_attention,
                 sm_scale=layer.scaling,
                 window_left=layer.sliding_window_size,
                 logits_soft_cap=layer.logit_cap,
@@ -241,9 +260,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
                 o, _ = merge_state(o1, s1, o2, s2)
 
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -251,12 +268,15 @@ class FlashInferAttnBackend(AttentionBackend):
         self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
     ):
         decode_wrapper = self.forward_metadata[0][self._get_wrapper_idx(layer)]
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
 
         if k is not None:
             assert v is not None
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -294,20 +314,31 @@ class FlashInferIndicesUpdaterDecode:
         self.max_context_len = model_runner.req_to_token_pool.req_to_token.size(1)
         self.sliding_window_size = model_runner.sliding_window_size
 
+        self.attn_backend = attn_backend
+
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.decode_wrappers = attn_backend.decode_wrappers
 
+    def update(
+        self, req_pool_indices, seq_lens, decode_wrappers=None, encoder_lens=None
+    ):
         # Dispatch
-        if attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
-            self.update = self.update_sliding_window
-        elif attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
-            self.update = self.update_cross_attention
+        if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+            return self.update_sliding_window(
+                req_pool_indices, seq_lens, decode_wrappers
+            )
+        elif self.attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
+            return self.update_cross_attention(
+                req_pool_indices, seq_lens, decode_wrappers, encoder_lens
+            )
         else:
-            assert attn_backend.num_wrappers == 1
-            self.update = self.update_single_wrapper
+            assert self.attn_backend.num_wrappers == 1
+            return self.update_single_wrapper(
+                req_pool_indices, seq_lens, decode_wrappers
+            )
 
     def update_single_wrapper(self, req_pool_indices, seq_lens, decode_wrappers=None):
         decode_wrappers = decode_wrappers or self.decode_wrappers
@@ -339,8 +370,28 @@ class FlashInferIndicesUpdaterDecode:
                 kv_start_idx,
             )
 
-    def update_cross_attention(self):
-        raise NotImplementedError()
+    def update_cross_attention(
+        self, req_pool_indices, seq_lens, decode_wrappers=None, encoder_lens=None
+    ):
+        decode_wrappers = decode_wrappers or self.decode_wrappers
+
+        for wrapper_id in range(2):
+            if wrapper_id == 0:
+                # Normal attention
+                paged_kernel_lens = seq_lens
+                kv_start_idx = encoder_lens
+            else:
+                # Cross attention
+                paged_kernel_lens = encoder_lens
+                kv_start_idx = torch.zeros_like(encoder_lens)
+
+            self.call_begin_forward(
+                decode_wrappers[wrapper_id],
+                req_pool_indices,
+                paged_kernel_lens,
+                self.kv_indptr[wrapper_id],
+                kv_start_idx,
+            )
 
     def call_begin_forward(
         self, wrapper, req_pool_indices, paged_kernel_lens, kv_indptr, kv_start_idx
@@ -390,6 +441,8 @@ class FlashInferIndicesUpdaterPrefill:
         self.max_context_len = model_runner.req_to_token_pool.req_to_token.size(1)
         self.sliding_window_size = model_runner.sliding_window_size
 
+        self.attn_backend = attn_backend
+
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
@@ -398,14 +451,28 @@ class FlashInferIndicesUpdaterPrefill:
         self.wrapper_ragged = attn_backend.prefill_wrapper_ragged
         self.wrappers_paged = attn_backend.prefill_wrappers_paged
 
+    def update(
+        self,
+        req_pool_indices,
+        seq_lens,
+        prefix_lens,
+        use_ragged=None,
+        encoder_lens=None,
+    ):
         # Dispatch
-        if attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
-            self.update = self.update_sliding_window
-        elif attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
-            self.update = self.update_cross_attention
+        if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+            return self.update_sliding_window(
+                req_pool_indices, seq_lens, prefix_lens, use_ragged
+            )
+        elif self.attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
+            return self.update_cross_attention(
+                req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens
+            )
         else:
-            assert attn_backend.num_wrappers == 1
-            self.update = self.update_single_wrapper
+            assert self.attn_backend.num_wrappers == 1
+            return self.update_single_wrapper(
+                req_pool_indices, seq_lens, prefix_lens, use_ragged
+            )
 
     def update_single_wrapper(
         self, req_pool_indices, seq_lens, prefix_lens, use_ragged
@@ -456,8 +523,31 @@ class FlashInferIndicesUpdaterPrefill:
                 use_ragged,
             )
 
-    def update_cross_attention(self):
-        raise NotImplementedError()
+    def update_cross_attention(
+        self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens
+    ):
+        for wrapper_id in range(2):
+            if wrapper_id == 0:
+                # normal attention
+                paged_kernel_lens = seq_lens
+                kv_start_idx = encoder_lens
+            else:
+                # cross attention
+                paged_kernel_lens = encoder_lens
+                kv_start_idx = torch.zeros_like(encoder_lens)
+
+            self.call_begin_forward(
+                self.wrapper_ragged,
+                self.wrappers_paged[wrapper_id],
+                req_pool_indices,
+                paged_kernel_lens,
+                seq_lens,
+                prefix_lens,
+                kv_start_idx,
+                self.kv_indptr[wrapper_id],
+                self.qo_indptr[wrapper_id],
+                use_ragged,
+            )
 
     def call_begin_forward(
         self,

@@ -2,21 +2,17 @@
 # https://github.com/vllm-project/vllm/blob/7193774b1ff8603ad5bf4598e5efba0d9a39b436/vllm/model_executor/models/mllama.py
 """PyTorch Mllama model."""
 import math
-from array import array
-from typing import Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers.models.mllama.configuration_mllama as config_mllama
 import vllm.distributed.parallel_state as ps
-from PIL import Image
 from torch import nn
 from transformers.modeling_outputs import BaseModelOutput, CausalLMOutputWithPast
-from transformers.models.mllama.image_processing_mllama import get_optimal_tiled_canvas
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.inputs import InputContext, LLMInputs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -31,7 +27,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.sequence import VLLM_TOKEN_ID_ARRAY_TYPE, SequenceData
 
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -43,103 +38,6 @@ from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
 logger = init_logger(__name__)
 MLLAMA_IMAGE_TOKEN_ID = 128256
 MLLAMA_IMAGE_TOKEN = "<|image|>"
-
-
-def input_processor_for_mllama(ctx: InputContext, llm_inputs: LLMInputs):
-    # move encoder_prompt to prompt
-    if llm_inputs.get("prompt") is None:
-        llm_inputs["prompt"] = llm_inputs["encoder_prompt"]
-        llm_inputs["prompt_token_ids"] = llm_inputs["encoder_prompt_token_ids"]
-
-    # process multi-modal data
-    assert (
-        "decoder_multi_modal_data" not in llm_inputs
-    ), "multi-modal data should be put in encoder message of mllama"
-    multi_modal_data = llm_inputs.get("encoder_multi_modal_data")
-
-    if (
-        multi_modal_data is None
-        or "image" not in multi_modal_data
-        or multi_modal_data["image"] is None
-    ):
-        # text-only
-        llm_inputs["encoder_prompt"] = ""
-        llm_inputs["encoder_prompt_token_ids"] = []
-        llm_inputs["encoder_multi_modal_data"] = {}
-        return llm_inputs
-
-    # get num_tiles
-    if isinstance(multi_modal_data["image"], Image.Image):
-        multi_modal_data["image"] = [multi_modal_data["image"]]
-    hf_config = ctx.model_config.hf_config
-    num_tiles = 0
-    for image in multi_modal_data["image"]:
-        width, height = image.size
-        tile_size = hf_config.vision_config.image_size
-        canvas_height, canvas_width = get_optimal_tiled_canvas(
-            image_height=height,
-            image_width=width,
-            max_image_tiles=hf_config.vision_config.max_num_tiles,
-            tile_size=tile_size,
-        )
-        num_tiles_height = canvas_height // tile_size
-        num_tiles_width = canvas_width // tile_size
-        num_tiles += num_tiles_height * num_tiles_width
-
-    # set encoder prompt based on num_tiles
-    assert (
-        hf_config.vision_config.image_size % 14 == 0
-    ), "chunk size should be multiple of 14"
-    token_per_chunk = (hf_config.vision_config.image_size // 14) ** 2 + 1
-    num_tokens = num_tiles * token_per_chunk
-    llm_inputs["encoder_prompt"] = MLLAMA_IMAGE_TOKEN * num_tokens
-    llm_inputs["encoder_prompt_token_ids"] = [MLLAMA_IMAGE_TOKEN_ID] * num_tokens
-
-    return llm_inputs
-
-
-def get_max_mllama_image_tokens(ctx: InputContext) -> int:
-    hf_config = ctx.model_config.hf_config
-    token_per_chunk = (hf_config.vision_config.image_size // 14) ** 2 + 1
-    return hf_config.vision_config.max_num_tiles * token_per_chunk
-
-
-def dummy_decoder_seq_data(seq_len: int, num_images: int):
-    # <|image|> * num_images + 0 * (seq_len - num_images)
-    assert (
-        seq_len >= num_images
-    ), "seq_len should be greater than or equal to num_images"
-    token_ids = array(VLLM_TOKEN_ID_ARRAY_TYPE, [MLLAMA_IMAGE_TOKEN_ID]) * num_images
-    token_ids += array(VLLM_TOKEN_ID_ARRAY_TYPE, [0]) * (seq_len - num_images)
-    return SequenceData(token_ids)
-
-
-def dummy_encoder_seq_data(ctx: InputContext, num_images: int):
-    num_tokens = get_max_mllama_image_tokens(ctx) * num_images
-    token_ids = array(VLLM_TOKEN_ID_ARRAY_TYPE, [MLLAMA_IMAGE_TOKEN_ID]) * num_tokens
-    return SequenceData(token_ids)
-
-
-def dummy_image(
-    num_images: int,
-):
-    width = height = 1024
-    image = Image.new("RGB", (width, height), color=0)
-    return {"image": image if num_images == 1 else [image] * num_images}
-
-
-def dummy_decoder_data_for_mllama(
-    ctx: InputContext, seq_len: int, mm_counts: Mapping[str, int]
-):
-    num_images = mm_counts["image"]
-    return dummy_decoder_seq_data(seq_len, num_images), None
-
-
-def dummy_encoder_data_for_mllama(
-    ctx: InputContext, seq_len: int, mm_counts: Mapping[str, int]
-):
-    num_images = mm_counts["image"]
-    return dummy_encoder_seq_data(ctx, num_images), dummy_image(num_images)
 
 
 def _prepare_aspect_ratio_attention_mask(
@@ -240,7 +138,6 @@ class MllamaPrecomputedAspectRatioEmbedding(nn.Module):
 
 
 class MllamaPrecomputedPositionEmbedding(nn.Module):
-
     def __init__(self, config: config_mllama.MllamaVisionConfig):
         super().__init__()
         self.max_num_tiles = config.max_num_tiles
@@ -283,7 +180,6 @@ class MllamaPrecomputedPositionEmbedding(nn.Module):
 
 
 class MllamaVisionSdpaAttention(nn.Module):
-
     def __init__(self, config: config_mllama.MllamaVisionConfig):
         super().__init__()
 
@@ -365,7 +261,6 @@ class MllamaVisionMLP(nn.Module):
 
 
 class MllamaVisionEncoderLayer(nn.Module):
-
     def __init__(
         self, config: config_mllama.MllamaVisionConfig, is_gated: bool = False
     ):
@@ -412,7 +307,6 @@ class MllamaVisionEncoderLayer(nn.Module):
 
 
 class MllamaVisionEncoder(nn.Module):
-
     def __init__(
         self,
         config: config_mllama.MllamaVisionConfig,
@@ -449,7 +343,6 @@ class MllamaVisionEncoder(nn.Module):
 
 
 class MllamaVisionModel(nn.Module):
-
     def __init__(self, config: config_mllama.MllamaVisionConfig):
         super().__init__()
         self.image_size = config.image_size
@@ -627,11 +520,7 @@ class MllamaVisionModel(nn.Module):
 
 
 class MllamaTextRMSNorm(nn.Module):
-
     def __init__(self, hidden_size, eps=1e-6):
-        """
-        MllamaTextRMSNorm is equivalent to T5LayerNorm
-        """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
@@ -673,7 +562,6 @@ class MllamaTextCrossAttention(nn.Module):
         self.q_local_size = self.num_local_heads * self.head_dim
         self.kv_local_size = self.num_local_key_value_heads * self.head_dim
 
-        # TODO: change to Q/KV separate linear after #7448 is merged
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
@@ -931,7 +819,6 @@ class MllamaForConditionalGeneration(nn.Module):
             config.pad_token_id if config.pad_token_id is not None else -1
         )
         self.image_size = config.vision_config.image_size
-        self.has_cross_attention = True
 
         self.vision_model = MllamaVisionModel(config.vision_config)
         self.language_model = MllamaForCausalLM(
@@ -959,174 +846,139 @@ class MllamaForConditionalGeneration(nn.Module):
 
         return pad_ids[:image_len] + input_ids
 
-    def _parse_and_validate_image_input(self, **kwargs: object):
-        # tensor with the same shape will be batched together by
-        # MultiModalInputs.batch, so pixel_values here can be:
-        #   - List[List[torch.Tensor]]:
-        #       with shape (num_tiles, 3, image_res, image_res)
-        #   - List[torch.Tensor]:
-        #       with shape (num_image, num_tiles, 3, image_res, image_res)
-        #   - torch.Tensor:
-        #       with shape (bs, num_image, num_tiles, 3, image_res, image_res)
-        pixel_values: Optional[
-            Union[List[List[torch.Tensor]], List[torch.Tensor], torch.Tensor]
-        ] = kwargs.pop("pixel_values", None)
-        image_embeds: Optional[
-            Union[List[List[torch.Tensor]], List[torch.Tensor], torch.Tensor]
-        ] = kwargs.pop("image_embeds", None)
-        aspect_ratio_ids: Optional[
-            Union[List[List[torch.Tensor]], List[torch.Tensor], torch.Tensor]
-        ] = kwargs.pop("aspect_ratio_ids", None)
-        aspect_ratio_mask: Optional[
-            Union[List[List[torch.Tensor]], List[torch.Tensor], torch.Tensor]
-        ] = kwargs.pop("aspect_ratio_mask", None)
+    def _batch_image_inputs(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_decode() or all(forward_batch.encoder_cached):
+            return None, None, None
 
-        if pixel_values is None and image_embeds is None:
-            return None
+        # pixel_values: shape (bs, num_image, num_tiles, 3, image_res, image_res)
+        max_num_images = max_num_tiles = bs = 0
+        for im in forward_batch.image_inputs:
+            if im is not None:
+                max_num_images = max(max_num_images, im.pixel_values.shape[1])
+                max_num_tiles = max(max_num_tiles, im.pixel_values.shape[2])
+                bs += 1
 
-        if pixel_values is not None and image_embeds is not None:
-            raise ValueError("Both pixel values and image embeds are provided.")
+        if max_num_images * max_num_tiles * bs == 0:
+            return None, None, None
 
-        if pixel_values is not None:
-            assert aspect_ratio_ids is not None
-            assert aspect_ratio_mask is not None
-            max_num_images = max([len(x[0]) for x in pixel_values])
-            if max_num_images == 0:
-                raise ValueError("No images provided.")
-            max_num_tiles = max(max([len(x) for x in y[0]]) for y in pixel_values)
-            device = self.multi_modal_projector.weight.device
-            bsz = len(pixel_values)
-            out_num_tiles = []
-            out_images = torch.zeros(
-                bsz,
+        with forward_batch.out_cache_loc.device:
+            batched_images = torch.zeros(
+                bs,
                 max_num_images,
                 max_num_tiles,
                 3,
                 self.image_size,
                 self.image_size,
                 dtype=torch.float32,
-                device=device,
             )
-            out_ar_ids = torch.ones(
-                bsz, max_num_images, dtype=torch.int64, device=device
+            batched_ar_ids = torch.ones(
+                bs, max_num_images, dtype=torch.int64, device="cuda"
             )
-            out_ar_mask = torch.zeros(
-                bsz, max_num_images, max_num_tiles, dtype=torch.int64, device=device
+            batched_ar_mask = torch.zeros(
+                bs, max_num_images, max_num_tiles, dtype=torch.int64
             )
-            for b in range(len(pixel_values)):
-                _num_tiles = []
-                for i in range(len(pixel_values[b][0])):
-                    img = pixel_values[b][0][i]
-                    out_images[b, i, : img.shape[0]] = img
-                    out_ar_ids[b, i] = aspect_ratio_ids[b][0][i]
-                    out_ar_mask[b, i] = aspect_ratio_mask[b][0][i]
-                    _num_tiles.append(img.shape[0])
-                out_num_tiles.append(_num_tiles)
+            i = 0
+            for im in forward_batch.image_inputs:
+                if im is None:
+                    continue
+                for j in range(im.pixel_values.shape[1]):
+                    img = im.pixel_values[0, j]
+                    num_tiles = img.shape[0]
+                    batched_images[i, j, :num_tiles] = img
+                    batched_ar_ids[i, j] = im.aspect_ratio_ids[0, j]
+                    batched_ar_mask[i, j, :num_tiles] = im.aspect_ratio_mask[0, j]
+                i += 1
 
-            return MllamaImagePixelInputs(
-                type="pixel_values",
-                data=out_images,
-                aspect_ratio_ids=out_ar_ids,
-                aspect_ratio_mask=out_ar_mask,
-            )
-
-        if image_embeds is not None:
-            raise NotImplementedError
-
-        raise AssertionError("This line should be unreachable.")
+        return batched_images, batched_ar_ids, batched_ar_mask
 
     def flat_encoder_result(
         self, cross_attention_states: torch.Tensor, forward_batch: ForwardBatch
     ):
-
-        # TODO: fix input_metadata.encoder_seq_lens
+        head_dim = cross_attention_states.shape[-1]
+        total_encoder_len = forward_batch.encoder_lens.sum()
         cross_attention_states_flat = torch.zeros(
-            sum(forward_batch.encoder_seq_lens),
-            cross_attention_states.shape[-1],
+            total_encoder_len,
+            head_dim,
             device=cross_attention_states.device,
             dtype=cross_attention_states.dtype,
         )
-        start_pos = 0
-        for seq_len, vision_token_in_batch in zip(
-            # TODO: fix input_metadata.encoder_seq_lens
-            forward_batch.encoder_seq_lens,
-            cross_attention_states,
-        ):
-            end_pos = start_pos + seq_len
-            cross_attention_states_flat[start_pos:end_pos] = vision_token_in_batch[
-                :seq_len
+
+        i = start_pos = 0
+        for encoder_len in forward_batch.encoder_lens_cpu:
+            if encoder_len == 0:
+                continue
+            end_pos = start_pos + encoder_len
+            cross_attention_states_flat[start_pos:end_pos] = cross_attention_states[i][
+                :encoder_len
             ]
-            start_pos = end_pos
-        cross_attention_states = cross_attention_states_flat
+            i += 1
+            start_pos += encoder_len
 
-        full_text_row_masked_out_mask = torch.ones(
-            (int(forward_batch.extend_seq_lens.sum()), 1), dtype=torch.bool
-        )
-        start_pos = 0
+        return cross_attention_states_flat
 
-        # TODO: fix input_metadata.encoder_seq_lens
-        for seq_len, encoder_seq_len in zip(
-            forward_batch.seq_lens.tolist(), forward_batch.encoder_seq_lens
-        ):
-            if encoder_seq_len == 0:
-                full_text_row_masked_out_mask[start_pos : start_pos + seq_len] = False
-            start_pos += seq_len
-        full_text_row_masked_out_mask = full_text_row_masked_out_mask.to(
-            cross_attention_states.device
-        )
+    def get_full_text_row_masked_out_mask(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_decode():
+            full_text_row_masked_out_mask = forward_batch.encoder_lens != 0
+        else:
+            full_text_row_masked_out_mask = torch.ones(
+                (forward_batch.extend_seq_lens.sum(), 1), dtype=torch.bool
+            )
+            start_pos = 0
 
-        return cross_attention_states, full_text_row_masked_out_mask
+            for seq_len, encoder_len in zip(
+                forward_batch.seq_lens.tolist(), forward_batch.encoder_lens_cpu
+            ):
+                if encoder_len == 0:
+                    full_text_row_masked_out_mask[start_pos : start_pos + seq_len] = (
+                        False
+                    )
+                start_pos += encoder_len
+
+            full_text_row_masked_out_mask = full_text_row_masked_out_mask.to(
+                forward_batch.seq_lens.device
+            )
+
+        return full_text_row_masked_out_mask
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        **kwargs: object,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        image_inputs = self._parse_and_validate_image_input(**kwargs)
-        setattr(
-            forward_batch,
-            "encoder_seq_lens_tensor",
-            torch.zeros_like(forward_batch.seq_lens),
+        batched_images, batched_ar_ids, batched_ar_mask = self._batch_image_inputs(
+            forward_batch
         )
-        setattr(
-            forward_batch,
-            "encoder_seq_lens",
-            forward_batch.encoder_seq_lens_tensor.tolist(),
-        )
-        if image_inputs is None:
-            cross_attention_mask = None
+
+        # TODO: support multi-image by this mask
+        cross_attention_mask = None
+
+        if batched_images is None:
+            # For 1) text-only prefill and decode, 2) image-present decode.
             full_text_row_masked_out_mask = (
-                # TODO: fix input_metadata.encoder_seq_lens
-                (forward_batch.encoder_seq_lens_tensor != 0)
-                .reshape(-1, 1)
-                .to(input_ids.device)
+                (forward_batch.encoder_lens != 0).reshape(-1, 1).to(input_ids.device)
             )
             cross_attention_states = None
-            # TODO: fix input_metadata.encoder_seq_lens
-            skip_cross_attention = max(forward_batch.encoder_seq_lens) == 0
+            skip_cross_attention = forward_batch.encoder_lens.max() == 0
         else:
             # NOTE: llama's reference implementation runs vision model on CPU
-            pixel_values = image_inputs["data"]
-            aspect_ratio_ids = image_inputs["aspect_ratio_ids"]
-            aspect_ratio_mask = image_inputs["aspect_ratio_mask"]
             cross_attention_states = self.vision_model(
-                pixel_values, aspect_ratio_ids, aspect_ratio_mask
+                batched_images, batched_ar_ids, batched_ar_mask
             )
             cross_attention_states = self.multi_modal_projector(cross_attention_states)
 
-            bsz, _, _, _, image_token_dim = tuple(cross_attention_states.shape)
+            bs, _, _, _, image_token_dim = cross_attention_states.shape
             cross_attention_states = cross_attention_states.view(
-                bsz, -1, image_token_dim
+                bs, -1, image_token_dim
             )
 
-            cross_attention_states, full_text_row_masked_out_mask = (
-                self.flat_encoder_result(cross_attention_states, forward_batch)
+            cross_attention_states = self.flat_encoder_result(
+                cross_attention_states, forward_batch
+            )
+            full_text_row_masked_out_mask = self.get_full_text_row_masked_out_mask(
+                forward_batch
             )
             skip_cross_attention = False
-            # TODO: support multi-image by this mask
-            cross_attention_mask = None
 
         hidden_states = self.language_model(
             input_ids=input_ids,

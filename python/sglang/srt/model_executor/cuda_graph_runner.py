@@ -189,9 +189,16 @@ class CudaGraphRunner:
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:bs]
 
+        # Fake encoder lens: just to initialize the attention wrappers
+        # TODO: support encoder-decode in cuda graph
+        encoder_lens = torch.zeros_like(seq_lens)
+
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs, req_pool_indices, seq_lens
+            bs,
+            req_pool_indices,
+            seq_lens,
+            encoder_lens,
         )
 
         # Run and capture
@@ -206,6 +213,7 @@ class CudaGraphRunner:
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
+                encoder_lens=encoder_lens,
                 return_logprob=False,
                 top_logprobs_nums=[0] * bs,
                 positions=torch.clamp((seq_lens - 1), min=0).to(torch.int64),
@@ -255,7 +263,7 @@ class CudaGraphRunner:
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs, self.req_pool_indices, self.seq_lens
+            bs, self.req_pool_indices, self.seq_lens, encoder_lens
         )
 
         # Replay

@@ -34,6 +34,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from sglang.global_config import global_config
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained import RegexGuide
 from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -418,6 +419,9 @@ class ScheduleBatch:
     token_to_kv_pool: BaseTokenToKVPool = None
     tree_cache: BasePrefixCache = None
 
+    # For utility
+    model_config: ModelConfig = None
+
     forward_mode: ForwardMode = None
     sampling_info: SamplingBatchInfo = None
 
@@ -440,6 +444,12 @@ class ScheduleBatch:
     running_bs: int = None
     decoding_reqs: List[Req] = None
 
+    # For encoder-decoder
+    encoder_cached: Optional[List[bool]] = None
+    encoder_lens: Optional[torch.Tensor] = None
+    encoder_lens_cpu: Optional[List[int]] = None
+    encoder_out_cache_loc: Optional[torch.Tensor] = None
+
     # Stream
     has_stream: bool = False
 
@@ -450,7 +460,14 @@ class ScheduleBatch:
     has_regex: bool = False
 
     @classmethod
-    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+    def init_new(
+        cls,
+        reqs,
+        req_to_token_pool,
+        token_to_kv_pool,
+        tree_cache,
+        model_config,
+    ):
         return_logprob = any(req.return_logprob for req in reqs)
         has_stream = any(req.stream for req in reqs)
         has_regex = any(req.regex_fsm for req in reqs)
@@ -460,6 +477,7 @@ class ScheduleBatch:
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
+            model_config=model_config,
             return_logprob=return_logprob,
             has_stream=has_stream,
             device=req_to_token_pool.device,
@@ -497,7 +515,78 @@ class ScheduleBatch:
 
         return out_cache_loc
 
-    def prepare_for_extend(self, vocab_size: int):
+    def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
+        self.encoder_lens_cpu = []
+        self.encoder_cached = []
+
+        for req in self.reqs:
+            im = req.image_inputs
+            if im is None or im.num_image_tokens is None:
+                # No image input
+                self.encoder_lens_cpu.append(0)
+                self.encoder_cached.append(True)
+            else:
+                self.encoder_lens_cpu.append(im.num_image_tokens)
+                self.encoder_cached.append(
+                    self.forward_mode.is_decode()
+                    or len(req.prefix_indices) >= im.num_image_tokens
+                )
+
+        self.encoder_lens = torch.tensor(self.encoder_lens_cpu, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+
+        # Strip encoder infos
+        pt = 0
+        decoder_out_cache_loc = []
+        encoder_out_cache_loc = []
+        for i, req in enumerate(self.reqs):
+            encoder_len = self.encoder_lens_cpu[i]
+            seq_lens[i] -= encoder_len
+
+            if len(req.prefix_indices) < encoder_len:
+                # NOTE: the encoder part should considered as a whole
+                assert len(req.prefix_indices) == 0
+                input_ids[i] = input_ids[i][encoder_len:]
+                encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
+                decoder_out_cache_loc.append(
+                    self.out_cache_loc[pt + encoder_len : pt + req.extend_input_len]
+                )
+                self.extend_lens[i] -= encoder_len
+                self.extend_num_tokens -= encoder_len
+            else:
+                decoder_out_cache_loc.append(
+                    self.out_cache_loc[pt : pt + req.extend_input_len]
+                )
+                self.prefix_lens[i] -= encoder_len
+
+            pt += req.extend_input_len
+
+        # Reassign
+        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+
+        if not decoder_out_cache_loc:
+            self.out_cache_loc = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+        else:
+            self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+
+        if not encoder_out_cache_loc:
+            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+        else:
+            self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
+
+        assert len(self.out_cache_loc) == self.extend_num_tokens
+
+    def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
         bs = len(self.reqs)
@@ -563,8 +652,13 @@ class ScheduleBatch:
         self.extend_lens = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
 
+        if self.model_config.is_encoder_decoder:
+            self.prepare_encoder_info_extend(input_ids, seq_lens)
+
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self, vocab_size, global_server_args_dict["disable_penalizer"]
+            self,
+            self.model_config.vocab_size,
+            global_server_args_dict["disable_penalizer"],
         )
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
@@ -755,6 +849,10 @@ class ScheduleBatch:
 
         return jump_forward_reqs
 
+    def prepare_encoder_info_decode(self):
+        # Reset the encoder cached status
+        self.encoder_cached = [True] * len(self.reqs)
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
 
@@ -769,7 +867,13 @@ class ScheduleBatch:
         bs = len(self.reqs)
         self.out_cache_loc = self.alloc_token_slots(bs)
 
-        self.req_to_token_pool.req_to_token[self.req_pool_indices, self.seq_lens] = (
+        if self.model_config.is_encoder_decoder:
+            locs = self.encoder_lens + self.seq_lens
+            self.prepare_encoder_info_decode()
+        else:
+            locs = self.seq_lens
+
+        self.req_to_token_pool.req_to_token[self.req_pool_indices, locs] = (
             self.out_cache_loc
         )
         self.seq_lens.add_(1)
@@ -875,6 +979,10 @@ class ScheduleBatch:
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
             image_inputs=image_inputs,
+            encoder_cached=self.encoder_cached,
+            encoder_lens=self.encoder_lens,
+            encoder_lens_cpu=self.encoder_lens_cpu,
+            encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_paths=lora_paths,
             sampling_info=self.sampling_info,
         )
@@ -882,6 +990,7 @@ class ScheduleBatch:
     def copy(self):
         return ScheduleBatch(
             reqs=self.reqs,
+            model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
@@ -922,6 +1031,12 @@ class ModelWorkerBatch:
     # For multimodal
     image_inputs: Optional[List[ImageInputs]]
 
+    # For encoder-decoder
+    encoder_cached: Optional[List[bool]]
+    encoder_lens: Optional[torch.Tensor]
+    encoder_lens_cpu: Optional[List[int]]
+    encoder_out_cache_loc: Optional[torch.Tensor]
+
     # For LoRA
     lora_paths: Optional[List[str]]
 
@@ -942,6 +1057,10 @@ class ModelWorkerBatch:
             extend_prefix_lens=self.extend_prefix_lens,
             extend_logprob_start_lens=self.extend_logprob_start_lens,
             image_inputs=self.image_inputs,
+            encoder_cached=self.encoder_cached,
+            encoder_lens=self.encoder_lens.clone(),
+            encoder_lens_cpu=self.encoder_lens_cpu,
+            encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_paths=self.lora_paths,
             sampling_info=self.sampling_info.copy(),
         )

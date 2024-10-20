@@ -661,8 +661,9 @@ class Scheduler:
             self.req_to_token_pool,
             self.token_to_kv_pool,
             self.tree_cache,
+            self.model_config,
         )
-        new_batch.prepare_for_extend(self.model_config.vocab_size)
+        new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill
         if self.is_mixed_chunk and self.running_batch is not None:

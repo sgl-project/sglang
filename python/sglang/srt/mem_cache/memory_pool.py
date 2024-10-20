@@ -186,10 +186,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        if layer.is_cross_attention:
-            # NOTE: Skip the encoder token cache
-            return
-
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
