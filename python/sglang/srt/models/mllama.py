@@ -11,16 +11,10 @@ import transformers.models.mllama.configuration_mllama as config_mllama
 import vllm.distributed.parallel_state as ps
 from torch import nn
 from transformers.modeling_outputs import BaseModelOutput, CausalLMOutputWithPast
-from vllm.config import CacheConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
+from transformers.models.mllama.modeling_mllama import (
+    _prepare_aspect_ratio_attention_mask,
 )
-from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -29,46 +23,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
-
-logger = init_logger(__name__)
-MLLAMA_IMAGE_TOKEN_ID = 128256
-MLLAMA_IMAGE_TOKEN = "<|image|>"
-
-
-def _prepare_aspect_ratio_attention_mask(
-    aspect_ratio_mask: torch.Tensor,
-    num_patches: int,
-    target_length: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    # Expand aspect ratio mask to target_length
-    batch_size, max_num_tiles = aspect_ratio_mask.shape
-    attention_mask = aspect_ratio_mask.view(batch_size, max_num_tiles, 1, 1).to(dtype)
-    attention_mask = attention_mask.repeat(1, 1, target_length, 1)
-
-    # Mask padding patches
-    pad_patches = target_length - num_patches
-    attention_mask[:, :, -pad_patches:] = 0
-
-    # Invert the mask (0 -> 1, 1 -> 0)
-    attention_mask = 1 - attention_mask
-
-    # Reshape to 2D and create 4D attention mask
-    # (batch_size, 1, max_num_tiles*target_length, max_num_tiles*target_length)
-    attention_mask = attention_mask.reshape(
-        batch_size, max_num_tiles * target_length, 1
-    )
-    attention_mask = (
-        attention_mask @ attention_mask.transpose(-1, -2) * torch.finfo(dtype).min
-    )
-    attention_mask = attention_mask.unsqueeze(1)
-
-    return attention_mask
 
 
 class ColumnParallelConv2dPatch(torch.nn.Module):
@@ -537,8 +503,6 @@ class MllamaTextRMSNorm(nn.Module):
 
 
 class MllamaTextCrossAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
     def __init__(
         self,
         config: Optional[config_mllama.MllamaTextConfig] = None,
@@ -689,8 +653,8 @@ class MllamaTextModel(nn.Module):
     def __init__(
         self,
         config: config_mllama.MllamaTextConfig,
-        cache_config: Optional[CacheConfig],
         quant_config: Optional[QuantizationConfig],
+        cache_config=None,
     ):
         super().__init__()
         self.padding_id = config.pad_token_id
@@ -767,8 +731,8 @@ class MllamaForCausalLM(nn.Module):
     def __init__(
         self,
         config: config_mllama.MllamaTextConfig,
-        cache_config: Optional[CacheConfig],
         quant_config: Optional[QuantizationConfig],
+        cache_config=None,
     ):
         super().__init__()
         self.vocab_size = config.vocab_size
@@ -807,8 +771,8 @@ class MllamaForConditionalGeneration(nn.Module):
     def __init__(
         self,
         config: config_mllama.MllamaConfig,
-        cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        cache_config=None,
     ):
         super().__init__()
         self.vocab_size = config.text_config.vocab_size
