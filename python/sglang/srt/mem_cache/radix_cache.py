@@ -145,9 +145,10 @@ class RadixCache(BasePrefixCache):
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node = self.match_prefix(token_ids)
         assert len(new_indices) == len(token_ids)
-        self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, len(req.prefix_indices) : len(new_indices)
-        ] = new_indices[len(req.prefix_indices) :]
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
+            new_indices[len(req.prefix_indices) :],
+        )
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)

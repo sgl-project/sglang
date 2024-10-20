@@ -51,6 +51,7 @@ from sglang.srt.managers.schedule_batch import (
     ImageInputs,
     Req,
     ScheduleBatch,
+    global_server_args_dict,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -144,25 +145,27 @@ class Scheduler:
         )
 
         # Launch a tensor parallel worker
-        self.tp_worker = TpModelWorker(
+        if self.server_args.enable_overlap_schedule:
+            TpWorkerClass = TpModelWorker
+        else:
+            TpWorkerClass = TpModelWorker
+        self.tp_worker = TpWorkerClass(
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
-
-        # Init states for overlap schedule
         if self.server_args.enable_overlap_schedule:
-            self.forward_batch_generation = (
-                self.tp_worker.forward_batch_generation_non_blocking
-            )
             self.resolve_next_token_ids = (
                 lambda bid, x: self.tp_worker.resolve_future_token_ids(bid)
             )
+            self.forward_batch_generation = (
+                self.tp_worker.forward_batch_generation_non_blocking
+            )
         else:
-            self.forward_batch_generation = self.tp_worker.forward_batch_generation
             self.resolve_next_token_ids = lambda bid, x: x.tolist()
+            self.forward_batch_generation = self.tp_worker.forward_batch_generation
 
         # Get token and memory info from the model worker
         (
@@ -172,9 +175,14 @@ class Scheduler:
             self.max_req_input_len,
             self.random_seed,
             self.device,
-        ) = self.tp_worker.get_token_and_memory_info()
+            worker_global_server_args_dict,
+            _,
+            _,
+            _,
+        ) = self.tp_worker.get_worker_info()
         self.tp_cpu_group = self.tp_worker.get_tp_cpu_group()
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
+        global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
 
         # Print debug info

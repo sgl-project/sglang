@@ -56,6 +56,9 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size))
 
+    def write(self, indices, values):
+        self.req_to_token[indices] = values
+
 
 class BaseTokenToKVPool:
     """A memory pool that maps a token to its kv cache locations"""
