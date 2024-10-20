@@ -91,6 +91,7 @@ class Scheduler:
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
+        dp_rank: Optional[int],
     ):
         # Parse args
         self.server_args = server_args
@@ -144,12 +145,24 @@ class Scheduler:
 
         # Launch a tensor parallel worker
         self.tp_worker = TpModelWorker(
+            server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
-            server_args=server_args,
+            dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
-        self.tp_cpu_group = self.tp_worker.model_runner.tp_group.cpu_group
+
+        # Init states for overlap schedule
+        if self.server_args.enable_overlap_schedule:
+            self.forward_batch_generation = (
+                self.tp_worker.forward_batch_generation_non_blocking
+            )
+            self.resolve_next_token_ids = (
+                lambda bid, x: self.tp_worker.resolve_future_token_ids(bid)
+            )
+        else:
+            self.forward_batch_generation = self.tp_worker.forward_batch_generation
+            self.resolve_next_token_ids = lambda bid, x: x.tolist()
 
         # Get token and memory info from the model worker
         (
@@ -158,11 +171,11 @@ class Scheduler:
             self.max_running_requests,
             self.max_req_input_len,
             self.random_seed,
+            self.device,
         ) = self.tp_worker.get_token_and_memory_info()
+        self.tp_cpu_group = self.tp_worker.get_tp_cpu_group()
+        self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
-        self.pad_input_ids_func = getattr(
-            self.tp_worker.model_runner.model, "pad_input_ids", None
-        )
 
         # Print debug info
         logger.info(
@@ -172,9 +185,8 @@ class Scheduler:
             f"context_len={self.model_config.context_len}"
         )
 
-        # Init cache
-        self.req_to_token_pool = self.tp_worker.model_runner.req_to_token_pool
-        self.token_to_kv_pool = self.tp_worker.model_runner.token_to_kv_pool
+        # Init memory pool and cache
+        self.req_to_token_pool, self.token_to_kv_pool = self.tp_worker.get_memory_pool()
 
         if (
             server_args.chunked_prefill_size is not None
@@ -251,25 +263,6 @@ class Scheduler:
                 ],
                 with_stack=True,
             )
-
-        # Init states for overlap schedule
-        if self.server_args.enable_overlap_schedule:
-            self.forward_batch_generation = (
-                self.tp_worker.forward_batch_generation_non_blocking
-            )
-            self.resolve_next_token_ids = (
-                lambda bid, x: self.tp_worker.resolve_future_token_ids(bid)
-            )
-
-            def cache_finished_req(req):
-                free_delta = int(self.running_batch and req in self.cur_batch.reqs)
-                self.tree_cache.cache_finished_req(req, free_delta=free_delta)
-
-            self.cache_finished_req = cache_finished_req
-        else:
-            self.forward_batch_generation = self.tp_worker.forward_batch_generation
-            self.resolve_next_token_ids = lambda bid, x: x.tolist()
-            self.cache_finished_req = self.tree_cache.cache_finished_req
 
     @torch.inference_mode()
     def event_loop_normal(self):
@@ -758,9 +751,7 @@ class Scheduler:
                 if logits_output.next_token_logprobs is not None:
                     logits_output.next_token_logprobs = (
                         logits_output.next_token_logprobs[
-                            torch.arange(
-                                len(next_token_ids), device=next_token_ids.device
-                            ),
+                            torch.arange(len(next_token_ids), device=self.device),
                             next_token_ids,
                         ].tolist()
                     )
@@ -785,21 +776,20 @@ class Scheduler:
                     req.check_finished()
 
                     if req.finished():
-                        self.cache_finished_req(req)
+                        self.tree_cache.cache_finished_req(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
 
-                if req.regex_fsm is not None:
-                    req.regex_fsm_state = req.regex_fsm.get_next_state(
-                        req.regex_fsm_state, next_token_ids[i]
-                    )
+                    if req.regex_fsm is not None:
+                        req.regex_fsm_state = req.regex_fsm.get_next_state(
+                            req.regex_fsm_state, next_token_ids[i]
+                        )
 
-                if req.return_logprob:
-                    logprob_pt += self.add_logprob_return_values(
-                        i, req, logprob_pt, next_token_ids, logits_output
-                    )
+                    if req.return_logprob:
+                        logprob_pt += self.add_logprob_return_values(
+                            i, req, logprob_pt, next_token_ids, logits_output
+                        )
         else:  # embedding or reward model
-            assert batch.extend_num_tokens != 0
             embeddings, bid = result
             embeddings = embeddings.tolist()
 
@@ -815,7 +805,7 @@ class Scheduler:
                     req.check_finished()
 
                 if req.finished():
-                    self.cache_finished_req(req)
+                    self.tree_cache.cache_finished_req(req)
                 else:
                     self.tree_cache.cache_unfinished_req(req)
 
@@ -828,15 +818,18 @@ class Scheduler:
         # Move logprobs to cpu
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs[
-                torch.arange(len(next_token_ids), device=next_token_ids.device),
+                torch.arange(len(next_token_ids), device=self.device),
                 next_token_ids,
             ].tolist()
 
         next_token_ids = self.resolve_next_token_ids(bid, next_token_ids)
 
+        self.token_to_kv_pool.free_group_begin()
+
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if self.server_args.enable_overlap_schedule and req.finished():
+                self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
             req.completion_tokens_wo_jump_forward += 1
@@ -849,7 +842,7 @@ class Scheduler:
                 )
 
             if req.finished():
-                self.cache_finished_req(req)
+                self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob:
                 req.output_token_logprobs.append(
@@ -859,6 +852,8 @@ class Scheduler:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
 
         self.stream_output(batch.reqs)
+
+        self.token_to_kv_pool.free_group_end()
 
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
@@ -1071,7 +1066,7 @@ class Scheduler:
             for req in self.running_batch.reqs:
                 if req.rid == recv_req.rid and not req.finished():
                     req.finished_reason = FINISH_ABORT()
-                    self.cache_finished_req(req)
+                    self.tree_cache.cache_finished_req(req)
                     break
 
     def update_weights(self, recv_req: UpdateWeightReqInput):
@@ -1114,7 +1109,7 @@ def run_scheduler_process(
     suppress_other_loggers()
 
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank)
+        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
         pipe_writer.send("ready")
         if server_args.enable_overlap_schedule:
             scheduler.event_loop_overlap()

@@ -59,8 +59,11 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
+    is_attention_free_model,
+    is_embedding_model,
     is_generation_model,
     is_multimodal_model,
+    model_has_inner_state,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
 )
@@ -142,6 +145,7 @@ class ModelRunner:
                 "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
                 "disable_penalizer": server_args.disable_penalizer,
+                "disable_nan_detection": server_args.disable_nan_detection,
             }
         )
 
@@ -320,11 +324,13 @@ class ModelRunner:
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
-                config.model,
-                config.revision,
-                fall_back_to_pt=getattr(
-                    self.model, "fall_back_to_pt_during_load", True
-                ),
+                DefaultModelLoader.Source(
+                    config.model,
+                    revision=config.revision,
+                    fall_back_to_pt=getattr(
+                        self.model, "fall_back_to_pt_during_load", True
+                    ),
+                )
             )
             return iter
 
@@ -556,11 +562,14 @@ class ModelRunner:
         ):
             return self.cuda_graph_runner.replay(forward_batch)
 
+        forward_batch.positions = (forward_batch.seq_lens - 1).to(torch.int64)
+        self.attn_backend.init_forward_metadata(forward_batch)
         return self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):
+        self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
             return self.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
@@ -672,3 +681,7 @@ def load_model_cls_srt(model_arch: str) -> Optional[Type[nn.Module]]:
 
 # Monkey patch model loader
 setattr(ModelRegistry, "_try_load_model_cls", load_model_cls_srt)
+setattr(ModelRegistry, "is_multimodal_model", is_multimodal_model)
+setattr(ModelRegistry, "is_attention_free_model", is_attention_free_model)
+setattr(ModelRegistry, "model_has_inner_state", model_has_inner_state)
+setattr(ModelRegistry, "is_embedding_model", is_embedding_model)

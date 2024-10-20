@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 class Sampler(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.use_nan_detectioin = not global_server_args_dict["disable_nan_detection"]
+
     def forward(
         self,
         logits: Union[torch.Tensor, LogitsProcessorOutput],
@@ -36,13 +40,13 @@ class Sampler(nn.Module):
         logits = None
         del logits
 
-        if torch.any(torch.isnan(probs)):
+        if self.use_nan_detectioin and torch.any(torch.isnan(probs)):
             logger.warning("Detected errors during sampling! NaN in the probability.")
             probs = torch.where(
                 torch.isnan(probs), torch.full_like(probs, 1e-10), probs
             )
 
-        if sampling_info.top_ks.max().item() <= 1:
+        if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
             batch_next_token_ids = torch.argmax(probs, -1)
         elif global_server_args_dict["sampling_backend"] == "flashinfer":

@@ -184,6 +184,7 @@ class CompletionResponseChoice(BaseModel):
     text: str
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class CompletionResponse(BaseModel):
@@ -200,6 +201,7 @@ class CompletionResponseStreamChoice(BaseModel):
     text: str
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class CompletionStreamResponse(BaseModel):
@@ -291,6 +293,7 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: str
+    matched_stop: Union[None, int, str] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -312,6 +315,7 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):

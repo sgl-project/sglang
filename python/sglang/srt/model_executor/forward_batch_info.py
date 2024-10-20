@@ -209,12 +209,24 @@ class ForwardBatch:
             sampling_info=batch.sampling_info,
         )
 
-        if not batch.forward_mode.is_decode():
-            ret.image_inputs = batch.image_inputs
-            ret.extend_seq_lens = torch.tensor(batch.extend_seq_lens, device=device)
-            ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, device=device
+        # Init position information
+        if not ret.forward_mode.is_decode():
+            ret.positions = torch.concat(
+                [
+                    torch.arange(prefix_len, prefix_len + extend_len, device=device)
+                    for prefix_len, extend_len in zip(
+                        batch.extend_prefix_lens, batch.extend_seq_lens
+                    )
+                ],
+                axis=0,
             )
+            ret.image_inputs = batch.image_inputs
+            ret.extend_seq_lens = torch.tensor(
+                batch.extend_seq_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
+            ret.extend_prefix_lens = torch.tensor(
+                batch.extend_prefix_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
             ret.extend_start_loc = torch.zeros_like(ret.extend_seq_lens)
             ret.extend_start_loc[1:] = torch.cumsum(ret.extend_seq_lens[:-1], dim=0)
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
@@ -231,7 +243,6 @@ class ForwardBatch:
         ret.req_to_token_pool = model_runner.req_to_token_pool
         ret.token_to_kv_pool = model_runner.token_to_kv_pool
         ret.attn_backend = model_runner.attn_backend
-        model_runner.attn_backend.init_forward_metadata(ret)
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
