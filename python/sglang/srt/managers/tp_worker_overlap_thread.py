@@ -111,11 +111,9 @@ class TpModelWorkerClient:
             if model_worker_batch.return_logprob:
                 self.future_logits_output_dict[future_logits_output] = logits_output
 
-            # logger.info(f"set output {future_next_token_ids=}, {next_token_ids=}")
             self.future_token_ids_map[-future_next_token_ids] = next_token_ids.to(
                 torch.int32
             )
-            # logger.info("Set event")
             self.future_token_ids_output[model_worker_batch.bid] = (
                 next_token_ids.tolist()
             )
