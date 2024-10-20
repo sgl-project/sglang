@@ -456,56 +456,6 @@ def popen_launch_server(
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
-def popen_launch_router(
-    router_url: str,
-    worker_urls: List[str],
-    policy: str,
-    timeout: float,
-    env: Optional[dict] = None,
-    return_stdout_stderr: bool = False,
-):
-    _, host, port = router_url.split(":")
-    host = host[2:]
-
-    command = [
-        "python",
-        "-m",
-        "sglang.srt.router.launch_router",
-        "--host",
-        host,
-        "--port",
-        port,
-        "--policy",
-        policy,
-        "--worker-urls",
-        *worker_urls,
-    ]
-
-    print(command)
-
-    if return_stdout_stderr:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            text=True,
-        )
-    else:
-        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
-
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            response = requests.get(f"{router_url}/health")
-            if response.status_code == 200:
-                return process
-        except requests.RequestException:
-            pass
-        time.sleep(10)
-    raise TimeoutError("Router failed to start within the timeout period.")
-
-
 def run_with_timeout(
     func: Callable,
     args: tuple = (),

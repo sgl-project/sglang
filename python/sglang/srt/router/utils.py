@@ -2,7 +2,6 @@ import logging
 
 
 def configure_logger(log_level: str = "INFO"):
-    # add level to the format
     format = "[%(asctime)s] %(name)s - %(levelname)s: %(message)s"
 
     logging.basicConfig(
