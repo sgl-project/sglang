@@ -36,7 +36,7 @@ def popen_launch_server(model, url, device_id, timeout):
     host = parsed_url.hostname
     port = parsed_url.port
 
-    command = f"export CUDA_VISIBLE_DEVICES={device_id}; python -m sglang.launch_server --model-path {model} --host {host} --port {port}"
+    command = f"export CUDA_VISIBLE_DEVICES={device_id}; python3 -m sglang.launch_server --model-path {model} --host {host} --port {port}"
 
     process = subprocess.Popen(command, stdout=None, stderr=None, shell=True)
 
@@ -64,7 +64,7 @@ def popen_launch_router(
     host = parsed_url.hostname
     port = parsed_url.port
 
-    command = f"python -m sglang.srt.router.launch_router --host {host} --port {port} --policy {policy} --worker-urls {' '.join(worker_urls)}"
+    command = f"python3 -m sglang.srt.router.launch_router --host {host} --port {port} --policy {policy} --worker-urls {' '.join(worker_urls)}"
 
     process = subprocess.Popen(command, stdout=None, stderr=None, shell=True)
 
