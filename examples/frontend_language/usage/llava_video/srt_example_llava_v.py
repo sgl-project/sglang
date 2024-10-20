@@ -208,7 +208,7 @@ if __name__ == "__main__":
         model_override_args["image_token_index"] = 64002
 
     if args.num_frames == 32:
-        model_override_args["rope_scaling"] = {"factor": 2.0, "type": "linear"}
+        model_override_args["rope_scaling"] = {"factor": 2.0, "rope_type": "linear"}
         model_override_args["max_sequence_length"] = 4096 * 2
         model_override_args["tokenizer_model_max_length"] = 4096 * 2
     elif args.num_frames < 32:
