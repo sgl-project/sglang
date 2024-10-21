@@ -127,6 +127,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
                 encoder_lens=forward_batch.encoder_lens,
             )
             self.forward_metadata = (self.decode_wrappers,)
@@ -135,10 +136,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
             # Some heuristics to check whether to use ragged forward
             use_ragged = False
-            if (
-                torch.sum(forward_batch.seq_lens).item() >= 4096
-                and self.num_wrappers == 1
-            ):
+            if forward_batch.extend_num_tokens >= 4096 and self.num_wrappers == 1:
                 use_ragged = True
 
             extend_no_prefix = not torch.any(forward_batch.extend_prefix_lens).item()
@@ -184,9 +182,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
 
+        seq_lens_sum = seq_lens.sum().item()
         self.indices_updater_decode.update(
             req_pool_indices,
             seq_lens,
+            seq_lens_sum,
             decode_wrappers=decode_wrappers,
             encoder_lens=encoder_lens,
         )
@@ -198,11 +198,13 @@ class FlashInferAttnBackend(AttentionBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_lens_sum: int,
         encoder_lens: torch.Tensor = None,
     ):
         self.indices_updater_decode.update(
             req_pool_indices[:bs],
             seq_lens[:bs],
+            seq_lens_sum,
             decode_wrappers=self.cuda_graph_metadata[bs],
             encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
         )
@@ -340,13 +342,30 @@ class FlashInferIndicesUpdaterDecode:
                 req_pool_indices, seq_lens, decode_wrappers
             )
 
-    def update_single_wrapper(self, req_pool_indices, seq_lens, decode_wrappers=None):
+    def update_single_wrapper(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        decode_wrappers=None,
+    ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
-            decode_wrappers[0], req_pool_indices, seq_lens, self.kv_indptr[0], None
+            decode_wrappers[0],
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            self.kv_indptr[0],
+            None,
         )
 
-    def update_sliding_window(self, req_pool_indices, seq_lens, decode_wrappers=None):
+    def update_sliding_window(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        decode_wrappers=None,
+    ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
 
         for wrapper_id in range(2):
@@ -366,6 +385,7 @@ class FlashInferIndicesUpdaterDecode:
                 decode_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
+                seq_lens_sum,
                 self.kv_indptr[wrapper_id],
                 kv_start_idx,
             )
@@ -394,13 +414,18 @@ class FlashInferIndicesUpdaterDecode:
             )
 
     def call_begin_forward(
-        self, wrapper, req_pool_indices, paged_kernel_lens, kv_indptr, kv_start_idx
+        self,
+        wrapper,
+        req_pool_indices,
+        paged_kernel_lens,
+        seq_lens_sum,
+        kv_indptr,
+        kv_start_idx,
     ):
         bs = len(req_pool_indices)
         kv_indptr = kv_indptr[: bs + 1]
-        # TODO: optimize the blocking call on kv_indptr[-1]
         kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-        kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
+        kv_indices = torch.empty(seq_lens_sum, dtype=torch.int32, device="cuda")
 
         create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,

@@ -227,6 +227,8 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
 
+        seq_lens_sum = seq_lens.sum().item()
+
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
@@ -247,6 +249,7 @@ class CudaGraphRunner:
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
+                seq_lens_sum=seq_lens_sum,
                 encoder_lens=encoder_lens,
                 return_logprob=False,
                 top_logprobs_nums=[0] * bs,
@@ -296,7 +299,11 @@ class CudaGraphRunner:
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs, self.req_pool_indices, self.seq_lens, self.encoder_lens
+            bs,
+            self.req_pool_indices,
+            self.seq_lens,
+            forward_batch.seq_lens_sum,
+            self.encoder_lens,
         )
 
         # Replay

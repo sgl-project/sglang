@@ -154,6 +154,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_lens_sum: int,
         encoder_lens=None,
     ):
         # NOTE: encoder_lens expected to be zeros or None

@@ -35,6 +35,7 @@ class AttentionBackend(ABC):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor] = None,
     ):
         """Init the metadata for a forward pass for replying a cuda graph."""

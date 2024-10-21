@@ -303,6 +303,7 @@ You can view the full example [here](https://github.com/sgl-project/sglang/tree/
 - MiniCPM / MiniCPM 3
 - XVERSE / XVERSE MoE
 - SmolLM
+- GLM-4
 
 **Embedding Models**
 
@@ -618,7 +619,6 @@ Learn more in our release blogs: [v0.2](https://lmsys.org/blog/2024-07-25-sglang
 ## Citation And Acknowledgment
 Please cite our paper, [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), if you find the project useful.
 We also learned from the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
-
 
 
 <p align="center">
