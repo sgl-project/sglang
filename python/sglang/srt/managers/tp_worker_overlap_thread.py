@@ -104,7 +104,7 @@ class TpModelWorkerClient:
             )
 
             # Update the future token ids map
-            bs = model_worker_batch.batch_size
+            bs = len(model_worker_batch.seq_lens)
             future_next_token_ids = torch.arange(
                 -(future_token_ids_ct + bs),
                 -(future_token_ids_ct),
