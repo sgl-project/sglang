@@ -92,7 +92,10 @@ class TpModelWorkerClient:
     @torch.inference_mode()
     def forward_thread_func_(self):
         while True:
+            self.has_batch = False
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
+            self.has_batch = True
+            self.launch_event = threading.Event()
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
@@ -106,6 +109,7 @@ class TpModelWorkerClient:
             logits_output, next_token_ids = self.worker.forward_batch_generation(
                 model_worker_batch
             )
+            self.launch_event.set()
 
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
@@ -133,6 +137,9 @@ class TpModelWorkerClient:
 
     def resulve_batch_result(self, bid: int):
         logits_output, next_token_ids = self.output_queue.get()
+        if self.has_batch:
+            # Wait until the batch is launched
+            self.launch_event.wait()
         return logits_output, next_token_ids
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
