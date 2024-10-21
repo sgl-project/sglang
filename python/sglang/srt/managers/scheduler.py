@@ -241,7 +241,7 @@ class Scheduler:
                     skip_tokenizer_init=server_args.skip_tokenizer_init,
                     whitespace_patterns=server_args.constrained_json_whitespace_pattern,
                 )
-            else:
+            elif server_args.grammar_backend == "outlines":
                 self.regex_fsm_cache = FSMCache(
                     server_args.tokenizer_path,
                     {

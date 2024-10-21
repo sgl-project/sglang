@@ -102,7 +102,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
-    grammar_backend: str = "xgrammar"
+    grammar_backend: Optional[str] = "outlines"
 
     # Optimization/debug options
     disable_flashinfer: bool = False
