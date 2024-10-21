@@ -375,7 +375,6 @@ class FlashInferIndicesUpdaterDecode:
     ):
         bs = len(req_pool_indices)
         kv_indptr = kv_indptr[: bs + 1]
-        # TODO: optimize the blocking call on kv_indptr[-1]
         kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
         kv_indices = torch.empty(seq_lens_sum, dtype=torch.int32, device="cuda")
 
