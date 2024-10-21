@@ -427,7 +427,7 @@ class Scheduler:
                 if req.sampling_params.max_new_tokens is not None
                 else 1 << 30
             ),
-            self.max_req_input_len - 1 - len(req.origin_input_ids),
+            self.max_req_input_len - len(req.origin_input_ids),
         )
 
         self.waiting_queue.append(req)
