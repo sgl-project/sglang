@@ -132,6 +132,7 @@ class CudaGraphRunner:
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
+        self.encoder_len_fill_value = 1
 
         if self.use_torch_compile:
             set_torch_compile_config()
@@ -147,7 +148,9 @@ class CudaGraphRunner:
 
             if self.is_encoder_decoder:
                 # NOTE: encoder_lens can influence the full_text_row_masked_out_mask tensor when doing mixed batch
-                self.encoder_lens = torch.zeros((self.max_bs,), dtype=torch.int32)
+                self.encoder_lens = torch.full(
+                    (self.max_bs,), self.encoder_len_fill_value, dtype=torch.int32
+                )
             else:
                 self.encoder_lens = None
 
