@@ -175,21 +175,6 @@ class ForwardBatch:
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
-    def compute_positions(self, model_runner: ModelRunner, batch: ModelWorkerBatch):
-        device = model_runner.device
-        if self.forward_mode.is_decode():
-            self.positions = (self.seq_lens - 1).to(torch.int64)
-        else:
-            self.positions = torch.concat(
-                [
-                    torch.arange(prefix_len, prefix_len + extend_len, device=device)
-                    for prefix_len, extend_len in zip(
-                        batch.extend_prefix_lens, batch.extend_seq_lens
-                    )
-                ],
-                axis=0,
-            )
-
     @classmethod
     def init_new(
         cls,
@@ -213,6 +198,15 @@ class ForwardBatch:
 
         # Init position information
         if not ret.forward_mode.is_decode():
+            ret.positions = torch.concat(
+                [
+                    torch.arange(prefix_len, prefix_len + extend_len, device=device)
+                    for prefix_len, extend_len in zip(
+                        batch.extend_prefix_lens, batch.extend_seq_lens
+                    )
+                ],
+                axis=0,
+            )
             ret.image_inputs = batch.image_inputs
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
@@ -225,12 +219,8 @@ class ForwardBatch:
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
-        # Init position information
-        is_mrope = model_runner.model_is_mrope
-        if is_mrope:
+        if model_runner.model_is_mrope:
             ret.compute_mrope_positions(model_runner, batch)
-        else:
-            ret.compute_positions(model_runner, batch)
 
         # Init attention information
         ret.req_to_token_pool = model_runner.req_to_token_pool
