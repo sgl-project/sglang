@@ -50,7 +50,7 @@ def run_eval(args):
 
     # Read data
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    filename = download_and_cache_file(url)
+    filename = download_and_cache_file(url, args.data_path)
     lines = list(read_jsonl(filename))
 
     # Construct prompts
