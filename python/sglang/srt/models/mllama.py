@@ -813,18 +813,18 @@ class MllamaForConditionalGeneration(nn.Module):
 
     def _batch_image_inputs(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode() or all(forward_batch.encoder_cached):
-            return None, None, None
+            return None, None, None, None
 
         # pixel_values: shape (bs, num_image, num_tiles, 3, image_res, image_res)
         max_num_images = max_num_tiles = bs = 0
-        for im in forward_batch.image_inputs:
-            if im is not None:
+        for i, im in enumerate(forward_batch.image_inputs):
+            if not forward_batch.encoder_cached[i] and im is not None:
                 max_num_images = max(max_num_images, im.pixel_values.shape[1])
                 max_num_tiles = max(max_num_tiles, im.pixel_values.shape[2])
                 bs += 1
 
         if max_num_images * max_num_tiles * bs == 0:
-            return None, None, None
+            return None, None, None, None
 
         with forward_batch.out_cache_loc.device:
             batched_images = torch.zeros(
@@ -843,9 +843,12 @@ class MllamaForConditionalGeneration(nn.Module):
                 bs, max_num_images, max_num_tiles, dtype=torch.int64
             )
             i = 0
-            for im in forward_batch.image_inputs:
-                if im is None:
+            encoder_lens_need = []
+            for k, im in enumerate(forward_batch.image_inputs):
+                if forward_batch.encoder_cached[k] or im is None:
                     continue
+
+                encoder_lens_need.append(forward_batch.encoder_lens[k])
                 for j in range(im.pixel_values.shape[1]):
                     img = im.pixel_values[0, j]
                     num_tiles = img.shape[0]
@@ -854,13 +857,14 @@ class MllamaForConditionalGeneration(nn.Module):
                     batched_ar_mask[i, j, :num_tiles] = im.aspect_ratio_mask[0, j]
                 i += 1
 
-        return batched_images, batched_ar_ids, batched_ar_mask
+        return batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need
 
     def flat_encoder_result(
-        self, cross_attention_states: torch.Tensor, forward_batch: ForwardBatch
+        self, cross_attention_states: torch.Tensor, encoder_lens_need: List[int]
     ):
+        # NOTE: not all encoders need computation, some are cached
         head_dim = cross_attention_states.shape[-1]
-        total_encoder_len = forward_batch.encoder_lens.sum()
+        total_encoder_len = sum(encoder_lens_need)
         cross_attention_states_flat = torch.zeros(
             total_encoder_len,
             head_dim,
@@ -869,7 +873,7 @@ class MllamaForConditionalGeneration(nn.Module):
         )
 
         i = start_pos = 0
-        for encoder_len in forward_batch.encoder_lens_cpu:
+        for encoder_len in encoder_lens_need:
             if encoder_len == 0:
                 continue
             end_pos = start_pos + encoder_len
@@ -911,8 +915,8 @@ class MllamaForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        batched_images, batched_ar_ids, batched_ar_mask = self._batch_image_inputs(
-            forward_batch
+        batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need = (
+            self._batch_image_inputs(forward_batch)
         )
 
         # TODO: support multi-image by this mask
@@ -949,7 +953,7 @@ class MllamaForConditionalGeneration(nn.Module):
             )
 
             cross_attention_states = self.flat_encoder_result(
-                cross_attention_states, forward_batch
+                cross_attention_states, encoder_lens_need
             )
 
         hidden_states = self.language_model(
