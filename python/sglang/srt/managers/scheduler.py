@@ -757,8 +757,6 @@ class Scheduler:
                 logits_output, next_token_ids = self.tp_worker.resulve_batch_result(bid)
             else:
                 # Move next_token_ids and logprobs to cpu
-                next_token_ids = next_token_ids.tolist()
-
                 if batch.return_logprob:
                     logits_output.next_token_logprobs = (
                         logits_output.next_token_logprobs[
@@ -772,6 +770,7 @@ class Scheduler:
                     logits_output.normalized_prompt_logprobs = (
                         logits_output.normalized_prompt_logprobs.tolist()
                     )
+                next_token_ids = next_token_ids.tolist()
 
             # Check finish conditions
             logprob_pt = 0
@@ -828,14 +827,12 @@ class Scheduler:
             logits_output, next_token_ids = self.tp_worker.resulve_batch_result(bid)
         else:
             # Move next_token_ids and logprobs to cpu
-            next_token_ids = next_token_ids.tolist()
-
             if batch.return_logprob:
-                # Move logprobs to cpu
                 next_token_logprobs = logits_output.next_token_logprobs[
                     torch.arange(len(next_token_ids), device=self.device),
                     next_token_ids,
                 ].tolist()
+            next_token_ids = next_token_ids.tolist()
 
         self.token_to_kv_pool.free_group_begin()
 
