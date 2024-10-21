@@ -303,7 +303,7 @@ class GLMTransformer(nn.Module):
         return hidden_states
 
 
-class ChatGLMModel(nn.Module):
+class ChatGLMM(nn.Module):
     def __init__(
         self,
         config,
@@ -366,7 +366,7 @@ class ChatGLMForCausalLM(nn.Module):
         self.config: ChatGLMConfig = config
         self.quant_config = quant_config
         self.max_position_embeddings = getattr(config, "max_sequence_length", 8192)
-        self.transformer = ChatGLMModel(config, cache_config, quant_config)
+        self.transformer = ChatGLMM(config, cache_config, quant_config)
         self.lm_head = self.transformer.output_layer
         self.logits_processor = LogitsProcessor(config)
 
@@ -401,4 +401,4 @@ class ChatGLMModel(ChatGLMForCausalLM):
     pass
 
 
-EntryClass = [ChatGLMForCausalLM, ChatGLMModel]
+EntryClass = [ChatGLMModel]
