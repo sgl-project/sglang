@@ -105,6 +105,7 @@ class CudaGraphRunner:
         self.graph_memory_pool = None
         self.use_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+        self.is_encoder_decoder = self.model_runner.model_config.is_encoder_decoder
 
         # Batch sizes to capture
         if self.model_runner.server_args.disable_cuda_graph_padding:
@@ -143,8 +144,12 @@ class CudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32)
-            # NOTE: encoder_lens can influence the full_text_row_masked_out_mask tensor when doing mixed batch
-            self.encoder_lens = torch.zeros((self.max_bs,), dtype=torch.int32)
+
+            if self.is_encoder_decoder:
+                # NOTE: encoder_lens can influence the full_text_row_masked_out_mask tensor when doing mixed batch
+                self.encoder_lens = torch.zeros((self.max_bs,), dtype=torch.int32)
+            else:
+                self.encoder_lens = None
 
         # Capture
         try:
@@ -201,7 +206,10 @@ class CudaGraphRunner:
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:bs]
-        encoder_lens = self.encoder_lens[:bs]
+        if self.is_encoder_decoder:
+            encoder_lens = self.encoder_lens[:bs]
+        else:
+            encoder_lens = None
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -267,7 +275,8 @@ class CudaGraphRunner:
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_bs].copy_(forward_batch.out_cache_loc)
-        self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
+        if self.is_encoder_decoder:
+            self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
