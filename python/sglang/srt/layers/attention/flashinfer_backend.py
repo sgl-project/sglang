@@ -414,6 +414,7 @@ class FlashInferIndicesUpdaterDecode:
                 # Cross attention
                 paged_kernel_lens = encoder_lens
                 kv_start_idx = torch.zeros_like(encoder_lens)
+                seq_lens_sum = encoder_lens.sum().item()
 
             self.call_begin_forward(
                 decode_wrappers[wrapper_id],
