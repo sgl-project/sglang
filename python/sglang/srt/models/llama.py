@@ -44,6 +44,7 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+from sageattention import sageattn
 
 class LlamaMLP(nn.Module):
     def __init__(
@@ -166,7 +167,10 @@ class LlamaAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+
+        # attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = sageattn(q, k, v, is_causal=False, smooth_k=True)
+        
         output, _ = self.o_proj(attn_output)
         return output
 
