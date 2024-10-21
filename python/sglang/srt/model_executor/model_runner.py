@@ -557,9 +557,7 @@ class ModelRunner:
         self.cuda_graph_runner = CudaGraphRunner(self)
 
     def forward_decode(self, forward_batch: ForwardBatch):
-        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            forward_batch.batch_size
-        ):
+        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
             return self.cuda_graph_runner.replay(forward_batch)
 
         forward_batch.positions = (forward_batch.seq_lens - 1).to(torch.int64)

@@ -132,7 +132,9 @@ class CudaGraphRunner:
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
-        self.encoder_len_fill_value = 1
+
+        # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
+        self.encoder_len_fill_value = 0
 
         if self.use_torch_compile:
             set_torch_compile_config()
@@ -178,11 +180,22 @@ class CudaGraphRunner:
         if hasattr(self.model_runner.model, "capture_mode"):
             self.model_runner.model.capture_mode = False
 
-    def can_run(self, batch_size: int):
-        if self.disable_padding:
-            return batch_size in self.graphs
-        else:
-            return batch_size <= self.max_bs
+    def can_run(self, forward_batch: ForwardBatch):
+        is_bs_supported = (
+            forward_batch.batch_size in self.graphs
+            if self.disable_padding
+            else forward_batch.batch_size <= self.max_bs
+        )
+
+        # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
+        # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
+        # because the full_text_row_masked_out_mask tensor will always be ones
+        is_encoder_lens_supported = (
+            torch.all(forward_batch.encoder_lens > 0)
+            if self.is_encoder_decoder
+            else True
+        )
+        return is_bs_supported and is_encoder_lens_supported
 
     def capture(self):
         with graph_capture() as graph_capture_context:
