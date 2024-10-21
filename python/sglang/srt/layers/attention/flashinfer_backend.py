@@ -204,7 +204,7 @@ class FlashInferAttnBackend(AttentionBackend):
             req_pool_indices[:bs],
             seq_lens[:bs],
             decode_wrappers=self.cuda_graph_metadata[bs],
-            encoder_lens=encoder_lens[:bs],
+            encoder_lens=encoder_lens[:bs] if encoder_lens else None,
         )
 
     def get_cuda_graph_seq_len_fill_value(self):
