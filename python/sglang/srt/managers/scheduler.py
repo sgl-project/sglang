@@ -104,6 +104,7 @@ class Scheduler:
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
+        self.enable_overlap = server_args.enable_overlap_schedule
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -147,14 +148,10 @@ class Scheduler:
         )
 
         # Launch a tensor parallel worker
-        if self.server_args.enable_overlap_schedule:
+        if self.enable_overlap:
             TpWorkerClass = TpModelWorkerClient
-            self.resolve_next_token_ids = (
-                lambda bid, x: self.tp_worker.resolve_future_token_ids(bid)
-            )
         else:
             TpWorkerClass = TpModelWorker
-            self.resolve_next_token_ids = lambda bid, x: x.tolist()
 
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
@@ -463,7 +460,7 @@ class Scheduler:
                 if req.sampling_params.max_new_tokens is not None
                 else 1 << 30
             ),
-            self.max_req_input_len - 1 - len(req.origin_input_ids),
+            self.max_req_input_len - len(req.origin_input_ids),
         )
 
         self.waiting_queue.append(req)
@@ -703,7 +700,7 @@ class Scheduler:
 
         # Mixed-style chunked prefill
         if self.is_mixed_chunk and self.running_batch is not None:
-            self.running_batch.prepare_for_decode()
+            self.running_batch.prepare_for_decode(self.enable_overlap)
             new_batch.mix_with_running(self.running_batch)
             new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = None
@@ -750,7 +747,7 @@ class Scheduler:
                 return
 
         # Update batch tensors
-        batch.prepare_for_decode()
+        batch.prepare_for_decode(self.enable_overlap)
 
     def run_batch(self, batch: ScheduleBatch):
         """Run a batch."""
@@ -788,9 +785,12 @@ class Scheduler:
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
         if self.is_generation:
             logits_output, next_token_ids, bid = result
-            if batch.return_logprob:
-                # Move logprobs to cpu
-                if logits_output.next_token_logprobs is not None:
+
+            if self.enable_overlap:
+                logits_output, next_token_ids = self.tp_worker.resulve_batch_result(bid)
+            else:
+                # Move next_token_ids and logprobs to cpu
+                if batch.return_logprob:
                     logits_output.next_token_logprobs = (
                         logits_output.next_token_logprobs[
                             torch.arange(len(next_token_ids), device=self.device),
@@ -803,8 +803,7 @@ class Scheduler:
                     logits_output.normalized_prompt_logprobs = (
                         logits_output.normalized_prompt_logprobs.tolist()
                     )
-
-            next_token_ids = self.resolve_next_token_ids(bid, next_token_ids)
+                next_token_ids = next_token_ids.tolist()
 
             # Check finish conditions
             logprob_pt = 0
@@ -861,14 +860,16 @@ class Scheduler:
         logits_output, next_token_ids, bid = result
         self.num_generated_tokens += len(batch.reqs)
 
-        # Move logprobs to cpu
-        if batch.return_logprob:
-            next_token_logprobs = logits_output.next_token_logprobs[
-                torch.arange(len(next_token_ids), device=self.device),
-                next_token_ids,
-            ].tolist()
-
-        next_token_ids = self.resolve_next_token_ids(bid, next_token_ids)
+        if self.enable_overlap:
+            logits_output, next_token_ids = self.tp_worker.resulve_batch_result(bid)
+        else:
+            # Move next_token_ids and logprobs to cpu
+            if batch.return_logprob:
+                next_token_logprobs = logits_output.next_token_logprobs[
+                    torch.arange(len(next_token_ids), device=self.device),
+                    next_token_ids,
+                ].tolist()
+            next_token_ids = next_token_ids.tolist()
 
         self.token_to_kv_pool.free_group_begin()
 
