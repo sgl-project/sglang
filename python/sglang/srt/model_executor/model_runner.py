@@ -270,7 +270,6 @@ class ModelRunner:
             if hasattr(self.model, "get_attention_sliding_window_size")
             else None
         )
-        self.has_cross_attention = getattr(self.model, "has_cross_attention", False)
         self.is_generation = is_generation_model(
             self.model_config.hf_config.architectures, self.server_args.is_embedding
         )
@@ -510,7 +509,7 @@ class ModelRunner:
                 "Window attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
             )
-            assert not self.has_cross_attention, (
+            assert not self.model_config.is_encoder_decoder, (
                 "Cross attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
             )
@@ -558,9 +557,7 @@ class ModelRunner:
         self.cuda_graph_runner = CudaGraphRunner(self)
 
     def forward_decode(self, forward_batch: ForwardBatch):
-        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            forward_batch.batch_size
-        ):
+        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
             return self.cuda_graph_runner.replay(forward_batch)
 
         forward_batch.positions = (forward_batch.seq_lens - 1).to(torch.int64)

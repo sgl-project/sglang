@@ -105,6 +105,7 @@ class CudaGraphRunner:
         self.graph_memory_pool = None
         self.use_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+        self.is_encoder_decoder = self.model_runner.model_config.is_encoder_decoder
 
         # Batch sizes to capture
         if self.model_runner.server_args.disable_cuda_graph_padding:
@@ -132,6 +133,9 @@ class CudaGraphRunner:
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
 
+        # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
+        self.encoder_len_fill_value = 0
+
         if self.use_torch_compile:
             set_torch_compile_config()
 
@@ -144,9 +148,18 @@ class CudaGraphRunner:
             )
             self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32)
 
+            if self.is_encoder_decoder:
+                # NOTE: encoder_lens can influence the full_text_row_masked_out_mask tensor when doing mixed batch
+                self.encoder_lens = torch.full(
+                    (self.max_bs,), self.encoder_len_fill_value, dtype=torch.int32
+                )
+            else:
+                self.encoder_lens = None
+
         # Capture
         try:
-            self.capture()
+            with self.model_capture_mode():
+                self.capture()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n"
@@ -157,11 +170,32 @@ class CudaGraphRunner:
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
-    def can_run(self, batch_size: int):
-        if self.disable_padding:
-            return batch_size in self.graphs
-        else:
-            return batch_size <= self.max_bs
+    @contextmanager
+    def model_capture_mode(self):
+        if hasattr(self.model_runner.model, "capture_mode"):
+            self.model_runner.model.capture_mode = True
+
+        yield
+
+        if hasattr(self.model_runner.model, "capture_mode"):
+            self.model_runner.model.capture_mode = False
+
+    def can_run(self, forward_batch: ForwardBatch):
+        is_bs_supported = (
+            forward_batch.batch_size in self.graphs
+            if self.disable_padding
+            else forward_batch.batch_size <= self.max_bs
+        )
+
+        # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
+        # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
+        # because the full_text_row_masked_out_mask tensor will always be ones
+        is_encoder_lens_supported = (
+            torch.all(forward_batch.encoder_lens > 0)
+            if self.is_encoder_decoder
+            else True
+        )
+        return is_bs_supported and is_encoder_lens_supported
 
     def capture(self):
         with graph_capture() as graph_capture_context:
@@ -188,11 +222,19 @@ class CudaGraphRunner:
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:bs]
+        if self.is_encoder_decoder:
+            encoder_lens = self.encoder_lens[:bs]
+        else:
+            encoder_lens = None
+
         seq_lens_sum = seq_lens.sum().item()
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs, req_pool_indices, seq_lens
+            bs,
+            req_pool_indices,
+            seq_lens,
+            encoder_lens,
         )
 
         # Run and capture
@@ -208,6 +250,7 @@ class CudaGraphRunner:
                 attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
                 seq_lens_sum=seq_lens_sum,
+                encoder_lens=encoder_lens,
                 return_logprob=False,
                 top_logprobs_nums=[0] * bs,
                 positions=torch.clamp((seq_lens - 1), min=0).to(torch.int64),
@@ -251,6 +294,8 @@ class CudaGraphRunner:
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_bs].copy_(forward_batch.out_cache_loc)
+        if self.is_encoder_decoder:
+            self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -258,6 +303,7 @@ class CudaGraphRunner:
             self.req_pool_indices,
             self.seq_lens,
             forward_batch.seq_lens_sum,
+            self.encoder_lens,
         )
 
         # Replay

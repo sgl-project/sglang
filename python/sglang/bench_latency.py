@@ -227,8 +227,9 @@ def extend(reqs, model_runner):
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool=model_runner.token_to_kv_pool,
         tree_cache=None,
+        model_config=model_runner.model_config,
     )
-    batch.prepare_for_extend(model_runner.model_config.vocab_size)
+    batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output = model_runner.forward(forward_batch)

@@ -108,6 +108,12 @@ class ForwardBatch:
     # For multimodal
     image_inputs: Optional[List[ImageInputs]] = None
 
+    # Encoder-decoder
+    encoder_cached: Optional[List[bool]] = None
+    encoder_lens: Optional[torch.Tensor] = None
+    encoder_lens_cpu: Optional[List[int]] = None
+    encoder_out_cache_loc: Optional[torch.Tensor] = None
+
     # For LoRA
     lora_paths: Optional[List[str]] = None
 
@@ -194,6 +200,11 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            image_inputs=batch.image_inputs,
+            encoder_cached=batch.encoder_cached,
+            encoder_lens=batch.encoder_lens,
+            encoder_lens_cpu=batch.encoder_lens_cpu,
+            encoder_out_cache_loc=batch.encoder_out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
@@ -212,11 +223,11 @@ class ForwardBatch:
                 ],
                 axis=0,
             )
-            ret.image_inputs = batch.image_inputs
             ret.extend_num_tokens = batch.extend_num_tokens
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
+
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
