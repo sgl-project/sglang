@@ -325,21 +325,26 @@ class FlashInferIndicesUpdaterDecode:
         self.decode_wrappers = attn_backend.decode_wrappers
 
     def update(
-        self, req_pool_indices, seq_lens, decode_wrappers=None, encoder_lens=None
+        self,
+        req_pool_indices,
+        seq_lens,
+        seq_lens_sum,
+        decode_wrappers=None,
+        encoder_lens=None,
     ):
         # Dispatch
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
             return self.update_sliding_window(
-                req_pool_indices, seq_lens, decode_wrappers
+                req_pool_indices, seq_lens, seq_lens_sum, decode_wrappers
             )
         elif self.attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
             return self.update_cross_attention(
-                req_pool_indices, seq_lens, decode_wrappers, encoder_lens
+                req_pool_indices, seq_lens, seq_lens_sum, decode_wrappers, encoder_lens
             )
         else:
             assert self.attn_backend.num_wrappers == 1
             return self.update_single_wrapper(
-                req_pool_indices, seq_lens, decode_wrappers
+                req_pool_indices, seq_lens, seq_lens_sum, decode_wrappers
             )
 
     def update_single_wrapper(
@@ -391,7 +396,12 @@ class FlashInferIndicesUpdaterDecode:
             )
 
     def update_cross_attention(
-        self, req_pool_indices, seq_lens, decode_wrappers=None, encoder_lens=None
+        self,
+        req_pool_indices,
+        seq_lens,
+        seq_lens_sum,
+        decode_wrappers=None,
+        encoder_lens=None,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
 
@@ -409,6 +419,7 @@ class FlashInferIndicesUpdaterDecode:
                 decode_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
+                seq_lens_sum,
                 self.kv_indptr[wrapper_id],
                 kv_start_idx,
             )

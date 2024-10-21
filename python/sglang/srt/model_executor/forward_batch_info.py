@@ -223,7 +223,6 @@ class ForwardBatch:
                 ],
                 axis=0,
             )
-            ret.image_inputs = batch.image_inputs
             ret.extend_num_tokens = batch.extend_num_tokens
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
