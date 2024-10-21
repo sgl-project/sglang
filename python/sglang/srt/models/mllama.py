@@ -886,7 +886,7 @@ class MllamaForConditionalGeneration(nn.Module):
             full_text_row_masked_out_mask = forward_batch.encoder_lens != 0
         else:
             full_text_row_masked_out_mask = torch.ones(
-                (forward_batch.extend_seq_lens.sum(), 1), dtype=torch.bool
+                forward_batch.extend_seq_lens.sum(), dtype=torch.bool
             )
             start_pos = 0
 
@@ -903,7 +903,7 @@ class MllamaForConditionalGeneration(nn.Module):
                 forward_batch.seq_lens.device
             )
 
-        return full_text_row_masked_out_mask
+        return full_text_row_masked_out_mask.reshape(-1, 1)
 
     def forward(
         self,
@@ -917,8 +917,11 @@ class MllamaForConditionalGeneration(nn.Module):
 
         # TODO: support multi-image by this mask
         cross_attention_mask = None
+        cross_attention_states = None
 
         if self.capture_mode:
+            # NOTE: when doing cuda graph capture, we do not want to skip cross attention
+            # Make is a constant value to avoid cuda graph capture issue
             skip_cross_attention = False
         else:
             # NOTE: we do not need image_inputs when prefill
@@ -926,13 +929,14 @@ class MllamaForConditionalGeneration(nn.Module):
             assert len(forward_batch.encoder_lens_cpu) == len(forward_batch.seq_lens)
             skip_cross_attention = forward_batch.encoder_lens.max() == 0
 
-        if batched_images is None:
-            # For 1) text-only prefill and decode, 2) image-present decode.
-            full_text_row_masked_out_mask = (
-                (forward_batch.encoder_lens != 0).reshape(-1, 1).to(input_ids.device)
+        if not skip_cross_attention:
+            full_text_row_masked_out_mask = self.get_full_text_row_masked_out_mask(
+                forward_batch
             )
-            cross_attention_states = None
         else:
+            full_text_row_masked_out_mask = None
+
+        if batched_images is not None:
             # NOTE: llama's reference implementation runs vision model on CPU
             cross_attention_states = self.vision_model(
                 batched_images, batched_ar_ids, batched_ar_mask
@@ -946,9 +950,6 @@ class MllamaForConditionalGeneration(nn.Module):
 
             cross_attention_states = self.flat_encoder_result(
                 cross_attention_states, forward_batch
-            )
-            full_text_row_masked_out_mask = self.get_full_text_row_masked_out_mask(
-                forward_batch
             )
 
         hidden_states = self.language_model(

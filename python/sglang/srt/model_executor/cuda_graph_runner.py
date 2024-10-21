@@ -143,6 +143,8 @@ class CudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32)
+            # NOTE: encoder_lens can influence the full_text_row_masked_out_mask tensor when doing mixed batch
+            self.encoder_lens = torch.zeros((self.max_bs,), dtype=torch.int32)
 
         # Capture
         try:
@@ -199,9 +201,7 @@ class CudaGraphRunner:
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:bs]
-
-        # Fake encoder lens: just to initialize the attention wrappers
-        encoder_lens = torch.zeros_like(seq_lens)
+        encoder_lens = self.encoder_lens[:bs]
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -267,13 +267,11 @@ class CudaGraphRunner:
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_bs].copy_(forward_batch.out_cache_loc)
-
-        # Encoder lens to initialize the attention wrappers
-        encoder_lens = forward_batch.encoder_lens
+        self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs, self.req_pool_indices, self.seq_lens, encoder_lens
+            bs, self.req_pool_indices, self.seq_lens, self.encoder_lens
         )
 
         # Replay
