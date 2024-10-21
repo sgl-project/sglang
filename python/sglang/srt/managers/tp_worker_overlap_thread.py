@@ -134,7 +134,6 @@ class TpModelWorkerClient:
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         # Push a new batch to the queue
-        self.future_event_map[model_worker_batch.bid] = threading.Event()
         self.input_queue.put((model_worker_batch.copy(), self.future_token_ids_ct))
 
         # Allocate output future objects
