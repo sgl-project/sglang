@@ -87,6 +87,9 @@ class ForwardBatch:
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
 
+    # The sum of all sequence lengths
+    seq_lens_sum: int
+
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
@@ -95,6 +98,7 @@ class ForwardBatch:
     positions: torch.Tensor = None
 
     # For extend
+    extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
     extend_start_loc: Optional[torch.Tensor] = None
@@ -190,6 +194,7 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            seq_lens_sum=batch.seq_lens_sum,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             lora_paths=batch.lora_paths,
@@ -208,6 +213,7 @@ class ForwardBatch:
                 axis=0,
             )
             ret.image_inputs = batch.image_inputs
+            ret.extend_num_tokens = batch.extend_num_tokens
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
