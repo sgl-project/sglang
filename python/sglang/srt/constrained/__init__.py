@@ -58,10 +58,9 @@ try:
         GrammarMatcherInitContextCache,
     )
 except ImportError as e:
-    print(
-        f'\nError: {e}. Please install a new version of xgrammar by `pip install "xgrammar>=0.0.12"`\n'
-    )
-    raise
+    GrammarMatcher = e
+    GrammarMatcherInitContext = e
+    GrammarMatcherInitContextCache = e
 
 
 __all__ = [
