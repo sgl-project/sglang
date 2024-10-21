@@ -1,4 +1,4 @@
-# How to Support a New Model
+# Add New Models
 
 To support a new model in SGLang, you only need to add a single file under [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models).
 You can learn from existing model implementations and create new files for the new models.
@@ -32,4 +32,3 @@ To port a model from vLLM to SGLang, you can compare these two files [SGLang Lla
   - Remove `Sample`.
   - Change `forward()` functions, and add `forward_batch`.
   - Add `EntryClass` at the end.
-

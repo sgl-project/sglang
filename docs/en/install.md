@@ -1,41 +1,41 @@
-## Install SGLang
-
-You can install SGLang using any of the methods below.
+# Installation Guide
 
 ### Method 1: With pip
-```
-pip install --upgrade pip
-pip install "sglang[all]"
-
-# Install FlashInfer CUDA kernels
-pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
-```
-
-### Method 2: From source
-```
-# Use the last release branch
-git clone -b v0.3.0 https://github.com/sgl-project/sglang.git
-cd sglang
-
-pip install --upgrade pip
-pip install -e "python[all]"
-
-# Install FlashInfer CUDA kernels
-pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
-```
-
-### Method 3: Using docker
-The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
-Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash
-docker run --gpus all \
-    -p 30000:30000 \
+pip install --upgrade pip
+pip install "sglang[all]"
+pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
+```
+
+**Important: Please check the [flashinfer installation guidance](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.**
+
+### Method 2: From Source
+
+```bash
+# Use the latest release branch
+# As of this documentation, it's v0.3.4, but newer versions may be available
+
+# Do not clone the main branch directly
+# Always use a specific release version
+# The main branch may contain unresolved bugs before a official release
+
+git clone -b v0.3.4 https://github.com/sgl-project/sglang.git
+cd sglang
+pip install -e "python[all]"
+pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
+```
+
+## Method 3: Using Docker
+
+The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker). Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
+
+```bash
+docker run --gpus all -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
-    --env "HF_TOKEN=<secret>" \
-    --ipc=host \
+    --env "HF_TOKEN=<secret>" --ipc=host \
     lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
+    python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 ```
 
 ### Method 4: Using docker compose
@@ -91,6 +91,8 @@ sky status --endpoint 30000 sglang
 3. To further scale up your deployment with autoscaling and failure recovery, check out the [SkyServe + SGLang guide](https://github.com/skypilot-org/skypilot/tree/master/llm/sglang#serving-llama-2-with-sglang-for-more-traffic-using-skyserve).
 </details>
 
-### Common Notes
+## Common Notes
+
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
+- The frontend can run independently of the backend. You can install the frontend locally (without a GPU) and the backend on a GPU cluster. Use `pip install sglang` to install the frontend, build LM programs locally, and connect to the remote backend. See [these examples](https://github.com/sgl-project/sglang/tree/main/examples/frontend_language/usage) for details.
