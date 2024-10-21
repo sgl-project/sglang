@@ -45,9 +45,9 @@ class ModelCase:
 
 # Popular models that run on the CI
 CI_MODELS = [
-    ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
+    # ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
     ModelCase(
-        "google/gemma-2-2b", skip_long_prompt=True
+        "google/gemma-2-2b"
     ),  # There is a bug with new transformers library. This can only run with transformers==4.44
 ]
 

@@ -346,6 +346,7 @@ class FlashInferIndicesUpdaterDecode:
                     seq_lens,
                     torch.tensor(self.sliding_window_size + 1),
                 )
+                seq_lens_sum = paged_kernel_lens.sum().item()
             else:
                 # Full attention
                 paged_kernel_lens = seq_lens
