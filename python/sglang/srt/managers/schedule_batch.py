@@ -556,6 +556,7 @@ class ScheduleBatch:
         self.seq_lens_sum = sum(seq_lens)
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+        self.extend_num_tokens = extend_num_tokens
         self.prefix_lens = [len(r.prefix_indices) for r in reqs]
         self.extend_lens = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
@@ -578,7 +579,6 @@ class ScheduleBatch:
         self.merge_batch(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
-        self.seq_lens_sum += running_batch.seq_lens_sum
         self.extend_num_tokens += running_bs
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
