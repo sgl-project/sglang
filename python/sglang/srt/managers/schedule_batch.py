@@ -749,7 +749,7 @@ class ScheduleBatch:
 
         return jump_forward_reqs
 
-    def prepare_for_decode(self):
+    def prepare_for_decode(self, enable_overlap: bool = False):
         self.forward_mode = ForwardMode.DECODE
 
         self.input_ids = self.output_ids
@@ -762,10 +762,19 @@ class ScheduleBatch:
         # Alloc mem
         bs = len(self.reqs)
         self.out_cache_loc = self.alloc_token_slots(bs)
-        self.req_to_token_pool.write(
-            (self.req_pool_indices, self.seq_lens), self.out_cache_loc
-        )
-        self.seq_lens.add_(1)
+
+        if enable_overlap:
+            # Do not use in-place operations in the overlap mode
+            self.req_to_token_pool.write(
+                (self.req_pool_indices, self.seq_lens), self.out_cache_loc
+            )
+            self.seq_lens = self.seq_lens + 1
+        else:
+            # A faster in-place version
+            self.req_to_token_pool.write(
+                (self.req_pool_indices, self.seq_lens), self.out_cache_loc
+            )
+            self.seq_lens.add_(1)
 
     def filter_batch(
         self,
@@ -938,7 +947,7 @@ class ModelWorkerBatch:
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
-            seq_lens=self.seq_lens.clone(),
+            seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
             req_to_token_pool_records=self.req_to_token_pool_records,
             return_logprob=self.return_logprob,
