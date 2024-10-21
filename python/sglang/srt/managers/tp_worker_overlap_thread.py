@@ -92,9 +92,9 @@ class TpModelWorkerClient:
     @torch.inference_mode()
     def forward_thread_func_(self):
         while True:
-            self.has_batch = False
+            self.has_inflight_batch = False
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
-            self.has_batch = True
+            self.has_inflight_batch = True
             self.launch_event = threading.Event()
 
             # Resolve future tokens in the input
@@ -137,7 +137,7 @@ class TpModelWorkerClient:
 
     def resulve_batch_result(self, bid: int):
         logits_output, next_token_ids = self.output_queue.get()
-        if self.has_batch:
+        if self.has_inflight_batch:
             # Wait until the batch is launched
             self.launch_event.wait()
         return logits_output, next_token_ids
