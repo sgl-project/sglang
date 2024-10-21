@@ -120,7 +120,7 @@ class ModelRunner:
             )
 
         if self.is_multimodal_model:
-            logger.info(
+            logger.warning(
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
             )
             server_args.chunked_prefill_size = None
@@ -130,13 +130,6 @@ class ModelRunner:
                 "Qwen2VLForConditionalGeneration"
             ]:
                 server_args.disable_cuda_graph = True
-
-        if self.server_args.enable_overlap_schedule:
-            logger.warning(
-                "Overlap scheduler is enabled. This is an experimental feature. "
-                "Sampling penalizer (e.g., frequency and repetition penalty), constrained decoding (e.g., regex, JSON), "
-                "and embedding APIs are not supported and will lead to wrong results."
-            )
 
         # Global vars
         if server_args.show_time_cost:
