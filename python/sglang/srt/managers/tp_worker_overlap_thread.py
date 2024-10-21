@@ -55,7 +55,7 @@ class TpModelWorkerClient:
             (self.max_running_requests * 5,), dtype=torch.int32, device=self.device
         )
 
-        # Launch a thread
+        # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
         self.forward_stream = torch.cuda.Stream()
@@ -63,6 +63,12 @@ class TpModelWorkerClient:
             target=self.forward_thread_func,
         )
         self.forward_thread.start()
+
+        self.copy_queue = Queue()
+        self.copy_thread = threading.Thread(
+            target=self.copy_thread_func,
+        )
+        self.copy_thread.start()
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -113,10 +119,16 @@ class TpModelWorkerClient:
                 torch.int32
             )
 
-            # Set the result
-            next_token_ids = next_token_ids.tolist()
-            assert logits_output.next_token_logprobs is None, "Not supported"
-            self.output_queue.put((None, next_token_ids))
+            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+            copy_event = torch.cuda.Event(blocking=True)
+            copy_event.record()
+            self.copy_queue.put((copy_event, next_token_ids))
+
+    def copy_thread_func(self):
+        while True:
+            copy_event, next_token_ids = self.copy_queue.get()
+            copy_event.wait()
+            self.output_queue.put((None, next_token_ids.tolist()))
 
     def resulve_batch_result(self, bid: int):
         logits_output, next_token_ids = self.output_queue.get()
