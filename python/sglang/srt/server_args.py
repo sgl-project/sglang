@@ -177,6 +177,16 @@ class ServerArgs:
         if self.sampling_backend is None:
             self.sampling_backend = "flashinfer"
 
+        if self.enable_overlap_schedule:
+            logger.warning(
+                "Overlap scheduler mode is enabled. This is an experimental feature. "
+                "Sampling penalizer (e.g., frequency and repetition penalty), constrained decoding (e.g., regex, JSON), "
+                "and embedding APIs are not supported and will lead to wrong results. "
+                "The NaN detection is also disabled."
+            )
+            self.disable_penalizer = True
+            self.disable_nan_detection = True
+
         # Model-specific patches
         if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
             logger.info(
