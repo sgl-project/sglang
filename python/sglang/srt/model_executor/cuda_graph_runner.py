@@ -188,6 +188,7 @@ class CudaGraphRunner:
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:bs]
+        seq_lens_sum = seq_lens.sum().item()
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -206,6 +207,7 @@ class CudaGraphRunner:
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
+                seq_lens_sum=seq_lens_sum,
                 return_logprob=False,
                 top_logprobs_nums=[0] * bs,
                 positions=torch.clamp((seq_lens - 1), min=0).to(torch.int64),
@@ -252,7 +254,10 @@ class CudaGraphRunner:
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs, self.req_pool_indices, self.seq_lens
+            bs,
+            self.req_pool_indices,
+            self.seq_lens,
+            forward_batch.seq_lens_sum,
         )
 
         # Replay

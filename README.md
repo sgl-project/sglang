@@ -621,7 +621,6 @@ Please cite our paper, [SGLang: Efficient Execution of Structured Language Model
 We also learned from the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
 
 
-
 <p align="center">
   <a href="#sglangtop" target="_blank">
   <bold>Back To Top </bold>
