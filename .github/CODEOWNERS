@@ -1,0 +1,13 @@
+/python/sglang/lang @merrymercy @Ying1123 @hnyls2002 @ByronHsu
+/python/sglang/srt @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
+/python/sglang/srt/constrained @hnyls2002
+/python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock
+/python/sglang/srt/lora @Ying1123
+/python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002
+/python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002
+/python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock
+/python/sglang/srt/models @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
+/python/sglang/srt/openai_api @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
+/python/sglang/srt/sampling @merrymercy @hnyls2002
+/test/lang @merrymercy @Ying1123 @hnyls2002 @ByronHsu
+/test/srt @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
