@@ -45,11 +45,14 @@ class ReqToTokenPool:
         self.write_records = []
         self.use_records = use_records
 
-    def write(self, indices, values):
         if self.use_records:
-            return self.write_with_records(indices, values)
+            self.write = self.write_with_records
         else:
-            return self.write_without_records(indices, values)
+            self.write = self.write_without_records
+
+    def write(self, indices, values):
+        # Keep the signature for type checking, will be initialized during runtime
+        raise NotImplementedError()
 
     def available_size(self):
         return len(self.free_slots)

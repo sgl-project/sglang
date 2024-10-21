@@ -128,6 +128,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
+                decode_wrappers=None,
                 encoder_lens=forward_batch.encoder_lens,
             )
             self.forward_metadata = (self.decode_wrappers,)
@@ -324,28 +325,20 @@ class FlashInferIndicesUpdaterDecode:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.decode_wrappers = attn_backend.decode_wrappers
 
-    def update(
-        self,
-        req_pool_indices,
-        seq_lens,
-        seq_lens_sum,
-        decode_wrappers=None,
-        encoder_lens=None,
-    ):
         # Dispatch
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
-            return self.update_sliding_window(
-                req_pool_indices, seq_lens, seq_lens_sum, decode_wrappers
-            )
+            self.update = self.update_sliding_window
         elif self.attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
-            return self.update_cross_attention(
-                req_pool_indices, seq_lens, seq_lens_sum, decode_wrappers, encoder_lens
-            )
+            self.update = self.update_cross_attention
         else:
             assert self.attn_backend.num_wrappers == 1
-            return self.update_single_wrapper(
-                req_pool_indices, seq_lens, seq_lens_sum, decode_wrappers
-            )
+            self.update = self.update_single_wrapper
+
+    def update(
+        self, req_pool_indices, seq_lens, seq_lens_sum, decode_wrappers, encoder_lens
+    ):
+        # Keep the signature for type checking, will be initialized during runtime
+        raise NotImplementedError()
 
     def update_single_wrapper(
         self,
@@ -353,6 +346,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         decode_wrappers=None,
+        encoder_lens=None,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -370,6 +364,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         decode_wrappers=None,
+        encoder_lens=None,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
 
@@ -488,31 +483,21 @@ class FlashInferIndicesUpdaterPrefill:
         self.wrapper_ragged = attn_backend.prefill_wrapper_ragged
         self.wrappers_paged = attn_backend.prefill_wrappers_paged
 
-    def update(
-        self,
-        req_pool_indices,
-        seq_lens,
-        prefix_lens,
-        use_ragged=None,
-        encoder_lens=None,
-    ):
         # Dispatch
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
-            return self.update_sliding_window(
-                req_pool_indices, seq_lens, prefix_lens, use_ragged
-            )
+            self.update = self.update_sliding_window
         elif self.attn_backend.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
-            return self.update_cross_attention(
-                req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens
-            )
+            self.update = self.update_cross_attention
         else:
             assert self.attn_backend.num_wrappers == 1
-            return self.update_single_wrapper(
-                req_pool_indices, seq_lens, prefix_lens, use_ragged
-            )
+            self.update = self.update_single_wrapper
+
+    def update(self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens):
+        # Keep the signature for type checking, will be initialized during runtime
+        raise NotImplementedError()
 
     def update_single_wrapper(
-        self, req_pool_indices, seq_lens, prefix_lens, use_ragged
+        self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -533,7 +518,7 @@ class FlashInferIndicesUpdaterPrefill:
         )
 
     def update_sliding_window(
-        self, req_pool_indices, seq_lens, prefix_lens, use_ragged
+        self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
