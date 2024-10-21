@@ -88,7 +88,7 @@ class TpModelWorkerClient:
     def forward_thread_func_(self):
         while True:
             tic1 = time.time()
-            model_worker_batch, future_next_token_ids = self.forward_queue.get()
+            model_worker_batch, future_token_ids_ct = self.forward_queue.get()
 
             # Resolve future tokens in the input
             tic2 = time.time()
@@ -104,6 +104,13 @@ class TpModelWorkerClient:
             )
 
             # Update the future token ids map
+            bs = model_worker_batch.batch_size
+            future_next_token_ids = torch.arange(
+                -(future_token_ids_ct + bs),
+                -(future_token_ids_ct),
+                dtype=torch.int32,
+                device=self.device,
+            )
             self.future_token_ids_map[-future_next_token_ids] = next_token_ids.to(
                 torch.int32
             )
@@ -131,23 +138,22 @@ class TpModelWorkerClient:
         return logits_output, next_token_ids
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        # Push a new batch to the queue
+        self.future_event_map[model_worker_batch.bid] = threading.Event()
+        self.forward_queue.put((model_worker_batch.copy(), self.future_token_ids_ct))
+
         # Allocate output future objects
         bs = len(model_worker_batch.seq_lens)
-        with torch.cuda.stream(self.forward_stream):
-            future_next_token_ids = -torch.arange(
-                self.future_token_ids_ct + 1,
-                self.future_token_ids_ct + 1 + bs,
-                dtype=torch.int32,
-                device=self.device,
-            )
+        future_next_token_ids = torch.arange(
+            -(self.future_token_ids_ct + bs),
+            -(self.future_token_ids_ct),
+            dtype=torch.int32,
+            device=self.device,
+        )
         self.future_token_ids_ct = (
             self.future_token_ids_ct + bs
         ) % self.future_token_ids_limit
-        ret = None, future_next_token_ids
-
-        self.future_event_map[model_worker_batch.bid] = threading.Event()
-        self.forward_queue.put((model_worker_batch.copy(), future_next_token_ids))
-        return ret
+        return None, future_next_token_ids
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
