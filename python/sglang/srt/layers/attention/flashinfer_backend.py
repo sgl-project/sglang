@@ -342,25 +342,25 @@ class FlashInferIndicesUpdaterDecode:
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # Sliding window attention
-                paged_kernel_lens = torch.minimum(  # TODO: replace this with clamp
+                paged_kernel_lens_tmp = torch.minimum(  # TODO: replace this with clamp
                     seq_lens,
                     torch.tensor(self.sliding_window_size + 1),
                 )
-                seq_lens_sum_tmp = paged_kernel_lens.sum().item()
+                paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
+                kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
             else:
                 # Full attention
-                paged_kernel_lens = seq_lens
-                seq_lens_sum_tmp = seq_lens_sum
-
-            kv_start_idx = seq_lens - paged_kernel_lens
+                paged_kernel_lens_tmp = seq_lens
+                paged_kernel_lens_sum_tmp = seq_lens_sum
+                kv_start_idx_tmp = None
 
             self.call_begin_forward(
                 decode_wrappers[wrapper_id],
                 req_pool_indices,
-                paged_kernel_lens,
-                seq_lens_sum_tmp,
+                paged_kernel_lens_tmp,
+                paged_kernel_lens_sum_tmp,
                 self.kv_indptr[wrapper_id],
-                kv_start_idx,
+                kv_start_idx_tmp,
             )
 
     def update_cross_attention(self):
