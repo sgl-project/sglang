@@ -444,9 +444,10 @@ class ServerArgs:
             choices=[
                 "round_robin",
                 "shortest_queue",
+                "resources_aware",
+                "pre_radix",
             ],
         )
-
         # Multi-node distributed serving args
         parser.add_argument(
             "--dist-init-addr",

@@ -17,10 +17,12 @@ limitations under the License.
 
 import json
 import logging
+import multiprocessing
 import os
 import time
 import warnings
 from collections import deque
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import List, Optional, Union
 
@@ -37,6 +39,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
     BatchTokenIDOut,
+    ControllerInfo,
     FlushCacheReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
@@ -61,7 +64,7 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixCacheSend
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
@@ -94,6 +97,7 @@ class Scheduler:
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        controller_info: Optional[ControllerInfo] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -265,6 +269,22 @@ class Scheduler:
                 with_stack=True,
             )
 
+        # init controller info
+        if controller_info and self.tp_rank == 0:
+            self.controller_info = controller_info
+            self.gpu_id = gpu_id
+            self.controller_info.available_kv_cache[self.gpu_id].value = (
+                self.token_to_kv_pool.available_size()
+            )
+            if self.server_args.load_balance_method == "zmq_radix":
+                self.pre_radix = True
+                import threading
+
+                self.change_cnt_lock = threading.Lock()
+                threading.Thread(target=self.loop_for_send_tree_cache).start()
+        else:
+            self.controller_info = None
+
     @torch.inference_mode()
     def event_loop_normal(self):
         """A normal blocking scheduler loop."""
@@ -322,6 +342,25 @@ class Scheduler:
                 self.new_token_ratio = global_config.init_new_token_ratio
 
             self.last_batch = batch
+
+    def loop_for_send_tree_cache(self):
+        while True:
+            self.send_tree_cache_to_queue()
+            time.sleep(1)
+
+    def send_tree_cache_to_queue(self):
+        if self.pre_radix:
+            try:
+                node = deepcopy(self.tree_cache.root_node)
+                send_data = RadixCacheSend(
+                    gpu_id=self.gpu_id, root_node=node, time=time.time()
+                )
+                del node
+                self.controller_info.radix_queue.put(send_data)
+                # logger.info("[send_tree_cache_to_queue] has send new data")
+            except Exception as e:
+                # logger.info(f"[send_tree_cache_to_queue]error:{e}")
+                return
 
     def recv_requests(self):
         if self.tp_rank == 0:
@@ -749,6 +788,20 @@ class Scheduler:
         else:
             self.process_batch_result_prefill(batch, result)
 
+        # update controller info
+        if self.controller_info:
+            with self.controller_info.lock:
+                self.controller_info.available_kv_cache[self.gpu_id].value = (
+                    self.token_to_kv_pool.available_size()
+                    + self.tree_cache.evictable_size()
+                )
+                self.controller_info.running_reqs[self.gpu_id].value = (
+                    len(self.running_batch.reqs) if self.running_batch else 0
+                )
+                self.controller_info.waiting_reqs[self.gpu_id].value = len(
+                    self.waiting_queue
+                )
+
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
         if self.is_generation:
             logits_output, next_token_ids, bid = result
@@ -1113,6 +1166,7 @@ def run_scheduler_process(
     tp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    controller_info,
 ):
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
@@ -1122,7 +1176,9 @@ def run_scheduler_process(
     suppress_other_loggers()
 
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(
+            server_args, port_args, gpu_id, tp_rank, dp_rank, controller_info
+        )
         pipe_writer.send("ready")
         if server_args.enable_overlap_schedule:
             scheduler.event_loop_overlap()
