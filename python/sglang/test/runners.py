@@ -103,7 +103,7 @@ class HFRunner:
 
     def start_model_process(self, in_queue, out_queue, model_path, torch_dtype):
         # Apply model-specific patches
-        # monkey_patch_gemma2_sdpa()
+        monkey_patch_gemma2_sdpa()
 
         # Load the model and tokenizer
         if self.model_type == "generation":

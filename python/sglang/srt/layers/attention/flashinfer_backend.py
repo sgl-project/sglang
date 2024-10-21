@@ -346,10 +346,11 @@ class FlashInferIndicesUpdaterDecode:
                     seq_lens,
                     torch.tensor(self.sliding_window_size + 1),
                 )
-                seq_lens_sum = paged_kernel_lens.sum().item()
+                seq_lens_sum_tmp = paged_kernel_lens.sum().item()
             else:
                 # Full attention
                 paged_kernel_lens = seq_lens
+                seq_lens_sum_tmp = seq_lens_sum
 
             kv_start_idx = seq_lens - paged_kernel_lens
 
@@ -357,7 +358,7 @@ class FlashInferIndicesUpdaterDecode:
                 decode_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
-                seq_lens_sum,
+                seq_lens_sum_tmp,
                 self.kv_indptr[wrapper_id],
                 kv_start_idx,
             )
@@ -370,14 +371,16 @@ class FlashInferIndicesUpdaterDecode:
         wrapper,
         req_pool_indices,
         paged_kernel_lens,
-        seq_lens_sum,
+        paged_kernel_lens_sum,
         kv_indptr,
         kv_start_idx,
     ):
         bs = len(req_pool_indices)
         kv_indptr = kv_indptr[: bs + 1]
         kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-        kv_indices = torch.empty(seq_lens_sum, dtype=torch.int32, device="cuda")
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+        )
 
         create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
