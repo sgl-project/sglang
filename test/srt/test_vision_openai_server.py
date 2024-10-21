@@ -133,6 +133,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.usage.total_tokens > 0
 
     def test_mult_images_chat_completion(self):
+        print("=" * 100, "Test Multi Images Chat Completion", "=" * 100, sep="\n")
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
@@ -215,6 +216,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         return messages
 
     def test_video_chat_completion(self):
+        print("=" * 100, "Test Video Chat Completion", "=" * 100, sep="\n")
         url = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
         cache_dir = os.path.expanduser("~/.cache")
         file_path = os.path.join(cache_dir, "jobs.mp4")
@@ -253,6 +255,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         self.assertGreater(len(video_response), 0)
 
     def test_regex(self):
+        print("=" * 100, "Test Regex", "=" * 100, sep="\n")
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         regex = (
@@ -339,6 +342,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert isinstance(text, str)
 
     def test_mixed_batch(self):
+        print("=" * 100, "Test Mixed Batch", "=" * 100, sep="\n")
         image_ids = [0, 1, 2] * 4
         with ThreadPoolExecutor(4) as executor:
             list(executor.map(self.run_decode_with_image, image_ids))
@@ -361,6 +365,28 @@ class TestQWen2VLServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
+
+
+class TestMllamaServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--chat-template",
+                "llama_3_vision",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
 
 
 if __name__ == "__main__":
