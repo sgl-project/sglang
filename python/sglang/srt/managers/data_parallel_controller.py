@@ -124,10 +124,7 @@ class DataParallelController:
         self.main_num_waiting_req = []
 
         # For pre_radix
-        self.choosen_gpu_per_req = {}
-
-        # For zmq_radix
-        self.zmq_raidx = server_args.load_balance_method == "zmq_radix"
+        self.zmq_raidx = server_args.load_balance_method == "pre_radix"
 
         # Start data parallel workers
         base_gpu_id = 0

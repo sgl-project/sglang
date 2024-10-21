@@ -276,7 +276,7 @@ class Scheduler:
             self.controller_info.available_kv_cache[self.gpu_id].value = (
                 self.token_to_kv_pool.available_size()
             )
-            if self.server_args.load_balance_method == "zmq_radix":
+            if self.server_args.load_balance_method == "pre_radix":
                 self.pre_radix = True
                 import threading
 
