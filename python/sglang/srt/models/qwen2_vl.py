@@ -605,7 +605,11 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal):
             ]
 
         positions = forward_batch.mrope_positions
-        if image_inputs is None or len(image_inputs) == 0:
+        if (
+            forward_batch.forward_mode.is_decode()
+            or image_inputs is None
+            or len(image_inputs) == 0
+        ):
             inputs_embeds = self.model.embed_tokens(input_ids)
         else:
             if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":

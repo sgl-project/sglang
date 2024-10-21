@@ -8,16 +8,12 @@ version = "0.3.4"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
-license = {file = "LICENSE"}
+license = { file = "LICENSE" }
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
 ]
-dependencies = [
-    "requests",
-    "tqdm",
-    "numpy",
-]
+dependencies = ["requests", "tqdm", "numpy"]
 
 [project.optional-dependencies]
 runtime_common = ["aiohttp", "decord", "fastapi", "hf_transfer", "huggingface_hub", "interegular",
@@ -32,7 +28,14 @@ srt_xpu = ["sglang[runtime_common]"]
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
-test = ["jsonlines", "matplotlib", "pandas", "sentence_transformers", "accelerate", "peft"]
+test = [
+    "jsonlines",
+    "matplotlib",
+    "pandas",
+    "sentence_transformers",
+    "accelerate",
+    "peft",
+]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 dev = ["sglang[all]", "sglang[test]"]
@@ -43,7 +46,23 @@ dev_xpu = ["sglang[all_xpu]", "sglang[test]"]
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [tool.setuptools.packages.find]
-exclude = ["assets*", "benchmark*", "docs*", "dist*", "playground*", "scripts*", "tests*"]
+exclude = [
+    "assets*",
+    "benchmark*",
+    "docs*",
+    "dist*",
+    "playground*",
+    "scripts*",
+    "tests*",
+]
 
 [tool.wheel]
-exclude = ["assets*", "benchmark*", "docs*", "dist*", "playground*", "scripts*", "tests*"]
+exclude = [
+    "assets*",
+    "benchmark*",
+    "docs*",
+    "dist*",
+    "playground*",
+    "scripts*",
+    "tests*",
+]
