@@ -6,6 +6,7 @@
 [![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
 [![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
 [![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
+[![](https://img.shields.io/badge/Gurubase-Ask%20SGLang%20Guru%20(experimental)-006BFF)](https://gurubase.io/g/sglang)
 
 </div>
 
