@@ -127,7 +127,8 @@ class TpModelWorkerClient:
     def copy_thread_func(self):
         while True:
             copy_event, next_token_ids = self.copy_queue.get()
-            copy_event.wait()
+            while not copy_event.query():
+                time.sleep(1e-5)
             self.output_queue.put((None, next_token_ids.tolist()))
 
     def resulve_batch_result(self, bid: int):
