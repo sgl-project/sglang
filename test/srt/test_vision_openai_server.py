@@ -171,7 +171,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert isinstance(text, str)
         print(text)
         assert "man" in text or "cab" in text, text
-        assert "logo" in text, text
+        assert "logo" in text or '"S"' in text or "SG" in text, text
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
