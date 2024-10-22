@@ -804,6 +804,9 @@ class ScheduleBatch:
         self.return_logprob = self.return_logprob or other.return_logprob
         self.has_stream = self.has_stream or other.has_stream
         self.has_regex = self.has_regex or other.has_regex
+        
+        if self.spec_info is not None:
+            self.spec_info.merge_batch(other.spec_info)
 
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode():

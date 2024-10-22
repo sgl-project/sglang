@@ -118,9 +118,10 @@ class CudaGraphRunner:
             bs for bs in self.capture_bs if bs <= model_runner.req_to_token_pool.size
         ]
         
-        if model_runner.server_args.speculative_algorithm == 'EAGLE' and model_runner.is_draft_runner:
+        if model_runner.server_args.speculative_algorithm == 'EAGLE' and self.model_runner.is_draft_runner:
             # TODO: Support edit top_k in config  @kavioyu
-            self.num_tokens = [bs * 8 for bs in self.capture_bs]
+            expand_num = self.model_runner.server_args.eagle_topk
+            self.num_tokens = [bs * expand_num for bs in self.capture_bs]
         else:
             self.num_tokens = [bs for bs in self.capture_bs]
                 
@@ -268,7 +269,6 @@ class CudaGraphRunner:
         # Pad
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
-        index = bisect.bisect_left(self.num_tokens, raw_bs)
         num_token = self.num_tokens[index] 
         if bs != raw_num_token:
             self.seq_lens.fill_(self.seq_len_fill_value)

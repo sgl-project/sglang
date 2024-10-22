@@ -114,8 +114,14 @@ class ServerArgs:
     draft_model_path: str = None
     speculative_algorithm: str = None
     num_speculative_steps: int = None
+    # should been set as 2^n
     num_draft_tokens: int = None
+    # should been set as [1, 2, 4, 8]
+    eagle_topk: int = None
+    # should not been set by cli, it is only a placeholder 
+    # which would be set and used in model_runner
     draft_runner_cache_size: int = None
+    
 
     def __post_init__(self):
         # Set missing default values
@@ -588,7 +594,15 @@ class ServerArgs:
             type=int,
             help="The number of token sampled from draft model in Speculative Decoding.",
             required=False,
-            default=5,
+            default=64,
+        )
+        parser.add_argument(
+            "--eagle-topk",
+            type=int,
+            help="The number of token sampled from draft model in eagle2 each step.",
+            required=False,
+            choices=[1, 2, 4, 8],
+            default=8,
         )
 
     @classmethod

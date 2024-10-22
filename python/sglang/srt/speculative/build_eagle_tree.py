@@ -17,7 +17,7 @@ import torch
 kernels = cutex.SourceModule(
     """
 //cuda
-__global__ void build_tree(Tensor<long, 1> parent_list, Tensor<long, 1> selected_index, Tensor<long, 1> verified_seq_len, 
+__global__ void build_tree(Tensor<long, 2> parent_list, Tensor<long, 2> selected_index, Tensor<long, 1> verified_seq_len, 
         Tensor<bool, 1> tree_mask, Tensor<long, 1> positions, Tensor<long, 3> retrive_index, int topk, int depth, int draft_token_num) {
         int bid = blockIdx.x;
         int tid = threadIdx.x;
@@ -48,13 +48,14 @@ __global__ void build_tree(Tensor<long, 1> parent_list, Tensor<long, 1> selected
             depends_order[position] = cur_position+1;
             position += 1;
             tree_mask[token_tree_idx+cur_position] = true;
-            int parent_tb_idx = selected_index[bid*draft_token_num+cur_position]/topk;
+            int parent_tb_idx = selected_index[bid][cur_position]/topk;
             if(parent_tb_idx==0){
                 break;
             }
-            int token_idx = parent_list[parent_tb_idx];
+
+            int token_idx = parent_list[bid][parent_tb_idx];
             for(cur_position=0; cur_position<draft_token_num;cur_position++){
-                if(selected_index[cur_position]==token_idx){
+                if(selected_index[bid][cur_position]==token_idx){
                     break;
                 }
             }
@@ -81,7 +82,7 @@ __global__ void build_tree(Tensor<long, 1> parent_list, Tensor<long, 1> selected
 //!cuda
 """,
     float_bits=16,  # change to 16 to use half precision as `float` type in the above source code.
-    boundscheck=False,  # turning on for debug and off for performance (to use full threads of a block), default is on.
+    boundscheck=True,  # turning on for debug and off for performance (to use full threads of a block), default is on.
 )
 
 
@@ -97,6 +98,7 @@ def build_tree_kernel(parent_list, top_score_index, seq_lens, topk, depth, draft
         (bs, draft_token, depth + 2), -1, device=device, dtype=torch.long
     )
     positions = torch.empty((bs * draft_token,), device=device, dtype=torch.long)
+
     kernels.build_tree(
         parent_list,
         top_score_index,
@@ -329,8 +331,8 @@ if __name__ == "__main__":
     positions = torch.empty((bs * draft_token,), device="cuda", dtype=torch.long)
 
     kernels.build_tree(
-        parent_list,
-        index,
+        parent_list.unsqueeze(0),
+        index.unsqueeze(0),
         verified_seq_len,
         tree_mask,
         positions,

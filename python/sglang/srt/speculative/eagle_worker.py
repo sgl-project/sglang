@@ -50,11 +50,12 @@ class EAGLEWorker(SpeculativeWorker):
                 self.forward_draft_decode(batch)
             batch.spec_info.clear_draft_cache(batch)
             self._swap_mem_pool(batch, self.target_worker.model_runner)
-            next_draft_input, logits_output = self.verify(batch)
-            verified_id = next_draft_input.verified_id
+            next_draft_input, logits_output, verified_id = self.verify(batch)
             next_draft_input.init(self.server_args)
             batch.spec_info = next_draft_input
-            self.forward_extend_after_decode(batch)
+            # if it is None, means all requsets are finished
+            if batch.spec_info.verified_id is not None:
+                self.forward_extend_after_decode(batch)
             return logits_output, verified_id
             
         else:
@@ -72,7 +73,7 @@ class EAGLEWorker(SpeculativeWorker):
         verify_input.prepare_for_verify(batch)
         batch.spec_info = verify_input
         model_worker_batch = batch.get_model_worker_batch()
-        logits_output, next_token_ids = self.target_worker.forward_batch_generation(model_worker_batch)
+        logits_output, _ = self.target_worker.forward_batch_generation(model_worker_batch, need_token_id=False)
         res = verify_input.verify(batch, logits_output)
         batch.forward_mode = ForwardMode.DECODE
         return res
@@ -84,13 +85,20 @@ class EAGLEWorker(SpeculativeWorker):
     def forward_extend_after_decode(self, batch: ScheduleBatch):
         self._swap_mem_pool(batch, self.model_runner)
         batch.forward_mode = ForwardMode.SPECEXTEND 
+        if batch.spec_info.has_finished:
+            index = batch.spec_info.unfinished_index
+            seq_lens = batch.seq_lens
+            batch.seq_lens = batch.seq_lens[index]
         batch.spec_info.prepare_extend_after_decode(batch)
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        
         forward_batch.is_draft_batch = True
         logits_output = self.model_runner.forward(forward_batch)
         self.capture_for_decode(logits_output, forward_batch)
         batch.forward_mode = ForwardMode.DECODE 
+        if batch.spec_info.has_finished:
+            batch.seq_lens = seq_lens
         self._swap_mem_pool(batch, self.model_runner)
         
     def post_decode_process(self, batch):

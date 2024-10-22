@@ -793,7 +793,7 @@ class Scheduler:
             req.completion_tokens_wo_jump_forward += 1
             if batch.spec_algorithm is None: # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
-            req.check_finished() # TODO: SUPPORT IT @kavioyu
+            req.check_finished()
 
             if req.regex_fsm is not None:
                 req.regex_fsm_state = req.regex_fsm.get_next_state(

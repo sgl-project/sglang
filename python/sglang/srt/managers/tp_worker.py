@@ -119,10 +119,13 @@ class TpModelWorker:
             self.random_seed,
         )
 
-    def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+    def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch, need_token_id=True):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
-        next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+        if need_token_id:
+            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+        else:
+            next_token_ids = None
         model_worker_batch.spec_info = forward_batch.spec_info
         return logits_output, next_token_ids
 

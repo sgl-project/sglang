@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .build_egale_tree import build_tree_kernel
+from .build_eagle_tree import build_tree_kernel
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, ForwardBatch
 
 if TYPE_CHECKING:
@@ -39,6 +39,9 @@ class SpecDraftInput(SpecInput):
 
     def clear():
         pass
+    
+    def merge_batch(self, batch: SpecDraftInput):
+        raise NotImplementedError()
 
 
 class SpecDraftInfoFactory:
