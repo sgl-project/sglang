@@ -122,7 +122,7 @@ class TokenizerManager:
 
                 # We want to parallelize the image pre-processing so we create an executor for it
                 self.image_processor = get_image_processor(
-                    self.hf_config, server_args, self.processor.image_processor
+                    self.hf_config, server_args, self.processor
                 )
             else:
                 self.tokenizer = get_tokenizer(
@@ -191,8 +191,10 @@ class TokenizerManager:
                 sampling_params = self._get_sampling_params(obj.sampling_params)
                 if self.is_generation:
                     image_inputs = await self.image_processor.process_images_async(
-                        obj.image_data, obj
+                        obj.image_data, input_text or input_ids, obj
                     )
+                    if image_inputs and "input_ids" in image_inputs:
+                        input_ids = image_inputs["input_ids"]
                     return_logprob = obj.return_logprob
                     logprob_start_len = obj.logprob_start_len
                     top_logprobs_num = obj.top_logprobs_num
@@ -217,8 +219,10 @@ class TokenizerManager:
                 sampling_params = self._get_sampling_params(obj.sampling_params[index])
                 if self.is_generation:
                     image_inputs = await self.image_processor.process_images_async(
-                        obj.image_data[index], obj
+                        obj.image_data[index], input_text or input_ids, obj
                     )
+                    if image_inputs and "input_ids" in image_inputs:
+                        input_ids = image_inputs["input_ids"]
                     return_logprob = obj.return_logprob[index]
                     logprob_start_len = obj.logprob_start_len[index]
                     top_logprobs_num = obj.top_logprobs_num[index]
@@ -263,8 +267,10 @@ class TokenizerManager:
             sampling_params = SamplingParams(**obj.sampling_params[0])
             sampling_params.max_new_tokens = 0
             image_inputs = await self.image_processor.process_images_async(
-                obj.image_data[0], obj
+                obj.image_data[0], input_text or input_ids, obj
             )
+            if image_inputs and "input_ids" in image_inputs:
+                input_ids = image_inputs["input_ids"]
             return_logprob = obj.return_logprob[0]
             logprob_start_len = obj.logprob_start_len[0]
             top_logprobs_num = obj.top_logprobs_num[0]
