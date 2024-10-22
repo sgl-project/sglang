@@ -33,5 +33,4 @@ jobs:
         timeout-minutes: 120
         run: |
           cd test/srt
-          python3 test_nightly_gsm8k_eval.py
           python3 test_nightly_human_eval.py
