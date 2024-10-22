@@ -1,8 +1,8 @@
 import os
-import unittest
-import subprocess
 import shutil
 import signal
+import subprocess
+import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_child_process
