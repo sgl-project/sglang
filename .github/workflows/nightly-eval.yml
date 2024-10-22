@@ -30,7 +30,7 @@ jobs:
           pip install --upgrade "evalplus[vllm] @ git+https://github.com/evalplus/evalplus"
 
       - name: Nightly gsm8k and human eval Accuracy
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           cd test/srt
           python3 test_nightly_gsm8k_eval.py
