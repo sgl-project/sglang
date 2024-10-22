@@ -26,9 +26,9 @@ extensions = [
     "myst_parser",
     "sphinx_copybutton",
     "sphinxcontrib.mermaid",
-    'nbsphinx',
-    'sphinx.ext.mathjax',
-    'sphinx.ext.autodoc',
+    "nbsphinx",
+    "sphinx.ext.mathjax",
+    "sphinx.ext.autodoc",
 ]
 
 autosectionlabel_prefix_document = True
@@ -127,4 +127,4 @@ intersphinx_mapping = {
     "torch": ("https://pytorch.org/docs/stable", None),
 }
 
-html_theme = 'sphinx_book_theme'
+html_theme = "sphinx_book_theme"
