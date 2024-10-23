@@ -46,6 +46,8 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
+    GetMemPoolSizeReq,
+    GetMemPoolSizeReqOutput,
     ProfileReq,
     RewardReqInput,
     TokenizedEmbeddingReqInput,
@@ -531,6 +533,15 @@ class TokenizerManager:
         req = ProfileReq.STOP_PROFILE
         self.send_to_scheduler.send_pyobj(req)
 
+    async def get_memory_pool_size(self):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        req = GetMemPoolSizeReq()
+        self.send_to_scheduler.send_pyobj(req)
+        self.mem_pool_size = asyncio.Future()
+        return await self.mem_pool_size
+
     async def update_weights(
         self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
     ):
@@ -589,6 +600,9 @@ class TokenizerManager:
 
             if isinstance(recv_obj, UpdateWeightReqOutput):
                 self.model_update_result.set_result(recv_obj)
+                continue
+            elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
+                self.mem_pool_size.set_result(recv_obj)
                 continue
 
             assert isinstance(
