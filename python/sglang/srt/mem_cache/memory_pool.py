@@ -221,8 +221,16 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        self.k_buffer[layer_id][loc] = cache_k.to(self.dtype).view(self.store_dtype)
-        self.v_buffer[layer_id][loc] = cache_v.to(self.dtype).view(self.store_dtype)
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+        if cache_v.dtype != self.dtype:
+            cache_v = cache_v.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
+            self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
+        else:
+            self.k_buffer[layer_id][loc] = cache_k
+            self.v_buffer[layer_id][loc] = cache_v
 
 
 # This compiled version is slower in the unit test
