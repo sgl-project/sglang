@@ -56,9 +56,11 @@ You can install SGLang using any of the methods below.
 pip install --upgrade pip
 pip install "sglang[all]"
 
-# Install FlashInfer CUDA kernels
+# Install FlashInfer accelerated kernels
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
+
+**Important: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.**
 
 ### Method 2: From source
 ```
@@ -69,9 +71,11 @@ cd sglang
 pip install --upgrade pip
 pip install -e "python[all]"
 
-# Install FlashInfer CUDA kernels
+# Install FlashInfer accelerated kernels
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
+
+**Important: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.**
 
 ### Method 3: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
