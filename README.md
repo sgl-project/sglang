@@ -56,9 +56,11 @@ You can install SGLang using any of the methods below.
 pip install --upgrade pip
 pip install "sglang[all]"
 
-# Install FlashInfer CUDA kernels
+# Install FlashInfer accelerated kernels
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
+
+**Important: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.**
 
 ### Method 2: From source
 ```
@@ -69,9 +71,11 @@ cd sglang
 pip install --upgrade pip
 pip install -e "python[all]"
 
-# Install FlashInfer CUDA kernels
+# Install FlashInfer accelerated kernels
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
+
+**Important: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.**
 
 ### Method 3: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
@@ -226,7 +230,8 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
 ```
-- To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes.
+- To enable the experimental overlapped scheduler, add `--enable-overlap-scheduler`. It overlaps CPU scheduler with GPU computation and can accelerate almost all workloads. This does not work for constrained decoding currenly.
+- To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. This does not work for FP8 currenly.
 - To enable torchao quantization, add `--torchao-config int4wo-128`. It supports various quantization strategies.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
@@ -247,7 +252,6 @@ We also provide an inference engine **without a HTTP server**. For example,
 ```python
 import sglang as sgl
 
-
 def main():
     prompts = [
         "Hello, my name is",
@@ -267,12 +271,8 @@ if __name__ == "__main__":
     main()
 ```
 
-This can be used for:
-
-1. **Offline Batch Inference**
-2. **Building Custom Servers**
-
-You can view the full example [here](https://github.com/sgl-project/sglang/tree/main/examples/runtime/engine)
+This can be used for offline batch inference and building custom servers.
+You can view the full example [here](https://github.com/sgl-project/sglang/tree/main/examples/runtime/engine).
 
 ### Supported Models
 
@@ -440,7 +440,6 @@ print(state["answer_1"])
 ```
 
 #### More Examples
-
 Anthropic and VertexAI (Gemini) models are also supported.
 You can find more examples at [examples/quick_start](examples/frontend_language/quick_start).
 
