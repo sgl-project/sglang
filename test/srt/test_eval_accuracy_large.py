@@ -1,3 +1,9 @@
+"""
+Usage:
+
+python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
+"""
+
 import unittest
 from types import SimpleNamespace
 
