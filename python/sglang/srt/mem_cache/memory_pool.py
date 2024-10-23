@@ -51,7 +51,7 @@ class ReqToTokenPool:
             self.write = self.write_without_records
 
     def write(self, indices, values):
-        # Keep the signature for type checking, will be initialized during runtime
+        # Keep the signature for type checking. It will be assigned during runtime
         raise NotImplementedError()
 
     def available_size(self):
@@ -213,6 +213,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    @torch.compile(dynamic=True)
     def set_kv_buffer(
         self,
         layer: RadixAttention,
