@@ -514,7 +514,12 @@ class ScheduleBatch:
                 out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
 
             if out_cache_loc is None:
-                logger.error("Prefill out of memory. Try to lower your batch size.")
+                phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
+                logger.error(
+                    f"{phase_str} out of memory. Try to lower your batch size.\n"
+                    f"Try to allocate {num_tokens} tokens.\n"
+                    f"Avaliable tokens: {self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()}\n"
+                )
                 if self.tree_cache is not None:
                     self.tree_cache.pretty_print()
                 exit(1)
