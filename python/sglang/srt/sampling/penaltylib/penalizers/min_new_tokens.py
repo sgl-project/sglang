@@ -33,10 +33,9 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                 torch.tensor(
                     data=(
                         list(
-                            req.sampling_params.stop_token_ids
+                            (req.sampling_params.stop_token_ids or {})
+                            | (req.tokenizer.additional_stop_token_ids or {})
                             | {req.tokenizer.eos_token_id}
-                            if req.sampling_params.stop_token_ids
-                            else {req.tokenizer.eos_token_id}
                         )
                     ),
                     dtype=torch.int64,
