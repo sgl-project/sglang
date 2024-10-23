@@ -67,6 +67,7 @@ def run_eval(args):
         model=args.model,
         max_tokens=2048,
         base_url=base_url,
+        temperature=getattr(args, "temperature", 0.0),
     )
 
     # Run eval
@@ -119,6 +120,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval-name", type=str, default="mmlu")
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
+    parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()
 
     run_eval(args)
