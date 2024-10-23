@@ -337,7 +337,7 @@ class FlashInferIndicesUpdaterDecode:
     def update(
         self, req_pool_indices, seq_lens, seq_lens_sum, decode_wrappers, encoder_lens
     ):
-        # Keep the signature for type checking. It will be assigned during runtime
+        # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
 
     def update_single_wrapper(
@@ -497,7 +497,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.update = self.update_single_wrapper
 
     def update(self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens):
-        # Keep the signature for type checking. It will be assigned during runtime
+        # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
 
     def update_single_wrapper(

@@ -51,7 +51,7 @@ class ReqToTokenPool:
             self.write = self.write_without_records
 
     def write(self, indices, values):
-        # Keep the signature for type checking. It will be assigned during runtime
+        # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
 
     def available_size(self):
