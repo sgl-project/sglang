@@ -23,7 +23,7 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--sampling-backend", "pytorch"],
+            other_args=["--sampling-backend", "pytorch", "--disable-radix-cache"],
         )
 
     @classmethod
@@ -37,6 +37,7 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
             eval_name="mmlu",
             num_examples=64,
             num_threads=32,
+            temperature=0.1,
         )
 
         metrics = run_eval(args)

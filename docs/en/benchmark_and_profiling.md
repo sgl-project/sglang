@@ -47,3 +47,7 @@ import nvtx
 with nvtx.annotate("description", color="color"):
     # some critical code
 ```
+
+## Other tips
+
+1. You can benchmark a model using dummy weights by only providing the config.json file. This allows for quick testing of model variants without training. To do so, add `--load-format dummy` to the above commands and then you only need a correct `config.json` under the checkpoint folder.
