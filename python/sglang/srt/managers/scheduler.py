@@ -71,7 +71,6 @@ from sglang.srt.utils import (
     is_generation_model,
     is_multimodal_model,
     kill_parent_process,
-    pytorch_profile,
     set_random_seed,
     suppress_other_loggers,
 )
