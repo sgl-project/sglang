@@ -1,6 +1,5 @@
 """
 Usage:
-
 python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
 """
 
@@ -38,7 +37,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=3000,
+            num_examples=5000,
             num_threads=1024,
         )
 
