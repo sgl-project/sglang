@@ -135,7 +135,7 @@ class SamplingParams:
             self.stop_str_max_len = stop_str_max_len
 
         # Process stop token ids
-        if tokenizer.additional_stop_token_ids:
+        if tokenizer and getattr(tokenizer, "additional_stop_token_ids", None):
             self.stop_token_ids.update(tokenizer.additional_stop_token_ids)
 
     def to_srt_kwargs(self):
