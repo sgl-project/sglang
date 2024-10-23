@@ -559,17 +559,17 @@ class ModelRunner:
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):
-        if self.is_embedding:
+        if not self.is_embedding:
+            return self.model.forward(
+                forward_batch.input_ids, forward_batch.positions, forward_batch
+            )
+        else:
             # Only embedding models have get_embedding parameter
             return self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 get_embedding=True,
-            )
-        else:
-            return self.model.forward(
-                forward_batch.input_ids, forward_batch.positions, forward_batch
             )
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
