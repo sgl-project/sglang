@@ -213,7 +213,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
-    @torch.compile(dynamic=True)
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -222,16 +221,21 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
-        if cache_v.dtype != self.dtype:
-            cache_v = cache_v.to(self.dtype)
-        if self.store_dtype != self.dtype:
-            self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
-            self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
-        else:
-            self.k_buffer[layer_id][loc] = cache_k
-            self.v_buffer[layer_id][loc] = cache_v
+        copy_two_array(
+            loc,
+            self.k_buffer[layer_id],
+            cache_k,
+            self.v_buffer[layer_id],
+            cache_v,
+            self.dtype,
+            self.store_dtype,
+        )
+
+
+@torch.compile(dynamic=True)
+def copy_two_array(loc, dst_1, src_1, dst_2, src_2, dtype, store_dtype):
+    dst_1[loc] = src_1.to(dtype).view(store_dtype)
+    dst_2[loc] = src_2.to(dtype).view(store_dtype)
 
 
 class MLATokenToKVPool(BaseTokenToKVPool):
