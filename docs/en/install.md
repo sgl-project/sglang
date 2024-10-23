@@ -7,22 +7,26 @@ You can install SGLang using any of the methods below.
 pip install --upgrade pip
 pip install "sglang[all]"
 
-# Install FlashInfer CUDA kernels
+# Install FlashInfer accelerated kernels
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
+
+**Important: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.**
 
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.3.0 https://github.com/sgl-project/sglang.git
+git clone -b v0.3.4.post1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
 pip install -e "python[all]"
 
-# Install FlashInfer CUDA kernels
+# Install FlashInfer accelerated kernels
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
+
+**Important: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.**
 
 ### Method 3: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
@@ -94,3 +98,4 @@ sky status --endpoint 30000 sglang
 ### Common Notes
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
+- The language frontend operates independently of the backend runtime. You can install the frontend locally without needing a GPU, while the backend can be set up on a GPU-enabled machine. To install the frontend, run `pip install sglang`, and for the backend, use `pip install sglang[srt]`. This allows you to build SGLang programs locally and execute them by connecting to the remote backend.
