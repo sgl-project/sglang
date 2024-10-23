@@ -119,6 +119,10 @@ class TestSRTEndpoint(unittest.TestCase):
                 [x[-1] for x in res["meta_info"]["output_token_logprobs"]]
             )
 
+    def test_get_memory_pool_size(self):
+        response = requests.post(self.base_url + "/get_memory_pool_size")
+        assert isinstance(response.json(), int)
+
 
 if __name__ == "__main__":
     unittest.main()

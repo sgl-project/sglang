@@ -38,6 +38,8 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchTokenIDOut,
     FlushCacheReq,
+    GetMemPoolSizeReq,
+    GetMemPoolSizeReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -363,6 +365,10 @@ class Scheduler:
                     self.start_profile()
                 else:
                     self.stop_profile()
+            elif isinstance(recv_req, GetMemPoolSizeReq):
+                self.send_to_detokenizer.send_pyobj(
+                    GetMemPoolSizeReqOutput(self.max_total_num_tokens)
+                )
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 

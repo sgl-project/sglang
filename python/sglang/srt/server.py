@@ -172,6 +172,18 @@ async def stop_profile():
     )
 
 
+@app.api_route("/get_memory_pool_size", methods=["GET", "POST"])
+async def get_memory_pool_size():
+    """Get the memory pool size in number of tokens"""
+    try:
+        ret = await tokenizer_manager.get_memory_pool_size()
+        return ret.size
+    except Exception as e:
+        return JSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
 @app.post("/update_weights")
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
     """Update the weights inplace without re-launching the server."""
