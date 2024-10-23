@@ -35,9 +35,9 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                         list(
                             req.sampling_params.stop_token_ids
                             | {req.tokenizer.eos_token_id}
+                            if req.sampling_params.stop_token_ids
+                            else {req.tokenizer.eos_token_id}
                         )
-                        if req.sampling_params.stop_token_ids
-                        else [req.tokenizer.eos_token_id]
                     ),
                     dtype=torch.int64,
                     device=self.orchestrator.device,
