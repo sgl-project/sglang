@@ -42,7 +42,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.705, f"{metrics}"
+        assert metrics["score"] >= 0.71, f"{metrics}"
 
     def test_human_eval(self):
         args = SimpleNamespace(
