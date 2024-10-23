@@ -50,10 +50,10 @@ class SamplingParams:
         self.presence_penalty = presence_penalty
         self.repetition_penalty = repetition_penalty
         self.stop_strs = stop
-        if stop_token_ids is None:
-            self.stop_token_ids = set()
-        else:
+        if stop_token_ids:
             self.stop_token_ids = set(stop_token_ids)
+        else:
+            self.stop_token_ids = None
         self.max_new_tokens = max_new_tokens
         self.min_new_tokens = min_new_tokens
         self.ignore_eos = ignore_eos
@@ -133,10 +133,6 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
-
-        # Process stop token ids
-        if tokenizer and tokenizer.additional_stop_token_ids:
-            self.stop_token_ids.update(tokenizer.additional_stop_token_ids)
 
     def to_srt_kwargs(self):
         return {
