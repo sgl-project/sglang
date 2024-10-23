@@ -31,6 +31,7 @@ class TestEvalAccuracyMini(unittest.TestCase):
             eval_name="mmlu",
             num_examples=64,
             num_threads=32,
+            temperature=0.1,
         )
 
         metrics = run_eval(args)

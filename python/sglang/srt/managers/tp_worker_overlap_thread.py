@@ -32,6 +32,15 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 
+@torch.compile(dynamic=True)
+def resolve_future_token_ids(input_ids, future_token_ids_map):
+    input_ids[:] = torch.where(
+        input_ids < 0,
+        future_token_ids_map[torch.clamp(-input_ids, min=0)],
+        input_ids,
+    )
+
+
 class TpModelWorkerClient:
     """A tensor parallel model worker."""
 
@@ -55,7 +64,7 @@ class TpModelWorkerClient:
             (self.max_running_requests * 5,), dtype=torch.int32, device=self.device
         )
 
-        # Launch a thread
+        # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
         self.forward_stream = torch.cuda.Stream()
@@ -63,6 +72,12 @@ class TpModelWorkerClient:
             target=self.forward_thread_func,
         )
         self.forward_thread.start()
+
+        self.copy_queue = Queue()
+        self.copy_thread = threading.Thread(
+            target=self.copy_thread_func,
+        )
+        self.copy_thread.start()
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -86,15 +101,14 @@ class TpModelWorkerClient:
     @torch.inference_mode()
     def forward_thread_func_(self):
         while True:
+            self.has_inflight_batch = False
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
+            self.has_inflight_batch = True
+            self.launch_event = threading.Event()
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
-            input_ids[:] = torch.where(
-                input_ids < 0,
-                self.future_token_ids_map[torch.clamp(-input_ids, min=0)],
-                input_ids,
-            )
+            resolve_future_token_ids(input_ids, self.future_token_ids_map)
 
             # Run forward
             logits_output, next_token_ids = self.worker.forward_batch_generation(
@@ -103,23 +117,30 @@ class TpModelWorkerClient:
 
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
-            future_next_token_ids = torch.arange(
-                -(future_token_ids_ct + bs),
-                -(future_token_ids_ct),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            self.future_token_ids_map[-future_next_token_ids] = next_token_ids.to(
-                torch.int32
-            )
+            self.future_token_ids_map[
+                future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
+            ] = next_token_ids
 
-            # Set the result
-            next_token_ids = next_token_ids.tolist()
-            assert logits_output.next_token_logprobs is None, "Not supported"
-            self.output_queue.put((None, next_token_ids))
+            # Copy results to the CPU
+            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+            copy_event = torch.cuda.Event(blocking=True)
+            copy_event.record()
+
+            self.launch_event.set()
+            self.copy_queue.put((copy_event, next_token_ids))
+
+    def copy_thread_func(self):
+        while True:
+            copy_event, next_token_ids = self.copy_queue.get()
+            while not copy_event.query():
+                time.sleep(1e-5)
+            self.output_queue.put((None, next_token_ids.tolist()))
 
     def resulve_batch_result(self, bid: int):
         logits_output, next_token_ids = self.output_queue.get()
+        if self.has_inflight_batch:
+            # Wait until the batch is launched
+            self.launch_event.wait()
         return logits_output, next_token_ids
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
@@ -129,8 +150,9 @@ class TpModelWorkerClient:
         # Allocate output future objects
         bs = len(model_worker_batch.seq_lens)
         future_next_token_ids = torch.arange(
-            -(self.future_token_ids_ct + bs),
-            -(self.future_token_ids_ct),
+            -(self.future_token_ids_ct + 1),
+            -(self.future_token_ids_ct + 1 + bs),
+            -1,
             dtype=torch.int32,
             device=self.device,
         )

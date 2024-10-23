@@ -41,6 +41,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     ControllerInfo,
     FlushCacheReq,
+    GetMemPoolSizeReq,
+    GetMemPoolSizeReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -169,6 +171,7 @@ class Scheduler:
             self.max_total_num_tokens,
             self.max_prefill_tokens,
             self.max_running_requests,
+            self.max_req_len,
             self.max_req_input_len,
             self.random_seed,
             self.device,
@@ -401,6 +404,10 @@ class Scheduler:
                     self.start_profile()
                 else:
                     self.stop_profile()
+            elif isinstance(recv_req, GetMemPoolSizeReq):
+                self.send_to_detokenizer.send_pyobj(
+                    GetMemPoolSizeReqOutput(self.max_total_num_tokens)
+                )
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 
@@ -454,19 +461,20 @@ class Scheduler:
                 )
 
         # Truncate prompts that are too long
-        if len(req.origin_input_ids) >= self.max_req_input_len:
+        if len(req.origin_input_ids) > self.max_req_input_len:
             logger.warning(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated!!!"
             )
             req.origin_input_ids = req.origin_input_ids[: self.max_req_input_len]
+
         req.sampling_params.max_new_tokens = min(
             (
                 req.sampling_params.max_new_tokens
                 if req.sampling_params.max_new_tokens is not None
                 else 1 << 30
             ),
-            self.max_req_input_len - 1 - len(req.origin_input_ids),
+            self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
         self.waiting_queue.append(req)
@@ -701,8 +709,9 @@ class Scheduler:
             self.req_to_token_pool,
             self.token_to_kv_pool,
             self.tree_cache,
+            self.model_config,
         )
-        new_batch.prepare_for_extend(self.model_config.vocab_size)
+        new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill
         if self.is_mixed_chunk and self.running_batch is not None:

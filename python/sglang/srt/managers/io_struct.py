@@ -357,6 +357,16 @@ class ProfileReq(Enum):
     STOP_PROFILE = 2
 
 
+@dataclass
+class GetMemPoolSizeReq:
+    pass
+
+
+@dataclass
+class GetMemPoolSizeReqOutput:
+    size: int
+
+
 class ControllerInfo:
     def __init__(self, dp_size):
         self.available_kv_cache = []
