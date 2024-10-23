@@ -124,7 +124,7 @@ class DataParallelController:
         self.main_num_waiting_req = []
 
         # For pre_radix
-        self.zmq_raidx = server_args.load_balance_method == "pre_radix"
+        self.pre_raidx = server_args.load_balance_method == "pre_radix"
 
         # Start data parallel workers
         base_gpu_id = 0
@@ -140,7 +140,7 @@ class DataParallelController:
             self.workers.append(send_to)
             base_gpu_id += server_args.tp_size
 
-        if self.zmq_raidx:
+        if self.pre_raidx:
             import threading
 
             self.newest_tree_cache = {}
@@ -231,7 +231,7 @@ class DataParallelController:
         if not self.main_available_kv_cache:
             self.main_available_kv_cache = available_mem.copy()
         if self.pre_available_kv_cache != available_mem:
-            self.pre_available_kv_cache = available_mem.copy()
+            self.pre_available_kv_cache = available_mem
             self.main_available_kv_cache = available_mem.copy()
 
         if not self.pre_num_running_req:
@@ -239,7 +239,7 @@ class DataParallelController:
         if not self.main_num_running_req:
             self.main_num_running_req = num_reqs_running.copy()
         if self.pre_num_running_req != num_reqs_running:
-            self.main_num_running_req = num_reqs_running.copy()
+            self.main_num_running_req = num_reqs_running
             self.pre_num_running_req = num_reqs_running.copy()
 
         if not self.pre_num_waiting_req:
@@ -247,7 +247,7 @@ class DataParallelController:
         if not self.main_num_waiting_req:
             self.main_num_waiting_req = num_reqs_waiting.copy()
         if self.pre_num_waiting_req != num_reqs_waiting:
-            self.main_num_waiting_req = num_reqs_waiting.copy()
+            self.main_num_waiting_req = num_reqs_waiting
             self.pre_num_waiting_req = num_reqs_waiting.copy()
 
     def allocate_gpu(self, req):
