@@ -9,5 +9,5 @@
 /python/sglang/srt/models @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
 /python/sglang/srt/openai_api @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
 /python/sglang/srt/sampling @merrymercy @hnyls2002
-/test/lang @merrymercy @Ying1123 @hnyls2002 @ByronHsu
-/test/srt @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
+/test/lang @merrymercy @Ying1123 @ByronHsu
+/test/srt @merrymercy @Ying1123 @zhyncs
