@@ -37,8 +37,7 @@ import torch
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained import GrammarMatcher, RegexGuide
-from sglang.srt.constrained.jump_forward import JumpForwardMap
+from sglang.srt.constrained.grammar import Grammar
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -247,12 +246,7 @@ class Req:
         self.embedding = None
 
         # Constrained decoding
-        self.regex_fsm: Optional[RegexGuide] = None
-        self.regex_fsm_state: int = 0
-        self.regex_bnf: Optional[GrammarMatcher] = None
-
-        self.allow_jump_forward = False
-        self.jump_forward_map: JumpForwardMap = None
+        self.grammar: Optional[Grammar] = None
 
         # For Qwen2-VL
         self.mrope_position_delta = []  # use mutable object
@@ -356,7 +350,9 @@ class Req:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
 
-    def jump_forward_and_retokenize_fsm(self, jump_forward_str, next_state):
+    def jump_forward_and_retokenize(self, jump_forward_str, next_state):
+        assert self.grammar is not None and self.tokenizer is not None
+
         if self.origin_input_text is None:
             # Recovering text can only use unpadded ids
             self.origin_input_text = self.tokenizer.decode(
@@ -396,7 +392,8 @@ class Req:
                 self.surr_offset = self.read_offset - i
                 break
 
-        self.regex_fsm_state = next_state
+        # update the inner state of the grammar
+        self.grammar.jump_and_retokenize(old_output_ids, self.output_ids, next_state)
 
         if self.return_logprob:
             # For fast-forward part's logprobs
@@ -406,72 +403,6 @@ class Req:
                     k = k + 1
                 else:
                     break
-            self.output_token_logprobs = self.output_token_logprobs[:k]
-            self.output_top_logprobs = self.output_top_logprobs[:k]
-            self.logprob_start_len = prompt_tokens + k
-            self.last_update_decode_tokens = len(self.output_ids) - k
-
-        return True
-
-    def jump_forward_and_retokenize_bnf(self, jump_forward_str):
-        assert self.regex_bnf is not None, "should be a regex request"
-        assert self.tokenizer is not None, "should have a tokenizer"
-
-        if self.origin_input_text is None:
-            # Recovering text can only use unpadded ids
-            self.origin_input_text = self.tokenizer.decode(
-                self.origin_input_ids_unpadded
-            )
-
-        all_text = self.origin_input_text + self.decoded_text + jump_forward_str
-        all_ids = self.tokenizer.encode(all_text)
-        if not all_ids:
-            logger.warning("Encoded all_text resulted in empty all_ids")
-            return False
-
-        prompt_tokens = len(self.origin_input_ids_unpadded)
-        if prompt_tokens > len(all_ids):
-            logger.warning("prompt_tokens is larger than encoded all_ids")
-            return False
-
-        if all_ids[prompt_tokens - 1] != self.origin_input_ids_unpadded[-1]:
-            # TODO(lsyin): fix token fusion
-            logger.warning(
-                "Token fusion between input and output, try to avoid this by removing the space at the end of the input."
-            )
-            return False
-
-        old_output_ids = self.output_ids
-        self.output_ids = all_ids[prompt_tokens:]
-        self.decoded_text = self.decoded_text + jump_forward_str
-        self.surr_offset = prompt_tokens
-        self.read_offset = len(all_ids)
-
-        # NOTE: A trick to reduce the surrouding tokens decoding overhead
-        for i in range(0, INIT_INCREMENTAL_DETOKENIZATION_OFFSET):
-            surr_text_ = self.tokenizer.decode(
-                all_ids[self.read_offset - i : self.read_offset]
-            )
-            if not surr_text_.endswith("�"):
-                self.surr_offset = self.read_offset - i
-                break
-
-        k = 0
-        for i, old_id in enumerate(old_output_ids):
-            if old_id == self.output_ids[i]:
-                k = i + 1
-            else:
-                break
-
-        # rollback to the last token that is the same
-        if k < len(old_output_ids):
-            self.regex_bnf.rollback(len(old_output_ids) - k)
-
-        for i in range(k, len(self.output_ids)):
-            assert self.regex_bnf.accept_token(self.output_ids[i])
-
-        if self.return_logprob:
-            # For fast-forward part's logprobs
             self.output_token_logprobs = self.output_token_logprobs[:k]
             self.output_top_logprobs = self.output_top_logprobs[:k]
             self.logprob_start_len = prompt_tokens + k
@@ -532,8 +463,8 @@ class ScheduleBatch:
     # Stream
     has_stream: bool = False
 
-    # Has regex
-    has_regex: bool = False
+    # Has grammar
+    has_grammar: bool = False
 
     # device
     device: str = "cuda"
@@ -541,7 +472,7 @@ class ScheduleBatch:
     @classmethod
     def init_new(
         cls,
-        reqs,
+        reqs: List[Req],
         req_to_token_pool,
         token_to_kv_pool,
         tree_cache,
@@ -555,7 +486,7 @@ class ScheduleBatch:
             model_config=model_config,
             return_logprob=any(req.return_logprob for req in reqs),
             has_stream=any(req.stream for req in reqs),
-            has_regex=any(req.regex_fsm or req.regex_bnf for req in reqs),
+            has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
         )
 
@@ -862,27 +793,10 @@ class ScheduleBatch:
         keep_indices = set(i for i in range(len(self.reqs)))
 
         for i, req in enumerate(self.reqs):
-            if req.jump_forward_map is not None:
-                assert req.regex_fsm is not None and req.regex_bnf is None
-                jump_forward_bytes = req.jump_forward_map.jump_forward_byte(
-                    req.regex_fsm_state
-                )
-                if jump_forward_bytes is not None and len(jump_forward_bytes) > 1:
-                    suffix_bytes = []
-                    continuation_range = range(0x80, 0xC0)
-                    cur_state = req.regex_fsm_state
-                    while (
-                        len(jump_forward_bytes)
-                        and jump_forward_bytes[0][0] in continuation_range
-                    ):
-                        # continuation bytes
-                        byte_edge = jump_forward_bytes.pop(0)
-                        suffix_bytes.append(byte_edge[0])
-                        cur_state = byte_edge[1]
-
-                    suffix_tokens = [f"<0x{hex(b)[2:].upper()}>" for b in suffix_bytes]
-                    suffix_ids = req.tokenizer.convert_tokens_to_ids(suffix_tokens)
-
+            if req.grammar is not None:
+                jump_helper = req.grammar.try_jump(req.tokenizer)
+                if jump_helper.can_jump():
+                    suffix_ids = jump_helper.suffix_ids
                     # Current ids, for cache and revert
                     cur_all_ids = tuple(req.origin_input_ids + req.output_ids)[:-1]
                     cur_output_ids = req.output_ids
@@ -896,46 +810,12 @@ class ScheduleBatch:
                     (
                         jump_forward_str,
                         next_state,
-                    ) = req.jump_forward_map.jump_forward_symbol(cur_state)
+                    ) = req.grammar.jump_forward_str_state(jump_helper)
 
-                    # Make the incrementally decoded text part of jump_forward_str
-                    # so that the UTF-8 will not corrupt
                     jump_forward_str = new_text + jump_forward_str
-                    if not req.jump_forward_and_retokenize_fsm(
+                    if not req.jump_forward_and_retokenize(
                         jump_forward_str, next_state
                     ):
-                        req.output_ids = cur_output_ids
-                        continue
-
-                    # The decode status has diverged from detokenizer_manager
-                    req.vid += 1
-
-                    # insert the old request into tree_cache
-                    self.tree_cache.cache_finished_req(req, cur_all_ids)
-
-                    # re-applying image padding
-                    if req.image_inputs is not None:
-                        req.origin_input_ids = pad_input_ids_func(
-                            req.origin_input_ids_unpadded, req.image_inputs
-                        )
-
-                    jump_forward_reqs.append(req)
-                    keep_indices.remove(i)
-
-            if req.allow_jump_forward:
-                assert req.regex_bnf is not None and req.regex_fsm is None
-                jump_forward_str = req.regex_bnf.find_jump_forward_string()
-                if len(jump_forward_str) > 1:
-                    cur_all_ids = tuple(req.origin_input_ids + req.output_ids)[:-1]
-                    cur_output_ids = req.output_ids
-                    decode_res, new_text = req.get_next_inc_detokenization()
-                    if not decode_res:
-                        req.output_ids = cur_output_ids
-                        continue
-
-                    jump_forward_str = new_text + jump_forward_str
-                    if not req.jump_forward_and_retokenize_bnf(jump_forward_str):
-                        # Failed to jump forward, revert
                         req.output_ids = cur_output_ids
                         continue
 
@@ -1038,7 +918,7 @@ class ScheduleBatch:
             self.top_logprobs_nums = None
 
         self.has_stream = any(req.stream for req in self.reqs)
-        self.has_regex = any(req.regex_fsm or req.regex_bnf for req in self.reqs)
+        self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, new_indices)
 
@@ -1071,7 +951,7 @@ class ScheduleBatch:
 
         self.return_logprob = self.return_logprob or other.return_logprob
         self.has_stream = self.has_stream or other.has_stream
-        self.has_regex = self.has_regex or other.has_regex
+        self.has_grammar = self.has_grammar or other.has_grammar
 
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode():
@@ -1081,15 +961,10 @@ class ScheduleBatch:
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        if self.has_regex:
-            self.sampling_info.regex_fsms = [req.regex_fsm for req in self.reqs]
-            self.sampling_info.regex_bnfs = [req.regex_bnf for req in self.reqs]
-            self.sampling_info.regex_fsm_states = [
-                req.regex_fsm_state for req in self.reqs
-            ]
+        if self.has_grammar:
+            self.sampling_info.grammars = [req.grammar for req in self.reqs]
         else:
-            self.sampling_info.regex_fsms = None
-            self.sampling_info.regex_bnfs = None
+            self.sampling_info.grammars = None
 
         global bid
         bid += 1
