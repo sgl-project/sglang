@@ -57,6 +57,7 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
+    split_prefill_batch: bool = False
 
     # Other runtime options
     tp_size: int = 1
@@ -186,6 +187,10 @@ class ServerArgs:
         if "gemma-2" in self.model_path.lower():
             logger.info("When using sliding window in gemma-2, turn on flashinfer.")
             self.attention_backend = "flashinfer"
+            
+        # Speculative Decoding
+        if self.speculative_algorithm=='EAGLE':
+            self.split_prefill_batch = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
