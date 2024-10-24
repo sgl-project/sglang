@@ -103,7 +103,7 @@ jobs:
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v3
         with:
-          personal_token: ${{ secrets.PAT_TOKEN }}
+          personal_token: ${{ secrets.DOCKERHUB_TOKEN }}
           external_repository: sgl-project/sgl-project.github.io
           publish_branch: main
           publish_dir: docs/en/_build/html
