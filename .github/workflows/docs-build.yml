@@ -79,7 +79,7 @@ jobs:
 
       - name: Push to sgl-project.github.io
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_DOCUMENTS }}
+          GITHUB_TOKEN: ${{ secrets.DOCUMENT_TOKEN }}
         run: |
           cd docs/en/_build/html
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
