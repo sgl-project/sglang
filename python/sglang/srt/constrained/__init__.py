@@ -51,6 +51,21 @@ except ImportError:
         return build_regex_from_schema(schema, whitespace_pattern)
 
 
+try:
+    from xgrammar import (
+        GrammarMatcher,
+        GrammarMatcherInitContext,
+        GrammarMatcherInitContextCache,
+    )
+except ImportError as e:
+
+    class Dummy:
+        pass
+
+    GrammarMatcher = Dummy
+    GrammarMatcherInitContext = Dummy
+    GrammarMatcherInitContextCache = Dummy
+
 __all__ = [
     "RegexGuide",
     "FSMInfo",
@@ -60,4 +75,7 @@ __all__ = [
     "disk_cache",
     "disable_cache",
     "make_byte_level_fsm",
+    "GrammarMatcher",
+    "GrammarMatcherInitContext",
+    "GrammarMatcherInitContextCache",
 ]

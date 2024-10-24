@@ -102,6 +102,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
+    grammar_backend: Optional[str] = "outlines"
 
     # Optimization/debug options
     disable_flashinfer: bool = False
@@ -536,6 +537,13 @@ class ServerArgs:
             choices=["flashinfer", "pytorch"],
             default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
+        )
+        parser.add_argument(
+            "--grammar-backend",
+            type=str,
+            choices=["xgrammar", "outlines"],
+            default=ServerArgs.grammar_backend,
+            help="Choose the backend for constrained decoding.",
         )
 
         # Optimization/debug options
