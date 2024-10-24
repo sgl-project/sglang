@@ -61,10 +61,10 @@ jobs:
             fi
           done
 
-          - name: Install Pandoc
-          run: |
-            sudo apt-get update
-            sudo apt-get install -y pandoc
+      - name: Install Pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
 
       - name: Build documentation
         run: |
