@@ -58,8 +58,8 @@ class TestOverlapSchedule(unittest.TestCase):
             metrics = run_eval(args)
             assert metrics["score"] >= 0.65
         finally:
-            kill_child_process(process.pid)
             time.sleep(1)
+            kill_child_process(process.pid)
 
         has_new_server = False
         has_leak = False
