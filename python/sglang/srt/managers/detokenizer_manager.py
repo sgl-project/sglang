@@ -27,6 +27,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    GetMemPoolSizeReqOutput,
     UpdateWeightReqOutput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR, FINISH_MATCHED_TOKEN
@@ -109,6 +110,9 @@ class DetokenizerManager:
                 continue
             elif isinstance(recv_obj, UpdateWeightReqOutput):
                 # If it is a weight update request, no detokenization is needed.
+                self.send_to_tokenizer.send_pyobj(recv_obj)
+                continue
+            elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
                 self.send_to_tokenizer.send_pyobj(recv_obj)
                 continue
             elif self.tokenizer is None:

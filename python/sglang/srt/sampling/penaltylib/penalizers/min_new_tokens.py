@@ -31,9 +31,12 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         padded_stop_token_ids = torch.nn.utils.rnn.pad_sequence(
             sequences=[
                 torch.tensor(
-                    data=list(
-                        req.sampling_params.stop_token_ids
-                        | {req.tokenizer.eos_token_id}
+                    data=(
+                        list(
+                            (req.sampling_params.stop_token_ids or set())
+                            | (req.tokenizer.additional_stop_token_ids or set())
+                            | {req.tokenizer.eos_token_id}
+                        )
                     ),
                     dtype=torch.int64,
                     device=self.orchestrator.device,
