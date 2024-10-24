@@ -151,6 +151,7 @@ class CudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int32)
 
             if self.is_encoder_decoder:
                 # NOTE: encoder_lens can influence the full_text_row_masked_out_mask tensor when doing mixed batch
@@ -232,6 +233,7 @@ class CudaGraphRunner:
             encoder_lens = None
 
         seq_lens_sum = seq_lens.sum().item()
+        mrope_positions = self.mrope_positions[:, :bs]
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -258,6 +260,7 @@ class CudaGraphRunner:
                 return_logprob=False,
                 top_logprobs_nums=[0] * bs,
                 positions=clamp_position(seq_lens),
+                mrope_positions=mrope_positions,
             )
             return forward(input_ids, forward_batch.positions, forward_batch)
 
@@ -300,6 +303,7 @@ class CudaGraphRunner:
         self.out_cache_loc[:raw_bs].copy_(forward_batch.out_cache_loc)
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
+        self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
