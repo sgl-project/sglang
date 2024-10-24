@@ -22,7 +22,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'  # 改为与其他 workflow 一致的 Python 版本
+          python-version: '3.9'
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
@@ -41,7 +49,7 @@ jobs:
         env:
           HF_HOME: /hf_home
           SGLANG_IS_IN_CI: true
-          CUDA_VISIBLE_DEVICES: 0  # 参考 setup_github_runner.md 中的环境变量
+          CUDA_VISIBLE_DEVICES: 0
         run: |
           cd docs/en
           for nb in *.ipynb; do
@@ -68,18 +76,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         uses: peaceiris/actions-gh-pages@v3
         with:
-          deploy_key: ${{ secrets.ACTIONS_DEPLOY_KEY }}  # 需要设置 deploy key
+          deploy_key: ${{ secrets.ACTIONS_DEPLOY_KEY }}
           publish_dir: docs/en/_build/html
           force_orphan: true
           full_commit_message: 'docs: update documentation'
-
-
-# Python 版本改为 3.9，与其他 workflow 保持一致
-# 使用 deploy_key 而不是 github_token，这样更安全
-# 添加了 CUDA_VISIBLE_DEVICES 环境变量
-# 修改了文档构建路径为 docs/en
-# 添加了 force_orphan 和 commit message 配置
-# 你需要在 GitHub 仓库设置中：
-# 生成一个新的 SSH key pair
-# 在仓库的 Settings -> Deploy Keys 中添加公钥，并勾选 "Allow write access"
-# 在仓库的 Settings -> Secrets -> Actions 中添加名为 ACTIONS_DEPLOY_KEY 的私钥
