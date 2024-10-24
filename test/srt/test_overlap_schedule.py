@@ -5,6 +5,7 @@ python3 test_overlap_schedule.py
 """
 
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -58,9 +59,18 @@ class TestOverlapSchedule(unittest.TestCase):
             assert metrics["score"] >= 0.65
         finally:
             kill_child_process(process.pid)
+            time.sleep(1)
 
+        has_new_server = False
+        has_leak = False
         for line in output_lines:
-            assert "leak" not in line
+            if "The server is fired" in line:
+                has_new_server = True
+            if "leak" in line:
+                has_leak = True
+
+        assert has_new_server
+        assert not has_leak
 
     def test_no_radix_attention_chunked_prefill(self):
         self.run_mmlu(disable_radix_cache=True, chunked_prefill_size=32)
