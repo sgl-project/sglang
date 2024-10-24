@@ -1,3 +1,7 @@
+"""
+python3 -m unittest test_large_max_new_tokens.TestLargeMaxNewTokens.test_chat_completion
+"""
+
 import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -62,7 +66,7 @@ class TestLargeMaxNewTokens(unittest.TestCase):
             all_requests_running = False
             for line in iter(self.process.stderr.readline, ""):
                 line = str(line)
-                print(line, end="")
+                print(line, end="", flush=True)
                 if f"#running-req: {num_requests}" in line:
                     all_requests_running = True
                     break

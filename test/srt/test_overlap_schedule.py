@@ -1,9 +1,10 @@
 """
 Usage:
-SGLANG_IS_IN_CI=true python3 -m unittest test_overlap_schedule.TestOverlapSchedule.test_radix_attention_chunked_prefill
-SGLANG_IS_IN_CI=true python3 test_overlap_schedule.py
+python3 -m unittest test_overlap_schedule.TestOverlapSchedule.test_radix_attention_chunked_prefill
+python3 test_overlap_schedule.py
 """
 
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -15,6 +16,12 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
+
+
+def read_output(process, output_lines):
+    for line in iter(process.stderr.readline, ""):
+        print(line, end="", flush=True)
+        output_lines.append(line)
 
 
 class TestOverlapSchedule(unittest.TestCase):
@@ -31,14 +38,19 @@ class TestOverlapSchedule(unittest.TestCase):
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
+            return_stdout_stderr=True,
         )
+
+        output_lines = []
+        t = threading.Thread(target=read_output, args=(process, output_lines))
+        t.start()
 
         args = SimpleNamespace(
             base_url=base_url,
             model=model,
             eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
+            num_examples=128,
+            num_threads=128,
         )
 
         try:
@@ -46,6 +58,9 @@ class TestOverlapSchedule(unittest.TestCase):
             assert metrics["score"] >= 0.65
         finally:
             kill_child_process(process.pid)
+
+        for line in output_lines:
+            assert "leak" not in line
 
     def test_no_radix_attention_chunked_prefill(self):
         self.run_mmlu(disable_radix_cache=True, chunked_prefill_size=32)

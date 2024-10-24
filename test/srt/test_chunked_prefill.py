@@ -1,3 +1,8 @@
+"""
+python3 -m unittest test_chunked_prefill.TestChunkedPrefill.test_mixed_chunked_prefill_without_radix_cache
+"""
+
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -10,6 +15,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
     run_bench_serving,
 )
+
+
+def read_output(process, output_lines):
+    for line in iter(process.stderr.readline, ""):
+        print(line, end="", flush=True)
+        output_lines.append(line)
 
 
 class TestChunkedPrefill(unittest.TestCase):
@@ -30,14 +41,19 @@ class TestChunkedPrefill(unittest.TestCase):
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
+            return_stdout_stderr=True,
         )
+
+        output_lines = []
+        t = threading.Thread(target=read_output, args=(process, output_lines))
+        t.start()
 
         args = SimpleNamespace(
             base_url=base_url,
             model=model,
             eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
+            num_examples=128,
+            num_threads=128,
         )
 
         try:
@@ -45,6 +61,9 @@ class TestChunkedPrefill(unittest.TestCase):
             assert metrics["score"] >= 0.65
         finally:
             kill_child_process(process.pid)
+
+        for line in output_lines:
+            assert "leak" not in line
 
     def test_chunked_prefill(self):
         self.run_mmlu(disable_radix_cache=False, enable_mixed_chunk=False)
