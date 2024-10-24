@@ -108,7 +108,6 @@ class CudaGraphRunner:
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
 
         # Batch sizes to capture
-        # For speculative decoding, it means number of input token
         if self.model_runner.server_args.disable_cuda_graph_padding:
             self.capture_bs = list(range(1, 32)) + [64, 128]
         else:
@@ -117,10 +116,13 @@ class CudaGraphRunner:
         self.capture_bs = [
             bs for bs in self.capture_bs if bs <= model_runner.req_to_token_pool.size
         ]
-        
-        if model_runner.server_args.speculative_algorithm == 'EAGLE' and self.model_runner.is_draft_runner:
-            # TODO: Support edit top_k in config  @kavioyu
-            expand_num = self.model_runner.server_args.eagle_topk
+        self.capture_forward_mode = ForwardMode.DECODE
+        if model_runner.server_args.speculative_algorithm == 'EAGLE':
+            if self.model_runner.is_draft_runner:
+                expand_num = self.model_runner.server_args.eagle_topk
+            else:
+                self.capture_forward_mode = ForwardMode.SPECVERIFY
+                expand_num = self.model_runner.server_args.num_draft_tokens
             self.num_tokens = [bs * expand_num for bs in self.capture_bs]
         else:
             self.num_tokens = [bs for bs in self.capture_bs]
@@ -207,21 +209,25 @@ class CudaGraphRunner:
         positions = self.positions[:num_token]
         
         spec_info = None
-        if self.model_runner.server_args.speculative_algorithm == 'EAGLE' and self.model_runner.is_draft_runner:
-            spec_info = DraftInfoFactory.get(self.model_runner.server_args.speculative_algorithm)()
-            spec_info.hidden_states = self.hidden_states[:num_token]
-            spec_info.positions = positions
-            spec_info.init(self.model_runner.server_args)
-        
+        if self.model_runner.server_args.speculative_algorithm == 'EAGLE':
+            if self.model_runner.is_draft_runner:
+                spec_info = DraftInfoFactory.get(self.model_runner.server_args.speculative_algorithm, 'DraftInput')()
+                spec_info.hidden_states = self.hidden_states[:num_token]
+                spec_info.positions = positions
+                spec_info.init(self.model_runner.server_args)
+            else:
+                spec_info = DraftInfoFactory.get(self.model_runner.server_args.speculative_algorithm, 'VerifyInput')(
+                    None, None, None, None, None, None, self.model_runner.server_args.num_draft_tokens)
+                
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-            num_token, req_pool_indices, seq_lens, spec_info
+            num_token, req_pool_indices, seq_lens, spec_info, self.model_runner.is_draft_runner
         )
 
         # Run and capture
-        def run_once():
+        def run_once(mode):
             forward_batch = ForwardBatch(
-                forward_mode=ForwardMode.DECODE,
+                forward_mode=mode,
                 batch_size=bs,
                 input_ids=input_ids,
                 req_pool_indices=req_pool_indices,
@@ -242,7 +248,7 @@ class CudaGraphRunner:
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
 
-            run_once()
+            run_once(self.capture_forward_mode)
 
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
@@ -251,7 +257,7 @@ class CudaGraphRunner:
         self.model_runner.tp_group.barrier()
 
         with torch.cuda.graph(graph, pool=self.graph_memory_pool, stream=stream):
-            out = run_once()
+            out = run_once(self.capture_forward_mode)
 
         torch.cuda.synchronize()
         self.model_runner.tp_group.barrier()
@@ -282,7 +288,7 @@ class CudaGraphRunner:
         self.positions[:num_token] = forward_batch.positions
         
         # EAGLE speculative decoding
-        if isinstance(forward_batch.spec_info, DraftInfoFactory.get('EAGLE')):
+        if isinstance(forward_batch.spec_info, DraftInfoFactory.get('EAGLE', 'DraftInput')):
             self.hidden_states[:num_token] = forward_batch.spec_info.hidden_states
 
         # Attention backend

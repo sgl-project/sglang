@@ -44,23 +44,26 @@ class SpecDraftInput(SpecInput):
         raise NotImplementedError()
 
 
-class SpecDraftInfoFactory:
+class SpecInfoFactory:
     def __init__(self):
         self.factory = {}
 
-    def register(self, name: str) -> SpecDraftInput:
-        def wrapper(info: Type[SpecDraftInput]) -> Type[SpecDraftInput]:
-            self.factory[name] = info
+    def register(self, alg_name: str, type_name: str) -> SpecInput:
+        def wrapper(info: Type[SpecInput]) -> Type[SpecInput]:
+            assert type_name in ['DraftInput', 'VerifyInput']
+            if alg_name not in self.factory:
+                self.factory[alg_name] = {}
+            self.factory[alg_name].update({type_name: info})
             return info
 
         return wrapper
 
-    def get(self, name):
-        if name is None:
+    def get(self, alg_name, type_name: str):
+        if alg_name is None:
             return None
-        return self.factory[name]
+        return self.factory[alg_name][type_name]
 
 
-DraftInfoFactory = SpecDraftInfoFactory()
+DraftInfoFactory = SpecInfoFactory()
 
 

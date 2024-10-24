@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.flashinfer_utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.speculative.speculative_utils import SpecInput
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -152,6 +153,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.cuda_graph_kv_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device="cuda"
         )
+        self.cuda_graph_q_indptr = self.cuda_graph_kv_indptr.clone()
         self.cuda_graph_kv_indices = torch.zeros(
             (max_bs * self.model_runner.model_config.context_len,),
             dtype=torch.int32,
@@ -170,24 +172,39 @@ class FlashInferAttnBackend(AttentionBackend):
         ]
 
     def init_forward_metadata_capture_cuda_graph(
-        self, num_token: int, req_pool_indices, seq_lens, spec_info
+        self, num_token: int, req_pool_indices, seq_lens, 
+        spec_info:SpecInput, is_draft_runner: bool=False
     ):
         decode_wrappers = []
         for i in range(self.num_wrappers):
-            decode_wrappers.append(
-                BatchDecodeWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    use_cuda_graph=True,
-                    use_tensor_cores=self.decode_use_tensor_cores,
-                    paged_kv_indptr_buffer=self.cuda_graph_kv_indptr[i][: num_token + 1],
-                    paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                    paged_kv_last_page_len_buffer=self.cuda_graph_kv_last_page_len[:num_token],
+            if spec_info is not None and not is_draft_runner:
+                decode_wrappers.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        use_cuda_graph=True,
+                        qo_indptr_buf=self.cuda_graph_q_indptr[:num_token+1],
+                        paged_kv_indptr_buf=self.cuda_graph_kv_indptr[i][: num_token + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.cuda_graph_kv_last_page_len[:num_token],
+                    )
                 )
-            )
+            else:
+                decode_wrappers.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        use_cuda_graph=True,
+                        use_tensor_cores=self.decode_use_tensor_cores,
+                        paged_kv_indptr_buffer=self.cuda_graph_kv_indptr[i][: num_token + 1],
+                        paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buffer=self.cuda_graph_kv_last_page_len[:num_token],
+                    )
+                )
+        mode = ForwardMode.SPECVERIFY if spec_info is not None and not is_draft_runner else ForwardMode.DECODE
 
         update_flashinfer_indices(
-            ForwardMode.DECODE,
+            mode,
             self.model_runner,
             req_pool_indices,
             seq_lens,

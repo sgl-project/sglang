@@ -77,7 +77,7 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.SPECEXTEND
     
     def is_cuda_graph(self):
-        return self in (ForwardMode.DECODE, )
+        return self in (ForwardMode.DECODE, ForwardMode)
 
 
 @dataclass

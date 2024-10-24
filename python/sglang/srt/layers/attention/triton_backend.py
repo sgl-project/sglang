@@ -79,7 +79,7 @@ class TritonAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_capture_cuda_graph(
-        self, num_token: int, req_pool_indices, seq_lens
+        self, num_token: int, req_pool_indices, seq_lens, spec_info, is_draft_runner
     ):
         self.forward_metadata = (
             self.cuda_graph_start_loc,

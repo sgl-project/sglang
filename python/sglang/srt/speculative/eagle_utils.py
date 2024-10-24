@@ -155,7 +155,7 @@ def assign_req_to_token_pool(req_pool_indices, req_to_token, start_offset, end_o
         load_offset += BLOCK_SIZE
 
 
-@DraftInfoFactory.register("EAGLE")
+@DraftInfoFactory.register("EAGLE", "DraftInput")
 class EAGLEDraftInput(SpecDraftInput):
     hidden_states: torch.Tensor = None
     verified_id: torch.Tensor = None
@@ -434,7 +434,7 @@ class EAGLEDraftInput(SpecDraftInput):
         #self.positions = torch.cat([self.positions, spec_info.positions], axis=0)
         self.sample_output = torch.cat([self.sample_output, spec_info.sample_output])
 
-
+@DraftInfoFactory.register("EAGLE", "VerifyInput")
 class EagleVerifyInput(SpecVerifyInput):
     def __init__(
         self,
