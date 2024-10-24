@@ -35,11 +35,11 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          # pip install -e "python[all]"
+          pip install -e "python[all]"
           pip install -r docs/requirements.txt
           pip install nbconvert jupyter_client ipykernel ipywidgets matplotlib
-          # pip install transformers==4.45.2
-          # pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          pip install transformers==4.45.2
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Setup Jupyter Kernel
         run: |
