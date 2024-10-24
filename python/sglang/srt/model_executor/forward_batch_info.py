@@ -142,11 +142,12 @@ class ForwardBatch:
                     int(self.seq_lens[i]),
                 )
         elif self.forward_mode.is_extend():
+            extend_start_loc_cpu = self.extend_start_loc.cpu().numpy()
             for i, image_inputs in enumerate(batch.image_inputs):
                 extend_start_loc, extend_seq_len, extend_prefix_len = (
-                    self.extend_start_loc[i],
-                    self.extend_seq_lens[i],
-                    self.extend_prefix_lens[i],
+                    extend_start_loc_cpu[i],
+                    batch.extend_seq_lens[i],
+                    batch.extend_prefix_lens[i],
                 )
                 if image_inputs is None:
                     # text only
@@ -160,20 +161,16 @@ class ForwardBatch:
                     ] * 3
                     mrope_position_delta = 0
                 else:
+                    # TODO: current qwen2-vl do not support radix cache since mrope position calculation
                     mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=self.input_ids[
                                 extend_start_loc : extend_start_loc + extend_seq_len
-                            ].tolist(),
+                            ],
                             image_grid_thw=image_inputs.image_grid_thws,
-                            video_grid_thw=None,
-                            image_token_id=hf_config.image_token_id,
-                            video_token_id=hf_config.video_token_id,
                             vision_start_token_id=hf_config.vision_start_token_id,
-                            vision_end_token_id=hf_config.vision_end_token_id,
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
                             context_len=0,
-                            extend_prefix_len=extend_prefix_len.item(),
                         )
                     )
                 mrope_positions_list[i] = mrope_positions
