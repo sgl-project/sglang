@@ -77,11 +77,18 @@ jobs:
           name: documentation
           path: docs/en/_build/html
 
-      - name: Deploy to GitHub Pages
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          deploy_key: ${{ secrets.ACTIONS_DEPLOY_KEY }}
-          publish_dir: docs/en/_build/html
-          force_orphan: true
-          full_commit_message: 'docs: update documentation'
+      - name: Push to sgl-project.github.io
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_DOCUMENTS }}
+        run: |
+          cd docs/en/_build/html
+          git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
+          cp -r * ../sgl-project.github.io
+          cd ../sgl-project.github.io
+          git config user.name "zhaochenyang20"
+          git config user.email "zhaochenyang20@gmail.com"
+          git add .
+          git commit -m "Update documentation"
+          git push https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git main
+          cd ..
+          rm -rf sgl-project.github.io
