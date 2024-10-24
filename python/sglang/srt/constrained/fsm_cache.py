@@ -73,9 +73,16 @@ class FSMCache(BaseToolCache):
     def init_value(self, key):
         key_type, key_string = key
         if key_type == "json":
-            regex = build_regex_from_schema(
-                key_string, whitespace_pattern=self.constrained_json_whitespace_pattern
-            )
+            try:
+                regex = build_regex_from_schema(
+                    key_string,
+                    whitespace_pattern=self.constrained_json_whitespace_pattern,
+                )
+            except NotImplementedError as e:
+                logger.warning(
+                    f"skip invalid json schema: json_schema={key_string}, {e=}"
+                )
+                return None, key_string
         elif key_type == "regex":
             regex = key_string
         else:
