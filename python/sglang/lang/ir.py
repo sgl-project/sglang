@@ -112,6 +112,23 @@ class SglSamplingParams:
             "presence_penalty": self.presence_penalty,
         }
 
+    def to_shortfin_kwargs(self):
+        kwargs = {
+            "return_logprob": self.return_logprob,
+            "logprob_start_len": self.logprob_start_len,
+            "top_logprobs_num": self.top_logprobs_num,
+        }
+        kwargs["return_text_in_logprobs"] = (
+            self.return_text_in_logprobs
+            if self.return_text_in_logprobs is not None
+            else False
+        )
+        kwargs["sampling_params"] = {
+            "max_tokens": self.max_new_tokens,
+            "temperature": self.temperature,
+        }
+        return kwargs
+
     def to_srt_kwargs(self):
         return {
             "max_new_tokens": self.max_new_tokens,
