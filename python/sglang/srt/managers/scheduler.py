@@ -38,6 +38,8 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchTokenIDOut,
     FlushCacheReq,
+    GetMemPoolSizeReq,
+    GetMemPoolSizeReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -69,7 +71,6 @@ from sglang.srt.utils import (
     is_generation_model,
     is_multimodal_model,
     kill_parent_process,
-    pytorch_profile,
     set_random_seed,
     suppress_other_loggers,
 )
@@ -363,6 +364,10 @@ class Scheduler:
                     self.start_profile()
                 else:
                     self.stop_profile()
+            elif isinstance(recv_req, GetMemPoolSizeReq):
+                self.send_to_detokenizer.send_pyobj(
+                    GetMemPoolSizeReqOutput(self.max_total_num_tokens)
+                )
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 
@@ -416,7 +421,7 @@ class Scheduler:
                 )
 
         # Truncate prompts that are too long
-        if len(req.origin_input_ids) >= self.max_req_input_len:
+        if len(req.origin_input_ids) > self.max_req_input_len:
             logger.warning(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated!!!"

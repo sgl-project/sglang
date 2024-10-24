@@ -50,9 +50,10 @@ class SamplingParams:
         self.presence_penalty = presence_penalty
         self.repetition_penalty = repetition_penalty
         self.stop_strs = stop
-        if stop_token_ids is None:
-            stop_token_ids = []
-        self.stop_token_ids = {*stop_token_ids}
+        if stop_token_ids:
+            self.stop_token_ids = set(stop_token_ids)
+        else:
+            self.stop_token_ids = None
         self.max_new_tokens = max_new_tokens
         self.min_new_tokens = min_new_tokens
         self.ignore_eos = ignore_eos
@@ -119,10 +120,7 @@ class SamplingParams:
         # Process stop strings
         if self.stop_strs is None:
             self.stop_strs = []
-            if self.stop_token_ids is None:
-                self.stop_str_max_len = 0
-            else:
-                self.stop_str_max_len = 1
+            self.stop_str_max_len = 0
         else:
             if isinstance(self.stop_strs, str):
                 self.stop_strs = [self.stop_strs]

@@ -156,7 +156,7 @@ class DataParallelController:
                 else:
                     # Send other control messages to all workers
                     for worker in self.workers:
-                        worker.queue.put(recv_req)
+                        worker.send_pyobj(recv_req)
 
 
 def run_data_parallel_controller_process(
