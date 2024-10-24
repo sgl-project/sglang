@@ -174,6 +174,7 @@ class EAGLEDraftInput(SpecDraftInput):
         self.scores: torch.Tensor = None
         self.score_list: List[torch.Tensor] = []
         self.token_list: List[torch.Tensor] = []
+        self.origin_score_list: List[torch.Tensor] = [] #used for sampling
         self.parents_list: List[torch.Tensor] = []
         self.cache_list: List[torch.Tenor] = []
         self.iter = 0
@@ -245,6 +246,7 @@ class EAGLEDraftInput(SpecDraftInput):
             batch.out_cache_loc = batch.alloc_token_slots(batch.input_ids.numel())
             self.score_list.append(scores) # b, topk, topk
             self.token_list.append(topk_index) # b, topk*topk
+            self.origin_score_list.append(topk_p.reshape(topk_index.shape))
             self.parents_list.append(
                 topk_cs_index + (self.topk**2 * (self.iter - 1) + self.topk)
             ) # b, topk
@@ -253,6 +255,7 @@ class EAGLEDraftInput(SpecDraftInput):
             self.scores = topk_p  # b, top_k
             self.score_list.append(topk_p.unsqueeze(1))
             self.token_list.append(topk_index)
+            self.origin_score_list.append(topk_p)
             batch.spec_info.hidden_states = (
                 batch.spec_info.hidden_states.repeat_interleave(self.topk, 0)
             )
@@ -322,13 +325,16 @@ class EAGLEDraftInput(SpecDraftInput):
     def prepare_for_verify(self, batch: ScheduleBatch):
         score_list = torch.cat(self.score_list, dim=1).flatten(1)  # b, n, topk; n= 1+(self.iter-1)*self.topk
         ss_token_list = torch.cat(self.token_list, dim=1)  # b, (self.topk+(self.iter-1)*self.topk)
+        origin_token_list = torch.cat(self.origin_score_list, dim=1)
         top_scores = torch.topk(score_list, self.num_verify_token - 1, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
 
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+        scores = torch.gather(origin_token_list, index=top_scores_index, dim=1)
         draft_tokens = torch.cat((self.verified_id.unsqueeze(1), draft_tokens), dim=1)
         parent_list = torch.cat(self.parents_list[:-1], dim=1)
+        
 
         tree_mask, position, retrive_index, retrive_cum_len = build_tree_kernel(
             parent_list,
@@ -339,12 +345,9 @@ class EAGLEDraftInput(SpecDraftInput):
             self.num_verify_token,
         )
 
-        # out_cache = torch.cat(self.cache_list, dim=0)
-        # mem_need_free_idx = out_cache[top_scores_index]
-        # batch.token_to_kv_pool.free(mem_need_free_idx)
-        
         return EagleVerifyInput(
             draft_tokens.flatten(),
+            scores.flatten(),
             tree_mask,
             position,
             retrive_index,
@@ -436,6 +439,7 @@ class EagleVerifyInput(SpecVerifyInput):
     def __init__(
         self,
         draft_token: torch.Tensor,
+        draft_score: torch.Tensor,
         tree_mask: torch.Tensor,
         positions: torch.Tensor,
         retrive_index: torch.Tensor,
@@ -443,6 +447,7 @@ class EagleVerifyInput(SpecVerifyInput):
         draft_token_num: int,
     ):
         self.draft_token = draft_token
+        self.draft_score = draft_score
         self.custom_mask = tree_mask
         self.positions = positions
         self.retrive_index = retrive_index
