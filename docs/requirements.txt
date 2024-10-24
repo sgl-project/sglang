@@ -8,3 +8,4 @@ sphinxcontrib-mermaid
 pillow
 pydantic
 urllib3<2.0.0
+nbsphinx
