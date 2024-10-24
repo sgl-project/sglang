@@ -561,10 +561,10 @@ class EagleVerifyInput(SpecVerifyInput):
             low += verified_len + 1
         
         if len(new_accept_index)>0:
-            accept_index = torch.cat(new_accept_index, dim=0)
-            draft_input.verified_id = predict[accept_index]
+            new_accept_index = torch.cat(new_accept_index, dim=0)
+            draft_input.verified_id = predict[new_accept_index]
             draft_input.hidden_states = batch.spec_info.hidden_states[
-                accept_index
+                new_accept_index
             ]
             draft_input.accept_length = accept_length[unfinished_index]
             draft_input.unfinished_index = unfinished_index
