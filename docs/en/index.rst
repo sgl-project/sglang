@@ -39,3 +39,4 @@ The core features include:
    choices_methods.md
    benchmark_and_profiling.md
    troubleshooting.md
+   embedding_model.ipynb
