@@ -161,9 +161,6 @@ class DoubleSparseAttnBackend(AttentionBackend):
         self.cuda_graph_start_loc.zero_()
         self.cuda_graph_start_loc[1:bs] = torch.cumsum(seq_lens[: bs - 1], dim=0)
 
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
-
     def forward_extend(
         self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
     ):
