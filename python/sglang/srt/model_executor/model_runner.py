@@ -496,6 +496,11 @@ class ModelRunner:
 
         if self.server_args.disable_cuda_graph:
             return
+        
+        # Target model don't need cuda graph due to it have big batch size in verify stage.
+        # Disable it to save gpu memory.
+        if self.server_args.speculative_algorithm is not None and not self.is_draft_runner:
+            return
 
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
