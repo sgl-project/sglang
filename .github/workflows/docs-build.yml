@@ -13,7 +13,8 @@ on:
 
 jobs:
   build-docs:
-    runs-on: 1-gpu-runner
+    # runs-on: 
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
         with:
