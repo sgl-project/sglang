@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+class XGrammarJump():
+    pass
+
 class JumpHelper():
     data        : Union[List, str]
     state       : int
@@ -43,15 +46,15 @@ class JumpHelper():
         return len(self.data) > 0
 
 class Grammar():
-    grammar : Union[GrammarMatcher, Tuple[RegexGuide, int]]
-    jump    : Union[bool, JumpForwardMap, None]
+    grammar  : Union[GrammarMatcher, Tuple[RegexGuide, int]]
+    jump_map : Union[XGrammarJump, JumpForwardMap, None]
     def __init__(
             self,
-            grammar : Union[GrammarMatcher, Tuple[RegexGuide, int]],
-            jump : Union[bool, JumpForwardMap, None]
+            grammar  : Union[GrammarMatcher, Tuple[RegexGuide, int]],
+            jump_map : Union[XGrammarJump, JumpForwardMap, None]
     ) -> None:
         self.grammar = grammar
-        self.jump = jump
+        self.jump_map = jump_map
 
     def accept_token(self, token : int):
         if isinstance(self.grammar, GrammarMatcher):
@@ -64,9 +67,9 @@ class Grammar():
         if isinstance(self.grammar, GrammarMatcher):
             return JumpHelper(self.grammar.find_jump_forward_string())
         elif isinstance(self.grammar, Tuple):
-            assert isinstance(self.jump, JumpForwardMap)
+            assert isinstance(self.jump_map, JumpForwardMap)
             _, state = self.grammar
-            jump_forward_bytes = self.jump.jump_forward_byte(state)
+            jump_forward_bytes = self.jump_map.jump_forward_byte(state)
             if jump_forward_bytes is None or len(jump_forward_bytes) == 0:
                 return JumpHelper("") # can't jump
 
@@ -93,8 +96,8 @@ class Grammar():
         if isinstance(helper.data, str):
             return helper.data, -1
         else:
-            assert isinstance(self.jump, JumpForwardMap)
-            return self.jump.jump_forward_symbol(helper.state)
+            assert isinstance(self.jump_map, JumpForwardMap)
+            return self.jump_map.jump_forward_symbol(helper.state)
 
     def jump_and_retokenize(self, old_output_ids : List[int], new_output_ids : List[int], next_state : int):
         if isinstance(self.grammar, GrammarMatcher):
@@ -131,7 +134,7 @@ class Grammar():
 
 class GrammarCache():
     grammar_cache   : Union[BNFCache, FSMCache]
-    jump_cache      : Union[bool, JumpForwardCache, None]
+    jump_cache      : Union[XGrammarJump, JumpForwardCache, None]
 
     def __init__(
         self,
@@ -145,9 +148,11 @@ class GrammarCache():
     ):
         if backend == "xgrammar":
             self.grammar_cache = BNFCache(tokenizer_path, tokenizer_args_dict, enable, skip_tokenizer_init)
+            self.jump_cache = XGrammarJump() if allow_jump else None
         else:
             assert backend == "outlines"
             self.grammar_cache = FSMCache(tokenizer_path, tokenizer_args_dict, enable, skip_tokenizer_init, whitespace_patterns)
+            self.jump_cache = JumpForwardCache() if allow_jump else None
 
     def query(self, key: Tuple[str, str], vocab_size: int) -> Grammar:
         if isinstance(self.grammar_cache, BNFCache):

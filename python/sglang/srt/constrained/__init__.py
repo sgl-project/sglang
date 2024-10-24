@@ -58,10 +58,11 @@ try:
         GrammarMatcherInitContextCache,
     )
 except ImportError as e:
-    GrammarMatcher = None
-    GrammarMatcherInitContext = None
-    GrammarMatcherInitContextCache = None
-
+    class Dummy:
+        pass
+    GrammarMatcher = Dummy
+    GrammarMatcherInitContext = Dummy
+    GrammarMatcherInitContextCache = Dummy
 
 __all__ = [
     "RegexGuide",
