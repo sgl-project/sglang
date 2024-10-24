@@ -79,7 +79,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
 ```
-- To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes.
+- To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. This does not work for FP8 currenly.
 - To enable torchao quantization, add `--torchao-config int4wo-128`. It supports various quantization strategies.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
@@ -100,7 +100,6 @@ We also provide an inference engine **without a HTTP server**. For example,
 ```python
 import sglang as sgl
 
-
 def main():
     prompts = [
         "Hello, my name is",
@@ -120,12 +119,8 @@ if __name__ == "__main__":
     main()
 ```
 
-This can be used for:
-
-1. **Offline Batch Inference**
-2. **Building Custom Servers**
-
-You can view the full example [here](https://github.com/sgl-project/sglang/tree/main/examples/runtime/engine)
+This can be used for offline batch inference and building custom servers.
+You can view the full example [here](https://github.com/sgl-project/sglang/tree/main/examples/runtime/engine).
 
 ### Supported Models
 

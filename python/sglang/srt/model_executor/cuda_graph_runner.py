@@ -116,7 +116,7 @@ class CudaGraphRunner:
         if self.model_runner.server_args.disable_cuda_graph_padding:
             self.capture_bs = list(range(1, 32)) + [64, 128]
         else:
-            self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+            self.capture_bs = [1, 2, 3, 4] + [i * 8 for i in range(1, 21)]
         self.capture_bs = [
             bs for bs in self.capture_bs if bs <= model_runner.req_to_token_pool.size
         ]
@@ -290,7 +290,7 @@ class CudaGraphRunner:
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         if bs != raw_bs:
-            self.seq_lens.fill_(self.seq_len_fill_value)
+            self.seq_lens.fill_(1)
             self.out_cache_loc.zero_()
 
         # Common inputs
