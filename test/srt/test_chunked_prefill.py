@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
 
 
 def read_output(process, output_lines):
+    # Read the outputs to prevent blocking on the buffer
     for line in iter(process.stderr.readline, ""):
         print(line, end="", flush=True)
         output_lines.append(line)
