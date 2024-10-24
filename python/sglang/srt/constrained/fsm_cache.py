@@ -75,10 +75,13 @@ class FSMCache(BaseToolCache):
         if key_type == "json":
             try:
                 regex = build_regex_from_schema(
-                    key_string, whitespace_pattern=self.constrained_json_whitespace_pattern
+                    key_string,
+                    whitespace_pattern=self.constrained_json_whitespace_pattern,
                 )
             except NotImplementedError as e:
-                logger.warning(f"skip invalid json schema: json_schema={key_string}, {e=}")
+                logger.warning(
+                    f"skip invalid json schema: json_schema={key_string}, {e=}"
+                )
                 return None, key_string
         elif key_type == "regex":
             regex = key_string
