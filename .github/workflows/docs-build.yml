@@ -77,6 +77,17 @@ jobs:
           name: documentation
           path: docs/en/_build/html
 
+
+      - name: Check Token
+        env:
+          GITHUB_TOKEN: ${{ secrets.DOCUMENT_TOKEN }}
+        run: |
+          if [ -z "$GITHUB_TOKEN" ]; then
+            echo "GITHUB_TOKEN is not set"
+          else
+            echo "GITHUB_TOKEN is set"
+          fi
+
       - name: Push to sgl-project.github.io
         env:
           GITHUB_TOKEN: ${{ secrets.DOCUMENT_TOKEN }}
