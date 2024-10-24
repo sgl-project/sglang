@@ -78,49 +78,33 @@ jobs:
           path: docs/en/_build/html
 
 
-      - name: Check Token
-        env:
-            GITHUB_TOKEN: ${{ secrets.DOCUMENT_TOKEN }}
-        run: |
-          if [ -z "$GITHUB_TOKEN" ]; then
-            echo "GITHUB_TOKEN is not set"
-          else
-            echo "GITHUB_TOKEN is set"
-            echo "Token length: ${#GITHUB_TOKEN}"
-          fi
+      # - name: Check Token
+      #   env:
+      #       GITHUB_TOKEN: ${{ secrets.DOCUMENT_TOKEN }}
+      #   run: |
+      #     if [ -z "$GITHUB_TOKEN" ]; then
+      #       echo "GITHUB_TOKEN is not set"
+      #     else
+      #       echo "GITHUB_TOKEN is set"
+      #       echo "Token length: ${#GITHUB_TOKEN}"
+      #     fi
 
-      - name: Check Token 2
-        env:
-            GITHUB_TOKEN: ${{ secrets.REPO_TOKEN }}
-        run: |
-          if [ -z "$GITHUB_TOKEN" ]; then
-            echo "REPO_TOKEN is not set"
-          else
-            echo "REPO_TOKEN is set"
-            echo "Token length: ${#GITHUB_TOKEN}"
-          fi
-          
-      - name: Push to sgl-project.github.io
-        env:
-          GITHUB_TOKEN: ${{ secrets.DOCUMENT_TOKEN }}
-        run: |
-          cd docs/en/_build/html
-          echo "Cloning the repository..."
-          git clone "https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git" ../sgl-project.github.io
-          echo "Copying files..."
-          cp -r * ../sgl-project.github.io
-          cd ../sgl-project.github.io
-          git config user.name "zhaochenyang20"
-          git config user.email "zhaochenyang20@gmail.com"
-          echo "Checking git status..."
-          git status
-          echo "Adding changes..."
-          git add .
-          echo "Committing changes..."
-          git commit -m "Update documentation"
-          echo "Pushing changes..."
-          echo "Using token: $GITHUB_TOKEN"
-          git push "https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git" main
-          echo "Push completed."
-          cd ..
-          rm -rf sgl-project.github.io
+      # - name: Check Token 2
+      #   env:
+      #       GITHUB_TOKEN: ${{ secrets.REPO_TOKEN }}
+      #   run: |
+      #     if [ -z "$GITHUB_TOKEN" ]; then
+      #       echo "REPO_TOKEN is not set"
+      #     else
+      #       echo "REPO_TOKEN is set"
+      #       echo "Token length: ${#GITHUB_TOKEN}"
+      #     fi
+        
+      - name: Deploy
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          personal_token: ${{ secrets.PAT_TOKEN }}
+          external_repository: sgl-project/sgl-project.github.io
+          publish_branch: main
+          publish_dir: docs/en/_build/html
+          keep_files: true
