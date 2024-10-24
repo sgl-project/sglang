@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import os
+import logging
 from enum import IntEnum, auto
 from typing import Optional
 
@@ -21,6 +22,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.hf_transformers_utils import get_config, get_context_length
 
+logger = logging.getLogger(__name__)
 
 class AttentionArch(IntEnum):
     MLA = auto()
@@ -48,18 +50,18 @@ class ModelConfig:
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         derived_context_len = get_context_length(self.hf_text_config)
-        allow_long_context = os.environ.get("SGLANG_ALLOW_LONG_MAX_MODEL_LEN", None)
+        allow_long_context = os.environ.get("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", None)
         
         if context_length is not None:
             if context_length > derived_context_len:
                 if allow_long_context:
-                    print(f"Warning: User-specified max_model_len ({context_length}) is greater than the derived max_model_len ({derived_context_len}). "
+                    logger.warning(f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                           f"This may lead to incorrect model outputs or CUDA errors.")
                     self.context_len = context_length
                 else:
-                    raise ValueError(f"User-specified max_model_len ({context_length}) is greater than the derived max_model_len "
-                                     f"(max_position_embeddings={derived_context_len} or model_max_length=None in model's config.json). "
-                                     f"This may lead to incorrect model outputs or CUDA errors. To allow overriding this maximum, set the env var SGLANG_ALLOW_LONG_MAX_MODEL_LEN=1")
+                    raise ValueError(f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
+                                     f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
+                                     f"To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1")
             else:
                 self.context_len = context_length
         else:
