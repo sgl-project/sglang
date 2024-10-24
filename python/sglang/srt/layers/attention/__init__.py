@@ -41,6 +41,10 @@ class AttentionBackend(ABC):
         """Init the metadata for a forward pass for replying a cuda graph."""
         raise NotImplementedError()
 
+    def get_cuda_graph_seq_len_fill_value(self):
+        """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
+        raise NotImplementedError()
+
     def forward(
         self,
         q: torch.Tensor,
