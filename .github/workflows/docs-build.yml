@@ -82,13 +82,22 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.DOCUMENT_TOKEN }}
         run: |
           cd docs/en/_build/html
+          echo "Cloning the repository..."
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
+          echo "Copying files..."
           cp -r * ../sgl-project.github.io
           cd ../sgl-project.github.io
           git config user.name "zhaochenyang20"
           git config user.email "zhaochenyang20@gmail.com"
+          echo "Checking git status..."
+          git status
+          echo "Adding changes..."
           git add .
+          echo "Committing changes..."
           git commit -m "Update documentation"
+          echo "Pushing changes..."
+          echo "Using token: $GITHUB_TOKEN"
           git push https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git main
+          echo "Push completed."
           cd ..
           rm -rf sgl-project.github.io
