@@ -334,15 +334,20 @@ class Req:
 
         last_token_id = self.output_ids[-1]
 
-        matched_eos = last_token_id in self.sampling_params.stop_token_ids
+        matched_eos = False
 
+        # Check stop token ids
+        if self.sampling_params.stop_token_ids:
+            matched_eos = last_token_id in self.sampling_params.stop_token_ids
         if self.tokenizer is not None:
             matched_eos |= last_token_id == self.tokenizer.eos_token_id
-
+            if self.tokenizer.additional_stop_token_ids:
+                matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
         if matched_eos and not self.sampling_params.ignore_eos:
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
             return
 
+        # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tokenizer.decode(
                 self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
@@ -514,7 +519,12 @@ class ScheduleBatch:
                 out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
 
             if out_cache_loc is None:
-                logger.error("Prefill out of memory. Try to lower your batch size.")
+                phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
+                logger.error(
+                    f"{phase_str} out of memory. Try to lower your batch size.\n"
+                    f"Try to allocate {num_tokens} tokens.\n"
+                    f"Avaliable tokens: {self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()}\n"
+                )
                 if self.tree_cache is not None:
                     self.tree_cache.pretty_print()
                 exit(1)

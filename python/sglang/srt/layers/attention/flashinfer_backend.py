@@ -337,7 +337,7 @@ class FlashInferIndicesUpdaterDecode:
     def update(
         self, req_pool_indices, seq_lens, seq_lens_sum, decode_wrappers, encoder_lens
     ):
-        # Keep the signature for type checking, will be initialized during runtime
+        # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
 
     def update_single_wrapper(
@@ -432,8 +432,8 @@ class FlashInferIndicesUpdaterDecode:
         kv_start_idx,
     ):
         bs = len(req_pool_indices)
+        kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
         kv_indptr = kv_indptr[: bs + 1]
-        kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
         kv_indices = torch.empty(
             paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
         )
@@ -497,7 +497,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.update = self.update_single_wrapper
 
     def update(self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens):
-        # Keep the signature for type checking, will be initialized during runtime
+        # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
 
     def update_single_wrapper(
@@ -589,8 +589,8 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged,
     ):
         bs = len(req_pool_indices)
+        kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
         kv_indptr = kv_indptr[: bs + 1]
-        kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
         kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
         create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
@@ -602,8 +602,8 @@ class FlashInferIndicesUpdaterPrefill:
             self.max_context_len,
         )
 
+        qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
         qo_indptr = qo_indptr[: bs + 1]
-        qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
 
         # extend part
         if use_ragged:

@@ -68,7 +68,6 @@ print(state["answer_1"])
 ```
 
 #### More Examples
-
 Anthropic and VertexAI (Gemini) models are also supported.
 You can find more examples at [examples/quick_start](https://github.com/sgl-project/sglang/tree/main/examples/frontend_language/quick_start).
 
