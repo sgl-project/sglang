@@ -34,7 +34,7 @@ class BNFCache:
         tokenizer_path,
         tokenizer_args_dict,
         skip_tokenizer_init=False,
-        whitespace_patterns=None,
+        whitespace_patterns=None
     ):
         # TODO(dark): how to deal with whitespace_patterns and skip_tokenizer_init
         if skip_tokenizer_init:

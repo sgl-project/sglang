@@ -140,18 +140,28 @@ class GrammarCache():
         self,
         tokenizer_path,
         tokenizer_args_dict,
-        enable=True,
         skip_tokenizer_init=False,
         whitespace_patterns=None,
         backend=None,
         allow_jump=False
     ):
         if backend == "xgrammar":
-            self.grammar_cache = BNFCache(tokenizer_path, tokenizer_args_dict, enable, skip_tokenizer_init)
+            self.grammar_cache = BNFCache(
+                tokenizer_path=tokenizer_path,
+                tokenizer_args_dict=tokenizer_args_dict,
+                skip_tokenizer_init=skip_tokenizer_init,
+                whitespace_patterns=whitespace_patterns
+            )
             self.jump_cache = XGrammarJump() if allow_jump else None
         else:
             assert backend == "outlines"
-            self.grammar_cache = FSMCache(tokenizer_path, tokenizer_args_dict, enable, skip_tokenizer_init, whitespace_patterns)
+            self.grammar_cache = FSMCache(
+                tokenizer_path=tokenizer_path,
+                tokenizer_args_dict=tokenizer_args_dict,
+                skip_tokenizer_init=skip_tokenizer_init,
+                constrained_json_whitespace_pattern=whitespace_patterns,
+                enable=True
+            )
             self.jump_cache = JumpForwardCache() if allow_jump else None
 
     def query(self, key: Tuple[str, str], vocab_size: int) -> Grammar:
