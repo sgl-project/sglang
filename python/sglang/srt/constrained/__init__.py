@@ -58,8 +58,10 @@ try:
         GrammarMatcherInitContextCache,
     )
 except ImportError as e:
+
     class Dummy:
         pass
+
     GrammarMatcher = Dummy
     GrammarMatcherInitContext = Dummy
     GrammarMatcherInitContextCache = Dummy

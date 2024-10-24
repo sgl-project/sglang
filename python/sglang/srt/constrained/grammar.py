@@ -13,15 +13,14 @@ limitations under the License.
 
 """Cache for the compressed finite state machine."""
 import logging
+from typing import List, Optional, Tuple, Union
+
 import torch
 
-from typing import Union, Tuple, List, Optional
 from sglang.srt.constrained import GrammarMatcher, RegexGuide
-
 from sglang.srt.constrained.bnf_cache import BNFCache
 from sglang.srt.constrained.fsm_cache import FSMCache
-from sglang.srt.constrained.jump_forward import JumpForwardMap
-from sglang.srt.constrained.jump_forward import JumpForwardCache
+from sglang.srt.constrained.jump_forward import JumpForwardCache, JumpForwardMap
 
 # from sglang.srt.managers.schedule_batch import Req
 
@@ -29,15 +28,17 @@ logger = logging.getLogger(__name__)
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
-class XGrammarJump():
+
+class XGrammarJump:
     pass
 
-class JumpHelper():
-    data        : Union[List, str]
-    state       : int
-    suffix_ids  : List[int]
 
-    def __init__(self, data : Union[List, str], state : int = -1, suffix_ids = []) -> None:
+class JumpHelper:
+    data: Union[List, str]
+    state: int
+    suffix_ids: List[int]
+
+    def __init__(self, data: Union[List, str], state: int = -1, suffix_ids=[]) -> None:
         self.data = data
         self.state = state
         self.suffix_ids = suffix_ids
@@ -45,18 +46,20 @@ class JumpHelper():
     def can_jump(self):
         return len(self.data) > 0
 
-class Grammar():
-    grammar  : Union[GrammarMatcher, Tuple[RegexGuide, int]]
-    jump_map : Union[XGrammarJump, JumpForwardMap, None]
+
+class Grammar:
+    grammar: Union[GrammarMatcher, Tuple[RegexGuide, int]]
+    jump_map: Union[XGrammarJump, JumpForwardMap, None]
+
     def __init__(
-            self,
-            grammar  : Union[GrammarMatcher, Tuple[RegexGuide, int]],
-            jump_map : Union[XGrammarJump, JumpForwardMap, None]
+        self,
+        grammar: Union[GrammarMatcher, Tuple[RegexGuide, int]],
+        jump_map: Union[XGrammarJump, JumpForwardMap, None],
     ) -> None:
         self.grammar = grammar
         self.jump_map = jump_map
 
-    def accept_token(self, token : int):
+    def accept_token(self, token: int):
         if isinstance(self.grammar, GrammarMatcher):
             assert self.grammar.accept_token(token)
         else:
@@ -71,7 +74,7 @@ class Grammar():
             _, state = self.grammar
             jump_forward_bytes = self.jump_map.jump_forward_byte(state)
             if jump_forward_bytes is None or len(jump_forward_bytes) == 0:
-                return JumpHelper("") # can't jump
+                return JumpHelper("")  # can't jump
 
             # preprocess the jump forward string
             suffix_bytes = []
@@ -90,16 +93,18 @@ class Grammar():
             suffix_ids = tokenizer.convert_tokens_to_ids(suffix_tokens)
             return JumpHelper(suffix_ids, cur_state, suffix_bytes)
         else:
-            return JumpHelper("") # can't jump
+            return JumpHelper("")  # can't jump
 
-    def jump_forward_str_state(self, helper : JumpHelper) -> Tuple[str, int]:
+    def jump_forward_str_state(self, helper: JumpHelper) -> Tuple[str, int]:
         if isinstance(helper.data, str):
             return helper.data, -1
         else:
             assert isinstance(self.jump_map, JumpForwardMap)
             return self.jump_map.jump_forward_symbol(helper.state)
 
-    def jump_and_retokenize(self, old_output_ids : List[int], new_output_ids : List[int], next_state : int):
+    def jump_and_retokenize(
+        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
+    ):
         if isinstance(self.grammar, GrammarMatcher):
             k = 0
             for i, old_id in enumerate(old_output_ids):
@@ -117,7 +122,7 @@ class Grammar():
         else:
             self.grammar = self.grammar[0], next_state
 
-    def fill_vocab_mask(self, vocab_mask : torch.Tensor, vocab_size : int):
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor, vocab_size: int):
         if isinstance(self.grammar, GrammarMatcher):
             # Note that this bitmask is a bitset, not bool
             bitmask = self.grammar.find_next_token_bitmask()
@@ -128,13 +133,12 @@ class Grammar():
         else:
             guide, state = self.grammar
             vocab_mask.fill_(1)
-            vocab_mask[
-                guide.get_next_instruction(state).tokens
-            ] = 0
+            vocab_mask[guide.get_next_instruction(state).tokens] = 0
 
-class GrammarCache():
-    grammar_cache   : Union[BNFCache, FSMCache]
-    jump_cache      : Union[XGrammarJump, JumpForwardCache, None]
+
+class GrammarCache:
+    grammar_cache: Union[BNFCache, FSMCache]
+    jump_cache: Union[XGrammarJump, JumpForwardCache, None]
 
     def __init__(
         self,
@@ -143,14 +147,14 @@ class GrammarCache():
         skip_tokenizer_init=False,
         whitespace_patterns=None,
         backend=None,
-        allow_jump=False
+        allow_jump=False,
     ):
         if backend == "xgrammar":
             self.grammar_cache = BNFCache(
                 tokenizer_path=tokenizer_path,
                 tokenizer_args_dict=tokenizer_args_dict,
                 skip_tokenizer_init=skip_tokenizer_init,
-                whitespace_patterns=whitespace_patterns
+                whitespace_patterns=whitespace_patterns,
             )
             self.jump_cache = XGrammarJump() if allow_jump else None
         else:
@@ -160,7 +164,7 @@ class GrammarCache():
                 tokenizer_args_dict=tokenizer_args_dict,
                 skip_tokenizer_init=skip_tokenizer_init,
                 constrained_json_whitespace_pattern=whitespace_patterns,
-                enable=True
+                enable=True,
             )
             self.jump_cache = JumpForwardCache() if allow_jump else None
 
