@@ -58,9 +58,9 @@ try:
         GrammarMatcherInitContextCache,
     )
 except ImportError as e:
-    GrammarMatcher = e
-    GrammarMatcherInitContext = e
-    GrammarMatcherInitContextCache = e
+    GrammarMatcher = None
+    GrammarMatcherInitContext = None
+    GrammarMatcherInitContextCache = None
 
 
 __all__ = [
