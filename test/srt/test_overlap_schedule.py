@@ -4,6 +4,7 @@ python3 -m unittest test_overlap_schedule.TestOverlapSchedule.test_radix_attenti
 python3 test_overlap_schedule.py
 """
 
+import random
 import threading
 import time
 import unittest
@@ -14,7 +15,6 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
 
@@ -33,7 +33,8 @@ class TestOverlapSchedule(unittest.TestCase):
         other_args += ["--enable-overlap-schedule"]
 
         model = DEFAULT_MODEL_NAME_FOR_TEST
-        base_url = DEFAULT_URL_FOR_TEST
+        port = random.randint(4000, 5000)
+        base_url = f"http://127.0.0.1:{port}"
         process = popen_launch_server(
             model,
             base_url,
@@ -59,6 +60,7 @@ class TestOverlapSchedule(unittest.TestCase):
             assert metrics["score"] >= 0.65
         finally:
             time.sleep(1)
+            kill_child_process(process.pid)
             kill_child_process(process.pid)
 
         has_new_server = False
