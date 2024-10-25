@@ -222,7 +222,7 @@ class Req:
         self.prefix_indices = []
         self.extend_input_len = 0
         self.last_node = None
-        self.is_inflight_req = 0
+        self.is_being_chunked = False
 
         # Logprobs (arguments)
         self.return_logprob = False
@@ -906,15 +906,14 @@ class ScheduleBatch:
 
     def filter_batch(
         self,
-        current_inflight_req: Optional[Req] = None,
+        being_chunked_req: Optional[Req] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
-                and self.reqs[i] is not current_inflight_req
+                if not self.reqs[i].finished() and self.reqs[i] is not being_chunked_req
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
