@@ -109,7 +109,7 @@ jobs:
           git config user.name "zhaochenyang20"
           git config user.email "zhaochenyang20@gmail.com"
           git add .
-          git commit -m "Update documentation"
+          git commit -m "$(date +'%Y-%m-%d %H:%M:%S') - Update documentation"
           git push https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git main
           cd ..
           rm -rf sgl-project.github.io
