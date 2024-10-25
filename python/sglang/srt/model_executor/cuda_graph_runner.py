@@ -303,7 +303,7 @@ class CudaGraphRunner:
         # Unpad
         if raw_num_token != num_token:
             logits_output = LogitsProcessorOutput(
-                next_token_logits=logits_output.next_token_logits[:num_token],
+                next_token_logits=logits_output.next_token_logits[:raw_num_token],
                 next_token_logprobs=None,
                 normalized_prompt_logprobs=None,
                 input_token_logprobs=None,

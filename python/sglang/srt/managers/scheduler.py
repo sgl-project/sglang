@@ -272,10 +272,9 @@ class Scheduler:
                     self.run_step()
                     self.send_results()
             else:
-                for recv_req in recv_reqs:
-                    self.process_input_requests(recv_req)
-                    self.run_step()
-                    self.send_results()
+                self.process_input_requests(recv_reqs)
+                self.run_step()
+                self.send_results()
 
     def recv_requests(self):
         if self.tp_rank == 0:
