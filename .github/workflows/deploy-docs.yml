@@ -71,18 +71,18 @@ jobs:
           cd docs/en
           make html
 
-          - name: Push to sgl-project.github.io
-          env:
-            GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-          run: |
-            cd docs/en/_build/html
-            git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
-            cp -r * ../sgl-project.github.io
-            cd ../sgl-project.github.io
-            git config user.name "zhaochenyang20"
-            git config user.email "zhaochenyang20@gmail.com"
-            git add .
-            git commit -m "Update documentation"
-            git push https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git main
-            cd ..
-            rm -rf sgl-project.github.io
+      - name: Push to sgl-project.github.io
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          cd docs/en/_build/html
+          git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
+          cp -r * ../sgl-project.github.io
+          cd ../sgl-project.github.io
+          git config user.name "zhaochenyang20"
+          git config user.email "zhaochenyang20@gmail.com"
+          git add .
+          git commit -m "Update documentation"
+          git push https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git main
+          cd ..
+          rm -rf sgl-project.github.io
