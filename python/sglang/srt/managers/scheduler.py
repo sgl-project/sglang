@@ -225,16 +225,15 @@ class Scheduler:
         )
 
         # Init the FSM cache for constrained generation
-        if not server_args.skip_tokenizer_init:
-            self.regex_fsm_cache = FSMCache(
-                server_args.tokenizer_path,
-                {
-                    "tokenizer_mode": server_args.tokenizer_mode,
-                    "trust_remote_code": server_args.trust_remote_code,
-                },
-                skip_tokenizer_init=server_args.skip_tokenizer_init,
-                constrained_json_whitespace_pattern=server_args.constrained_json_whitespace_pattern,
-            )
+        self.regex_fsm_cache = FSMCache(
+            server_args.tokenizer_path,
+            {
+                "tokenizer_mode": server_args.tokenizer_mode,
+                "trust_remote_code": server_args.trust_remote_code,
+            },
+            skip_tokenizer_init=server_args.skip_tokenizer_init,
+            constrained_json_whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+        )
         self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
