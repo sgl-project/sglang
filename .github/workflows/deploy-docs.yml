@@ -3,17 +3,14 @@ name: Build Documentation
 on:
   push:
     branches: [ main ]
-    paths:
-      - 'docs/**'
   pull_request:
     branches: [ main ]
-    paths:
-      - 'docs/**'
   workflow_dispatch:
 
 jobs:
-  build-docs:
+  execute-notebooks:
     runs-on: 1-gpu-runner
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v3
         with:
@@ -60,6 +57,36 @@ jobs:
                 --ExecutePreprocessor.kernel_name=python3
             fi
           done
+
+  build-and-deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: 1-gpu-runner
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "python[all]"
+          pip install -r docs/requirements.txt
+          pip install nbconvert jupyter_client ipykernel ipywidgets matplotlib
+          pip install transformers==4.45.2
+          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Install Pandoc
         run: |
