@@ -124,9 +124,12 @@ class TpModelWorkerClient:
             ] = next_token_ids
 
             # Copy results to the CPU
-            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             if model_worker_batch.return_logprob:
-                logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                logits_output.next_token_logprobs = logits_output.next_token_logprobs[
+                    torch.arange(len(next_token_ids), device=self.device),
+                    next_token_ids,
+                ].to("cpu", non_blocking=True)
+            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_event = torch.cuda.Event(blocking=True)
             copy_event.record()
 
