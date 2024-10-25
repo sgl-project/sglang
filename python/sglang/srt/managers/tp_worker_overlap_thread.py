@@ -125,20 +125,26 @@ class TpModelWorkerClient:
 
             # Copy results to the CPU
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+            if model_worker_batch.return_logprob:
+                logits_output.next_token_logprobs.to("cpu", non_blocking=True)
             copy_event = torch.cuda.Event(blocking=True)
             copy_event.record()
 
             self.launch_event.set()
-            self.copy_queue.put((copy_event, next_token_ids))
+            self.copy_queue.put((copy_event, logits_output, next_token_ids))
 
     def copy_thread_func(self):
         while True:
-            copy_event, next_token_ids = self.copy_queue.get()
+            copy_event, logits_output, next_token_ids = self.copy_queue.get()
             if not copy_event:
                 break
             while not copy_event.query():
                 time.sleep(1e-5)
-            self.output_queue.put((None, next_token_ids.tolist()))
+            if logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = (
+                    logits_output.next_token_logprobs.tolist()
+                )
+            self.output_queue.put((logits_output, next_token_ids.tolist()))
 
     def resulve_batch_result(self, bid: int):
         logits_output, next_token_ids = self.output_queue.get()
