@@ -831,6 +831,7 @@ class Scheduler:
 
         if self.enable_overlap:
             logits_output, next_token_ids = self.tp_worker.resulve_batch_result(bid)
+            next_token_logprobs = logits_output.next_token_logprobs
         else:
             # Move next_token_ids and logprobs to cpu
             if batch.return_logprob:

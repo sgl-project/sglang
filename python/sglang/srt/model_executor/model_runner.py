@@ -125,11 +125,11 @@ class ModelRunner:
             )
             server_args.chunked_prefill_size = None
             server_args.mem_fraction_static *= 0.95
-            # TODO: qwen2-vl does not support cuda graph now, set disable-graph=True automatically
+            # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
             if self.model_config.hf_config.architectures == [
                 "Qwen2VLForConditionalGeneration"
             ]:
-                server_args.disable_cuda_graph = True
+                server_args.disable_radix_cache = True
 
         # Global vars
         if server_args.show_time_cost:
