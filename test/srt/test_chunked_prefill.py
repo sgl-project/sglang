@@ -48,7 +48,9 @@ class TestChunkedPrefill(unittest.TestCase):
         )
 
         output_lines = []
-        t = threading.Thread(target=read_output, args=(process, output_lines))
+        t = threading.Thread(
+            target=read_output, args=(process, output_lines), daemon=True
+        )
         t.start()
 
         args = SimpleNamespace(
