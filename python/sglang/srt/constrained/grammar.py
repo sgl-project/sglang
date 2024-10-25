@@ -38,7 +38,7 @@ class JumpHelper:
     state: int
     suffix_ids: List[int]
 
-    def __init__(self, data: Union[List, str], state: int = -1, suffix_ids=[]) -> None:
+    def __init__(self, data: Union[List, str]="", state: int = -1, suffix_ids=[]) -> None:
         self.data = data
         self.state = state
         self.suffix_ids = suffix_ids
@@ -67,14 +67,16 @@ class Grammar:
             self.grammar = guide, guide.get_next_state(state, token)
 
     def try_jump(self, tokenizer) -> JumpHelper:
-        if isinstance(self.grammar, GrammarMatcher):
+        if isinstance(self.jump_map, XGrammarJump):
+            assert isinstance(self.grammar, GrammarMatcher)
             return JumpHelper(self.grammar.find_jump_forward_string())
-        elif isinstance(self.grammar, Tuple):
-            assert isinstance(self.jump_map, JumpForwardMap)
+        elif isinstance(self.jump_map, JumpForwardMap):
+            assert isinstance(self.grammar, Tuple)
+
             _, state = self.grammar
             jump_forward_bytes = self.jump_map.jump_forward_byte(state)
             if jump_forward_bytes is None or len(jump_forward_bytes) == 0:
-                return JumpHelper("")  # can't jump
+                return JumpHelper()  # can't jump
 
             # preprocess the jump forward string
             suffix_bytes = []
@@ -93,7 +95,7 @@ class Grammar:
             suffix_ids = tokenizer.convert_tokens_to_ids(suffix_tokens)
             return JumpHelper(suffix_ids, cur_state, suffix_bytes)
         else:
-            return JumpHelper("")  # can't jump
+            return JumpHelper() # can't jump
 
     def jump_forward_str_state(self, helper: JumpHelper) -> Tuple[str, int]:
         if isinstance(helper.data, str):
