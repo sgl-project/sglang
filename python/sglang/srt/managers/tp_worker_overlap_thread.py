@@ -165,7 +165,6 @@ class TpModelWorkerClient:
                         logits_output.normalized_prompt_logprobs.tolist()
                     )
 
-            print(f"{logits_output.next_token_logprobs=}")
             self.output_queue.put((logits_output, next_token_ids.tolist()))
 
     def resulve_batch_result(self, bid: int):
