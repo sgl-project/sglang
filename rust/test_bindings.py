@@ -10,7 +10,7 @@ router = router.Router(
     worker_urls=[
         "http://localhost:30000",
         "http://localhost:30002",
-    ]
+    ],
 )
 
 # Start the router - this will block and run the server
