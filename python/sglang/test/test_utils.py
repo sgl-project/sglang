@@ -712,8 +712,10 @@ def run_mmlu_test(
     kill_child_process(process.pid)
     stdout.close()
     stderr.close()
-    os.remove(STDOUT_FILENAME)
-    os.remove(STDERR_FILENAME)
+    if os.path.exists(STDOUT_FILENAME):
+        os.remove(STDOUT_FILENAME)
+    if os.path.exists(STDERR_FILENAME):
+        os.remove(STDERR_FILENAME)
     t.join()
 
     # Assert success

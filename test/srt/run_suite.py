@@ -5,7 +5,6 @@ from sglang.test.test_utils import run_unittest_files
 
 suites = {
     "minimal": [
-        "test_radix_attention.py",
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
         "models/test_lora.py",
@@ -20,6 +19,7 @@ suites = {
         "test_openai_server.py",
         "test_overlap_schedule.py",
         "test_pytorch_sampling_backend.py",
+        "test_radix_attention.py",
         "test_retract_decode.py",
         "test_server_args.py",
         "test_skip_tokenizer_init.py",
