@@ -280,7 +280,7 @@ You can view the full example [here](https://github.com/sgl-project/sglang/tree/
 - Llama / Llama 2 / Llama 3 / Llama 3.1
 - Mistral / Mixtral / Mistral NeMo
 - Gemma / Gemma 2
-- Qwen / Qwen 2 / Qwen 2 MoE
+- Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL
 - DeepSeek / DeepSeek 2
 - OLMoE
 - [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
