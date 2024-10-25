@@ -33,13 +33,12 @@ class TestSkipTokenizerInit(unittest.TestCase):
             self.base_url + "/generate",
             json={
                 "input_ids": [
-                    119689,
-                    50650,
-                    18291,
-                    30061,
-                    5316,
-                    26951,
-                    119690,
+                    128000,
+                    791,
+                    6864,
+                    315,
+                    9822,
+                    374,
                 ],  # The capital of France is
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,

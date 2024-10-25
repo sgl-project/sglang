@@ -112,8 +112,16 @@ class Scheduler:
             self.recv_from_tokenizer = context.socket(zmq.PULL)
             self.recv_from_tokenizer.bind(f"ipc://{port_args.scheduler_input_ipc_name}")
 
-            self.send_to_detokenizer = context.socket(zmq.PUSH)
-            self.send_to_detokenizer.connect(f"ipc://{port_args.detokenizer_ipc_name}")
+            if server_args.skip_tokenizer_init:
+                self.send_to_detokenizer = context.socket(zmq.PUSH)
+                self.send_to_detokenizer.connect(
+                    f"ipc://{port_args.detokenizer_ipc_name}"
+                )
+            else:
+                self.send_to_detokenizer = context.socket(zmq.PUSH)
+                self.send_to_detokenizer.connect(
+                    f"ipc://{port_args.tokenizer_ipc_name}"
+                )
         else:
             self.recv_from_tokenizer = None
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
