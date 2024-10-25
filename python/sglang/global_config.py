@@ -34,13 +34,15 @@ class GlobalConfig:
 
     def adjust_new_token_ratio(self, schedule_conservativeness=1):
         assert schedule_conservativeness >= 0, "Invalid schedule_conservativeness"
-        global_config.min_new_token_ratio = min(
+        min_new_token_ratio = min(
             global_config.min_new_token_ratio * schedule_conservativeness,
             1.0,
         )
-        global_config.init_new_token_ratio = max(
-            global_config.init_new_token_ratio, global_config.min_new_token_ratio
+        init_new_token_ratio = max(
+            global_config.init_new_token_ratio, min_new_token_ratio
         )
+
+        return min_new_token_ratio, init_new_token_ratio
 
 
 global_config = GlobalConfig()

@@ -237,8 +237,10 @@ class Scheduler:
         self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
-        global_config.adjust_new_token_ratio(server_args.schedule_conservativeness)
-        self.new_token_ratio = global_config.init_new_token_ratio
+        self.min_new_token_ratio, self.init_new_token_ratio = (
+            global_config.adjust_new_token_ratio(server_args.schedule_conservativeness)
+        )
+        self.new_token_ratio = self.init_new_token_ratio
         self.batch_is_full = False
 
         # Init profiler
@@ -285,7 +287,7 @@ class Scheduler:
                         self.process_batch_result(batch, result)
             else:
                 self.check_memory()
-                self.new_token_ratio = global_config.init_new_token_ratio
+                self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
 
@@ -312,7 +314,7 @@ class Scheduler:
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.check_memory()
-                self.new_token_ratio = global_config.init_new_token_ratio
+                self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
 
@@ -565,6 +567,7 @@ class Scheduler:
         # NOTE: if there is request being chunked, we always add it first
         has_being_chunked = self.being_chunked_req is not None
         if has_being_chunked:
+            # NOTE: the prefix_indices of being-chunked prefill should align with the last prefill result
             self.being_chunked_req.init_next_round_input()
             adder.add_being_chunked_req(self.being_chunked_req)
 
@@ -692,7 +695,7 @@ class Scheduler:
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - global_config.new_token_ratio_decay,
-                global_config.min_new_token_ratio,
+                self.min_new_token_ratio,
             )
 
         # Check for jump-forward
