@@ -641,14 +641,17 @@ STDERR_FILENAME = "stderr.txt"
 
 def read_output(output_lines):
     """Print the output in real time with another thread."""
+    while not os.path.exists(STDERR_FILENAME):
+        time.sleep(1)
+
     pt = 0
     while pt >= 0:
         if pt > 0 and not os.path.exists(STDERR_FILENAME):
             break
         lines = open(STDERR_FILENAME).readlines()
-        output_lines[:] = lines
         for line in lines[pt:]:
             print(line, end="", flush=True)
+            output_lines.append(line)
             pt += 1
         time.sleep(0.1)
 
@@ -709,8 +712,10 @@ def run_mmlu_test(
     kill_child_process(process.pid)
     stdout.close()
     stderr.close()
-    os.remove(STDOUT_FILENAME)
-    os.remove(STDERR_FILENAME)
+    if os.path.exists(STDOUT_FILENAME):
+        os.remove(STDOUT_FILENAME)
+    if os.path.exists(STDERR_FILENAME):
+        os.remove(STDERR_FILENAME)
     t.join()
 
     # Assert success
