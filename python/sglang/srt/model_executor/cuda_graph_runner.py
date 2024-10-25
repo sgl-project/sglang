@@ -312,7 +312,7 @@ class CudaGraphRunner:
             bs,
             self.req_pool_indices,
             self.seq_lens,
-            forward_batch.seq_lens_sum,
+            forward_batch.seq_lens_sum + (bs - raw_bs),
             self.encoder_lens,
         )
 
