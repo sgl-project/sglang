@@ -219,35 +219,28 @@ class Scheduler:
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
-        self.current_inflight_req = None
+        self.being_chunked_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
 
         # Init the FSM cache for constrained generation
-        if not server_args.skip_tokenizer_init:
-            self.regex_fsm_cache = FSMCache(
-                server_args.tokenizer_path,
-                {
-                    "tokenizer_mode": server_args.tokenizer_mode,
-                    "trust_remote_code": server_args.trust_remote_code,
-                },
-                skip_tokenizer_init=server_args.skip_tokenizer_init,
-                constrained_json_whitespace_pattern=server_args.constrained_json_whitespace_pattern,
-            )
+        self.regex_fsm_cache = FSMCache(
+            server_args.tokenizer_path,
+            {
+                "tokenizer_mode": server_args.tokenizer_mode,
+                "trust_remote_code": server_args.trust_remote_code,
+            },
+            skip_tokenizer_init=server_args.skip_tokenizer_init,
+            constrained_json_whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+        )
         self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
-        assert (
-            server_args.schedule_conservativeness >= 0
-        ), "Invalid schedule_conservativeness"
-        self.min_new_token_ratio = min(
-            global_config.base_min_new_token_ratio
-            * server_args.schedule_conservativeness,
-            1.0,
+        self.min_new_token_ratio, self.init_new_token_ratio = (
+            global_config.adjust_new_token_ratio(server_args.schedule_conservativeness)
         )
-        self.new_token_ratio = self.min_new_token_ratio
-        self.new_token_ratio_decay = global_config.new_token_ratio_decay
+        self.new_token_ratio = self.init_new_token_ratio
         self.batch_is_full = False
 
         # Init profiler
@@ -294,7 +287,7 @@ class Scheduler:
                         self.process_batch_result(batch, result)
             else:
                 self.check_memory()
-                self.new_token_ratio = global_config.init_new_token_ratio
+                self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
 
@@ -321,7 +314,7 @@ class Scheduler:
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.check_memory()
-                self.new_token_ratio = global_config.init_new_token_ratio
+                self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
 
@@ -499,20 +492,18 @@ class Scheduler:
             )
             exit(1) if crash_on_warning else None
 
-    def get_next_batch_to_run(self):
+    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         if (
             self.last_batch
             and not self.last_batch.forward_mode.is_decode()
             and not self.last_batch.is_empty()
         ):
-            if self.current_inflight_req:
-                self.last_batch.filter_batch(
-                    current_inflight_req=self.current_inflight_req
-                )
-                self.tree_cache.cache_unfinished_req(self.current_inflight_req)
-                # Inflight request keeps its rid but will get a new req_pool_idx.
-                self.req_to_token_pool.free(self.current_inflight_req.req_pool_idx)
+            if self.being_chunked_req:
+                self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
+                self.tree_cache.cache_unfinished_req(self.being_chunked_req)
+                # Being chunked request keeps its rid but will get a new req_pool_idx.
+                self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
                 self.batch_is_full = False
             if not self.last_batch.is_empty():
                 if self.running_batch is None:
@@ -543,7 +534,7 @@ class Scheduler:
         # Handle the cases where prefill is not allowed
         if (
             self.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.current_inflight_req is None:
+        ) and self.being_chunked_req is None:
             return None
 
         running_bs = len(self.running_batch.reqs) if self.running_batch else 0
@@ -566,21 +557,19 @@ class Scheduler:
             num_mixed_running,
         )
 
-        has_inflight = self.current_inflight_req is not None
-        if has_inflight:
-            self.current_inflight_req.init_next_round_input(
-                None if prefix_computed else self.tree_cache
-            )
-            self.current_inflight_req = adder.add_inflight_req(
-                self.current_inflight_req
-            )
-
         if self.lora_paths:
             lora_set = (
                 set([req.lora_path for req in self.running_batch.reqs])
                 if self.running_batch is not None
                 else set([])
             )
+
+        # NOTE: if there is request being chunked, we always add it first
+        has_being_chunked = self.being_chunked_req is not None
+        if has_being_chunked:
+            # NOTE: the prefix_indices of being-chunked prefill should align with the last prefill result
+            self.being_chunked_req.init_next_round_input()
+            adder.add_being_chunked_req(self.being_chunked_req)
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -615,12 +604,8 @@ class Scheduler:
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
 
-        if adder.new_inflight_req is not None:
-            assert self.current_inflight_req is None
-            self.current_inflight_req = adder.new_inflight_req
-
-        if self.current_inflight_req:
-            self.current_inflight_req.is_inflight_req += 1
+        # Update new round being chunked request
+        self.being_chunked_req = adder.new_chunked_req
 
         # Print stats
         if self.tp_rank == 0:
@@ -649,7 +634,7 @@ class Scheduler:
                     f"#cached-token: {adder.log_hit_tokens}, "
                     f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
                     f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                    f"#queue-req: {len(self.waiting_queue) + has_inflight}"
+                    f"#queue-req: {len(self.waiting_queue) + has_being_chunked}"
                 )
             else:
                 logger.info(
@@ -660,7 +645,7 @@ class Scheduler:
                     f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
                     f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                     f"#running-req: {running_bs}, "
-                    f"#queue-req: {len(self.waiting_queue) + has_inflight}"
+                    f"#queue-req: {len(self.waiting_queue) + has_being_chunked}"
                 )
 
         # Create a new batch
@@ -709,7 +694,7 @@ class Scheduler:
             self.waiting_queue.extend(retracted_reqs)
         else:
             self.new_token_ratio = max(
-                self.new_token_ratio - self.new_token_ratio_decay,
+                self.new_token_ratio - global_config.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
 
@@ -783,10 +768,8 @@ class Scheduler:
             # Check finish conditions
             logprob_pt = 0
             for i, req in enumerate(batch.reqs):
-                if req.is_inflight_req > 0:
-                    req.is_inflight_req -= 1
-                else:
-                    # Inflight reqs' prefill is not finished
+                if not req.is_being_chunked:
+                    # Being chunked reqs' prefill is not finished
                     req.completion_tokens_wo_jump_forward += 1
                     req.output_ids.append(next_token_ids[i])
                     req.check_finished()
@@ -812,10 +795,8 @@ class Scheduler:
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
                 req.embedding = embeddings[i]
-                if req.is_inflight_req > 0:
-                    req.is_inflight_req -= 1
-                else:
-                    # Inflight reqs' prefill is not finished
+                if not req.is_being_chunked:
+                    # Being chunked reqs' prefill is not finished
                     # dummy output token for embedding models
                     req.output_ids.append(0)
                     req.check_finished()
