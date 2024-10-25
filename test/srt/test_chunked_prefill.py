@@ -61,6 +61,7 @@ class TestChunkedPrefill(unittest.TestCase):
 
         try:
             metrics = run_eval(args)
+            print(f"{metrics=}")
             assert metrics["score"] >= 0.65
         finally:
             time.sleep(1)
