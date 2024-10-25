@@ -611,6 +611,21 @@ class ServerArgs:
             choices=[1, 2, 4, 8],
             default=8,
         )
+        parser.add_argument(
+            "--split-prefill-batch",
+            type=bool,
+            help="Whether to inference prefill sample one by one.",
+            required=False,
+            default=False,
+        )
+        parser.add_argument(
+            "--draft-runner-cache-size",
+            type=int,
+            help="""It should not been set by cli, it is only a placeholder which 
+            would be set and used in model_runner when using speculative inference.""",
+            required=False,
+            default=-1,
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
