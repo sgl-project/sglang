@@ -67,3 +67,11 @@ python -m sglang.launch_server \
 ```
 
 **Note**: This module is still experimental. Please expect active changes and updates.
+
+### Python bindings
+
+```bash
+$ cargo build --release
+$ maturin build -i /usr/bin/python
+$ pip install <path to wheel>
+```
