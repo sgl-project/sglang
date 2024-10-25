@@ -649,7 +649,8 @@ def read_output(output_lines):
         if pt > 0 and not os.path.exists(STDERR_FILENAME):
             break
         lines = open(STDERR_FILENAME).readlines()
-        output_lines[:] = lines
+        if len(lines) > len(output_lines):
+            output_lines[:] = lines
         for line in lines[pt:]:
             print(line, end="", flush=True)
             pt += 1
