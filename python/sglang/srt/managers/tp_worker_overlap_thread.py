@@ -103,6 +103,8 @@ class TpModelWorkerClient:
         while True:
             self.has_inflight_batch = False
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
+            if not model_worker_batch:
+                break
             self.has_inflight_batch = True
             self.launch_event = threading.Event()
 
@@ -132,6 +134,8 @@ class TpModelWorkerClient:
     def copy_thread_func(self):
         while True:
             copy_event, next_token_ids = self.copy_queue.get()
+            if not copy_event:
+                break
             while not copy_event.query():
                 time.sleep(1e-5)
             self.output_queue.put((None, next_token_ids.tolist()))
@@ -172,3 +176,7 @@ class TpModelWorkerClient:
             recv_req.model_path, recv_req.load_format
         )
         return success, message
+
+    def __delete__(self):
+        self.input_queue.put((None, None))
+        self.copy_queue.put((None, None))
