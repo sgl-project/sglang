@@ -293,7 +293,7 @@ class EAGLEDraftInput(SpecDraftInput):
             batch.input_ids = topk_index.flatten()
             batch.out_cache_loc = batch.alloc_token_slots(topk_index.numel())
             self.parents_list.append(
-                torch.arange(-1, self.topk, dtype=torch.int, device="cuda").unsqueeze(0).repeat(self.scores.shape[0], 1)
+                torch.arange(-1, self.topk, dtype=torch.long, device="cuda").unsqueeze(0).repeat(self.scores.shape[0], 1)
             ) # b, topk+1
         self.cache_list.append(batch.out_cache_loc)
         self.positions = (
@@ -357,7 +357,6 @@ class EAGLEDraftInput(SpecDraftInput):
         scores = torch.gather(origin_token_list, index=top_scores_index, dim=1)
         draft_tokens = torch.cat((self.verified_id.unsqueeze(1), draft_tokens), dim=1)
         parent_list = torch.cat(self.parents_list[:-1], dim=1)
-        
 
         tree_mask, position, retrive_index, retrive_cum_len = build_tree_kernel(
             parent_list,
@@ -395,23 +394,6 @@ class EAGLEDraftInput(SpecDraftInput):
         
         kv_indices = torch.empty((total_len * self.topk + seq_num*self.iter*self.topk, ), 
                                  dtype=torch.int32, device='cuda')
-
-        # kv_indices_list = []
-        # req_pool_indice = req_pool_indices.tolist()
-        # paged_kernel_len = paged_kernel_lens.tolist()
-        # for i in range(len(req_pool_indice)):
-        #     for k in range(self.topk):
-        #         index = torch.arange(self.iter) * self.topk + k
-        #         kv_indices_list.append(
-        #             req_to_token_pool.req_to_token[
-        #                 req_pool_indice[i], : paged_kernel_len[i]
-        #             ]
-        #         )
-        #         kv_indices_list.append(
-        #             req_to_token_pool.req_to_token[
-        #                 req_pool_indice[i], paged_kernel_len[i] + index
-        #             ]
-        #         )
         
         generate_draft_decode_kv_indices[(req_pool_indices.numel(), self.topk)](req_pool_indices, req_to_token_pool.req_to_token,
                                          paged_kernel_lens, kv_indices, self.iter, self.topk, 
