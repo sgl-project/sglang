@@ -153,6 +153,37 @@ def assign_req_to_token_pool(req_pool_indices, req_to_token, start_offset, end_o
         tl.store(token_pool+save_offset, data, mask=mask)
         save_offset += BLOCK_SIZE
         load_offset += BLOCK_SIZE
+        
+        
+@triton.jit
+def generate_draft_decode_kv_indices(req_pool_indices, req_to_token, paged_kernel_lens, kv_indices,
+                                     iters: tl.constexpr, topk: tl.constexpr, pool_len: tl.constexpr, 
+                                     bs_upper: tl.constexpr, iter_upper: tl.constexpr):
+    BLOCK_SIZE: tl.constexpr = 128
+    bid = tl.program_id(axis=0)
+    topk_id = tl.program_id(axis=1)
+    
+    load_offset = tl.arange(0, bs_upper)
+    seq_lens = tl.load(paged_kernel_lens+load_offset, mask=load_offset<bid)
+    seq_len = tl.load(paged_kernel_lens+bid)
+    cum_seq_len = tl.sum(seq_lens)
+    
+    kv_offset = cum_seq_len*topk+bid*iters*topk+ topk_id*(seq_len+iters)
+    kv_ptr = kv_indices + kv_offset
+    token_pool_ptr = req_to_token + tl.load(req_pool_indices+bid) * pool_len
+    
+    kv_offset = tl.arange(0, BLOCK_SIZE)
+    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+    for _ in range(num_loop):
+        mask = kv_offset < seq_len
+        data = tl.load(token_pool_ptr+kv_offset, mask=mask)
+        tl.store(kv_ptr+kv_offset, data, mask=mask)
+        kv_offset += BLOCK_SIZE
+        
+    extend_offset = tl.arange(0, iter_upper)
+    extend_data = tl.load(token_pool_ptr+seq_len+tl.arange(0, iter_upper)*topk+topk_id, 
+                          mask=extend_offset<iters)
+    tl.store(kv_ptr+seq_len+extend_offset, extend_data, mask=extend_offset<iters)
 
 
 @DraftInfoFactory.register("EAGLE", "DraftInput")
@@ -269,13 +300,6 @@ class EAGLEDraftInput(SpecDraftInput):
             batch.seq_lens[:, None]
             + torch.ones([1, self.topk], device="cuda", dtype=torch.long) * self.iter
         ).flatten()
-
-        # batch.req_to_token_pool.req_to_token[
-        #     batch.req_pool_indices,
-        #     batch.seq_lens
-        #     + self.topk * self.iter : batch.seq_lens
-        #     + self.topk * (self.iter + 1),
-        # ] = batch.out_cache_loc
         
         bs = batch.seq_lens.numel()
         assign_req_to_token_pool[(bs, )](batch.req_pool_indices,
@@ -289,7 +313,6 @@ class EAGLEDraftInput(SpecDraftInput):
         self.iter += 1
         
     def prepare_extend_after_decode(self, batch: ScheduleBatch):
-        #req_pool_indices = batch.alloc_req_slots(len(batch.reqs))
         batch.out_cache_loc = batch.alloc_token_slots(self.verified_id.numel())
         batch.extend_lens = (self.accept_length+1).tolist()
         
@@ -361,30 +384,39 @@ class EAGLEDraftInput(SpecDraftInput):
         paged_kernel_lens: torch.Tensor,
         req_to_token_pool: ReqToTokenPool,
     ):
-        req_pool_indices = req_pool_indices.tolist()
-        paged_kernel_lens = paged_kernel_lens.tolist()
-        bs = self.topk * len(req_pool_indices)
+        seq_num = req_pool_indices.numel()
+        bs = self.topk * req_pool_indices.numel()
         seq_len = self.positions.reshape(-1).contiguous()
         
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         cum_kv_seq_len[1:] = torch.cumsum(seq_len + 1, dim=0)
         kv_last_page_len = torch.ones((bs,), dtype=torch.int32, device="cuda")
-        kv_indices_list = []
-        # TODO: reimplement it by triton if it is slow @kavioyu
-        for i in range(len(req_pool_indices)):
-            for k in range(self.topk):
-                index = torch.arange(self.iter) * self.topk + k
-                kv_indices_list.append(
-                    req_to_token_pool.req_to_token[
-                        req_pool_indices[i], : paged_kernel_lens[i]
-                    ]
-                )
-                kv_indices_list.append(
-                    req_to_token_pool.req_to_token[
-                        req_pool_indices[i], paged_kernel_lens[i] + index
-                    ]
-                )
-        kv_indices = torch.cat(kv_indices_list, dim=0).contiguous()
+        total_len = torch.sum(paged_kernel_lens).item()
+        
+        kv_indices = torch.empty((total_len * self.topk + seq_num*self.iter*self.topk, ), 
+                                 dtype=torch.int32, device='cuda')
+
+        # kv_indices_list = []
+        # req_pool_indice = req_pool_indices.tolist()
+        # paged_kernel_len = paged_kernel_lens.tolist()
+        # for i in range(len(req_pool_indice)):
+        #     for k in range(self.topk):
+        #         index = torch.arange(self.iter) * self.topk + k
+        #         kv_indices_list.append(
+        #             req_to_token_pool.req_to_token[
+        #                 req_pool_indice[i], : paged_kernel_len[i]
+        #             ]
+        #         )
+        #         kv_indices_list.append(
+        #             req_to_token_pool.req_to_token[
+        #                 req_pool_indice[i], paged_kernel_len[i] + index
+        #             ]
+        #         )
+        
+        generate_draft_decode_kv_indices[(req_pool_indices.numel(), self.topk)](req_pool_indices, req_to_token_pool.req_to_token,
+                                         paged_kernel_lens, kv_indices, self.iter, self.topk, 
+                                         req_to_token_pool.req_to_token.shape[1], triton.next_power_of_2(seq_num),
+                                         triton.next_power_of_2(self.spec_steps))
         return kv_indices, cum_kv_seq_len, kv_last_page_len, None
 
     def clear(self):
