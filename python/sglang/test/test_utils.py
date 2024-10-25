@@ -642,13 +642,14 @@ STDERR_FILENAME = "stderr.txt"
 def read_output(output_lines):
     pt = 0
     while pt >= 0:
-        if pt > 0 and os.path.exists(STDERR_FILENAME):
+        if pt > 0 and not os.path.exists(STDERR_FILENAME):
             break
         lines = open(STDERR_FILENAME).readlines()
         output_lines[:] = lines
         for line in lines[pt:]:
             print(line, end="", flush=True)
             pt += 1
+        time.sleep(0.1)
 
 
 def run_mmlu_test(
