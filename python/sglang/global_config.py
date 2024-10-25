@@ -38,9 +38,7 @@ class GlobalConfig:
             self.min_new_token_ratio * schedule_conservativeness,
             1.0,
         )
-        init_new_token_ratio = max(
-            self.init_new_token_ratio, min_new_token_ratio
-        )
+        init_new_token_ratio = max(self.init_new_token_ratio, min_new_token_ratio)
 
         return min_new_token_ratio, init_new_token_ratio
 
