@@ -1,0 +1,91 @@
+name: Build Documentation
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'docs/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'docs/**'
+  workflow_dispatch:
+
+jobs:
+  build-docs:
+    runs-on: 1-gpu-runner
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          # pip install --upgrade pip
+          # pip install -e "python[all]"
+          pip install -r docs/requirements.txt
+          pip install nbconvert jupyter_client ipykernel ipywidgets matplotlib
+          pip install transformers==4.45.2
+          # pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+
+      - name: Setup Jupyter Kernel
+        run: |
+          python -m ipykernel install --user --name python3 --display-name "Python 3"
+
+      - name: Execute notebooks
+        env:
+          HF_HOME: /hf_home
+          SGLANG_IS_IN_CI: true
+          CUDA_VISIBLE_DEVICES: 0
+        run: |
+          cd docs/en
+          for nb in *.ipynb; do
+            if [ -f "$nb" ]; then
+              echo "Executing $nb"
+              jupyter nbconvert --to notebook --execute --inplace "$nb" \
+                --ExecutePreprocessor.timeout=600 \
+                --ExecutePreprocessor.kernel_name=python3
+            fi
+          done
+
+      - name: Install Pandoc
+        run: |
+          apt-get update
+          apt-get install -y pandoc
+
+      - name: Build documentation
+        run: |
+          cd docs/en
+          make html
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.5.3
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY_CHENYANG }}
+
+      - name: Push to sgl-project.github.io
+        run: |
+          cd docs/en/_build/html
+          git clone git@github.com:sgl-project/sgl-project.github.io.git ../sgl-project.github.io
+          cp -r * ../sgl-project.github.io
+          cd ../sgl-project.github.io
+          git config user.name "zhaochenyang20"
+          git config user.email "zhaochenyang20@gmail.com"
+          git add .
+          git commit -m "Update documentation"
+          git push origin main || exit 1
+          cd ..
+          rm -rf sgl-project.github.io
