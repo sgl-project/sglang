@@ -82,7 +82,7 @@ __global__ void build_tree(Tensor<long, 2> parent_list, Tensor<long, 2> selected
 //!cuda
 """,
     float_bits=16,  # change to 16 to use half precision as `float` type in the above source code.
-    boundscheck=True,  # turning on for debug and off for performance (to use full threads of a block), default is on.
+    boundscheck=False,  # turning on for debug and off for performance (to use full threads of a block), default is on.
 )
 
 

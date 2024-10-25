@@ -191,6 +191,8 @@ class ServerArgs:
         # Speculative Decoding
         if self.speculative_algorithm=='EAGLE':
             self.split_prefill_batch = True
+            # EAGLE don't support it currently.
+            self.disable_cuda_graph_padding = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

@@ -290,7 +290,6 @@ class LlamaModel(nn.Module):
                 (hidden_states, forward_batch.spec_info.hidden_states), dim=-1
             )
         )
-        #hidden_states = forward_batch.spec_info.hidden_states
 
         residual = None
         for i in range(len(self.layers)):

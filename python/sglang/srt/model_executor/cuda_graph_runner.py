@@ -281,15 +281,15 @@ class CudaGraphRunner:
             self.out_cache_loc.zero_()
 
         # Common inputs
-        self.input_ids[:num_token] = forward_batch.input_ids
+        self.input_ids[:raw_num_token] = forward_batch.input_ids
         self.req_pool_indices[:raw_bs] = forward_batch.req_pool_indices
         self.seq_lens[:raw_bs] = forward_batch.seq_lens
-        self.out_cache_loc[:num_token] = forward_batch.out_cache_loc
-        self.positions[:num_token] = forward_batch.positions
+        self.out_cache_loc[:raw_num_token] = forward_batch.out_cache_loc
+        self.positions[:raw_num_token] = forward_batch.positions
         
         # EAGLE speculative decoding
         if isinstance(forward_batch.spec_info, DraftInfoFactory.get('EAGLE', 'DraftInput')):
-            self.hidden_states[:num_token] = forward_batch.spec_info.hidden_states
+            self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
