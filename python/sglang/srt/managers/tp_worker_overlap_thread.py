@@ -129,6 +129,15 @@ class TpModelWorkerClient:
                     torch.arange(len(next_token_ids), device=self.device),
                     next_token_ids,
                 ].to("cpu", non_blocking=True)
+                if logits_output.input_token_logprobs is not None:
+                    logits_output.input_token_logprobs = (
+                        logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                    )
+                    logits_output.normalized_prompt_logprobs = (
+                        logits_output.normalized_prompt_logprobs.to(
+                            "cpu", non_blocking=True
+                        )
+                    )
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_event = torch.cuda.Event(blocking=True)
             copy_event.record()
@@ -143,10 +152,20 @@ class TpModelWorkerClient:
                 break
             while not copy_event.query():
                 time.sleep(1e-5)
+
             if logits_output.next_token_logprobs is not None:
                 logits_output.next_token_logprobs = (
                     logits_output.next_token_logprobs.tolist()
                 )
+                if logits_output.input_token_logprobs is not None:
+                    logits_output.input_token_logprobs = (
+                        logits_output.input_token_logprobs.tolist()
+                    )
+                    logits_output.normalized_prompt_logprobs = (
+                        logits_output.normalized_prompt_logprobs.tolist()
+                    )
+
+            print(f"{logits_output.next_token_logprobs=}")
             self.output_queue.put((logits_output, next_token_ids.tolist()))
 
     def resulve_batch_result(self, bid: int):
@@ -188,4 +207,4 @@ class TpModelWorkerClient:
 
     def __delete__(self):
         self.input_queue.put((None, None))
-        self.copy_queue.put((None, None))
+        self.copy_queue.put((None, None, None))
