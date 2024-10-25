@@ -641,6 +641,9 @@ STDERR_FILENAME = "stderr.txt"
 
 def read_output(output_lines):
     """Print the output in real time with another thread."""
+    while not os.path.exists(STDERR_FILENAME):
+        time.sleep(1)
+
     pt = 0
     while pt >= 0:
         if pt > 0 and not os.path.exists(STDERR_FILENAME):
