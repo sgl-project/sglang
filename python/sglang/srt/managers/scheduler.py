@@ -29,8 +29,7 @@ import zmq
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.fsm_cache import FSMCache
-from sglang.srt.constrained.jump_forward import JumpForwardCache
+from sglang.srt.constrained.grammar import GrammarCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
@@ -225,17 +224,20 @@ class Scheduler:
         )
 
         # Init the FSM cache for constrained generation
+        self.grammar_cache = None
+
         if not server_args.skip_tokenizer_init:
-            self.regex_fsm_cache = FSMCache(
+            self.grammar_cache = GrammarCache(
                 server_args.tokenizer_path,
                 {
                     "tokenizer_mode": server_args.tokenizer_mode,
                     "trust_remote_code": server_args.trust_remote_code,
                 },
                 skip_tokenizer_init=server_args.skip_tokenizer_init,
-                constrained_json_whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+                whitespace_patterns=server_args.constrained_json_whitespace_pattern,
+                backend=server_args.grammar_backend,
+                allow_jump=not server_args.disable_regex_jump_forward,
             )
-        self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
         assert (
@@ -402,22 +404,20 @@ class Scheduler:
             # By default, only return the logprobs for output tokens
             req.logprob_start_len = len(recv_req.input_ids) - 1
 
-        # Init regex FSM
+        # Init regex FSM or BNF
         if (
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
         ):
+            assert self.grammar_cache is not None
             if req.sampling_params.json_schema is not None:
-                req.regex_fsm, computed_regex_string = self.regex_fsm_cache.query(
-                    ("json", req.sampling_params.json_schema)
+                req.grammar = self.grammar_cache.query(
+                    ("json", req.sampling_params.json_schema),
+                    self.model_config.vocab_size,
                 )
             elif req.sampling_params.regex is not None:
-                req.regex_fsm, computed_regex_string = self.regex_fsm_cache.query(
-                    ("regex", req.sampling_params.regex)
-                )
-            if not self.disable_regex_jump_forward:
-                req.jump_forward_map = self.jump_forward_cache.query(
-                    computed_regex_string
+                req.grammar = self.grammar_cache.query(
+                    ("regex", req.sampling_params.regex), self.model_config.vocab_size
                 )
 
         # Truncate prompts that are too long
@@ -796,10 +796,8 @@ class Scheduler:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
 
-                    if req.regex_fsm is not None:
-                        req.regex_fsm_state = req.regex_fsm.get_next_state(
-                            req.regex_fsm_state, next_token_ids[i]
-                        )
+                    if req.grammar is not None:
+                        req.grammar.accept_token(next_token_ids[i])
 
                     if req.return_logprob:
                         logprob_pt += self.add_logprob_return_values(
@@ -833,6 +831,7 @@ class Scheduler:
 
         if self.enable_overlap:
             logits_output, next_token_ids = self.tp_worker.resulve_batch_result(bid)
+            next_token_logprobs = logits_output.next_token_logprobs
         else:
             # Move next_token_ids and logprobs to cpu
             if batch.return_logprob:
@@ -854,10 +853,8 @@ class Scheduler:
             req.output_ids.append(next_token_id)
             req.check_finished()
 
-            if req.regex_fsm is not None:
-                req.regex_fsm_state = req.regex_fsm.get_next_state(
-                    req.regex_fsm_state, next_token_id
-                )
+            if req.grammar is not None:
+                req.grammar.accept_token(next_token_id)
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
@@ -1055,7 +1052,9 @@ class Scheduler:
         ):
             self.tree_cache.reset()
             self.tree_cache_metrics = {"total": 0, "hit": 0}
-            self.regex_fsm_cache.reset()
+            if self.grammar_cache is not None:
+                self.grammar_cache.reset()
+            # TODO(dark): reset the bnf cache
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()
