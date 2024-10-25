@@ -237,16 +237,8 @@ class Scheduler:
         self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
-        assert (
-            server_args.schedule_conservativeness >= 0
-        ), "Invalid schedule_conservativeness"
-        self.min_new_token_ratio = min(
-            global_config.base_min_new_token_ratio
-            * server_args.schedule_conservativeness,
-            1.0,
-        )
-        self.new_token_ratio = self.min_new_token_ratio
-        self.new_token_ratio_decay = global_config.new_token_ratio_decay
+        global_config.adjust_new_token_ratio(server_args.schedule_conservativeness)
+        self.new_token_ratio = global_config.init_new_token_ratio
         self.batch_is_full = False
 
         # Init profiler
@@ -706,8 +698,8 @@ class Scheduler:
             self.waiting_queue.extend(retracted_reqs)
         else:
             self.new_token_ratio = max(
-                self.new_token_ratio - self.new_token_ratio_decay,
-                self.min_new_token_ratio,
+                self.new_token_ratio - global_config.new_token_ratio_decay,
+                global_config.min_new_token_ratio,
             )
 
         # Check for jump-forward

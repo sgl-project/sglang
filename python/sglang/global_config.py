@@ -15,7 +15,7 @@ class GlobalConfig:
 
         # Runtime constants: New generation token ratio estimation
         self.init_new_token_ratio = 0.7
-        self.base_min_new_token_ratio = 0.1
+        self.min_new_token_ratio = 0.1
         self.new_token_ratio_decay = 0.001
 
         # Runtime constants: others
@@ -31,6 +31,16 @@ class GlobalConfig:
         # Interpreter optimization configs
         self.enable_precache_with_tracing = True
         self.enable_parallel_encoding = True
+
+    def adjust_new_token_ratio(self, schedule_conservativeness=1):
+        assert schedule_conservativeness >= 0, "Invalid schedule_conservativeness"
+        global_config.min_new_token_ratio = min(
+            global_config.min_new_token_ratio * schedule_conservativeness,
+            1.0,
+        )
+        global_config.init_new_token_ratio = max(
+            global_config.init_new_token_ratio, global_config.min_new_token_ratio
+        )
 
 
 global_config = GlobalConfig()
