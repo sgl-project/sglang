@@ -572,7 +572,6 @@ class ScheduleBatch:
 
     def check_decode_mem(self, buf_multiplier=1):
         bs = len(self.reqs)*buf_multiplier
-        print('aval', self.token_to_kv_pool.available_size(), buf_multiplier, bs)
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 
