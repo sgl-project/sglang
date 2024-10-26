@@ -1,20 +1,15 @@
 name: Build Documentation
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   execute-notebooks:
     runs-on: 1-gpu-runner
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
+      - name: Checkout code
+        uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -23,22 +18,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
+          bash scripts/ci_install_dependency.sh
           pip install -r docs/requirements.txt
-          pip install nbconvert jupyter_client ipykernel ipywidgets matplotlib
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
 
       - name: Setup Jupyter Kernel
         run: |
           python -m ipykernel install --user --name python3 --display-name "Python 3"
 
       - name: Execute notebooks
-        env:
-          HF_HOME: /hf_home
-          SGLANG_IS_IN_CI: true
-          CUDA_VISIBLE_DEVICES: 0
         run: |
           cd docs/en
           for nb in *.ipynb; do
@@ -54,34 +41,18 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: 1-gpu-runner
     steps:
-      - uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
+      - name: Checkout code
+        uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
 
-      - name: Cache Python dependencies
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
+          bash scripts/ci_install_dependency.sh
           pip install -r docs/requirements.txt
-          pip install nbconvert jupyter_client ipykernel ipywidgets matplotlib
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
-
-      - name: Install Pandoc
-        run: |
           apt-get update
           apt-get install -y pandoc
 

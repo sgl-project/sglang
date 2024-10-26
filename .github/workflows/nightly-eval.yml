@@ -24,9 +24,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Nightly gsm8k Accuracy
         timeout-minutes: 60

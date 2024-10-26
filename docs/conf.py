@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath("../.."))
 
-version_file = "../../python/sglang/version.py"
+version_file = "../python/sglang/version.py"
 with open(version_file, "r") as f:
     exec(compile(f.read(), version_file, "exec"))
 __version__ = locals()["__version__"]
