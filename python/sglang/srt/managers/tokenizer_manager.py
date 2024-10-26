@@ -87,9 +87,13 @@ class TokenizerManager:
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = context.socket(zmq.PULL)
+        self.recv_from_detokenizer.setsockopt(zmq.RCVHWM, 10000)
+        self.recv_from_detokenizer.setsockopt(zmq.RCVBUF, 100000000)
         self.recv_from_detokenizer.bind(f"ipc://{port_args.tokenizer_ipc_name}")
 
         self.send_to_scheduler = context.socket(zmq.PUSH)
+        self.send_to_scheduler.setsockopt(zmq.SNDHWM, 10000)
+        self.send_to_scheduler.setsockopt(zmq.SNDBUF, 100000000)
         self.send_to_scheduler.connect(f"ipc://{port_args.scheduler_input_ipc_name}")
 
         # Read model args
@@ -433,10 +437,11 @@ class TokenizerManager:
 
     def _validate_input_length(self, input_ids: List[int]):
         if len(input_ids) >= self.context_len:
-            raise ValueError(
-                f"The input ({len(input_ids)} tokens) is longer than the "
-                f"model's context length ({self.context_len} tokens)."
-            )
+            input_ids[:] = input_ids[: self.context_len - 5]
+            # raise ValueError(
+            #     f"The input ({len(input_ids)} tokens) is longer than the "
+            #     f"model's context length ({self.context_len} tokens)."
+            # )
 
     def _get_sampling_params(self, sampling_params_data: dict):
         sampling_params = SamplingParams(**sampling_params_data)

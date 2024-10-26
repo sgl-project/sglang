@@ -111,9 +111,13 @@ class Scheduler:
 
         if self.tp_rank == 0:
             self.recv_from_tokenizer = context.socket(zmq.PULL)
+            self.recv_from_tokenizer.setsockopt(zmq.RCVHWM, 10000)
+            self.recv_from_tokenizer.setsockopt(zmq.RCVBUF, 100000000)
             self.recv_from_tokenizer.bind(f"ipc://{port_args.scheduler_input_ipc_name}")
 
             self.send_to_detokenizer = context.socket(zmq.PUSH)
+            self.send_to_detokenizer.setsockopt(zmq.SNDHWM, 10000)
+            self.send_to_detokenizer.setsockopt(zmq.SNDBUF, 100000000)
             self.send_to_detokenizer.connect(f"ipc://{port_args.detokenizer_ipc_name}")
         else:
             self.recv_from_tokenizer = None
@@ -568,9 +572,10 @@ class Scheduler:
 
         has_inflight = self.current_inflight_req is not None
         if has_inflight:
-            self.current_inflight_req.init_next_round_input(
-                None if prefix_computed else self.tree_cache
-            )
+            # self.current_inflight_req.init_next_round_input(
+            #     None if prefix_computed else self.tree_cache
+            # )
+            self.current_inflight_req.init_next_round_input()
             self.current_inflight_req = adder.add_inflight_req(
                 self.current_inflight_req
             )
