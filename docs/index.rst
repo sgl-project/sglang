@@ -16,7 +16,6 @@ The core features include:
    :caption: Getting Started
 
    install.md
-   send_request.ipynb
 
 
 .. toctree::
