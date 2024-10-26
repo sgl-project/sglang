@@ -30,6 +30,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
+    get_zmq_socket,
     kill_parent_process,
     suppress_other_loggers,
 )
@@ -66,8 +67,9 @@ class DataParallelController:
 
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
-        self.recv_from_tokenizer = self.context.socket(zmq.PULL)
-        self.recv_from_tokenizer.bind(f"ipc://{port_args.scheduler_input_ipc_name}")
+        self.recv_from_tokenizer = get_zmq_socket(
+            self.context, zmq.PULL, port_args.scheduler_input_ipc_name
+        )
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -120,8 +122,9 @@ class DataParallelController:
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
 
-        send_to = self.context.socket(zmq.PUSH)
-        send_to.connect(f"ipc://{port_args.scheduler_input_ipc_name}")
+        send_to = get_zmq_socket(
+            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
+        )
 
         # Wait for model to finish loading
         for i in range(len(scheduler_pipe_readers)):
