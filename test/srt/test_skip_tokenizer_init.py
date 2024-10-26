@@ -56,8 +56,10 @@ class TestSkipTokenizerInit(unittest.TestCase):
             assert item["meta_info"]["prompt_tokens"] == len(input_ids)
 
             if return_logprob:
-                assert len(item["input_token_logprobs"]) == len(input_ids)
-                assert len(item["output_token_logprobs"]) == max_new_tokens
+                assert len(item["meta_info"]["input_token_logprobs"]) == len(
+                    input_ids
+                ), f'{len(item["meta_info"]["input_token_logprobs"])} vs. f{len(input_ids)}'
+                assert len(item["meta_info"]["output_token_logprobs"]) == max_new_tokens
 
         if n == 1:
             assert_one_item(ret)
