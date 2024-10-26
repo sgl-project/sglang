@@ -27,7 +27,7 @@ jobs:
 
       - name: Execute notebooks
         run: |
-          cd docs/en
+          cd docs
           for nb in *.ipynb; do
             if [ -f "$nb" ]; then
               echo "Executing $nb"
@@ -65,7 +65,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          cd docs/en/_build/html
+          cd docs/_build/html
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
           cp -r * ../sgl-project.github.io
           cd ../sgl-project.github.io
