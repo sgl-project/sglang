@@ -1,7 +1,7 @@
 from typing import Type
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch, Req
 
 
 class SpeculativeWorker(TpModelWorker):
@@ -21,9 +21,8 @@ class SpeculativeWorker(TpModelWorker):
     def forward_batch_speculative_generate(self, batch: ScheduleBatch):
         raise NotImplementedError()
     
-    def post_decode_process(self, batch: ScheduleBatch):
-        # do nothing by default
-        pass
+    def finish_request(self, req: Req):
+        raise NotImplementedError()
     
 class SpecWorkerFactory:
     def __init__(self):

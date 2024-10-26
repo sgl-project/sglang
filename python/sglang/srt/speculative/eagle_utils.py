@@ -566,6 +566,7 @@ class EagleVerifyInput(SpecVerifyInput):
         
         new_accept_index = []
         unfinished_index = []
+        finished_extend_len = {} # {rid:accept_length + 1}
 
 
         low = 0
@@ -574,6 +575,7 @@ class EagleVerifyInput(SpecVerifyInput):
             req.check_finished()
             if req.finished():
                 draft_input.has_finished = True
+                finished_extend_len[req.rid] = verified_len+1
             else:
                 new_accept_index.append(accept_index[low: low+verified_len+1])
                 unfinished_index.append(i)
@@ -609,5 +611,5 @@ class EagleVerifyInput(SpecVerifyInput):
         batch.seq_lens.add_(accept_length+1)
 
         logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
-        return draft_input, logits_output, verified_id
+        return draft_input, logits_output, verified_id, finished_extend_len
 

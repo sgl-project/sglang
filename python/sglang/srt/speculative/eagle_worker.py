@@ -2,7 +2,7 @@ import torch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.speculative.speculative_worker import SpeculativeWorker, spec_worker_factory
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch, Req
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EAGLEDraftInput, EagleVerifyInput
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -25,6 +25,7 @@ class EAGLEWorker(SpeculativeWorker):
         self.model_runner.model.set_embed_and_head(embed, head)
         self.model_runner.server_args.disable_cuda_graph = disable_cuda_graph
         self.model_runner.init_cuda_graphs()
+        self.finish_extend_len = None
     
     def forward_draft_decode(self, batch: ScheduleBatch):
         batch.spec_info.prepare_for_decode(batch)
@@ -50,7 +51,8 @@ class EAGLEWorker(SpeculativeWorker):
                 self.forward_draft_decode(batch)
             batch.spec_info.clear_draft_cache(batch)
             self._swap_mem_pool(batch, self.target_worker.model_runner)
-            next_draft_input, logits_output, verified_id = self.verify(batch)
+            next_draft_input, logits_output, verified_id, self.finish_extend_len = self.verify(batch)
+            print('aval', self.model_runner.token_to_kv_pool.available_size())
             next_draft_input.init(self.server_args)
             batch.spec_info = next_draft_input
             # if it is None, means all requsets are finished
@@ -100,9 +102,6 @@ class EAGLEWorker(SpeculativeWorker):
         if batch.spec_info.has_finished:
             batch.seq_lens = seq_lens
         self._swap_mem_pool(batch, self.model_runner)
-        
-    def post_decode_process(self, batch):
-        return self.forward_extend_after_decode(batch)
 
     def capture_for_decode(self, hidden_states, forward_batch):
         # lm head is not support cuda graph currently. But it could be support theoretically.
@@ -118,4 +117,13 @@ class EAGLEWorker(SpeculativeWorker):
         forward_batch.spec_info.capture_for_decode(
             sample_output, forward_batch.forward_mode
         )
+    
+    # Don't support prefix share now.
+    def finish_request(self, req):
+        req_len = len(req.origin_input_ids) + len(req.output_ids) - self.finish_extend_len[req.rid] - 1
+        kv_indices = self.model_runner.req_to_token_pool.req_to_token[
+            req.req_pool_idx
+        ][:req_len]
+        self.model_runner.token_to_kv_pool.free(kv_indices)
+        self.model_runner.req_to_token_pool.free(req.req_pool_idx)
         

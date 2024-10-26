@@ -157,6 +157,8 @@ class Scheduler:
                 nccl_port=port_args.nccl_port,
                 target_worker=self.tp_worker
             )
+        else:
+            self.draft_worker = None
             
         # Get token and memory info from the model worker
         (
@@ -925,6 +927,8 @@ class Scheduler:
                     or len(req.output_ids) == 1
                 )
             ):
+                if req.finished() and self.draft_worker is not None:
+                    self.draft_worker.finish_request(req)
                 output_rids.append(req.rid)
                 output_finished_reason.append(req.finished_reason)
                 if self.is_generation:
