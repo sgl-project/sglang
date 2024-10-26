@@ -30,7 +30,9 @@ from sglang.srt.mem_cache.radix_cache import TreeNode
 # This can prevent the server from being too conservative.
 # Note that this only clips the estimation in the scheduler but does not change the stop
 # condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
-CLIP_MAX_NEW_TOKENS = int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS", "4096"))
+CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
+    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
+)
 
 
 class SchedulePolicy:
@@ -146,7 +148,7 @@ class PrefillAdder:
                 [
                     min(
                         (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                        CLIP_MAX_NEW_TOKENS,
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
                     )
                     * self.new_token_ratio
                     for r in running_batch.reqs
@@ -186,7 +188,7 @@ class PrefillAdder:
             len(req.prefix_indices),
             req.extend_input_len,
             (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
                 if not truncated
                 else 0
             ),
@@ -258,7 +260,7 @@ class PrefillAdder:
             self._prefill_one_req(
                 0,
                 req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
             )
         else:
             # Chunked prefill
@@ -276,7 +278,7 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req)
 
         total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
         input_tokens = req.extend_input_len
         prefix_len = len(req.prefix_indices)
@@ -302,7 +304,10 @@ class PrefillAdder:
                 self._prefill_one_req(
                     prefix_len,
                     input_tokens,
-                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                    min(
+                        req.sampling_params.max_new_tokens,
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                    ),
                 )
             else:
                 # Chunked prefill
