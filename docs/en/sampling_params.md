@@ -194,7 +194,7 @@ Since we compute penalty algorithms through CUDA, the logic stores relevant para
 
 You can run your own benchmark with desired parameters on your own hardware to make sure it's not OOMing before using.
 
-Tuning `--mem-fraction-static` and/or `--max-running-requests` will help. See [here](hyperparameter_tuning.md#minor-tune---max-prefill-tokens---mem-fraction-static---max-running-requests) for more information.
+Tuning `--mem-fraction-static` and/or `--max-running-requests` will help.
 
 ### Benchmarks
 

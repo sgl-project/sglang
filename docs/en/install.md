@@ -48,9 +48,9 @@ docker run --gpus all \
 <summary>More</summary>
 
 > This method is recommended if you plan to serve it as a service.
-> A better approach is to use the [k8s-sglang-service.yaml](./docker/k8s-sglang-service.yaml).
+> A better approach is to use the [k8s-sglang-service.yaml](https://github.com/sgl-project/sglang/blob/main/docker/k8s-sglang-service.yaml).
 
-1. Copy the [compose.yml](./docker/compose.yaml) to your local machine
+1. Copy the [compose.yml](https://github.com/sgl-project/sglang/blob/main/docker/compose.yaml) to your local machine
 2. Execute the command `docker compose up -d` in your terminal.
 </details>
 
