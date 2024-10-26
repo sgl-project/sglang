@@ -1,4 +1,5 @@
 import torch
+from typing import Union, List
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.speculative.speculative_worker import SpeculativeWorker, spec_worker_factory
@@ -52,7 +53,6 @@ class EAGLEWorker(SpeculativeWorker):
             batch.spec_info.clear_draft_cache(batch)
             self._swap_mem_pool(batch, self.target_worker.model_runner)
             next_draft_input, logits_output, verified_id, self.finish_extend_len = self.verify(batch)
-            print('aval', self.model_runner.token_to_kv_pool.available_size())
             next_draft_input.init(self.server_args)
             batch.spec_info = next_draft_input
             # if it is None, means all requsets are finished
@@ -101,7 +101,7 @@ class EAGLEWorker(SpeculativeWorker):
         batch.forward_mode = ForwardMode.DECODE 
         if batch.spec_info.has_finished:
             batch.seq_lens = seq_lens
-        self._swap_mem_pool(batch, self.model_runner)
+        self._swap_mem_pool(batch, self.target_worker.model_runner)
 
     def capture_for_decode(self, hidden_states, forward_batch):
         # lm head is not support cuda graph currently. But it could be support theoretically.
@@ -119,11 +119,14 @@ class EAGLEWorker(SpeculativeWorker):
         )
     
     # Don't support prefix share now.
-    def finish_request(self, req):
-        req_len = len(req.origin_input_ids) + len(req.output_ids) - self.finish_extend_len[req.rid] - 1
-        kv_indices = self.model_runner.req_to_token_pool.req_to_token[
-            req.req_pool_idx
-        ][:req_len]
-        self.model_runner.token_to_kv_pool.free(kv_indices)
-        self.model_runner.req_to_token_pool.free(req.req_pool_idx)
+    def finish_request(self, reqs: Union[Req, List[Req]]):
+        if not isinstance(reqs, List):
+            reqs = [reqs]
+        for req in reqs:
+            req_len = len(req.origin_input_ids) + len(req.output_ids) - self.finish_extend_len[req.rid] - 1
+            kv_indices = self.model_runner.req_to_token_pool.req_to_token[
+                req.req_pool_idx
+            ][:req_len]
+            self.model_runner.token_to_kv_pool.free(kv_indices)
+            self.model_runner.req_to_token_pool.free(req.req_pool_idx)
         

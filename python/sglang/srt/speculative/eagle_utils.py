@@ -564,10 +564,25 @@ class EagleVerifyInput(SpecVerifyInput):
         verified_id = predict[accept_index]
         verified_id_cpu = verified_id.tolist()
         
+        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
+        evict_mask[accept_index] = False
+        mem_need_free_idx = batch.out_cache_loc[evict_mask]
+        batch.token_to_kv_pool.free(mem_need_free_idx)
+        batch.seq_lens.add_(accept_length+1)
+
+        assign_req_to_token_pool[(bs, )](batch.req_pool_indices,
+                            batch.req_to_token_pool.req_to_token,
+                            batch.seq_lens, 
+                            batch.seq_lens+accept_length+1, 
+                            batch.out_cache_loc[accept_index],
+                            batch.req_to_token_pool.req_to_token.shape[1],
+                            triton.next_power_of_2(bs)
+                        )
+        
         new_accept_index = []
         unfinished_index = []
         finished_extend_len = {} # {rid:accept_length + 1}
-
+        retracted_reqs, new_token_ratio = batch.retract_decode()
 
         low = 0
         for i, (req, verified_len) in enumerate(zip(batch.reqs, accept_length_cpu)):
@@ -589,26 +604,6 @@ class EagleVerifyInput(SpecVerifyInput):
             ]
             draft_input.accept_length = accept_length[unfinished_index]
             draft_input.unfinished_index = unfinished_index
-            
-
-        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-        evict_mask[accept_index] = False
-        mem_need_free_idx = batch.out_cache_loc[evict_mask]
-        
-        assign_req_to_token_pool[(bs, )](batch.req_pool_indices,
-                            batch.req_to_token_pool.req_to_token,
-                            batch.seq_lens, 
-                            batch.seq_lens+accept_length+1, 
-                            batch.out_cache_loc[accept_index],
-                            batch.req_to_token_pool.req_to_token.shape[1],
-                            triton.next_power_of_2(bs)
-                        )
-        
-        
-
-        batch.token_to_kv_pool.free(mem_need_free_idx)
-        #batch.spec_info.evict_mask = evict_mask
-        batch.seq_lens.add_(accept_length+1)
 
         logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
         return draft_input, logits_output, verified_id, finished_extend_len

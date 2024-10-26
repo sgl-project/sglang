@@ -635,11 +635,14 @@ class Scheduler:
         batch = self.running_batch
 
         # Check if decode out of memory
-        if not batch.check_decode_mem():
+        buf_multiplier = 1 if self.server_args.speculative_algorithm is None else self.server_args.num_draft_tokens
+        if not batch.check_decode_mem(buf_multiplier):
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio = batch.retract_decode()
             self.new_token_ratio = new_token_ratio
+            if self.draft_worker is not None:
+                self.draft_worker.finish_request(retracted_reqs)
 
             logger.info(
                 "Decode out of memory happened. "

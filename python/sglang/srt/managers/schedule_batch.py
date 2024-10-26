@@ -570,8 +570,9 @@ class ScheduleBatch:
         self.extend_lens.extend([1] * running_bs)
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
-    def check_decode_mem(self):
-        bs = len(self.reqs)
+    def check_decode_mem(self, buf_multiplier=1):
+        bs = len(self.reqs)*buf_multiplier
+        print('aval', self.token_to_kv_pool.available_size(), buf_multiplier, bs)
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 

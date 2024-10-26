@@ -1,4 +1,4 @@
-from typing import Type
+from typing import Type, Union, List
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.schedule_batch import ScheduleBatch, Req
@@ -21,7 +21,7 @@ class SpeculativeWorker(TpModelWorker):
     def forward_batch_speculative_generate(self, batch: ScheduleBatch):
         raise NotImplementedError()
     
-    def finish_request(self, req: Req):
+    def finish_request(self, reqs: Union[Req, List[Req]]):
         raise NotImplementedError()
     
 class SpecWorkerFactory:
