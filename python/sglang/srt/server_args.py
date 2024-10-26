@@ -120,6 +120,7 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     max_torch_compile_bs: int = 32
+    max_cuda_graph_bs: int = 160
     torchao_config: str = ""
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -623,6 +624,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_torch_compile_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--max-cuda-graph-bs",
+            type=int,
+            default=ServerArgs.max_cuda_graph_bs,
+            help="Set the maximum batch size for cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",
