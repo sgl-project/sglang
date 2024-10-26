@@ -167,7 +167,7 @@ cython_debug/
 *.swp
 
 # Documentation
-docs/en/_build
+docs/_build
 
 # SGL
 benchmark/mmlu/data
@@ -186,6 +186,3 @@ work_dirs/
 *.csv
 
 !logo.png
-
-# docs
-/docs/en/_build
