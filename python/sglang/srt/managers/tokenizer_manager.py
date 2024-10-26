@@ -58,7 +58,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import is_generation_model, is_multimodal_model
+from sglang.srt.utils import get_zmq_socket, is_generation_model, is_multimodal_model
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -86,11 +86,12 @@ class TokenizerManager:
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
-        self.recv_from_detokenizer = context.socket(zmq.PULL)
-        self.recv_from_detokenizer.bind(f"ipc://{port_args.tokenizer_ipc_name}")
-
-        self.send_to_scheduler = context.socket(zmq.PUSH)
-        self.send_to_scheduler.connect(f"ipc://{port_args.scheduler_input_ipc_name}")
+        self.recv_from_detokenizer = get_zmq_socket(
+            context, zmq.PULL, port_args.tokenizer_ipc_name
+        )
+        self.send_to_scheduler = get_zmq_socket(
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name
+        )
 
         # Read model args
         self.model_path = server_args.model_path
