@@ -27,10 +27,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 10
@@ -47,10 +44,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -67,10 +61,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -87,10 +78,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -107,10 +95,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -127,10 +112,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Benchmark Single Latency
         timeout-minutes: 10
@@ -165,10 +147,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Benchmark Offline Throughput (w/o RadixAttention)
         timeout-minutes: 10
@@ -197,10 +176,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Benchmark Offline Throughput (TP=2)
         timeout-minutes: 10
@@ -229,10 +205,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
@@ -253,10 +226,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval

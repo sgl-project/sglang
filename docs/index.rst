@@ -10,23 +10,27 @@ The core features include:
 - **Extensive Model Support**: Supports a wide range of generative models (Llama 3, Gemma 2, Mistral, QWen, DeepSeek, LLaVA, etc.) and embedding models (e5-mistral), with easy extensibility for integrating new models.
 - **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
 
+
 .. toctree::
    :maxdepth: 1
    :caption: Getting Started
 
    install.md
-   send_request.ipynb
+
 
 .. toctree::
    :maxdepth: 1
    :caption: Backend Tutorial
+
    backend.md
 
 
 .. toctree::
    :maxdepth: 1
    :caption: Frontend Tutorial
+
    frontend.md
+
 
 .. toctree::
    :maxdepth: 1
@@ -39,4 +43,3 @@ The core features include:
    choices_methods.md
    benchmark_and_profiling.md
    troubleshooting.md
-   embedding_model.ipynb
