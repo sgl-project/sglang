@@ -620,13 +620,13 @@ class ServerArgs:
             help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
-            "--max-torch-compile-bs",
+            "--torch-compile-max-bs",
             type=int,
             default=ServerArgs.max_torch_compile_bs,
             help="Set the maximum batch size when using torch compile.",
         )
         parser.add_argument(
-            "--max-cuda-graph-bs",
+            "--cuda-graph-max-bs",
             type=int,
             default=ServerArgs.max_cuda_graph_bs,
             help="Set the maximum batch size for cuda graph.",
