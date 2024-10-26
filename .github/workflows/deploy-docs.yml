@@ -1,12 +1,18 @@
-name: Build Documentation
+name: Release Documentation
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+      - 'python/sglang/version.py'
   workflow_dispatch:
 
 jobs:
   execute-notebooks:
     runs-on: 1-gpu-runner
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: github.repository == 'sgl-project/sglang'
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -38,8 +44,9 @@ jobs:
           done
 
   build-and-deploy:
+    needs: execute-notebooks
     if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-runner
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
