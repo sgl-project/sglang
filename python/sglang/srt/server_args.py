@@ -720,11 +720,11 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args) -> "PortArgs":
-        port = server_args.port + 1
+        port = server_args.port + 42
         while True:
             if is_port_available(port):
                 break
-            port += 1
+            port += 42
 
         return PortArgs(
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
