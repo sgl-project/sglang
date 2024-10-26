@@ -572,7 +572,7 @@ class TokenizerManager:
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
             if obj.is_single:
                 self.abort_request(obj.rid)
             else:
@@ -622,11 +622,8 @@ class TokenizerManager:
                         "meta_info": recv_obj.meta_info[i],
                     }
                 elif isinstance(recv_obj, BatchTokenIDOut):
-                    read_start = 0 if i == 0 else recv_obj.read_offsets[i - 1]
                     out_dict = {
-                        "token_ids": recv_obj.decode_ids[
-                            read_start : recv_obj.read_offsets[i]
-                        ],
+                        "token_ids": recv_obj.output_ids[i],
                         "meta_info": recv_obj.meta_info[i],
                     }
 

@@ -116,12 +116,9 @@ class DetokenizerManager:
             elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
                 self.send_to_tokenizer.send_pyobj(recv_obj)
                 continue
-            elif self.tokenizer is None:
-                # If the tokenizer is skipped, no detokenization is needed
-                self.send_to_tokenizer.send_pyobj(recv_obj)
-                continue
+            else:
+                assert isinstance(recv_obj, BatchTokenIDOut)
 
-            assert isinstance(recv_obj, BatchTokenIDOut)
             bs = len(recv_obj.rids)
 
             # Initialize decode status

@@ -105,6 +105,7 @@ class Scheduler:
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = server_args.enable_overlap_schedule
+        self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -113,9 +114,17 @@ class Scheduler:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name
             )
-            self.send_to_detokenizer = get_zmq_socket(
-                context, zmq.PUSH, port_args.detokenizer_ipc_name
-            )
+
+            if server_args.skip_tokenizer_init:
+                # Directly send to the tokenizer/api
+                self.send_to_detokenizer = get_zmq_socket(
+                    context, zmq.PUSH, port_args.tokenizer_ipc_name
+                )
+            else:
+                # Send to the detokenizer
+                self.send_to_detokenizer = get_zmq_socket(
+                    context, zmq.PUSH, port_args.detokenizer_ipc_name
+                )
         else:
             self.recv_from_tokenizer = None
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
@@ -736,7 +745,7 @@ class Scheduler:
                 )
             else:
                 logits_output = None
-                if self.tokenizer is not None:
+                if self.skip_tokenizer_init:
                     next_token_ids = torch.full(
                         (batch.batch_size(),), self.tokenizer.eos_token_id
                     )
@@ -952,13 +961,14 @@ class Scheduler:
     def stream_output(self, reqs: List[Req]):
         """Stream the output to detokenizer."""
         output_rids = []
-        output_meta_info = []
+        output_meta_info: List[dict] = []
         output_finished_reason: List[BaseFinishReason] = []
         if self.is_generation:
             output_vids = []
             decoded_texts = []
             output_read_ids = []
             output_read_offsets = []
+            output_ids = []
             output_skip_special_tokens = []
             output_spaces_between_special_tokens = []
             output_no_stop_trim = []
@@ -979,6 +989,8 @@ class Scheduler:
                     read_ids, read_offset = req.init_incremental_detokenize()
                     output_read_ids.append(read_ids)
                     output_read_offsets.append(read_offset)
+                    if self.skip_tokenizer_init:
+                        output_ids.append(req.output_ids)
                     output_skip_special_tokens.append(
                         req.sampling_params.skip_special_tokens
                     )
@@ -1030,6 +1042,7 @@ class Scheduler:
                         decoded_texts,
                         output_read_ids,
                         output_read_offsets,
+                        output_ids,
                         output_skip_special_tokens,
                         output_spaces_between_special_tokens,
                         output_meta_info,
