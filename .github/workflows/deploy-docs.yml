@@ -2,10 +2,11 @@ name: Release Documentation
 
 on:
   push:
-    paths:
-      - 'python/sglang/version.py'
     branches:
       - main
+    paths:
+      - 'docs/**'
+      - 'python/sglang/version.py'
   workflow_dispatch:
 
 jobs:
