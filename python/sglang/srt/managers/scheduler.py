@@ -255,9 +255,10 @@ class Scheduler:
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
 
-        self.init_new_token_ratio = (
+        self.init_new_token_ratio = min(
             global_config.default_init_new_token_ratio
-            * server_args.schedule_conservativeness
+            * server_args.schedule_conservativeness,
+            1.0,
         )
         self.min_new_token_ratio = min(
             self.init_new_token_ratio
