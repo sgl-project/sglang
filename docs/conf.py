@@ -55,7 +55,6 @@ html_copy_source = True
 html_last_updated_fmt = ""
 
 html_theme_options = {
-    "path_to_docs": "docs/en",
     "repository_url": "https://github.com/sgl-project/sglang",
     "repository_branch": "main",
     "show_navbar_depth": 3,
