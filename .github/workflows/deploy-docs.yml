@@ -1,6 +1,11 @@
-name: Build Documentation
+name: Release Documentation
 
 on:
+  push:
+    paths:
+      - 'python/sglang/version.py'
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -38,8 +43,9 @@ jobs:
           done
 
   build-and-deploy:
+    needs: execute-notebooks
     if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-runner
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
