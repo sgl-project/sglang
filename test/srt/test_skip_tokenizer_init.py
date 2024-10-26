@@ -29,20 +29,15 @@ class TestSkipTokenizerInit(unittest.TestCase):
         kill_child_process(cls.process.pid)
 
     def run_decode(self, return_logprob=False, top_logprobs_num=0, n=1):
+        max_new_tokens = 32
+        input_ids = [128000, 791, 6864, 315, 9822, 374]  # The capital of France is
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "input_ids": [
-                    128000,
-                    791,
-                    6864,
-                    315,
-                    9822,
-                    374,
-                ],  # The capital of France is
+                "input_ids": input_ids,
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
-                    "max_new_tokens": 32,
+                    "max_new_tokens": max_new_tokens,
                     "n": n,
                     "stop_token_ids": [119690],
                 },
@@ -52,7 +47,25 @@ class TestSkipTokenizerInit(unittest.TestCase):
                 "logprob_start_len": 0,
             },
         )
-        print(json.dumps(response.json()))
+        ret = response.json()
+        print(json.dumps(ret))
+
+        def assert_one_item(item):
+            assert len(item["token_ids"]) == item["meta_info"]["completion_tokens"]
+            assert len(item["token_ids"]) == max_new_tokens
+            assert item["meta_info"]["prompt_tokens"] == len(input_ids)
+
+            if return_logprob:
+                assert len(item["input_token_logprobs"]) == len(input_ids)
+                assert len(item["output_token_logprobs"]) == max_new_tokens
+
+        if n == 1:
+            assert_one_item(ret)
+        else:
+            assert len(ret) == n
+            for i in range(n):
+                assert_one_item(ret[i])
+
         print("=" * 100)
 
     def test_simple_decode(self):

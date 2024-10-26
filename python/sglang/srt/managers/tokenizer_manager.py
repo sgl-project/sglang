@@ -621,9 +621,8 @@ class TokenizerManager:
                         "meta_info": recv_obj.meta_info[i],
                     }
                 elif isinstance(recv_obj, BatchTokenIDOut):
-                    num_prompt_tokens = recv_obj.meta_info[i]["prompt_tokens"]
                     out_dict = {
-                        "token_ids": recv_obj.decode_ids[i][num_prompt_tokens:],
+                        "token_ids": recv_obj.output_ids[i],
                         "meta_info": recv_obj.meta_info[i],
                     }
 
