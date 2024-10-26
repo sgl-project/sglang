@@ -81,9 +81,9 @@ def get_config(
 CONTEXT_LENGTH_KEYS = [
     "max_sequence_length",
     "seq_length",
-    "max_position_embeddings",
     "max_seq_len",
     "model_max_length",
+    "max_position_embeddings",
 ]
 
 
