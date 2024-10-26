@@ -32,7 +32,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR, FINISH_MATCHED_TOKEN
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, kill_parent_process
+from sglang.srt.utils import configure_logger, get_zmq_socket, kill_parent_process
 from sglang.utils import find_printable_text, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -59,11 +59,12 @@ class DetokenizerManager:
     ):
         # Init inter-process communication
         context = zmq.Context(2)
-        self.recv_from_scheduler = context.socket(zmq.PULL)
-        self.recv_from_scheduler.bind(f"ipc://{port_args.detokenizer_ipc_name}")
-
-        self.send_to_tokenizer = context.socket(zmq.PUSH)
-        self.send_to_tokenizer.connect(f"ipc://{port_args.tokenizer_ipc_name}")
+        self.recv_from_scheduler = get_zmq_socket(
+            context, zmq.PULL, port_args.detokenizer_ipc_name
+        )
+        self.send_to_tokenizer = get_zmq_socket(
+            context, zmq.PUSH, port_args.tokenizer_ipc_name
+        )
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = None

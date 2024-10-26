@@ -67,6 +67,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
+    get_zmq_socket,
     is_generation_model,
     is_multimodal_model,
     kill_parent_process,
@@ -109,11 +110,12 @@ class Scheduler:
         context = zmq.Context(2)
 
         if self.tp_rank == 0:
-            self.recv_from_tokenizer = context.socket(zmq.PULL)
-            self.recv_from_tokenizer.bind(f"ipc://{port_args.scheduler_input_ipc_name}")
-
-            self.send_to_detokenizer = context.socket(zmq.PUSH)
-            self.send_to_detokenizer.connect(f"ipc://{port_args.detokenizer_ipc_name}")
+            self.recv_from_tokenizer = get_zmq_socket(
+                context, zmq.PULL, port_args.scheduler_input_ipc_name
+            )
+            self.send_to_detokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.detokenizer_ipc_name
+            )
         else:
             self.recv_from_tokenizer = None
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)

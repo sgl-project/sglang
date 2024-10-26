@@ -35,6 +35,7 @@ import psutil
 import requests
 import torch
 import torch.distributed as dist
+import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from torch import nn
@@ -720,3 +721,17 @@ def first_rank_print(*args, **kwargs):
         print(*args, **kwargs)
     else:
         pass
+
+
+def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
+    socket = context.socket(socket_type)
+    if socket_type == zmq.PUSH:
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDBUF, 100000000)
+        socket.connect(f"ipc://{endpoint}")
+    elif socket_type == zmq.PULL:
+        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVBUF, 100000000)
+        socket.bind(f"ipc://{endpoint}")
+    else:
+        raise ValueError(f"Unsupported socket type: {socket_type}")
