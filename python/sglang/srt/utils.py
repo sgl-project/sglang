@@ -735,3 +735,5 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
         socket.bind(f"ipc://{endpoint}")
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    return socket
