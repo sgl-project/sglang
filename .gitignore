@@ -186,3 +186,6 @@ work_dirs/
 *.csv
 
 !logo.png
+
+# docs
+/docs/en/_build
