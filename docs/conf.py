@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath("../.."))
 
-version_file = "../../python/sglang/version.py"
+version_file = "../python/sglang/version.py"
 with open(version_file, "r") as f:
     exec(compile(f.read(), version_file, "exec"))
 __version__ = locals()["__version__"]
@@ -26,6 +26,9 @@ extensions = [
     "myst_parser",
     "sphinx_copybutton",
     "sphinxcontrib.mermaid",
+    "nbsphinx",
+    "sphinx.ext.mathjax",
+    "sphinx.ext.autodoc",
 ]
 
 autosectionlabel_prefix_document = True
@@ -52,7 +55,6 @@ html_copy_source = True
 html_last_updated_fmt = ""
 
 html_theme_options = {
-    "path_to_docs": "docs/en",
     "repository_url": "https://github.com/sgl-project/sglang",
     "repository_branch": "main",
     "show_navbar_depth": 3,
@@ -123,3 +125,5 @@ intersphinx_mapping = {
     "numpy": ("https://numpy.org/doc/stable", None),
     "torch": ("https://pytorch.org/docs/stable", None),
 }
+
+html_theme = "sphinx_book_theme"

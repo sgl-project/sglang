@@ -34,7 +34,7 @@ class TestLargeMaxNewTokens(unittest.TestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=("--max-total-token", "1024", "--context-len", "8192"),
-            env={"SGLANG_CLIP_MAX_NEW_TOKENS": "256", **os.environ},
+            env={"SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "256", **os.environ},
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
         cls.base_url += "/v1"
@@ -42,7 +42,7 @@ class TestLargeMaxNewTokens(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
         cls.stdout.close()
         cls.stderr.close()
         os.remove("stdout.txt")
