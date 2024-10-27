@@ -11,12 +11,12 @@ pip install "sglang[all]"
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
 
-**Important: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.**
+Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.
 
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.3.4.post1 https://github.com/sgl-project/sglang.git
+git clone -b v0.3.4.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -26,7 +26,7 @@ pip install -e "python[all]"
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
 
-**Important: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.**
+Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.
 
 ### Method 3: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
@@ -48,9 +48,9 @@ docker run --gpus all \
 <summary>More</summary>
 
 > This method is recommended if you plan to serve it as a service.
-> A better approach is to use the [k8s-sglang-service.yaml](./docker/k8s-sglang-service.yaml).
+> A better approach is to use the [k8s-sglang-service.yaml](https://github.com/sgl-project/sglang/blob/main/docker/k8s-sglang-service.yaml).
 
-1. Copy the [compose.yml](./docker/compose.yaml) to your local machine
+1. Copy the [compose.yml](https://github.com/sgl-project/sglang/blob/main/docker/compose.yaml) to your local machine
 2. Execute the command `docker compose up -d` in your terminal.
 </details>
 

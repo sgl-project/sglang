@@ -24,6 +24,7 @@ class MockSamplingParams:
 @dataclasses.dataclass
 class MockTokenizer:
     eos_token_id: int
+    additional_stop_token_ids: typing.Optional[typing.List[int]] = None
 
 
 @dataclasses.dataclass

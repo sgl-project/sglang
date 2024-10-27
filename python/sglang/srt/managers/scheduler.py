@@ -29,8 +29,7 @@ import zmq
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.fsm_cache import FSMCache
-from sglang.srt.constrained.jump_forward import JumpForwardCache
+from sglang.srt.constrained.grammar import GrammarCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
@@ -68,6 +67,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
+    get_zmq_socket,
     is_generation_model,
     is_multimodal_model,
     kill_parent_process,
@@ -105,20 +105,26 @@ class Scheduler:
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = server_args.enable_overlap_schedule
+        self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
         # Init inter-process communication
         context = zmq.Context(2)
 
         if self.tp_rank == 0:
-            self.recv_from_tokenizer = context.socket(zmq.PULL)
-            self.recv_from_tokenizer.setsockopt(zmq.RCVHWM, 10000)
-            self.recv_from_tokenizer.setsockopt(zmq.RCVBUF, 100000000)
-            self.recv_from_tokenizer.bind(f"ipc://{port_args.scheduler_input_ipc_name}")
+            self.recv_from_tokenizer = get_zmq_socket(
+                context, zmq.PULL, port_args.scheduler_input_ipc_name
+            )
 
-            self.send_to_detokenizer = context.socket(zmq.PUSH)
-            self.send_to_detokenizer.setsockopt(zmq.SNDHWM, 10000)
-            self.send_to_detokenizer.setsockopt(zmq.SNDBUF, 100000000)
-            self.send_to_detokenizer.connect(f"ipc://{port_args.detokenizer_ipc_name}")
+            if server_args.skip_tokenizer_init:
+                # Directly send to the tokenizer/api
+                self.send_to_detokenizer = get_zmq_socket(
+                    context, zmq.PUSH, port_args.tokenizer_ipc_name
+                )
+            else:
+                # Send to the detokenizer
+                self.send_to_detokenizer = get_zmq_socket(
+                    context, zmq.PUSH, port_args.detokenizer_ipc_name
+                )
         else:
             self.recv_from_tokenizer = None
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
@@ -229,29 +235,41 @@ class Scheduler:
         )
 
         # Init the FSM cache for constrained generation
+        self.grammar_cache = None
+
         if not server_args.skip_tokenizer_init:
-            self.regex_fsm_cache = FSMCache(
+            self.grammar_cache = GrammarCache(
                 server_args.tokenizer_path,
                 {
                     "tokenizer_mode": server_args.tokenizer_mode,
                     "trust_remote_code": server_args.trust_remote_code,
                 },
                 skip_tokenizer_init=server_args.skip_tokenizer_init,
-                constrained_json_whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+                whitespace_patterns=server_args.constrained_json_whitespace_pattern,
+                backend=server_args.grammar_backend,
+                allow_jump=not server_args.disable_regex_jump_forward,
             )
-        self.jump_forward_cache = JumpForwardCache()
 
         # Init new token estimation
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
-        self.min_new_token_ratio = min(
-            global_config.base_min_new_token_ratio
+
+        self.init_new_token_ratio = min(
+            global_config.default_init_new_token_ratio
             * server_args.schedule_conservativeness,
             1.0,
         )
-        self.new_token_ratio = self.min_new_token_ratio
-        self.new_token_ratio_decay = global_config.new_token_ratio_decay
+        self.min_new_token_ratio = min(
+            self.init_new_token_ratio
+            * global_config.default_min_new_token_ratio_factor,
+            1.0,
+        )
+        self.new_token_ratio_decay = (
+            self.init_new_token_ratio - self.min_new_token_ratio
+        ) / global_config.default_new_token_ratio_decay_steps
+        self.new_token_ratio = self.init_new_token_ratio
+
         self.batch_is_full = False
 
         # Init profiler
@@ -298,7 +316,7 @@ class Scheduler:
                         self.process_batch_result(batch, result)
             else:
                 self.check_memory()
-                self.new_token_ratio = global_config.init_new_token_ratio
+                self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
 
@@ -325,7 +343,7 @@ class Scheduler:
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.check_memory()
-                self.new_token_ratio = global_config.init_new_token_ratio
+                self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
 
@@ -406,22 +424,20 @@ class Scheduler:
             # By default, only return the logprobs for output tokens
             req.logprob_start_len = len(recv_req.input_ids) - 1
 
-        # Init regex FSM
+        # Init regex FSM or BNF
         if (
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
         ):
+            assert self.grammar_cache is not None
             if req.sampling_params.json_schema is not None:
-                req.regex_fsm, computed_regex_string = self.regex_fsm_cache.query(
-                    ("json", req.sampling_params.json_schema)
+                req.grammar = self.grammar_cache.query(
+                    ("json", req.sampling_params.json_schema),
+                    self.model_config.vocab_size,
                 )
             elif req.sampling_params.regex is not None:
-                req.regex_fsm, computed_regex_string = self.regex_fsm_cache.query(
-                    ("regex", req.sampling_params.regex)
-                )
-            if not self.disable_regex_jump_forward:
-                req.jump_forward_map = self.jump_forward_cache.query(
-                    computed_regex_string
+                req.grammar = self.grammar_cache.query(
+                    ("regex", req.sampling_params.regex), self.model_config.vocab_size
                 )
 
         # Truncate prompts that are too long
@@ -739,7 +755,7 @@ class Scheduler:
                 )
             else:
                 logits_output = None
-                if self.tokenizer is not None:
+                if self.skip_tokenizer_init:
                     next_token_ids = torch.full(
                         (batch.batch_size(),), self.tokenizer.eos_token_id
                     )
@@ -801,10 +817,8 @@ class Scheduler:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
 
-                    if req.regex_fsm is not None:
-                        req.regex_fsm_state = req.regex_fsm.get_next_state(
-                            req.regex_fsm_state, next_token_ids[i]
-                        )
+                    if req.grammar is not None:
+                        req.grammar.accept_token(next_token_ids[i])
 
                     if req.return_logprob:
                         logprob_pt += self.add_logprob_return_values(
@@ -838,6 +852,7 @@ class Scheduler:
 
         if self.enable_overlap:
             logits_output, next_token_ids = self.tp_worker.resulve_batch_result(bid)
+            next_token_logprobs = logits_output.next_token_logprobs
         else:
             # Move next_token_ids and logprobs to cpu
             if batch.return_logprob:
@@ -859,10 +874,8 @@ class Scheduler:
             req.output_ids.append(next_token_id)
             req.check_finished()
 
-            if req.regex_fsm is not None:
-                req.regex_fsm_state = req.regex_fsm.get_next_state(
-                    req.regex_fsm_state, next_token_id
-                )
+            if req.grammar is not None:
+                req.grammar.accept_token(next_token_id)
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
@@ -958,13 +971,14 @@ class Scheduler:
     def stream_output(self, reqs: List[Req]):
         """Stream the output to detokenizer."""
         output_rids = []
-        output_meta_info = []
+        output_meta_info: List[dict] = []
         output_finished_reason: List[BaseFinishReason] = []
         if self.is_generation:
             output_vids = []
             decoded_texts = []
             output_read_ids = []
             output_read_offsets = []
+            output_ids = []
             output_skip_special_tokens = []
             output_spaces_between_special_tokens = []
             output_no_stop_trim = []
@@ -985,6 +999,8 @@ class Scheduler:
                     read_ids, read_offset = req.init_incremental_detokenize()
                     output_read_ids.append(read_ids)
                     output_read_offsets.append(read_offset)
+                    if self.skip_tokenizer_init:
+                        output_ids.append(req.output_ids)
                     output_skip_special_tokens.append(
                         req.sampling_params.skip_special_tokens
                     )
@@ -1036,6 +1052,7 @@ class Scheduler:
                         decoded_texts,
                         output_read_ids,
                         output_read_offsets,
+                        output_ids,
                         output_skip_special_tokens,
                         output_spaces_between_special_tokens,
                         output_meta_info,
@@ -1060,7 +1077,9 @@ class Scheduler:
         ):
             self.tree_cache.reset()
             self.tree_cache_metrics = {"total": 0, "hit": 0}
-            self.regex_fsm_cache.reset()
+            if self.grammar_cache is not None:
+                self.grammar_cache.reset()
+            # TODO(dark): reset the bnf cache
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()

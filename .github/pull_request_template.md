@@ -10,6 +10,6 @@
 
 ## Checklist
 
-- [ ] Format your code according to the [Contributor Guide](https://github.com/sgl-project/sglang/blob/main/docs/en/contributor_guide.md).
-- [ ] Add unit tests as outlined in the [Contributor Guide](https://github.com/sgl-project/sglang/blob/main/docs/en/contributor_guide.md).
+- [ ] Format your code according to the [Contributor Guide](https://github.com/sgl-project/sglang/blob/main/docs/contributor_guide.md).
+- [ ] Add unit tests as outlined in the [Contributor Guide](https://github.com/sgl-project/sglang/blob/main/docs/contributor_guide.md).
 - [ ] Update documentation as needed, including docstrings or example tutorials.

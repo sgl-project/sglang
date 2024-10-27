@@ -60,12 +60,12 @@ pip install "sglang[all]"
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
 
-**Important: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.**
+Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.
 
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.3.4.post1 https://github.com/sgl-project/sglang.git
+git clone -b v0.3.4.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -75,7 +75,7 @@ pip install -e "python[all]"
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ```
 
-**Important: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.**
+Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions.
 
 ### Method 3: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
@@ -171,7 +171,7 @@ curl http://localhost:30000/generate \
   }'
 ```
 
-Learn more about the argument specification, streaming, and multi-modal support [here](docs/en/sampling_params.md).
+Learn more about the argument specification, streaming, and multi-modal support [here](docs/sampling_params.md).
 
 ### OpenAI Compatible API
 In addition, the server supports OpenAI-compatible APIs.
@@ -225,7 +225,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --mem-fraction-static 0.7
 ```
-- See [hyperparameter_tuning.md](docs/en/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
+- See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
 - If you see out-of-memory errors during prefill for long prompts, try to set a smaller chunked prefill size.
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
@@ -235,7 +235,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - To enable torchao quantization, add `--torchao-config int4wo-128`. It supports various quantization strategies.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
-- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](docs/en/custom_chat_template.md).
+- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](docs/custom_chat_template.md).
 - To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
 ```
 # Node 0
@@ -280,7 +280,7 @@ You can view the full example [here](https://github.com/sgl-project/sglang/tree/
 - Llama / Llama 2 / Llama 3 / Llama 3.1
 - Mistral / Mixtral / Mistral NeMo
 - Gemma / Gemma 2
-- Qwen / Qwen 2 / Qwen 2 MoE
+- Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL
 - DeepSeek / DeepSeek 2
 - OLMoE
 - [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
@@ -311,7 +311,7 @@ You can view the full example [here](https://github.com/sgl-project/sglang/tree/
 - gte-Qwen2
   - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
 
-Instructions for supporting a new model are [here](docs/en/model_support.md).
+Instructions for supporting a new model are [here](docs/model_support.md).
 
 #### Use Models From ModelScope
 <details>
