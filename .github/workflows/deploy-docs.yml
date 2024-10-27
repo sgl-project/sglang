@@ -12,15 +12,10 @@ on:
 jobs:
   execute-and-deploy:
     runs-on: 1-gpu-runner
-    if: github.repository == 'sgl-project/sglang'
-    defaults:
-      run:
-        working-directory: docs
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-        with:
-          path: .
 
       - name: Set up Python
         uses: actions/setup-python@v4
