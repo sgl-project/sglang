@@ -406,11 +406,12 @@ class ModelRunner:
                 4096,
             )
 
-        if self.is_draft_runner:
-            self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-        else:
-            self.server_args.draft_runner_cache_size = self.max_total_num_tokens + \
-                max_num_reqs * self.server_args.num_speculative_steps + 100
+        if self.server_args.speculative_algorithm is not None:
+            if self.is_draft_runner:
+                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+            else:
+                self.server_args.draft_runner_cache_size = self.max_total_num_tokens + \
+                    max_num_reqs * self.server_args.num_speculative_steps + 100
             
         
         if max_total_tokens is not None:
