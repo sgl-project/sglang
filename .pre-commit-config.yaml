@@ -10,6 +10,9 @@ repos:
     rev: 24.10.0
     hooks:
       - id: black
+        additional_dependencies: ['.[jupyter]']
+        types: [python, jupyter]
+        types_or: [python, jupyter]
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

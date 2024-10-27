@@ -28,10 +28,9 @@ jobs:
           python-version: '3.9'
 
       - name: Install dependencies
-        working-directory: .
         run: |
           bash scripts/ci_install_dependency.sh
-          pip install -r docs/requirements.txt
+          pip install -r requirements.txt
           apt-get update
           apt-get install -y pandoc
 
