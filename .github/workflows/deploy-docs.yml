@@ -10,12 +10,17 @@ on:
   workflow_dispatch:
 
 jobs:
-  execute-notebooks:
+  execute-and-deploy:
     runs-on: 1-gpu-runner
     if: github.repository == 'sgl-project/sglang'
+    defaults:
+      run:
+        working-directory: docs
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          path: .
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -25,7 +30,9 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
-          pip install -r docs/requirements.txt
+          pip install -r requirements.txt
+          apt-get update
+          apt-get install -y pandoc
 
       - name: Setup Jupyter Kernel
         run: |
@@ -33,7 +40,6 @@ jobs:
 
       - name: Execute notebooks
         run: |
-          cd docs
           for nb in *.ipynb; do
             if [ -f "$nb" ]; then
               echo "Executing $nb"
@@ -43,36 +49,15 @@ jobs:
             fi
           done
 
-  build-and-deploy:
-    needs: execute-notebooks
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
-          pip install -r docs/requirements.txt
-          apt-get update
-          apt-get install -y pandoc
-
       - name: Build documentation
         run: |
-          cd docs
           make html
 
       - name: Push to sgl-project.github.io
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          cd docs/_build/html
+          cd _build/html
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
           cp -r * ../sgl-project.github.io
           cd ../sgl-project.github.io
