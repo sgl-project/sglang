@@ -24,7 +24,6 @@ import pickle
 import random
 import resource
 import socket
-import sys
 import time
 import warnings
 from importlib.metadata import PackageNotFoundError, version
