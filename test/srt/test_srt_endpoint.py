@@ -27,7 +27,7 @@ class TestSRTEndpoint(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def run_decode(
         self,
