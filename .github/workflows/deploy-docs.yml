@@ -33,7 +33,9 @@ jobs:
         run: |
           python -m ipykernel install --user --name python3 --display-name "Python 3"
 
-      - name: Execute notebooks
+      - name: Execute notebooks and push to documents
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           cd docs
           for nb in *.ipynb; do
@@ -45,15 +47,9 @@ jobs:
             fi
           done
 
-      - name: Build documentation
-        run: |
           make html
-
-      - name: Push to sgl-project.github.io
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
           cd _build/html
+          
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
           cp -r * ../sgl-project.github.io
           cd ../sgl-project.github.io
