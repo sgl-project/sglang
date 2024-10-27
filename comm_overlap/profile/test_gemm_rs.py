@@ -218,7 +218,7 @@ def perf_te(
     for i in range(total_iters):
         start_events[i].record()
         workspace_size = input.size(0) * weight.size(0)  # 根据矩阵相乘所需的临时内存量
-        workspace = torch.empty((workspace_size,), dtype=torch.float32, device='cuda')
+        workspace = torch.empty((workspace_size,), dtype=torch.float16, device='cuda')
         output_gemm = tex.gemm(
             weight, input,
             # input, weight,
