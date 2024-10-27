@@ -18,6 +18,7 @@ limitations under the License.
 import json
 import logging
 import os
+import threading
 import time
 import warnings
 from collections import deque
@@ -222,10 +223,11 @@ class Scheduler:
         self.waiting_queue: List[Req] = []
         self.running_batch: Optional[ScheduleBatch] = None
         self.cur_batch: Optional[ScheduleBatch] = None
-        self.decode_forward_ct = 0
-        self.stream_interval = server_args.stream_interval
+        self.forward_ct = 0
+        self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
+        self.stream_interval = server_args.stream_interval
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -272,6 +274,11 @@ class Scheduler:
 
         self.batch_is_full = False
 
+        # Init watchdog thread
+        self.watchdog_timeout = server_args.watchdog_timeout
+        t = threading.Thread(target=self.watchdog_thread, daemon=True)
+        t.start()
+
         # Init profiler
         if os.getenv("SGLANG_TORCH_PROFILER_DIR", "") == "":
             self.profiler = None
@@ -289,6 +296,23 @@ class Scheduler:
                 with_stack=True,
             )
 
+    def watchdog_thread(self):
+        self.watchdog_last_forward_ct = 0
+        self.watchdog_last_time = time.time()
+
+        while True:
+            if self.cur_batch is not None:
+                if self.watchdog_last_forward_ct == self.forward_ct:
+                    if time.time() > self.watchdog_last_time + self.watchdog_timeout:
+                        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
+                        break
+                else:
+                    self.watchdog_last_forward_ct = self.forward_ct
+                    self.watchdog_last_time = time.time()
+            time.sleep(self.watchdog_timeout / 2)
+
+        kill_parent_process()
+
     @torch.inference_mode()
     def event_loop_normal(self):
         """A normal blocking scheduler loop."""
@@ -299,6 +323,7 @@ class Scheduler:
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
 
             if batch:
                 result = self.run_batch(batch)
@@ -746,6 +771,8 @@ class Scheduler:
 
     def run_batch(self, batch: ScheduleBatch):
         """Run a batch."""
+        self.forward_ct += 1
+
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
                 model_worker_batch = batch.get_model_worker_batch()
@@ -778,6 +805,7 @@ class Scheduler:
             self.process_batch_result_prefill(batch, result)
 
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
+
         if self.is_generation:
             logits_output, next_token_ids, bid = result
 
@@ -890,8 +918,8 @@ class Scheduler:
 
         self.token_to_kv_pool.free_group_end()
 
-        self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
-        if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
+        self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
+        if self.tp_rank == 0 and self.forward_ct_decode % 40 == 0:
             self.print_decode_stats()
 
     def add_logprob_return_values(
@@ -984,7 +1012,7 @@ class Scheduler:
         else:  # embedding or reward model
             output_embeddings = []
 
-        is_stream_iter = self.decode_forward_ct % self.stream_interval == 0
+        is_stream_iter = self.forward_ct_decode % self.stream_interval == 0
 
         for req in reqs:
             if req.finished() or (

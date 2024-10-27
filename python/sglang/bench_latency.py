@@ -550,4 +550,4 @@ if __name__ == "__main__":
     except Exception as e:
         raise e
     finally:
-        kill_child_process(os.getpid(), including_parent=False)
+        kill_child_process()
