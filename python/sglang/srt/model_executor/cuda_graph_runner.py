@@ -121,13 +121,13 @@ class CudaGraphRunner:
             bs
             for bs in self.capture_bs
             if bs <= model_runner.req_to_token_pool.size
-            and bs <= model_runner.server_args.max_cuda_graph_bs
+            and bs <= model_runner.server_args.cuda_graph_max_bs
         ]
         self.compile_bs = (
             [
                 bs
                 for bs in self.capture_bs
-                if bs <= self.model_runner.server_args.max_torch_compile_bs
+                if bs <= self.model_runner.server_args.torch_compile_max_bs
             ]
             if self.use_torch_compile
             else []
