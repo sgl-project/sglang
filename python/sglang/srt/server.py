@@ -441,7 +441,7 @@ def launch_server(
 
     # Send a warmup request
     t = threading.Thread(
-        target=_wait_and_warmup, args=(server_args, pipe_finish_writer, os.getpid())
+        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
     )
     t.start()
 
@@ -496,7 +496,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
-def _wait_and_warmup(server_args, pipe_finish_writer, pid):
+def _wait_and_warmup(server_args, pipe_finish_writer):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
@@ -519,7 +519,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_child_process(pid, including_parent=False)
+        kill_child_process(include_self=True)
         return
 
     model_info = res.json()
@@ -551,7 +551,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_child_process(pid, including_parent=False)
+        kill_child_process(include_self=True)
         return
 
     # logger.info(f"{res.json()=}")
@@ -617,7 +617,7 @@ class Runtime:
 
     def shutdown(self):
         if self.pid is not None:
-            kill_child_process(self.pid)
+            kill_child_process(self.pid, include_self=True)
             self.pid = None
 
     def cache_prefix(self, prefix: str):
@@ -834,7 +834,7 @@ class Engine:
             return ret
 
     def shutdown(self):
-        kill_child_process(os.getpid(), including_parent=False)
+        kill_child_process(include_self=True)
 
     def get_tokenizer(self):
         global tokenizer_manager
