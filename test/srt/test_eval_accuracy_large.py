@@ -30,7 +30,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def test_mmlu(self):
         args = SimpleNamespace(
