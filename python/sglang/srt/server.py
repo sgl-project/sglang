@@ -496,7 +496,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
-def _wait_and_warmup(server_args, pipe_finish_writer, pid):
+def _wait_and_warmup(server_args, pipe_finish_writer):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
