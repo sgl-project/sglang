@@ -106,6 +106,31 @@ class TestSRTEngine(unittest.TestCase):
         metrics = run_eval(args)
         assert metrics["accuracy"] > 0.7
 
+    def test_5_prompt_input_ids_consistency(self):
+        prompt = "The capital of UK is"
+
+
+        model_path = DEFAULT_MODEL_NAME_FOR_TEST
+        engine = sgl.Engine(model_path=model_path, random_seed=42, log_level="error")
+        sampling_params = {"temperature": 0, "max_new_tokens": 8}
+        out1 = engine.generate(prompt, sampling_params)["text"]
+
+    
+        from sglang.srt.hf_transformers_utils import get_tokenizer
+        tokenizer = get_tokenizer(model_path)
+
+        token_ids = tokenizer.encode(prompt)
+        out2 = engine.generate(input_ids=token_ids, sampling_params=sampling_params)["text"]
+
+        engine.shutdown()
+
+        print("==== Answer 1 ====")
+        print(out1)
+
+        print("==== Answer 2 ====")
+        print(out2)
+        assert out1 == out2, f"{out1} != {out2}"
+
 
 if __name__ == "__main__":
     unittest.main()
