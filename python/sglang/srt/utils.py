@@ -728,7 +728,7 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
     if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
+        buf_size = int(1 * 1024**3)
     else:
         buf_size = -1
 
