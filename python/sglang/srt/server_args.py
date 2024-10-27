@@ -119,8 +119,8 @@ class ServerArgs:
     enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
-    max_torch_compile_bs: int = 32
-    max_cuda_graph_bs: int = 160
+    torch_compile_max_bs: int = 32
+    cuda_graph_max_bs: int = 160
     torchao_config: str = ""
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -620,15 +620,15 @@ class ServerArgs:
             help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
-            "--max-torch-compile-bs",
+            "--torch-compile-max-bs",
             type=int,
-            default=ServerArgs.max_torch_compile_bs,
+            default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
         )
         parser.add_argument(
-            "--max-cuda-graph-bs",
+            "--cuda-graph-max-bs",
             type=int,
-            default=ServerArgs.max_cuda_graph_bs,
+            default=ServerArgs.cuda_graph_max_bs,
             help="Set the maximum batch size for cuda graph.",
         )
         parser.add_argument(

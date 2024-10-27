@@ -254,13 +254,22 @@ class Scheduler:
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
-        self.min_new_token_ratio = min(
-            global_config.base_min_new_token_ratio
+
+        self.init_new_token_ratio = min(
+            global_config.default_init_new_token_ratio
             * server_args.schedule_conservativeness,
             1.0,
         )
-        self.new_token_ratio = self.min_new_token_ratio
-        self.new_token_ratio_decay = global_config.new_token_ratio_decay
+        self.min_new_token_ratio = min(
+            self.init_new_token_ratio
+            * global_config.default_min_new_token_ratio_factor,
+            1.0,
+        )
+        self.new_token_ratio_decay = (
+            self.init_new_token_ratio - self.min_new_token_ratio
+        ) / global_config.default_new_token_ratio_decay_steps
+        self.new_token_ratio = self.init_new_token_ratio
+
         self.batch_is_full = False
 
         # Init profiler
@@ -307,7 +316,7 @@ class Scheduler:
                         self.process_batch_result(batch, result)
             else:
                 self.check_memory()
-                self.new_token_ratio = global_config.init_new_token_ratio
+                self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
 
@@ -334,7 +343,7 @@ class Scheduler:
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.check_memory()
-                self.new_token_ratio = global_config.init_new_token_ratio
+                self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
 
