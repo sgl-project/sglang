@@ -834,7 +834,7 @@ class Engine:
             return ret
 
     def shutdown(self):
-        kill_child_process(include_self=True)
+        kill_child_process()
 
     def get_tokenizer(self):
         global tokenizer_manager
