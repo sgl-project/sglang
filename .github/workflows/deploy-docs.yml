@@ -12,7 +12,7 @@ on:
 jobs:
   execute-and-deploy:
     runs-on: 1-gpu-runner
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: github.repository == 'sgl-project/sglang'
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
