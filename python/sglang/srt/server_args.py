@@ -74,6 +74,7 @@ class ServerArgs:
     api_key: Optional[str] = None
     file_storage_pth: str = "SGLang_storage"
     enable_cache_report: bool = False
+    watchdog_timeout: float = 600
 
     # Data parallelism
     dp_size: int = 1
@@ -428,6 +429,12 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--watchdog-timeout",
+            type=float,
+            default=ServerArgs.watchdog_timeout,
+            help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
         )
 
         # Data parallelism
