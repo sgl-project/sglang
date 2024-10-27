@@ -13,7 +13,7 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
 )
 
 
-class TestExtendAttention(unittest.TestCase):
+class TestTritonAttention(unittest.TestCase):
 
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
@@ -127,7 +127,7 @@ class TestExtendAttention(unittest.TestCase):
         for value in attention_values:
             self._test_extend_attention_once(19, 12331, 12, 4, value)
 
-    def _test_context_attention_once(self, head_dim):
+    def _test_context_attention_once(self, head_dim, is_causal):
         # Set up a simple test case
         num_heads = 4
         seq_lens = [8, 12]
@@ -143,15 +143,35 @@ class TestExtendAttention(unittest.TestCase):
         b_start_loc = torch.tensor([0, seq_lens[0]], device="cuda")
         b_seq_len = torch.tensor(seq_lens, device="cuda")
 
-        context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_seq_len)
+        context_attention_fwd(
+            q, k, v, o, b_start_loc, b_seq_len, max_seq_len, is_causal=is_causal
+        )
+
+        cu_seq_lens = [0] * (len(seq_lens) + 1)
+        for i, seq_len in enumerate(seq_lens):
+            cu_seq_lens[i + 1] = cu_seq_lens[i] + seq_len
+
+        for i in range(len(seq_lens)):
+            start, end = cu_seq_lens[i], cu_seq_lens[i + 1]
+            o_torch = torch.nn.functional.scaled_dot_product_attention(
+                q[start:end].permute(1, 0, 2),
+                k[start:end].permute(1, 0, 2),
+                v[start:end].permute(1, 0, 2),
+                is_causal=is_causal,
+            ).permute(1, 0, 2)
+
+            cos_sim = torch.nn.functional.cosine_similarity(
+                o[start:end].flatten(), o_torch.flatten(), dim=0
+            )
+            self.assertTrue(cos_sim.item() > 1 - (1e-5))
+            self.assertTrue(torch.allclose(o[start:end], o_torch, atol=1e-2))
 
     def test_context_attention(self):
-        # Here we just to ensure there is no error
-        # TODO: correctnesss test
         head_dim = [128, 96, 80, 13]
 
         for dim in head_dim:
-            self._test_context_attention_once(dim)
+            for is_causal in [True, False]:
+                self._test_context_attention_once(dim, is_causal)
 
     def _test_decode_attention_once(self, B, H_Q, H_KV, D):
         dtype = torch.bfloat16
@@ -174,6 +194,12 @@ class TestExtendAttention(unittest.TestCase):
         b_start_loc = torch.arange(0, total_tokens, seq_len, device="cuda")
         b_seq_len = torch.full((B,), seq_len, device="cuda")
 
+        attn_logits = torch.empty(
+            (H_Q, total_tokens),
+            dtype=dtype,
+            device="cuda",
+        )
+
         decode_attention_fwd(
             q,
             k_buffer,
@@ -183,8 +209,8 @@ class TestExtendAttention(unittest.TestCase):
             b_req_idx,
             b_start_loc,
             b_seq_len,
+            attn_logits,
             seq_len,
-            total_tokens,
             sm_scale,
         )
 
