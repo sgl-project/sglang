@@ -13,7 +13,7 @@ table.autosummary td {
 }
  
 .output_area.stderr {
-    color: #d3d3d3 !important; /* 浅灰色 */
+    color: #d3d3d3 !important;
 }
 
 .output_area.stdout {
@@ -21,7 +21,7 @@ table.autosummary td {
 }
 
 div.output_area.stderr {
-    color: #d3d3d3 !important; /* 浅灰色 */
+    color: #d3d3d3 !important;
 }
 
 div.output_area.stdout {
