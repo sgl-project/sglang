@@ -721,16 +721,3 @@ class TokenizerManager:
                     token_top_logprobs, decode_to_text
                 )
         return top_logprobs
-
-
-"""
-    # Case 1: Direct double set_result
-    print("\nCase 1: Direct double set_result")
-    future = asyncio.Future()
-    future.set_result("First result")
-    try:
-        future.set_result("Second result")  # This will raise InvalidStateError
-    except asyncio.InvalidStateError as e:
-        print(f"Error on second set_result: {e}")
-   
-"""
