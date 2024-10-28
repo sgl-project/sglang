@@ -13,14 +13,9 @@ jobs:
   execute-and-deploy:
     runs-on: 1-gpu-runner
     if: github.repository == 'sgl-project/sglang'
-    defaults:
-      run:
-        working-directory: docs
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-        with:
-          path: .
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -30,7 +25,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
-          pip install -r requirements.txt
+          pip install -r docs/requirements.txt
           apt-get update
           apt-get install -y pandoc
 
@@ -38,8 +33,11 @@ jobs:
         run: |
           python -m ipykernel install --user --name python3 --display-name "Python 3"
 
-      - name: Execute notebooks
+      - name: Execute notebooks and push to documents
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
+          cd docs
           for nb in *.ipynb; do
             if [ -f "$nb" ]; then
               echo "Executing $nb"
@@ -49,15 +47,9 @@ jobs:
             fi
           done
 
-      - name: Build documentation
-        run: |
           make html
-
-      - name: Push to sgl-project.github.io
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
           cd _build/html
+          
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
           cp -r * ../sgl-project.github.io
           cd ../sgl-project.github.io
