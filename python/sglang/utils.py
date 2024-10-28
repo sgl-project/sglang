@@ -300,7 +300,7 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
-def execute_shell_command(command: str) -> subprocess.Popen:
+def lauch_sglang_server(command: str) -> subprocess.Popen:
     """
     Execute a shell command and return the process handle
 
@@ -316,8 +316,10 @@ def execute_shell_command(command: str) -> subprocess.Popen:
     return subprocess.Popen(
         parts,
         text=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Redirect stderr to stdout
+        bufsize=0,
+        universal_newlines=True
     )
 
 
