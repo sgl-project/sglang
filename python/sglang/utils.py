@@ -317,6 +317,7 @@ def lauch_sglang_server(command: str) -> subprocess.Popen:
     return subprocess.Popen(
         parts,
         text=True,
+        stderr=subprocess.STDOUT
     )
 
 def wait_for_server(base_url: str, timeout: int = None) -> None:
@@ -375,4 +376,4 @@ def terminate_process(process):
         time.sleep(2)
 
 def highlight_text(html_content: str):
-    display(HTML(f"<strong>{html_content}</strong>"))
+    display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))

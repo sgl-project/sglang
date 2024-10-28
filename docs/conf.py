@@ -70,7 +70,10 @@ html_theme_options = {
 }
 
 html_static_path = ["_static"]
-html_css_files = ["css/readthedocs.css"]
+html_css_files = ["css/custom_log.css"]
+
+def setup(app):
+    app.add_css_file('css/custom_log.css')
 
 myst_enable_extensions = [
     "dollarmath",
@@ -127,3 +130,14 @@ intersphinx_mapping = {
 }
 
 html_theme = "sphinx_book_theme"
+
+
+nbsphinx_prolog = """
+.. raw:: html
+
+    <style>
+        .output_area.stderr, .output_area.stdout {
+            color: #d3d3d3 !important; /* 浅灰色 */
+        }
+    </style>
+"""
