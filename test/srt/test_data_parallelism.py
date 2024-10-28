@@ -1,5 +1,8 @@
+import time
 import unittest
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
@@ -38,6 +41,26 @@ class TestDataParallelism(unittest.TestCase):
 
         metrics = run_eval(args)
         assert metrics["score"] >= 0.65
+
+    def test_update_weight(self):
+        response = requests.post(
+            self.base_url + "/update_weights",
+            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
+        )
+
+        # check if the response is 200
+        assert response.status_code == 200
+
+        # pause a few seconds then send again
+        time.sleep(5)
+        
+        response = requests.post(
+            self.base_url + "/update_weights",
+            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
+        )
+
+        # check if the response is 200
+        assert response.status_code == 200
 
 
 if __name__ == "__main__":
