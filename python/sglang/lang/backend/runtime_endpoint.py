@@ -1,5 +1,7 @@
 import json
+import uuid
 import warnings
+from datetime import datetime
 from typing import List, Optional
 
 from sglang.global_config import global_config
@@ -160,6 +162,19 @@ class RuntimeEndpoint(BaseBackend):
 
         self._add_images(s, data)
 
+        debug_request_id = str(uuid.uuid4())
+        print("LOGGING DEBUG")
+        debug_obj = s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "requestPrompt": data["text"],
+                    "requestTimestamp": datetime.now().isoformat(),
+                    "requestMetadata": {k: v for k, v in data.items() if k != "text"},
+                }
+            ]
+        )
+
         res = http_request(
             self.base_url + "/generate",
             json=data,
@@ -169,6 +184,17 @@ class RuntimeEndpoint(BaseBackend):
         self._assert_success(res)
 
         obj = res.json()
+
+        s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "responseContent": obj["text"],
+                    "responseTimestamp": datetime.now().isoformat(),
+                    "responseMetadata": obj["meta_info"],
+                }
+            ]
+        )
         comp = obj["text"]
         return comp, obj["meta_info"]
 
@@ -201,6 +227,18 @@ class RuntimeEndpoint(BaseBackend):
         data["stream"] = True
         self._add_images(s, data)
 
+        debug_request_id = str(uuid.uuid4())
+        debug_obj = s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "requestPrompt": data["text"],
+                    "requestTimestamp": datetime.now().isoformat(),
+                    "requestMetadata": {k: v for k, v in data.items() if k != "text"},
+                }
+            ]
+        )
+
         res = http_request(
             self.base_url + "/generate",
             json=data,
@@ -211,10 +249,21 @@ class RuntimeEndpoint(BaseBackend):
         self._assert_success(res)
         pos = 0
 
+        data = None
         for chunk in res.iter_lines(decode_unicode=False):
             chunk = chunk.decode("utf-8")
             if chunk and chunk.startswith("data:"):
                 if chunk == "data: [DONE]":
+                    s.log_debug(
+                        [
+                            {
+                                "id": debug_request_id,
+                                "responseContent": data["text"],
+                                "responseTimestamp": datetime.now().isoformat(),
+                                "responseMetadata": data["meta_info"],
+                            }
+                        ]
+                    )
                     break
                 data = json.loads(chunk[5:].strip("\n"))
                 chunk_text = data["text"][pos:]

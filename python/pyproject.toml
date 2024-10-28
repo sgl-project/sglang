@@ -25,6 +25,8 @@ runtime_common = ["aiohttp", "decord", "fastapi", "hf_transfer", "huggingface_hu
 srt = ["sglang[runtime_common]", "torch", "vllm==0.6.3.post1"]
 srt_xpu = ["sglang[runtime_common]"]
 
+studio = ["enochian-studio"]
+
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
@@ -36,8 +38,8 @@ test = [
     "accelerate",
     "peft",
 ]
-all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
-all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[studio]"]
+all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[studio]"]
 dev = ["sglang[all]", "sglang[test]"]
 dev_xpu = ["sglang[all_xpu]", "sglang[test]"]
 

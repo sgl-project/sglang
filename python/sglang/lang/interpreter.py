@@ -15,6 +15,14 @@ from typing import Any, Callable, Dict, List, Optional
 import tqdm
 
 from sglang.global_config import global_config
+from sglang.lang.debug import (
+    DebugInfo,
+    PostBody,
+    PostBodyRequest,
+    PromptRequest,
+    PromptRequestUpdate,
+    post_studio_prompt,
+)
 from sglang.lang.ir import (
     SglCommitLazy,
     SglConcateAndAppend,
@@ -244,6 +252,9 @@ class StreamExecutor:
             self.stream_text_event = None
             self.stream_var_event = None
 
+        # For debug logging
+        self.debug_: Optional[DebugInfo] = None
+
     def submit(self, expr: SglExpr):
         self._init_var_event(expr)
 
@@ -305,6 +316,65 @@ class StreamExecutor:
             # TODO(ying): handle API speculative execution
 
         return exes
+
+    def begin_debug_region(
+        self,
+        debug_name: Optional[str],
+        debug_prompt_id: Optional[str],
+        debug_base_url: Optional[str],
+        debug_port: Optional[int],
+    ):
+        print("BEGINNING DEBUG")
+        if self.debug_ is None:
+            assert (
+                debug_name is not None
+                and debug_base_url is not None
+                and debug_port is not None
+            ), "Must set required debug info fields"
+            self.debug_ = DebugInfo(
+                base_url=debug_base_url,
+                port=debug_port,
+                debug_name=debug_name,
+                debug_prompt_id=debug_prompt_id,
+            )
+        else:
+            if debug_name is not None:
+                self.debug_.debug_name = debug_name
+            if debug_prompt_id is not None:
+                self.debug_.debug_prompt_id = debug_prompt_id
+            if debug_base_url is not None:
+                self.debug_.base_url = debug_base_url
+            if debug_port is not None:
+                self.debug_.port = debug_port
+
+    def end_debug_region(self):
+        self.debug_ = None
+
+    def log_debug(
+        self,
+        post_body_request_list,  # List[PostBodyRequest] in Dict form
+    ):
+        print("🧧", self.debug_)
+        if not self.debug_ or not self.debug_.debug_name:
+            return
+        post_body = PostBody(
+            type=self.debug_.debug_name,
+            id=self.debug_.debug_prompt_id,
+            requests=[
+                (
+                    PromptRequest(**body)
+                    if "requestPrompt" in body
+                    else PromptRequestUpdate(**body)
+                )
+                for body in post_body_request_list
+            ],
+        )
+        res = post_studio_prompt(post_body, self.debug_)
+        if res.status_code != 200:
+            raise RuntimeError(res.json())
+        obj = res.json()
+        self.debug_.debug_prompt_id = obj["id"]
+        return obj
 
     def text(self):
         self.sync()
@@ -868,6 +938,23 @@ class ProgramState:
 
     def get_meta_info(self, name):
         return self.stream_executor.get_meta_info(name)
+
+    def begin_debug_region(
+        self,
+        debug_name: str,
+        debug_prompt_id: Optional[str] = None,
+        debug_base_url: str = "http://localhost",
+        debug_port: int = 56765,
+    ):
+        self.stream_executor.begin_debug_region(
+            debug_name=debug_name,
+            debug_prompt_id=debug_prompt_id,
+            debug_base_url=debug_base_url,
+            debug_port=debug_port,
+        )
+
+    def end_debug_region(self):
+        self.stream_executor.end_debug_region()
 
     def __iadd__(self, other):
         if other is None:
