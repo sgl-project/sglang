@@ -43,8 +43,6 @@ class TestDataParallelism(unittest.TestCase):
         assert metrics["score"] >= 0.65
 
     def test_update_weight(self):
-
-
         response = requests.post(
             self.base_url + "/update_weights",
             json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
