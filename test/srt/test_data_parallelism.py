@@ -1,5 +1,8 @@
+import time
 import unittest
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
@@ -9,8 +12,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
-import requests
-import time
+
 
 class TestDataParallelism(unittest.TestCase):
     @classmethod
