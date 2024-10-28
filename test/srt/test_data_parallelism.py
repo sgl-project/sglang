@@ -9,7 +9,8 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
-
+import requests
+import time
 
 class TestDataParallelism(unittest.TestCase):
     @classmethod
@@ -38,6 +39,28 @@ class TestDataParallelism(unittest.TestCase):
 
         metrics = run_eval(args)
         assert metrics["score"] >= 0.65
+
+    def test_update_weight(self):
+
+
+        response = requests.post(
+            self.base_url + "/update_weights",
+            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
+        )
+
+        # check if the response is 200
+        assert response.status_code == 200
+
+        # pause a few seconds then send again
+        time.sleep(5)
+        
+        response = requests.post(
+            self.base_url + "/update_weights",
+            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
+        )
+
+        # check if the response is 200
+        assert response.status_code == 200
 
 
 if __name__ == "__main__":
