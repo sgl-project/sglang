@@ -303,25 +303,20 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
 def lauch_sglang_server(command: str) -> subprocess.Popen:
     """
     Execute a shell command and return the process handle
-
+    
     Args:
         command: Shell command as a string (can include \ line continuations)
     Returns:
         subprocess.Popen: Process handle
     """
     # Replace \ newline with space and split
-    command = command.replace("\\\n", " ").replace("\\", " ")
+    command = command.replace('\\\n', ' ').replace('\\', ' ')
     parts = command.split()
-
+    
     return subprocess.Popen(
         parts,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,  # Redirect stderr to stdout
-        bufsize=0,
-        universal_newlines=True
     )
-
 
 def wait_for_server(base_url: str, timeout: int = None) -> None:
     """Wait for the server to be ready by polling the /v1/models endpoint.
