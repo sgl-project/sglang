@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
 from typing import Optional, Union
-
+from IPython.display import display, HTML
 import numpy as np
 import requests
 import torch
@@ -372,3 +372,6 @@ def terminate_process(process):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
         time.sleep(2)
+
+def highlight_text(html_content: str):
+    display(HTML(f"<strong>{html_content}</strong>"))
