@@ -16,10 +16,11 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
 from typing import Optional, Union
-from IPython.display import display, HTML
+
 import numpy as np
 import requests
 import torch
+from IPython.display import HTML, display
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
