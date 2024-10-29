@@ -72,6 +72,5 @@ def post_studio_prompt(body: PostBody, debug_info: DebugInfo) -> Any:
     Raises:
         requests.RequestException: If the HTTP request fails
     """
-    print("DEBUGGGGGGING")
     url = f"{debug_info.base_url}:{debug_info.port}/api/prompt"
     return http_request(url, json=body.model_dump(exclude_none=True))
