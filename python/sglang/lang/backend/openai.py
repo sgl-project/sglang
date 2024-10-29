@@ -327,6 +327,21 @@ class OpenAI(BaseBackend):
                 if valid[i]:
                     logit_bias[token_ids[i][step]] = 100
 
+            debug_request_id = str(uuid.uuid4())
+            s.log_debug(
+                [
+                    {
+                        "id": debug_request_id,
+                        "requestPrompt": str(prompt_tokens),
+                        "requestTimestamp": datetime.now().isoformat(),
+                        "requestMetadata": {
+                            **logit_bias,
+                            "max_tokens": 1,
+                            "temperature": temperature,
+                        },
+                    }
+                ]
+            )
             # Call API
             ret = self.client.completions.create(
                 model=self.model_name,
@@ -339,6 +354,16 @@ class OpenAI(BaseBackend):
             ret_token = self.tokenizer.encode(ret_str)[0]
             self.token_usage.prompt_tokens += ret.usage.prompt_tokens
             self.token_usage.completion_tokens = ret.usage.completion_tokens
+            s.log_debug(
+                [
+                    {
+                        "id": debug_request_id,
+                        "responseContent": ret_str,
+                        "responseTimestamp": datetime.now().isoformat(),
+                        "responseMetadata": ret.to_json(),
+                    }
+                ]
+            )
 
             # TODO:
             # 1. return logits as the scores
@@ -407,7 +432,7 @@ def openai_completion(
                         "id": debug_request_id,
                         "responseContent": comp,
                         "responseTimestamp": datetime.now().isoformat(),
-                        "responseMetadata": str(token_usage),
+                        "responseMetadata": ret.to_json(),
                     }
                 ]
             )
@@ -488,7 +513,7 @@ def openai_completion_stream(
                         "id": debug_request_id,
                         "responseContent": full_text,
                         "responseTimestamp": datetime.now().isoformat(),
-                        "responseMetadata": str(token_usage),
+                        "responseMetadata": ret.to_json(),
                     }
                 ]
             )
