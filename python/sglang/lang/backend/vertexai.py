@@ -1,5 +1,7 @@
 import os
+import uuid
 import warnings
+from datetime import datetime
 from typing import Optional
 
 from sglang.lang.backend.base_backend import BaseBackend
@@ -50,6 +52,20 @@ class VertexAI(BaseBackend):
                 if s.cur_images
                 else s.text_
             )
+
+        debug_request_id = str(uuid.uuid4())
+        s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "requestPrompt": str(prompt),
+                    "requestTimestamp": datetime.now().isoformat(),
+                    "requestMetadata": {
+                        **sampling_params.to_vertexai_kwargs(),
+                    },
+                }
+            ]
+        )
         ret = GenerativeModel(self.model_name).generate_content(
             prompt,
             generation_config=GenerationConfig(**sampling_params.to_vertexai_kwargs()),
@@ -57,6 +73,16 @@ class VertexAI(BaseBackend):
         )
 
         comp = ret.text
+        s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "responseContent": comp,
+                    "responseTimestamp": datetime.now().isoformat(),
+                    "responseMetadata": ret.to_json(),
+                }
+            ]
+        )
 
         return comp, {}
 
@@ -74,14 +100,42 @@ class VertexAI(BaseBackend):
                 if s.cur_images
                 else s.text_
             )
+        debug_request_id = str(uuid.uuid4())
+        s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "requestPrompt": str(prompt),
+                    "requestTimestamp": datetime.now().isoformat(),
+                    "requestMetadata": {
+                        **sampling_params.to_vertexai_kwargs(),
+                    },
+                }
+            ]
+        )
+
         generator = GenerativeModel(self.model_name).generate_content(
             prompt,
             stream=True,
             generation_config=GenerationConfig(**sampling_params.to_vertexai_kwargs()),
             safety_settings=self.safety_settings,
         )
+
+        full_text = ""
         for ret in generator:
+            full_text += ret.text
             yield ret.text, {}
+
+        s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "responseContent": full_text,
+                    "responseTimestamp": datetime.now().isoformat(),
+                    "responseMetadata": {},
+                }
+            ]
+        )
 
     def text_to_vertexai_input(self, text, images):
         input = []
