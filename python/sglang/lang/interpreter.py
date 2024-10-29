@@ -323,7 +323,6 @@ class StreamExecutor:
         self,
         post_body_request_list,  # List[PostBodyRequest] in Dict form
     ):
-        print("🧧", self.debug_)
         if not self.debug_ or not self.debug_.debug_name:
             return
         post_body = PostBody(

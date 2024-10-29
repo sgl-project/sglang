@@ -228,7 +228,7 @@ class RuntimeEndpoint(BaseBackend):
         self._add_images(s, data)
 
         debug_request_id = str(uuid.uuid4())
-        debug_obj = s.log_debug(
+        s.log_debug(
             [
                 {
                     "id": debug_request_id,
