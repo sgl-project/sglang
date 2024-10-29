@@ -1,7 +1,9 @@
 import dataclasses
 import logging
 import time
+import uuid
 import warnings
+from datetime import datetime
 from typing import Callable, List, Optional, Union
 
 import numpy as np
@@ -164,6 +166,7 @@ class OpenAI(BaseBackend):
             comp = openai_completion(
                 client=self.client,
                 token_usage=self.token_usage,
+                s=s,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=prompt,
@@ -178,6 +181,7 @@ class OpenAI(BaseBackend):
             comp = openai_completion(
                 client=self.client,
                 token_usage=self.token_usage,
+                s=s,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=s.text_ + '"',
@@ -194,6 +198,7 @@ class OpenAI(BaseBackend):
             comp = openai_completion(
                 client=self.client,
                 token_usage=self.token_usage,
+                s=s,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=s.text_,
@@ -244,6 +249,7 @@ class OpenAI(BaseBackend):
                 comp = openai_completion(
                     client=self.client,
                     token_usage=self.token_usage,
+                    s=s,
                     is_chat=self.is_chat_model,
                     model=self.model_name,
                     prompt=s.messages_,
@@ -283,6 +289,7 @@ class OpenAI(BaseBackend):
             generator = openai_completion_stream(
                 client=self.client,
                 token_usage=self.token_usage,
+                s=s,
                 is_chat=self.is_chat_model,
                 model=self.model_name,
                 prompt=prompt,
@@ -364,10 +371,21 @@ class OpenAI(BaseBackend):
 
 
 def openai_completion(
-    client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs
+    client, token_usage, s, is_chat=None, retries=3, prompt=None, **kwargs
 ):
     for attempt in range(retries):
         try:
+            debug_request_id = str(uuid.uuid4())
+            s.log_debug(
+                [
+                    {
+                        "id": debug_request_id,
+                        "requestPrompt": str(prompt),
+                        "requestTimestamp": datetime.now().isoformat(),
+                        "requestMetadata": {**kwargs},
+                    }
+                ]
+            )
             if is_chat:
                 if "stop" in kwargs and kwargs["stop"] is None:
                     kwargs.pop("stop")
@@ -382,6 +400,18 @@ def openai_completion(
 
             token_usage.prompt_tokens += ret.usage.prompt_tokens
             token_usage.completion_tokens += ret.usage.completion_tokens
+
+            s.log_debug(
+                [
+                    {
+                        "id": debug_request_id,
+                        "responseContent": comp,
+                        "responseTimestamp": datetime.now().isoformat(),
+                        "responseMetadata": str(token_usage),
+                    }
+                ]
+            )
+
             break
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError) as e:
             logger.error(f"OpenAI Error: {e}. Waiting 5 seconds...")
@@ -396,10 +426,27 @@ def openai_completion(
 
 
 def openai_completion_stream(
-    client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs
+    client, token_usage, s, is_chat=None, retries=3, prompt=None, **kwargs
 ):
     for attempt in range(retries):
         try:
+            debug_request_id = str(uuid.uuid4())
+            s.log_debug(
+                [
+                    {
+                        "id": debug_request_id,
+                        "requestPrompt": str(prompt),
+                        "requestTimestamp": datetime.now().isoformat(),
+                        "requestMetadata": {
+                            **kwargs,
+                            "stream": True,
+                            "stream_options": {"include_usage": True},
+                        },
+                    }
+                ]
+            )
+            full_text = ""
+
             if is_chat:
                 if "stop" in kwargs and kwargs["stop"] is None:
                     kwargs.pop("stop")
@@ -416,6 +463,7 @@ def openai_completion_stream(
                         content = ret.choices[0].delta.content
                     except IndexError:
                         content = None
+                    full_text += content or ""
                     yield content or "", {}
             else:
                 generator = client.completions.create(
@@ -428,10 +476,23 @@ def openai_completion_stream(
                     if len(ret.choices) == 0:
                         continue
                     content = ret.choices[0].text
+                    full_text += content or ""
                     yield content or "", {}
 
             token_usage.prompt_tokens += ret.usage.prompt_tokens
             token_usage.completion_tokens += ret.usage.completion_tokens
+
+            s.log_debug(
+                [
+                    {
+                        "id": debug_request_id,
+                        "responseContent": full_text,
+                        "responseTimestamp": datetime.now().isoformat(),
+                        "responseMetadata": str(token_usage),
+                    }
+                ]
+            )
+
             break
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError) as e:
             logger.error(f"OpenAI Error: {e}. Waiting 5 seconds...")
