@@ -1,3 +1,5 @@
+import uuid
+from datetime import datetime
 from typing import List, Optional, Union
 
 import numpy as np
@@ -42,6 +44,20 @@ class Anthropic(BaseBackend):
         else:
             system = ""
 
+        debug_request_id = str(uuid.uuid4())
+        debug_obj = s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "requestPrompt": str(
+                        [{"role": "system", "content": system}] + messages
+                    ),
+                    "requestTimestamp": datetime.now().isoformat(),
+                    "requestMetadata": sampling_params.to_anthropic_kwargs(),
+                }
+            ]
+        )
+
         ret = self.client.messages.create(
             model=self.model_name,
             system=system,
@@ -49,6 +65,17 @@ class Anthropic(BaseBackend):
             **sampling_params.to_anthropic_kwargs(),
         )
         comp = ret.content[0].text
+
+        s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "responseContent": comp,
+                    "responseTimestamp": datetime.now().isoformat(),
+                    "responseMetadata": ret.to_json(),
+                }
+            ]
+        )
 
         return comp, {}
 
@@ -67,6 +94,20 @@ class Anthropic(BaseBackend):
         else:
             system = ""
 
+        debug_request_id = str(uuid.uuid4())
+        debug_obj = s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "requestPrompt": str(
+                        [{"role": "system", "content": system}] + messages
+                    ),
+                    "requestTimestamp": datetime.now().isoformat(),
+                    "requestMetadata": sampling_params.to_anthropic_kwargs(),
+                }
+            ]
+        )
+
         with self.client.messages.stream(
             model=self.model_name,
             system=system,
@@ -75,3 +116,15 @@ class Anthropic(BaseBackend):
         ) as stream:
             for text in stream.text_stream:
                 yield text, {}
+        final_message = stream.get_final_message()
+        final_message_json = final_message.to_json()
+        s.log_debug(
+            [
+                {
+                    "id": debug_request_id,
+                    "responseContent": final_message.content[0].text,
+                    "responseTimestamp": datetime.now().isoformat(),
+                    "responseMetadata": final_message_json,
+                }
+            ]
+        )
