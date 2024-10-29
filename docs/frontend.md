@@ -233,6 +233,35 @@ def chat_example(s):
     s += sgl.assistant_end()
 ```
 
+#### Debug Studio
+
+The frontend also provides a debug studio to view what exactly is getting passed into the runtime endpoint's generation API.
+To use it, first start the debug server:
+
+```bash
+python -m sglang.launch_debug_server
+```
+
+It will start a debug server on port 56765. Then, add a debug region to an `sgl.function`:
+
+```python
+@sgl.function
+def text_qa(s, question):
+    s.begin_debug_region("TEXT_QA")
+    s += "Q: " + question + "\n"
+    s += "A:" + sgl.gen("answer", stop="\n")
+
+state = text_qa.run(
+    question="What is the capital of France?",
+    temperature=0.1,
+    stream=True
+)
+```
+
+When you navigate to `http://localhost:56765` (if you're on a remote server, ssh forward the port), you should see a web app with the prompt and response.
+
+<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/debug_studio_example.png" alt="prompt_studio_demo" margin="10px">
+
 #### Tips and Implementation Details
 - The `choices` argument in `sgl.gen` is implemented by computing the [token-length normalized log probabilities](https://blog.eleuther.ai/multiple-choice-normalization/) of all choices and selecting the one with the highest probability.
 - The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex. It is compatible with `temperature=0` and `temperature != 0`.

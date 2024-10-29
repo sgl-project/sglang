@@ -244,7 +244,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 # Node 1
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-0:50000 --nnodes 2 --node-rank 1
 ```
- 
+
 ### Engine Without HTTP Server
 
 We also provide an inference engine **without a HTTP server**. For example,
@@ -336,7 +336,7 @@ docker run --gpus all \
     lmsysorg/sglang:latest \
     python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --host 0.0.0.0 --port 30000
 ```
-  
+
 </details>
 
 #### Run Llama 3.1 405B
@@ -604,6 +604,35 @@ def chat_example(s):
     s += "Answer: " + sgl.gen(max_tokens=100, stop="\n")
     s += sgl.assistant_end()
 ```
+
+#### Debug Studio
+
+The frontend also provides a debug studio to view what exactly is getting passed into the runtime endpoint's generation API.
+To use it, first start the debug server:
+
+```bash
+python -m sglang.launch_debug_server
+```
+
+It will start a debug server on port 56765. Then, add a debug region to an `sgl.function`:
+
+```python
+@sgl.function
+def text_qa(s, question):
+    s.begin_debug_region("TEXT_QA")
+    s += "Q: " + question + "\n"
+    s += "A:" + sgl.gen("answer", stop="\n")
+
+state = text_qa.run(
+    question="What is the capital of France?",
+    temperature=0.1,
+    stream=True
+)
+```
+
+When you navigate to `http://localhost:56765` (if you're on a remote server, ssh forward the port), you should see a web app with the prompt and response.
+
+<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/debug_studio_example.png" alt="prompt_studio_demo" margin="10px">
 
 #### Tips and Implementation Details
 - The `choices` argument in `sgl.gen` is implemented by computing the [token-length normalized log probabilities](https://blog.eleuther.ai/multiple-choice-normalization/) of all choices and selecting the one with the highest probability.
