@@ -537,7 +537,7 @@ class TokenizerManager:
     async def get_memory_pool_size(self):
         if self.to_create_loop:
             self.create_handle_loop()
-        
+
         req = GetMemPoolSizeReq()
         ret = None
 
@@ -740,7 +740,3 @@ class TokenizerManager:
                     token_top_logprobs, decode_to_text
                 )
         return top_logprobs
-
-# curl -X POST http://127.0.0.1:30000/update_weights  -H "Content-Type: application/json" -d '{
-#     "model_path": "/shared/public/models/Qwen/Qwen2.5-1.5B-Instruct/"
-#   }'
