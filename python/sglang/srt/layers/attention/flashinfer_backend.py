@@ -125,7 +125,7 @@ class FlashInferAttnBackend(AttentionBackend):
             use_ragged = False
             if (
                 torch.sum(forward_batch.seq_lens).item() >= 4096
-                and self.num_wrappers == 1
+                and self.num_wrappers == 1 and not forward_batch.forward_mode.is_verify()
             ):
                 use_ragged = True
 
@@ -162,7 +162,14 @@ class FlashInferAttnBackend(AttentionBackend):
         self.cuda_graph_kv_last_page_len = torch.ones(
             (max_bs,), dtype=torch.int32, device="cuda"
         )
-
+        
+        self.cuda_graph_custom_mask = torch.zeros(
+            (max_bs * (self.model_runner.model_config.context_len+7)//8),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        self.cuda_graph_qk_indptr = self.cuda_graph_kv_indptr.clone()
+        
         # NOTE: the buffers are always in the form of list
         self.cuda_graph_kv_indptr = [self.cuda_graph_kv_indptr] + [
             self.cuda_graph_kv_indptr.clone() for _ in range(self.num_wrappers - 1)
@@ -172,7 +179,7 @@ class FlashInferAttnBackend(AttentionBackend):
         ]
 
     def init_forward_metadata_capture_cuda_graph(
-        self, num_token: int, req_pool_indices, seq_lens, 
+        self, num_token: int, bs: int, req_pool_indices, seq_lens, 
         spec_info:SpecInput, is_draft_runner: bool=False
     ):
         decode_wrappers = []
@@ -183,10 +190,12 @@ class FlashInferAttnBackend(AttentionBackend):
                         self.workspace_buffer,
                         "NHD",
                         use_cuda_graph=True,
-                        qo_indptr_buf=self.cuda_graph_q_indptr[:num_token+1],
-                        paged_kv_indptr_buf=self.cuda_graph_kv_indptr[i][: num_token + 1],
+                        qo_indptr_buf=self.cuda_graph_q_indptr[:bs+1],
+                        paged_kv_indptr_buf=self.cuda_graph_kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buf=self.cuda_graph_kv_last_page_len[:num_token],
+                        paged_kv_last_page_len_buf=self.cuda_graph_kv_last_page_len[:bs],
+                        custom_mask_buf=self.cuda_graph_custom_mask,
+                        qk_indptr_buf=self.cuda_graph_qk_indptr[:bs+1]
                     )
                 )
             else:
@@ -210,7 +219,8 @@ class FlashInferAttnBackend(AttentionBackend):
             seq_lens,
             None,
             decode_wrappers,
-            spec_info=spec_info
+            spec_info=spec_info,
+            use_cuda_graph=True,
         )
 
         self.cuda_graph_metadata[num_token] = decode_wrappers
@@ -218,17 +228,18 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata = (False, False, None, decode_wrappers)
 
     def init_forward_metadata_replay_cuda_graph(
-        self, bs: int, num_token: int, req_pool_indices, seq_lens, spec_info
+        self, bs: int, num_token: int, req_pool_indices, seq_lens, spec_info, forward_mode
     ):
         # num_token == bs if not use speculative decoding with eagle2
         update_flashinfer_indices(
-            ForwardMode.DECODE,
+            forward_mode,
             self.model_runner,
             req_pool_indices[:bs],
             seq_lens[:bs],
             None,
             self.cuda_graph_metadata[num_token],
-            spec_info=spec_info
+            spec_info=spec_info,
+            use_cuda_graph=True,
         )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -247,20 +258,26 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer.layer_id, forward_batch.out_cache_loc, k, v
                 )
-            causal = True
-            if (
-                forward_batch.spec_algorithm == "EAGLE"
-                and forward_batch.forward_mode == ForwardMode.SPECVERIFY
-            ):
-                causal = False
-            o = prefill_wrapper_paged.forward(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=causal,
-                sm_scale=layer.scaling,
-                window_left=layer.sliding_window_size,
-                logits_soft_cap=layer.logit_cap,
-            )
+
+            if forward_batch.forward_mode == ForwardMode.SPECVERIFY and forward_batch.is_cuda_graph:
+                decode_wrapper = self.forward_metadata[-1][self._get_wrapper_idx(layer)]
+                o = decode_wrapper.forward(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=False,
+                    sm_scale=layer.scaling,
+                    window_left=layer.sliding_window_size,
+                    logits_soft_cap=layer.logit_cap,
+                )
+            else:
+                o = prefill_wrapper_paged.forward(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    window_left=layer.sliding_window_size,
+                    logits_soft_cap=layer.logit_cap,
+                )
         else:
             o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),

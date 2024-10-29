@@ -34,6 +34,13 @@ class LogitsProcessorOutput:
     next_token_logits: torch.Tensor
     # The logprobs of the next tokens.     shape: [#seq, vocab_size]
     next_token_logprobs: torch.Tensor
+    
+    # Used by speculative inference
+    # The output of transformer layers
+    hidden_states: Optional[torch.Tensor]
+    # backup of next_token_logits when use cuda graph
+    # id(next_token_logits_bak) == id(next_token_logits)
+    next_token_logits_bak: Optional[torch.Tensor]
 
     # The normlaized logprobs of prompts.  shape: [#seq]
     normalized_prompt_logprobs: torch.Tensor
@@ -172,9 +179,9 @@ class LogitsProcessor(nn.Module):
         weight,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
     ):
-        spec_info = None
+        need_hidden_states = False
         if isinstance(logits_metadata, ForwardBatch):
-            spec_info = getattr(logits_metadata, 'spec_info', None)
+            need_hidden_states = logits_metadata.spec_algorithm == 'EAGLE'
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
         assert isinstance(logits_metadata, LogitsMetadata)
 
@@ -185,9 +192,6 @@ class LogitsProcessor(nn.Module):
         else:
             last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             last_hidden = hidden_states[last_index]
-
-        if spec_info:
-            spec_info.hidden_states = last_hidden
 
         last_logits = torch.matmul(last_hidden, weight.T)
         if self.do_tensor_parallel_all_gather:
@@ -208,6 +212,8 @@ class LogitsProcessor(nn.Module):
                 input_token_logprobs=None,
                 input_top_logprobs=None,
                 output_top_logprobs=None,
+                hidden_states=last_hidden if need_hidden_states else None,
+                next_token_logits_bak=last_logits,
             )
         else:
             last_logprobs = torch.nn.functional.log_softmax(last_logits, dim=-1)

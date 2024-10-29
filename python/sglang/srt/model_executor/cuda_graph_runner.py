@@ -218,10 +218,12 @@ class CudaGraphRunner:
             else:
                 spec_info = DraftInfoFactory.get(self.model_runner.server_args.speculative_algorithm, 'VerifyInput')(
                     None, None, None, None, None, None, self.model_runner.server_args.num_draft_tokens)
+                spec_info.custom_mask = torch.zeros((num_token*self.model_runner.model_config.context_len), dtype=torch.bool,
+                    device="cuda",)
                 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-            num_token, req_pool_indices, seq_lens, spec_info, self.model_runner.is_draft_runner
+            num_token, bs, req_pool_indices, seq_lens, spec_info, self.model_runner.is_draft_runner
         )
 
         # Run and capture
@@ -241,6 +243,8 @@ class CudaGraphRunner:
                 positions=positions,
                 #positions=torch.clamp((seq_lens - 1), min=0).to(torch.int64),
                 spec_info=spec_info,
+                spec_algorithm=self.model_runner.server_args.speculative_algorithm,
+                is_cuda_graph=True,
             )
             return forward(input_ids, forward_batch.positions, forward_batch)
 
@@ -267,6 +271,7 @@ class CudaGraphRunner:
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
+        forward_batch.is_cuda_graph = True
         raw_bs = forward_batch.batch_size
         # In most case, raw_bs == num_token in decode stage. 
         # But for speculative, the token num maybe large than raw_bs
@@ -293,7 +298,7 @@ class CudaGraphRunner:
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs, num_token, self.req_pool_indices, self.seq_lens, forward_batch.spec_info
+            bs, num_token, self.req_pool_indices, self.seq_lens, forward_batch.spec_info, self.capture_forward_mode
         )
 
         # Replay

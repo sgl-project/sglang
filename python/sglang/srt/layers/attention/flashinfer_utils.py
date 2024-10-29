@@ -57,6 +57,7 @@ class FlashinferUpdater:
         decode_wrappers=None,
         use_ragged=False,
         spec_info=None,
+        use_cuda_graph=False,
     ):
         self.forward_mode = forward_mode
         self.model_runner = model_runner
@@ -65,6 +66,7 @@ class FlashinferUpdater:
         self.prefix_lens = prefix_lens
         self.use_ragged = use_ragged
         self.spec_info = spec_info
+        self.use_cuda_graph = use_cuda_graph
 
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -231,7 +233,10 @@ class FlashinferUpdater:
     def _update_indicess_single_wrapper(self):
         self._get_indices()
         if self.forward_mode.is_verify():
-            self._update_verify_indices(self.prefill_wrappers_paged[0])
+            if self.use_cuda_graph:
+                self._update_verify_indices(self.decode_wrappers[0])
+            else:
+                self._update_verify_indices(self.prefill_wrappers_paged[0])
         elif self.forward_mode.is_spec_extend():
             self._update_spec_extend(self.prefill_wrappers_paged[0])
         elif self.forward_mode.is_decode():
@@ -266,7 +271,8 @@ def update_flashinfer_indices(
     prefix_lens,
     decode_wrappers=None,
     use_ragged=False,
-    spec_info=None
+    spec_info=None,
+    use_cuda_graph=False,
 ):
     updater = FlashinferUpdater(
         forward_mode,
@@ -277,6 +283,7 @@ def update_flashinfer_indices(
         decode_wrappers,
         use_ragged,
         spec_info,
+        use_cuda_graph,
     )
 
     dispatch_reason = model_runner.attn_backend.dispatch_reason

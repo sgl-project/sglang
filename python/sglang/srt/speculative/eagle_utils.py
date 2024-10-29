@@ -198,7 +198,7 @@ class EAGLEDraftInput(SpecDraftInput):
     def init(self, server_args: ServerArgs):
         self.prev_mode = ForwardMode.DECODE
         self.sample_output = None
-        self.topk: int = 8
+        self.topk: int = server_args.eagle_topk
         self.num_verify_token: int = server_args.num_draft_tokens
         self.spec_steps = server_args.num_speculative_steps
 
@@ -247,9 +247,11 @@ class EAGLEDraftInput(SpecDraftInput):
             model_input_ids, dtype=torch.int32, device="cuda"
         )
 
-    def capture_for_decode(self, sample_output: SampleOutput, prev_mode: ForwardMode):
+    def capture_for_decode(self, sample_output: SampleOutput, hidden_states: torch.Tensor,
+                           prev_mode: ForwardMode):
         self.sample_output = sample_output
         self.prev_mode = prev_mode
+        self.hidden_states = hidden_states
 
     def prepare_for_decode(self, batch: ScheduleBatch):
         prob = self.sample_output  # b * (1/topk), vocab
@@ -471,12 +473,6 @@ class EagleVerifyInput(SpecVerifyInput):
     def prepare_for_verify(self, batch: ScheduleBatch):
         batch.input_ids = self.draft_token
         batch.out_cache_loc = batch.alloc_token_slots(batch.input_ids.numel())
-        # batch.req_to_token_pool.req_to_token[
-        #     batch.req_pool_indices,
-        #     batch.seq_lens : batch.seq_lens + self.draft_token_num,
-        # ] = batch.out_cache_loc
-        
-        #print(batch.req_to_token_pool.req_to_token[0][:100])
         bs = batch.seq_lens.numel()
         assign_req_to_token_pool[(bs, )](batch.req_pool_indices,
                             batch.req_to_token_pool.req_to_token,
@@ -506,7 +502,7 @@ class EagleVerifyInput(SpecVerifyInput):
             (batch_size + 1,), dtype=torch.int32, device="cuda"
         )
         
-        paged_kernel_lens = paged_kernel_lens.add_(self.draft_token_num)
+        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
@@ -522,11 +518,10 @@ class EagleVerifyInput(SpecVerifyInput):
             kv_indices,
             req_to_token_pool.req_to_token.size(1),
         )
-        paged_kernel_lens = paged_kernel_lens.sub_(self.draft_token_num)
         return kv_indices, cum_kv_seq_len, kv_last_page_len, qo_indptr
 
     def verify(self, batch: ScheduleBatch, logits_output: torch.Tensor) -> torch.Tensor:
-        predict = torch.argmax(logits_output.next_token_logits, dim=-1)
+        predict = torch.argmax(logits_output.next_token_logits_bak, dim=-1)
         predict = torch.cat([predict, torch.full([1], -1, dtype=torch.long, device='cuda')], dim=-1)
         draft_token = torch.cat([self.draft_token, torch.full([1], -1, dtype=torch.long, device='cuda')], dim=-1)
         target_predict = predict[self.retrive_index]
@@ -605,6 +600,6 @@ class EagleVerifyInput(SpecVerifyInput):
             draft_input.accept_length = accept_length[unfinished_index]
             draft_input.unfinished_index = unfinished_index
 
-        logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
+        logits_output.next_token_logits = logits_output.next_token_logits_bak[accept_index]
         return draft_input, logits_output, verified_id, finished_extend_len
 

@@ -326,7 +326,10 @@ class LlamaForCausalLMEagle(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return hidden_states
+        logits_output = self.logits_processor(
+            None, hidden_states, self.lm_head.weight, forward_batch
+        )
+        return logits_output
     
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim

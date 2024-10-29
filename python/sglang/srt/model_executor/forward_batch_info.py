@@ -77,7 +77,7 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.SPECEXTEND
     
     def is_cuda_graph(self):
-        return self in (ForwardMode.DECODE, ForwardMode)
+        return self in (ForwardMode.DECODE, ForwardMode.SPECVERIFY)
 
 
 @dataclass
@@ -129,6 +129,7 @@ class ForwardBatch:
     spec_info: SpecInput = None
     spec_algorithm: str = None
     is_draft_batch: bool = False
+    is_cuda_graph: bool = False
 
     @classmethod
     def init_new(

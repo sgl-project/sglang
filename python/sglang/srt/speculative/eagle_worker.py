@@ -76,6 +76,7 @@ class EAGLEWorker(SpeculativeWorker):
         batch.spec_info = verify_input
         model_worker_batch = batch.get_model_worker_batch()
         logits_output, _ = self.target_worker.forward_batch_generation(model_worker_batch, need_token_id=False)
+        verify_input.hidden_states = logits_output.hidden_states
         res = verify_input.verify(batch, logits_output)
         batch.forward_mode = ForwardMode.DECODE
         return res
@@ -103,19 +104,14 @@ class EAGLEWorker(SpeculativeWorker):
             batch.seq_lens = seq_lens
         self._swap_mem_pool(batch, self.target_worker.model_runner)
 
-    def capture_for_decode(self, hidden_states, forward_batch):
-        # lm head is not support cuda graph currently. But it could be support theoretically.
-        # TODO: Support it. @kavioyu
-        logits_output = self.model_runner.model.logits_processor(
-            None, hidden_states, self.model_runner.model.lm_head.weight, forward_batch
-        )
+    def capture_for_decode(self, logits_output, forward_batch):
         if isinstance(logits_output, LogitsProcessorOutput):
             logits = logits_output.next_token_logits
         sample_output = torch.softmax(
             logits, dim=-1
         )  # TODO: Support more sampling method @kavioyu
         forward_batch.spec_info.capture_for_decode(
-            sample_output, forward_batch.forward_mode
+            sample_output, logits_output.hidden_states, forward_batch.forward_mode
         )
     
     # Don't support prefix share now.
