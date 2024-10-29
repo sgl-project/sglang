@@ -2,6 +2,7 @@ import unittest
 
 import sglang as sgl
 from sglang.test.test_programs import (
+    test_debug_server,
     test_decode_int,
     test_decode_json_regex,
     test_dtype_gen,
@@ -16,20 +17,23 @@ from sglang.test.test_programs import (
     test_stream,
     test_tool_use,
 )
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, launch_debug_server
 
 
 class TestSRTBackend(unittest.TestCase):
     backend = None
+    debug_server = None
 
     @classmethod
     def setUpClass(cls):
         cls.backend = sgl.Runtime(model_path=DEFAULT_MODEL_NAME_FOR_TEST)
         sgl.set_default_backend(cls.backend)
+        cls.debug_server = launch_debug_server()
 
     @classmethod
     def tearDownClass(cls):
         cls.backend.shutdown()
+        cls.debug_server.kill()
 
     def test_few_shot_qa(self):
         test_few_shot_qa()
@@ -72,6 +76,9 @@ class TestSRTBackend(unittest.TestCase):
 
     def test_gen_min_new_tokens(self):
         test_gen_min_new_tokens()
+
+    def test_debug_server(self):
+        test_debug_server()
 
 
 if __name__ == "__main__":

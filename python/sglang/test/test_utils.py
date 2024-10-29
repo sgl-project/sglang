@@ -15,6 +15,7 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
+from enochian_studio.cli import start_server
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
@@ -728,3 +729,8 @@ def run_mmlu_test(
 
     assert has_new_server
     # assert not has_leak
+
+
+def launch_debug_server():
+    process = start_server(port=56765)
+    return process
