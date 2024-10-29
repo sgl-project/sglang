@@ -1,0 +1,23 @@
+[package]
+name = "sglang-router"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "router"
+path = "src/main.rs"
+
+[lib]
+name = "router"
+crate-type = ["cdylib"]
+
+[dependencies]
+actix-web = "4.0"
+serde = { version = "1.0", features = ["derive"] }
+clap = { version = "4.4", features = ["derive"] }
+bytes = "1.8.0"
+rand = "0.8.5"
+reqwest = { version = "0.12.8", features = ["stream"] }
+futures-util = "0.3"
+serde_json = "=1.0.1"
+pyo3 = { version = "0.22.5", features = ["extension-module"] }
