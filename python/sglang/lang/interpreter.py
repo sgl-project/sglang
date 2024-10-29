@@ -54,7 +54,14 @@ def run_internal(state, program, func_args, func_kwargs, sync):
 
 
 def run_program(
-    program, backend, func_args, func_kwargs, default_sampling_para, stream, sync=False
+    program,
+    backend,
+    func_args,
+    func_kwargs,
+    default_sampling_para,
+    stream,
+    sync=False,
+    use_thread=True,
 ):
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
@@ -67,6 +74,7 @@ def run_program(
         chat_template=None,
         stream=stream,
         num_api_spec_tokens=program.num_api_spec_tokens,
+        use_thread=use_thread,
     )
     state = ProgramState(stream_executor)
 
