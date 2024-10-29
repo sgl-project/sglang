@@ -537,11 +537,24 @@ class TokenizerManager:
     async def get_memory_pool_size(self):
         if self.to_create_loop:
             self.create_handle_loop()
-
+        
         req = GetMemPoolSizeReq()
-        self.send_to_scheduler.send_pyobj(req)
-        self.mem_pool_size = asyncio.Future()
-        return await self.mem_pool_size
+        ret = None
+
+        if self.server_args.dp_size == 1:
+            self.send_to_scheduler.send_pyobj(req)
+            self.mem_pool_size = asyncio.Future()
+            res = await self.mem_pool_size
+            ret = res.size
+
+        else: # self.server_args.dp_size > 1
+            self.send_to_scheduler.send_pyobj(req)
+            self.mem_pool_size = asyncio.Future()
+            self.mem_pool_size_tmp = []
+            res = await self.mem_pool_size
+            ret = [r.size for r in res]
+            
+        return ret
 
     async def update_weights(
         self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
@@ -634,7 +647,13 @@ class TokenizerManager:
                         self.model_update_result.set_result(self.model_update_tmp)
                 continue
             elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
-                self.mem_pool_size.set_result(recv_obj)
+                if self.server_args.dp_size == 1:
+                    self.mem_pool_size.set_result(recv_obj)
+                else: # self.sever_args.dp_size > 1
+                    self.mem_pool_size_tmp.append(recv_obj)
+                    # set future if the all results are received
+                    if len(self.mem_pool_size_tmp) == self.server_args.dp_size:
+                        self.mem_pool_size.set_result(self.mem_pool_size_tmp)
                 continue
 
             assert isinstance(
@@ -721,3 +740,7 @@ class TokenizerManager:
                     token_top_logprobs, decode_to_text
                 )
         return top_logprobs
+
+# curl -X POST http://127.0.0.1:30000/update_weights  -H "Content-Type: application/json" -d '{
+#     "model_path": "/shared/public/models/Qwen/Qwen2.5-1.5B-Instruct/"
+#   }'
