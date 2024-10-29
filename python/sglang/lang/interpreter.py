@@ -750,7 +750,6 @@ class StreamExecutor:
         return clone
 
     def _execute_begin_debug_region(self, expr: SglDebugRegionBegin):
-        print("BEGINNING DEBUG")
         if self.debug_ is None:
             assert (
                 expr.debug_name is not None
