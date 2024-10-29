@@ -20,7 +20,7 @@ curl http://localhost:30000/generate \
   }'
 ```
 
-Learn more about the argument specification, streaming, and multi-modal support [here](https://sglang.readthedocs.io/en/latest/sampling_params.html).
+Learn more about the argument specification, streaming, and multi-modal support [here](https://sgl-project.github.io/sampling_params.html).
 
 ### OpenAI Compatible API
 In addition, the server supports OpenAI-compatible APIs.
@@ -74,16 +74,16 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --mem-fraction-static 0.7
 ```
-- See [hyperparameter tuning](https://sglang.readthedocs.io/en/latest/hyperparameter_tuning.html) on tuning hyperparameters for better performance.
+- See [hyperparameter tuning](https://sgl-project.github.io/hyperparameter_tuning.html) on tuning hyperparameters for better performance.
 - If you see out-of-memory errors during prefill for long prompts, try to set a smaller chunked prefill size.
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
 ```
-- To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes.
+- To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. This does not work for FP8 currenly.
 - To enable torchao quantization, add `--torchao-config int4wo-128`. It supports various quantization strategies.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
-- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](https://sglang.readthedocs.io/en/latest/custom_chat_template.html).
+- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](https://sgl-project.github.io/custom_chat_template.html).
 - To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
 ```
 # Node 0
@@ -99,7 +99,6 @@ We also provide an inference engine **without a HTTP server**. For example,
 
 ```python
 import sglang as sgl
-
 
 def main():
     prompts = [
@@ -120,12 +119,8 @@ if __name__ == "__main__":
     main()
 ```
 
-This can be used for:
-
-1. **Offline Batch Inference**
-2. **Building Custom Servers**
-
-You can view the full example [here](https://github.com/sgl-project/sglang/tree/main/examples/runtime/engine)
+This can be used for offline batch inference and building custom servers.
+You can view the full example [here](https://github.com/sgl-project/sglang/tree/main/examples/runtime/engine).
 
 ### Supported Models
 
@@ -163,7 +158,7 @@ You can view the full example [here](https://github.com/sgl-project/sglang/tree/
 - gte-Qwen2
   - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
 
-Instructions for supporting a new model are [here](https://sglang.readthedocs.io/en/latest/model_support.html).
+Instructions for supporting a new model are [here](https://sgl-project.github.io/model_support.html).
 
 #### Use Models From ModelScope
 <details>

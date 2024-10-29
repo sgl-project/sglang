@@ -90,10 +90,14 @@ class TpModelWorker:
             ),
             self.model_runner.req_to_token_pool.size,
         )
-        self.max_req_input_len = min(
+        self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
         )
+        self.max_req_input_len = self.max_req_len - 5
+        assert (
+            self.max_req_len > 0 and self.max_req_input_len > 0
+        ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
         self.random_seed = broadcast_pyobj(
@@ -108,6 +112,7 @@ class TpModelWorker:
             self.max_total_num_tokens,
             self.max_prefill_tokens,
             self.max_running_requests,
+            self.max_req_len,
             self.max_req_input_len,
             self.random_seed,
             self.device,

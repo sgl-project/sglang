@@ -1,8 +1,10 @@
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
 from torch import nn
 
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -19,13 +21,22 @@ class AttentionBackend(ABC):
         raise NotImplementedError()
 
     def init_forward_metadata_capture_cuda_graph(
-        self, bs: int, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor] = None,
     ):
         """Init the metadata for a forward pass for capturing a cuda graph."""
         raise NotImplementedError()
 
     def init_forward_metadata_replay_cuda_graph(
-        self, bs: int, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor] = None,
     ):
         """Init the metadata for a forward pass for replying a cuda graph."""
         raise NotImplementedError()
@@ -39,7 +50,7 @@ class AttentionBackend(ABC):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: nn.Module,
+        layer: RadixAttention,
         forward_batch: ForwardBatch,
     ):
         """Run forward on an attention layer."""
@@ -53,7 +64,7 @@ class AttentionBackend(ABC):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: nn.Module,
+        layer: RadixAttention,
         forward_batch: ForwardBatch,
     ):
         """Run a forward for decode."""
@@ -64,7 +75,7 @@ class AttentionBackend(ABC):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: nn.Module,
+        layer: RadixAttention,
         forward_batch: ForwardBatch,
     ):
         """Run a forward for extend."""

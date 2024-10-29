@@ -13,12 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     environment: 'prod'
     steps:
-      - name: Set up python3.8
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.8'
+          python-version: '3.9'
+
       - name: Checkout repository
         uses: actions/checkout@v3
+
       - name: Upload to pypi
         run: |
           cd python

@@ -46,9 +46,7 @@ class ModelCase:
 # Popular models that run on the CI
 CI_MODELS = [
     ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
-    ModelCase(
-        "google/gemma-2-2b", skip_long_prompt=True
-    ),  # There is a bug with new transformers library. This can only run with transformers==4.44
+    ModelCase("google/gemma-2-2b"),
 ]
 
 # All other models that do not run on the CI
@@ -57,6 +55,7 @@ ALL_OTHER_MODELS = [
     ModelCase("Qwen/Qwen2.5-14B-Instruct"),
     ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
     ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),
+    ModelCase("THUDM/glm-4-9b-chat"),
 ]
 
 TORCH_DTYPES = [torch.float16]

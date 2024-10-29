@@ -36,8 +36,8 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from sglang.global_config import global_config
-from sglang.srt.constrained import RegexGuide
-from sglang.srt.constrained.jump_forward import JumpForwardMap
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constrained.grammar import Grammar
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -121,11 +121,12 @@ class ImageInputs:
     """The image related inputs."""
 
     pixel_values: torch.Tensor
-    image_hash: int
+    image_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
     pad_values: Optional[list] = None
     modalities: Optional[list] = None
+    num_image_tokens: Optional[int] = None
 
     image_embeds: Optional[List[torch.Tensor]] = None
     aspect_ratio_ids: Optional[List[torch.Tensor]] = None
@@ -138,19 +139,27 @@ class ImageInputs:
         # Use image hash as fake token_ids, which is then used for prefix matching
         ret = ImageInputs(
             pixel_values=obj["pixel_values"],
-            image_hash=hash(tuple(obj["image_hashes"])),
-            image_grid_thws=obj.get("image_grid_thws"),
+            image_hashes=hash(tuple(obj["image_hashes"])),
         )
-        image_hash = ret.image_hash
+        image_hash = ret.image_hashes
         ret.pad_values = [
             (image_hash) % vocab_size,
             (image_hash >> 16) % vocab_size,
             (image_hash >> 32) % vocab_size,
             (image_hash >> 64) % vocab_size,
         ]
-        ret.image_sizes = obj["image_sizes"]
-        # Only when pixel values is not None we have modalities
-        ret.modalities = obj["modalities"] or ["image"]
+
+        optional_args = [
+            "image_sizes",
+            "modalities",
+            "aspect_ratio_ids",
+            "aspect_ratio_mask",
+            "image_grid_thws",
+        ]
+        for arg in optional_args:
+            if arg in obj:
+                setattr(ret, arg, obj[arg])
+
         return ret
 
 
@@ -237,9 +246,7 @@ class Req:
         self.embedding = None
 
         # Constrained decoding
-        self.regex_fsm: RegexGuide = None
-        self.regex_fsm_state: int = 0
-        self.jump_forward_map: JumpForwardMap = None
+        self.grammar: Optional[Grammar] = None
 
         # For Qwen2-VL
         self.mrope_position_delta = []  # use mutable object
@@ -324,15 +331,20 @@ class Req:
 
         last_token_id = self.output_ids[-1]
 
-        matched_eos = last_token_id in self.sampling_params.stop_token_ids
+        matched_eos = False
 
+        # Check stop token ids
+        if self.sampling_params.stop_token_ids:
+            matched_eos = last_token_id in self.sampling_params.stop_token_ids
         if self.tokenizer is not None:
             matched_eos |= last_token_id == self.tokenizer.eos_token_id
-
+            if self.tokenizer.additional_stop_token_ids:
+                matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
         if matched_eos and not self.sampling_params.ignore_eos:
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
             return
 
+        # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tokenizer.decode(
                 self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
@@ -344,6 +356,8 @@ class Req:
                     return
 
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
+        assert self.grammar is not None and self.tokenizer is not None
+
         if self.origin_input_text is None:
             # Recovering text can only use unpadded ids
             self.origin_input_text = self.tokenizer.decode(
@@ -383,7 +397,8 @@ class Req:
                 self.surr_offset = self.read_offset - i
                 break
 
-        self.regex_fsm_state = next_state
+        # update the inner state of the grammar
+        self.grammar.jump_and_retokenize(old_output_ids, self.output_ids, next_state)
 
         if self.return_logprob:
             # For fast-forward part's logprobs
@@ -417,6 +432,9 @@ class ScheduleBatch:
     token_to_kv_pool: BaseTokenToKVPool = None
     tree_cache: BasePrefixCache = None
 
+    # For utility
+    model_config: ModelConfig = None
+
     forward_mode: ForwardMode = None
     sampling_info: SamplingBatchInfo = None
 
@@ -424,8 +442,12 @@ class ScheduleBatch:
     input_ids: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
+    # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None
     output_ids: torch.Tensor = None
+
+    # The sum of all sequence lengths
+    seq_lens_sum: int = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -435,28 +457,41 @@ class ScheduleBatch:
     prefix_lens: List[int] = None
     extend_lens: List[int] = None
     extend_num_tokens: int = None
-    running_bs: int = None
     decoding_reqs: List[Req] = None
+
+    # For encoder-decoder
+    encoder_cached: Optional[List[bool]] = None
+    encoder_lens: Optional[torch.Tensor] = None
+    encoder_lens_cpu: Optional[List[int]] = None
+    encoder_out_cache_loc: Optional[torch.Tensor] = None
 
     # Stream
     has_stream: bool = False
 
-    # Has regex
-    has_regex: bool = False
+    # Has grammar
+    has_grammar: bool = False
 
     # device
     device: str = "cuda"
 
     @classmethod
-    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+    def init_new(
+        cls,
+        reqs: List[Req],
+        req_to_token_pool,
+        token_to_kv_pool,
+        tree_cache,
+        model_config,
+    ):
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
+            model_config=model_config,
             return_logprob=any(req.return_logprob for req in reqs),
             has_stream=any(req.stream for req in reqs),
-            has_regex=any(req.regex_fsm for req in reqs),
+            has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
         )
 
@@ -484,14 +519,90 @@ class ScheduleBatch:
                 out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
 
             if out_cache_loc is None:
-                logger.error("Prefill out of memory. Try to lower your batch size.")
+                phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
+                logger.error(
+                    f"{phase_str} out of memory. Try to lower your batch size.\n"
+                    f"Try to allocate {num_tokens} tokens.\n"
+                    f"Avaliable tokens: {self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()}\n"
+                )
                 if self.tree_cache is not None:
                     self.tree_cache.pretty_print()
                 exit(1)
 
         return out_cache_loc
 
-    def prepare_for_extend(self, vocab_size: int):
+    def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
+        self.encoder_lens_cpu = []
+        self.encoder_cached = []
+
+        for req in self.reqs:
+            im = req.image_inputs
+            if im is None or im.num_image_tokens is None:
+                # No image input
+                self.encoder_lens_cpu.append(0)
+                self.encoder_cached.append(True)
+            else:
+                self.encoder_lens_cpu.append(im.num_image_tokens)
+                self.encoder_cached.append(
+                    self.forward_mode.is_decode()
+                    or len(req.prefix_indices) >= im.num_image_tokens
+                )
+
+        self.encoder_lens = torch.tensor(self.encoder_lens_cpu, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+
+        # Strip encoder infos
+        pt = 0
+        decoder_out_cache_loc = []
+        encoder_out_cache_loc = []
+        for i, req in enumerate(self.reqs):
+            encoder_len = self.encoder_lens_cpu[i]
+            seq_lens[i] -= encoder_len
+
+            if len(req.prefix_indices) < encoder_len:
+                # NOTE: the encoder part should considered as a whole
+                assert len(req.prefix_indices) == 0
+                input_ids[i] = input_ids[i][encoder_len:]
+                encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
+                decoder_out_cache_loc.append(
+                    self.out_cache_loc[pt + encoder_len : pt + req.extend_input_len]
+                )
+                self.extend_lens[i] -= encoder_len
+                self.extend_num_tokens -= encoder_len
+            else:
+                decoder_out_cache_loc.append(
+                    self.out_cache_loc[pt : pt + req.extend_input_len]
+                )
+                self.prefix_lens[i] -= encoder_len
+
+            pt += req.extend_input_len
+
+        # Reassign
+        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+
+        if not decoder_out_cache_loc:
+            self.out_cache_loc = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+        else:
+            self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+
+        if not encoder_out_cache_loc:
+            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+        else:
+            self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
+
+        assert len(self.out_cache_loc) == self.extend_num_tokens
+
+    def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
         bs = len(self.reqs)
@@ -549,16 +660,23 @@ class ScheduleBatch:
             self.device, non_blocking=True
         )
 
-        self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
+
+        self.seq_lens_sum = sum(seq_lens)
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+        self.extend_num_tokens = extend_num_tokens
         self.prefix_lens = [len(r.prefix_indices) for r in reqs]
         self.extend_lens = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
 
+        if self.model_config.is_encoder_decoder:
+            self.prepare_encoder_info_extend(input_ids, seq_lens)
+
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self, vocab_size, global_server_args_dict["disable_penalizer"]
+            self,
+            self.model_config.vocab_size,
+            global_server_args_dict["disable_penalizer"],
         )
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
@@ -571,12 +689,11 @@ class ScheduleBatch:
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
-        extend_num_tokens = self.extend_num_tokens + running_bs
 
         self.merge_batch(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
-        self.extend_num_tokens = extend_num_tokens
+        self.extend_num_tokens += running_bs
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
@@ -686,26 +803,10 @@ class ScheduleBatch:
         keep_indices = set(i for i in range(len(self.reqs)))
 
         for i, req in enumerate(self.reqs):
-            if req.jump_forward_map is not None:
-                jump_forward_bytes = req.jump_forward_map.jump_forward_byte(
-                    req.regex_fsm_state
-                )
-                if jump_forward_bytes is not None and len(jump_forward_bytes) > 1:
-                    suffix_bytes = []
-                    continuation_range = range(0x80, 0xC0)
-                    cur_state = req.regex_fsm_state
-                    while (
-                        len(jump_forward_bytes)
-                        and jump_forward_bytes[0][0] in continuation_range
-                    ):
-                        # continuation bytes
-                        byte_edge = jump_forward_bytes.pop(0)
-                        suffix_bytes.append(byte_edge[0])
-                        cur_state = byte_edge[1]
-
-                    suffix_tokens = [f"<0x{hex(b)[2:].upper()}>" for b in suffix_bytes]
-                    suffix_ids = req.tokenizer.convert_tokens_to_ids(suffix_tokens)
-
+            if req.grammar is not None:
+                jump_helper = req.grammar.try_jump(req.tokenizer)
+                if jump_helper.can_jump():
+                    suffix_ids = jump_helper.suffix_ids
                     # Current ids, for cache and revert
                     cur_all_ids = tuple(req.origin_input_ids + req.output_ids)[:-1]
                     cur_output_ids = req.output_ids
@@ -719,10 +820,8 @@ class ScheduleBatch:
                     (
                         jump_forward_str,
                         next_state,
-                    ) = req.jump_forward_map.jump_forward_symbol(cur_state)
+                    ) = req.grammar.jump_forward_str_state(jump_helper)
 
-                    # Make the incrementally decoded text part of jump_forward_str
-                    # so that the UTF-8 will not corrupt
                     jump_forward_str = new_text + jump_forward_str
                     if not req.jump_forward_and_retokenize(
                         jump_forward_str, next_state
@@ -749,6 +848,10 @@ class ScheduleBatch:
 
         return jump_forward_reqs
 
+    def prepare_encoder_info_decode(self):
+        # Reset the encoder cached status
+        self.encoder_cached = [True] * len(self.reqs)
+
     def prepare_for_decode(self, enable_overlap: bool = False):
         self.forward_mode = ForwardMode.DECODE
 
@@ -763,18 +866,25 @@ class ScheduleBatch:
         bs = len(self.reqs)
         self.out_cache_loc = self.alloc_token_slots(bs)
 
+        if self.model_config.is_encoder_decoder:
+            locs = self.encoder_lens + self.seq_lens
+            self.prepare_encoder_info_decode()
+        else:
+            locs = self.seq_lens
+
         if enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.req_to_token_pool.write(
-                (self.req_pool_indices, self.seq_lens), self.out_cache_loc
+                (self.req_pool_indices, locs), self.out_cache_loc
             )
             self.seq_lens = self.seq_lens + 1
         else:
             # A faster in-place version
             self.req_to_token_pool.write(
-                (self.req_pool_indices, self.seq_lens), self.out_cache_loc
+                (self.req_pool_indices, locs), self.out_cache_loc
             )
             self.seq_lens.add_(1)
+        self.seq_lens_sum += bs
 
     def filter_batch(
         self,
@@ -798,6 +908,10 @@ class ScheduleBatch:
             # No need to filter
             return
 
+        if self.model_config.is_encoder_decoder:
+            self.encoder_lens = self.encoder_lens[keep_indices]
+            self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
+
         self.reqs = [self.reqs[i] for i in keep_indices]
         new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(
             self.device, non_blocking=True
@@ -805,6 +919,7 @@ class ScheduleBatch:
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
         self.out_cache_loc = None
+        self.seq_lens_sum = self.seq_lens.sum().item()
         self.output_ids = self.output_ids[new_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
@@ -813,7 +928,7 @@ class ScheduleBatch:
             self.top_logprobs_nums = None
 
         self.has_stream = any(req.stream for req in self.reqs)
-        self.has_regex = any(req.regex_fsm for req in self.reqs)
+        self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, new_indices)
 
@@ -823,11 +938,17 @@ class ScheduleBatch:
         # needs to be called with pre-merged Batch.reqs.
         self.sampling_info.merge_batch(other.sampling_info)
 
+        # Encoder-decoder infos
+        if self.model_config.is_encoder_decoder:
+            self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
+            self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
+
         self.req_pool_indices = torch.concat(
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
+        self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.concat([self.output_ids, other.output_ids])
         if self.return_logprob and other.return_logprob:
@@ -840,26 +961,20 @@ class ScheduleBatch:
 
         self.return_logprob = self.return_logprob or other.return_logprob
         self.has_stream = self.has_stream or other.has_stream
-        self.has_regex = self.has_regex or other.has_regex
+        self.has_grammar = self.has_grammar or other.has_grammar
 
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode():
-            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = (
-                image_inputs
-            ) = None
+            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
-            image_inputs = [r.image_inputs for r in self.reqs]
 
-        if self.has_regex:
-            self.sampling_info.regex_fsms = [req.regex_fsm for req in self.reqs]
-            self.sampling_info.regex_fsm_states = [
-                req.regex_fsm_state for req in self.reqs
-            ]
+        if self.has_grammar:
+            self.sampling_info.grammars = [req.grammar for req in self.reqs]
         else:
-            self.sampling_info.regex_fsms = None
+            self.sampling_info.grammars = None
 
         global bid
         bid += 1
@@ -873,13 +988,19 @@ class ScheduleBatch:
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
+            seq_lens_sum=self.seq_lens_sum,
             req_to_token_pool_records=self.req_to_token_pool.get_write_records(),
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
+            extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
-            image_inputs=image_inputs,
+            image_inputs=[r.image_inputs for r in self.reqs],
+            encoder_cached=self.encoder_cached,
+            encoder_lens=self.encoder_lens,
+            encoder_lens_cpu=self.encoder_lens_cpu,
+            encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
             mrope_positions_delta=mrope_positions_delta,
@@ -889,6 +1010,7 @@ class ScheduleBatch:
         # Only contain fields that will be used by process_batch_result
         return ScheduleBatch(
             reqs=self.reqs,
+            model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
@@ -917,6 +1039,9 @@ class ModelWorkerBatch:
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
 
+    # The sum of all sequence lengths
+    seq_lens_sum: int
+
     # The memory pool operation records
     req_to_token_pool_records: Optional[List[Tuple[Tuple, torch.Tensor]]]
 
@@ -925,12 +1050,19 @@ class ModelWorkerBatch:
     top_logprobs_nums: Optional[List[int]]
 
     # For extend
+    extend_num_tokens: Optional[int]
     extend_seq_lens: Optional[List[int]]
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
 
     # For multimodal
     image_inputs: Optional[List[ImageInputs]]
+
+    # For encoder-decoder
+    encoder_cached: Optional[List[bool]]
+    encoder_lens: Optional[torch.Tensor]
+    encoder_lens_cpu: Optional[List[int]]
+    encoder_out_cache_loc: Optional[torch.Tensor]
 
     # For LoRA
     lora_paths: Optional[List[str]]

@@ -26,6 +26,8 @@ from typing import List, Tuple, Union
 
 import torch
 
+from sglang.srt.layers.radix_attention import RadixAttention
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,17 +38,21 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        self.req_to_token = torch.empty(
+        self.req_to_token = torch.zeros(
             (size, max_context_len), dtype=torch.int32, device=device
         )
         self.free_slots = list(range(size))
         self.write_records = []
+        self.use_records = use_records
 
-        if use_records:
-            # records all write operations
+        if self.use_records:
             self.write = self.write_with_records
         else:
             self.write = self.write_without_records
+
+    def write(self, indices, values):
+        # Keep the signature for type checking. It will be assigned during runtime.
+        raise NotImplementedError()
 
     def available_size(self):
         return len(self.free_slots)
@@ -154,7 +160,7 @@ class BaseTokenToKVPool:
 
     def set_kv_buffer(
         self,
-        layer_id: int,
+        layer: RadixAttention,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
@@ -209,14 +215,14 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def set_kv_buffer(
         self,
-        layer_id: int,
+        layer: RadixAttention,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
-        if cache_v.dtype != self.dtype:
             cache_v = cache_v.to(self.dtype)
         if self.store_dtype != self.dtype:
             self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
@@ -224,6 +230,14 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         else:
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
+
+
+# This compiled version is slower in the unit test
+# python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
+@torch.compile(dynamic=True)
+def copy_two_array(loc, dst_1, src_1, dst_2, src_2, dtype, store_dtype):
+    dst_1[loc] = src_1.to(dtype).view(store_dtype)
+    dst_2[loc] = src_2.to(dtype).view(store_dtype)
 
 
 class MLATokenToKVPool(BaseTokenToKVPool):
@@ -265,11 +279,12 @@ class MLATokenToKVPool(BaseTokenToKVPool):
 
     def set_kv_buffer(
         self,
-        layer_id: int,
+        layer: RadixAttention,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
@@ -324,13 +339,14 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
 
     def set_kv_buffer(
         self,
-        layer_id: int,
+        layer: RadixAttention,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         cache_label: torch.Tensor,
     ):
         # NOTE(Andy): ignore the dtype check
+        layer_id = layer.layer_id
         self.k_buffer[layer_id][loc] = cache_k
         self.v_buffer[layer_id][loc] = cache_v
         self.label_buffer[layer_id][loc] = cache_label

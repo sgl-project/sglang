@@ -294,6 +294,8 @@ class BatchTokenIDOut:
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
+    # Only used when `--skip-tokenizer-init`
+    output_ids: Optional[List[int]]
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
     meta_info: List[Dict]
@@ -353,3 +355,13 @@ class AbortReq:
 class ProfileReq(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
+
+
+@dataclass
+class GetMemPoolSizeReq:
+    pass
+
+
+@dataclass
+class GetMemPoolSizeReqOutput:
+    size: int
