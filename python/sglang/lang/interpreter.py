@@ -27,6 +27,8 @@ from sglang.lang.ir import (
     SglCommitLazy,
     SglConcateAndAppend,
     SglConstantText,
+    SglDebugRegionBegin,
+    SglDebugRegionEnd,
     SglExpr,
     SglExprList,
     SglGen,
@@ -317,39 +319,6 @@ class StreamExecutor:
 
         return exes
 
-    def begin_debug_region(
-        self,
-        debug_name: Optional[str],
-        debug_prompt_id: Optional[str],
-        debug_base_url: Optional[str],
-        debug_port: Optional[int],
-    ):
-        print("BEGINNING DEBUG")
-        if self.debug_ is None:
-            assert (
-                debug_name is not None
-                and debug_base_url is not None
-                and debug_port is not None
-            ), "Must set required debug info fields"
-            self.debug_ = DebugInfo(
-                base_url=debug_base_url,
-                port=debug_port,
-                debug_name=debug_name,
-                debug_prompt_id=debug_prompt_id,
-            )
-        else:
-            if debug_name is not None:
-                self.debug_.debug_name = debug_name
-            if debug_prompt_id is not None:
-                self.debug_.debug_prompt_id = debug_prompt_id
-            if debug_base_url is not None:
-                self.debug_.base_url = debug_base_url
-            if debug_port is not None:
-                self.debug_.port = debug_port
-
-    def end_debug_region(self):
-        self.debug_ = None
-
     def log_debug(
         self,
         post_body_request_list,  # List[PostBodyRequest] in Dict form
@@ -472,6 +441,10 @@ class StreamExecutor:
                 self._execute_concatenate_and_append_kv_cache(other)
             else:
                 self._execute_concatenate_and_append_text(other)
+        elif isinstance(other, SglDebugRegionBegin):
+            self._execute_begin_debug_region(other)
+        elif isinstance(other, SglDebugRegionEnd):
+            self._execute_end_debug_region(other)
         else:
             raise ValueError(f"Unknown type: {type(other)}")
 
@@ -777,6 +750,33 @@ class StreamExecutor:
 
         return clone
 
+    def _execute_begin_debug_region(self, expr: SglDebugRegionBegin):
+        print("BEGINNING DEBUG")
+        if self.debug_ is None:
+            assert (
+                expr.debug_name is not None
+                and expr.debug_base_url is not None
+                and expr.debug_port is not None
+            ), "Must set required debug info fields"
+            self.debug_ = DebugInfo(
+                base_url=expr.debug_base_url,
+                port=expr.debug_port,
+                debug_name=expr.debug_name,
+                debug_prompt_id=expr.debug_prompt_id,
+            )
+        else:
+            if expr.debug_name is not None:
+                self.debug_.debug_name = expr.debug_name
+            if expr.debug_prompt_id is not None:
+                self.debug_.debug_prompt_id = expr.debug_prompt_id
+            if expr.debug_base_url is not None:
+                self.debug_.base_url = expr.debug_base_url
+            if expr.debug_port is not None:
+                self.debug_.port = expr.debug_port
+
+    def _execute_end_debug_region(self, expr: SglDebugRegionEnd):
+        self.debug_ = None
+
     def __del__(self):
         self.end()
 
@@ -826,6 +826,25 @@ class ProgramState:
         states = [ProgramState(x) for x in stream_executors]
         state_group = ProgramStateGroup(states, self)
         return state_group
+
+    def begin_debug_region(
+        self,
+        debug_name: str,
+        debug_prompt_id: Optional[str] = None,
+        debug_base_url: str = "http://localhost",
+        debug_port: int = 56765,
+    ):
+        self.stream_executor.submit(
+            SglDebugRegionBegin(
+                debug_name=debug_name,
+                debug_prompt_id=debug_prompt_id,
+                debug_base_url=debug_base_url,
+                debug_port=debug_port,
+            )
+        )
+
+    def end_debug_region(self):
+        self.stream_executor.submit(SglDebugRegionEnd())
 
     @contextmanager
     def copy(self, position_ids_offset: Optional[List[int]] = None):
@@ -938,23 +957,6 @@ class ProgramState:
 
     def get_meta_info(self, name):
         return self.stream_executor.get_meta_info(name)
-
-    def begin_debug_region(
-        self,
-        debug_name: str,
-        debug_prompt_id: Optional[str] = None,
-        debug_base_url: str = "http://localhost",
-        debug_port: int = 56765,
-    ):
-        self.stream_executor.begin_debug_region(
-            debug_name=debug_name,
-            debug_prompt_id=debug_prompt_id,
-            debug_base_url=debug_base_url,
-            debug_port=debug_port,
-        )
-
-    def end_debug_region(self):
-        self.stream_executor.end_debug_region()
 
     def __iadd__(self, other):
         if other is None:

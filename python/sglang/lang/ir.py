@@ -593,3 +593,34 @@ class SglCommitLazy(SglExpr):
 
     def __repr__(self):
         return "CommitLazy()"
+
+
+class SglDebugRegionBegin(SglExpr):
+    def __init__(
+        self,
+        debug_name: Optional[str],
+        debug_prompt_id: Optional[str],
+        debug_base_url: Optional[str],
+        debug_port: Optional[int],
+    ):
+        super().__init__()
+        self.debug_name = debug_name
+        self.debug_prompt_id = debug_prompt_id
+        self.debug_base_url = debug_base_url
+        self.debug_port = debug_port
+
+    def __repr__(self):
+        return (
+            f"DebugRegionBegin(debug_name='{self.debug_name}', "
+            + f"debug_prompt_id={self.debug_prompt_id},"
+            + f"debug_base_url={self.debug_base_url},"
+            + f"debug_port={self.debug_port})"
+        )
+
+
+class SglDebugRegionEnd(SglExpr):
+    def __init__(self):
+        super().__init__()
+
+    def __repr__(self):
+        return "DebugRegionEnd"
