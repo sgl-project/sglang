@@ -304,21 +304,18 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
 def execute_shell_command(command: str) -> subprocess.Popen:
     """
     Execute a shell command and return the process handle
-    
+
     Args:
         command: Shell command as a string (can include \ line continuations)
     Returns:
         subprocess.Popen: Process handle
     """
     # Replace \ newline with space and split
-    command = command.replace('\\\n', ' ').replace('\\', ' ')
+    command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
-    
-    return subprocess.Popen(
-        parts,
-        text=True,
-        stderr=subprocess.STDOUT
-    )
+
+    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
+
 
 def wait_for_server(base_url: str, timeout: int = None) -> None:
     """Wait for the server to be ready by polling the /v1/models endpoint.
@@ -335,6 +332,15 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 headers={"Authorization": "Bearer None"},
             )
             if response.status_code == 200:
+                print_highlight(
+                    """
+                            Server and notebook outputs are combined for clarity.
+                            
+                            Typically, the server runs in a separate terminal.
+                            
+                            Server output is gray; notebook output is highlighted.
+                            """
+                )
                 break
 
             if timeout and time.time() - start_time > timeout:
@@ -374,6 +380,7 @@ def terminate_process(process):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
         time.sleep(2)
+
 
 def print_highlight(html_content: str):
     html_content = html_content.replace("\n", "<br>")
