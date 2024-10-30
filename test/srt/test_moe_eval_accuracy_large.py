@@ -1,3 +1,8 @@
+"""
+Usage:
+python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mmlu
+"""
+
 import unittest
 from types import SimpleNamespace
 
@@ -11,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEvalAccuracyLarge(unittest.TestCase):
+class TestMoEEvalAccuracyLarge(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MOE_MODEL_NAME_FOR_TEST
@@ -37,7 +42,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=3000,
+            num_examples=5000,
             num_threads=1024,
         )
 
