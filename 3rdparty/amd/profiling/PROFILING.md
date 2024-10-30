@@ -8,7 +8,8 @@ Two primary methods are covered:
 ### Profiling SGLang Infer System with RPD Profiler
 RPD profiler is a low-overhead cross-platform profiler. To use RPD profiler on this repository, please use scripts and patch files included in this directory and follow the steps below:
 1. Install RPD with rpd.patch applied during installation using install_rpd.sh, both files are in this directory.
-![alt text](rpd_patch.png)
+
+install_rpd.sh
 
 ```bash
 # download and install RPD
@@ -22,9 +23,126 @@ make && make install
 cd rocpd_python && python setup.py install && cd ..
 cd rpd_tracer && make clean;make install && python setup.py install && cd ..
 ```
+
+rpd.patch
+
+```bash
+diff --git a/rpd_tracer/Makefile b/rpd_tracer/Makefile
+index e9d9feb..b2e9e1a 100644
+--- a/rpd_tracer/Makefile
++++ b/rpd_tracer/Makefile
+@@ -16,7 +16,7 @@ ifneq (,$(HIP_PATH))
+         $(info Building with roctracer)
+         RPD_LIBS += -L/opt/rocm/lib -lroctracer64 -lroctx64 -lamdhip64 -lrocm_smi64
+         RPD_INCLUDES += -I/opt/rocm/include -I/opt/rocm/include/roctracer -I/opt/rocm/include/hsa
+-        RPD_SRCS += RoctracerDataSource.cpp RocmSmiDataSource.cpp
++        RPD_SRCS += RoctracerDataSource.cpp
+         RPD_INCLUDES += -D__HIP_PLATFORM_AMD__
+ endif
+```
 2. Add loadTracer.sh file included in this directory to /sglang/python/sglang.
+
+loadTracer.sh
+
+```bash
+#!/bin/bash
+################################################################################
+# Copyright (c) 2021 - 2023 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+################################################################################
+OUTPUT_FILE="trace.rpd"
+ 
+if [ "$1" = "-o" ] ; then
+  OUTPUT_FILE=$2
+  shift
+  shift
+fi
+  
+if [ -e ${OUTPUT_FILE} ] ; then
+  rm ${OUTPUT_FILE}
+fi
+ 
+python3 -m rocpd.schema --create ${OUTPUT_FILE}
+if [ $? != 0 ] ; then
+  echo "Error: Could not create rpd file. Please run 'python setup.py install' from the rocpd_python dir"
+  exit
+fi
+ 
+export RPDT_FILENAME=${OUTPUT_FILE}
+export RPDT_AUTOSTART=0
+LD_PRELOAD=librocm-smi_64:librpd_tracer.so "$@"
+```
 3. Apply patch (provided in this directory) with "git apply rpd_profile_server_enable.patch". 
-![alt text](rpd_profile_server_enable_patch.png)
+
+```bash
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 62d1ff9..9021c01 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -71,6 +71,8 @@ from sglang.srt.utils import (
+     suppress_other_loggers,
+ )
+ from sglang.utils import get_exception_traceback
++from rpdTracerControl import rpdTracerControl
++rpdTracerControl.skipCreate()
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -245,6 +247,7 @@ class Scheduler:
+                 ],
+                 with_stack=True,
+             )
++            self.rpd = rpdTracerControl()
+ 
+     @torch.inference_mode()
+     def event_loop(self):
+@@ -1027,15 +1030,24 @@ class Scheduler:
+     def start_profile(self) -> None:
+         if self.profiler is None:
+             raise RuntimeError("Profiler is not enabled.")
+-        self.profiler.start()
++        #self.profiler.start() #block pytorch profiler for rpd profiler enabling
++        if self.tp_rank == 0 or self.tp_rank == 1:
++            self.rpd.start()
++            self.rpd.rangePush("", "rpd profile range", "")
++            logger.info("rpd is enabled")
+ 
+     def stop_profile(self) -> None:
+         if self.profiler is None:
+             raise RuntimeError("Profiler is not enabled.")
+-        self.profiler.stop()
+-        self.profiler.export_chrome_trace(
+-            self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz"
+-        )
++        #self.profiler.stop()
++        #self.profiler.export_chrome_trace(
++        #    self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz"
++        #)
++        if self.tp_rank ==0 or self.tp_rank ==1:
++            self.rpd.rangePop()
++            self.rpd.stop()
++            self.rpd.flush()
++            logger.info("rpd is done")
+         logger.info("Profiler is done")
+```
+
 4. Untar dummy_grok1.tar in this directory and copy it to the right path for "--model-path" if you want to use the server.sh file provided.
 5. Launch server with rpd enabled script ./server.sh in one terminal inside the docker container. 
 #### Common Notes
@@ -32,6 +150,9 @@ cd rpd_tracer && make clean;make install && python setup.py install && cd ..
 - loadTracer.sh is needed to conduct profiling
 - SGLANG_TORCH_PROFILER_DIR is used for default torch profiler
 - Do not use loadTracer.sh if you are using the torch profiler, simply use python3 -m sglang.launch_server. It may interrupt and cause the GPU info to be unavailable (though CPU data will still be there).  
+
+
+server.sh
 
 ```bash
 #!/bin/bash
@@ -59,6 +180,9 @@ loadTracer.sh python3 -m sglang.launch_server \
 #### Common Notes
 - Use curl http://localhost:30000/start_profile & curl http://localhost:30000/stop_profile to control the start and end of profiling. Check sglang/python/sglang/srt/managers/scheduler.py for more details.
 - Please don't use RPD profiler together with together profier to avoid interference.
+
+client.sh
+
 ```bash
 #!/bin/bash
  
