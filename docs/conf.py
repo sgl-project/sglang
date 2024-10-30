@@ -137,7 +137,7 @@ nbsphinx_prolog = """
 
     <style>
         .output_area.stderr, .output_area.stdout {
-            color: #d3d3d3 !important; /* 浅灰色 */
+            color: #d3d3d3 !important; /* light gray */
         }
     </style>
 """
