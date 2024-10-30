@@ -20,6 +20,7 @@ from typing import Optional, Union
 import numpy as np
 import requests
 import torch
+from IPython.display import HTML, display
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -313,12 +314,7 @@ def execute_shell_command(command: str) -> subprocess.Popen:
     command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
 
-    return subprocess.Popen(
-        parts,
-        text=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
 
 
 def wait_for_server(base_url: str, timeout: int = None) -> None:
@@ -336,6 +332,15 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 headers={"Authorization": "Bearer None"},
             )
             if response.status_code == 200:
+                print_highlight(
+                    """
+                            Server and notebook outputs are combined for clarity.
+                            
+                            Typically, the server runs in a separate terminal.
+                            
+                            Server output is gray; notebook output is highlighted.
+                            """
+                )
                 break
 
             if timeout and time.time() - start_time > timeout:
@@ -375,3 +380,8 @@ def terminate_process(process):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
         time.sleep(2)
+
+
+def print_highlight(html_content: str):
+    html_content = str(html_content).replace("\n", "<br>")
+    display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
