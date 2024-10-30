@@ -58,7 +58,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import is_generation_model, is_multimodal_model
+from sglang.srt.utils import get_zmq_socket, is_generation_model, is_multimodal_model
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -86,11 +86,12 @@ class TokenizerManager:
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
-        self.recv_from_detokenizer = context.socket(zmq.PULL)
-        self.recv_from_detokenizer.bind(f"ipc://{port_args.tokenizer_ipc_name}")
-
-        self.send_to_scheduler = context.socket(zmq.PUSH)
-        self.send_to_scheduler.connect(f"ipc://{port_args.scheduler_input_ipc_name}")
+        self.recv_from_detokenizer = get_zmq_socket(
+            context, zmq.PULL, port_args.tokenizer_ipc_name
+        )
+        self.send_to_scheduler = get_zmq_socket(
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name
+        )
 
         # Read model args
         self.model_path = server_args.model_path
@@ -538,9 +539,22 @@ class TokenizerManager:
             self.create_handle_loop()
 
         req = GetMemPoolSizeReq()
-        self.send_to_scheduler.send_pyobj(req)
-        self.mem_pool_size = asyncio.Future()
-        return await self.mem_pool_size
+        ret = None
+
+        if self.server_args.dp_size == 1:
+            self.send_to_scheduler.send_pyobj(req)
+            self.mem_pool_size = asyncio.Future()
+            res = await self.mem_pool_size
+            ret = res.size
+
+        else: # self.server_args.dp_size > 1
+            self.send_to_scheduler.send_pyobj(req)
+            self.mem_pool_size = asyncio.Future()
+            self.mem_pool_size_tmp = []
+            res = await self.mem_pool_size
+            ret = [r.size for r in res]
+            
+        return ret
 
     async def update_weights(
         self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
@@ -553,25 +567,50 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
 
         if not self.model_update_lock.locked():
-            async with self.model_update_lock:
-                # wait for the previous generation requests to finish
-                while len(self.rid_to_state) > 0:
-                    await asyncio.sleep(0.001)
-                self.send_to_scheduler.send_pyobj(obj)
-                self.model_update_result = asyncio.Future()
-                result = await self.model_update_result
-                if result.success:
-                    self.server_args.model_path = obj.model_path
-                    self.server_args.load_format = obj.load_format
-                    self.model_path = obj.model_path
-            return result.success, result.message
+        
+            if self.server_args.dp_size == 1:
+                async with self.model_update_lock:
+                    # wait for the previous generation requests to finish
+                    while len(self.rid_to_state) > 0:
+                        await asyncio.sleep(0.001)
+                    self.send_to_scheduler.send_pyobj(obj)
+                    self.model_update_result = asyncio.Future()
+                    result = await self.model_update_result
+                    if result.success:
+                        self.server_args.model_path = obj.model_path
+                        self.server_args.load_format = obj.load_format
+                        self.model_path = obj.model_path
+                return result.success, result.message
+
+            else: # self.server_args.dp_size > 1
+
+                # There will be dp_size number of response from the detokenizer
+                async with self.model_update_lock:
+                    # wait for the previous generation requests to finish
+                    while len(self.rid_to_state) > 0:
+                        await asyncio.sleep(0.001)
+                    self.send_to_scheduler.send_pyobj(obj)
+                    self.model_update_result = asyncio.Future()
+                    self.model_update_tmp = []
+                    result = await self.model_update_result
+
+                    all_success = all([r.success for r in result])
+                    if all_success is True:
+                        self.server_args.model_path = obj.model_path
+                        self.server_args.load_format = obj.load_format
+                        self.model_path = obj.model_path
+                    all_message = [r.message for r in result]
+                    all_message = " | ".join(all_message)
+                    
+                return all_success, all_message
+
         else:
             return False, "Another update is in progress. Please try again later."
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
             if obj.is_single:
                 self.abort_request(obj.rid)
             else:
@@ -599,10 +638,22 @@ class TokenizerManager:
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
             if isinstance(recv_obj, UpdateWeightReqOutput):
-                self.model_update_result.set_result(recv_obj)
+                if self.server_args.dp_size == 1:
+                    self.model_update_result.set_result(recv_obj)
+                else: # self.server_args.dp_size > 1
+                    self.model_update_tmp.append(recv_obj)
+                    # set future if the all results are recevied
+                    if len(self.model_update_tmp) == self.server_args.dp_size:
+                        self.model_update_result.set_result(self.model_update_tmp)
                 continue
             elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
-                self.mem_pool_size.set_result(recv_obj)
+                if self.server_args.dp_size == 1:
+                    self.mem_pool_size.set_result(recv_obj)
+                else: # self.sever_args.dp_size > 1
+                    self.mem_pool_size_tmp.append(recv_obj)
+                    # set future if the all results are received
+                    if len(self.mem_pool_size_tmp) == self.server_args.dp_size:
+                        self.mem_pool_size.set_result(self.mem_pool_size_tmp)
                 continue
 
             assert isinstance(
@@ -621,11 +672,8 @@ class TokenizerManager:
                         "meta_info": recv_obj.meta_info[i],
                     }
                 elif isinstance(recv_obj, BatchTokenIDOut):
-                    read_start = 0 if i == 0 else recv_obj.read_offsets[i - 1]
                     out_dict = {
-                        "token_ids": recv_obj.decode_ids[
-                            read_start : recv_obj.read_offsets[i]
-                        ],
+                        "token_ids": recv_obj.output_ids[i],
                         "meta_info": recv_obj.meta_info[i],
                     }
 

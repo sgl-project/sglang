@@ -74,6 +74,7 @@ class ServerArgs:
     api_key: Optional[str] = None
     file_storage_pth: str = "SGLang_storage"
     enable_cache_report: bool = False
+    watchdog_timeout: float = 600
 
     # Data parallelism
     dp_size: int = 1
@@ -102,6 +103,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
+    grammar_backend: Optional[str] = "outlines"
 
     # Optimization/debug options
     disable_flashinfer: bool = False
@@ -118,7 +120,8 @@ class ServerArgs:
     enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
-    max_torch_compile_bs: int = 32
+    torch_compile_max_bs: int = 32
+    cuda_graph_max_bs: int = 160
     torchao_config: str = ""
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -427,6 +430,12 @@ class ServerArgs:
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
         )
+        parser.add_argument(
+            "--watchdog-timeout",
+            type=float,
+            default=ServerArgs.watchdog_timeout,
+            help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
 
         # Data parallelism
         parser.add_argument(
@@ -537,6 +546,13 @@ class ServerArgs:
             default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
         )
+        parser.add_argument(
+            "--grammar-backend",
+            type=str,
+            choices=["xgrammar", "outlines"],
+            default=ServerArgs.grammar_backend,
+            help="Choose the backend for constrained decoding.",
+        )
 
         # Optimization/debug options
         parser.add_argument(
@@ -611,10 +627,16 @@ class ServerArgs:
             help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
-            "--max-torch-compile-bs",
+            "--torch-compile-max-bs",
             type=int,
-            default=ServerArgs.max_torch_compile_bs,
+            default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--cuda-graph-max-bs",
+            type=int,
+            default=ServerArgs.cuda_graph_max_bs,
+            help="Set the maximum batch size for cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -712,11 +734,11 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args) -> "PortArgs":
-        port = server_args.port + 1
+        port = server_args.port + 42
         while True:
             if is_port_available(port):
                 break
-            port += 1
+            port += 42
 
         return PortArgs(
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,

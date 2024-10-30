@@ -495,7 +495,7 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
             )
             assert ret_code == 0
         except TimeoutError:
-            kill_child_process(process.pid)
+            kill_child_process(process.pid, include_self=True)
             time.sleep(5)
             print(
                 f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
@@ -563,7 +563,7 @@ def run_bench_serving(
     try:
         res = run_benchmark(args)
     finally:
-        kill_child_process(process.pid)
+        kill_child_process(process.pid, include_self=True)
 
     assert res["completed"] == num_prompts
     return res
@@ -596,7 +596,7 @@ def run_bench_latency(model, other_args):
         lastline = output.split("\n")[-3]
         output_throughput = float(lastline.split(" ")[-2])
     finally:
-        kill_child_process(process.pid)
+        kill_child_process(process.pid, include_self=True)
 
     return output_throughput
 
@@ -640,15 +640,20 @@ STDERR_FILENAME = "stderr.txt"
 
 
 def read_output(output_lines):
+    """Print the output in real time with another thread."""
+    while not os.path.exists(STDERR_FILENAME):
+        time.sleep(1)
+
     pt = 0
     while pt >= 0:
-        if pt > 0 and os.path.exists(STDERR_FILENAME):
+        if pt > 0 and not os.path.exists(STDERR_FILENAME):
             break
         lines = open(STDERR_FILENAME).readlines()
-        output_lines[:] = lines
         for line in lines[pt:]:
             print(line, end="", flush=True)
+            output_lines.append(line)
             pt += 1
+        time.sleep(0.1)
 
 
 def run_mmlu_test(
@@ -703,12 +708,14 @@ def run_mmlu_test(
         pass
 
     # Clean up everything
-    kill_child_process(process.pid)
-    kill_child_process(process.pid)
+    kill_child_process(process.pid, include_self=True)
+    kill_child_process(process.pid, include_self=True)
     stdout.close()
     stderr.close()
-    os.remove(STDOUT_FILENAME)
-    os.remove(STDERR_FILENAME)
+    if os.path.exists(STDOUT_FILENAME):
+        os.remove(STDOUT_FILENAME)
+    if os.path.exists(STDERR_FILENAME):
+        os.remove(STDERR_FILENAME)
     t.join()
 
     # Assert success
