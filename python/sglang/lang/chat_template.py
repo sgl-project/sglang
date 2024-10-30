@@ -144,7 +144,7 @@ register_chat_template(
             "assistant": ("<|im_start|>assistant\n", "<|im_end|>\n"),
         },
         style=ChatTemplateStyle.PLAIN,
-        stop_str=("<|im_end|>"),
+        stop_str=("<|im_end|>",),
         image_token="<|vision_start|><|image_pad|><|vision_end|>",
     )
 )
