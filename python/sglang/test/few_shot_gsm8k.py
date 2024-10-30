@@ -50,7 +50,7 @@ def run_eval(args):
 
     # Read data
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    filename = download_and_cache_file(url)
+    filename = download_and_cache_file(url, args.data_path)
     lines = list(read_jsonl(filename))
 
     # Construct prompts
@@ -131,7 +131,7 @@ def run_eval(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-shots", type=int, default=5)
-    parser.add_argument("--data-path", type=str, default="test.jsonl")
+    parser.add_argument("--data-path", type=str, default="/home/jobuser/resources/data/test.jsonl")
     parser.add_argument("--num-questions", type=int, default=200)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--parallel", type=int, default=128)
