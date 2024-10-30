@@ -112,7 +112,7 @@ class TokenizerManager:
             self.hf_config.architectures, self.server_args.is_embedding
         )
         self.context_len = server_args.context_length or get_context_length(
-            self.hf_config
+            getattr(self.hf_config, "text_config", self.hf_config)
         )
         # Create image processor placeholder
         self.image_processor = get_dummy_image_processor()
