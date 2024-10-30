@@ -139,7 +139,7 @@ async def get_server_args():
     return dataclasses.asdict(tokenizer_manager.server_args)
 
 
-@app.get("/flush_cache")
+@app.post("/flush_cache")
 async def flush_cache():
     """Flush the radix cache."""
     tokenizer_manager.flush_cache()
@@ -180,7 +180,7 @@ async def get_memory_pool_size():
 
         return ret
     except Exception as e:
-        return JSONResponse(
+        return ORJSONResponse(
             {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
         )
 

@@ -13,7 +13,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
 ]
-dependencies = ["requests", "tqdm", "numpy"]
+dependencies = ["requests", "tqdm", "numpy", "IPython"]
 
 [project.optional-dependencies]
 runtime_common = ["aiohttp", "decord", "fastapi", "hf_transfer", "huggingface_hub", "interegular",
