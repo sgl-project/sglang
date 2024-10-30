@@ -124,7 +124,7 @@ class ModelRunner:
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
             )
             server_args.chunked_prefill_size = None
-            server_args.mem_fraction_static *= 0.95
+            self.mem_fraction_static *= 0.95
             # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
             if self.model_config.hf_config.architectures == [
                 "Qwen2VLForConditionalGeneration"
