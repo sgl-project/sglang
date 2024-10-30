@@ -19,7 +19,6 @@ from typing import Optional, Union
 
 import numpy as np
 import requests
-import torch
 from IPython.display import HTML, display
 from tqdm import tqdm
 
@@ -332,14 +331,13 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 headers={"Authorization": "Bearer None"},
             )
             if response.status_code == 200:
+                time.sleep(5)
                 print_highlight(
+                    """\n
+                    NOTE: Typically, the server runs in a separate terminal.
+                    In this notebook, we run the server and notebook code together, so their outputs are combined.
+                    To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
                     """
-                            Server and notebook outputs are combined for clarity.
-                            
-                            Typically, the server runs in a separate terminal.
-                            
-                            Server output is gray; notebook output is highlighted.
-                            """
                 )
                 break
 
@@ -350,36 +348,8 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 
 def terminate_process(process):
-    """Safely terminate a process and clean up GPU memory.
-
-    Args:
-        process: subprocess.Popen object to terminate
-    """
-    try:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            if os.name != "nt":
-                try:
-                    pgid = os.getpgid(process.pid)
-                    os.killpg(pgid, signal.SIGTERM)
-                    time.sleep(1)
-                    if process.poll() is None:
-                        os.killpg(pgid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            else:
-                process.kill()
-            process.wait()
-    except Exception as e:
-        print(f"Warning: {e}")
-    finally:
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-        time.sleep(2)
+    from sglang.srt.utils import kill_child_process
+    kill_child_process(process.pid, include_self=True)
 
 
 def print_highlight(html_content: str):
