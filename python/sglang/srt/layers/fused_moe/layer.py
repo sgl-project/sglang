@@ -6,7 +6,6 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from fused_moe import padding_size
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -21,6 +20,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.utils import set_weight_attrs
 
+from sglang.srt.layers.fused_moe.fused_moe import padding_size
 from sglang.srt.utils import is_hip
 
 logger = init_logger(__name__)
