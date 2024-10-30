@@ -177,7 +177,8 @@ async def get_memory_pool_size():
     """Get the memory pool size in number of tokens"""
     try:
         ret = await tokenizer_manager.get_memory_pool_size()
-        return ret.size
+
+        return ret
     except Exception as e:
         return JSONResponse(
             {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST

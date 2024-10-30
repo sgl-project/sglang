@@ -168,6 +168,7 @@ class SglFunction:
         return_text_in_logprobs: Optional[bool] = None,
         stream: bool = False,
         backend=None,
+        use_thread: bool = True,
         **kwargs,
     ):
         from sglang.lang.interpreter import run_program
@@ -195,7 +196,15 @@ class SglFunction:
             return_text_in_logprobs=return_text_in_logprobs,
         )
         backend = backend or global_config.default_backend
-        return run_program(self, backend, args, kwargs, default_sampling_para, stream)
+        return run_program(
+            self,
+            backend,
+            args,
+            kwargs,
+            default_sampling_para,
+            stream,
+            use_thread=use_thread,
+        )
 
     def run_batch(
         self,
