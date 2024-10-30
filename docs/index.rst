@@ -46,3 +46,4 @@ The core features include:
    benchmark_and_profiling.md
    troubleshooting.md
    embedding_model.ipynb
+   learn_more.md
