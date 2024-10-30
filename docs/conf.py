@@ -55,7 +55,7 @@ html_copy_source = True
 html_last_updated_fmt = ""
 
 html_theme_options = {
-    "repository_url": "https://github.com/sgl-project/sglang",
+    "repository_url": "https://github.com/sgl-project/sgl-project.github.io",
     "repository_branch": "main",
     "show_navbar_depth": 3,
     "max_navbar_depth": 4,
@@ -67,6 +67,14 @@ html_theme_options = {
     "use_download_button": True,
     "use_sidenotes": True,
     "show_toc_level": 2,
+}
+
+html_context = {
+    "display_github": True,
+    "github_user": "sgl-project",
+    "github_repo": "sgl-project.github.io",
+    "github_version": "main",
+    "conf_py_path": "/docs/",
 }
 
 html_static_path = ["_static"]

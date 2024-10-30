@@ -13,6 +13,7 @@ repos:
         additional_dependencies: ['.[jupyter]']
         types: [python, jupyter]
         types_or: [python, jupyter]
+        args: ['--recursive']
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
