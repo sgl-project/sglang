@@ -383,5 +383,5 @@ def terminate_process(process):
 
 
 def print_highlight(html_content: str):
-    html_content = html_content.replace("\n", "<br>")
+    html_content = str(html_content).replace("\n", "<br>")
     display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
