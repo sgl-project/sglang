@@ -26,9 +26,6 @@ class TestSRTBackend(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import pprint
-        import traceback
-        pprint.pp(traceback.format_stack())
         cls.backend = sgl.Runtime(model_path=DEFAULT_MODEL_NAME_FOR_TEST)
         sgl.set_default_backend(cls.backend)
         cls.debug_server = launch_debug_server()
