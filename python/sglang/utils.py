@@ -301,7 +301,7 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
-def lauch_sglang_server(command: str) -> subprocess.Popen:
+def execute_shell_command(command: str) -> subprocess.Popen:
     """
     Execute a shell command and return the process handle
     
@@ -375,5 +375,6 @@ def terminate_process(process):
             torch.cuda.ipc_collect()
         time.sleep(2)
 
-def highlight_text(html_content: str):
+def print_highlight(html_content: str):
+    html_content = html_content.replace("\n", "<br>")
     display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
