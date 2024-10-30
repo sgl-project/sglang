@@ -79,7 +79,7 @@ class HttpResponse:
         return self.resp.status
 
 
-def http_request(url, json=None, stream=False, api_key=None, verify=None):
+def http_request(url, json=None, stream=False, api_key=None, verify=None, timeout=None):
     """A faster version of requests.post with low-level urllib API."""
     headers = {"Content-Type": "application/json; charset=utf-8"}
 
@@ -88,7 +88,9 @@ def http_request(url, json=None, stream=False, api_key=None, verify=None):
         headers["Authorization"] = f"Bearer {api_key}"
 
     if stream:
-        return requests.post(url, json=json, stream=True, headers=headers)
+        return requests.post(
+            url, json=json, stream=True, headers=headers, timeout=timeout
+        )
     else:
         req = urllib.request.Request(url, headers=headers)
         if json is None:
@@ -97,7 +99,9 @@ def http_request(url, json=None, stream=False, api_key=None, verify=None):
             data = bytes(dumps(json), encoding="utf-8")
 
         try:
-            resp = urllib.request.urlopen(req, data=data, cafile=verify)
+            resp = urllib.request.urlopen(
+                req, data=data, cafile=verify, timeout=timeout
+            )
             return HttpResponse(resp)
         except urllib.error.HTTPError as e:
             return HttpResponse(e)

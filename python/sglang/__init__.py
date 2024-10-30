@@ -74,5 +74,6 @@ Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
 LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
 OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
 VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
+Shortfin = LazyImport("sglang.lang.backend.shortfin", "Shortfin")
 
-__all__ += ["Anthropic", "LiteLLM", "OpenAI", "VertexAI", "RuntimeEndpoint"]
+__all__ += ["Anthropic", "LiteLLM", "OpenAI", "VertexAI", "Shortfin", "RuntimeEndpoint"]
