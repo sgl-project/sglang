@@ -746,7 +746,7 @@ class Scheduler:
             self.waiting_queue.extend(retracted_reqs)
         else:
             self.new_token_ratio = max(
-                self.new_token_ratio - global_config.new_token_ratio_decay,
+                self.new_token_ratio - self.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
 
