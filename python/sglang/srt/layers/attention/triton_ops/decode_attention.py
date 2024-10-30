@@ -26,6 +26,7 @@ import triton.language as tl
 
 from sglang.srt.utils import is_hip
 
+
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
