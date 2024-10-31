@@ -44,6 +44,7 @@ jobs:
       - name: Execute notebooks
         run: |
           cd docs
+          rm -rf _build
           find . -name "*.ipynb" | while read nb; do
             if [ -f "$nb" ]; then
               echo "Executing $nb"
