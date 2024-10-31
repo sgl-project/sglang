@@ -200,7 +200,7 @@ class PrefillAdder:
             self.new_chunked_req = req
         else:
             # Release the being chunked status
-            req.is_being_chunked = False
+            req.is_being_chunked -= 1
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
@@ -273,7 +273,7 @@ class PrefillAdder:
 
             trunc_len = self.rem_chunk_tokens
             req.extend_input_len = trunc_len
-            req.is_being_chunked = True
+            req.is_being_chunked += 1
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
@@ -327,7 +327,7 @@ class PrefillAdder:
 
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
-                req.is_being_chunked = True
+                req.is_being_chunked += 1
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
                 self.tree_cache.inc_lock_ref(req.last_node)

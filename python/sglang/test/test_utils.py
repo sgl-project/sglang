@@ -665,7 +665,6 @@ def run_and_check_memory_leak(
     chunked_prefill_size,
 ):
     other_args = ["--chunked-prefill-size", str(chunked_prefill_size)]
-    other_args += ["--mem-fraction-static", "0.85"]
     if disable_radix_cache:
         other_args += ["--disable-radix-cache"]
     if enable_mixed_chunk:

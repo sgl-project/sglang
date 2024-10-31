@@ -221,7 +221,7 @@ class Req:
         self.prefix_indices = []
         self.extend_input_len = 0
         self.last_node = None
-        self.is_being_chunked = False
+        self.is_being_chunked = 0
 
         # Logprobs (arguments)
         self.return_logprob = False
