@@ -1,4 +1,4 @@
-## Install SGLang
+# Install
 
 You can install SGLang using any of the methods below.
 
