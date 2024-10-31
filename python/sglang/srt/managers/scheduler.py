@@ -720,9 +720,11 @@ class Scheduler:
 
         # Mixed-style chunked prefill
         if self.is_mixed_chunk and self.running_batch is not None:
-            self.running_batch.prepare_for_decode(self.enable_overlap)
-            new_batch.mix_with_running(self.running_batch)
-            new_batch.decoding_reqs = self.running_batch.reqs
+            self.running_batch.filter_batch()
+            if not self.running_batch.is_empty():
+                self.running_batch.prepare_for_decode(self.enable_overlap)
+                new_batch.mix_with_running(self.running_batch)
+                new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = None
         else:
             new_batch.decoding_reqs = None
