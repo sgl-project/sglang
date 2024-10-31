@@ -1,10 +1,10 @@
-## Frontend: Structured Generation Language (SGLang)
+# Frontend: Structured Generation Language (SGLang)
 The frontend language can be used with local models or API models. It is an alternative to the OpenAI API. You may found it easier to use for complex prompting workflow.
 
-### Quick Start
-The example below shows how to use sglang to answer a mulit-turn question.
+## Quick Start
+The example below shows how to use SGLang to answer a multi-turn question.
 
-#### Using Local Models
+### Using Local Models
 First, launch a server with
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
@@ -36,7 +36,7 @@ for m in state.messages():
 print(state["answer_1"])
 ```
 
-#### Using OpenAI Models
+### Using OpenAI Models
 Set the OpenAI API Key
 ```
 export OPENAI_API_KEY=sk-******
@@ -67,11 +67,11 @@ for m in state.messages():
 print(state["answer_1"])
 ```
 
-#### More Examples
+### More Examples
 Anthropic and VertexAI (Gemini) models are also supported.
 You can find more examples at [examples/quick_start](https://github.com/sgl-project/sglang/tree/main/examples/frontend_language/quick_start).
 
-### Language Feature
+## Language Feature
 To begin with, import sglang.
 ```python
 import sglang as sgl
@@ -84,7 +84,7 @@ The system will manage the state, chat template, parallelism and batching for yo
 
 The complete code for the examples below can be found at [readme_examples.py](https://github.com/sgl-project/sglang/blob/main/examples/frontend_language/usage/readme_examples.py)
 
-#### Control Flow
+### Control Flow
 You can use any Python code within the function body, including control flow, nested function calls, and external libraries.
 
 ```python
@@ -99,7 +99,7 @@ def tool_use(s, question):
         s += "The key word to search is" + sgl.gen("word")
 ```
 
-#### Parallelism
+### Parallelism
 Use `fork` to launch parallel prompts.
 Because `sgl.gen` is non-blocking, the for loop below issues two generation calls in parallel.
 
@@ -121,7 +121,7 @@ def tip_suggestion(s):
     s += "In summary" + sgl.gen("summary")
 ```
 
-#### Multi-Modality
+### Multi-Modality
 Use `sgl.image` to pass an image as input.
 
 ```python
@@ -133,7 +133,7 @@ def image_qa(s, image_file, question):
 
 See also [local_example_llava_next.py](https://github.com/sgl-project/sglang/blob/main/examples/frontend_language/quick_start/local_example_llava_next.py).
 
-#### Constrained Decoding
+### Constrained Decoding
 Use `regex` to specify a regular expression as a decoding constraint.
 This is only supported for local models.
 
@@ -148,7 +148,7 @@ def regular_expression_gen(s):
     )
 ```
 
-#### JSON Decoding
+### JSON Decoding
 Use `regex` to specify a JSON schema with a regular expression.
 
 ```python
@@ -177,7 +177,7 @@ def character_gen(s, name):
 
 See also [json_decode.py](https://github.com/sgl-project/sglang/blob/main/examples/frontend_language/usage/json_decode.py) for an additional example of specifying formats with Pydantic models.
 
-#### Batching
+### Batching
 Use `run_batch` to run a batch of requests with continuous batching.
 
 ```python
@@ -196,7 +196,7 @@ states = text_qa.run_batch(
 )
 ```
 
-#### Streaming
+### Streaming
 Add `stream=True` to enable streaming.
 
 ```python
@@ -215,7 +215,7 @@ for out in state.text_iter():
     print(out, end="", flush=True)
 ```
 
-#### Roles
+### Roles
 
 Use `sgl.system`， `sgl.user` and `sgl.assistant` to set roles when using Chat models. You can also define more complex role prompts using begin and end tokens.
 
@@ -233,6 +233,6 @@ def chat_example(s):
     s += sgl.assistant_end()
 ```
 
-#### Tips and Implementation Details
+### Tips and Implementation Details
 - The `choices` argument in `sgl.gen` is implemented by computing the [token-length normalized log probabilities](https://blog.eleuther.ai/multiple-choice-normalization/) of all choices and selecting the one with the highest probability.
 - The `regex` argument in `sgl.gen` is implemented through autoregressive decoding with logit bias masking, according to the constraints set by the regex. It is compatible with `temperature=0` and `temperature != 0`.
