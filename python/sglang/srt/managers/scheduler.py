@@ -919,7 +919,7 @@ class Scheduler:
         self.token_to_kv_pool.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        if self.tp_rank == 0 and self.forward_ct_decode % 40 == 0:
+        if self.tp_rank == 0 and self.forward_ct_decode % self.server_args.decode_log_interval == 0:
             self.print_decode_stats()
 
     def add_logprob_return_values(
