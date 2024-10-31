@@ -1,7 +1,6 @@
 # Guide on Hyperparameter Tuning
 
 ## Achieving Peak Throughput
-
 Achieving a large batch size is the most important thing for attaining high throughput.
 
 When the server is running at full load, look for the following in the log:
