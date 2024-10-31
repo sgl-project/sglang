@@ -3,7 +3,7 @@ This AppNote describes the SGLang profiling technical, code augment and running 
 Examples and steps are provided in detail, to facilitate easy reproduce and use to localize performance problem towards optimizations.
 Two primary methods are covered:
 - [RPD](https://github.com/ROCm/rocmProfileData.git)
-- [Torch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html)
+- [PyTorch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html)
 
 ### Profiling SGLang Infer System with RPD Profiler
 RPD profiler is a low-overhead cross-platform profiler. To use RPD profiler on this repository, please use scripts and patch files included in this directory and follow the steps below:
@@ -214,5 +214,43 @@ python3 /sgl-workspace/rocmProfileData/tools/rpd2tracing.py trace.rpd trace.json
 ```
 7. Follow [Perfetto docs](https://perfetto.dev/docs/visualization/large-traces) to visualize large json files. Try to adjust parameters so that the trace.json file size is less than 9GB.
 
+### Profiling SGLang Infer System with PyTorch Profiler
 
+Please use the steps as follows:
 
+1. Apply the patch torch_profiler.patch. Note that you can modify "if self.tp_rank == 0" in the patch to allow more ranks be recorded in profiling.
+
+torch_profiler.patch
+```bash
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 62d1ff9..6ecd78c 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -240,7 +240,6 @@ class Scheduler:
+             )
+             self.profiler = torch.profiler.profile(
+                 activities=[
+-                    torch.profiler.ProfilerActivity.CPU,
+                     torch.profiler.ProfilerActivity.CUDA,
+                 ],
+                 with_stack=True,
+@@ -1033,9 +1032,11 @@ class Scheduler:
+         if self.profiler is None:
+             raise RuntimeError("Profiler is not enabled.")
+         self.profiler.stop()
+-        self.profiler.export_chrome_trace(
+-            self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz"
+-        )
++        if self.tp_rank == 0:
++            with open(f"stats_repro_{int(time.time())}.txt", "w") as f:
++                print(self.profiler.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=-1), file=f)
++                print("Profiling stats done.")
++
+         logger.info("Profiler is done")
+```
+
+2. Untar dummy_grok1.tar in this directory and copy it to the right path for "--model-path" if you want to use the server.sh file provided.
+
+3. Modify the included server.sh by removing "loadTracer.sh" before python command and launch script ./server.sh in one terminal inside the docker container. 
+
+4. Similar to step 6 in RPD profiling section, but remove the last 2 lines, which converted rpd file into csv and json files, from in client.sh. Run modified client.sh for PyTorch profiling.
