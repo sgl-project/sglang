@@ -64,6 +64,8 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.metrics.metrics_collector import PrometheusMetricsCollector
+from sglang.srt.metrics.metrics_types import Stats
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
@@ -76,8 +78,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import get_exception_traceback
-from sglang.srt.metrics.metrics_types import Stats
-from sglang.srt.metrics.metrics_collector import PrometheusMetricsCollector
 
 logger = logging.getLogger(__name__)
 

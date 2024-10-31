@@ -25,15 +25,15 @@ import json
 import logging
 import multiprocessing as mp
 import os
-import threading
-import time
 import re
 import tempfile
+import threading
+import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, List, Optional, Union
-from starlette.routing import Mount
 
 import orjson
+from starlette.routing import Mount
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
