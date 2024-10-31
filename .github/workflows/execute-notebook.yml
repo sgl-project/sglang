@@ -44,7 +44,7 @@ jobs:
       - name: Execute notebooks
         run: |
           cd docs
-          for nb in *.ipynb; do
+          find . -name "*.ipynb" | while read nb; do
             if [ -f "$nb" ]; then
               echo "Executing $nb"
               jupyter nbconvert --to notebook --execute --inplace "$nb" \

@@ -15,35 +15,35 @@ The core features include:
    :maxdepth: 1
    :caption: Getting Started
 
-   install.md
-   send_request.ipynb
+   starts/install.md
+   starts/send_request.ipynb
 
 
 .. toctree::
    :maxdepth: 1
    :caption: Backend Tutorial
 
-   openai_api.ipynb
-   backend.md
+   backend/openai_api.ipynb
+   backend/backend.md
 
 
 .. toctree::
    :maxdepth: 1
    :caption: Frontend Tutorial
 
-   frontend.md
+   frontend/frontend.md
 
 
 .. toctree::
    :maxdepth: 1
    :caption: References
 
-   sampling_params.md
-   hyperparameter_tuning.md
-   model_support.md
-   contributor_guide.md
-   choices_methods.md
-   benchmark_and_profiling.md
-   troubleshooting.md
-   embedding_model.ipynb
-   learn_more.md
+   references/sampling_params.md
+   references/hyperparameter_tuning.md
+   references/model_support.md
+   references/contributor_guide.md
+   references/choices_methods.md
+   references/benchmark_and_profiling.md
+   references/troubleshooting.md
+   references/embedding_model.ipynb
+   references/learn_more.md
