@@ -20,6 +20,8 @@ import dataclasses
 import json
 import logging
 import os
+import signal
+import sys
 from typing import Dict, List, Optional, Tuple, Union
 
 import fastapi
@@ -58,7 +60,12 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, is_generation_model, is_multimodal_model
+from sglang.srt.utils import (
+    get_zmq_socket,
+    is_generation_model,
+    is_multimodal_model,
+    kill_child_process,
+)
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -141,6 +148,9 @@ class TokenizerManager:
         # For update model weights
         self.model_update_lock = asyncio.Lock()
         self.model_update_result = None
+
+        # Others
+        self.gracefully_exit = False
 
     async def generate_request(
         self,
@@ -539,22 +549,18 @@ class TokenizerManager:
             self.create_handle_loop()
 
         req = GetMemPoolSizeReq()
-        ret = None
+
+        self.send_to_scheduler.send_pyobj(req)
+        self.mem_pool_size = asyncio.Future()
 
         if self.server_args.dp_size == 1:
-            self.send_to_scheduler.send_pyobj(req)
-            self.mem_pool_size = asyncio.Future()
             res = await self.mem_pool_size
-            ret = res.size
-
+            return res.size
         else: # self.server_args.dp_size > 1
-            self.send_to_scheduler.send_pyobj(req)
-            self.mem_pool_size = asyncio.Future()
             self.mem_pool_size_tmp = []
             res = await self.mem_pool_size
             ret = [r.size for r in res]
-            
-        return ret
+            return ret
 
     async def update_weights(
         self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
@@ -568,29 +574,21 @@ class TokenizerManager:
 
         if not self.model_update_lock.locked():
         
-            if self.server_args.dp_size == 1:
-                async with self.model_update_lock:
-                    # wait for the previous generation requests to finish
-                    while len(self.rid_to_state) > 0:
-                        await asyncio.sleep(0.001)
-                    self.send_to_scheduler.send_pyobj(obj)
-                    self.model_update_result = asyncio.Future()
+            async with self.model_update_lock:
+                # wait for the previous generation requests to finish
+                while len(self.rid_to_state) > 0:
+                    await asyncio.sleep(0.001)
+                self.send_to_scheduler.send_pyobj(obj)
+                self.model_update_result = asyncio.Future()
+
+                if self.server_args.dp_size == 1:
                     result = await self.model_update_result
                     if result.success:
                         self.server_args.model_path = obj.model_path
                         self.server_args.load_format = obj.load_format
                         self.model_path = obj.model_path
-                return result.success, result.message
-
-            else: # self.server_args.dp_size > 1
-
-                # There will be dp_size number of response from the detokenizer
-                async with self.model_update_lock:
-                    # wait for the previous generation requests to finish
-                    while len(self.rid_to_state) > 0:
-                        await asyncio.sleep(0.001)
-                    self.send_to_scheduler.send_pyobj(obj)
-                    self.model_update_result = asyncio.Future()
+                    return result.success, result.message
+                else: # self.server_args.dp_size > 1
                     self.model_update_tmp = []
                     result = await self.model_update_result
 
@@ -601,8 +599,7 @@ class TokenizerManager:
                         self.model_path = obj.model_path
                     all_message = [r.message for r in result]
                     all_message = " | ".join(all_message)
-                    
-                return all_success, all_message
+                    return all_success, all_message
 
         else:
             return False, "Another update is in progress. Please try again later."
@@ -628,6 +625,28 @@ class TokenizerManager:
         self.to_create_loop = False
         loop = asyncio.get_event_loop()
         loop.create_task(self.handle_loop())
+
+        signal_handler = SignalHandler(self)
+        loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+        loop.create_task(self.sigterm_watchdog())
+
+    async def sigterm_watchdog(self):
+        while not self.gracefully_exit:
+            await asyncio.sleep(60)
+
+        # drain requests
+        while True:
+            remain_num_req = len(self.rid_to_state)
+            logger.info(
+                f"gracefully exiting... remaining number of requests {remain_num_req}"
+            )
+            if remain_num_req > 0:
+                await asyncio.sleep(5)
+            else:
+                break
+
+        kill_child_process(include_self=True)
+        sys.exit(-1)
 
     async def handle_loop(self):
         """The event loop that handles requests"""
@@ -740,3 +759,14 @@ class TokenizerManager:
                     token_top_logprobs, decode_to_text
                 )
         return top_logprobs
+
+
+class SignalHandler:
+    def __init__(self, tokenizer_manager):
+        self.tokenizer_manager = tokenizer_manager
+
+    def signal_handler(self, signum=None, frame=None):
+        logger.warning(
+            f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
+        )
+        self.tokenizer_manager.gracefully_exit = True

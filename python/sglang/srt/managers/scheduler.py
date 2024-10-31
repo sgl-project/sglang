@@ -712,9 +712,11 @@ class Scheduler:
 
         # Mixed-style chunked prefill
         if self.is_mixed_chunk and self.running_batch is not None:
-            self.running_batch.prepare_for_decode(self.enable_overlap)
-            new_batch.mix_with_running(self.running_batch)
-            new_batch.decoding_reqs = self.running_batch.reqs
+            self.running_batch.filter_batch()
+            if not self.running_batch.is_empty():
+                self.running_batch.prepare_for_decode(self.enable_overlap)
+                new_batch.mix_with_running(self.running_batch)
+                new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = None
         else:
             new_batch.decoding_reqs = None
@@ -907,7 +909,7 @@ class Scheduler:
         self.token_to_kv_pool.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        if self.tp_rank == 0 and self.forward_ct_decode % 40 == 0:
+        if self.tp_rank == 0 and self.forward_ct_decode % self.server_args.decode_log_interval == 0:
             self.print_decode_stats()
 
     def add_logprob_return_values(
