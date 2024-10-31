@@ -1,4 +1,4 @@
-## Backend: SGLang Runtime (SRT)
+# Backend: SGLang Runtime (SRT)
 The SGLang Runtime (SRT) is an efficient serving engine.
 
 ### Quick Start
@@ -79,6 +79,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
 ```
+- To enable the experimental overlapped scheduler, add `--enable-overlap-scheduler`. It overlaps CPU scheduler with GPU computation and can accelerate almost all workloads. This does not work for constrained decoding currenly.
 - To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. This does not work for FP8 currenly.
 - To enable torchao quantization, add `--torchao-config int4wo-128`. It supports various quantization strategies.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
@@ -128,7 +129,7 @@ You can view the full example [here](https://github.com/sgl-project/sglang/tree/
 - Llama / Llama 2 / Llama 3 / Llama 3.1
 - Mistral / Mixtral / Mistral NeMo
 - Gemma / Gemma 2
-- Qwen / Qwen 2 / Qwen 2 MoE
+- Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL
 - DeepSeek / DeepSeek 2
 - OLMoE
 - [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
@@ -151,6 +152,7 @@ You can view the full example [here](https://github.com/sgl-project/sglang/tree/
 - MiniCPM / MiniCPM 3
 - XVERSE / XVERSE MoE
 - SmolLM
+- GLM-4
 
 **Embedding Models**
 
@@ -171,6 +173,17 @@ export SGLANG_USE_MODELSCOPE=true
 Launch [Qwen2-7B-Instruct](https://www.modelscope.cn/models/qwen/qwen2-7b-instruct) Server
 ```
 SGLANG_USE_MODELSCOPE=true python -m sglang.launch_server --model-path qwen/Qwen2-7B-Instruct --port 30000
+```
+
+Or start it by docker.
+```bash
+docker run --gpus all \
+    -p 30000:30000 \
+    -v ~/.cache/modelscope:/root/.cache/modelscope \
+    --env "SGLANG_USE_MODELSCOPE=true" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --host 0.0.0.0 --port 30000
 ```
   
 </details>
