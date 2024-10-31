@@ -1,0 +1,54 @@
+name: Execute Notebooks
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "docs/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "docs/**"
+  workflow_dispatch:
+
+
+concurrency:
+  group: execute-notebook-${{ github.ref }}
+  cancel-in-progress: true
+
+  
+jobs:
+  run-all-notebooks:
+    runs-on: 1-gpu-runner
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+          pip install -r docs/requirements.txt
+
+      - name: Setup Jupyter Kernel
+        run: |
+          python -m ipykernel install --user --name python3 --display-name "Python 3"
+
+      - name: Execute notebooks
+        run: |
+          cd docs
+          for nb in *.ipynb; do
+            if [ -f "$nb" ]; then
+              echo "Executing $nb"
+              jupyter nbconvert --to notebook --execute --inplace "$nb" \
+                --ExecutePreprocessor.timeout=600 \
+                --ExecutePreprocessor.kernel_name=python3
+            fi
+          done

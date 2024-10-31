@@ -33,17 +33,17 @@ class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     next_token_logits: torch.Tensor
     # The logprobs of the next tokens.     shape: [#seq, vocab_size]
-    next_token_logprobs: torch.Tensor
+    next_token_logprobs: torch.Tensor = None
 
     # The normlaized logprobs of prompts.  shape: [#seq]
-    normalized_prompt_logprobs: torch.Tensor
+    normalized_prompt_logprobs: torch.Tensor = None
     # The logprobs of input tokens.        shape: [#token, vocab_size]
-    input_token_logprobs: torch.Tensor
+    input_token_logprobs: torch.Tensor = None
 
     # The logprob and id of the top-k tokens in input positions.  shape [#seq, #token, k] of Tuple(logprob, token_id)
-    input_top_logprobs: List
+    input_top_logprobs: List = None
     # The logprob and id of the top-k tokens in output positions. shape [#seq, #token, k] of Tuple(logprob, token_id)
-    output_top_logprobs: List
+    output_top_logprobs: List = None
 
 
 @dataclasses.dataclass

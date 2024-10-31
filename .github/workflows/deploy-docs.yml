@@ -1,0 +1,62 @@
+name: Release Documentation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+      - 'python/sglang/version.py'
+  workflow_dispatch:
+
+jobs:
+  execute-and-deploy:
+    runs-on: 1-gpu-runner
+    if: github.repository == 'sgl-project/sglang'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+          pip install -r docs/requirements.txt
+          apt-get update
+          apt-get install -y pandoc
+
+      - name: Setup Jupyter Kernel
+        run: |
+          python -m ipykernel install --user --name python3 --display-name "Python 3"
+
+      - name: Execute notebooks and push to documents
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          cd docs
+          for nb in *.ipynb; do
+            if [ -f "$nb" ]; then
+              echo "Executing $nb"
+              jupyter nbconvert --to notebook --execute --inplace "$nb" \
+                --ExecutePreprocessor.timeout=600 \
+                --ExecutePreprocessor.kernel_name=python3
+            fi
+          done
+
+          make html
+          cd _build/html
+          
+          git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
+          cp -r * ../sgl-project.github.io
+          cd ../sgl-project.github.io
+          git config user.name "zhaochenyang20"
+          git config user.email "zhaochenyang20@gmail.com"
+          git add .
+          git commit -m "Update $(date +'%Y-%m-%d %H:%M:%S')"
+          git push https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git main
+          cd ..
+          rm -rf sgl-project.github.io
