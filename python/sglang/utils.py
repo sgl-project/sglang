@@ -155,7 +155,7 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
     frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
 
     frames = []
-    for i in range(total_frames):
+    for _ in range(total_frames):
         ret, frame = cap.read()
         if ret:
             frames.append(frame)
