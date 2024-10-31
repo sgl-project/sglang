@@ -63,6 +63,7 @@ class ServerArgs:
     stream_interval: int = 1
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
+    decode_log_interval: int = 40
 
     # Logging
     log_level: str = "info"
@@ -435,6 +436,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.watchdog_timeout,
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
+        parser.add_argument(
+            "--decode-log-interval",
+            type=int,
+            default=ServerArgs.decode_log_interval,
+            help="The log interval of decode batch"
         )
 
         # Data parallelism
