@@ -1,7 +1,7 @@
 # Backend: SGLang Runtime (SRT)
 The SGLang Runtime (SRT) is an efficient serving engine.
 
-### Quick Start
+## Quick Start
 Launch a server
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
@@ -22,7 +22,7 @@ curl http://localhost:30000/generate \
 
 Learn more about the argument specification, streaming, and multi-modal support [here](https://sgl-project.github.io/sampling_params.html).
 
-### OpenAI Compatible API
+## OpenAI Compatible API
 In addition, the server supports OpenAI-compatible APIs.
 
 ```python
@@ -61,7 +61,7 @@ print(response)
 
 It supports streaming, vision, and almost all features of the Chat/Completions/Models/Batch endpoints specified by the [OpenAI API Reference](https://platform.openai.com/docs/api-reference/).
 
-### Additional Server Arguments
+## Additional Server Arguments
 - To enable multi-GPU tensor parallelism, add `--tp 2`. If it reports the error "peer access is not supported between these two devices", add `--enable-p2p-check` to the server launch command.
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 2
@@ -94,7 +94,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --nccl-init sgl-dev-0:50000 --nnodes 2 --node-rank 1
 ```
 
-### Engine Without HTTP Server
+## Engine Without HTTP Server
 
 We also provide an inference engine **without a HTTP server**. For example,
 
@@ -123,7 +123,7 @@ if __name__ == "__main__":
 This can be used for offline batch inference and building custom servers.
 You can view the full example [here](https://github.com/sgl-project/sglang/tree/main/examples/runtime/engine).
 
-### Supported Models
+## Supported Models
 
 **Generative Models**
 - Llama / Llama 2 / Llama 3 / Llama 3.1
@@ -162,7 +162,7 @@ You can view the full example [here](https://github.com/sgl-project/sglang/tree/
 
 Instructions for supporting a new model are [here](https://sgl-project.github.io/model_support.html).
 
-#### Use Models From ModelScope
+### Use Models From ModelScope
 <details>
 <summary>More</summary>
 
@@ -188,7 +188,7 @@ docker run --gpus all \
   
 </details>
 
-#### Run Llama 3.1 405B
+### Run Llama 3.1 405B
 <details>
 <summary>More</summary>
 
@@ -206,7 +206,7 @@ GLOO_SOCKET_IFNAME=eth0 python3 -m sglang.launch_server --model-path meta-llama/
 
 </details>
 
-### Benchmark Performance
+## Benchmark Performance
 
 - Benchmark a single static batch by running the following command without launching a server. The arguments are the same as for `launch_server.py`.
   Note that this is not a dynamic batching server, so it may run out of memory for a batch size that a real server can handle.
