@@ -613,9 +613,7 @@ class Scheduler:
 
         has_inflight = self.current_inflight_req is not None
         if has_inflight:
-            self.current_inflight_req.init_next_round_input(
-                None if prefix_computed else self.tree_cache
-            )
+            self.current_inflight_req.init_next_round_input()
             self.current_inflight_req = adder.add_inflight_req(
                 self.current_inflight_req
             )
