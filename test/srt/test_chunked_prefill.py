@@ -8,6 +8,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     run_bench_serving,
     run_mmlu_test,
+    run_mulit_request_test,
 )
 
 
@@ -38,6 +39,12 @@ class TestChunkedPrefill(unittest.TestCase):
         )
 
         assert res["completed"] == 10
+
+    def test_mixed_chunked_prefill_multi_requests(self):
+        run_mulit_request_test(
+            enable_mixed_chunk=True,
+            chunked_prefill_size=2048,
+        )
 
 
 if __name__ == "__main__":
