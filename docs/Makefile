@@ -14,8 +14,13 @@ help:
 
 # New target to compile Markdown and Jupyter Notebook files
 compile:
-	find $(SOURCEDIR) -name '*.md' -o -name '*.ipynb' | while read file; do \
-		$(SPHINXBUILD) -b html "$$file" "$(BUILDDIR)/$$(basename $$file .md)" $(SPHINXOPTS); \
+	find $(SOURCEDIR) -name '*.ipynb' | while read nb; do \
+		if [ -f "$$nb" ]; then \
+			echo "Executing $$nb"; \
+			jupyter nbconvert --to notebook --execute --inplace "$$nb" \
+				--ExecutePreprocessor.timeout=600 \
+				--ExecutePreprocessor.kernel_name=python3; \
+		fi; \
 	done
 
 .PHONY: help Makefile compile
