@@ -235,15 +235,15 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 self.forward_metadata = (decode_wrappers,)
 
-        # seq_lens_sum = seq_lens.sum().item()
-        # self.indices_updater_decode.update(
-        #     req_pool_indices,
-        #     seq_lens,
-        #     seq_lens_sum,
-        #     decode_wrappers=decode_wrappers,
-        #     encoder_lens=encoder_lens,
-        #     forward_batch=forward_batch,
-        # )
+                seq_lens_sum = seq_lens.sum().item()
+                self.indices_updater_decode.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_sum,
+                    decode_wrappers=decode_wrappers,
+                    encoder_lens=encoder_lens,
+                    forward_batch=forward_batch,
+                )
         self.cuda_graph_metadata[num_token] = decode_wrappers
         
 

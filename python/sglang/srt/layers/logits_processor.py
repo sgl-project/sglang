@@ -33,14 +33,14 @@ class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     next_token_logits: torch.Tensor
     # The logprobs of the next tokens.     shape: [#seq, vocab_size]
-    next_token_logprobs: torch.Tensor
+    next_token_logprobs: torch.Tensor = None
     
     # Used by speculative inference
     # The output of transformer layers
-    hidden_states: Optional[torch.Tensor]
+    hidden_states: Optional[torch.Tensor] = None
     # backup of next_token_logits when use cuda graph
     # id(next_token_logits_bak) == id(next_token_logits)
-    next_token_logits_bak: Optional[torch.Tensor]
+    next_token_logits_bak: Optional[torch.Tensor] = None
 
     # The normlaized logprobs of prompts.  shape: [#seq]
     normalized_prompt_logprobs: torch.Tensor = None
