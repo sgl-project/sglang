@@ -1,7 +1,7 @@
 # Deploy the documents	
 
-import os	
-from datetime import datetime	
+import os
+from datetime import datetime
 
 
 def run_cmd(cmd):	
