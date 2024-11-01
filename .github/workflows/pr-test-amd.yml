@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: pr-test-${{ github.ref }}
+  group: pr-test-amd-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -28,7 +28,8 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -e "python[all]" --no-deps
+          pip install -e "python[runtime_common, test]"
+          pip install -e "python" --no-deps
 
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval

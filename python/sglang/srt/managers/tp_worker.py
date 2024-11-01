@@ -21,11 +21,12 @@ from typing import TYPE_CHECKING
 
 import json
 import logging
+from typing import Optional
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import UpdateWeightReqInput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
@@ -41,9 +42,10 @@ class TpModelWorker:
     """A tensor parallel model worker."""
     def __init__(
         self,
+        server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
-        server_args: ServerArgs,
+        dp_rank: Optional[int],
         nccl_port: int,
     ):
         # Parse args
@@ -85,6 +87,7 @@ class TpModelWorker:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                 )
+        self.device = self.model_runner.device
 
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
@@ -97,10 +100,14 @@ class TpModelWorker:
             ),
             self.model_runner.req_to_token_pool.size,
         )
-        self.max_req_input_len = min(
+        self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
         )
+        self.max_req_input_len = self.max_req_len - 5
+        assert (
+            self.max_req_len > 0 and self.max_req_input_len > 0
+        ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
         self.random_seed = broadcast_pyobj(
@@ -110,13 +117,31 @@ class TpModelWorker:
         )[0]
         set_random_seed(self.random_seed)
 
-    def get_token_and_memory_info(self):
+    def get_worker_info(self):
         return (
             self.max_total_num_tokens,
             self.max_prefill_tokens,
             self.max_running_requests,
+            self.max_req_len,
             self.max_req_input_len,
             self.random_seed,
+            self.device,
+            global_server_args_dict,
+            self.model_runner.req_to_token_pool.size,
+            self.model_runner.req_to_token_pool.max_context_len,
+            self.model_runner.token_to_kv_pool.size,
+        )
+
+    def get_pad_input_ids_func(self):
+        return getattr(self.model_runner.model, "pad_input_ids", None)
+
+    def get_tp_cpu_group(self):
+        return self.model_runner.tp_group.cpu_group
+
+    def get_memory_pool(self):
+        return (
+            self.model_runner.req_to_token_pool,
+            self.model_runner.token_to_kv_pool,
         )
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch, need_token_id=True):
@@ -132,7 +157,7 @@ class TpModelWorker:
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
-        embeddings = logits_output.embeddings.tolist()
+        embeddings = logits_output.embeddings
         return embeddings
 
     def update_weights(self, recv_req: UpdateWeightReqInput):

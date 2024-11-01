@@ -8,8 +8,8 @@ import time
 import cutex
 import torch
 
-# parent_table [bs*(topk*depth+1)]
-# selected_index [bs*(draft_token_num-1)]
+# parent_table [bs,topk*depth+)]
+# selected_index [bs,draft_token_num-1)]
 # verified_seq_len [bs]
 # tree_mask [draft_token*(seq_len[0]+draft_token) | draft_token*(seq_len[1]+draft_token) | ..] = [sum(verified_seq_len)*draft_token+bs*draft_token*draft_token]
 # positions [bs*draft_token]
@@ -17,7 +17,7 @@ import torch
 kernels = cutex.SourceModule(
     """
 //cuda
-__global__ void build_tree(Tensor<long, 2> parent_list, Tensor<long, 2> selected_index, Tensor<long, 1> verified_seq_len, 
+__global__ void build_tree(Tensor<long, 2> parent_list, Tensor<long, 2> selected_index, Tensor<int, 1> verified_seq_len, 
         Tensor<bool, 1> tree_mask, Tensor<long, 1> positions, Tensor<long, 3> retrive_index, int topk, int depth, int draft_token_num) {
         int bid = blockIdx.x;
         int tid = threadIdx.x;
@@ -82,7 +82,7 @@ __global__ void build_tree(Tensor<long, 2> parent_list, Tensor<long, 2> selected
 //!cuda
 """,
     float_bits=16,  # change to 16 to use half precision as `float` type in the above source code.
-    boundscheck=False,  # turning on for debug and off for performance (to use full threads of a block), default is on.
+    boundscheck=True,  # turning on for debug and off for performance (to use full threads of a block), default is on.
 )
 
 
@@ -102,7 +102,7 @@ def build_tree_kernel(parent_list, top_score_index, seq_lens, topk, depth, draft
     kernels.build_tree(
         parent_list,
         top_score_index,
-        seq_lens,
+        seq_lens.to(torch.int32),
         tree_mask,
         positions,
         retrive_index,

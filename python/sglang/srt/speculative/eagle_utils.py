@@ -383,7 +383,7 @@ class EAGLEDraftInput(SpecDraftInput):
         self,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
-        req_to_token_pool: ReqToTokenPool,
+        req_to_token: torch.Tensor,
     ):
         seq_num = req_pool_indices.numel()
         bs = self.topk * req_pool_indices.numel()
@@ -397,9 +397,9 @@ class EAGLEDraftInput(SpecDraftInput):
         kv_indices = torch.empty((total_len * self.topk + seq_num*self.iter*self.topk, ), 
                                  dtype=torch.int32, device='cuda')
         
-        generate_draft_decode_kv_indices[(req_pool_indices.numel(), self.topk)](req_pool_indices, req_to_token_pool.req_to_token,
+        generate_draft_decode_kv_indices[(req_pool_indices.numel(), self.topk)](req_pool_indices, req_to_token,
                                          paged_kernel_lens, kv_indices, self.iter, self.topk, 
-                                         req_to_token_pool.req_to_token.shape[1], triton.next_power_of_2(seq_num),
+                                         req_to_token.shape[1], triton.next_power_of_2(seq_num),
                                          triton.next_power_of_2(self.spec_steps))
         return kv_indices, cum_kv_seq_len, kv_last_page_len, None
 
@@ -416,7 +416,7 @@ class EAGLEDraftInput(SpecDraftInput):
         self,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
-        req_to_token_pool: ReqToTokenPool,
+        req_to_token: torch.Tensor,
     ):
         bs = self.accept_length.numel()
         qo_indptr = torch.zeros(
@@ -432,13 +432,13 @@ class EAGLEDraftInput(SpecDraftInput):
         kv_indices = torch.empty(cum_kv_seq_len[-1], dtype=torch.int32, device="cuda")
         
         create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token_pool.req_to_token,
+            req_to_token,
             req_pool_indices,
             paged_kernel_lens,
             cum_kv_seq_len,
             None,
             kv_indices,
-            req_to_token_pool.req_to_token.size(1),
+            req_to_token.size(1),
         )
 
         return kv_indices, cum_kv_seq_len, kv_last_page_len, qo_indptr
@@ -487,7 +487,7 @@ class EagleVerifyInput(SpecVerifyInput):
         self,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
-        req_to_token_pool: ReqToTokenPool,
+        req_to_token: torch.Tensor,
     ):
         batch_size = len(req_pool_indices)
         qo_indptr = torch.arange(
@@ -510,13 +510,13 @@ class EagleVerifyInput(SpecVerifyInput):
         kv_indices = torch.empty(cum_kv_seq_len[-1], dtype=torch.int32, device="cuda")
         
         create_flashinfer_kv_indices_triton[(batch_size,)](
-            req_to_token_pool.req_to_token,
+            req_to_token,
             req_pool_indices,
             paged_kernel_lens,
             cum_kv_seq_len,
             None,
             kv_indices,
-            req_to_token_pool.req_to_token.size(1),
+            req_to_token.size(1),
         )
         return kv_indices, cum_kv_seq_len, kv_last_page_len, qo_indptr
 
@@ -577,7 +577,7 @@ class EagleVerifyInput(SpecVerifyInput):
         new_accept_index = []
         unfinished_index = []
         finished_extend_len = {} # {rid:accept_length + 1}
-        retracted_reqs, new_token_ratio = batch.retract_decode()
+        #retracted_reqs, new_token_ratio = batch.retract_decode()
 
         low = 0
         for i, (req, verified_len) in enumerate(zip(batch.reqs, accept_length_cpu)):

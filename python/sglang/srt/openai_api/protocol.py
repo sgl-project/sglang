@@ -76,6 +76,8 @@ class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+    # only used to return cached tokens when --enable-cache-report is set
+    prompt_tokens_details: Optional[Dict[str, int]] = None
 
 
 class StreamOptions(BaseModel):
@@ -170,10 +172,11 @@ class CompletionRequest(BaseModel):
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
     json_schema: Optional[str] = None
-    ignore_eos: Optional[bool] = False
-    min_tokens: Optional[int] = 0
+    ignore_eos: bool = False
+    min_tokens: int = 0
     repetition_penalty: Optional[float] = 1.0
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
+    no_stop_trim: Union[bool, List[bool]] = False
 
 
 class CompletionResponseChoice(BaseModel):
@@ -181,6 +184,7 @@ class CompletionResponseChoice(BaseModel):
     text: str
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class CompletionResponse(BaseModel):
@@ -197,6 +201,7 @@ class CompletionResponseStreamChoice(BaseModel):
     text: str
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class CompletionStreamResponse(BaseModel):
@@ -275,6 +280,7 @@ class ChatCompletionRequest(BaseModel):
     min_tokens: Optional[int] = 0
     repetition_penalty: Optional[float] = 1.0
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
+    ignore_eos: bool = False
 
 
 class ChatMessage(BaseModel):
@@ -287,6 +293,7 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: str
+    matched_stop: Union[None, int, str] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -308,6 +315,7 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):

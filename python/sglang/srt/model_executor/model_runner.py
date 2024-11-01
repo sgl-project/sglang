@@ -18,6 +18,7 @@ limitations under the License.
 import gc
 import importlib
 import importlib.resources
+import json
 import logging
 import pkgutil
 from functools import lru_cache
@@ -39,6 +40,7 @@ from vllm.model_executor.models import ModelRegistry
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.constrained import disable_cache
+from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -46,6 +48,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
+    DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -56,8 +59,11 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
+    is_attention_free_model,
+    is_embedding_model,
     is_generation_model,
     is_multimodal_model,
+    model_has_inner_state,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
 )
@@ -101,12 +107,31 @@ class ModelRunner:
             logger.info("MLA optimization is turned on. Use triton backend.")
             self.server_args.attention_backend = "triton"
 
-        if self.is_multimodal_model:
+        if self.server_args.enable_double_sparsity:
             logger.info(
+                "Double sparsity optimization is turned on. Use triton backend without CUDA graph."
+            )
+            self.server_args.attention_backend = "triton"
+            self.server_args.disable_cuda_graph = True
+            if self.server_args.ds_heavy_channel_type is None:
+                raise ValueError(
+                    "Please specify the heavy channel type for double sparsity optimization."
+                )
+            self.init_double_sparsity_channel_config(
+                self.server_args.ds_heavy_channel_type
+            )
+
+        if self.is_multimodal_model:
+            logger.warning(
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
             )
             server_args.chunked_prefill_size = None
             server_args.mem_fraction_static *= 0.95
+            # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
+            if self.model_config.hf_config.architectures == [
+                "Qwen2VLForConditionalGeneration"
+            ]:
+                server_args.disable_radix_cache = True
 
         # Global vars
         if server_args.show_time_cost:
@@ -121,6 +146,8 @@ class ModelRunner:
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
+                "disable_penalizer": server_args.disable_penalizer,
+                "disable_nan_detection": server_args.disable_nan_detection,
             }
         )
 
@@ -140,6 +167,7 @@ class ModelRunner:
             self.init_attention_backend()
             self.init_cuda_graphs()
         else:
+            self.cuda_graph_runner = None
             self.init_attention_backend()
 
     def init_torch_distributed(self):
@@ -148,6 +176,11 @@ class ModelRunner:
         if self.device == "cuda":
             torch.cuda.set_device(self.gpu_id)
             backend = "nccl"
+        # ToDO(liangan1):Just use gloo to bypass the initilization fail
+        # Need to use xccl for xpu backend in the future
+        elif self.device == "xpu":
+            torch.xpu.set_device(self.gpu_id)
+            backend = "gloo"
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
@@ -241,7 +274,6 @@ class ModelRunner:
             if hasattr(self.model, "get_attention_sliding_window_size")
             else None
         )
-        self.has_cross_attention = getattr(self.model, "has_cross_attention", False)
         self.is_generation = is_generation_model(
             self.model_config.hf_config.architectures, self.server_args.is_embedding
         )
@@ -295,11 +327,13 @@ class ModelRunner:
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
-                config.model,
-                config.revision,
-                fall_back_to_pt=getattr(
-                    self.model, "fall_back_to_pt_during_load", True
-                ),
+                DefaultModelLoader.Source(
+                    config.model,
+                    revision=config.revision,
+                    fall_back_to_pt=getattr(
+                        self.model, "fall_back_to_pt_during_load", True
+                    ),
+                )
             )
             return iter
 
@@ -432,6 +466,7 @@ class ModelRunner:
             size=max_num_reqs + 1,
             max_context_len=self.model_config.context_len + 4,
             device=self.device,
+            use_records=False,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -444,6 +479,16 @@ class ModelRunner:
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
+            )
+        elif self.server_args.enable_double_sparsity:
+            self.token_to_kv_pool = DoubleSparseTokenToKVPool(
+                self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                device=self.device,
+                heavy_channel_num=self.server_args.ds_heavy_channel_num,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
@@ -477,14 +522,35 @@ class ModelRunner:
                 "Window attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
             )
-            assert not self.has_cross_attention, (
+            assert not self.model_config.is_encoder_decoder, (
                 "Cross attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
             )
-            self.attn_backend = TritonAttnBackend(self)
+            if self.server_args.enable_double_sparsity:
+                self.attn_backend = DoubleSparseAttnBackend(self)
+            else:
+                self.attn_backend = TritonAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
+            )
+
+    def init_double_sparsity_channel_config(self, selected_channel):
+
+        selected_channel = "." + selected_channel + "_proj"
+        self.sorted_channels = []
+        # load channel config
+        with open(self.server_args.ds_channel_config_path, "r") as f:
+            channel_config = json.load(f)
+
+        for i in range(self.model_config.num_hidden_layers):
+            key = "model.layers." + str(i) + ".self_attn" + selected_channel
+            self.sorted_channels.append(
+                torch.tensor(channel_config[key])[
+                    :, : self.server_args.ds_heavy_channel_num
+                ]
+                .contiguous()
+                .cuda()
             )
 
     def init_cuda_graphs(self):
@@ -508,13 +574,20 @@ class ModelRunner:
             forward_batch.batch_size
         ) and forward_batch.forward_mode.is_cuda_graph():
             return self.cuda_graph_runner.replay(forward_batch)
+        if hasattr(forward_batch.spec_info, 'positions'):
+            forward_batch.positions = forward_batch.spec_info.positions
+        else:
+            forward_batch.positions = (forward_batch.seq_lens - 1).to(torch.int64)
         self.attn_backend.init_forward_metadata(forward_batch)
         return self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):
+        self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
+            if getattr(forward_batch.spec_info, 'positions', None) is not None:
+                forward_batch.positions = forward_batch.spec_info.positions
             return self.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
@@ -571,6 +644,15 @@ class ModelRunner:
 
         return logits
 
+    @property
+    def model_is_mrope(self) -> bool:
+        """Detect if the model has "mrope" rope_scaling type.
+        mrope requires keep "rope_deltas" between prompt and decoding phases."""
+        rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
+        if rope_scaling is None:
+            return False
+        return rope_scaling.get("type", None) == "mrope"
+
 
 @lru_cache()
 def import_model_classes():
@@ -616,3 +698,7 @@ def load_model_cls_srt(model_arch: str) -> Optional[Type[nn.Module]]:
 
 # Monkey patch model loader
 setattr(ModelRegistry, "_try_load_model_cls", load_model_cls_srt)
+setattr(ModelRegistry, "is_multimodal_model", is_multimodal_model)
+setattr(ModelRegistry, "is_attention_free_model", is_attention_free_model)
+setattr(ModelRegistry, "model_has_inner_state", model_has_inner_state)
+setattr(ModelRegistry, "is_embedding_model", is_embedding_model)

@@ -40,6 +40,7 @@ class ModelCase:
     prefill_tolerance: float = 5e-2
     decode_tolerance: float = 5e-2
     rouge_l_tolerance: float = 1
+    skip_long_prompt: bool = False
 
 
 # Popular models that run on the CI
@@ -52,7 +53,9 @@ CI_MODELS = [
 ALL_OTHER_MODELS = [
     ModelCase("Qwen/Qwen2-1.5B"),
     ModelCase("Qwen/Qwen2.5-14B-Instruct"),
-    ModelCase("HuggingFaceTB/SmolLM-135M-Instruct"),
+    ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
+    ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),
+    ModelCase("THUDM/glm-4-9b-chat"),
 ]
 
 TORCH_DTYPES = [torch.float16]
@@ -135,8 +138,15 @@ class TestGenerationModels(unittest.TestCase):
     def test_ci_models(self):
         for model_case in CI_MODELS:
             for torch_dtype in TORCH_DTYPES:
+
+                # Skip long prompts for models that do not have a long context
+                prompts = DEFAULT_PROMPTS
+                if model_case.skip_long_prompt:
+                    prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
+
+                # Assert the logits and output strs are close
                 self.assert_close_logits_and_output_strs(
-                    DEFAULT_PROMPTS, model_case, torch_dtype
+                    prompts, model_case, torch_dtype
                 )
 
     def test_others(self):
@@ -151,9 +161,9 @@ class TestGenerationModels(unittest.TestCase):
             ):
                 continue
 
-            # Skip long prompts for models that does not have a long context
+            # Skip long prompts for models that do not have a long context
             prompts = DEFAULT_PROMPTS
-            if model_case.model_path in ["HuggingFaceTB/SmolLM-135M-Instruct"]:
+            if model_case.skip_long_prompt:
                 prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
 
             # Assert the logits and output strs are close

@@ -25,7 +25,7 @@ from http import HTTPStatus
 from typing import Dict, List
 
 from fastapi import HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 try:
@@ -101,7 +101,7 @@ def create_error_response(
     status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
 ):
     error = ErrorResponse(message=message, type=err_type, code=status_code.value)
-    return JSONResponse(content=error.model_dump(), status_code=error.code)
+    return ORJSONResponse(content=error.model_dump(), status_code=error.code)
 
 
 def create_streaming_error_response(
@@ -302,7 +302,12 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
             if not isinstance(ret, list):
                 ret = [ret]
             if end_point == "/v1/chat/completions":
-                responses = v1_chat_generate_response(request, ret, to_file=True)
+                responses = v1_chat_generate_response(
+                    request,
+                    ret,
+                    to_file=True,
+                    cache_report=tokenizer_manager.server_args.enable_cache_report,
+                )
             else:
                 responses = v1_generate_response(
                     request, ret, tokenizer_manager, to_file=True
@@ -493,23 +498,38 @@ def v1_generate_request(
         top_logprobs_nums.append(
             request.logprobs if request.logprobs is not None else 0
         )
-        sampling_params_list.append(
-            {
-                "temperature": request.temperature,
-                "max_new_tokens": request.max_tokens,
-                "min_new_tokens": request.min_tokens,
-                "stop": request.stop,
-                "stop_token_ids": request.stop_token_ids,
-                "top_p": request.top_p,
-                "presence_penalty": request.presence_penalty,
-                "frequency_penalty": request.frequency_penalty,
-                "repetition_penalty": request.repetition_penalty,
-                "regex": request.regex,
-                "json_schema": request.json_schema,
-                "n": request.n,
-                "ignore_eos": request.ignore_eos,
-            }
-        )
+        sampling_params = []
+        if isinstance(request.no_stop_trim, list):
+            num_reqs = len(request.prompt)
+        else:
+            num_reqs = 1
+        for i in range(num_reqs):
+            sampling_params.append(
+                {
+                    "temperature": request.temperature,
+                    "max_new_tokens": request.max_tokens,
+                    "min_new_tokens": request.min_tokens,
+                    "stop": request.stop,
+                    "stop_token_ids": request.stop_token_ids,
+                    "top_p": request.top_p,
+                    "presence_penalty": request.presence_penalty,
+                    "frequency_penalty": request.frequency_penalty,
+                    "repetition_penalty": request.repetition_penalty,
+                    "regex": request.regex,
+                    "json_schema": request.json_schema,
+                    "n": request.n,
+                    "ignore_eos": request.ignore_eos,
+                    "no_stop_trim": (
+                        request.no_stop_trim
+                        if not isinstance(request.no_stop_trim, list)
+                        else request.no_stop_trim[i]
+                    ),
+                }
+            )
+        if num_reqs == 1:
+            sampling_params_list.append(sampling_params[0])
+        else:
+            sampling_params_list.append(sampling_params)
 
     if len(all_requests) == 1:
         prompt = prompts[0]
@@ -601,16 +621,19 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
         else:
             logprobs = None
 
+        finish_reason = ret_item["meta_info"]["finish_reason"]
+
         if to_file:
             # to make the choise data json serializable
             choice_data = {
                 "index": 0,
                 "text": text,
                 "logprobs": logprobs,
-                "finish_reason": (
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
-                    else ""
+                "finish_reason": (finish_reason["type"] if finish_reason else ""),
+                "matched_stop": (
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             }
         else:
@@ -618,10 +641,11 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                 index=idx,
                 text=text,
                 logprobs=logprobs,
-                finish_reason=(
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
-                    else ""
+                finish_reason=(finish_reason["type"] if finish_reason else ""),
+                matched_stop=(
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             )
 
@@ -751,14 +775,16 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
                     delta = text[len(stream_buffer) :]
                     stream_buffer = stream_buffer + delta
+                    finish_reason = content["meta_info"]["finish_reason"]
                     choice_data = CompletionResponseStreamChoice(
                         index=index,
                         text=delta,
                         logprobs=logprobs,
-                        finish_reason=(
-                            content["meta_info"]["finish_reason"]["type"]
-                            if content["meta_info"]["finish_reason"]
-                            else ""
+                        finish_reason=(finish_reason["type"] if finish_reason else ""),
+                        matched_stop=(
+                            finish_reason["matched"]
+                            if finish_reason and "matched" in finish_reason
+                            else None
                         ),
                     )
                     chunk = CompletionStreamResponse(
@@ -910,6 +936,7 @@ def v1_chat_generate_request(
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
             "n": request.n,
+            "ignore_eos": request.ignore_eos,
         }
         if request.response_format and request.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
@@ -954,7 +981,7 @@ def v1_chat_generate_request(
     return adapted_request, all_requests
 
 
-def v1_chat_generate_response(request, ret, to_file=False):
+def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
     choices = []
 
     for idx, ret_item in enumerate(ret):
@@ -995,16 +1022,19 @@ def v1_chat_generate_response(request, ret, to_file=False):
         else:
             choice_logprobs = None
 
+        finish_reason = ret_item["meta_info"]["finish_reason"]
+
         if to_file:
             # to make the choice data json serializable
             choice_data = {
                 "index": 0,
                 "message": {"role": "assistant", "content": ret_item["text"]},
                 "logprobs": choice_logprobs,
-                "finish_reason": (
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
-                    else ""
+                "finish_reason": (finish_reason["type"] if finish_reason else ""),
+                "matched_stop": (
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             }
         else:
@@ -1012,10 +1042,11 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 index=idx,
                 message=ChatMessage(role="assistant", content=ret_item["text"]),
                 logprobs=choice_logprobs,
-                finish_reason=(
-                    ret_item["meta_info"]["finish_reason"]["type"]
-                    if ret_item["meta_info"]["finish_reason"]
-                    else ""
+                finish_reason=(finish_reason["type"] if finish_reason else ""),
+                matched_stop=(
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
                 ),
             )
 
@@ -1051,6 +1082,7 @@ def v1_chat_generate_response(request, ret, to_file=False):
             ret[i]["meta_info"]["prompt_tokens"] for i in range(0, len(ret), request.n)
         )
         completion_tokens = sum(item["meta_info"]["completion_tokens"] for item in ret)
+        cached_tokens = sum(item["meta_info"].get("cached_tokens", 0) for item in ret)
         response = ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             model=request.model,
@@ -1059,6 +1091,9 @@ def v1_chat_generate_response(request, ret, to_file=False):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
+                prompt_tokens_details=(
+                    {"cached_tokens": cached_tokens} if cache_report else None
+                ),
             ),
         )
         return response
@@ -1134,6 +1169,8 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     else:
                         choice_logprobs = None
 
+                    finish_reason = content["meta_info"]["finish_reason"]
+
                     if is_first:
                         # First chunk with role
                         is_first = False
@@ -1141,9 +1178,12 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             index=index,
                             delta=DeltaMessage(role="assistant"),
                             finish_reason=(
-                                content["meta_info"]["finish_reason"]["type"]
-                                if content["meta_info"]["finish_reason"]
-                                else ""
+                                finish_reason["type"] if finish_reason else ""
+                            ),
+                            matched_stop=(
+                                finish_reason["matched"]
+                                if finish_reason and "matched" in finish_reason
+                                else None
                             ),
                             logprobs=choice_logprobs,
                         )
@@ -1160,10 +1200,11 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=index,
                         delta=DeltaMessage(content=delta),
-                        finish_reason=(
-                            content["meta_info"]["finish_reason"]["type"]
-                            if content["meta_info"]["finish_reason"]
-                            else ""
+                        finish_reason=(finish_reason["type"] if finish_reason else ""),
+                        matched_stop=(
+                            finish_reason["matched"]
+                            if finish_reason and "matched" in finish_reason
+                            else None
                         ),
                         logprobs=choice_logprobs,
                     )
@@ -1224,7 +1265,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     if not isinstance(ret, list):
         ret = [ret]
 
-    response = v1_chat_generate_response(request, ret)
+    response = v1_chat_generate_response(
+        request, ret, cache_report=tokenizer_manager.server_args.enable_cache_report
+    )
 
     return response
 

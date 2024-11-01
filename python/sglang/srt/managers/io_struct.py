@@ -56,6 +56,9 @@ class GenerateReqInput:
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
+    # Whether it is a single request or a batch request
+    is_single: bool = True
+
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (
             self.text is not None and self.input_ids is not None
@@ -291,10 +294,13 @@ class BatchTokenIDOut:
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
+    # Only used when `--skip-tokenizer-init`
+    output_ids: Optional[List[int]]
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
+    no_stop_trim: List[bool]
 
 
 @dataclass
@@ -349,3 +355,13 @@ class AbortReq:
 class ProfileReq(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
+
+
+@dataclass
+class GetMemPoolSizeReq:
+    pass
+
+
+@dataclass
+class GetMemPoolSizeReqOutput:
+    size: int

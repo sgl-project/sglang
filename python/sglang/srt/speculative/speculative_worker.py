@@ -1,4 +1,4 @@
-from typing import Type, Union, List
+from typing import Type, Union, List, Optional
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.schedule_batch import ScheduleBatch, Req
@@ -6,16 +6,16 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch, Req
 
 class SpeculativeWorker(TpModelWorker):
     is_draft_worker = True
-    
     def __init__(
         self,
+        server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
-        server_args: ServerArgs,
+        dp_rank: Optional[int],
         nccl_port: int,
         target_worker: TpModelWorker
-    ): 
-        super().__init__(gpu_id=gpu_id, tp_rank=tp_rank, server_args=server_args, nccl_port=nccl_port)
+    ):
+        super().__init__(gpu_id=gpu_id, tp_rank=tp_rank, server_args=server_args, nccl_port=nccl_port, dp_rank=dp_rank)
         self.target_worker = target_worker
     
     def forward_batch_speculative_generate(self, batch: ScheduleBatch):

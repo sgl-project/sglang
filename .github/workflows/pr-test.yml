@@ -27,13 +27,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.44
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 10
         run: |
           cd test/lang
           python3 run_suite.py --suite minimal
@@ -47,10 +44,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.44
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -67,16 +61,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.44
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 5 --range-end 16
+          python3 run_suite.py --suite minimal --range-begin 5 --range-end 17
 
   unit-test-backend-part-3:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -87,16 +78,30 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.44
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 16
+          python3 run_suite.py --suite minimal --range-begin 17 --range-end 20
+
+  unit-test-backend-part-4:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite minimal --range-begin 20
 
   performance-test-1-gpu-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -107,10 +112,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.44
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Benchmark Single Latency
         timeout-minutes: 10
@@ -145,10 +147,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.44
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Benchmark Offline Throughput (w/o RadixAttention)
         timeout-minutes: 10
@@ -177,10 +176,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.44
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Benchmark Offline Throughput (TP=2)
         timeout-minutes: 10
@@ -209,10 +205,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.44
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
@@ -233,10 +226,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.44
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
@@ -263,7 +253,7 @@ jobs:
 
   finish:
     needs: [
-      unit-test-frontend, unit-test-backend-part-1, unit-test-backend-part-2, unit-test-backend-part-3,
+      unit-test-frontend, unit-test-backend-part-1, unit-test-backend-part-2, unit-test-backend-part-3, unit-test-backend-part-4,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu
     ]

@@ -227,22 +227,24 @@ def extend(reqs, model_runner):
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool=model_runner.token_to_kv_pool,
         tree_cache=None,
+        model_config=model_runner.model_config,
     )
-    batch.prepare_for_extend(model_runner.model_config.vocab_size)
+    batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch).tolist()
+    next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
 
 
 @torch.inference_mode()
 def decode(input_token_ids, batch, model_runner):
-    batch.prepare_for_decode(input_token_ids)
+    batch.output_ids = input_token_ids
+    batch.prepare_for_decode()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch).tolist()
+    next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
 
 
@@ -252,6 +254,7 @@ def correctness_test(
     bench_args,
     tp_rank,
 ):
+    configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
@@ -279,8 +282,9 @@ def correctness_test(
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
     for _ in range(bench_args.output_len[0] - 1):
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+        next_token_ids_list = next_token_ids.tolist()
         for i in range(len(reqs)):
-            output_ids[i].append(next_token_ids[i])
+            output_ids[i].append(next_token_ids_list[i])
 
     # Print
     for i in range(len(reqs)):
@@ -288,8 +292,15 @@ def correctness_test(
         rank_print(tokenizer.decode(output_ids[i]), "\n")
 
 
+def synchronize(device):
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "xpu":
+        torch.xpu.synchronize()
+
+
 def latency_test_run_once(
-    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len
+    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
@@ -312,10 +323,10 @@ def latency_test_run_once(
     tot_latency = 0
 
     # Prefill
-    torch.cuda.synchronize()
+    synchronize(device)
     tic = time.time()
     next_token_ids, _, batch = extend(reqs, model_runner)
-    torch.cuda.synchronize()
+    synchronize(device)
     prefill_latency = time.time() - tic
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
@@ -328,10 +339,10 @@ def latency_test_run_once(
     # Decode
     decode_latencies = []
     for i in range(output_len - 1):
-        torch.cuda.synchronize()
+        synchronize(device)
         tic = time.time()
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-        torch.cuda.synchronize()
+        synchronize(device)
         latency = time.time() - tic
         tot_latency += latency
         throughput = batch_size / latency
@@ -387,6 +398,7 @@ def latency_test(
         bench_args.batch_size[0],
         bench_args.input_len[0],
         8,  # shorter decoding to speed up the warmup
+        server_args.device,
     )
     rank_print("Benchmark ...")
 
@@ -397,7 +409,14 @@ def latency_test(
     ):
         reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
         ret = latency_test_run_once(
-            bench_args.run_name, model_runner, rank_print, reqs, bs, il, ol
+            bench_args.run_name,
+            model_runner,
+            rank_print,
+            reqs,
+            bs,
+            il,
+            ol,
+            server_args.device,
         )
         if ret is not None:
             result_list.append(ret)
@@ -531,4 +550,4 @@ if __name__ == "__main__":
     except Exception as e:
         raise e
     finally:
-        kill_child_process(os.getpid(), including_parent=False)
+        kill_child_process()

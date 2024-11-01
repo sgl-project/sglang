@@ -36,7 +36,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
 
     def tearDown(self):
         if self.process:
-            kill_child_process(self.process.pid)
+            kill_child_process(self.process.pid, include_self=True)
 
     def launch_server(self, model, is_fp8, is_tp2):
         other_args = ["--log-level-http", "warning", "--trust-remote-code"]

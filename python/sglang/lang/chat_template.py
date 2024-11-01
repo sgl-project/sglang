@@ -133,6 +133,22 @@ register_chat_template(
     )
 )
 
+# Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
+register_chat_template(
+    ChatTemplate(
+        name="qwen2-vl",
+        default_system_prompt="You are a helpful assistant.",
+        role_prefix_and_suffix={
+            "system": ("<|im_start|>system\n", "<|im_end|>\n"),
+            "user": ("<|im_start|>user\n", "<|im_end|>\n"),
+            "assistant": ("<|im_start|>assistant\n", "<|im_end|>\n"),
+        },
+        style=ChatTemplateStyle.PLAIN,
+        stop_str=("<|im_end|>"),
+        image_token="<|vision_start|><|image_pad|><|vision_end|>",
+    )
+)
+
 
 register_chat_template(
     ChatTemplate(
@@ -213,6 +229,7 @@ register_chat_template(
             ),
         },
         stop_str=("<|eot_id|>",),
+        image_token="<|image|>",
     )
 )
 

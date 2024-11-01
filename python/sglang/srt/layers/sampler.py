@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Union
 
 import torch
@@ -17,10 +18,19 @@ if is_flashinfer_available():
         top_p_renorm_prob,
     )
 
+
+# Crash on warning if we are running CI tests
+crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+
+
 logger = logging.getLogger(__name__)
 
 
 class Sampler(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.use_nan_detectioin = not global_server_args_dict["disable_nan_detection"]
+
     def forward(
         self,
         logits: Union[torch.Tensor, LogitsProcessorOutput],
@@ -29,56 +39,62 @@ class Sampler(nn.Module):
         if isinstance(logits, LogitsProcessorOutput):
             logits = logits.next_token_logits
 
-        # Post process logits
         logits = logits.contiguous()
-        logits.div_(sampling_info.temperatures)
-        probs = torch.softmax(logits, dim=-1)
-        logits = None
-        del logits
 
-        if torch.any(torch.isnan(probs)):
-            logger.warning("Detected errors during sampling! NaN in the probability.")
-            probs = torch.where(
-                torch.isnan(probs), torch.full_like(probs, 1e-10), probs
+        if self.use_nan_detectioin and torch.any(torch.isnan(logits)):
+            logger.warning("Detected errors during sampling! NaN in the logits.")
+            logits = torch.where(
+                torch.isnan(logits), torch.full_like(logits, -1e5), logits
             )
+            exit(1) if crash_on_warning else None
 
-        if sampling_info.top_ks.max().item() <= 1:
+        if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
-            batch_next_token_ids = torch.argmax(probs, -1)
-        elif global_server_args_dict["sampling_backend"] == "flashinfer":
-            max_top_k_round, batch_size = 32, probs.shape[0]
-            uniform_samples = torch.rand(
-                (max_top_k_round, batch_size), device=probs.device
-            )
-            if sampling_info.need_min_p_sampling:
-                probs = top_k_renorm_prob(probs, sampling_info.top_ks)
-                probs = top_p_renorm_prob(probs, sampling_info.top_ps)
-                batch_next_token_ids, success = min_p_sampling_from_probs(
-                    probs, uniform_samples, sampling_info.min_ps
+            batch_next_token_ids = torch.argmax(logits, -1)
+        else:
+            # Post process logits
+            logits.div_(sampling_info.temperatures)
+            probs = torch.softmax(logits, dim=-1)
+            logits = None
+            del logits
+
+            if global_server_args_dict["sampling_backend"] == "flashinfer":
+                max_top_k_round, batch_size = 32, probs.shape[0]
+                uniform_samples = torch.rand(
+                    (max_top_k_round, batch_size), device=probs.device
                 )
-            else:
-                batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
+                if sampling_info.need_min_p_sampling:
+                    probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                    probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                    batch_next_token_ids, success = min_p_sampling_from_probs(
+                        probs, uniform_samples, sampling_info.min_ps
+                    )
+                else:
+                    batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
+                        probs,
+                        uniform_samples,
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        filter_apply_order="joint",
+                    )
+
+                if not torch.all(success):
+                    logger.warning("Detected errors during sampling!")
+                    batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
+            elif global_server_args_dict["sampling_backend"] == "pytorch":
+                # A slower fallback implementation with torch native operations.
+                batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                     probs,
-                    uniform_samples,
                     sampling_info.top_ks,
                     sampling_info.top_ps,
-                    filter_apply_order="joint",
+                    sampling_info.min_ps,
+                )
+            else:
+                raise ValueError(
+                    f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
                 )
 
-            if not torch.all(success):
-                logger.warning("Detected errors during sampling!")
-                batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
-        elif global_server_args_dict["sampling_backend"] == "pytorch":
-            # Here we provide a slower fallback implementation.
-            batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
-                probs, sampling_info.top_ks, sampling_info.top_ps, sampling_info.min_ps
-            )
-        else:
-            raise ValueError(
-                f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
-            )
-
-        return batch_next_token_ids
+        return batch_next_token_ids.to(torch.int32)
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(

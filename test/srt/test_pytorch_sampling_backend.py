@@ -1,4 +1,3 @@
-import json
 import unittest
 from types import SimpleNamespace
 
@@ -23,12 +22,12 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--sampling-backend", "pytorch"],
+            other_args=["--sampling-backend", "pytorch", "--disable-radix-cache"],
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -37,6 +36,7 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
             eval_name="mmlu",
             num_examples=64,
             num_threads=32,
+            temperature=0.1,
         )
 
         metrics = run_eval(args)
