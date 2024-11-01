@@ -107,6 +107,27 @@ class TestRadixCacheLPM(TestRadixCacheFCFS):
         )
 
 
+class TestRadixCacheOverlapLPM(TestRadixCacheFCFS):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-overlap-schedule",
+                "--chunked-prefill-size",
+                "128",
+                "--max-total-tokens",
+                "20000",
+                "--schedule-policy",
+                "lpm",
+            ],
+        )
+
+
 if __name__ == "__main__":
     os.environ["SGLANG_TEST_RETRACT"] = "true"
     unittest.main()
