@@ -38,7 +38,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           cd docs
-          rm -rf _build
+          make clean
           make compile
 
           make html

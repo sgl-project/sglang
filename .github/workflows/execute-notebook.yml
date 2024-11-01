@@ -44,5 +44,5 @@ jobs:
       - name: Execute notebooks
         run: |
           cd docs
-          rm -rf _build
+          make clean
           make compile
