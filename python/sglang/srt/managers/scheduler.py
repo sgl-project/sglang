@@ -81,6 +81,7 @@ from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+
 # Crash on warning if we are running CI tests
 crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
 
@@ -233,7 +234,7 @@ class Scheduler:
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
-        self.current_inflight_req = None
+        self.being_chunked_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
@@ -570,13 +571,13 @@ class Scheduler:
             and not self.last_batch.forward_mode.is_decode()
             and not self.last_batch.is_empty()
         ):
-            if self.current_inflight_req:
+            if self.being_chunked_req:
                 self.last_batch.filter_batch(
-                    current_inflight_req=self.current_inflight_req
+                    being_chunked_req=self.being_chunked_req
                 )
-                self.tree_cache.cache_unfinished_req(self.current_inflight_req)
+                self.tree_cache.cache_unfinished_req(self.being_chunked_req)
                 # Inflight request keeps its rid but will get a new req_pool_idx.
-                self.req_to_token_pool.free(self.current_inflight_req.req_pool_idx)
+                self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
                 self.batch_is_full = False
             if not self.last_batch.is_empty():
                 if self.running_batch is None:
@@ -607,7 +608,7 @@ class Scheduler:
         # Handle the cases where prefill is not allowed
         if (
             self.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.current_inflight_req is None:
+        ) and self.being_chunked_req is None:
             return None
 
         running_bs = len(self.running_batch.reqs) if self.running_batch else 0
@@ -630,13 +631,11 @@ class Scheduler:
             num_mixed_running,
         )
 
-        has_inflight = self.current_inflight_req is not None
+        has_inflight = self.being_chunked_req is not None
         if has_inflight:
-            self.current_inflight_req.init_next_round_input(
-                None if prefix_computed else self.tree_cache
-            )
-            self.current_inflight_req = adder.add_inflight_req(
-                self.current_inflight_req
+            self.being_chunked_req.init_next_round_input()
+            self.being_chunked_req = adder.add_inflight_req(
+                self.being_chunked_req
             )
 
         if self.lora_paths:
@@ -681,11 +680,11 @@ class Scheduler:
         ]
 
         if adder.new_inflight_req is not None:
-            assert self.current_inflight_req is None
-            self.current_inflight_req = adder.new_inflight_req
+            assert self.being_chunked_req is None
+            self.being_chunked_req = adder.new_inflight_req
 
-        if self.current_inflight_req:
-            self.current_inflight_req.is_inflight_req += 1
+        if self.being_chunked_req:
+            self.being_chunked_req.is_being_chunked += 1
 
         # Print stats
         if self.tp_rank == 0:
@@ -743,9 +742,11 @@ class Scheduler:
 
         # Mixed-style chunked prefill
         if self.is_mixed_chunk and self.running_batch is not None:
-            self.running_batch.prepare_for_decode(self.enable_overlap)
-            new_batch.mix_with_running(self.running_batch)
-            new_batch.decoding_reqs = self.running_batch.reqs
+            self.running_batch.filter_batch()
+            if not self.running_batch.is_empty():
+                self.running_batch.prepare_for_decode(self.enable_overlap)
+                new_batch.mix_with_running(self.running_batch)
+                new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = None
         else:
             new_batch.decoding_reqs = None
@@ -937,9 +938,10 @@ class Scheduler:
             # Check finish conditions
             logprob_pt = 0
             for i, req in enumerate(batch.reqs):
-                if req.is_inflight_req > 0:
-                    req.is_inflight_req -= 1
-                else:
+                if req.is_retracted:
+                    continue
+
+                if req.is_being_chunked <= 0:
                     # Inflight reqs' prefill is not finished
                     req.completion_tokens_wo_jump_forward += 1
                     req.output_ids.append(next_token_ids[i])
@@ -957,15 +959,21 @@ class Scheduler:
                         logprob_pt += self.add_logprob_return_values(
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
+                else:
+                    req.is_being_chunked -= 1
+
         else:  # embedding or reward model
             embeddings, bid = result
             embeddings = embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
+                if req.is_retracted:
+                    continue
+
                 req.embedding = embeddings[i]
-                if req.is_inflight_req > 0:
-                    req.is_inflight_req -= 1
+                if req.is_being_chunked > 0:
+                    req.is_being_chunked -= 1
                 else:
                     # Inflight reqs' prefill is not finished
                     # dummy output token for embedding models
@@ -999,7 +1007,12 @@ class Scheduler:
 
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-            if self.server_args.enable_overlap_schedule and req.finished():
+            if req.is_retracted:
+                continue
+
+            if self.server_args.enable_overlap_schedule and (
+                req.finished()
+            ):
                 self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
@@ -1121,6 +1134,7 @@ class Scheduler:
         is_stream_iter = self.forward_ct_decode % self.stream_interval == 0
 
         for req in reqs:
+            # TODO(lianmin): revisit this for overlap + retract + stream
             if req.finished() or (
                 req.stream and (is_stream_iter or len(req.output_ids) == 1)
             ):
