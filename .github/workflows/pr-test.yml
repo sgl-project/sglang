@@ -50,7 +50,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 0 --range-end 4
+          python3 run_suite.py --suite minimal --range-begin 0 --range-end 6
 
   unit-test-backend-part-2:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -67,7 +67,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 4 --range-end 14
+          python3 run_suite.py --suite minimal --range-begin 6 --range-end 14
 
   unit-test-backend-part-3:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
