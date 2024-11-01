@@ -901,8 +901,11 @@ class Scheduler:
 
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            if req.is_retracted:
+                continue
+
             if self.server_args.enable_overlap_schedule and (
-                req.finished() or req.is_retracted
+                req.finished()
             ):
                 self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
