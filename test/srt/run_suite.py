@@ -9,6 +9,7 @@ suites = {
         "models/test_generation_models.py",
         "models/test_lora.py",
         "models/test_reward_models.py",
+        "sampling/penaltylib",
         "test_chunked_prefill.py",
         "test_double_sparsity.py",
         "test_embedding_openai_server.py",
