@@ -79,6 +79,7 @@ from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+
 # Crash on warning if we are running CI tests
 crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
 
@@ -831,9 +832,10 @@ class Scheduler:
             # Check finish conditions
             logprob_pt = 0
             for i, req in enumerate(batch.reqs):
-                if req.is_being_chunked > 0:
-                    req.is_being_chunked -= 1
-                else:
+                if req.is_retracted:
+                    continue
+
+                if req.is_being_chunked <= 0:
                     # Inflight reqs' prefill is not finished
                     req.completion_tokens_wo_jump_forward += 1
                     req.output_ids.append(next_token_ids[i])
@@ -851,12 +853,18 @@ class Scheduler:
                         logprob_pt += self.add_logprob_return_values(
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
+                else:
+                    req.is_being_chunked -= 1
+
         else:  # embedding or reward model
             embeddings, bid = result
             embeddings = embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
+                if req.is_retracted:
+                    continue
+
                 req.embedding = embeddings[i]
                 if req.is_being_chunked > 0:
                     req.is_being_chunked -= 1
@@ -893,7 +901,12 @@ class Scheduler:
 
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-            if self.server_args.enable_overlap_schedule and req.finished():
+            if req.is_retracted:
+                continue
+
+            if self.server_args.enable_overlap_schedule and (
+                req.finished()
+            ):
                 self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
@@ -1015,6 +1028,7 @@ class Scheduler:
         is_stream_iter = self.forward_ct_decode % self.stream_interval == 0
 
         for req in reqs:
+            # TODO(lianmin): revisit this for overlap + retract + stream
             if req.finished() or (
                 req.stream and (is_stream_iter or len(req.output_ids) == 1)
             ):
