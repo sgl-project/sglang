@@ -24,6 +24,7 @@ The core features include:
    :caption: Backend Tutorial
 
    backend/openai_api.ipynb
+   backend/vision_language_model.ipynb
    backend/backend.md
 
 
