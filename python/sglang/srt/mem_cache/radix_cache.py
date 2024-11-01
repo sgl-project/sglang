@@ -131,6 +131,9 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
+        if not req.last_node:
+            return
+
         if token_ids is None:
             token_ids = req.fill_ids
 
