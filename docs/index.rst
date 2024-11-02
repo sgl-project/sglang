@@ -15,8 +15,8 @@ The core features include:
    :maxdepth: 1
    :caption: Getting Started
 
-   starts/install.md
-   starts/send_request.ipynb
+   start/install.md
+   start/send_request.ipynb
 
 
 .. toctree::
