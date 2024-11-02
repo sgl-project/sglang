@@ -14,5 +14,4 @@ sphinx-book-theme
 sphinx-copybutton
 sphinx-tabs
 sphinxcontrib-mermaid
-python-multipart
 urllib3<2.0.0
