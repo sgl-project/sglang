@@ -1,3 +1,5 @@
+.. _sampling-parameters:
+
 # Sampling Parameters in SGLang Runtime
 This doc describes the sampling parameters of the SGLang Runtime.
 It is the low-level endpoint of the runtime.

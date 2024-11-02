@@ -84,7 +84,8 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - To enable torchao quantization, add `--torchao-config int4wo-128`. It supports various quantization strategies.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
-- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](https://sgl-project.github.io/custom_chat_template.html).
+- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](https://sgl-project.github.io/references/custom_chat_template.html).
+
 - To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
 ```
 # Node 0

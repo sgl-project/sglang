@@ -23,8 +23,8 @@ The core features include:
    :maxdepth: 1
    :caption: Backend Tutorial
 
-   backend/openai_api.ipynb
-   backend/vision_language_model.ipynb
+   backend/openai_api_completions.ipynb
+   backend/openai_api_vision.ipynb
    backend/backend.md
 
 
