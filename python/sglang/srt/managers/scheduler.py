@@ -398,6 +398,8 @@ class Scheduler:
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
+                if self.server_args.split_prefill_batch:
+                    break
         else:
             recv_reqs = None
 
