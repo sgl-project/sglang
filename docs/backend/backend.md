@@ -20,7 +20,7 @@ curl http://localhost:30000/generate \
   }'
 ```
 
-Learn more about the argument specification, streaming, and multi-modal support [here](https://sgl-project.github.io/sampling_params.html).
+Learn more about the argument specification, streaming, and multi-modal support [here](https://sgl-project.github.io/references/sampling_params.html).
 
 ## OpenAI Compatible API
 In addition, the server supports OpenAI-compatible APIs.
@@ -74,7 +74,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --mem-fraction-static 0.7
 ```
-- See [hyperparameter tuning](https://sgl-project.github.io/hyperparameter_tuning.html) on tuning hyperparameters for better performance.
+- See [hyperparameter tuning](https://sgl-project.github.io/references/hyperparameter_tuning.html) on tuning hyperparameters for better performance.
 - If you see out-of-memory errors during prefill for long prompts, try to set a smaller chunked prefill size.
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
@@ -161,7 +161,7 @@ You can view the full example [here](https://github.com/sgl-project/sglang/tree/
 - gte-Qwen2
   - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
 
-Instructions for supporting a new model are [here](https://sgl-project.github.io/model_support.html).
+Instructions for supporting a new model are [here](https://sgl-project.github.io/references/model_support.html).
 
 ### Use Models From ModelScope
 <details>

@@ -1,5 +1,3 @@
-Here’s the text with corrected grammar and refined phrasing in U.S. English:
-
 # Frequently Asked Questions
 
 ## The results are not deterministic, even with a temperature of 0
