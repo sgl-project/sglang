@@ -23,8 +23,8 @@ The core features include:
    :maxdepth: 1
    :caption: Backend Tutorial
 
-   backend/openai_api.ipynb
-   backend/vision_language_model.ipynb
+   backend/openai_api_completions.ipynb
+   backend/openai_api_vision.ipynb
    backend/backend.md
 
 
@@ -46,5 +46,5 @@ The core features include:
    references/choices_methods.md
    references/benchmark_and_profiling.md
    references/troubleshooting.md
-   references/embedding_model.ipynb
+   references/custom_chat_template.md
    references/learn_more.md
