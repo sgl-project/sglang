@@ -132,7 +132,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
-    def test_mult_images_chat_completion(self):
+    def test_multi_images_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
