@@ -40,7 +40,7 @@ The core features include:
 - **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
 
 ## Install
-See [https://sgl-project.github.io/starts/install.html](https://sgl-project.github.io/starts/install.html)
+See [https://sgl-project.github.io/start/install.html](https://sgl-project.github.io/start/install.html)
 
 ## Backend: SGLang Runtime (SRT)
 See [https://sgl-project.github.io/backend/backend.html](https://sgl-project.github.io/backend/backend.html)
