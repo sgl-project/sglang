@@ -47,4 +47,5 @@ The core features include:
    references/benchmark_and_profiling.md
    references/troubleshooting.md
    references/custom_chat_template.md
+   references/faq.md
    references/learn_more.md
