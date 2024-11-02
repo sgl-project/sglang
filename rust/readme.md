@@ -71,8 +71,7 @@ python -m sglang.launch_server \
 ### Python bindings
 
 ```bash
-$ cargo build --release
-$ maturin build -i /usr/bin/python
+$ maturin build
 $ pip install <path to wheel>
 ```
 
