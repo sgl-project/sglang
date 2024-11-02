@@ -25,6 +25,7 @@ The core features include:
 
    backend/openai_api_completions.ipynb
    backend/openai_api_vision.ipynb
+   backend/openai_embedding_api.ipynb
    backend/native_api.ipynb
    backend/backend.md
 
