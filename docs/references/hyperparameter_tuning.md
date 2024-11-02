@@ -25,7 +25,7 @@ If you see `decode out of memory happened` occasionally but not frequently, it i
 Data parallelism is better for throughput. When there is enough GPU memory, always favor data parallelism for throughput.
 
 ### Avoid out-of-memory by Tuning `--chunked-prefill-size`, `--mem-fraction-static`, `--max-running-requests`
-If you see out of memory (OOM) errors, you can decrease these parameters.  
+If you see out of memory (OOM) errors, you can try to tune the following parameters.  
 If OOM happens during prefill, try to decrease `--chunked-prefill-size` to `4096` or `2048`.  
 If OOM happens during decoding, try to decrease `--max-running-requests`.  
 You can also try to decrease `--mem-fraction-static`, which reduces the memory usage of the KV cache memory pool and helps both prefill and decoding.
