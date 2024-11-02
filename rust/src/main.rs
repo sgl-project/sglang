@@ -4,6 +4,7 @@ use clap::builder::PossibleValuesParser;
 // declare child modules
 mod server;
 mod router;
+mod tree;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

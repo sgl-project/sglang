@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 mod server;
 pub mod router;
+pub mod tree;
 
 // Python binding
 #[pyclass]
