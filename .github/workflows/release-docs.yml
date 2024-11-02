@@ -38,19 +38,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           cd docs
-          for nb in *.ipynb; do
-            if [ -f "$nb" ]; then
-              echo "Executing $nb"
-              jupyter nbconvert --to notebook --execute --inplace "$nb" \
-                --ExecutePreprocessor.timeout=600 \
-                --ExecutePreprocessor.kernel_name=python3
-            fi
-          done
+          make clean
+          make compile
 
           make html
           cd _build/html
           
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
+          rm -rf  ../sgl-project.github.io/*
           cp -r * ../sgl-project.github.io
           cd ../sgl-project.github.io
           git config user.name "zhaochenyang20"

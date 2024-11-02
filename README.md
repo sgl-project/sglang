@@ -40,13 +40,13 @@ The core features include:
 - **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
 
 ## Install
-See [https://sgl-project.github.io/install.html](https://sgl-project.github.io/install.html)
+See [https://sgl-project.github.io/start/install.html](https://sgl-project.github.io/start/install.html)
 
 ## Backend: SGLang Runtime (SRT)
-See [https://sgl-project.github.io/backend.html](https://sgl-project.github.io/backend.html)
+See [https://sgl-project.github.io/backend/backend.html](https://sgl-project.github.io/backend/backend.html)
 
 ## Frontend: Structured Generation Language (SGLang)
-See [https://sgl-project.github.io/frontend.html](https://sgl-project.github.io/frontend.html)
+See [https://sgl-project.github.io/frontend/frontend.html](https://sgl-project.github.io/frontend/frontend.html)
 
 ## Benchmark And Performance
 Learn more in our release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)
