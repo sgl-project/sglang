@@ -1,4 +1,3 @@
-Here’s the corrected version of your text in US English:
 # Frequently Asked Questions
 
 ## The results are not deterministic even with temperature 0
