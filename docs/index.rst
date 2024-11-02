@@ -25,7 +25,10 @@ The core features include:
 
    backend/openai_api_completions.ipynb
    backend/openai_api_vision.ipynb
+<<<<<<< HEAD
    backend/openai_embedding_api.ipynb
+=======
+>>>>>>> main
    backend/native_api.ipynb
    backend/backend.md
 
@@ -44,10 +47,10 @@ The core features include:
    references/sampling_params.md
    references/hyperparameter_tuning.md
    references/model_support.md
-   references/contributor_guide.md
-   references/choices_methods.md
    references/benchmark_and_profiling.md
-   references/troubleshooting.md
+   references/choices_methods.md
    references/custom_chat_template.md
+   references/contributor_guide.md
+   references/troubleshooting.md
    references/faq.md
    references/learn_more.md
