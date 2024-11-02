@@ -190,7 +190,7 @@ class FlashInferAttnBackend(AttentionBackend):
             device="cuda",
         )
         self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
-        self.cuda_graph_q_indptr = [x.clone() for x in self.kv_indptr]
+        self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -212,7 +212,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         self.workspace_buffer,
                         "NHD",
                         use_cuda_graph=True,
-                        qo_indptr_buf=self.cuda_graph_qk_indptr[i][:bs+1],
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][:bs+1],
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
@@ -221,6 +221,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                 )
                 self.forward_metadata = (False, False, decode_wrappers)
+                
             else:
                 decode_wrappers.append(
                     BatchDecodeWithPagedKVCacheWrapper(
@@ -235,15 +236,15 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 self.forward_metadata = (decode_wrappers,)
 
-                seq_lens_sum = seq_lens.sum().item()
-                self.indices_updater_decode.update(
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_sum,
-                    decode_wrappers=decode_wrappers,
-                    encoder_lens=encoder_lens,
-                    forward_batch=forward_batch,
-                )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_decode.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                decode_wrappers=decode_wrappers,
+                encoder_lens=encoder_lens,
+                forward_batch=forward_batch,
+            )
         self.cuda_graph_metadata[num_token] = decode_wrappers
         
 
