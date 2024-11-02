@@ -46,5 +46,5 @@ The core features include:
    references/choices_methods.md
    references/benchmark_and_profiling.md
    references/troubleshooting.md
-   references/embedding_model.ipynb
+   references/custom_chat_template.md
    references/learn_more.md
