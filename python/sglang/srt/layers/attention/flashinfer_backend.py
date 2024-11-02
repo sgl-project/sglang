@@ -504,8 +504,8 @@ class FlashInferIndicesUpdaterDecode:
         forward_batch=None,
     ):
         
-        bs = forward_batch.input_ids.numel()
         if forward_batch.spec_info is not None:
+            bs = forward_batch.input_ids.numel()
             kv_indices, kv_indptr, kv_last_page_len, qo_indptr = (
                 forward_batch.spec_info.generate_attn_arg(
                     req_pool_indices,
@@ -514,6 +514,7 @@ class FlashInferIndicesUpdaterDecode:
                 )
             )
         else:
+            bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
