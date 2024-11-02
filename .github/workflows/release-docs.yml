@@ -9,6 +9,10 @@ on:
       - 'python/sglang/version.py'
   workflow_dispatch:
 
+concurrency:
+  group: execute-notebook-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   execute-and-deploy:
     runs-on: 1-gpu-runner
