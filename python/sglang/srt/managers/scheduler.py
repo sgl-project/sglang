@@ -669,7 +669,6 @@ class Scheduler:
                 if res == AddReqResult.NO_TOKEN:
                     self.batch_is_full = True
                 break
-            req.queued_time = time.time()
 
         # Update waiting queue
         can_run_list = adder.can_run_list
