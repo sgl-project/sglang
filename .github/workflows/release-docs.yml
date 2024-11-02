@@ -45,6 +45,7 @@ jobs:
           cd _build/html
           
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
+          rm -rf  ../sgl-project.github.io/*
           cp -r * ../sgl-project.github.io
           cd ../sgl-project.github.io
           git config user.name "zhaochenyang20"
