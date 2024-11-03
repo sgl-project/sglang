@@ -15,7 +15,6 @@ limitations under the License.
 
 """A tensor parallel worker."""
 
-import json
 import logging
 from typing import Optional
 
@@ -50,7 +49,7 @@ class TpModelWorker:
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
             context_length=server_args.context_length,
-            model_override_args=json.loads(server_args.json_model_override_args),
+            model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
         )
         self.model_runner = ModelRunner(
