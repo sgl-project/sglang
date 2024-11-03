@@ -281,7 +281,7 @@ index 7111c93..2bd722c 100644
 
 4. Untar dummy_grok1.tar in this directory and copy it to the right path for "--model-path" if you want to use the server.sh file provided.
 5. Launch server with rpd enabled script ./server.sh in one terminal inside the docker container. 
-#### Common Notes
+#### Common Notes 1
 - Remember to change model-path to the correct path
 - loadTracer.sh is needed to conduct profiling
 - SGLANG_TORCH_PROFILER_DIR is used for default torch profiler
@@ -313,9 +313,9 @@ loadTracer.sh python3 -m sglang.launch_server \
     --disable-radix-cache 2>&1 | tee "$LOGFILE"
 ```
 6. Open another terminal for the same docker container, and run the rpd enabled ./client.sh after you see "The server is fired up and is ready to roll!" message from server side terminal.
-#### Common Notes
+#### Common Notes 2
 - Use curl http://localhost:30000/start_profile & curl http://localhost:30000/stop_profile to control the start and end of profiling. Check sglang/python/sglang/srt/managers/scheduler.py for more details.
-- Please don't use RPD profiler together with together profier to avoid interference.
+- Please don't use RPD profiler together with PyTorch profiler to avoid interference.
 
 client.sh
 
