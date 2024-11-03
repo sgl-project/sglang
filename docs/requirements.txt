@@ -14,4 +14,5 @@ sphinx-book-theme
 sphinx-copybutton
 sphinx-tabs
 sphinxcontrib-mermaid
+sanic
 urllib3<2.0.0
