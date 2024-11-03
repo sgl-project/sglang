@@ -174,7 +174,8 @@ class TokenizerManager:
         is_single = obj.is_single
         if is_single:
             tokenized_obj = await self._tokenize_one_request(obj)
-            async for response in self._wait_one_response(obj, tokenized_obj, request):
+            self.send_to_scheduler.send_pyobj(tokenized_obj)
+            async for response in self._wait_one_response(obj, request):
                 yield response
         else:
             async for response in self._handle_batch_request(obj, request):
@@ -240,12 +241,10 @@ class TokenizerManager:
     async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
-        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
         index: Optional[int] = None,
     ):
         """Wait for the response of one request."""
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
         event = asyncio.Event()
         state = ReqState([], False, event)
         self.rid_to_state[obj.rid] = state
@@ -297,7 +296,8 @@ class TokenizerManager:
             for i in range(batch_size):
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                generators.append(self._wait_one_response(tmp_obj, tokenized_obj, request, index=len(generators)))
+                self.send_to_scheduler.send_pyobj(tokenized_obj)
+                generators.append(self._wait_one_response(tmp_obj, request, index=len(generators)))
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
 
@@ -308,11 +308,13 @@ class TokenizerManager:
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
-                tmp_obj.regenerate_rid()
-                tmp_obj.sampling_params.max_new_tokens = 0
-                tmp_obj.stream = False
-                tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                await self._wait_one_response(tmp_obj, tokenized_obj, request).__anext__()
+                tokenized_obj = copy.copy(tokenized_objs[i])
+                tokenized_obj.rid = tmp_obj.regenerate_rid()
+                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
+                tokenized_obj.sampling_params.max_new_tokens = 0
+                tokenized_obj.stream = False
+                self.send_to_scheduler.send_pyobj(tokenized_obj)
+                await self._wait_one_response(tmp_obj, request).__anext__()
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -320,7 +322,8 @@ class TokenizerManager:
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    generators.append(self._wait_one_response(tmp_obj, tokenized_obj, request, index=len(generators)))
+                    self.send_to_scheduler.send_pyobj(tokenized_obj)
+                    generators.append(self._wait_one_response(tmp_obj, request, index=len(generators)))
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -329,17 +332,14 @@ class TokenizerManager:
             yield outputs
         else:
             task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
-
             while task_map:
                 done, _ = await asyncio.wait(task_map.keys(), return_when=asyncio.FIRST_COMPLETED)
 
                 for task in done:
                     gen = task_map.pop(task)
-
                     try:
                         result = task.result()
                         yield result
-
                         new_task = asyncio.create_task(gen.__anext__())
                         task_map[new_task] = gen
                     except StopAsyncIteration:
