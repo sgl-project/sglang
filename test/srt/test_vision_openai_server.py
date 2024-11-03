@@ -1,6 +1,7 @@
 """
 Usage:
 python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_mixed_batch
+python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_images_chat_completion
 """
 
 import base64

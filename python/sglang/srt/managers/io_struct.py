@@ -169,7 +169,7 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
-            modalities=self.modalities[i] if self.modalities is not None else None,
+            modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
         )
 
