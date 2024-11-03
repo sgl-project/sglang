@@ -737,6 +737,12 @@ class Engine:
 
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
+        
+        # runtime server default log level is log
+        # offline engine works in scripts, so we set it to error
+
+        if 'log_level' not in kwargs:
+            kwargs['log_level'] = 'error'
 
         server_args = ServerArgs(*args, **kwargs)
         launch_engine(server_args=server_args)
