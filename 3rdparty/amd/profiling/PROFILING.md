@@ -89,7 +89,7 @@ export RPDT_FILENAME=${OUTPUT_FILE}
 export RPDT_AUTOSTART=0
 LD_PRELOAD=librocm-smi_64:librpd_tracer.so "$@"
 ```
-3. Apply patch (provided in this directory) with "git apply rpd_profile_server_enable.patch" if the main profiling purpose is to get info on gpu kernels. 
+3. Apply patch (provided in this directory) with "git apply rpd_profile_server_enable.patch" if the main profiling purpose is to get info on gpu kernels as well as limited cpu activity info. 
 
 rpd_profile_server_enable.patch
 
@@ -145,7 +145,8 @@ index 62d1ff9..9021c01 100644
          logger.info("Profiler is done")
 ```
 
-(*Advanced*) Sometimes, we need to use rpd profiler to capture more CPU and python activities in order to debug some challenging issues (e.g. root cause of load imbalance across gpu processes, root cause of bubbles, etc). Only in such cases, we need to apply patch "git apply rpd_profile_server_enable_wCPU_activities.patch".
+#### Advanced Debugging with RPD Profiler
+Sometimes, we want to use rpd profiler to capture more CPU and python activities in order to debug some challenging issues (e.g. root cause of load imbalance across gpu processes, root cause of bubbles, etc). Only in such cases, we need to apply patch "git apply rpd_profile_server_enable_wCPU_activities.patch".
 
 rpd_profile_server_enable_wCPU_activities.patch
 
