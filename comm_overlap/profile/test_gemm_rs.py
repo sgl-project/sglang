@@ -1,20 +1,3 @@
-################################################################################
-#
-# Copyright 2023 ByteDance Ltd. and/or its affiliates. All rights reserved.
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-################################################################################
-
 # usage: torchrun --node_rank=0 --nproc_per_node=8 --nnodes=1 --rdzv_id=none --master_addr=127.0.0.1 --master_port=23456 test/test_gemm_rs.py 2048 10240 40960
 import argparse
 from functools import partial
@@ -217,7 +200,7 @@ def perf_te(
 
     for i in range(total_iters):
         start_events[i].record()
-        workspace_size = input.size(0) * weight.size(0)  # 根据矩阵相乘所需的临时内存量
+        workspace_size = input.size(0) * weight.size(0)  # pre-allocate memory for tex.gemm()
         workspace = torch.empty((workspace_size,), dtype=torch.float16, device='cuda')
         output_gemm = tex.gemm(
             weight, input,
