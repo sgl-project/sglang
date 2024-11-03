@@ -15,7 +15,6 @@ limitations under the License.
 
 """A scheduler that manages a tensor parallel GPU worker."""
 
-import json
 import logging
 import os
 import threading
@@ -23,7 +22,7 @@ import time
 import warnings
 from collections import deque
 from types import SimpleNamespace
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import torch
 import zmq

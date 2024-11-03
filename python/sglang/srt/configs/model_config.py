@@ -42,6 +42,7 @@ class ModelConfig:
         is_embedding: Optional[bool] = None
     ) -> None:
         # Parse args
+        self.model_override_args = model_override_args
         self.hf_config = get_config(
             path,
             trust_remote_code=trust_remote_code,
