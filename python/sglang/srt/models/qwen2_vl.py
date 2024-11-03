@@ -23,7 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 from functools import lru_cache, partial
-from typing import Iterable, List, Mapping, Optional, Tuple, Type, TypedDict, Union
+from typing import Iterable, List, Optional, Tuple, Type, TypedDict
 
 import numpy as np
 import torch
@@ -36,7 +36,6 @@ from vllm.distributed import utils as dist_utils
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import QuickGELU
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsMultiModal
 
 from sglang.srt.configs import Qwen2VLConfig, Qwen2VLVisionConfig
 from sglang.srt.hf_transformers_utils import get_processor
@@ -486,7 +485,7 @@ class Qwen2VisionTransformer(nn.Module):
 cached_get_processor = lru_cache(get_processor)
 
 
-class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal):
+class Qwen2VLForConditionalGeneration(nn.Module):
     def calculate_num_image_tokens(self, image_grid_thw: Tuple[int, int, int]):
         processor = cached_get_processor(self.config._name_or_path)
         grid_t, grid_h, grid_w = image_grid_thw
