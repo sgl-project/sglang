@@ -254,7 +254,7 @@ app.put("/encode")(encode_request)
 
 
 async def judge_request(obj: EmbeddingReqInput, request: Request):
-    """Handle a reward model request."""
+    """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
