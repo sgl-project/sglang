@@ -173,7 +173,7 @@ class TokenizerManager:
         is_single = obj.is_single
         if is_single:
             await self._send_one_request(obj)
-            async for response in self._wait_for_response(obj, request):
+            async for response in self._wait_one_response(obj, request):
                 yield response
         else:
             async for response in self._handle_batch_request(obj, request):
@@ -236,7 +236,7 @@ class TokenizerManager:
 
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
-    async def _wait_for_response(
+    async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
@@ -285,14 +285,19 @@ class TokenizerManager:
         for i in range(obj.batch_size):
             tmp_obj = obj[i]
             await self._send_one_request(tmp_obj)
-            generators.append(self._wait_for_response(tmp_obj, request))
+            generators.append(self._wait_one_response(tmp_obj, request))
 
         is_stream = hasattr(obj, "stream") and obj.stream
 
         if not is_stream:
             outputs = []
             for gen in generators:
-                outputs.append(await gen.__anext__())
+                out = await gen.__anext__()
+                if isinstance(out, list):
+                    # Multiple results from parallel sampling
+                    outputs.extend(out)
+                else:
+                    outputs.append(out)
             yield outputs
         else:
             raise NotImplementedError()
