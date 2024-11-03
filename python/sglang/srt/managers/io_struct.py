@@ -210,7 +210,7 @@ class EmbeddingReqInput:
     # Dummy sampling params for compatibility
     sampling_params: Union[List[Dict], Dict] = None
 
-    def post_init(self):
+    def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
             self.text is not None and self.input_ids is not None
         ):
@@ -249,6 +249,18 @@ class EmbeddingReqInput:
                 self.sampling_params = [{}] * self.batch_size
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 1
+
+    def regenerate_rid(self):
+        self.rid = uuid.uuid4().hex
+        return self.rid
+
+    def __getitem__(self, i):
+        return EmbeddingReqInput(
+            text=self.text[i] if self.text is not None else None,
+            input_ids=self.input_ids[i] if self.input_ids is not None else None,
+            sampling_params=self.sampling_params[i],
+            rid=self.rid[i],
+        )
 
 
 @dataclass
