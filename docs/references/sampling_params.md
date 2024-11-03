@@ -179,6 +179,7 @@ The `image_data` can be a file name, a URL, or a base64 encoded string. See also
 Streaming is supported in a similar manner as [above](#streaming).
 
 ### Structured decoding (JSON, Regex)
+You can specify a JSON schema or a regular expression to constrain the model output. The model output will be guaranteed to follow the given constraints.
 
 ```python
 import json
