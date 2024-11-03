@@ -56,7 +56,6 @@ from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
-    RewardReqInput,
     UpdateWeightReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -98,7 +97,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 app = FastAPI()
-tokenizer_manager = None
+tokenizer_manager: TokenizerManager = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -261,7 +260,7 @@ app.post("/encode")(encode_request)
 app.put("/encode")(encode_request)
 
 
-async def judge_request(obj: RewardReqInput, request: Request):
+async def judge_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request."""
     try:
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
@@ -774,6 +773,12 @@ class Engine:
 
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
+        
+        # runtime server default log level is log
+        # offline engine works in scripts, so we set it to error
+
+        if 'log_level' not in kwargs:
+            kwargs['log_level'] = 'error'
 
         server_args = ServerArgs(*args, **kwargs)
         launch_engine(server_args=server_args)

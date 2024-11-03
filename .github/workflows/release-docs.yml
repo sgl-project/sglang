@@ -9,6 +9,10 @@ on:
       - 'python/sglang/version.py'
   workflow_dispatch:
 
+concurrency:
+  group: release-docs-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   execute-and-deploy:
     runs-on: 1-gpu-runner
@@ -45,6 +49,7 @@ jobs:
           cd _build/html
           
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io
+          rm -rf  ../sgl-project.github.io/*
           cp -r * ../sgl-project.github.io
           cd ../sgl-project.github.io
           git config user.name "zhaochenyang20"

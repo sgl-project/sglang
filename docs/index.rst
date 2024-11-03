@@ -15,15 +15,19 @@ The core features include:
    :maxdepth: 1
    :caption: Getting Started
 
-   starts/install.md
-   starts/send_request.ipynb
+   start/install.md
+   start/send_request.ipynb
 
 
 .. toctree::
    :maxdepth: 1
    :caption: Backend Tutorial
 
-   backend/openai_api.ipynb
+   backend/openai_api_completions.ipynb
+   backend/openai_api_vision.ipynb
+   backend/openai_api_embeddings.ipynb
+   backend/native_api.ipynb
+   backend/offline_engine_api.ipynb
    backend/backend.md
 
 
@@ -41,9 +45,10 @@ The core features include:
    references/sampling_params.md
    references/hyperparameter_tuning.md
    references/model_support.md
-   references/contributor_guide.md
-   references/choices_methods.md
    references/benchmark_and_profiling.md
+   references/choices_methods.md
+   references/custom_chat_template.md
+   references/contributor_guide.md
    references/troubleshooting.md
-   references/embedding_model.ipynb
+   references/faq.md
    references/learn_more.md

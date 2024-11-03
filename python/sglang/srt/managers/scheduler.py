@@ -43,7 +43,6 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    TokenizedRewardReqInput,
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
 )
@@ -410,9 +409,7 @@ class Scheduler:
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 self.handle_generate_request(recv_req)
-            elif isinstance(
-                recv_req, (TokenizedEmbeddingReqInput, TokenizedRewardReqInput)
-            ):
+            elif isinstance(recv_req, TokenizedEmbeddingReqInput):
                 self.handle_embedding_request(recv_req)
             elif isinstance(recv_req, FlushCacheReq):
                 self.flush_cache()
@@ -504,7 +501,7 @@ class Scheduler:
 
     def handle_embedding_request(
         self,
-        recv_req: Union[TokenizedEmbeddingReqInput, TokenizedRewardReqInput],
+        recv_req: TokenizedEmbeddingReqInput,
     ):
         req = Req(
             recv_req.rid,
