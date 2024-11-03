@@ -90,7 +90,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 app = FastAPI()
-tokenizer_manager = None
+tokenizer_manager: TokenizerManager = None
 
 app.add_middleware(
     CORSMiddleware,

@@ -242,7 +242,6 @@ class TokenizerManager:
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
-        index: Optional[int] = None,
     ):
         """Wait for the response of one request."""
         event = asyncio.Event()
@@ -268,9 +267,6 @@ class TokenizerManager:
             else:  # isinstance(obj, (EmbeddingReqInput,))
                 out = state.out_list[-1]
 
-            if index is not None:
-                out["index"] = index
-
             state.out_list = []
             if state.finished:
                 if self.server_args.log_requests:
@@ -291,13 +287,15 @@ class TokenizerManager:
         batch_size = obj.batch_size
 
         generators = []
+        rids = []
         if obj.parallel_sample_num == 1:
             # Send all requests
             for i in range(batch_size):
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
                 self.send_to_scheduler.send_pyobj(tokenized_obj)
-                generators.append(self._wait_one_response(tmp_obj, request, index=len(generators)))
+                generators.append(self._wait_one_response(tmp_obj, request))
+                rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
 
@@ -323,7 +321,8 @@ class TokenizerManager:
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self.send_to_scheduler.send_pyobj(tokenized_obj)
-                    generators.append(self._wait_one_response(tmp_obj, request, index=len(generators)))
+                    generators.append(self._wait_one_response(tmp_obj, request))
+                    rids.append(tmp_obj.rid)
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -331,6 +330,7 @@ class TokenizerManager:
             outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
             yield outputs
         else:
+            rid_to_index = {rid: i for i, rid in enumerate(rids)}
             task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
             while task_map:
                 done, _ = await asyncio.wait(task_map.keys(), return_when=asyncio.FIRST_COMPLETED)
@@ -339,6 +339,7 @@ class TokenizerManager:
                     gen = task_map.pop(task)
                     try:
                         result = task.result()
+                        result["index"] = rid_to_index[result["meta_info"]["id"]]
                         yield result
                         new_task = asyncio.create_task(gen.__anext__())
                         task_map[new_task] = gen
