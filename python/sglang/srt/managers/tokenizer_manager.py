@@ -345,7 +345,7 @@ class TokenizerManager:
             async for response in self._wait_for_response(state, obj, rid, request):
                 yield response
         else:
-            asyncio.wait_for(state.event.wait())
+            await state.event.wait()
             assert state.finished
             del self.rid_to_state[rid]
             yield input_ids
