@@ -696,24 +696,8 @@ class Runtime:
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
     ):
-        if isinstance(prompt, str) or isinstance(prompt[0], str):
-            # embedding
-            json_data = {
-                "text": prompt,
-            }
-            response = requests.post(
-                self.url + "/encode",
-                json=json_data,
-            )
-        else:
-            # reward
-            json_data = {
-                "conv": prompt,
-            }
-            response = requests.post(
-                self.url + "/judge",
-                json=json_data,
-            )
+        json_data = {"text": prompt}
+        response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
 
     def __del__(self):
