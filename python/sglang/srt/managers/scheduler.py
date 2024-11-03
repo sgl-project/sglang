@@ -139,7 +139,7 @@ class Scheduler:
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            if self.model_config.is_multi_modal:
+            if self.model_config.is_multimodal:
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,

@@ -52,7 +52,7 @@ class ModelConfig:
 
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
-        self.is_multi_modal = is_multimodal_model(self.hf_config.architectures)
+        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
 
         # Derive context length

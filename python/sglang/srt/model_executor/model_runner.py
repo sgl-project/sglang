@@ -89,7 +89,7 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_generation = model_config.is_generation
-        self.is_multi_modal = model_config.is_multi_modal
+        self.is_multimodal = model_config.is_multimodal
 
         # Model-specific adjustment
         if (
@@ -113,7 +113,7 @@ class ModelRunner:
                 self.server_args.ds_heavy_channel_type
             )
 
-        if self.is_multi_modal:
+        if self.is_multimodal:
             logger.warning(
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
             )

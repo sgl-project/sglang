@@ -26,7 +26,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_a
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import broadcast_pyobj, is_multimodal_model, set_random_seed
+from sglang.srt.utils import broadcast_pyobj, set_random_seed
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class TpModelWorker:
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            if is_multimodal_model(self.model_config.hf_config.architectures):
+            if self.model_config.is_multimodal:
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
