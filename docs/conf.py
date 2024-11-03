@@ -28,10 +28,60 @@ extensions = [
     "sphinxcontrib.mermaid",
     "nbsphinx",
     "sphinx.ext.mathjax",
-    "sphinx.ext.autodoc",
 ]
 
+nbsphinx_allow_errors = True
+nbsphinx_execute = 'never'
+
 autosectionlabel_prefix_document = True
+nbsphinx_allow_directives = True
+
+
+myst_enable_extensions = [
+    "dollarmath",
+    "amsmath",
+    "deflist",
+    "colon_fence",
+    "html_image",
+    "linkify",
+    "substitution",
+]
+
+myst_heading_anchors = 3
+
+nbsphinx_kernel_name = 'python3'
+nbsphinx_execute_arguments = [
+    "--InlineBackend.figure_formats={'svg', 'pdf'}",
+    "--InlineBackend.rc={'figure.dpi': 96}",
+]
+
+
+nb_render_priority = {
+    "html": (
+        "application/vnd.jupyter.widget-view+json",
+        "application/javascript",
+        "text/html",
+        "image/svg+xml",
+        "image/png",
+        "image/jpeg",
+        "text/markdown",
+        "text/latex",
+        "text/plain",
+    )
+}
+
+myst_enable_extensions = [
+    "dollarmath",
+    "amsmath",
+    "deflist",
+    "colon_fence",
+    "html_image",
+    "linkify",
+    "substitution",
+]
+
+myst_heading_anchors = 3
+myst_ref_domains = ["std", "py"]
 
 templates_path = ["_templates"]
 
