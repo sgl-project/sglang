@@ -65,39 +65,20 @@ class GenerateReqInput:
         ):
             raise ValueError("Either text or input_ids should be provided.")
 
-        self.is_single = False
         if self.text is not None:
             if isinstance(self.text, str):
                 self.is_single = True
                 self.batch_size = 1
             else:
+                self.is_single = False
                 self.batch_size = len(self.text)
         else:
             if isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
             else:
-                self.batch_size = len(self.input_ids)
-
-        if self.sampling_params is None:
-            self.parallel_sample_num = 1
-        elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self.sampling_params.get("n", 1)
-        else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
-            for sp in self.sampling_params:
-                # TODO cope with the case that the parallel_sample_num is different for different samples
-                assert self.parallel_sample_num == sp.get(
-                    "n", 1
-                ), "The parallel_sample_num should be the same for all samples in sample params."
-
-        if self.parallel_sample_num > 1:
-            if self.is_single:
                 self.is_single = False
-                if self.text is not None:
-                    self.text = [self.text]
-                if self.input_ids is not None:
-                    self.input_ids = [self.input_ids]
+                self.batch_size = len(self.input_ids)
 
         if self.is_single:
             if self.sampling_params is None:
@@ -111,11 +92,7 @@ class GenerateReqInput:
             if self.top_logprobs_num is None:
                 self.top_logprobs_num = 0
         else:
-            if self.parallel_sample_num == 1:
-                num = self.batch_size
-            else:
-                # The first bs samples are used for caching the prefix for parallel sampling
-                num = self.batch_size + self.parallel_sample_num * self.batch_size
+            num = self.batch_size
 
             if self.image_data is None:
                 self.image_data = [None] * num
@@ -128,35 +105,26 @@ class GenerateReqInput:
                 self.sampling_params = [{}] * num
             elif not isinstance(self.sampling_params, list):
                 self.sampling_params = [self.sampling_params] * num
-            else:
-                assert self.parallel_sample_num == 1
 
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(num)]
             else:
                 assert isinstance(self.rid, list), "The rid should be a list."
-                assert self.parallel_sample_num == 1
 
             if self.return_logprob is None:
                 self.return_logprob = [False] * num
             elif not isinstance(self.return_logprob, list):
                 self.return_logprob = [self.return_logprob] * num
-            else:
-                assert self.parallel_sample_num == 1
 
             if self.logprob_start_len is None:
                 self.logprob_start_len = [-1] * num
             elif not isinstance(self.logprob_start_len, list):
                 self.logprob_start_len = [self.logprob_start_len] * num
-            else:
-                assert self.parallel_sample_num == 1
 
             if self.top_logprobs_num is None:
                 self.top_logprobs_num = [0] * num
             elif not isinstance(self.top_logprobs_num, list):
                 self.top_logprobs_num = [self.top_logprobs_num] * num
-            else:
-                assert self.parallel_sample_num == 1
 
 
 @dataclass
