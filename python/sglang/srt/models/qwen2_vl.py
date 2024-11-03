@@ -535,15 +535,12 @@ class Qwen2VLForConditionalGeneration(nn.Module):
     def __init__(
         self,
         config: Qwen2VLConfig,
-        multimodal_config: MultiModalConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
 
         self.config = config
-        self.multimodal_config = multimodal_config
-
         self.visual = Qwen2VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),

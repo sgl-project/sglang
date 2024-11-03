@@ -180,7 +180,7 @@ class LlavaImageProcessor(BaseImageProcessor):
             "pixel_values": pixel_values,
             "image_hashes": image_hashes,
             "image_sizes": image_sizes,
-            "modalities": request_obj.modalities,
+            "modalities": request_obj.modalities or ["image"],
         }
 
 
