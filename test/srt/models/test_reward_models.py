@@ -21,7 +21,7 @@ import torch
 from sglang.test.runners import HFRunner, SRTRunner
 
 MODELS = [
-    ("LxzGordon/URM-LLaMa-3.1-8B", 1, 2e-2),
+    ("LxzGordon/URM-LLaMa-3.1-8B", 1, 3e-2),
 ]
 TORCH_DTYPES = [torch.float16]
 

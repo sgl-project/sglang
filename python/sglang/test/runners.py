@@ -367,7 +367,7 @@ class SRTRunner:
                 return ModelOutput(embed_logits=logits)
             else:
                 scores = [x["embedding"][0] for x in response]
-                return ModelOutput(scores=logits)
+                return ModelOutput(scores=scores)
 
     def __enter__(self):
         return self
