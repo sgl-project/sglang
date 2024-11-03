@@ -415,6 +415,7 @@ class LlamaForCausalLM(nn.Module):
             param = self.lm_head.weight
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, self.model.embed_tokens.weight)
+
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
 

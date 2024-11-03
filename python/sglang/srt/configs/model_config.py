@@ -42,12 +42,12 @@ class ModelConfig:
         is_embedding: Optional[bool] = None
     ) -> None:
         # Parse args
-        self.model_override_args = model_override_args
+        self.model_override_args = json.loads(model_override_args)
         self.hf_config = get_config(
             path,
             trust_remote_code=trust_remote_code,
             revision=revision,
-            model_override_args=json.loads(model_override_args),
+            model_override_args=self.model_override_args,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
 
