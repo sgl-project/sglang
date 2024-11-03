@@ -305,7 +305,7 @@ def execute_shell_command(command: str) -> subprocess.Popen:
     Execute a shell command and return the process handle
 
     Args:
-        command: Shell command as a string (can include \ line continuations)
+        command: Shell command as a string (can include \\ line continuations)
     Returns:
         subprocess.Popen: Process handle
     """
