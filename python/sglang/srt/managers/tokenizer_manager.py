@@ -94,9 +94,8 @@ class TokenizerManager:
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
         self.model_config = ModelConfig(
-            self.model_path,
+            server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
-            revision=None,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
