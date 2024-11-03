@@ -16,7 +16,7 @@ Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/
 ## Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.3.4.post2 https://github.com/sgl-project/sglang.git
+git clone -b v0.3.5 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
