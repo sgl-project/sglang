@@ -1,3 +1,5 @@
+use std::mem;
+
 #[derive(Clone)]
 pub struct Node {
     pub children: Vec<Node>,
@@ -35,67 +37,69 @@ impl RadixTree {
 
         let mut curr_idx = 0;
         let input_ids_len = input_ids.len();
+        
 
         while curr_idx < input_ids_len {
-            
-            let mut has_match = false;
+        
+            let mut match_info = None; 
 
             for i in 0..curr.children.len() {
                 let prefix_len = common_prefix_len(&input_ids[curr_idx..], &curr.children[i].ids);
-                
-                // TODO: moving below `let child =` does not work. Why?
+
                 if prefix_len == 0 {
                     continue;
-                }
-
-                let child = &mut curr.children[i];
-                
-                if prefix_len == child.ids.len() {
-
-                    // move to child
-                    curr = child;
-                    curr.count += 1;
-                    curr_idx += prefix_len;
-
-                    has_match = true;
-
-                    break;
                 } else {
-
-                    // split child
-                    let new_child = Node {
-                        children: child.children.clone(), // move the owndership of child.children
-                        ids: child.ids[prefix_len..].to_vec(),
-                        count: child.count,
-                    };
-
-                    child.ids = child.ids[..prefix_len].to_vec();
-                    child.children = vec![new_child];
-
-                    curr = child;
-                    curr.count += 1;
-                    curr_idx += prefix_len;
-
-                    has_match = true;
-
+                    match_info = Some((i, prefix_len));
                     break;
                 }
 
             }
 
-            if !has_match {
-                // create new child
-                let new_child = Node {
-                    children: Vec::new(),
-                    ids: input_ids[curr_idx..].to_vec(),
-                    count: 0,
-                };
+            match match_info {
+                Some((child_id, prefix_len)) => {
+                    let child = &mut curr.children[child_id];
 
-                curr.children.push(new_child);
-                
-                curr = curr.children.last_mut().unwrap();
-                curr.count += 1;
-                curr_idx = input_ids_len;
+                    if prefix_len == child.ids.len() {
+    
+                        // move curr to child
+                        curr = child;
+                        curr.count += 1;
+                        curr_idx += prefix_len;
+    
+
+                    } else {
+                        // split child
+                        // [child]->... => [child]->[new child]->... 
+                        let new_child = Node {
+                            // to avoid clone: replace child.children with default value (empty vector) and return the original value
+                            children: mem::take(&mut child.children),
+                            ids: child.ids[prefix_len..].to_vec(),
+                            count: child.count,
+                        };
+    
+                        child.ids = child.ids[..prefix_len].to_vec();
+                        child.children = vec![new_child];
+
+                        curr = child;
+                        curr.count += 1;
+                        curr_idx += prefix_len;
+    
+                    }
+                }
+                None => {
+                    // create new child
+                    let new_child = Node {
+                        children: Vec::new(),
+                        ids: input_ids[curr_idx..].to_vec(),
+                        count: 0,
+                    };
+
+                    curr.children.push(new_child);
+                    
+                    curr = curr.children.last_mut().unwrap();
+                    curr.count += 1;
+                    curr_idx = input_ids_len;
+                }
             }
             
         }
