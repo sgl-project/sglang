@@ -68,8 +68,6 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     get_zmq_socket,
-    is_generation_model,
-    is_multimodal_model,
     kill_parent_process,
     set_random_seed,
     suppress_other_loggers,
@@ -141,7 +139,7 @@ class Scheduler:
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            if is_multimodal_model(self.model_config.hf_config.architectures):
+            if self.model_config.is_multi_modal:
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
@@ -154,9 +152,7 @@ class Scheduler:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                 )
-        self.is_generation = is_generation_model(
-            self.model_config.hf_config.architectures, self.server_args.is_embedding
-        )
+        self.is_generation = self.model_config.is_generation
 
         # Launch a tensor parallel worker
         if self.enable_overlap:
