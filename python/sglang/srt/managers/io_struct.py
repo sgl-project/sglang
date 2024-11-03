@@ -125,6 +125,22 @@ class GenerateReqInput:
             elif not isinstance(self.top_logprobs_num, list):
                 self.top_logprobs_num = [self.top_logprobs_num] * num
 
+    def __getitem__(self, i):
+        return GenerateReqInput(
+            text=self.text[i] if self.text is not None else None,
+            input_ids=self.input_ids[i] if self.input_ids is not None else None,
+            image_data=self.image_data[i],
+            sampling_params=self.sampling_params[i],
+            rid=self.rid[i],
+            return_logprob=self.return_logprob[i],
+            logprob_start_len=self.logprob_start_len[i],
+            top_logprobs_num=self.top_logprobs_num[i],
+            return_text_in_logprobs=self.return_text_in_logprobs,
+            stream=self.stream,
+            modalities=self.modalities[i] if self.modalities is not None else None,
+            lora_path=self.lora_path[i] if self.lora_path is not None else None,
+        )
+
 
 @dataclass
 class TokenizedGenerateReqInput:

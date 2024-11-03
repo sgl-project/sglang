@@ -41,7 +41,7 @@ class TestSRTEndpoint(unittest.TestCase):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": "The capital of France is",
+                "text": ["The capital of France is"],
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": 16,

@@ -178,10 +178,9 @@ class TokenizerManager:
             async for response in self._handle_batch_request(obj, request):
                 yield response
 
-    async def _handle_single_request(
+    async def _send_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
     ):
         # Tokenize
         rid = obj.rid
@@ -236,18 +235,44 @@ class TokenizerManager:
 
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
+    async def _handle_single_request(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request] = None,
+    ):
+        # Send inputs
+        await self._send_one_request(obj)
+
         # Recv results
         event = asyncio.Event()
         state = ReqState([], False, event)
-        self.rid_to_state[rid] = state
-        async for response in self._wait_for_response(state, obj, rid, request):
+        self.rid_to_state[obj.rid] = state
+        async for response in self._wait_for_response(state, obj, request):
             yield response
+
+    async def _handle_batch_request(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request] = None,
+    ):
+        generators = []
+        for i in range(obj.batch_size):
+            generators.append(self._handle_single_request(obj[i], request))
+
+        is_stream = hasattr(obj, "stream") and obj.stream
+
+        if not is_stream:
+            outputs = []
+            for gen in generators:
+                outputs.append(await gen.__anext__())
+            yield outputs
+        else:
+            raise NotImplementedError()
 
     async def _wait_for_response(
         self,
         state: ReqState,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
-        rid: str,
         request: Optional[fastapi.Request] = None,
     ):
         while True:
@@ -255,8 +280,8 @@ class TokenizerManager:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
             except asyncio.TimeoutError:
                 if request is not None and await request.is_disconnected():
-                    self.abort_request(rid)
-                    raise ValueError(f"Abort request {rid}")
+                    self.abort_request(obj.rid)
+                    raise ValueError(f"Abort request {obj.rid}")
                 continue
 
             if isinstance(obj, GenerateReqInput):
@@ -274,7 +299,7 @@ class TokenizerManager:
                 if self.server_args.log_requests:
                     # Log requests
                     logger.info(f"in={obj}, out={out}")
-                del self.rid_to_state[rid]
+                del self.rid_to_state[obj.rid]
                 yield out
                 break
 
