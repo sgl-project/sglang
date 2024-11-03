@@ -1,5 +1,6 @@
 """
 python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_simple_decode
+python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_parallel_sample
 """
 
 import json

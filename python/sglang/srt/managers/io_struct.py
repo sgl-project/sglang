@@ -56,15 +56,13 @@ class GenerateReqInput:
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    # Whether it is a single request or a batch request
-    is_single: bool = True
-
-    def post_init(self):
+    def set_missing_values(self):
         if (self.text is None and self.input_ids is None) or (
             self.text is not None and self.input_ids is not None
         ):
             raise ValueError("Either text or input_ids should be provided.")
 
+        # Derive the batch size
         if self.text is not None:
             if isinstance(self.text, str):
                 self.is_single = True
@@ -80,6 +78,7 @@ class GenerateReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_ids)
 
+        # Fill in default arguments
         if self.is_single:
             if self.sampling_params is None:
                 self.sampling_params = {}
@@ -163,20 +162,29 @@ class EmbeddingReqInput:
     # Dummy sampling params for compatibility
     sampling_params: Union[List[Dict], Dict] = None
 
-    # Whether it is a single request or a batch request
-    is_single: bool = True
-
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (
             self.text is not None and self.input_ids is not None
         ):
             raise ValueError("Either text or input_ids should be provided.")
 
+        # Derive the batch size
         if self.text is not None:
-            self.is_single = isinstance(self.text, str)
+            if isinstance(self.text, str):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.is_single = False
+                self.batch_size = len(self.text)
         else:
-            self.is_single = isinstance(self.input_ids[0], int)
+            if isinstance(self.input_ids[0], int):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.is_single = False
+                self.batch_size = len(self.input_ids)
 
+        # Fill in default arguments
         if self.is_single:
             if self.rid is None:
                 self.rid = uuid.uuid4().hex
@@ -184,15 +192,11 @@ class EmbeddingReqInput:
                 self.sampling_params = {}
             self.sampling_params["max_new_tokens"] = 1
         else:
-            # support select operation
-            self.batch_size = (
-                len(self.text) if self.text is not None else len(self.input_ids)
-            )
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
             else:
-                if not isinstance(self.rid, list):
-                    raise ValueError("The rid should be a list.")
+                assert isinstance(self.rid, list), "The rid should be a list."
+
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
             for i in range(self.batch_size):
@@ -201,56 +205,6 @@ class EmbeddingReqInput:
 
 @dataclass
 class TokenizedEmbeddingReqInput:
-    # The request id
-    rid: str
-    # The input text
-    input_text: str
-    # The input token ids
-    input_ids: List[int]
-    # Dummy sampling params for compatibility
-    sampling_params: SamplingParams
-
-
-RewardReqConv = Union[List[List[Dict]], List[Dict], str, List[str]]
-
-
-@dataclass
-class RewardReqInput:
-    # The input prompt. It can be a single prompt or a batch of prompts. Can be either chat format or a string.
-    conv: RewardReqConv
-    # The request id.
-    rid: Optional[Union[List[str], str]] = None
-    # Dummy sampling params for compatibility
-    sampling_params: Union[List[Dict], Dict] = None
-
-    # Whether it is a single request or a batch request
-    is_single: bool = True
-
-    def post_init(self):
-        self.is_single = isinstance(self.conv[0], dict)
-
-        if self.is_single:
-            if self.rid is None:
-                self.rid = uuid.uuid4().hex
-            if self.sampling_params is None:
-                self.sampling_params = {}
-            self.sampling_params["max_new_tokens"] = 1
-        else:
-            # support select operation
-            self.batch_size = len(self.conv)
-            if self.rid is None:
-                self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
-            else:
-                if not isinstance(self.rid, list):
-                    raise ValueError("The rid should be a list.")
-            if self.sampling_params is None:
-                self.sampling_params = [{}] * self.batch_size
-            for i in range(self.batch_size):
-                self.sampling_params[i]["max_new_tokens"] = 1
-
-
-@dataclass
-class TokenizedRewardReqInput:
     # The request id
     rid: str
     # The input text
