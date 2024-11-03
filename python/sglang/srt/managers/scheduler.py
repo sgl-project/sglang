@@ -15,7 +15,6 @@ limitations under the License.
 
 """A scheduler that manages a tensor parallel GPU worker."""
 
-import json
 import logging
 import os
 import threading
@@ -23,7 +22,7 @@ import time
 import warnings
 from collections import deque
 from types import SimpleNamespace
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import torch
 import zmq
@@ -43,7 +42,6 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    TokenizedRewardReqInput,
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
 )
@@ -69,8 +67,6 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     get_zmq_socket,
-    is_generation_model,
-    is_multimodal_model,
     kill_parent_process,
     set_random_seed,
     suppress_other_loggers,
@@ -134,15 +130,17 @@ class Scheduler:
         # Init tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,
-            server_args.trust_remote_code,
+            trust_remote_code=server_args.trust_remote_code,
             context_length=server_args.context_length,
-            model_override_args=json.loads(server_args.json_model_override_args),
+            model_override_args=server_args.json_model_override_args,
+            is_embedding=server_args.is_embedding,
         )
+        self.is_generation = self.model_config.is_generation
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            if is_multimodal_model(self.model_config.hf_config.architectures):
+            if self.model_config.is_multimodal:
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
@@ -155,9 +153,6 @@ class Scheduler:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                 )
-        self.is_generation = is_generation_model(
-            self.model_config.hf_config.architectures, self.server_args.is_embedding
-        )
 
         # Launch a tensor parallel worker
         if self.enable_overlap:
@@ -394,9 +389,7 @@ class Scheduler:
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 self.handle_generate_request(recv_req)
-            elif isinstance(
-                recv_req, (TokenizedEmbeddingReqInput, TokenizedRewardReqInput)
-            ):
+            elif isinstance(recv_req, TokenizedEmbeddingReqInput):
                 self.handle_embedding_request(recv_req)
             elif isinstance(recv_req, FlushCacheReq):
                 self.flush_cache()
@@ -487,7 +480,7 @@ class Scheduler:
 
     def handle_embedding_request(
         self,
-        recv_req: Union[TokenizedEmbeddingReqInput, TokenizedRewardReqInput],
+        recv_req: TokenizedEmbeddingReqInput,
     ):
         req = Req(
             recv_req.rid,

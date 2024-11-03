@@ -24,7 +24,6 @@ import zmq
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    TokenizedRewardReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -152,7 +151,6 @@ class DataParallelController:
                     (
                         TokenizedGenerateReqInput,
                         TokenizedEmbeddingReqInput,
-                        TokenizedRewardReqInput,
                     ),
                 ):
                     self.dispatching(recv_req)

@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: execute-notebook-${{ github.ref }}
+  group: release-docs-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
