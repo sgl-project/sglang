@@ -172,7 +172,8 @@ class TokenizerManager:
         obj.set_missing_values()
         is_single = obj.is_single
         if is_single:
-            async for response in self._handle_single_request(obj, request):
+            await self._send_one_request(obj)
+            async for response in self._wait_for_response(obj, request):
                 yield response
         else:
             async for response in self._handle_batch_request(obj, request):
@@ -235,46 +236,15 @@ class TokenizerManager:
 
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
-    async def _handle_single_request(
+    async def _wait_for_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        # Send inputs
-        await self._send_one_request(obj)
-
-        # Recv results
         event = asyncio.Event()
         state = ReqState([], False, event)
         self.rid_to_state[obj.rid] = state
-        async for response in self._wait_for_response(state, obj, request):
-            yield response
 
-    async def _handle_batch_request(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
-    ):
-        generators = []
-        for i in range(obj.batch_size):
-            generators.append(self._handle_single_request(obj[i], request))
-
-        is_stream = hasattr(obj, "stream") and obj.stream
-
-        if not is_stream:
-            outputs = []
-            for gen in generators:
-                outputs.append(await gen.__anext__())
-            yield outputs
-        else:
-            raise NotImplementedError()
-
-    async def _wait_for_response(
-        self,
-        state: ReqState,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
-    ):
         while True:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
@@ -305,6 +275,27 @@ class TokenizerManager:
 
             state.event.clear()
             yield out
+
+    async def _handle_batch_request(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request] = None,
+    ):
+        generators = []
+        for i in range(obj.batch_size):
+            tmp_obj = obj[i]
+            await self._send_one_request(tmp_obj)
+            generators.append(self._wait_for_response(tmp_obj, request))
+
+        is_stream = hasattr(obj, "stream") and obj.stream
+
+        if not is_stream:
+            outputs = []
+            for gen in generators:
+                outputs.append(await gen.__anext__())
+            yield outputs
+        else:
+            raise NotImplementedError()
 
     def flush_cache(self):
         req = FlushCacheReq()
