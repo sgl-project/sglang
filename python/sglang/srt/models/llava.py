@@ -140,8 +140,8 @@ class LlavaBaseForCausalLM(nn.Module):
             modalities_list = []
             max_image_offset = []
             for im in image_inputs:
-                if im and im.modalities is not None:
-                    modalities_list.extend(im.modalities)
+                if im:
+                    modalities_list.extend(im.modalities if im.modalities is not None else ["image"] * len(im.image_sizes))
                 if im and im.image_offsets is not None:
                     max_image_offset.append(max(im.image_offsets))
                 else:

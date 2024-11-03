@@ -34,6 +34,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.torchao_utils import apply_torchao_config_
@@ -303,6 +304,7 @@ class LlamaForCausalLM(nn.Module):
         self.model = LlamaModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
     @torch.no_grad()
     def forward(
@@ -311,11 +313,15 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        get_embedding: bool = False,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, forward_batch
-        )
+        if not get_embedding:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head.weight, forward_batch
+            )
+        else:
+            return self.pooler(hidden_states, forward_batch)
 
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim

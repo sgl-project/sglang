@@ -92,7 +92,7 @@ def get_context_length(config):
     And here the config should be text_config part if the model is a multimodal
     LLM.
     """
-    text_config = getattr(config, "text_config", config)
+    text_config = config
     rope_scaling = getattr(text_config, "rope_scaling", None)
     if rope_scaling:
         rope_scaling_factor = rope_scaling.get("factor", 1)
