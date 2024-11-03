@@ -16,6 +16,7 @@ limitations under the License.
 """TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
+import copy
 import dataclasses
 import json
 import logging
@@ -169,22 +170,22 @@ class TokenizerManager:
                 "Please add `--is-embedding` when launching the server or try another model."
             )
 
-        obj.set_missing_values()
+        obj.normalize_batch_and_arguments()
         is_single = obj.is_single
         if is_single:
-            await self._send_one_request(obj)
-            async for response in self._wait_one_response(obj, request):
+            tokenized_obj = await self._tokenize_one_request(obj)
+            async for response in self._wait_one_response(obj, tokenized_obj, request):
                 yield response
         else:
             async for response in self._handle_batch_request(obj, request):
                 yield response
 
-    async def _send_one_request(
+    async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
+        """Tokenize one request."""
         # Tokenize
-        rid = obj.rid
         input_text = obj.text
         if obj.input_ids is None:
             input_ids = self.tokenizer.encode(input_text)
@@ -212,10 +213,10 @@ class TokenizerManager:
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify()
 
-        # Send to the controller
+        # Build return object
         if isinstance(obj, GenerateReqInput):
             tokenized_obj = TokenizedGenerateReqInput(
-                rid,
+                obj.rid,
                 input_text,
                 input_ids,
                 image_inputs,
@@ -228,19 +229,22 @@ class TokenizerManager:
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
-                rid,
+                obj.rid,
                 input_text,
                 input_ids,
                 sampling_params,
             )
 
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        return tokenized_obj
 
     async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        """Wait for the response of one request."""
+        self.send_to_scheduler.send_pyobj(tokenized_obj)
         event = asyncio.Event()
         state = ReqState([], False, event)
         self.rid_to_state[obj.rid] = state
@@ -281,23 +285,22 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        # Tokenize all requests
+        batch_size = obj.batch_size
+        objs = [obj[i] for i in range(batch_size)]
+        tokenized_objs = await asyncio.gather(*(self._tokenize_one_request(obj) for obj in objs))
+
+        # Send all requests
         generators = []
         for i in range(obj.batch_size):
-            tmp_obj = obj[i]
-            await self._send_one_request(tmp_obj)
-            generators.append(self._wait_one_response(tmp_obj, request))
+            generators.append(self._wait_one_response(objs[i], tokenized_objs[i], request))
 
+        # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
-
         if not is_stream:
             outputs = []
             for gen in generators:
-                out = await gen.__anext__()
-                if isinstance(out, list):
-                    # Multiple results from parallel sampling
-                    outputs.extend(out)
-                else:
-                    outputs.append(out)
+                outputs.append(await gen.__anext__())
             yield outputs
         else:
             raise NotImplementedError()

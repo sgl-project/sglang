@@ -56,7 +56,7 @@ class GenerateReqInput:
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    def set_missing_values(self):
+    def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
             self.text is not None and self.input_ids is not None
         ):
@@ -78,6 +78,24 @@ class GenerateReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_ids)
 
+        # Handle parallel sampling
+        # When parallel sampling is used, we always treat the input as a batch.
+        if self.sampling_params is None:
+            self.parallel_sample_num = 1
+        elif isinstance(self.sampling_params, dict):
+            self.parallel_sample_num = self.sampling_params.get("n", 1)
+        else:  # isinstance(self.sampling_params, list):
+            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            assert all(self.parallel_sample_num == sampling_params.get("n", 1) for sampling_params in self.sampling_params), (
+                "The parallel_sample_num should be the same for all samples in sample params.")
+
+        if self.parallel_sample_num > 1 and self.is_single:
+            self.is_single = False
+            if self.text is not None:
+                self.text = [self.text]
+            if self.input_ids is not None:
+                self.input_ids = [self.input_ids]
+
         # Fill in default arguments
         if self.is_single:
             if self.sampling_params is None:
@@ -91,7 +109,11 @@ class GenerateReqInput:
             if self.top_logprobs_num is None:
                 self.top_logprobs_num = 0
         else:
-            num = self.batch_size
+            if self.parallel_sample_num == 1:
+                num = self.batch_size
+            else:
+                # Expand parallel_sample_num
+                num = self.batch_size * self.parallel_sample_num
 
             if self.image_data is None:
                 self.image_data = [None] * num
@@ -114,16 +136,25 @@ class GenerateReqInput:
                 self.return_logprob = [False] * num
             elif not isinstance(self.return_logprob, list):
                 self.return_logprob = [self.return_logprob] * num
+            else:
+                assert self.parallel_sample_num == 1
 
             if self.logprob_start_len is None:
                 self.logprob_start_len = [-1] * num
             elif not isinstance(self.logprob_start_len, list):
                 self.logprob_start_len = [self.logprob_start_len] * num
+            else:
+                assert self.parallel_sample_num == 1
 
             if self.top_logprobs_num is None:
                 self.top_logprobs_num = [0] * num
             elif not isinstance(self.top_logprobs_num, list):
                 self.top_logprobs_num = [self.top_logprobs_num] * num
+            else:
+                assert self.parallel_sample_num == 1
+
+    def regenerate_rid(self):
+        self.rid = uuid.uuid4().hex
 
     def __getitem__(self, i):
         return GenerateReqInput(
