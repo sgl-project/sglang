@@ -114,8 +114,7 @@ class GenerateReqInput:
             if self.parallel_sample_num == 1:
                 num = self.batch_size
             else:
-                # FIXME support cascade inference
-                # first bs samples are used for caching the prefix for parallel sampling
+                # The first bs samples are used for caching the prefix for parallel sampling
                 num = self.batch_size + self.parallel_sample_num * self.batch_size
 
             if self.image_data is None:
@@ -196,6 +195,9 @@ class EmbeddingReqInput:
     # Dummy sampling params for compatibility
     sampling_params: Union[List[Dict], Dict] = None
 
+    # Whether it is a single request or a batch request
+    is_single: bool = True
+
     def post_init(self):
         if (self.text is None and self.input_ids is None) or (
             self.text is not None and self.input_ids is not None
@@ -241,14 +243,20 @@ class TokenizedEmbeddingReqInput:
     sampling_params: SamplingParams
 
 
+RewardReqConv = Union[List[List[Dict]], List[Dict], str, List[str]]
+
+
 @dataclass
 class RewardReqInput:
-    # The input prompt in the chat format. It can be a single prompt or a batch of prompts.
-    conv: Union[List[List[Dict]], List[Dict]]
+    # The input prompt. It can be a single prompt or a batch of prompts. Can be either chat format or a string.
+    conv: RewardReqConv
     # The request id.
     rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
     sampling_params: Union[List[Dict], Dict] = None
+
+    # Whether it is a single request or a batch request
+    is_single: bool = True
 
     def post_init(self):
         self.is_single = isinstance(self.conv[0], dict)
