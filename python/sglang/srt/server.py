@@ -254,7 +254,7 @@ app.put("/encode")(encode_request)
 
 
 async def judge_request(obj: EmbeddingReqInput, request: Request):
-    """Handle a reward model request."""
+    """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
@@ -696,24 +696,8 @@ class Runtime:
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
     ):
-        if isinstance(prompt, str) or isinstance(prompt[0], str):
-            # embedding
-            json_data = {
-                "text": prompt,
-            }
-            response = requests.post(
-                self.url + "/encode",
-                json=json_data,
-            )
-        else:
-            # reward
-            json_data = {
-                "conv": prompt,
-            }
-            response = requests.post(
-                self.url + "/judge",
-                json=json_data,
-            )
+        json_data = {"text": prompt}
+        response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
 
     def __del__(self):
