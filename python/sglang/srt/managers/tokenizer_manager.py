@@ -285,22 +285,38 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        # Tokenize all requests
         batch_size = obj.batch_size
-        objs = [obj[i] for i in range(batch_size)]
-        tokenized_objs = await asyncio.gather(*(self._tokenize_one_request(obj) for obj in objs))
 
-        # Send all requests
         generators = []
-        for i in range(obj.batch_size):
-            generators.append(self._wait_one_response(objs[i], tokenized_objs[i], request))
+        if obj.parallel_sample_num == 1:
+            # Send all requests
+            for i in range(batch_size):
+                tmp_obj = obj[i]
+                tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                generators.append(self._wait_one_response(tmp_obj, tokenized_obj, request))
+        else:
+            # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
+
+            # Tokenize all requests
+            objs = [obj[i] for i in range(batch_size)]
+            tokenized_objs = await asyncio.gather(*(self._tokenize_one_request(obj) for obj in objs))
+
+            # Cache the common prefix for parallel sampling
+            for i in range(batch_size):
+                pass
+
+            # Expand requests, assign new rids for them, and send them
+            for i in range(batch_size):
+                for _ in range(obj.parallel_sample_num):
+                    tmp_obj = copy.copy(objs[i])
+                    tokenized_obj = copy.copy(tokenized_objs[i])
+                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    generators.append(self._wait_one_response(tmp_obj, tokenized_obj, request))
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
         if not is_stream:
-            outputs = []
-            for gen in generators:
-                outputs.append(await gen.__anext__())
+            outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
             yield outputs
         else:
             raise NotImplementedError()

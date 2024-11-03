@@ -155,6 +155,7 @@ class GenerateReqInput:
 
     def regenerate_rid(self):
         self.rid = uuid.uuid4().hex
+        return self.rid
 
     def __getitem__(self, i):
         return GenerateReqInput(
