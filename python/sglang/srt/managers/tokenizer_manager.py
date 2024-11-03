@@ -242,6 +242,7 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        index: Optional[int] = None,
     ):
         """Wait for the response of one request."""
         self.send_to_scheduler.send_pyobj(tokenized_obj)
@@ -268,6 +269,9 @@ class TokenizerManager:
             else:  # isinstance(obj, (EmbeddingReqInput,))
                 out = state.out_list[-1]
 
+            if index is not None:
+                out["index"] = index
+
             state.out_list = []
             if state.finished:
                 if self.server_args.log_requests:
@@ -293,7 +297,7 @@ class TokenizerManager:
             for i in range(batch_size):
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                generators.append(self._wait_one_response(tmp_obj, tokenized_obj, request))
+                generators.append(self._wait_one_response(tmp_obj, tokenized_obj, request, index=len(generators)))
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
 
@@ -303,7 +307,12 @@ class TokenizerManager:
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
-                pass
+                tmp_obj = copy.copy(objs[i])
+                tmp_obj.regenerate_rid()
+                tmp_obj.sampling_params.max_new_tokens = 0
+                tmp_obj.stream = False
+                tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                await self._wait_one_response(tmp_obj, tokenized_obj, request).__anext__()
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -311,7 +320,7 @@ class TokenizerManager:
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    generators.append(self._wait_one_response(tmp_obj, tokenized_obj, request))
+                    generators.append(self._wait_one_response(tmp_obj, tokenized_obj, request, index=len(generators)))
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -319,7 +328,22 @@ class TokenizerManager:
             outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
             yield outputs
         else:
-            raise NotImplementedError()
+            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+
+            while task_map:
+                done, _ = await asyncio.wait(task_map.keys(), return_when=asyncio.FIRST_COMPLETED)
+
+                for task in done:
+                    gen = task_map.pop(task)
+
+                    try:
+                        result = task.result()
+                        yield result
+
+                        new_task = asyncio.create_task(gen.__anext__())
+                        task_map[new_task] = gen
+                    except StopAsyncIteration:
+                        pass
 
     def flush_cache(self):
         req = FlushCacheReq()
