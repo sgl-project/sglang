@@ -75,3 +75,18 @@ $ cargo build --release
 $ maturin build -i /usr/bin/python
 $ pip install <path to wheel>
 ```
+
+
+### Development
+
+1. Run test
+
+```
+$ cargo test 
+```
+
+2. Run lint
+
+```
+$ cargo fmt
+```
