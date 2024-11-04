@@ -228,7 +228,8 @@ class Scheduler:
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.last_stats_tic = time.time()
+        self.last_stats_tic = time.time() # time of last stats for every iter
+        self.last_log_tic = time.time() # time of last log for print decode log
         self.stream_interval = server_args.stream_interval
 
         # Init chunked prefill
@@ -354,7 +355,7 @@ class Scheduler:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
             # log stats
-            if self.is_generation and not self.server_args.disable_log_stats:
+            if self.is_generation and self.server_args.enable_metrics:
                 stats = self.get_stats(batch)
                 self.log_stats(stats)
             self.last_stats_tic = time.time()
@@ -525,9 +526,9 @@ class Scheduler:
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
+        throughput = self.num_generated_tokens / (time.time() - self.last_log_tic)
         self.num_generated_tokens = 0
-        # self.last_stats_tic = time.time()
+        self.last_log_tic = time.time()
         # set system stats
         self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
         num_running_reqs = len(self.running_batch.reqs) if self.running_batch else 0
