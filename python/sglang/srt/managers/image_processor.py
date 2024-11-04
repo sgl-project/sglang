@@ -36,11 +36,12 @@ class BaseImageProcessor(ABC):
     def __init__(self, hf_config, server_args, _processor):
         self.hf_config = hf_config
         self._processor = _processor
+
         self.executor = concurrent.futures.ProcessPoolExecutor(
             initializer=init_global_processor,
             mp_context=mp.get_context("fork"),
             initargs=(server_args,),
-            max_workers=os.environ.get("SGLANG_CPU_COUNT", os.cpu_count()),
+            max_workers=int(os.environ.get("SGLANG_CPU_COUNT", os.cpu_count())),
         )
 
     @abstractmethod
@@ -179,7 +180,7 @@ class LlavaImageProcessor(BaseImageProcessor):
             "pixel_values": pixel_values,
             "image_hashes": image_hashes,
             "image_sizes": image_sizes,
-            "modalities": request_obj.modalities,
+            "modalities": request_obj.modalities or ["image"],
         }
 
 
@@ -239,7 +240,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             initializer=init_global_processor,
             mp_context=mp.get_context("fork"),
             initargs=(server_args,),
-            max_workers=os.environ.get("SGLANG_CPU_COUNT", os.cpu_count()),
+            max_workers=int(os.environ.get("SGLANG_CPU_COUNT", os.cpu_count())),
         )
 
     @staticmethod

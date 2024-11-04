@@ -1,0 +1,45 @@
+# Usage (to build SGLang ROCm docker image):
+#   docker build --build-arg SGL_BRANCH=v0.3.5 -t testImage -f Dockerfile.rocm .
+
+# default base image
+ARG BASE_IMAGE="rocm/vllm-dev:20241022"
+
+FROM $BASE_IMAGE AS base
+USER root
+
+WORKDIR /sgl-workspace
+
+ARG SGL_REPO="https://github.com/sgl-project/sglang"
+ENV SGL_DEFAULT="main"
+ARG SGL_BRANCH=${SGL_DEFAULT}
+
+RUN git clone ${SGL_REPO} \
+    && cd sglang \
+    && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
+         echo "Using ${SGL_DEFAULT}, default branch."; \
+       else \
+         echo "Using ${SGL_BRANCH} branch."; \
+         git checkout ${SGL_BRANCH}; \
+       fi \
+    && if [ "$BUILD_TYPE" = "srt" ]; then \
+         python -m pip --no-cache-dir install -e "python[srt_hip]"; \
+       else \
+         python -m pip --no-cache-dir install -e "python[all_hip]"; \
+       fi
+
+RUN cp -r /sgl-workspace/sglang /sglang
+RUN python -m pip cache purge
+
+# Performance environment variable.
+
+ENV HIP_FORCE_DEV_KERNARG=1
+ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+ENV NCCL_MIN_NCHANNELS=112
+
+ENV MOE_PADDING=1
+ENV VLLM_FP8_PADDING=1
+ENV VLLM_FP8_ACT_PADDING=1
+ENV VLLM_FP8_WEIGHT_PADDING=1
+ENV VLLM_FP8_REDUCE_CONV=1
+
+CMD ["/bin/bash"]

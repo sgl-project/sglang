@@ -1,3 +1,8 @@
+"""
+Usage:
+python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
+"""
+
 import unittest
 from types import SimpleNamespace
 
@@ -25,19 +30,19 @@ class TestEvalAccuracyLarge(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def test_mmlu(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=3000,
+            num_examples=5000,
             num_threads=1024,
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.705, f"{metrics}"
+        assert metrics["score"] >= 0.71, f"{metrics}"
 
     def test_human_eval(self):
         args = SimpleNamespace(

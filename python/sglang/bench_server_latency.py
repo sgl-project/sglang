@@ -15,7 +15,6 @@ import dataclasses
 import itertools
 import json
 import multiprocessing
-import os
 import time
 from typing import Tuple
 
@@ -70,7 +69,7 @@ def launch_server_internal(server_args):
     except Exception as e:
         raise e
     finally:
-        kill_child_process(os.getpid(), including_parent=False)
+        kill_child_process()
 
 
 def launch_server_process(server_args: ServerArgs):
@@ -176,7 +175,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             )
     finally:
         if proc:
-            kill_child_process(proc.pid)
+            kill_child_process(proc.pid, include_self=True)
 
     print(f"\nResults are saved to {bench_args.result_filename}")
 

@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# This script tags all remote branches starting with 'v' with the same name as the branch, 
+# This script is used for release.
+# It tags all remote branches starting with 'v' with the same name as the branch, 
 # deletes the corresponding branches from the remote, and pushes the tags to the remote repository. 
 
 git fetch origin --prune

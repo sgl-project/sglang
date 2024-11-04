@@ -37,8 +37,7 @@ import torch
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained import RegexGuide
-from sglang.srt.constrained.jump_forward import JumpForwardMap
+from sglang.srt.constrained.grammar import Grammar
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -212,9 +211,6 @@ class Req:
         # this does not include the jump forward tokens.
         self.completion_tokens_wo_jump_forward = 0
 
-        # The number of cached tokens, that were already cached in the KV store
-        self.cached_tokens = 0
-
         # For vision inputs
         self.image_inputs: Optional[ImageInputs] = None
 
@@ -222,7 +218,10 @@ class Req:
         self.prefix_indices = []
         self.extend_input_len = 0
         self.last_node = None
-        self.is_inflight_req = 0
+        self.is_being_chunked = 0
+
+        # For retraction
+        self.is_retracted = False
 
         # Logprobs (arguments)
         self.return_logprob = False
@@ -243,13 +242,14 @@ class Req:
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
 
-        # Embedding
+        # Embedding (return values)
         self.embedding = None
 
         # Constrained decoding
-        self.regex_fsm: RegexGuide = None
-        self.regex_fsm_state: int = 0
-        self.jump_forward_map: JumpForwardMap = None
+        self.grammar: Optional[Grammar] = None
+
+        # The number of cached tokens, that were already cached in the KV cache
+        self.cached_tokens = 0
 
         # For Qwen2-VL
         self.mrope_position_delta = []  # use mutable object
@@ -334,15 +334,20 @@ class Req:
 
         last_token_id = self.output_ids[-1]
 
-        matched_eos = last_token_id in self.sampling_params.stop_token_ids
+        matched_eos = False
 
+        # Check stop token ids
+        if self.sampling_params.stop_token_ids:
+            matched_eos = last_token_id in self.sampling_params.stop_token_ids
         if self.tokenizer is not None:
             matched_eos |= last_token_id == self.tokenizer.eos_token_id
-
+            if self.tokenizer.additional_stop_token_ids:
+                matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
         if matched_eos and not self.sampling_params.ignore_eos:
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
             return
 
+        # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tokenizer.decode(
                 self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
@@ -354,6 +359,8 @@ class Req:
                     return
 
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
+        assert self.grammar is not None and self.tokenizer is not None
+
         if self.origin_input_text is None:
             # Recovering text can only use unpadded ids
             self.origin_input_text = self.tokenizer.decode(
@@ -393,7 +400,8 @@ class Req:
                 self.surr_offset = self.read_offset - i
                 break
 
-        self.regex_fsm_state = next_state
+        # update the inner state of the grammar
+        self.grammar.jump_and_retokenize(old_output_ids, self.output_ids, next_state)
 
         if self.return_logprob:
             # For fast-forward part's logprobs
@@ -463,8 +471,8 @@ class ScheduleBatch:
     # Stream
     has_stream: bool = False
 
-    # Has regex
-    has_regex: bool = False
+    # Has grammar
+    has_grammar: bool = False
 
     # device
     device: str = "cuda"
@@ -472,7 +480,7 @@ class ScheduleBatch:
     @classmethod
     def init_new(
         cls,
-        reqs,
+        reqs: List[Req],
         req_to_token_pool,
         token_to_kv_pool,
         tree_cache,
@@ -486,7 +494,7 @@ class ScheduleBatch:
             model_config=model_config,
             return_logprob=any(req.return_logprob for req in reqs),
             has_stream=any(req.stream for req in reqs),
-            has_regex=any(req.regex_fsm for req in reqs),
+            has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
         )
 
@@ -514,7 +522,12 @@ class ScheduleBatch:
                 out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
 
             if out_cache_loc is None:
-                logger.error("Prefill out of memory. Try to lower your batch size.")
+                phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
+                logger.error(
+                    f"{phase_str} out of memory. Try to lower your batch size.\n"
+                    f"Try to allocate {num_tokens} tokens.\n"
+                    f"Avaliable tokens: {self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()}\n"
+                )
                 if self.tree_cache is not None:
                     self.tree_cache.pretty_print()
                 exit(1)
@@ -551,7 +564,7 @@ class ScheduleBatch:
             seq_lens[i] -= encoder_len
 
             if len(req.prefix_indices) < encoder_len:
-                # NOTE: the encoder part should considered as a whole
+                # NOTE: the encoder part should be considered as a whole
                 assert len(req.prefix_indices) == 0
                 input_ids[i] = input_ids[i][encoder_len:]
                 encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
@@ -638,6 +651,7 @@ class ScheduleBatch:
 
             req.extend_logprob_start_len = extend_logprob_start_len
             pt += req.extend_input_len
+            req.is_retracted = False
 
         # Set fields
         self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
@@ -770,6 +784,7 @@ class ScheduleBatch:
             req.prefix_indices = []
             req.last_node = None
             req.extend_input_len = 0
+            req.is_retracted = True
 
             # For incremental logprobs
             req.last_update_decode_tokens = 0
@@ -793,26 +808,10 @@ class ScheduleBatch:
         keep_indices = set(i for i in range(len(self.reqs)))
 
         for i, req in enumerate(self.reqs):
-            if req.jump_forward_map is not None:
-                jump_forward_bytes = req.jump_forward_map.jump_forward_byte(
-                    req.regex_fsm_state
-                )
-                if jump_forward_bytes is not None and len(jump_forward_bytes) > 1:
-                    suffix_bytes = []
-                    continuation_range = range(0x80, 0xC0)
-                    cur_state = req.regex_fsm_state
-                    while (
-                        len(jump_forward_bytes)
-                        and jump_forward_bytes[0][0] in continuation_range
-                    ):
-                        # continuation bytes
-                        byte_edge = jump_forward_bytes.pop(0)
-                        suffix_bytes.append(byte_edge[0])
-                        cur_state = byte_edge[1]
-
-                    suffix_tokens = [f"<0x{hex(b)[2:].upper()}>" for b in suffix_bytes]
-                    suffix_ids = req.tokenizer.convert_tokens_to_ids(suffix_tokens)
-
+            if req.grammar is not None:
+                jump_helper = req.grammar.try_jump(req.tokenizer)
+                if jump_helper.can_jump():
+                    suffix_ids = jump_helper.suffix_ids
                     # Current ids, for cache and revert
                     cur_all_ids = tuple(req.origin_input_ids + req.output_ids)[:-1]
                     cur_output_ids = req.output_ids
@@ -826,10 +825,8 @@ class ScheduleBatch:
                     (
                         jump_forward_str,
                         next_state,
-                    ) = req.jump_forward_map.jump_forward_symbol(cur_state)
+                    ) = req.grammar.jump_forward_str_state(jump_helper)
 
-                    # Make the incrementally decoded text part of jump_forward_str
-                    # so that the UTF-8 will not corrupt
                     jump_forward_str = new_text + jump_forward_str
                     if not req.jump_forward_and_retokenize(
                         jump_forward_str, next_state
@@ -896,7 +893,7 @@ class ScheduleBatch:
 
     def filter_batch(
         self,
-        current_inflight_req: Optional[Req] = None,
+        being_chunked_req: Optional[Req] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
@@ -904,7 +901,7 @@ class ScheduleBatch:
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and self.reqs[i] is not current_inflight_req
+                and self.reqs[i] is not being_chunked_req
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -936,7 +933,7 @@ class ScheduleBatch:
             self.top_logprobs_nums = None
 
         self.has_stream = any(req.stream for req in self.reqs)
-        self.has_regex = any(req.regex_fsm for req in self.reqs)
+        self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, new_indices)
 
@@ -969,7 +966,7 @@ class ScheduleBatch:
 
         self.return_logprob = self.return_logprob or other.return_logprob
         self.has_stream = self.has_stream or other.has_stream
-        self.has_regex = self.has_regex or other.has_regex
+        self.has_grammar = self.has_grammar or other.has_grammar
 
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode():
@@ -979,13 +976,10 @@ class ScheduleBatch:
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        if self.has_regex:
-            self.sampling_info.regex_fsms = [req.regex_fsm for req in self.reqs]
-            self.sampling_info.regex_fsm_states = [
-                req.regex_fsm_state for req in self.reqs
-            ]
+        if self.has_grammar:
+            self.sampling_info.grammars = [req.grammar for req in self.reqs]
         else:
-            self.sampling_info.regex_fsms = None
+            self.sampling_info.grammars = None
 
         global bid
         bid += 1

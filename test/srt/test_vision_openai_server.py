@@ -1,6 +1,7 @@
 """
 Usage:
 python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_mixed_batch
+python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_images_chat_completion
 """
 
 import base64
@@ -45,7 +46,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def test_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -132,7 +133,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
-    def test_mult_images_chat_completion(self):
+    def test_multi_images_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(

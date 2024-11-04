@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Union
 
 import torch
@@ -16,6 +17,11 @@ if is_flashinfer_available():
         top_k_top_p_sampling_from_probs,
         top_p_renorm_prob,
     )
+
+
+# Crash on warning if we are running CI tests
+crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +46,7 @@ class Sampler(nn.Module):
             logits = torch.where(
                 torch.isnan(logits), torch.full_like(logits, -1e5), logits
             )
+            exit(1) if crash_on_warning else None
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
