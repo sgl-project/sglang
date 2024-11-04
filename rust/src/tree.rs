@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::mem;
 
 #[derive(Clone)]
 pub struct Node {
-    pub children: Vec<Node>,
+    pub children: HashMap<usize, Node>, // the key is first id of the child because each child must have unique first id
     pub ids: Vec<usize>,
     pub count: usize,
 }
@@ -19,11 +20,17 @@ fn common_prefix_len(a: &[usize], b: &[usize]) -> usize {
     i
 }
 
+impl Default for RadixTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RadixTree {
     pub fn new() -> Self {
         RadixTree {
             root: Node {
-                children: Vec::new(),
+                children: HashMap::new(),
                 ids: Vec::new(),
                 count: 0,
             },
@@ -34,74 +41,68 @@ impl RadixTree {
         let mut curr = &mut self.root;
         curr.count += 1;
 
-
         let mut curr_idx = 0;
         let input_ids_len = input_ids.len();
-        
 
         while curr_idx < input_ids_len {
-        
-            let mut match_info = None; 
+            let mut match_info = None;
 
-            for i in 0..curr.children.len() {
-                let prefix_len = common_prefix_len(&input_ids[curr_idx..], &curr.children[i].ids);
+            for key in curr.children.keys() {
+                let prefix_len = common_prefix_len(&input_ids[curr_idx..], &curr.children[key].ids);
 
                 if prefix_len == 0 {
                     continue;
                 } else {
-                    match_info = Some((i, prefix_len));
+                    match_info = Some((*key, prefix_len));
                     break;
                 }
-
             }
 
             match match_info {
-                Some((child_id, prefix_len)) => {
-                    let child = &mut curr.children[child_id];
+                Some((key, prefix_len)) => {
+                    let child = curr.children.get_mut(&key).unwrap();
 
                     if prefix_len == child.ids.len() {
-    
                         // move curr to child
                         curr = child;
                         curr.count += 1;
                         curr_idx += prefix_len;
-    
-
                     } else {
                         // split child
-                        // [child]->... => [child]->[new child]->... 
+
+                        // [child]->... => [child]->[new child]->...
                         let new_child = Node {
                             // to avoid clone: replace child.children with default value (empty vector) and return the original value
                             children: mem::take(&mut child.children),
                             ids: child.ids[prefix_len..].to_vec(),
                             count: child.count,
                         };
-    
+
                         child.ids = child.ids[..prefix_len].to_vec();
-                        child.children = vec![new_child];
+                        child.children = HashMap::new();
+                        child.children.insert(new_child.ids[0], new_child);
 
                         curr = child;
                         curr.count += 1;
                         curr_idx += prefix_len;
-    
                     }
                 }
                 None => {
                     // create new child
                     let new_child = Node {
-                        children: Vec::new(),
+                        children: HashMap::new(),
                         ids: input_ids[curr_idx..].to_vec(),
                         count: 0,
                     };
 
-                    curr.children.push(new_child);
-                    
-                    curr = curr.children.last_mut().unwrap();
+                    let first_id = new_child.ids[0];
+                    curr.children.insert(first_id, new_child);
+
+                    curr = curr.children.get_mut(&first_id).unwrap();
                     curr.count += 1;
                     curr_idx = input_ids_len;
                 }
             }
-            
         }
     }
 
@@ -112,18 +113,17 @@ impl RadixTree {
         let input_ids_len = input_ids.len();
 
         while curr_idx < input_ids_len {
-            
             let mut has_full_match = false;
 
-            for i in 0..curr.children.len() {
-                let prefix_len = common_prefix_len(&input_ids[curr_idx..], &curr.children[i].ids);
-                
+            for key in curr.children.keys() {
+                let prefix_len = common_prefix_len(&input_ids[curr_idx..], &curr.children[key].ids);
+
                 if prefix_len == 0 {
                     continue;
                 }
 
-                let child = &curr.children[i];
-                
+                let child = &curr.children[key];
+
                 if prefix_len == child.ids.len() {
                     // full match
                     curr_idx += prefix_len;
@@ -144,8 +144,7 @@ impl RadixTree {
             }
         }
 
-        return &input_ids[..curr_idx];
-
+        &input_ids[..curr_idx]
     }
 
     pub fn delete(&mut self, input_ids: &[usize]) {
@@ -157,37 +156,37 @@ impl RadixTree {
 
         while curr_idx < input_ids_len {
             // First find the matching child index and prefix length
-            let mut child_idx = None;
+            let mut child_key = None;
             let mut prefix_len = 0;
-            
-            for i in 0..curr.children.len() {
-                let current_prefix_len = common_prefix_len(&input_ids[curr_idx..], &curr.children[i].ids);
-                if current_prefix_len == curr.children[i].ids.len() {
-                    child_idx = Some(i);
+
+            for key in curr.children.keys() {
+                let current_prefix_len =
+                    common_prefix_len(&input_ids[curr_idx..], &curr.children[key].ids);
+                if current_prefix_len == curr.children[key].ids.len() {
+                    child_key = Some(*key);
                     prefix_len = current_prefix_len;
                     break;
                 }
             }
-    
-            match child_idx {
-                Some(i) => {
-                    curr_idx += prefix_len;
-                    
+
+            match child_key {
+                Some(key) => {
                     // Check count first
-                    if curr.children[i].count == 1 {
+                    if curr.children[&key].count == 1 {
                         // If count will become 0, remove the child
-                        curr.children[i].count -= 1;
-                        curr.children.remove(i);
-                        
+                        let child = curr.children.get_mut(&key).unwrap();
+                        child.count -= 1;
+                        curr.children.remove(&key);
                         break;
                     } else {
                         // Otherwise decrement count and continue
-                        let child = &mut curr.children[i];
+                        let child = curr.children.get_mut(&key).unwrap();
                         child.count -= 1;
                         curr = child;
+                        curr_idx += prefix_len;
                     }
                 }
-                None => panic!("No match found for {:?}", input_ids)
+                None => panic!("No match found for {:?}", input_ids),
             }
         }
     }
@@ -197,22 +196,20 @@ impl RadixTree {
         println!("RadixTree:");
         Self::print_node(&self.root, String::from(""));
     }
- 
+
     fn print_node(node: &Node, prefix: String) {
         // Print current node info with "count" word
         println!("{}└── {:?} (count: {})", prefix, node.ids, node.count);
-        
+
         // Print children with proper prefixes
-        for (i, child) in node.children.iter().enumerate() {
+        for (i, child) in node.children.values().enumerate() {
             let is_last = i == node.children.len() - 1;
             let child_prefix = if is_last {
-                format!("{}    ", prefix)  // Add space for last child
+                format!("{}    ", prefix) // Add space for last child
             } else {
-                format!("{}│   ", prefix)  // Add vertical line for other children
+                format!("{}│   ", prefix) // Add vertical line for other children
             };
             Self::print_node(child, child_prefix);
         }
     }
-
 }
-

@@ -1,6 +1,6 @@
 use pyo3::prelude::*;
-mod server;
 pub mod router;
+mod server;
 pub mod tree;
 
 // Python binding
@@ -9,7 +9,7 @@ struct Router {
     host: String,
     port: u16,
     worker_urls: Vec<String>,
-    policy: String
+    policy: String,
 }
 
 #[pymethods]
@@ -20,7 +20,7 @@ impl Router {
             host,
             port,
             worker_urls,
-            policy
+            policy,
         }
     }
 
@@ -31,7 +31,9 @@ impl Router {
         let policy = self.policy.clone();
 
         actix_web::rt::System::new().block_on(async move {
-            server::startup(host, port, worker_urls, policy).await.unwrap();
+            server::startup(host, port, worker_urls, policy)
+                .await
+                .unwrap();
         });
 
         Ok(())
