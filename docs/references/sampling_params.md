@@ -177,3 +177,50 @@ print(response.json())
 
 The `image_data` can be a file name, a URL, or a base64 encoded string. See also `python/sglang/srt/utils.py:load_image`.
 Streaming is supported in a similar manner as [above](#streaming).
+
+### Structured decoding (JSON, Regex)
+You can specify a JSON schema or a regular expression to constrain the model output. The model output will be guaranteed to follow the given constraints.
+
+```python
+import json
+import requests
+
+json_schema = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "pattern": "^[\\w]+$"},
+            "population": {"type": "integer"},
+        },
+        "required": ["name", "population"],
+    }
+)
+
+# JSON
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "Here is the information of the capital of France in the JSON format.\n",
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 64,
+            "json_schema": json_schema,
+        },
+    },
+)
+print(response.json())
+
+# Regular expression
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "Paris is the capital of",
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 64,
+            "regex": "(France|England)",
+        },
+    },
+)
+print(response.json())
+```

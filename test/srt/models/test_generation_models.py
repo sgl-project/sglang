@@ -63,9 +63,10 @@ TORCH_DTYPES = [torch.float16]
 
 
 class TestGenerationModels(unittest.TestCase):
+
     @classmethod
     def setUpClass(cls):
-        mp.set_start_method("spawn")
+        mp.set_start_method("spawn", force=True)
 
     def assert_close_logits_and_output_strs(
         self,
