@@ -34,7 +34,9 @@ impl Router for RoundRobinRouter {
             return None;
         }
         // Use relaxed because operation order doesn't matter in round robin
-        let index = self.current_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed) 
+        let index = self
+            .current_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % self.worker_urls.len();
         Some(self.worker_urls[index].clone())
     }
@@ -62,11 +64,11 @@ impl RandomRouter {
 impl Router for RandomRouter {
     fn select(&self) -> Option<String> {
         use rand::seq::SliceRandom;
-        
+
         if self.worker_urls.is_empty() {
             return None;
         }
-        
+
         self.worker_urls.choose(&mut rand::thread_rng()).cloned()
     }
 
@@ -83,6 +85,9 @@ pub fn create_router(worker_urls: Vec<String>, policy: String) -> Box<dyn Router
     match policy.to_lowercase().as_str() {
         "random" => Box::new(RandomRouter::new(worker_urls)),
         "round_robin" => Box::new(RoundRobinRouter::new(worker_urls)),
-        _ => panic!("Unknown routing policy: {}. The available policies are 'random' and 'round_robin'", policy),
+        _ => panic!(
+            "Unknown routing policy: {}. The available policies are 'random' and 'round_robin'",
+            policy
+        ),
     }
 }
