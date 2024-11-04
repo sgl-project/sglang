@@ -298,7 +298,7 @@ class Scheduler:
         self.stats = Stats()
         self.metrics_collector = PrometheusMetricsCollector(
             labels={
-                "name": self.model_config.path,
+                "model_name": self.server_args.served_model_name,
                 # TODO: Add lora name/path in the future,
             },
             max_model_len=self.max_total_num_tokens,
