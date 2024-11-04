@@ -45,31 +45,24 @@ impl RadixTree {
         let input_ids_len = input_ids.len();
 
         while curr_idx < input_ids_len {
-            let mut match_info = None;
-
-            for key in curr.children.keys() {
-                let prefix_len = common_prefix_len(&input_ids[curr_idx..], &curr.children[key].ids);
-
-                if prefix_len == 0 {
-                    continue;
-                } else {
-                    match_info = Some((*key, prefix_len));
-                    break;
-                }
-            }
-
-            match match_info {
-                Some((key, prefix_len)) => {
-                    let child = curr.children.get_mut(&key).unwrap();
+            let first_id = &input_ids[curr_idx];
+            // TODO: changing this get_mut causes error
+            match curr.children.get(first_id) {
+                Some(child) => {
+                    let prefix_len = common_prefix_len(&input_ids[curr_idx..], &child.ids);
 
                     if prefix_len == child.ids.len() {
+                        // mutable ref
+                        let child = curr.children.get_mut(first_id).unwrap();
                         // move curr to child
                         curr = child;
                         curr.count += 1;
                         curr_idx += prefix_len;
                     } else {
-                        // split child
+                        // mutable ref
+                        let child = curr.children.get_mut(first_id).unwrap();
 
+                        // split child
                         // [child]->... => [child]->[new child]->...
                         let new_child = Node {
                             // to avoid clone: replace child.children with default value (empty vector) and return the original value
@@ -113,34 +106,21 @@ impl RadixTree {
         let input_ids_len = input_ids.len();
 
         while curr_idx < input_ids_len {
-            let mut has_full_match = false;
+            match curr.children.get(&input_ids[curr_idx]) {
+                Some(child) => {
+                    let prefix_len = common_prefix_len(&input_ids[curr_idx..], &child.ids);
 
-            for key in curr.children.keys() {
-                let prefix_len = common_prefix_len(&input_ids[curr_idx..], &curr.children[key].ids);
-
-                if prefix_len == 0 {
-                    continue;
+                    if prefix_len == child.ids.len() {
+                        curr_idx += prefix_len;
+                        curr = child;
+                    } else {
+                        curr_idx += prefix_len;
+                        break;
+                    }
                 }
-
-                let child = &curr.children[key];
-
-                if prefix_len == child.ids.len() {
-                    // full match
-                    curr_idx += prefix_len;
-                    curr = child;
-                    has_full_match = true;
-
-                    break;
-                } else {
-                    // partial match
-                    curr_idx += prefix_len;
+                None => {
                     break;
                 }
-            }
-
-            if !has_full_match {
-                // if not full match, break
-                break;
             }
         }
 
@@ -155,35 +135,27 @@ impl RadixTree {
         let input_ids_len = input_ids.len();
 
         while curr_idx < input_ids_len {
-            // First find the matching child index and prefix length
-            let mut child_key = None;
-            let mut prefix_len = 0;
+            let first_id = &input_ids[curr_idx];
+            match curr.children.get(first_id) {
+                Some(child) => {
+                    let prefix_len = common_prefix_len(&input_ids[curr_idx..], &child.ids);
 
-            for key in curr.children.keys() {
-                let current_prefix_len =
-                    common_prefix_len(&input_ids[curr_idx..], &curr.children[key].ids);
-                if current_prefix_len == curr.children[key].ids.len() {
-                    child_key = Some(*key);
-                    prefix_len = current_prefix_len;
-                    break;
-                }
-            }
-
-            match child_key {
-                Some(key) => {
-                    // Check count first
-                    if curr.children[&key].count == 1 {
-                        // If count will become 0, remove the child
-                        let child = curr.children.get_mut(&key).unwrap();
-                        child.count -= 1;
-                        curr.children.remove(&key);
-                        break;
+                    if prefix_len == child.ids.len() {
+                        if child.count == 1 {
+                            // If count will become 0, remove the child
+                            let child = curr.children.get_mut(first_id).unwrap();
+                            child.count -= 1;
+                            curr.children.remove(first_id);
+                            break;
+                        } else {
+                            // Otherwise decrement count and continue
+                            let child = curr.children.get_mut(first_id).unwrap();
+                            child.count -= 1;
+                            curr = child;
+                            curr_idx += prefix_len;
+                        }
                     } else {
-                        // Otherwise decrement count and continue
-                        let child = curr.children.get_mut(&key).unwrap();
-                        child.count -= 1;
-                        curr = child;
-                        curr_idx += prefix_len;
+                        panic!("No match found for {:?}", input_ids);
                     }
                 }
                 None => panic!("No match found for {:?}", input_ids),
