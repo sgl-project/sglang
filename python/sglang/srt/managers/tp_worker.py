@@ -15,7 +15,6 @@ limitations under the License.
 
 """A tensor parallel worker."""
 
-import json
 import logging
 from typing import Optional
 
@@ -26,7 +25,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_a
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import broadcast_pyobj, is_multimodal_model, set_random_seed
+from sglang.srt.utils import broadcast_pyobj, set_random_seed
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +47,10 @@ class TpModelWorker:
         # Init model and tokenizer
         self.model_config = ModelConfig(
             server_args.model_path,
-            server_args.trust_remote_code,
+            trust_remote_code=server_args.trust_remote_code,
             context_length=server_args.context_length,
-            model_override_args=json.loads(server_args.json_model_override_args),
+            model_override_args=server_args.json_model_override_args,
+            is_embedding=server_args.is_embedding,
         )
         self.model_runner = ModelRunner(
             model_config=self.model_config,
@@ -64,7 +64,7 @@ class TpModelWorker:
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            if is_multimodal_model(self.model_config.hf_config.architectures):
+            if self.model_config.is_multimodal:
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,

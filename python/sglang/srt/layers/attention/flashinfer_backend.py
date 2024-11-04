@@ -210,6 +210,9 @@ class FlashInferAttnBackend(AttentionBackend):
             encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
         )
 
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 0
+
     def forward_extend(
         self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
     ):
