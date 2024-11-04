@@ -26,7 +26,11 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_rust.sh
-
+      - name: Run fmt
+        run: |
+          source "$HOME/.cargo/env"
+          cd rust/
+          cargo fmt -- --check
       - name: Run test
         timeout-minutes: 20
         run: |
