@@ -25,4 +25,5 @@ sudo apt install -y python3-pip vim
 # Install Python packages
 pip install torch torchvision torchaudio
 pip install packaging
+pip install cmake
 pip install transformer_engine[pytorch]
