@@ -420,7 +420,7 @@ def launch_engine(
         scheduler_pipe_readers[i].recv()
 
 def add_prometheus_middleware(app: FastAPI):
-    # Adopted from https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/entrypoints/openai/api_server.py#L216
+    # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/entrypoints/openai/api_server.py#L216
     from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
 
     registry = CollectorRegistry()
