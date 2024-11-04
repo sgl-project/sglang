@@ -4,7 +4,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.speculative.speculative_worker import SpeculativeWorker, spec_worker_factory
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch, Req
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode, CaptureHiddenMode
 from sglang.srt.speculative.eagle_utils import EAGLEDraftInput, EagleVerifyInput
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -33,7 +33,7 @@ class EAGLEWorker(SpeculativeWorker):
         batch.spec_info.prepare_for_decode(batch)
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        forward_batch.is_draft_batch = True
+        forward_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         logits_output = self.model_runner.forward(forward_batch)
         self.capture_for_decode(logits_output, forward_batch)
     
@@ -42,6 +42,7 @@ class EAGLEWorker(SpeculativeWorker):
         batch.spec_info.prepare_for_extend(batch)
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)  
+        forward_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         logits_output = self.model_runner.forward(forward_batch)
         self.capture_for_decode(logits_output, forward_batch)
         self._swap_mem_pool(batch, self.target_worker.model_runner)
@@ -59,7 +60,6 @@ class EAGLEWorker(SpeculativeWorker):
             # if it is None, means all requsets are finished
             if batch.spec_info.verified_id is not None:
                 self.forward_extend_after_decode(batch)
-            torch.cuda.synchronize()
             
             return logits_output, verified_id, model_worker_batch
             
@@ -67,8 +67,10 @@ class EAGLEWorker(SpeculativeWorker):
             batch.spec_info = EAGLEDraftInput()
             batch.spec_info.init(self.server_args)
             model_worker_batch = batch.get_model_worker_batch()
+            batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
             logits_output, next_token_ids = self.target_worker.forward_batch_generation(model_worker_batch)
             model_worker_batch.spec_info.verified_id = next_token_ids
+            model_worker_batch.spec_info.hidden_states = logits_output.hidden_states
             self.forward_draft_extend(batch)
             return logits_output, next_token_ids, model_worker_batch
         
@@ -77,6 +79,7 @@ class EAGLEWorker(SpeculativeWorker):
         batch.forward_mode = ForwardMode.SPECVERIFY
         verify_input.prepare_for_verify(batch)
         batch.spec_info = verify_input
+        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch = batch.get_model_worker_batch()
         logits_output, _ = self.target_worker.forward_batch_generation(model_worker_batch, need_token_id=False)
         verify_input.hidden_states = logits_output.hidden_states
@@ -98,10 +101,9 @@ class EAGLEWorker(SpeculativeWorker):
         batch.spec_info.prepare_extend_after_decode(batch)
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        
-        forward_batch.is_draft_batch = True
+        forward_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         logits_output = self.model_runner.forward(forward_batch)
-        torch.cuda.synchronize()
+        batch.spec_info.hidden_states = logits_output.hidden_states
         self.capture_for_decode(logits_output, forward_batch)
         batch.forward_mode = ForwardMode.DECODE 
         if batch.spec_info.has_finished:

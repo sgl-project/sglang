@@ -25,7 +25,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode, CaptureHiddenMode
 
 
 @dataclasses.dataclass
@@ -67,7 +67,7 @@ class LogitsMetadata:
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
     
-    is_draft_batch: bool = False
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -76,7 +76,7 @@ class LogitsMetadata:
         else:
             return_top_logprob = False
 
-        if forward_batch.forward_mode.is_extend() and not forward_batch.is_draft_batch:
+        if forward_batch.forward_mode.is_extend() and hasattr(forward_batch, 'spec_info'):
             extend_logprob_pruned_lens_cpu = [
                 extend_len - start_len
                 for extend_len, start_len in zip(
@@ -96,7 +96,7 @@ class LogitsMetadata:
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
-            is_draft_batch=forward_batch.is_draft_batch
+            capture_hidden_mode=getattr(forward_batch.spec_info, 'capture_hidden_mode', CaptureHiddenMode.NULL)
         )
 
 
@@ -179,9 +179,7 @@ class LogitsProcessor(nn.Module):
         weight,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
     ):
-        need_hidden_states = False
         if isinstance(logits_metadata, ForwardBatch):
-            need_hidden_states = logits_metadata.spec_algorithm == 'EAGLE'
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
         assert isinstance(logits_metadata, LogitsMetadata)
 
@@ -204,7 +202,7 @@ class LogitsProcessor(nn.Module):
             last_logits.mul_(self.config.final_logit_softcapping)
 
         # Return only last_logits if logprob is not requested
-        if not logits_metadata.return_logprob or logits_metadata.is_draft_batch:
+        if not logits_metadata.return_logprob or logits_metadata.capture_hidden_mode.need_capture():
             return LogitsProcessorOutput(
                 next_token_logits=last_logits,
                 next_token_logprobs=None,
@@ -212,7 +210,8 @@ class LogitsProcessor(nn.Module):
                 input_token_logprobs=None,
                 input_top_logprobs=None,
                 output_top_logprobs=None,
-                hidden_states=last_hidden if need_hidden_states else None,
+                hidden_states=hidden_states if logits_metadata.capture_hidden_mode.is_full() else 
+                    last_hidden if logits_metadata.capture_hidden_mode.is_last() else None,
                 next_token_logits_bak=last_logits,
             )
         else:

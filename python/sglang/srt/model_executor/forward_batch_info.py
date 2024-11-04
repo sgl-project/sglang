@@ -83,6 +83,20 @@ class ForwardMode(IntEnum):
         return self in (ForwardMode.DECODE, ForwardMode.SPECVERIFY)
 
 
+class CaptureHiddenMode(IntEnum):
+    NULL = auto()
+    FULL = auto()
+    LAST = auto()
+    
+    def need_capture(self):
+        return self != CaptureHiddenMode.NULL
+    
+    def is_full(self):
+        return self == CaptureHiddenMode.FULL
+    
+    def is_last(self):
+        return self == CaptureHiddenMode.LAST
+
 @dataclass
 class ForwardBatch:
     """Store all inputs of a forward pass."""
@@ -141,8 +155,6 @@ class ForwardBatch:
     # Speculative decoding
     spec_info: SpecInput = None
     spec_algorithm: str = None
-    is_draft_batch: bool = False
-    is_cuda_graph: bool = False
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None

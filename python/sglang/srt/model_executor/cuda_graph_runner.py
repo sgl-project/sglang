@@ -31,7 +31,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode, CaptureHiddenMode
 from sglang.srt.utils import monkey_patch_vllm_all_gather
 from sglang.srt.speculative.speculative_utils import DraftInfoFactory
 
@@ -257,11 +257,13 @@ class CudaGraphRunner:
                 spec_info.hidden_states = self.hidden_states[:num_token]
                 spec_info.positions = positions
                 spec_info.init(self.model_runner.server_args)
+                spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
             else:
                 spec_info = DraftInfoFactory.get(self.model_runner.server_args.speculative_algorithm, 'VerifyInput')(
                     None, None, None, None, None, None, self.model_runner.server_args.num_draft_tokens)
                 spec_info.custom_mask = torch.zeros((num_token*self.model_runner.model_config.context_len), dtype=torch.bool,
                     device="cuda",)
+                spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
                 
             
         if self.is_encoder_decoder:
@@ -290,7 +292,6 @@ class CudaGraphRunner:
             #positions=clamp_position(seq_lens),
             spec_info=spec_info,
             spec_algorithm=self.model_runner.server_args.speculative_algorithm,
-            is_cuda_graph=True,
             mrope_positions=mrope_positions,
         )
 
@@ -332,7 +333,6 @@ class CudaGraphRunner:
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
-        forward_batch.is_cuda_graph = True
         raw_bs = forward_batch.batch_size
         # In most case, raw_bs == num_token in decode stage. 
         # But for speculative, the token num maybe large than raw_bs

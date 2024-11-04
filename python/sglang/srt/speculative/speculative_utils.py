@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from .build_eagle_tree import build_tree_kernel
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
 if TYPE_CHECKING:
     from python.sglang.srt.layers.sampler import SampleOutput
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 class SpecInput:
-    pass
+    capture_hidden_mode:CaptureHiddenMode = CaptureHiddenMode.NULL
 
 class SpecVerifyInput(SpecInput):
     pass

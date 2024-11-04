@@ -316,8 +316,6 @@ class LlamaForCausalLM(nn.Module):
         res =  self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
-        if forward_batch.spec_algorithm == 'EAGLE':
-            forward_batch.spec_info.hidden_states = hidden_states
         return res
 
     def get_hidden_dim(self, module_name):
