@@ -1,9 +1,10 @@
 // src/main.rs
-use clap::Parser;
 use clap::builder::PossibleValuesParser;
+use clap::Parser;
 // declare child modules
-mod server;
 mod router;
+mod server;
+mod tree;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
