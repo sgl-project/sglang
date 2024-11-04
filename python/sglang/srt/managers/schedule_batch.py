@@ -258,7 +258,7 @@ class Req:
         # Lifetime traces
         # time when request is created and added to waitlist
         self.created_time = None
-        # time when request is added to prefill batech
+        # time when request is added to prefill batch
         self.queued_time = None
         # time when request is being processed
         self.started_time = None
