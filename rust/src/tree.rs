@@ -47,54 +47,48 @@ impl RadixTree {
         while curr_idx < input_ids_len {
             let first_id = &input_ids[curr_idx];
             // TODO: changing this get_mut causes error
-            match curr.children.get(first_id) {
-                Some(child) => {
-                    let prefix_len = common_prefix_len(&input_ids[curr_idx..], &child.ids);
+            if curr.children.contains_key(first_id) {
+                let child = curr.children.get_mut(first_id).unwrap();
 
-                    if prefix_len == child.ids.len() {
-                        // mutable ref
-                        let child = curr.children.get_mut(first_id).unwrap();
-                        // move curr to child
-                        curr = child;
-                        curr.count += 1;
-                        curr_idx += prefix_len;
-                    } else {
-                        // mutable ref
-                        let child = curr.children.get_mut(first_id).unwrap();
+                let prefix_len = common_prefix_len(&input_ids[curr_idx..], &child.ids);
 
-                        // split child
-                        // [child]->... => [child]->[new child]->...
-                        let new_child = Node {
-                            // to avoid clone: replace child.children with default value (empty vector) and return the original value
-                            children: mem::take(&mut child.children),
-                            ids: child.ids[prefix_len..].to_vec(),
-                            count: child.count,
-                        };
-
-                        child.ids = child.ids[..prefix_len].to_vec();
-                        child.children = HashMap::new();
-                        child.children.insert(new_child.ids[0], new_child);
-
-                        curr = child;
-                        curr.count += 1;
-                        curr_idx += prefix_len;
-                    }
-                }
-                None => {
-                    // create new child
+                if prefix_len == child.ids.len() {
+                    // move curr to child
+                    curr = child;
+                    curr.count += 1;
+                    curr_idx += prefix_len;
+                } else {
+                    // split child
+                    // [child]->... => [child]->[new child]->...
                     let new_child = Node {
-                        children: HashMap::new(),
-                        ids: input_ids[curr_idx..].to_vec(),
-                        count: 0,
+                        // to avoid clone: replace child.children with default value (empty vector) and return the original value
+                        children: mem::take(&mut child.children),
+                        ids: child.ids[prefix_len..].to_vec(),
+                        count: child.count,
                     };
 
-                    let first_id = new_child.ids[0];
-                    curr.children.insert(first_id, new_child);
+                    child.ids = child.ids[..prefix_len].to_vec();
+                    child.children = HashMap::new();
+                    child.children.insert(new_child.ids[0], new_child);
 
-                    curr = curr.children.get_mut(&first_id).unwrap();
+                    curr = child;
                     curr.count += 1;
-                    curr_idx = input_ids_len;
+                    curr_idx += prefix_len;
                 }
+            } else {
+                // create new child
+                let new_child = Node {
+                    children: HashMap::new(),
+                    ids: input_ids[curr_idx..].to_vec(),
+                    count: 0,
+                };
+
+                let first_id = new_child.ids[0];
+                curr.children.insert(first_id, new_child);
+
+                curr = curr.children.get_mut(&first_id).unwrap();
+                curr.count += 1;
+                curr_idx = input_ids_len;
             }
         }
     }
@@ -136,29 +130,32 @@ impl RadixTree {
 
         while curr_idx < input_ids_len {
             let first_id = &input_ids[curr_idx];
-            match curr.children.get(first_id) {
-                Some(child) => {
-                    let prefix_len = common_prefix_len(&input_ids[curr_idx..], &child.ids);
 
-                    if prefix_len == child.ids.len() {
-                        if child.count == 1 {
-                            // If count will become 0, remove the child
-                            let child = curr.children.get_mut(first_id).unwrap();
-                            child.count -= 1;
-                            curr.children.remove(first_id);
-                            break;
-                        } else {
-                            // Otherwise decrement count and continue
-                            let child = curr.children.get_mut(first_id).unwrap();
-                            child.count -= 1;
-                            curr = child;
-                            curr_idx += prefix_len;
-                        }
+            if curr.children.contains_key(first_id) {
+                let child = curr.children.get(first_id).unwrap();
+
+                let prefix_len = common_prefix_len(&input_ids[curr_idx..], &child.ids);
+
+                if prefix_len == child.ids.len() {
+                    if child.count == 1 {
+                        // If count will become 0, remove the child
+                        let child = curr.children.get_mut(first_id).unwrap();
+                        child.count -= 1;
+                        curr.children.remove(first_id);
+                        break;
                     } else {
-                        panic!("No match found for {:?}", input_ids);
+                        // Otherwise decrement count and continue
+                        let child = curr.children.get_mut(first_id).unwrap();
+
+                        child.count -= 1;
+                        curr = child;
+                        curr_idx += prefix_len;
                     }
+                } else {
+                    panic!("No match found for {:?}", input_ids);
                 }
-                None => panic!("No match found for {:?}", input_ids),
+            } else {
+                panic!("No match found for {:?}", input_ids);
             }
         }
     }
