@@ -441,7 +441,7 @@ class ServerArgs:
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch"
+            help="The log interval of decode batch",
         )
 
         # Data parallelism
@@ -679,10 +679,10 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        if is_ipv6(self.host):
-            return f"http://[{self.host}]:{self.port}"
-        else:
-            return f"http://{self.host}:{self.port}"
+        real_host = f"[{self.host}]" if is_ipv6(self.host) else self.host
+        if real_host == "0.0.0.0":
+            real_host = "127.0.0.1"
+        return f"http://[{real_host}]:{self.port}"
 
     def check_server_args(self):
         assert (
