@@ -44,7 +44,7 @@ The core features include:
 
    references/sampling_params.md
    references/hyperparameter_tuning.md
-   references/model_support.md
+   references/supported_models.md
    references/benchmark_and_profiling.md
    references/choices_methods.md
    references/custom_chat_template.md
