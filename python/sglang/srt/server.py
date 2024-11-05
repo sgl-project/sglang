@@ -25,12 +25,14 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import re
 import threading
 import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, List, Optional, Union
 
 import orjson
+from setuptools_scm import get_version
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -136,6 +138,41 @@ async def get_model_info():
 async def get_server_args():
     """Get the server arguments."""
     return dataclasses.asdict(tokenizer_manager.server_args)
+
+
+@app.get("/get_latest_commit")
+async def get_latest_commit():
+    try:
+        __version__ = get_version(root="../..", relative_to=__file__)
+        return __version__
+    except Exception as e:
+        print(e)
+        print("The approach of using setuptools_scm does not work. Extract from files.")
+        try:
+
+            def is_commit_hash(s):
+                return bool(re.match(r"^[a-f0-9]{40}$", s))
+
+            cur_dir = os.path.dirname(os.path.abspath(__file__))
+            root_dir = "/".join(cur_dir.split("/")[:-3])
+            git_dir = os.path.join(root_dir, ".git")
+            with open(os.path.join(git_dir, "HEAD"), "r") as file:
+                head = file.read().strip()
+            if is_commit_hash(head):
+                return head
+
+            elif head.startswith("ref:"):
+                ref_path = os.path.join(git_dir, head[len("ref: ") :])
+                with open(ref_path, "r") as file:
+                    head = file.read().strip()
+                if is_commit_hash(head):
+                    return head
+
+            raise Exception("Cannot find the commit hash.")
+
+        except Exception as e:
+            print(e)
+            return "Commit hash file not found."
 
 
 @app.post("/flush_cache")
