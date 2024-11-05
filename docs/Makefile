@@ -14,7 +14,7 @@ help:
 
 # New target to compile Markdown and Jupyter Notebook files
 compile:
-	find $(SOURCEDIR) -name '*.ipynb' | while read nb; do \
+	find $(SOURCEDIR) -path "*/_build/*" -prune -o -name "*.ipynb" -print | while read nb; do \
 		if [ -f "$$nb" ]; then \
 			echo "Executing $$nb"; \
 			jupyter nbconvert --to notebook --execute --inplace "$$nb" \
