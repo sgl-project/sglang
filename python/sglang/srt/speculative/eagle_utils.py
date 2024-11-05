@@ -130,7 +130,7 @@ def create_extend_spec_info(verified_id, seq_len, accept_len, accept_len_cum, po
 
 @triton.jit
 def assign_req_to_token_pool(req_pool_indices, req_to_token, start_offset, end_offset, out_cache_loc, pool_len: tl.constexpr, bs_upper: tl.constexpr):
-    BLOCK_SIZE: tl.constexpr = 128
+    BLOCK_SIZE: tl.constexpr = 32
     pid = tl.program_id(axis=0)
     kv_start = tl.load(start_offset+pid)
     kv_end = tl.load(end_offset+pid)
@@ -563,8 +563,6 @@ class EagleVerifyInput(SpecVerifyInput):
         evict_mask[accept_index] = False
         mem_need_free_idx = batch.out_cache_loc[evict_mask]
         batch.token_to_kv_pool.free(mem_need_free_idx)
-        batch.seq_lens.add_(accept_length+1)
-
         assign_req_to_token_pool[(bs, )](batch.req_pool_indices,
                             batch.req_to_token_pool.req_to_token,
                             batch.seq_lens, 
@@ -573,7 +571,7 @@ class EagleVerifyInput(SpecVerifyInput):
                             batch.req_to_token_pool.req_to_token.shape[1],
                             triton.next_power_of_2(bs)
                         )
-        
+        batch.seq_lens.add_(accept_length+1)
         new_accept_index = []
         unfinished_index = []
         finished_extend_len = {} # {rid:accept_length + 1}

@@ -100,9 +100,13 @@ class FlashInferAttnBackend(AttentionBackend):
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
         self.prefill_wrappers_paged = []
+        self.prefill_wrappers_verify = []
         self.decode_wrappers = []
         for _ in range(self.num_wrappers):
             self.prefill_wrappers_paged.append(
+                BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
+            )
+            self.prefill_wrappers_verify.append(
                 BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
             )
             self.decode_wrappers.append(
@@ -125,7 +129,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode():
-            wrappers = self.prefill_wrappers_paged if forward_batch.forward_mode.is_verify() \
+            wrappers = self.prefill_wrappers_verify if forward_batch.forward_mode.is_verify() \
                 else self.decode_wrappers
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -273,9 +277,14 @@ class FlashInferAttnBackend(AttentionBackend):
     def forward_extend(
         self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
     ):
-        prefill_wrapper_paged = self.prefill_wrappers_paged[
-            self._get_wrapper_idx(layer)
-        ]
+        if forward_batch.forward_mode.is_verify():
+            prefill_wrapper_paged = self.prefill_wrappers_verify[
+                self._get_wrapper_idx(layer)
+            ]
+        else:
+            prefill_wrapper_paged = self.prefill_wrappers_paged[
+                self._get_wrapper_idx(layer)
+            ]
 
         use_ragged, extend_no_prefix, graph_wrapper = self.forward_metadata
         cache_loc = (
