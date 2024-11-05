@@ -459,6 +459,7 @@ def launch_server(
         add_api_key_middleware(app, server_args.api_key)
 
     # add prometheus middleware
+    _set_prometheus_env()
     add_prometheus_middleware(app)
 
     # Send a warmup request
@@ -488,15 +489,7 @@ def launch_server(
     finally:
         t.join()
 
-
-def _set_envs_and_config(server_args: ServerArgs):
-    # Set global environments
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    os.environ["NCCL_NVLS_ENABLE"] = "0"
-    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
-
+def _set_prometheus_env():
     # Set prometheus multiprocess directory
     # sglang uses prometheus multiprocess mode
     # we need to set this before importing prometheus_client
@@ -511,6 +504,14 @@ def _set_envs_and_config(server_args: ServerArgs):
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
     logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+def _set_envs_and_config(server_args: ServerArgs):
+    # Set global environments
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
 
     # Set ulimit
     set_ulimit()
