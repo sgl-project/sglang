@@ -6,7 +6,7 @@ Two primary methods are covered:
 - [PyTorch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html)
 
 ### Profiling SGLang Infer System with RPD Profiler
-RPD profiler is a low-overhead cross-platform profiler. To use RPD profiler on this repository, please use scripts and patch files included in this directory and follow the steps below:
+RPD profiler is a low-overhead cross-platform profiler. Therefore, the same RPD code augment not only works for profiling on ROCm/AMD GPUs, but also works for profiling on CUDA/Nvidia GPUs as well. To do RPD profiling on SGLang repository, please use scripts and patch files included in this directory and follow the steps below:
 1. Install RPD with rpd.patch applied during installation using install_rpd.sh, both files are in this directory.
 
 install_rpd.sh
@@ -18,6 +18,7 @@ apt update && apt install -y sqlite3 libsqlite3-dev libfmt-dev
 # install rpd module
 git clone https://github.com/ROCmSoftwarePlatform/rocmProfileData
 cd rocmProfileData
+git checkout 976899e9c6dbc6dd2bccf770818e4e44125590ac
 git apply rpd.patch 
 make && make install
 cd rocpd_python && python setup.py install && cd ..
@@ -91,6 +92,9 @@ LD_PRELOAD=librocm-smi_64:librpd_tracer.so "$@"
 ```
 3. Apply patch (provided in this directory) with "git apply rpd_profile_server_enable.patch" if the main profiling purpose is to get info on gpu kernels as well as limited cpu activity info. 
 
+#### Common Notes 1
+Please note that although we are doing TP=8 in the example, we purposely only log RPD profiling on 2 ranks in the patch file (i.e.tp_rank=0/1) for profiling/visualization convenience, as even Perfetto streaming mode can only load maximal 8GB json file for visualization. With 2 ranks logged in RPD profiling, we could still check whether there are issues among ranks (e.g. load imbalance issue, nccl issue), and at the same time, we could log relatively longer time duration before the json file generated from RPD file hits 8GB size.
+
 rpd_profile_server_enable.patch
 
 ```bash
@@ -146,7 +150,7 @@ index 62d1ff9..9021c01 100644
 ```
 
 #### Advanced Debugging with RPD Profiler
-Sometimes, we want to use rpd profiler to capture more CPU and python activities in order to debug some challenging issues (e.g. root cause of load imbalance across gpu processes, root cause of bubbles, etc). Only in such cases, we need to apply patch "git apply rpd_profile_server_enable_wCPU_activities.patch".
+Sometimes, we want to use rpd profiler to capture more CPU and python activities in order to debug some challenging issues (e.g. root cause of load imbalance across gpu processes, root cause of bubbles, etc). Only in such cases, we need to apply patch "git apply rpd_profile_server_enable_wCPU_activities.patch", where 3 files are modified.
 
 rpd_profile_server_enable_wCPU_activities.patch
 
@@ -279,13 +283,38 @@ index 7111c93..2bd722c 100644
          status_code=200,
 ```
 
-4. Untar dummy_grok1.tar in this directory and copy it to the right path for "--model-path" if you want to use the server.sh file provided.
+4. As an example for grok1 profiling, we create a dummy_grok1 directory with config.json (see content below) inside this directory and copy this directory to the right path for "--model-path" if you want to use the example server.sh file provided.
+```bash
+cat ../dummy_grok1/config.json
+{
+  "architectures": [
+    "Grok1ModelForCausalLM"
+  ],
+  "embedding_multiplier_scale": 78.38367176906169,
+  "output_multiplier_scale": 0.5773502691896257,
+  "vocab_size": 131072,
+  "hidden_size": 6144,
+  "intermediate_size": 32768,
+  "max_position_embeddings": 8192,
+  "num_experts_per_tok": 2,
+  "num_local_experts": 8,
+  "num_attention_heads": 48,
+  "num_hidden_layers": 64,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "rms_norm_eps": 1e-05,
+  "rope_theta": 10000.0,
+  "model_type": "mixtral",
+  "torch_dtype": "bfloat16"
+}
+```
 5. Launch server with rpd enabled script ./server.sh in one terminal inside the docker container. 
-#### Common Notes 1
+
+#### Common Notes 2
 - Remember to change model-path to the correct path
 - loadTracer.sh is needed to conduct profiling
 - SGLANG_TORCH_PROFILER_DIR is used for default torch profiler
-- Do not use loadTracer.sh if you are using the torch profiler, simply use python3 -m sglang.launch_server. It may interrupt and cause the GPU info to be unavailable (though CPU data will still be there).  
+- Do not use loadTracer.sh if you are using the torch profiler, simply use python3 -m sglang.launch_server.  
 
 
 server.sh
@@ -313,9 +342,11 @@ loadTracer.sh python3 -m sglang.launch_server \
     --disable-radix-cache 2>&1 | tee "$LOGFILE"
 ```
 6. Open another terminal for the same docker container, and run the rpd enabled ./client.sh after you see "The server is fired up and is ready to roll!" message from server side terminal.
-#### Common Notes 2
+
+#### Common Notes 3
 - Use curl http://localhost:30000/start_profile & curl http://localhost:30000/stop_profile to control the start and end of profiling. Check sglang/python/sglang/srt/managers/scheduler.py for more details.
 - Please don't use RPD profiler together with PyTorch profiler to avoid interference.
+- The rocmProfileData/tools/rpd2tracing.py file is used to generate json file from RPD file.
 
 client.sh
 
@@ -346,7 +377,7 @@ curl http://localhost:30000/stop_profile -H "Content-Type: application/json"
  
 # Convert tracing file to csv & json
 sqlite3 trace.rpd ".mode csv" ".header on" ".output trace.csv" "select * from top;" ".output stdout"
-python3 /sgl-workspace/rocmProfileData/tools/rpd2tracing.py trace.rpd trace.json
+python3 ./rocmProfileData/tools/rpd2tracing.py trace.rpd trace.json
 ```
 7. Follow [Perfetto docs](https://perfetto.dev/docs/visualization/large-traces) to visualize large json files. Try to adjust parameters so that the trace.json file size is less than 9GB.
 
@@ -385,8 +416,8 @@ index 62d1ff9..6ecd78c 100644
          logger.info("Profiler is done")
 ```
 
-2. Untar dummy_grok1.tar in this directory and copy it to the right path for "--model-path" if you want to use the server.sh file provided.
+2. Create the model path directory and copy it to the right path for "--model-path" if you want to use the server.sh file provided.
 
 3. Modify the included server.sh by removing "loadTracer.sh" before python command and launch script ./server.sh in one terminal inside the docker container. 
 
-4. Similar to step 6 in RPD profiling section, but remove the last 2 lines, which converted rpd file into csv and json files, from in client.sh. Run modified client.sh for PyTorch profiling.
+4. Similar to step 6 in RPD profiling section, but remove the last 2 lines in client.sh, which converted rpd file into csv and json files. Run modified client.sh for PyTorch profiling.
