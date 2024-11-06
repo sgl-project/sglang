@@ -57,27 +57,27 @@ logger = init_logger(__name__)
 
 class Qwen2VLImageInputs(TypedDict):
     pixel_values: torch.Tensor
-    """Shape: 
+    """Shape:
     `(num_patches, num_channels * patch_size * patch_size)`
     """
 
     image_grid_thw: torch.Tensor
     """Shape: `(num_images, 3)`
-    
+
     This should be in `(grid_t, grid_h, grid_w)` format.
     """
 
 
 class Qwen2VLVideoInputs(TypedDict):
     pixel_values_videos: torch.Tensor
-    """Shape: 
-    `(num_patches, 
+    """Shape:
+    `(num_patches,
       num_channels * temporal_patch_size * patch_size * patch_size)`
     """
 
     video_grid_thw: torch.Tensor
     """Shape: `(num_videos, 3)`
-    
+
     This should be in `(grid_t, grid_h, grid_w)` format.
     """
 

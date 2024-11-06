@@ -838,7 +838,7 @@ class Scheduler:
         time_per_output_tokens_iter: List[float] = []
 
         # Request stats
-        #   Decode 
+        #   Decode
         gen_throughput: float = 0.0
         #   Latency
         time_e2e_requests: List[float] = []
@@ -866,11 +866,11 @@ class Scheduler:
                     time_waiting_requests.append(req.queued_time - req.created_time)
                     num_prompt_tokens_requests.append(len(req.origin_input_ids))
                     num_generation_tokens_requests.append(len(req.output_ids))
-                    finished_reason_requests.append(                            
+                    finished_reason_requests.append(
                             req.finished_reason.to_json()
                             if req.finished_reason is not None
                             else None)
-    
+
         return Stats(
             new_seq=new_seq,
             num_running_req=num_running_req,

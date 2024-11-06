@@ -147,7 +147,7 @@ docker run --gpus all \
     lmsysorg/sglang:latest \
     python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --host 0.0.0.0 --port 30000
 ```
-  
+
 </details>
 
 ## Example: Run Llama 3.1 405B

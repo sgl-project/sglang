@@ -384,7 +384,7 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
 
         if not self.model_update_lock.locked():
-        
+
             async with self.model_update_lock:
                 # wait for the previous generation requests to finish
                 while len(self.rid_to_state) > 0:

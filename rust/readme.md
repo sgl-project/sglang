@@ -36,7 +36,7 @@ Usage: router [OPTIONS]
 Options:
       --host <HOST>                [default: 127.0.0.1]
       --port <PORT>                [default: 3001]
-      --worker-urls <WORKER_URLS>  
+      --worker-urls <WORKER_URLS>
       --policy <POLICY>            [default: round_robin] [possible values: round_robin, random]
   -h, --help                       Print help
   -V, --version                    Print version
@@ -82,7 +82,7 @@ $ pip install <path to wheel>
 1. Run test
 
 ```
-$ cargo test 
+$ cargo test
 ```
 
 2. Run lint
