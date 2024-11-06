@@ -25,12 +25,15 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import re
+import tempfile
 import threading
 import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, List, Optional, Union
 
 import orjson
+from starlette.routing import Mount
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -85,6 +88,10 @@ from sglang.srt.utils import (
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+# Temporary directory for prometheus multiprocess mode
+# Cleaned up automatically when this object is garbage collected
+prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -412,6 +419,18 @@ def launch_engine(
     for i in range(len(scheduler_pipe_readers)):
         scheduler_pipe_readers[i].recv()
 
+def add_prometheus_middleware(app: FastAPI):
+    # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/entrypoints/openai/api_server.py#L216
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)
+
 
 def launch_server(
     server_args: ServerArgs,
@@ -438,6 +457,11 @@ def launch_server(
     # Add api key authorization
     if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)
+
+    # add prometheus middleware
+    if server_args.enable_metrics:
+        _set_prometheus_env()
+        add_prometheus_middleware(app)
 
     # Send a warmup request
     t = threading.Thread(
@@ -466,6 +490,21 @@ def launch_server(
     finally:
         t.join()
 
+def _set_prometheus_env():
+    # Set prometheus multiprocess directory
+    # sglang uses prometheus multiprocess mode
+    # we need to set this before importing prometheus_client
+    # https://prometheus.github.io/client_python/multiprocess/
+    global prometheus_multiproc_dir
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.debug(f"User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        )
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
