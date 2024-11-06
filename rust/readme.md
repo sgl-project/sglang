@@ -10,7 +10,7 @@ WIP. Ideally just
 pip install sglang-router
 ```
 
-## Development 
+## Development
 
 ### Rust
 
