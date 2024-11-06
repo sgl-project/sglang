@@ -459,8 +459,9 @@ def launch_server(
         add_api_key_middleware(app, server_args.api_key)
 
     # add prometheus middleware
-    _set_prometheus_env()
-    add_prometheus_middleware(app)
+    if server_args.enable_metrics:
+        _set_prometheus_env()
+        add_prometheus_middleware(app)
 
     # Send a warmup request
     t = threading.Thread(
