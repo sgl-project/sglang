@@ -29,7 +29,4 @@ repos:
   - repo: https://github.com/psf/black
     rev: 24.10.0
     hooks:
-      - id: black
-        additional_dependencies: ['.[jupyter]']
-        types: [python, jupyter]
-        types_or: [python, jupyter]
+      - id: black-jupyter
