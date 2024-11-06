@@ -322,7 +322,7 @@ class EAGLEDraftInput(SpecDraftInput):
         seq_lens = batch.seq_lens.tolist()
         
         i = 0
-        # TODO: Chage it to triton kernel @kavioyu
+
         for req in batch.reqs:
             if req.finished():
                 continue

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.3.4.post2"
+version = "0.3.5"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -13,16 +13,19 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
 ]
-dependencies = ["requests", "tqdm", "numpy"]
+dependencies = ["requests", "tqdm", "numpy", "IPython"]
 
 [project.optional-dependencies]
 runtime_common = ["aiohttp", "decord", "fastapi", "hf_transfer", "huggingface_hub", "interegular",
     "orjson", "packaging", "pillow", "psutil", "pydantic", "python-multipart",
     "torchao", "uvicorn", "uvloop", "zmq",
     "outlines>=0.0.44", "modelscope"]
+srt = ["sglang[runtime_common]", "torch", "vllm==0.6.3.post1"]
+# HIP (Heterogeneous-computing Interface for Portability) for AMD
+# => base docker rocm/vllm-dev:20241022, not from public vllm whl
+srt_hip = ["sglang[runtime_common]", "torch", "vllm==0.6.3.dev13"]
 # xpu is not enabled in public vllm and torch whl,
 # need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
-srt = ["sglang[runtime_common]", "torch", "vllm==0.6.3.post1"]
 srt_xpu = ["sglang[runtime_common]"]
 
 openai = ["openai>=1.0", "tiktoken"]
@@ -37,8 +40,10 @@ test = [
     "peft",
 ]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 dev = ["sglang[all]", "sglang[test]"]
+dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_xpu = ["sglang[all_xpu]", "sglang[test]"]
 
 [project.urls]

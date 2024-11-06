@@ -19,7 +19,7 @@ from typing import Optional, Union
 
 import numpy as np
 import requests
-import torch
+from IPython.display import HTML, display
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -155,7 +155,7 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
     frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
 
     frames = []
-    for i in range(total_frames):
+    for _ in range(total_frames):
         ret, frame = cap.read()
         if ret:
             frames.append(frame)
@@ -305,7 +305,7 @@ def execute_shell_command(command: str) -> subprocess.Popen:
     Execute a shell command and return the process handle
 
     Args:
-        command: Shell command as a string (can include \ line continuations)
+        command: Shell command as a string (can include \\ line continuations)
     Returns:
         subprocess.Popen: Process handle
     """
@@ -313,12 +313,7 @@ def execute_shell_command(command: str) -> subprocess.Popen:
     command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
 
-    return subprocess.Popen(
-        parts,
-        text=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
 
 
 def wait_for_server(base_url: str, timeout: int = None) -> None:
@@ -336,6 +331,14 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 headers={"Authorization": "Bearer None"},
             )
             if response.status_code == 200:
+                time.sleep(5)
+                print_highlight(
+                    """\n
+                    NOTE: Typically, the server runs in a separate terminal.
+                    In this notebook, we run the server and notebook code together, so their outputs are combined.
+                    To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
+                    """
+                )
                 break
 
             if timeout and time.time() - start_time > timeout:
@@ -345,33 +348,10 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 
 def terminate_process(process):
-    """Safely terminate a process and clean up GPU memory.
+    from sglang.srt.utils import kill_child_process
+    kill_child_process(process.pid, include_self=True)
 
-    Args:
-        process: subprocess.Popen object to terminate
-    """
-    try:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            if os.name != "nt":
-                try:
-                    pgid = os.getpgid(process.pid)
-                    os.killpg(pgid, signal.SIGTERM)
-                    time.sleep(1)
-                    if process.poll() is None:
-                        os.killpg(pgid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            else:
-                process.kill()
-            process.wait()
-    except Exception as e:
-        print(f"Warning: {e}")
-    finally:
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-        time.sleep(2)
+
+def print_highlight(html_content: str):
+    html_content = str(html_content).replace("\n", "<br>")
+    display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))

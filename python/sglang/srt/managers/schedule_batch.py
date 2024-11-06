@@ -33,8 +33,8 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+import time
+from typing import List, Optional, Tuple, Union, TYPE_CHECKING
 
 import torch
 
@@ -217,9 +217,6 @@ class Req:
         # this does not include the jump forward tokens.
         self.completion_tokens_wo_jump_forward = 0
 
-        # The number of cached tokens, that were already cached in the KV store
-        self.cached_tokens = 0
-
         # For vision inputs
         self.image_inputs: Optional[ImageInputs] = None
 
@@ -227,7 +224,10 @@ class Req:
         self.prefix_indices = []
         self.extend_input_len = 0
         self.last_node = None
-        self.is_inflight_req = 0
+        self.is_being_chunked = 0
+
+        # For retraction
+        self.is_retracted = False
 
         # Logprobs (arguments)
         self.return_logprob = False
@@ -248,14 +248,27 @@ class Req:
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
 
-        # Embedding
+        # Embedding (return values)
         self.embedding = None
 
         # Constrained decoding
         self.grammar: Optional[Grammar] = None
 
+        # The number of cached tokens, that were already cached in the KV cache
+        self.cached_tokens = 0
+
         # For Qwen2-VL
         self.mrope_position_delta = []  # use mutable object
+
+        # Lifetime traces
+        # time when request is created and added to waitlist
+        self.created_time = None
+        # time when request is added to prefill batch
+        self.queued_time = None
+        # time when request is being processed
+        self.started_time = None
+        # time when request is finished
+        self.finished_time = None
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -573,7 +586,7 @@ class ScheduleBatch:
             seq_lens[i] -= encoder_len
 
             if len(req.prefix_indices) < encoder_len:
-                # NOTE: the encoder part should considered as a whole
+                # NOTE: the encoder part should be considered as a whole
                 assert len(req.prefix_indices) == 0
                 input_ids[i] = input_ids[i][encoder_len:]
                 encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
@@ -660,6 +673,7 @@ class ScheduleBatch:
 
             req.extend_logprob_start_len = extend_logprob_start_len
             pt += req.extend_input_len
+            req.is_retracted = False
 
         # Set fields
         self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
@@ -792,6 +806,7 @@ class ScheduleBatch:
             req.prefix_indices = []
             req.last_node = None
             req.extend_input_len = 0
+            req.is_retracted = True
 
             # For incremental logprobs
             req.last_update_decode_tokens = 0
@@ -902,7 +917,7 @@ class ScheduleBatch:
 
     def filter_batch(
         self,
-        current_inflight_req: Optional[Req] = None,
+        being_chunked_req: Optional[Req] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
@@ -910,7 +925,7 @@ class ScheduleBatch:
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and self.reqs[i] is not current_inflight_req
+                and self.reqs[i] is not being_chunked_req
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -1041,6 +1056,9 @@ class ScheduleBatch:
             f"#req={(len(self.reqs))})"
         )
 
+    def mark_reqs_started(self):
+        for req in self.reqs:
+            req.started_time = time.time()
 
 @dataclasses.dataclass
 class ModelWorkerBatch:
