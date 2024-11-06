@@ -260,7 +260,7 @@ app.post("/encode")(encode_request)
 app.put("/encode")(encode_request)
 
 
-async def judge_request(obj: EmbeddingReqInput, request: Request):
+async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
@@ -271,8 +271,8 @@ async def judge_request(obj: EmbeddingReqInput, request: Request):
         )
 
 
-app.post("/judge")(judge_request)
-app.put("/judge")(judge_request)
+app.post("/classify")(classify_request)
+app.put("/classify")(classify_request)
 
 
 @app.post("/v1/completions")
