@@ -129,9 +129,9 @@ def load_model(server_args, port_args, tp_rank):
 
     model_config = ModelConfig(
         server_args.model_path,
-        server_args.trust_remote_code,
+        trust_remote_code=server_args.trust_remote_code,
         context_length=server_args.context_length,
-        model_override_args=json.loads(server_args.json_model_override_args),
+        model_override_args=server_args.json_model_override_args,
     )
     model_runner = ModelRunner(
         model_config=model_config,
@@ -227,22 +227,24 @@ def extend(reqs, model_runner):
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool=model_runner.token_to_kv_pool,
         tree_cache=None,
+        model_config=model_runner.model_config,
     )
-    batch.prepare_for_extend(model_runner.model_config.vocab_size)
+    batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch).tolist()
+    next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
 
 
 @torch.inference_mode()
 def decode(input_token_ids, batch, model_runner):
-    batch.prepare_for_decode(input_token_ids)
+    batch.output_ids = input_token_ids
+    batch.prepare_for_decode()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch).tolist()
+    next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
 
 
@@ -252,6 +254,7 @@ def correctness_test(
     bench_args,
     tp_rank,
 ):
+    configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
@@ -279,8 +282,9 @@ def correctness_test(
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
     for _ in range(bench_args.output_len[0] - 1):
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+        next_token_ids_list = next_token_ids.tolist()
         for i in range(len(reqs)):
-            output_ids[i].append(next_token_ids[i])
+            output_ids[i].append(next_token_ids_list[i])
 
     # Print
     for i in range(len(reqs)):
@@ -546,4 +550,4 @@ if __name__ == "__main__":
     except Exception as e:
         raise e
     finally:
-        kill_child_process(os.getpid(), including_parent=False)
+        kill_child_process()

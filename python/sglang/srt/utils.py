@@ -35,7 +35,8 @@ import psutil
 import requests
 import torch
 import torch.distributed as dist
-from fastapi.responses import JSONResponse
+import zmq
+from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
@@ -203,34 +204,6 @@ def is_port_available(port):
             return False
 
 
-def is_multimodal_model(model_architectures):
-    if (
-        "LlavaLlamaForCausalLM" in model_architectures
-        or "LlavaQwenForCausalLM" in model_architectures
-        or "LlavaMistralForCausalLM" in model_architectures
-        or "LlavaVidForCausalLM" in model_architectures
-    ):
-        return True
-    else:
-        return False
-
-
-def is_generation_model(model_architectures, is_embedding: bool = False):
-    # We have two ways to determine whether a model is a generative model.
-    # 1. Check the model architectue
-    # 2. check the `is_embedding` server args
-
-    if (
-        "LlamaEmbeddingModel" in model_architectures
-        or "MistralModel" in model_architectures
-        or "LlamaForSequenceClassification" in model_architectures
-        or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
-    ):
-        return False
-    else:
-        return not is_embedding
-
-
 def decode_video_base64(video_base64):
     from PIL import Image
 
@@ -375,17 +348,26 @@ def kill_parent_process():
     """Kill the parent process and all children of the parent process."""
     current_process = psutil.Process()
     parent_process = current_process.parent()
-    kill_child_process(parent_process.pid, skip_pid=current_process.pid)
-
-
-def kill_child_process(pid, including_parent=True, skip_pid=None):
-    """Kill the process and all its children process."""
+    kill_child_process(
+        parent_process.pid, include_self=True, skip_pid=current_process.pid
+    )
     try:
-        parent = psutil.Process(pid)
+        current_process.kill()
+    except psutil.NoSuchProcess:
+        pass
+
+
+def kill_child_process(pid=None, include_self=False, skip_pid=None):
+    """Kill the process and all its children process."""
+    if pid is None:
+        pid = os.getpid()
+
+    try:
+        itself = psutil.Process(pid)
     except psutil.NoSuchProcess:
         return
 
-    children = parent.children(recursive=True)
+    children = itself.children(recursive=True)
     for child in children:
         if child.pid == skip_pid:
             continue
@@ -394,9 +376,9 @@ def kill_child_process(pid, including_parent=True, skip_pid=None):
         except psutil.NoSuchProcess:
             pass
 
-    if including_parent:
+    if include_self:
         try:
-            parent.kill()
+            itself.kill()
         except psutil.NoSuchProcess:
             pass
 
@@ -566,7 +548,7 @@ def add_api_key_middleware(app, api_key: str):
         if request.url.path.startswith("/health"):
             return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
-            return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+            return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
 
 
@@ -584,10 +566,11 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
 
 def configure_logger(server_args, prefix: str = ""):
     format = f"[%(asctime)s{prefix}] %(message)s"
+    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
-        datefmt="%H:%M:%S",
+        datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
 
@@ -697,3 +680,27 @@ def first_rank_print(*args, **kwargs):
         print(*args, **kwargs)
     else:
         pass
+
+
+def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
+    mem = psutil.virtual_memory()
+    total_mem = mem.total / 1024**3
+    available_mem = mem.available / 1024**3
+    if total_mem > 32 and available_mem > 16:
+        buf_size = int(0.5 * 1024**3)
+    else:
+        buf_size = -1
+
+    socket = context.socket(socket_type)
+    if socket_type == zmq.PUSH:
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDBUF, buf_size)
+        socket.connect(f"ipc://{endpoint}")
+    elif socket_type == zmq.PULL:
+        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVBUF, buf_size)
+        socket.bind(f"ipc://{endpoint}")
+    else:
+        raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    return socket

@@ -27,11 +27,12 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    GetMemPoolSizeReqOutput,
     UpdateWeightReqOutput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR, FINISH_MATCHED_TOKEN
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, kill_parent_process
+from sglang.srt.utils import configure_logger, get_zmq_socket, kill_parent_process
 from sglang.utils import find_printable_text, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -58,11 +59,12 @@ class DetokenizerManager:
     ):
         # Init inter-process communication
         context = zmq.Context(2)
-        self.recv_from_scheduler = context.socket(zmq.PULL)
-        self.recv_from_scheduler.bind(f"ipc://{port_args.detokenizer_ipc_name}")
-
-        self.send_to_tokenizer = context.socket(zmq.PUSH)
-        self.send_to_tokenizer.connect(f"ipc://{port_args.tokenizer_ipc_name}")
+        self.recv_from_scheduler = get_zmq_socket(
+            context, zmq.PULL, port_args.detokenizer_ipc_name
+        )
+        self.send_to_tokenizer = get_zmq_socket(
+            context, zmq.PUSH, port_args.tokenizer_ipc_name
+        )
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
@@ -75,8 +77,8 @@ class DetokenizerManager:
 
         self.decode_status = LimitedCapacityDict()
 
-    def trim_eos(self, output: Union[str, List[int]], finished_reason, no_eos_trim):
-        if no_eos_trim:
+    def trim_eos(self, output: Union[str, List[int]], finished_reason, no_stop_trim):
+        if no_stop_trim:
             return output
 
         # Trim stop str. TODO(lmzheng): handle the case where multiple stop strs are hit
@@ -111,12 +113,12 @@ class DetokenizerManager:
                 # If it is a weight update request, no detokenization is needed.
                 self.send_to_tokenizer.send_pyobj(recv_obj)
                 continue
-            elif self.tokenizer is None:
-                # If the tokenizer is skipped, no detokenization is needed
+            elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
                 self.send_to_tokenizer.send_pyobj(recv_obj)
                 continue
+            else:
+                assert isinstance(recv_obj, BatchTokenIDOut)
 
-            assert isinstance(recv_obj, BatchTokenIDOut)
             bs = len(recv_obj.rids)
 
             # Initialize decode status
@@ -141,7 +143,7 @@ class DetokenizerManager:
                     self.trim_eos(
                         s.decode_ids[s.surr_offset :],
                         recv_obj.finished_reason[i],
-                        recv_obj.no_eos_trim[i],
+                        recv_obj.no_stop_trim[i],
                     )
                 )
                 surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
@@ -177,7 +179,7 @@ class DetokenizerManager:
                     self.trim_eos(
                         s.decoded_text + new_text,
                         recv_obj.finished_reason[i],
-                        recv_obj.no_eos_trim[i],
+                        recv_obj.no_stop_trim[i],
                     )
                 )
 

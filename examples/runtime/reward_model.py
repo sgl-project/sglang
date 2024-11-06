@@ -24,7 +24,7 @@ json_data = {
     ],
 }
 response = requests.post(
-    url + "/judge",
+    url + "/classify",
     json=json_data,
 ).json()
 

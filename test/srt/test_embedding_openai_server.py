@@ -28,7 +28,7 @@ class TestOpenAIServer(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def run_embedding(self, use_list_input, token_input):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)

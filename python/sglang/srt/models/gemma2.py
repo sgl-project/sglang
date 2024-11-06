@@ -20,11 +20,10 @@ from typing import Iterable, Optional, Set, Tuple, Union
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.config import CacheConfig, LoRAConfig
+from vllm.config import LoRAConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 
 # from vllm.model_executor.layers.rotary_embedding import GemmaRotaryEmbedding
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.activation import GeluAndMul
@@ -37,6 +36,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -105,7 +105,7 @@ class Gemma2Attention(nn.Module):
         head_dim: int,
         max_position_embeddings: int,
         rope_theta: float,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -190,7 +190,7 @@ class Gemma2DecoderLayer(nn.Module):
         self,
         layer_idx: int,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -257,7 +257,7 @@ class Gemma2Model(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -336,7 +336,7 @@ class Gemma2ForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
     ) -> None:

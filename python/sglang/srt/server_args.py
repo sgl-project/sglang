@@ -64,16 +64,20 @@ class ServerArgs:
     stream_interval: int = 1
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
+    decode_log_interval: int = 40
 
     # Logging
     log_level: str = "info"
     log_level_http: Optional[str] = None
     log_requests: bool = False
     show_time_cost: bool = False
+    enable_metrics: bool = False
 
     # Other
     api_key: Optional[str] = None
     file_storage_pth: str = "SGLang_storage"
+    enable_cache_report: bool = False
+    watchdog_timeout: float = 600
 
     # Data parallelism
     dp_size: int = 1
@@ -87,6 +91,14 @@ class ServerArgs:
     # Model override args in JSON
     json_model_override_args: str = "{}"
 
+    # Double Sparsity
+    enable_double_sparsity: bool = False
+    ds_channel_config_path: str = None
+    ds_heavy_channel_num: int = 32
+    ds_heavy_token_num: int = 256
+    ds_heavy_channel_type: str = "qk"
+    ds_sparse_decode_threshold: int = 4096
+
     # LoRA
     lora_paths: Optional[List[str]] = None
     max_loras_per_batch: int = 8
@@ -94,6 +106,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
+    grammar_backend: Optional[str] = "outlines"
 
     # Optimization/debug options
     disable_flashinfer: bool = False
@@ -106,9 +119,12 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_penalizer: bool = False
+    disable_nan_detection: bool = False
+    enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
-    max_torch_compile_bs: int = 32
+    torch_compile_max_bs: int = 32
+    cuda_graph_max_bs: int = 160
     torchao_config: str = ""
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -166,6 +182,16 @@ class ServerArgs:
 
         if self.sampling_backend is None:
             self.sampling_backend = "flashinfer"
+
+        if self.enable_overlap_schedule:
+            logger.warning(
+                "Overlap scheduler mode is enabled. This is an experimental feature. "
+                "Sampling penalizer (e.g., frequency and repetition penalty), constrained decoding (e.g., regex, JSON), "
+                "and embedding APIs are not supported and will lead to wrong results. "
+                "The NaN detection is also disabled."
+            )
+            self.disable_penalizer = True
+            self.disable_nan_detection = True
 
         # Model-specific patches
         if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
@@ -399,6 +425,12 @@ class ServerArgs:
             help="Show time cost of custom marks.",
         )
         parser.add_argument(
+            "--enable-metrics",
+            action="store_true",
+            help="Enable log prometheus metrics.",
+        )
+
+        parser.add_argument(
             "--api-key",
             type=str,
             default=ServerArgs.api_key,
@@ -409,6 +441,23 @@ class ServerArgs:
             type=str,
             default=ServerArgs.file_storage_pth,
             help="The path of the file storage in backend.",
+        )
+        parser.add_argument(
+            "--enable-cache-report",
+            action="store_true",
+            help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--watchdog-timeout",
+            type=float,
+            default=ServerArgs.watchdog_timeout,
+            help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
+        parser.add_argument(
+            "--decode-log-interval",
+            type=int,
+            default=ServerArgs.decode_log_interval,
+            help="The log interval of decode batch"
         )
 
         # Data parallelism
@@ -452,6 +501,43 @@ class ServerArgs:
             default=ServerArgs.json_model_override_args,
         )
 
+        # Double Sparsity
+        parser.add_argument(
+            "--enable-double-sparsity",
+            action="store_true",
+            help="Enable double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-channel-config-path",
+            type=str,
+            default=ServerArgs.ds_channel_config_path,
+            help="The path of the double sparsity channel config",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-num",
+            type=int,
+            default=ServerArgs.ds_heavy_channel_num,
+            help="The number of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-token-num",
+            type=int,
+            default=ServerArgs.ds_heavy_token_num,
+            help="The number of heavy tokens in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-type",
+            type=str,
+            default=ServerArgs.ds_heavy_channel_type,
+            help="The type of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-sparse-decode-threshold",
+            type=int,
+            default=ServerArgs.ds_sparse_decode_threshold,
+            help="The type of heavy channels in double sparsity attention",
+        )
+
         # LoRA
         parser.add_argument(
             "--lora-paths",
@@ -482,6 +568,13 @@ class ServerArgs:
             choices=["flashinfer", "pytorch"],
             default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
+        )
+        parser.add_argument(
+            "--grammar-backend",
+            type=str,
+            choices=["xgrammar", "outlines"],
+            default=ServerArgs.grammar_backend,
+            help="Choose the backend for constrained decoding.",
         )
 
         # Optimization/debug options
@@ -534,7 +627,17 @@ class ServerArgs:
         parser.add_argument(
             "--disable-penalizer",
             action="store_true",
-            help="Disable the logit penalizer (e.g., frequency and repetition penalty).",
+            help="Disable the logit penalizers (e.g., frequency and repetition penalty) for better performance if they are not used in any requests.",
+        )
+        parser.add_argument(
+            "--disable-nan-detection",
+            action="store_true",
+            help="Disable the NaN detection for better performance.",
+        )
+        parser.add_argument(
+            "--enable-overlap-schedule",
+            action="store_true",
+            help="Overlap the CPU scheduler with GPU model worker. Experimental feature.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",
@@ -547,10 +650,16 @@ class ServerArgs:
             help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
-            "--max-torch-compile-bs",
+            "--torch-compile-max-bs",
             type=int,
-            default=ServerArgs.max_torch_compile_bs,
+            default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--cuda-graph-max-bs",
+            type=int,
+            default=ServerArgs.cuda_graph_max_bs,
+            help="Set the maximum batch size for cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -648,11 +757,11 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args) -> "PortArgs":
-        port = server_args.port + 1
+        port = server_args.port + 42
         while True:
             if is_port_available(port):
                 break
-            port += 1
+            port += 42
 
         return PortArgs(
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,

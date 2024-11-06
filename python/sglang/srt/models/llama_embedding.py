@@ -36,9 +36,7 @@ class LlamaEmbeddingModel(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.pooler(hidden_states, forward_batch)
 
-    def load_weights(
-        self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -49,7 +47,7 @@ class LlamaEmbeddingModel(nn.Module):
         ]
         params_dict = dict(self.model.named_parameters())
 
-        def load_weights_per_param(name, loaded_weight):
+        for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 return
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -77,12 +75,6 @@ class LlamaEmbeddingModel(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-        if name is None or loaded_weight is None:
-            for name, loaded_weight in weights:
-                load_weights_per_param(name, loaded_weight)
-        else:
-            load_weights_per_param(name, loaded_weight)
 
 
 class MistralModel(LlamaEmbeddingModel):

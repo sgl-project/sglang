@@ -1,3 +1,8 @@
+"""
+python3 -m unittest test_openai_server.TestOpenAIServer.test_batch
+python3 -m unittest test_openai_server.TestOpenAIServer.test_completion
+
+"""
 import json
 import time
 import unittest
@@ -31,7 +36,7 @@ class TestOpenAIServer(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def run_completion(
         self, echo, logprobs, use_list_input, parallel_sample_num, token_input

@@ -22,7 +22,7 @@ class TestEvalAccuracyMini(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -31,6 +31,7 @@ class TestEvalAccuracyMini(unittest.TestCase):
             eval_name="mmlu",
             num_examples=64,
             num_threads=32,
+            temperature=0.1,
         )
 
         metrics = run_eval(args)
