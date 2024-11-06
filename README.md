@@ -36,17 +36,19 @@ The core features include:
 
 - **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, jump-forward constrained decoding, continuous batching, token attention (paged attention), tensor parallelism, FlashInfer kernels, chunked prefill, and quantization (INT4/FP8/AWQ/GPTQ).
 - **Flexible Frontend Language**: Offers an intuitive interface for programming LLM applications, including chained generation calls, advanced prompting, control flow, multi-modal inputs, parallelism, and external interactions.
-- **Extensive Model Support**: Supports a wide range of generative models (Llama, Gemma, Mistral, QWen, DeepSeek, LLaVA, etc.) and embedding models (e5-mistral), with easy extensibility for integrating new models.
+- **Extensive Model Support**: Supports a wide range of generative models (Llama, Gemma, Mistral, QWen, DeepSeek, LLaVA, etc.), embedding models (e5-mistral, gte) and reward models (Skywork), with easy extensibility for integrating new models.
 - **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
 
-## Install
-See [https://sgl-project.github.io/install.html](https://sgl-project.github.io/install.html)
+## Getting Started
+Install SGLang: See [https://sgl-project.github.io/start/install.html](https://sgl-project.github.io/start/install.html)
+
+Send requests: See [https://sgl-project.github.io/start/send_request.html](https://sgl-project.github.io/start/send_request.html)
 
 ## Backend: SGLang Runtime (SRT)
-See [https://sgl-project.github.io/backend.html](https://sgl-project.github.io/backend.html)
+See [https://sgl-project.github.io/backend/backend.html](https://sgl-project.github.io/backend/backend.html)
 
 ## Frontend: Structured Generation Language (SGLang)
-See [https://sgl-project.github.io/frontend.html](https://sgl-project.github.io/frontend.html)
+See [https://sgl-project.github.io/frontend/frontend.html](https://sgl-project.github.io/frontend/frontend.html)
 
 ## Benchmark And Performance
 Learn more in our release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)

@@ -1,5 +1,6 @@
 """
 python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_simple_decode
+python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_parallel_sample
 """
 
 import json
@@ -36,11 +37,17 @@ class TestSRTEndpoint(unittest.TestCase):
         return_text=False,
         n=1,
         stream=False,
+        batch=False,
     ):
+        if batch:
+            text = ["The capital of France is"]
+        else:
+            text = "The capital of France is"
+
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": "The capital of France is",
+                "text": text,
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": 16,
@@ -66,6 +73,9 @@ class TestSRTEndpoint(unittest.TestCase):
 
     def test_simple_decode(self):
         self.run_decode()
+
+    def test_simple_decode_batch(self):
+        self.run_decode(batch=True)
 
     def test_parallel_sample(self):
         self.run_decode(n=3)

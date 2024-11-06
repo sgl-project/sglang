@@ -36,7 +36,7 @@ Usage: router [OPTIONS]
 Options:
       --host <HOST>                [default: 127.0.0.1]
       --port <PORT>                [default: 3001]
-      --worker-urls <WORKER_URLS>  
+      --worker-urls <WORKER_URLS>
       --policy <POLICY>            [default: round_robin] [possible values: round_robin, random]
   -h, --help                       Print help
   -V, --version                    Print version
@@ -74,4 +74,19 @@ python -m sglang.launch_server \
 $ cargo build --release
 $ maturin build -i /usr/bin/python
 $ pip install <path to wheel>
+```
+
+
+### Development
+
+1. Run test
+
+```
+$ cargo test
+```
+
+2. Run lint
+
+```
+$ cargo fmt
 ```

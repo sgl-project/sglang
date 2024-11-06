@@ -1,7 +1,7 @@
 # Minimal makefile for Sphinx documentation
 #
 
-# You can set these variables from the command line, and also
+# You can set these variables from the terminal, and also
 # from the environment for the first two.
 SPHINXOPTS    ?=
 SPHINXBUILD   ?= sphinx-build
@@ -12,7 +12,18 @@ BUILDDIR      = _build
 help:
 	@$(SPHINXBUILD) -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
-.PHONY: help Makefile
+# New target to compile Markdown and Jupyter Notebook files
+compile:
+	find $(SOURCEDIR) -path "*/_build/*" -prune -o -name "*.ipynb" -print | while read nb; do \
+		if [ -f "$$nb" ]; then \
+			echo "Executing $$nb"; \
+			jupyter nbconvert --to notebook --execute --inplace "$$nb" \
+				--ExecutePreprocessor.timeout=600 \
+				--ExecutePreprocessor.kernel_name=python3; \
+		fi; \
+	done
+
+.PHONY: help Makefile compile
 
 # Catch-all target: route all unknown targets to Sphinx using the new
 # "make mode" option.  $(O) is meant as a shortcut for $(SPHINXOPTS).

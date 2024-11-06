@@ -21,7 +21,7 @@ def main():
     # Tokenize inputs
     tokenizer = get_tokenizer(MODEL_PATH)
     token_ids_list = [tokenizer.encode(prompt) for prompt in prompts]
-    
+
     # Create an LLM.
     # You can also specify `skip_tokenizer_init=True`, but it requires explicit detokenization at the end
     llm = sgl.Engine(model_path=MODEL_PATH)
