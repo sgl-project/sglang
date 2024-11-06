@@ -110,7 +110,6 @@ class TestSRTEngine(unittest.TestCase):
     def test_5_prompt_input_ids_consistency(self):
         prompt = "The capital of UK is"
 
-
         model_path = DEFAULT_MODEL_NAME_FOR_TEST
         engine = sgl.Engine(model_path=model_path, random_seed=42, log_level="error")
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
@@ -118,7 +117,9 @@ class TestSRTEngine(unittest.TestCase):
 
         tokenizer = get_tokenizer(model_path)
         token_ids = tokenizer.encode(prompt)
-        out2 = engine.generate(input_ids=token_ids, sampling_params=sampling_params)["text"]
+        out2 = engine.generate(input_ids=token_ids, sampling_params=sampling_params)[
+            "text"
+        ]
 
         engine.shutdown()
 
