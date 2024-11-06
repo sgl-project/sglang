@@ -185,3 +185,21 @@ sglang:waiting_request_latency_seconds_bucket{le="100000.0",name="google/gemma-2
 sglang:waiting_request_latency_seconds_bucket{le="+Inf",name="google/gemma-2-9b-it"} 2104.0
 sglang:waiting_request_latency_seconds_count{name="google/gemma-2-9b-it"} 2104.0
 ```
+
+## Setup Guide
+
+To setup a monitoring dashboard, you can use the following docker compose file: [examples/monitoring/docker-compose.yaml](../examples/monitoring/docker-compose.yaml).
+
+Assume you have sglang server running at `localhost:30000`.
+
+To start the monitoring dashboard (prometheus + grafana), cd to `examples/monitoring` and run:
+
+```bash
+docker compose -f compose.yaml -p monitoring up
+```
+
+Then you can access the Grafana dashboard at http://localhost:3000.
+
+### Grafana Dashboard
+
+To import the Grafana dashboard, click `+` -> `Import` -> `Upload JSON file` -> `Upload` and select [grafana.json](../examples/monitoring/grafana.json).
