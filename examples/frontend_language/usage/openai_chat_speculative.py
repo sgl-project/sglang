@@ -4,8 +4,8 @@ Usage:
 Show in "assistant" the desired answer format. Each "gen" term should have a stop token.
 The stream mode is not supported in speculative execution.
 
-E.g. 
-correct: 
+E.g.
+correct:
     sgl.assistant("\nName:" + sgl.gen("name", stop="\n") + "\nBirthday:" + sgl.gen("birthday", stop="\n") + "\nJob:" + sgl.gen("job", stop="\n"))
 incorrect:
     s += sgl.assistant("\nName:" + sgl.gen("name", stop="\n"))

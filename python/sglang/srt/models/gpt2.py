@@ -136,7 +136,7 @@ class GPT2Block(nn.Module):
         layer_id: int,
         config: GPT2Config,
         cache_config = None,
-        
+
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):

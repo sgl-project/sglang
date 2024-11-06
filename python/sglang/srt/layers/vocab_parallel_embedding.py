@@ -311,7 +311,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     def get_sharded_to_full_mapping(self) -> Optional[List[int]]:
         """Get a mapping that can be used to reindex the gathered
         logits for sampling.
-        
+
         During sampling, we gather logits from all ranks. The relationship
         of index->token_id will follow the same format as outlined in the class
         docstring. However, after the gather, we want to reindex the final

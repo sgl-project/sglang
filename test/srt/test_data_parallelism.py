@@ -53,7 +53,7 @@ class TestDataParallelism(unittest.TestCase):
 
         # pause a few seconds then send again
         time.sleep(5)
-        
+
         response = requests.post(
             self.base_url + "/update_weights",
             json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},

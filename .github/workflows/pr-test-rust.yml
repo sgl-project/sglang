@@ -4,11 +4,11 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "rust/*"
+      - "rust/**"
   pull_request:
     branches: [ main ]
     paths:
-      - "rust/*"
+      - "rust/**"
   workflow_dispatch:
 
 concurrency:
