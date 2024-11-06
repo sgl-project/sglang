@@ -70,6 +70,7 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = False
     show_time_cost: bool = False
+    enable_metrics: bool = False
 
     # Other
     api_key: Optional[str] = None
@@ -414,6 +415,12 @@ class ServerArgs:
             action="store_true",
             help="Show time cost of custom marks.",
         )
+        parser.add_argument(
+            "--enable-metrics",
+            action="store_true",
+            help="Enable log prometheus metrics.",
+        )
+
         parser.add_argument(
             "--api-key",
             type=str,
