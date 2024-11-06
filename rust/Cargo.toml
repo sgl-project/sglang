@@ -22,4 +22,4 @@ rand = "0.8.5"
 reqwest = { version = "0.12.8", features = ["stream"] }
 futures-util = "0.3"
 serde_json = "=1.0.1"
-pyo3 = { version = "0.22.5" }
+pyo3 = { version = "0.22.5", features = ["extension-module"] }
