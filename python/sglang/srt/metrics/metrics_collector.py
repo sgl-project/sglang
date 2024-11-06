@@ -151,7 +151,7 @@ class Metrics:
                 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75,
                 1.0, 2.5
             ])
-        
+
         # Request Stats
         #   Metadata
         self.num_prompt_tokens_requests = Histogram(
@@ -253,7 +253,7 @@ class PrometheusMetricsCollector(MetricsCollector):
                             stats.time_to_first_tokens_iter)
         self._log_histogram(self.metrics.histogram_time_per_output_token,
                             stats.time_per_output_tokens_iter)
-        
+
         # self._log_gauge(self.metrics.gpu_cache_usage_sys, stats.gpu_cache_usage_sys)
         self._log_gauge(self.metrics.num_running_sys, stats.num_running_req)
         self._log_gauge(self.metrics.num_waiting_sys, stats.num_waiting_req)

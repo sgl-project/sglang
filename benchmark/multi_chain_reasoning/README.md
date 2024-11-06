@@ -43,7 +43,7 @@ python3 bench_other.py --num-questions 8 --backend guidance --parallel 1 --n-ctx
 ```
 
 ### Benchmark lmql
-    
+
 ```
 python3 bench_other.py --num-questions 64 --backend lmql --parallel 1
 ```
