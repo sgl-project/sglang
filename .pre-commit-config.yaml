@@ -31,5 +31,5 @@ repos:
     hooks:
       - id: black
         additional_dependencies: ['.[jupyter]']
-        types: [python, jupyter]
-        types_or: [python, jupyter]
+        types: [file]
+        files: '\.(py|ipynb)$'
