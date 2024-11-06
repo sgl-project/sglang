@@ -62,6 +62,8 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.metrics.metrics_collector import PrometheusMetricsCollector
+from sglang.srt.metrics.metrics_types import Stats
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
@@ -222,7 +224,8 @@ class Scheduler:
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.last_stats_tic = time.time()
+        self.last_stats_tic = time.time() # time of last stats for every iter
+        self.last_log_tic = time.time() # time of last log for print decode log
         self.stream_interval = server_args.stream_interval
 
         # Init chunked prefill
@@ -291,6 +294,15 @@ class Scheduler:
                 ],
                 with_stack=True,
             )
+        # Init metrics stats
+        self.stats = Stats()
+        self.metrics_collector = PrometheusMetricsCollector(
+            labels={
+                "model_name": self.server_args.served_model_name,
+                # TODO: Add lora name/path in the future,
+            },
+            max_model_len=self.max_total_num_tokens,
+        )
 
     def watchdog_thread(self):
         self.watchdog_last_forward_ct = 0
@@ -338,6 +350,11 @@ class Scheduler:
             else:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+            # log stats
+            if self.is_generation and self.server_args.enable_metrics:
+                stats = self.get_stats(batch)
+                self.log_stats(stats)
+            self.last_stats_tic = time.time()
 
             self.last_batch = batch
 
@@ -476,6 +493,7 @@ class Scheduler:
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
+        req.created_time = time.time()
         self.waiting_queue.append(req)
 
     def handle_embedding_request(
@@ -504,9 +522,11 @@ class Scheduler:
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
+        throughput = self.num_generated_tokens / (time.time() - self.last_log_tic)
         self.num_generated_tokens = 0
-        self.last_stats_tic = time.time()
+        self.last_log_tic = time.time()
+        # set system stats
+        self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
         num_running_reqs = len(self.running_batch.reqs) if self.running_batch else 0
         logger.info(
             f"Decode batch. "
@@ -676,6 +696,9 @@ class Scheduler:
                 self.token_to_kv_pool.available_size()
                 + self.tree_cache.evictable_size()
             )
+            # set system stats
+            self.stats.cache_hit_rate = round(100.0 * tree_cache_hit_rate, 2)
+            self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
 
             if num_mixed_running > 0:
                 logger.info(
@@ -770,6 +793,7 @@ class Scheduler:
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
                 model_worker_batch = batch.get_model_worker_batch()
+                batch.mark_reqs_started()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
@@ -789,6 +813,88 @@ class Scheduler:
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = embeddings, model_worker_batch.bid
         return ret
+    def get_stats(self,batch: ScheduleBatch):
+        # TODO: get stats for chunked prefill
+
+        now = time.time()
+        # system stats
+        #   Scheduler State
+        new_seq: int = 0
+        num_running_req = len(self.running_batch.reqs) if self.running_batch else 0
+        num_waiting_req = len(self.waiting_queue)
+        #   Cache State
+        cache_hit_rate: float = 0.0
+        token_usage: float = 0.0
+
+        # set stats from prefill
+        if self.stats is not None:
+            # new_seq=self.stats.new_seq
+            cache_hit_rate=self.stats.cache_hit_rate
+            token_usage=self.stats.token_usage
+        # Iteration stats
+        num_prompt_tokens_iter = 0
+        num_generation_tokens_iter = 0
+        time_to_first_tokens_iter: List[float] = []
+        time_per_output_tokens_iter: List[float] = []
+
+        # Request stats
+        #   Decode 
+        gen_throughput: float = 0.0
+        #   Latency
+        time_e2e_requests: List[float] = []
+        time_waiting_requests: List[float] = []
+        #   Metadata
+        num_prompt_tokens_requests: List[int] = []
+        num_generation_tokens_requests: List[int] = []
+        finished_reason_requests: List[str] = []
+
+        # _, next_token_ids, _ = result
+        if batch is not None:
+            num_generation_tokens_iter = len(batch.output_ids)
+            gen_throughput = round(num_generation_tokens_iter / (now - self.last_stats_tic), 2)
+
+            for i, req in enumerate(batch.reqs):
+                # NOTE: Batch forward mode is extend befor start decode,
+                if batch.forward_mode.is_extend():
+                    num_prompt_tokens_iter=len(batch.input_ids)+sum(batch.prefix_lens)
+                    time_to_first_tokens_iter.append(now - req.started_time)
+                else:
+                    time_per_output_tokens_iter.append(now-self.last_stats_tic)
+
+                if req.finished():
+                    time_e2e_requests.append(now - req.created_time)
+                    time_waiting_requests.append(req.queued_time - req.created_time)
+                    num_prompt_tokens_requests.append(len(req.origin_input_ids))
+                    num_generation_tokens_requests.append(len(req.output_ids))
+                    finished_reason_requests.append(                            
+                            req.finished_reason.to_json()
+                            if req.finished_reason is not None
+                            else None)
+    
+        return Stats(
+            new_seq=new_seq,
+            num_running_req=num_running_req,
+            num_waiting_req=num_waiting_req,
+            cache_hit_rate=cache_hit_rate,
+            token_usage=token_usage,
+            num_prompt_tokens_iter=num_prompt_tokens_iter,
+            num_generation_tokens_iter=num_generation_tokens_iter,
+            time_to_first_tokens_iter=time_to_first_tokens_iter,
+            time_per_output_tokens_iter=time_per_output_tokens_iter,
+            gen_throughput=gen_throughput,
+            time_e2e_requests=time_e2e_requests,
+            time_waiting_requests=time_waiting_requests,
+            num_prompt_tokens_requests=num_prompt_tokens_requests,
+            num_generation_tokens_requests=num_generation_tokens_requests,
+            finished_reason_requests=finished_reason_requests,
+            context_len=self.model_config.context_len,
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_prefill_tokens=self.max_prefill_tokens,
+            max_running_requests=self.max_running_requests,
+        )
+
+    def log_stats(self,stats:Stats):
+        self.metrics_collector.log_stats(stats)
 
     def process_batch_result(self, batch: ScheduleBatch, result):
         if batch.forward_mode.is_decode():
