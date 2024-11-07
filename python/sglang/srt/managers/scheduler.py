@@ -224,8 +224,8 @@ class Scheduler:
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.last_stats_tic = time.time() # time of last stats for every iter
-        self.last_log_tic = time.time() # time of last log for print decode log
+        self.last_stats_tic = time.time()  # time of last stats for every iter
+        self.last_log_tic = time.time()  # time of last log for print decode log
         self.stream_interval = server_args.stream_interval
 
         # Init chunked prefill
@@ -566,9 +566,7 @@ class Scheduler:
             and not self.last_batch.is_empty()
         ):
             if self.being_chunked_req:
-                self.last_batch.filter_batch(
-                    being_chunked_req=self.being_chunked_req
-                )
+                self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
                 self.tree_cache.cache_unfinished_req(self.being_chunked_req)
                 # Inflight request keeps its rid but will get a new req_pool_idx.
                 self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
@@ -628,9 +626,7 @@ class Scheduler:
         has_inflight = self.being_chunked_req is not None
         if has_inflight:
             self.being_chunked_req.init_next_round_input()
-            self.being_chunked_req = adder.add_inflight_req(
-                self.being_chunked_req
-            )
+            self.being_chunked_req = adder.add_inflight_req(self.being_chunked_req)
 
         if self.lora_paths:
             lora_set = (
@@ -813,7 +809,8 @@ class Scheduler:
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = embeddings, model_worker_batch.bid
         return ret
-    def get_stats(self,batch: ScheduleBatch):
+
+    def get_stats(self, batch: ScheduleBatch):
         # TODO: get stats for chunked prefill
 
         now = time.time()
@@ -829,8 +826,8 @@ class Scheduler:
         # set stats from prefill
         if self.stats is not None:
             # new_seq=self.stats.new_seq
-            cache_hit_rate=self.stats.cache_hit_rate
-            token_usage=self.stats.token_usage
+            cache_hit_rate = self.stats.cache_hit_rate
+            token_usage = self.stats.token_usage
         # Iteration stats
         num_prompt_tokens_iter = 0
         num_generation_tokens_iter = 0
@@ -851,15 +848,19 @@ class Scheduler:
         # _, next_token_ids, _ = result
         if batch is not None:
             num_generation_tokens_iter = len(batch.output_ids)
-            gen_throughput = round(num_generation_tokens_iter / (now - self.last_stats_tic), 2)
+            gen_throughput = round(
+                num_generation_tokens_iter / (now - self.last_stats_tic), 2
+            )
 
             for i, req in enumerate(batch.reqs):
                 # NOTE: Batch forward mode is extend befor start decode,
                 if batch.forward_mode.is_extend():
-                    num_prompt_tokens_iter=len(batch.input_ids)+sum(batch.prefix_lens)
+                    num_prompt_tokens_iter = len(batch.input_ids) + sum(
+                        batch.prefix_lens
+                    )
                     time_to_first_tokens_iter.append(now - req.started_time)
                 else:
-                    time_per_output_tokens_iter.append(now-self.last_stats_tic)
+                    time_per_output_tokens_iter.append(now - self.last_stats_tic)
 
                 if req.finished():
                     time_e2e_requests.append(now - req.created_time)
@@ -867,9 +868,10 @@ class Scheduler:
                     num_prompt_tokens_requests.append(len(req.origin_input_ids))
                     num_generation_tokens_requests.append(len(req.output_ids))
                     finished_reason_requests.append(
-                            req.finished_reason.to_json()
-                            if req.finished_reason is not None
-                            else None)
+                        req.finished_reason.to_json()
+                        if req.finished_reason is not None
+                        else None
+                    )
 
         return Stats(
             new_seq=new_seq,
@@ -893,7 +895,7 @@ class Scheduler:
             max_running_requests=self.max_running_requests,
         )
 
-    def log_stats(self,stats:Stats):
+    def log_stats(self, stats: Stats):
         self.metrics_collector.log_stats(stats)
 
     def process_batch_result(self, batch: ScheduleBatch, result):
@@ -1003,9 +1005,7 @@ class Scheduler:
             if req.is_retracted:
                 continue
 
-            if self.server_args.enable_overlap_schedule and (
-                req.finished()
-            ):
+            if self.server_args.enable_overlap_schedule and (req.finished()):
                 self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
@@ -1031,7 +1031,10 @@ class Scheduler:
         self.token_to_kv_pool.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        if self.tp_rank == 0 and self.forward_ct_decode % self.server_args.decode_log_interval == 0:
+        if (
+            self.tp_rank == 0
+            and self.forward_ct_decode % self.server_args.decode_log_interval == 0
+        ):
             self.print_decode_stats()
 
     def add_logprob_return_values(
