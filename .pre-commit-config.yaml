@@ -30,6 +30,6 @@ repos:
     rev: 24.10.0
     hooks:
       - id: black
-        additional_dependencies: ['.[jupyter]']
-        types: [file]
-        files: '\.(py|ipynb)$'
+        types: [python]
+      - id: black-jupyter
+        types: [jupyter]
