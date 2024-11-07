@@ -24,6 +24,11 @@ from transformers import MixtralConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    DEFAULT_VOCAB_PADDING_SIZE,
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.layernorm import RMSNorm
@@ -36,12 +41,72 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.torchao_utils import apply_torchao_config_
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+def sparsemixer(scores: torch.Tensor, jitter_eps: float = 0.01) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Custom sparse gating function tailored for PhiMoE routing.
+    """
+    # First expert
+    with torch.no_grad():
+        mask_logits_threshold, max_ind = scores.max(dim=-1, keepdim=True)
+        factor = scores.abs().clamp(min=mask_logits_threshold)
+        mask_logits_threshold = ((mask_logits_threshold - scores) / factor) > (2 * jitter_eps)
+
+    # Apply mask
+    masked_gates = scores.masked_fill(mask_logits_threshold, float("-inf"))
+    selected_experts = max_ind
+
+    # Compute scores for gradients
+    masked_gates = torch.softmax(masked_gates, dim=-1)
+    multiplier_o = masked_gates.gather(dim=-1, index=selected_experts)
+
+    multiplier = multiplier_o
+
+    # Masked out first expert
+    masked_scores = torch.scatter(
+        scores,
+        -1,
+        selected_experts,
+        float("-inf"),
+    )
+
+    with torch.no_grad():
+        mask_logits_threshold, max_ind = masked_scores.max(dim=-1, keepdim=True)
+        factor = scores.abs().clamp(min=mask_logits_threshold)
+        mask_logits_threshold = ((mask_logits_threshold - scores) / factor) > (2 * jitter_eps)
+
+    # Apply mask for top-2
+    masked_gates_top2 = masked_scores.masked_fill(mask_logits_threshold, float("-inf"))
+    selected_experts_top2 = max_ind
+
+    # Compute scores for gradients
+    masked_gates_top2 = torch.softmax(masked_gates_top2, dim=-1)
+    multiplier_top2 = masked_gates_top2.gather(dim=-1, index=selected_experts_top2)
+
+    multiplier = torch.cat((multiplier, multiplier_top2), dim=-1)
+    selected_experts = torch.cat((selected_experts, selected_experts_top2), dim=-1)
+
+    return multiplier, selected_experts
+
+
+def phimoe_routing_function(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    PhiMoE routing function specific to PhiMoE's architecture.
+    """
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    assert topk == 2, "Only top-2 routing is supported"
+    assert renormalize is False, "Renormalization is not supported"
+
+    topk_weights, topk_ids = sparsemixer(gating_output)
+    return topk_weights, topk_ids
 
 
 class MixtralMoE(nn.Module):
@@ -63,6 +128,7 @@ class MixtralMoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
         prefix: str = "",
+        is_phimoe: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -84,10 +150,13 @@ class MixtralMoE(nn.Module):
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
             reduce_results=True,
-            renormalize=True,
+            renormalize=not is_phimoe,
             quant_config=quant_config,
             tp_size=tp_size,
             prefix=f"{prefix}.experts",
+            custom_routing_function=phimoe_routing_function if is_phimoe else None,
+            # custom_routing_function=phimoe_routing_function,
+            
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -201,6 +270,9 @@ class MixtralDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
+        
+        # todo: check if isinstance can be used (probably need trust_remote_code=True)
+        is_phimoe = config.architectures[0] == 'PhiMoEForCausalLM'
         self.block_sparse_moe = MixtralMoE(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
@@ -208,11 +280,20 @@ class MixtralDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
             prefix=f"{prefix}.block_sparse_moe",
+            is_phimoe=is_phimoe,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        if is_phimoe:
+            self.input_layernorm = nn.LayerNorm(config.hidden_size,
+                                                eps=config.rms_norm_eps,
+                                                elementwise_affine=True)
+            self.post_attention_layernorm = nn.LayerNorm(config.hidden_size,
+                                                         eps=config.rms_norm_eps,
+                                                         elementwise_affine=True)
+        else:
+            self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
 
     def forward(
         self,
@@ -222,11 +303,18 @@ class MixtralDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # todo gaurav: add these back
+        # if residual is None:
+        #     residual = hidden_states
+        #     hidden_states = self.input_layernorm(hidden_states)
+        # else:
+        #     hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # if isphimoe:
+        residual = hidden_states
+
+        # Self Attention
+        hidden_states = self.input_layernorm(hidden_states)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -234,8 +322,11 @@ class MixtralDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # if isphimoe:
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.block_sparse_moe(hidden_states)
+        hidden_states = hidden_states + residual
         return hidden_states, residual
 
 
@@ -262,7 +353,11 @@ class MixtralModel(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # if isphimoe:
+        self.norm = nn.LayerNorm(config.hidden_size,
+                                 eps=config.rms_norm_eps,
+                                 elementwise_affine=True)
+        # self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -281,7 +376,9 @@ class MixtralModel(nn.Module):
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        # if isphimoe:
+        # hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
@@ -368,9 +465,6 @@ class MixtralForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    # Skip loading kv_scale from ckpts towards new design.
-                    if name.endswith(".kv_scale") and name not in params_dict:
-                        continue
                     if name is None:
                         continue
 
@@ -383,4 +477,8 @@ class MixtralForCausalLM(nn.Module):
         apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
 
-EntryClass = MixtralForCausalLM
+class PhiMoEForCausalLM(MixtralForCausalLM):
+    pass
+
+
+EntryClass = [MixtralForCausalLM, PhiMoEForCausalLM]
