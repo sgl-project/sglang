@@ -121,6 +121,7 @@ class ServerArgs:
     disable_nan_detection: bool = False
     enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
+    enable_dp_mla: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: int = 160
@@ -192,6 +193,9 @@ class ServerArgs:
             )
             self.disable_penalizer = True
             self.disable_nan_detection = True
+
+        if self.enable_dp_mla:
+            self.dp_size = self.tp_size
 
         # Model-specific patches
         if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
@@ -643,6 +647,11 @@ class ServerArgs:
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
+        )
+        parser.add_argument(
+            "--enable-dp-mla",
+            action="store_true",
+            help="Enabling data parallelism for DeepSeek MLA and tensor parallelism for MoE. The dp size should be equal to the tp size",
         )
         parser.add_argument(
             "--enable-torch-compile",

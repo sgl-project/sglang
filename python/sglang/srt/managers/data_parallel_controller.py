@@ -85,15 +85,24 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
 
-            send_to = self.launch_tensor_parallel_group(
-                server_args,
-                tmp_port_args,
-                base_gpu_id,
-                dp_rank,
-            )
-
+            if server_args.enable_dp_mla:
+                # Share workers for DP and TP
+                send_to = self.launch_tensor_parallel_process(
+                    server_args,
+                    tmp_port_args,
+                    base_gpu_id,
+                    dp_rank,
+                )
+                base_gpu_id += 1
+            else:
+                send_to = self.launch_tensor_parallel_group(
+                    server_args,
+                    tmp_port_args,
+                    base_gpu_id,
+                    dp_rank,
+                )
+                base_gpu_id += server_args.tp_size
             self.workers.append(send_to)
-            base_gpu_id += server_args.tp_size
 
     def launch_tensor_parallel_group(
         self,
@@ -128,6 +137,28 @@ class DataParallelController:
         # Wait for model to finish loading
         for i in range(len(scheduler_pipe_readers)):
             scheduler_pipe_readers[i].recv()
+
+        return send_to
+
+    def launch_tensor_parallel_process(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        base_gpu_id: int,
+        dp_rank: int,
+    ):
+        reader, writer = mp.Pipe(duplex=False)
+        gpu_id = base_gpu_id
+        tp_rank = dp_rank
+        proc = mp.Process(
+            target=run_scheduler_process,
+            args=(server_args, port_args, gpu_id, tp_rank, dp_rank, writer),
+        )
+        proc.start()
+        send_to = get_zmq_socket(
+            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
+        )
+        reader.recv()
 
         return send_to
 
