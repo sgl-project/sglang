@@ -55,6 +55,8 @@ class GenerateReqInput:
     modalities: Optional[List[str]] = None
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # Predicted output for speculation
+    predicted_output: Optional[str] = None
 
     def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
@@ -126,6 +128,9 @@ class GenerateReqInput:
                 self.sampling_params = [{}] * num
             elif not isinstance(self.sampling_params, list):
                 self.sampling_params = [self.sampling_params] * num
+            
+            if self.predicted_output is not None and not isinstance(self.predicted_output, list):
+                self.predicted_output = [self.predicted_output] * num
 
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(num)]
