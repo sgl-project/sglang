@@ -14,7 +14,7 @@ jobs:
     environment: 'prod'
     strategy:
       matrix:
-        vendor_version: ['11.8.0', '12.1.1', '12.4.1', '6.2.0']
+        cuda_version: ['11.8.0', '12.1.1', '12.4.1']
         build_type: ['all', 'srt']
     steps:
       - name: Delete huge unnecessary tools folder
@@ -33,20 +33,18 @@ jobs:
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
 
-          if [ "${{ matrix.vendor_version }}" = "11.8.0" ]; then
-            ven_tag="cu118"
-          elif [ "${{ matrix.vendor_version }}" = "12.1.1" ]; then
-            ven_tag="cu121"
-          elif [ "${{ matrix.vendor_version }}" = "12.4.1" ]; then
-            ven_tag="cu124"
-          elif [ "${{ matrix.vendor_version }}" = "6.2.0" ]; then
-            ven_tag="rocm620"
+          if [ "${{ matrix.cuda_version }}" = "11.8.0" ]; then
+            cuda_tag="cu118"
+          elif [ "${{ matrix.cuda_version }}" = "12.1.1" ]; then
+            cuda_tag="cu121"
+          elif [ "${{ matrix.cuda_version }}" = "12.4.1" ]; then
+            cuda_tag="cu124"
           else
-            echo "Unsupported CUDA or ROCm version"
+            echo "Unsupported CUDA version"
             exit 1
           fi
 
-          tag=v${version}-${ven_tag}
+          tag=v${version}-${cuda_tag}
 
           if [ "${{ matrix.build_type }}" = "all" ]; then
             tag_suffix=""
@@ -57,14 +55,10 @@ jobs:
             exit 1
           fi
 
-          if [ "${{ matrix.vendor_version }}" = "6.2.0" ]; then
-            docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache
-          else
-            docker build . -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.vendor_version }} --build-arg BUILD_TYPE=${{ matrix.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache
-          fi
+          docker build . -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache
           docker push lmsysorg/sglang:${tag}${tag_suffix}
 
-          if [ "${{ matrix.vendor_version }}" = "12.1.1" ]; then
+          if [ "${{ matrix.cuda_version }}" = "12.1.1" ]; then
             docker tag lmsysorg/sglang:${tag}${tag_suffix} lmsysorg/sglang:latest${tag_suffix}
             docker push lmsysorg/sglang:latest${tag_suffix}
           fi

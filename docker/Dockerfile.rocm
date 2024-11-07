@@ -8,7 +8,7 @@ FROM $BASE_IMAGE AS base
 USER root
 
 WORKDIR /sgl-workspace
-ARG BUILD_TYPE=all
+
 ARG SGL_REPO="https://github.com/sgl-project/sglang"
 ENV SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
