@@ -13,7 +13,7 @@ def main():
     sampling_params = {"temperature": 0.8, "top_p": 0.95}
 
     # Create an LLM.
-    llm = sgl.Engine(model_path="meta-llama/Llama-2-7b-chat-hf")
+    llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
 
     outputs = llm.generate(prompts, sampling_params)
     # Print the outputs.
