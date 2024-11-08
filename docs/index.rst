@@ -36,17 +36,17 @@ The core features include:
    :caption: Frontend Tutorial
 
    frontend/frontend.md
+   frontend/choices_methods.md
 
 
 .. toctree::
    :maxdepth: 1
    :caption: References
 
+   references/supported_models.md
    references/sampling_params.md
    references/hyperparameter_tuning.md
-   references/supported_models.md
    references/benchmark_and_profiling.md
-   references/choices_methods.md
    references/custom_chat_template.md
    references/contributor_guide.md
    references/troubleshooting.md
