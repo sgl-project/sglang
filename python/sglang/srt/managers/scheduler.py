@@ -110,7 +110,7 @@ class Scheduler:
         # Init inter-process communication
         context = zmq.Context(2)
 
-        if self.tp_rank == 0:
+        if self.tp_rank == 0 or self.server_args.enable_dp_mla:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name
             )
@@ -331,6 +331,10 @@ class Scheduler:
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
+
+            if self.server_args.enable_dp_mla and self.check_dp_batch_running(batch) and batch is None:
+                batch = self.get_idle_batch()
+
             self.cur_batch = batch
 
             if batch:
@@ -345,11 +349,17 @@ class Scheduler:
                         self.update_running_batch()
                         if not self.running_batch:
                             break
+                        if self.server_args.enable_dp_mla:
+                            self.check_dp_batch_running(batch)
                         result = self.run_batch(batch)
                         self.process_batch_result(batch, result)
             else:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+
+            if batch and batch.forward_mode.is_idle():
+                continue
+
             # log stats
             if self.is_generation and self.server_args.enable_metrics:
                 stats = self.get_stats(batch)
@@ -385,8 +395,29 @@ class Scheduler:
 
             self.last_batch = batch
 
+    def check_dp_batch_running(self, local_batch):
+        # Check if other DP workers have running batches
+        local_value = torch.tensor([1 if local_batch is not None else 0], dtype=torch.int32, device=self.device)
+        torch.distributed.all_reduce(
+            local_value,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.tp_worker.model_runner.tp_group,
+        )
+        return local_value.item() == 1
+
+    def get_idle_batch(self):
+        idle_batch = ScheduleBatch.init_new(
+            [],
+            self.req_to_token_pool,
+            self.token_to_kv_pool,
+            self.tree_cache,
+            self.model_config,
+        )
+        idle_batch.prepare_for_idle()
+        return idle_batch
+
     def recv_requests(self):
-        if self.tp_rank == 0:
+        if self.tp_rank == 0 or self.server_args.enable_dp_mla:
             recv_reqs = []
 
             while True:
@@ -398,7 +429,7 @@ class Scheduler:
         else:
             recv_reqs = None
 
-        if self.tp_size != 1:
+        if self.tp_size != 1 and not self.server_args.enable_dp_mla:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs
 
@@ -787,12 +818,16 @@ class Scheduler:
         self.forward_ct += 1
 
         if self.is_generation:
-            if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
+            if batch.forward_mode.is_decode() or (batch.extend_num_tokens is not None and batch.extend_num_tokens != 0):
                 model_worker_batch = batch.get_model_worker_batch()
                 batch.mark_reqs_started()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
+            elif batch.forward_mode.is_idle():
+                model_worker_batch = batch.get_model_worker_batch()
+                self.tp_worker.forward_batch_idle(model_worker_batch)
+                return
             else:
                 logits_output = None
                 if self.skip_tokenizer_init:
@@ -899,6 +934,8 @@ class Scheduler:
         self.metrics_collector.log_stats(stats)
 
     def process_batch_result(self, batch: ScheduleBatch, result):
+        if batch.forward_mode.is_idle():
+            return
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
             if batch.is_empty():

@@ -572,11 +572,16 @@ class ModelRunner:
                 get_embedding=True,
             )
 
+    def forward_idle(self, forward_batch: ForwardBatch):
+        return self.model.forward(forward_batch.input_ids, forward_batch.positions, forward_batch)
+
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
             return self.forward_extend(forward_batch)
+        elif forward_batch.forward_mode.is_idle():
+            return self.forward_idle(forward_batch)
         else:
             raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
 

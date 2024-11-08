@@ -134,6 +134,10 @@ class TpModelWorker:
             self.model_runner.token_to_kv_pool,
         )
 
+    def forward_batch_idle(self, model_worker_batch: ModelWorkerBatch):
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        self.model_runner.forward(forward_batch)
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)

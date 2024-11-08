@@ -868,6 +868,9 @@ class ScheduleBatch:
         # Reset the encoder cached status
         self.encoder_cached = [True] * len(self.reqs)
 
+    def prepare_for_idle(self):
+        self.forward_mode = ForwardMode.IDLE
+
     def prepare_for_decode(self, enable_overlap: bool = False):
         self.forward_mode = ForwardMode.DECODE
 
@@ -979,17 +982,18 @@ class ScheduleBatch:
         self.has_grammar = self.has_grammar or other.has_grammar
 
     def get_model_worker_batch(self):
-        if self.forward_mode.is_decode():
+        if self.forward_mode.is_decode() or self.forward_mode.is_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        if self.has_grammar:
-            self.sampling_info.grammars = [req.grammar for req in self.reqs]
-        else:
-            self.sampling_info.grammars = None
+        if self.sampling_info is not None:
+            if self.has_grammar:
+                self.sampling_info.grammars = [req.grammar for req in self.reqs]
+            else:
+                self.sampling_info.grammars = None
 
         global bid
         bid += 1

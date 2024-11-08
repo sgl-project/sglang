@@ -56,6 +56,8 @@ class ForwardMode(IntEnum):
     DECODE = auto()
     # Contains both EXTEND and DECODE.
     MIXED = auto()
+    # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence allocated.
+    IDLE = auto()
 
     def is_prefill(self):
         return self == ForwardMode.PREFILL
@@ -68,6 +70,9 @@ class ForwardMode(IntEnum):
 
     def is_mixed(self):
         return self == ForwardMode.MIXED
+
+    def is_idle(self):
+        return self == ForwardMode.IDLE
 
 
 @dataclass
@@ -192,7 +197,7 @@ class ForwardBatch:
         device = model_runner.device
         ret = cls(
             forward_mode=batch.forward_mode,
-            batch_size=len(batch.seq_lens),
+            batch_size=0 if (batch.seq_lens is None) else len(batch.seq_lens),
             input_ids=batch.input_ids,
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
@@ -208,6 +213,9 @@ class ForwardBatch:
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
         )
+
+        if ret.forward_mode.is_idle():
+            return ret
 
         # Init position information
         if not ret.forward_mode.is_decode():
