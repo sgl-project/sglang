@@ -12,7 +12,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-TEST_MODEL = DEFAULT_MODEL_NAME_FOR_TEST # I used "google/gemma-2-2b-it" for testing locally
+TEST_MODEL = (
+    DEFAULT_MODEL_NAME_FOR_TEST  # I used "google/gemma-2-2b-it" for testing locally
+)
+
+
 class TestEnableMetrics(unittest.TestCase):
     def test_metrics_enabled(self):
         """Test that metrics endpoint returns data when enabled"""
@@ -21,13 +25,12 @@ class TestEnableMetrics(unittest.TestCase):
             model=TEST_MODEL,
             base_url=DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            enable_metrics=True
+            enable_metrics=True,
         )
 
         try:
             # Make a request to generate some metrics
-            response = requests.get(
-                f"{DEFAULT_URL_FOR_TEST}/health_generate")
+            response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
             self.assertEqual(response.status_code, 200)
 
             # Get metrics
@@ -38,14 +41,14 @@ class TestEnableMetrics(unittest.TestCase):
             # Verify essential metrics are present
             essential_metrics = [
                 "sglang:prompt_tokens_total",
-                "sglang:generation_tokens_total", 
+                "sglang:generation_tokens_total",
                 "sglang:max_total_num_tokens",
                 "sglang:context_len",
                 "sglang:time_to_first_token_seconds",
                 "sglang:time_per_output_token_seconds",
-                "sglang:e2e_request_latency_seconds"
+                "sglang:e2e_request_latency_seconds",
             ]
-            
+
             for metric in essential_metrics:
                 self.assertIn(metric, metrics_content, f"Missing metric: {metric}")
 
@@ -67,12 +70,11 @@ class TestEnableMetrics(unittest.TestCase):
             model=TEST_MODEL,
             base_url=DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            enable_metrics=False
+            enable_metrics=False,
         )
 
         try:
-            response = requests.get(
-                f"{DEFAULT_URL_FOR_TEST}/health_generate")
+            response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
             self.assertEqual(response.status_code, 200)
             # Verify metrics endpoint is not available
             metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
