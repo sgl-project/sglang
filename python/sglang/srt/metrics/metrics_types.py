@@ -34,15 +34,12 @@ class Stats:
     num_running_req: int = 0
     num_waiting_req: int = 0
     gen_throughput: float = 0.0
-    num_token: int = 0
-    token_usage: float = 0.0
     waiting_queue: int = 0
     time_e2e_requests: List[float] = field(default_factory=list)
     time_waiting_requests: List[float] = field(default_factory=list)
     time_decode_requests: List[float] = field(default_factory=list)
     # system stats
     token_usage: float = 0.0
-    is_mixed_chunk: bool = False
     new_seq: int = 0
     new_token: int = 0
     cached_token: int = 0
