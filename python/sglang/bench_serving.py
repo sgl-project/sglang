@@ -384,7 +384,6 @@ async def async_request_shortfin_generate(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
-    print("SNB: Using Shortfin Generate")
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
 
