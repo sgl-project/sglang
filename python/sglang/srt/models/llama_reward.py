@@ -59,9 +59,10 @@ class LlamaForSequenceClassification(nn.Module):
         ), "LlamaForSequenceClassification is only used for embedding"
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        scores = self.score(hidden_states)
+        last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
+        scores = self.score(last_token_hidden)
 
-        return self.pooler(scores, forward_batch)
+        return EmbeddingPoolerOutput(scores)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
