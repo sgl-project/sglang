@@ -197,7 +197,7 @@ class ForwardBatch:
         device = model_runner.device
         ret = cls(
             forward_mode=batch.forward_mode,
-            batch_size=0 if (batch.seq_lens is None) else len(batch.seq_lens),
+            batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,

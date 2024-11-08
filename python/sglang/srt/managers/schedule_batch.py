@@ -57,6 +57,7 @@ global_server_args_dict = {
     "disable_mla": ServerArgs.disable_mla,
     "torchao_config": ServerArgs.torchao_config,
     "disable_nan_detection": ServerArgs.disable_nan_detection,
+    "enable_dp_mla": ServerArgs.enable_dp_mla,
 }
 
 
@@ -870,6 +871,9 @@ class ScheduleBatch:
 
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
+        self.input_ids = torch.empty(0, dtype=torch.int32).to(self.device, non_blocking=True)
+        self.seq_lens = torch.empty(0, dtype=torch.int32).to(self.device, non_blocking=True)
+        self.extend_num_tokens = 0
 
     def prepare_for_decode(self, enable_overlap: bool = False):
         self.forward_mode = ForwardMode.DECODE

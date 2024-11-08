@@ -818,7 +818,7 @@ class Scheduler:
         self.forward_ct += 1
 
         if self.is_generation:
-            if batch.forward_mode.is_decode() or (batch.extend_num_tokens is not None and batch.extend_num_tokens != 0):
+            if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
                 model_worker_batch = batch.get_model_worker_batch()
                 batch.mark_reqs_started()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(

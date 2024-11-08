@@ -140,6 +140,7 @@ class ModelRunner:
                 "torchao_config": server_args.torchao_config,
                 "disable_penalizer": server_args.disable_penalizer,
                 "disable_nan_detection": server_args.disable_nan_detection,
+                "enable_dp_mla": server_args.enable_dp_mla,
             }
         )
 
