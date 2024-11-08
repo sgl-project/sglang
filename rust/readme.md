@@ -2,6 +2,11 @@
 
 SGLang router is a standalone module implemented in Rust to achieve data parallelism across SGLang instances.
 
+## Architecture
+
+1. `src/`: rust impl of the router
+2. `py_src/`: lightweight python interafce on top of rust python binding. This will be published as `sglang-router` pypi package
+
 ## Installation
 
 WIP. Ideally just

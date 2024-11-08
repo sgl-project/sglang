@@ -1,13 +1,13 @@
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::{TryStreamExt};
 use std::fmt::Debug;
 use crate::tree::RadixTree;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
-use tokenizers::tokenizer::{Result, Tokenizer};
+use tokenizers::tokenizer::{Tokenizer};
 
 #[derive(Debug)]
 pub enum Router {
@@ -38,7 +38,7 @@ pub enum PolicyConfig {
 }
 
 
-fn get_token_ids_from_request(req: &HttpRequest, body: &Bytes, tokenizer: &Tokenizer) -> Vec<u32> {
+fn get_token_ids_from_request(body: &Bytes, tokenizer: &Tokenizer) -> Vec<u32> {
     // 1. convert body to json
     let json = serde_json::from_slice::<serde_json::Value>(body).unwrap();
     // 2. get the text field
@@ -101,7 +101,7 @@ impl Router {
 
         let mut input_ids: Vec<u32> = Vec::new();
         if let Router::ApproxTree { tokenizer, .. } = self {
-            input_ids = get_token_ids_from_request(&req, &body, tokenizer);
+            input_ids = get_token_ids_from_request(&body, tokenizer);
         }
 
  
@@ -173,7 +173,7 @@ impl Router {
 
 
         if let Router::ApproxTree { url_to_tree, url_to_count, .. } = self {
-            // Add sent input_ids to the tree
+            // Insert input_ids to the tree
             let mut locked_url_to_tree = url_to_tree.lock().unwrap();
             let selected_tree = locked_url_to_tree.get_mut(&worker_url).unwrap();
             selected_tree.insert(&input_ids[..]);

@@ -42,7 +42,6 @@ async fn forward_request(
 
 #[get("/v1/models")]
 async fn v1_model(data: web::Data<AppState>) -> impl Responder {
-    // TODO: extract forward_to_route
     let worker_url = match data.router.get_first() {
         Some(url) => url,
         None => return HttpResponse::InternalServerError().finish(),
@@ -61,7 +60,6 @@ async fn get_model_info(data: web::Data<AppState>) -> impl Responder {
     forward_request(&data.client, worker_url, "/get_model_info".to_string()).await
 }
 
-// no deser and ser, just forward and return
 #[post("/generate")]
 async fn generate(req: HttpRequest, body: Bytes, data: web::Data<AppState>) -> impl Responder {
     data.router.dispatch(&data.client, req, body).await
