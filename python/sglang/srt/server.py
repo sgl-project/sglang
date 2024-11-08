@@ -79,6 +79,7 @@ from sglang.srt.utils import (
     add_api_key_middleware,
     assert_pkg_version,
     configure_logger,
+    delete_directory,
     is_port_available,
     kill_child_process,
     maybe_set_triton_cache_manager,
@@ -97,8 +98,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 app = FastAPI()
-tokenizer_manager: TokenizerManager = None
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -106,6 +105,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+tokenizer_manager: TokenizerManager = None
+
+##### Native API endpoints #####
 
 
 @app.get("/health")
@@ -275,6 +278,9 @@ app.post("/classify")(classify_request)
 app.put("/classify")(classify_request)
 
 
+##### OpenAI-compatible API endpoints #####
+
+
 @app.post("/v1/completions")
 async def openai_v1_completions(raw_request: Request):
     return await v1_completions(tokenizer_manager, raw_request)
@@ -420,19 +426,6 @@ def launch_engine(
         scheduler_pipe_readers[i].recv()
 
 
-def add_prometheus_middleware(app: FastAPI):
-    # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/entrypoints/openai/api_server.py#L216
-    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
-
-    registry = CollectorRegistry()
-    multiprocess.MultiProcessCollector(registry)
-    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
-
-    # Workaround for 307 Redirect for /metrics
-    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
-    app.routes.append(metrics_route)
-
-
 def launch_server(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
@@ -490,6 +483,19 @@ def launch_server(
         )
     finally:
         t.join()
+
+
+def add_prometheus_middleware(app: FastAPI):
+    # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/entrypoints/openai/api_server.py#L216
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)
 
 
 def _set_prometheus_env():
@@ -565,6 +571,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         return
 
     model_info = res.json()
+
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
@@ -601,6 +608,9 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
         pipe_finish_writer.send("ready")
+
+    if server_args.delete_ckpt_after_loading:
+        delete_directory(server_args.model_path)
 
 
 class Runtime:
