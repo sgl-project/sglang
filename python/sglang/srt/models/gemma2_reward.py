@@ -63,6 +63,7 @@ class Gemma2ForSequenceClassification(nn.Module):
 
         return EmbeddingPoolerOutput(scores)
 
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         Gemma2ForCausalLM.load_weights(self, weights)
 
