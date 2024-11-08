@@ -1,4 +1,4 @@
-name: Release Docker Images
+name: Release Docker Images (AMD)
 on:
   push:
     branches:
@@ -10,7 +10,7 @@ on:
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: docker-build-amd
+    runs-on: docker-builder-amd
     environment: 'prod'
     strategy:
       matrix:
