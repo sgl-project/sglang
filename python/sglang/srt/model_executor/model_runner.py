@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_parallel import tensor_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -158,7 +159,7 @@ class ModelRunner:
             device_mesh = torch.distributed.init_device_mesh(
                 self.device, (self.tp_size,)
             )
-            self.model.tensor_parallel(device_mesh)
+            tensor_parallel(self.model, device_mesh)
 
         if server_args.lora_paths is not None:
             self.init_lora_manager()
