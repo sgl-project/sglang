@@ -1,10 +1,21 @@
-# SGLang Router
+# SGLang Router (Experimental)
 
 SGLang router is a standalone module implemented in Rust to achieve data parallelism across SGLang instances.
 
-### Installation
+## Installation
+
+WIP. Ideally just
+
+```bash
+pip install sglang-router
+```
+
+## Development
+
+### Rust
 
 1. Install Rust
+
 ```bash
 # Install rustup (Rust installer and version manager)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -18,6 +29,7 @@ cargo --version
 ```
 
 2. Build the router
+
 ```bash
 # Navigate to the rust directory
 cd ./rust
@@ -36,13 +48,42 @@ Usage: router [OPTIONS]
 Options:
       --host <HOST>                [default: 127.0.0.1]
       --port <PORT>                [default: 3001]
-      --worker-urls <WORKER_URLS>  
+      --worker-urls <WORKER_URLS>
       --policy <POLICY>            [default: round_robin] [possible values: round_robin, random]
   -h, --help                       Print help
   -V, --version                    Print version
 ```
 
-### Setting Up Workers
+### Python Binding
+
+1. Create a virtual environment
+
+```bash
+$ python -m venv .venv
+$ source .venv/bin/activate
+```
+
+2. Install python dependencies
+
+```bash
+$ pip install maturin
+$ pip install patchelf
+```
+
+3. Install rust python binding
+
+```bash
+$ maturin develop
+🔗 Found pyo3 bindings
+🐍 Found CPython 3.10 at /home/jobuser/resources/sglang/rust/.venv/bin/python
+📡 Using build options bindings from pyproject.toml
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+📦 Built wheel for CPython 3.10 to /tmp/.tmpJb65sc/sglang_router-0.0.0-cp310-cp310-linux_x86_64.whl
+✏️  Setting installed package as editable
+🛠 Installed sglang_router-0.0.0
+```
+
+## Usage
 
 1. Launch worker instances
 ```bash
@@ -64,29 +105,4 @@ python -m sglang.launch_server \
 2. Launch router and connect to workers
 ```bash
 ./target/debug/router --worker-urls http://127.0.0.1:30000,http://127.0.0.1:30002
-```
-
-**Note**: This module is still experimental. Please expect active changes and updates.
-
-### Python bindings
-
-```bash
-$ cargo build --release
-$ maturin build -i /usr/bin/python
-$ pip install <path to wheel>
-```
-
-
-### Development
-
-1. Run test
-
-```
-$ cargo test 
-```
-
-2. Run lint
-
-```
-$ cargo fmt
 ```

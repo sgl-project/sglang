@@ -130,28 +130,66 @@ class Metrics:
         self.counter_prompt_tokens = Counter(
             name="sglang:prompt_tokens_total",
             documentation="Number of prefill tokens processed.",
-            labelnames=labelnames)
+            labelnames=labelnames,
+        )
         self.counter_generation_tokens = Counter(
             name="sglang:generation_tokens_total",
             documentation="Number of generation tokens processed.",
-            labelnames=labelnames)
+            labelnames=labelnames,
+        )
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
             labelnames=labelnames,
             buckets=[
-                0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5,
-                0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 20.0, 25.0, 30.0
-            ])
+                0.001,
+                0.005,
+                0.01,
+                0.02,
+                0.04,
+                0.06,
+                0.08,
+                0.1,
+                0.25,
+                0.5,
+                0.75,
+                1.0,
+                2.5,
+                5.0,
+                7.5,
+                10.0,
+                15.0,
+                20.0,
+                25.0,
+                30.0,
+            ],
+        )
         self.histogram_time_per_output_token = Histogram(
             name="sglang:time_per_output_token_seconds",
             documentation="Histogram of time per output token in seconds.",
             labelnames=labelnames,
             buckets=[
-                0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75,
-                1.0, 2.5
-            ])
-        
+                0.005,
+                0.01,
+                0.015,
+                0.02,
+                0.025,
+                0.03,
+                0.04,
+                0.05,
+                0.075,
+                0.1,
+                0.15,
+                0.2,
+                0.3,
+                0.4,
+                0.5,
+                0.75,
+                1.0,
+                2.5,
+            ],
+        )
+
         # Request Stats
         #   Metadata
         self.num_prompt_tokens_requests = Histogram(
@@ -245,15 +283,20 @@ class PrometheusMetricsCollector(MetricsCollector):
             stats.num_generation_tokens_requests,
         )
 
-        self._log_counter(self.metrics.counter_prompt_tokens,
-                          stats.num_prompt_tokens_iter)
-        self._log_counter(self.metrics.counter_generation_tokens,
-                          stats.num_generation_tokens_iter)
-        self._log_histogram(self.metrics.histogram_time_to_first_token,
-                            stats.time_to_first_tokens_iter)
-        self._log_histogram(self.metrics.histogram_time_per_output_token,
-                            stats.time_per_output_tokens_iter)
-        
+        self._log_counter(
+            self.metrics.counter_prompt_tokens, stats.num_prompt_tokens_iter
+        )
+        self._log_counter(
+            self.metrics.counter_generation_tokens, stats.num_generation_tokens_iter
+        )
+        self._log_histogram(
+            self.metrics.histogram_time_to_first_token, stats.time_to_first_tokens_iter
+        )
+        self._log_histogram(
+            self.metrics.histogram_time_per_output_token,
+            stats.time_per_output_tokens_iter,
+        )
+
         # self._log_gauge(self.metrics.gpu_cache_usage_sys, stats.gpu_cache_usage_sys)
         self._log_gauge(self.metrics.num_running_sys, stats.num_running_req)
         self._log_gauge(self.metrics.num_waiting_sys, stats.num_waiting_req)

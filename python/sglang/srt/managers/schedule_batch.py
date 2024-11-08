@@ -911,8 +911,7 @@ class ScheduleBatch:
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
-                and self.reqs[i] is not being_chunked_req
+                if not self.reqs[i].finished() and self.reqs[i] is not being_chunked_req
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -1042,6 +1041,7 @@ class ScheduleBatch:
     def mark_reqs_started(self):
         for req in self.reqs:
             req.started_time = time.time()
+
 
 @dataclasses.dataclass
 class ModelWorkerBatch:

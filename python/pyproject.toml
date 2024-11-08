@@ -21,6 +21,7 @@ runtime_common = ["aiohttp", "decord", "fastapi", "hf_transfer", "huggingface_hu
     "torchao", "uvicorn", "uvloop", "zmq", 
     "outlines>=0.0.44", "modelscope"]
 srt = ["sglang[runtime_common]", "torch", "vllm==0.6.3.post1"]
+
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20241022, not from public vllm whl
 srt_hip = ["sglang[runtime_common]", "torch", "vllm==0.6.3.dev13"]
