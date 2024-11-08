@@ -452,6 +452,9 @@ def launch_server(
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
 
+    if server_args.enable_metrics:
+        _set_prometheus_env()
+
     launch_engine(server_args=server_args)
 
     # Add api key authorization
@@ -460,7 +463,6 @@ def launch_server(
 
     # add prometheus middleware
     if server_args.enable_metrics:
-        _set_prometheus_env()
         add_prometheus_middleware(app)
 
     # Send a warmup request
