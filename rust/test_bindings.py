@@ -11,7 +11,7 @@ router = router.Router(
         "http://localhost:30000",
         "http://localhost:30002",
     ],
-    policy="random"
+    policy="random",
 )
 
 # Start the router - this will block and run the server

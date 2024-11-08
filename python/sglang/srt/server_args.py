@@ -448,7 +448,7 @@ class ServerArgs:
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch"
+            help="The log interval of decode batch",
         )
 
         # Data parallelism

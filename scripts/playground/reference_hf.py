@@ -104,15 +104,9 @@ if __name__ == "__main__":
         default="TinyLlama/TinyLlama-1.1B-Chat-v0.4",
         # default="meta-llama/Llama-2-7b-chat-hf",
     )
-    parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=16)
+    parser.add_argument("--max-new-tokens", type=int, default=16)
 
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="float16")
+    parser.add_argument("--dtype", type=str, default="float16")
 
     args = parser.parse_args()
 

@@ -7,6 +7,7 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 
 MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
 
+
 def main():
     # Sample prompts.
     prompts = [

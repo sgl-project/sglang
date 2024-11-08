@@ -31,7 +31,7 @@ extensions = [
 ]
 
 nbsphinx_allow_errors = True
-nbsphinx_execute = 'never'
+nbsphinx_execute = "never"
 
 autosectionlabel_prefix_document = True
 nbsphinx_allow_directives = True
@@ -49,7 +49,7 @@ myst_enable_extensions = [
 
 myst_heading_anchors = 3
 
-nbsphinx_kernel_name = 'python3'
+nbsphinx_kernel_name = "python3"
 nbsphinx_execute_arguments = [
     "--InlineBackend.figure_formats={'svg', 'pdf'}",
     "--InlineBackend.rc={'figure.dpi': 96}",
@@ -130,8 +130,10 @@ html_context = {
 html_static_path = ["_static"]
 html_css_files = ["css/custom_log.css"]
 
+
 def setup(app):
-    app.add_css_file('css/custom_log.css')
+    app.add_css_file("css/custom_log.css")
+
 
 myst_enable_extensions = [
     "dollarmath",

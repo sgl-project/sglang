@@ -39,7 +39,7 @@ class ModelConfig:
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
         model_override_args: Optional[dict] = None,
-        is_embedding: Optional[bool] = None
+        is_embedding: Optional[bool] = None,
     ) -> None:
         # Parse args
         self.model_override_args = json.loads(model_override_args)
@@ -52,7 +52,9 @@ class ModelConfig:
         self.hf_text_config = get_hf_text_config(self.hf_config)
 
         # Check model type
-        self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
+        self.is_generation = is_generation_model(
+            self.hf_config.architectures, is_embedding
+        )
         self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
 
