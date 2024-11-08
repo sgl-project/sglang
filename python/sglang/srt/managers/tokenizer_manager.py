@@ -461,7 +461,7 @@ class TokenizerManager:
                 break
 
         kill_child_process(include_self=True)
-        sys.exit(-1)
+        sys.exit(0)
 
     async def handle_loop(self):
         """The event loop that handles requests"""
