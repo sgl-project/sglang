@@ -124,7 +124,7 @@ class SglSamplingParams:
             else False
         )
         kwargs["sampling_params"] = {
-            "max_tokens": self.max_new_tokens,
+            "max_completion_tokens": self.max_new_tokens,
             "temperature": self.temperature,
         }
         return kwargs
