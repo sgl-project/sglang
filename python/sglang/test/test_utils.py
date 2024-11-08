@@ -404,6 +404,7 @@ def popen_launch_server(
     other_args: tuple = (),
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
+    enable_metrics: bool = False,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -422,6 +423,8 @@ def popen_launch_server(
     ]
     if api_key:
         command += ["--api-key", api_key]
+    if enable_metrics:
+        command += ["--enable-metrics"]
 
     if return_stdout_stderr:
         process = subprocess.Popen(
