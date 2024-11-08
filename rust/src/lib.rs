@@ -45,7 +45,7 @@ impl Router {
         if matches!(policy, PolicyType::ApproxTree) {
             if tokenizer_path.is_none() {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "tokenizer_path is required for approx_tree policy"
+                    "tokenizer_path is required for approx_tree policy",
                 ));
             }
         }
@@ -64,14 +64,17 @@ impl Router {
         let host = self.host.clone();
         let port = self.port;
         let worker_urls = self.worker_urls.clone();
-        
+
         let policy_config = match &self.policy {
             PolicyType::Random => router::PolicyConfig::RandomConfig,
             PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig,
             PolicyType::ApproxTree => router::PolicyConfig::ApproxTreeConfig {
-                tokenizer_path: self.tokenizer_path.clone()
+                tokenizer_path: self
+                    .tokenizer_path
+                    .clone()
                     .expect("tokenizer_path is required for approx_tree policy"),
-                cache_threshold: self.cache_threshold
+                cache_threshold: self
+                    .cache_threshold
                     .expect("cache_threshold is required for approx_tree policy"),
             },
         };

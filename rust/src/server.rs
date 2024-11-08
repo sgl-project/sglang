@@ -1,7 +1,7 @@
+use crate::router::PolicyConfig;
 use crate::router::Router;
 use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use bytes::Bytes;
-use crate::router::PolicyConfig;
 
 #[derive(Debug)]
 pub struct AppState {
@@ -9,9 +9,12 @@ pub struct AppState {
     client: reqwest::Client,
 }
 
-
 impl AppState {
-    pub fn new(worker_urls: Vec<String>, client: reqwest::Client, policy_config: PolicyConfig) -> Self {
+    pub fn new(
+        worker_urls: Vec<String>,
+        client: reqwest::Client,
+        policy_config: PolicyConfig,
+    ) -> Self {
         // Create router based on policy
         let router = Router::new(worker_urls, policy_config);
 
@@ -64,7 +67,6 @@ async fn get_model_info(data: web::Data<AppState>) -> impl Responder {
 async fn generate(req: HttpRequest, body: Bytes, data: web::Data<AppState>) -> impl Responder {
     data.router.dispatch(&data.client, req, body).await
 }
-
 
 pub async fn startup(
     host: String,

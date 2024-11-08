@@ -8,7 +8,6 @@ mod tree;
 
 use crate::router::PolicyConfig;
 
-
 #[derive(Debug, Clone, ValueEnum)]
 pub enum PolicyType {
     Random,
@@ -26,11 +25,7 @@ struct Args {
     )]
     host: String,
 
-    #[arg(
-        long,
-        default_value_t = 3001,
-        help = "Port number to listen on"
-    )]
+    #[arg(long, default_value_t = 3001, help = "Port number to listen on")]
     port: u16,
 
     #[arg(
@@ -72,9 +67,12 @@ impl Args {
             PolicyType::Random => PolicyConfig::RandomConfig,
             PolicyType::RoundRobin => PolicyConfig::RoundRobinConfig,
             PolicyType::ApproxTree => PolicyConfig::ApproxTreeConfig {
-                tokenizer_path: self.tokenizer_path.clone()
+                tokenizer_path: self
+                    .tokenizer_path
+                    .clone()
                     .expect("tokenizer_path is required for approx_tree policy"),
-                cache_threshold: self.cache_threshold
+                cache_threshold: self
+                    .cache_threshold
                     .expect("cache_threshold is required for approx_tree policy"),
             },
         }

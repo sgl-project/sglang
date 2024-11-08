@@ -1,5 +1,7 @@
 import itertools
 import json
+import random
+import string
 import threading
 import time
 from argparse import ArgumentParser
@@ -13,9 +15,6 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import dump_state_text
 
-import random
-import string
-
 random.seed(42)
 
 
@@ -27,7 +26,10 @@ def gen_prompt(tokenizer, token_num):
 
 
 def gen_arguments(args, tokenizer):
-    multi_qas = [{"system_prompt": gen_prompt(tokenizer, args.system_prompt_len), "qas": []} for _ in range(args.num_qa)]
+    multi_qas = [
+        {"system_prompt": gen_prompt(tokenizer, args.system_prompt_len), "qas": []}
+        for _ in range(args.num_qa)
+    ]
     for i in range(args.num_qa):
         qas = multi_qas[i]["qas"]
         for j in range(args.turns):
@@ -38,6 +40,7 @@ def gen_arguments(args, tokenizer):
                 }
             )
     return multi_qas
+
 
 @sgl.function
 def multi_turns(s, system_prompt, qas):

@@ -1,13 +1,13 @@
+use crate::tree::RadixTree;
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
-use futures_util::{TryStreamExt};
-use std::fmt::Debug;
-use crate::tree::RadixTree;
+use futures_util::TryStreamExt;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
-use tokenizers::tokenizer::{Tokenizer};
+use tokenizers::tokenizer::Tokenizer;
 
 #[derive(Debug)]
 pub enum Router {
@@ -21,9 +21,9 @@ pub enum Router {
     ApproxTree {
         worker_urls: Vec<String>,
         // TODO: don't lock the whole tree
-        url_to_tree: Arc< Mutex< HashMap<String, RadixTree> > >,
+        url_to_tree: Arc<Mutex<HashMap<String, RadixTree>>>,
         tokenizer: Tokenizer,
-        url_to_count: Arc< Mutex <HashMap<String, usize>>>,
+        url_to_count: Arc<Mutex<HashMap<String, usize>>>,
         cache_threshold: f32,
     },
 }
@@ -33,10 +33,9 @@ pub enum PolicyConfig {
     RoundRobinConfig,
     ApproxTreeConfig {
         tokenizer_path: String,
-        cache_threshold: f32
-    }
+        cache_threshold: f32,
+    },
 }
-
 
 fn get_token_ids_from_request(body: &Bytes, tokenizer: &Tokenizer) -> Vec<u32> {
     // 1. convert body to json
@@ -51,14 +50,16 @@ fn get_token_ids_from_request(body: &Bytes, tokenizer: &Tokenizer) -> Vec<u32> {
 
 impl Router {
     pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Self {
-
         match policy_config {
             PolicyConfig::RandomConfig => Router::Random { worker_urls },
             PolicyConfig::RoundRobinConfig => Router::RoundRobin {
                 worker_urls,
                 current_index: std::sync::atomic::AtomicUsize::new(0),
             },
-            PolicyConfig::ApproxTreeConfig { tokenizer_path, cache_threshold } => {
+            PolicyConfig::ApproxTreeConfig {
+                tokenizer_path,
+                cache_threshold,
+            } => {
                 let mut url_to_tree = HashMap::new();
                 let mut url_to_count = HashMap::new();
 
@@ -75,13 +76,15 @@ impl Router {
                     url_to_count: Arc::new(Mutex::new(url_to_count)),
                     cache_threshold,
                 }
-            }   
+            }
         }
     }
 
     pub fn get_first(&self) -> Option<String> {
         match self {
-            Router::RoundRobin { worker_urls, .. } | Router::Random { worker_urls } | Router::ApproxTree { worker_urls, .. } => {
+            Router::RoundRobin { worker_urls, .. }
+            | Router::Random { worker_urls }
+            | Router::ApproxTree { worker_urls, .. } => {
                 if worker_urls.is_empty() {
                     None
                 } else {
@@ -97,16 +100,12 @@ impl Router {
         req: HttpRequest,
         body: Bytes,
     ) -> HttpResponse {
- 
-
         let mut input_ids: Vec<u32> = Vec::new();
         if let Router::ApproxTree { tokenizer, .. } = self {
             input_ids = get_token_ids_from_request(&body, tokenizer);
         }
 
- 
         let worker_url = match self {
-
             Router::RoundRobin {
                 worker_urls,
                 current_index,
@@ -126,12 +125,17 @@ impl Router {
                 worker_urls[rand::random::<usize>() % worker_urls.len()].clone()
             }
 
-            Router::ApproxTree { worker_urls, url_to_tree, url_to_count, cache_threshold, .. } => {
+            Router::ApproxTree {
+                worker_urls,
+                url_to_tree,
+                url_to_count,
+                cache_threshold,
+                ..
+            } => {
                 // TODO: pipeline the locks. Release one earlier.
 
                 let mut max_matched_rate = 0.0;
                 let mut max_matched_idx = 0;
-
 
                 let locked_url_to_tree = url_to_tree.lock().unwrap();
 
@@ -167,12 +171,15 @@ impl Router {
 
                     worker_urls[min_count_id].clone()
                 }
-
             }
         };
 
-
-        if let Router::ApproxTree { url_to_tree, url_to_count, .. } = self {
+        if let Router::ApproxTree {
+            url_to_tree,
+            url_to_count,
+            ..
+        } = self
+        {
             // Insert input_ids to the tree
             let mut locked_url_to_tree = url_to_tree.lock().unwrap();
             let selected_tree = locked_url_to_tree.get_mut(&worker_url).unwrap();
@@ -205,13 +212,12 @@ impl Router {
             Err(_) => return HttpResponse::InternalServerError().finish(),
         };
 
-        
         let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
             // TODO: do the correction on the tree based on the cached input_ids
-            if let Router::ApproxTree {url_to_count, .. } = self {
+            if let Router::ApproxTree { url_to_count, .. } = self {
                 let mut locked_url_to_count = url_to_count.lock().unwrap();
                 let count = locked_url_to_count.get_mut(&worker_url).unwrap();
                 *count -= 1;
@@ -225,14 +231,9 @@ impl Router {
             // TODO: do the correction on the tree based on the cached input_ids. The streaming might be tricker to handle
             HttpResponse::build(status)
                 .insert_header((CONTENT_TYPE, HeaderValue::from_static("text/event-stream")))
-                .streaming(
-            res.bytes_stream()
-                    .map_err(|_| {
-                        actix_web::error::ErrorInternalServerError("Failed to read string")
-                    })
-                )
+                .streaming(res.bytes_stream().map_err(|_| {
+                    actix_web::error::ErrorInternalServerError("Failed to read string")
+                }))
         }
-
-
     }
 }
