@@ -225,45 +225,56 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         return await _generate_request(obj, request)
     
     # Predicted outputs does not currently support all args
-    if obj.input_ids is None:
+    # TODO: Remove some of these checks
+    # TODO: Validate other args, e.g. returning logprobs and sampling strategies. Also weaken
+    # constraints, e.g. input_ids can be supported
+    if isinstance(obj.text, list):
+        raise ValueError("Predicted outputs only supports single queries and not batched queries.")
+    if obj.input_ids is not None:
         raise ValueError("Predicted outputs only supports text and not input_ids.")
-    if obj.stream:
-        raise ValueError("Predicted outputs do not support streaming.")
-    # TODO: Validate other args, e.g. returning logprobs and sampling strategies
 
     tokenizer = tokenizer_manager.tokenizer
-    predicted_tokens = tokenizer.encode(obj.predicted_output)
+    input_ids = tokenizer.encode(obj.text)
+    predicted_ids = tokenizer.encode(obj.text + obj.predicted_output)[len(input_ids):]
     prefill_obj = copy.deepcopy(obj)
-    prefill_obj.text = obj.text + obj.predicted_output
 
-    # Require logprobs for speculation
+    # Update prefill text and ensure only prefill is done
+    # TODO: We can add a new request type that is just prefill. It would not generate a new token
+    # and just cache.
+    prefill_obj.text = obj.text + obj.predicted_output
+    prefill_obj.sampling_params["max_new_tokens"] = 1
+    prefill_obj.stream = False
     prefill_obj.return_logprob = True  
-    prefill_obj.logprob_start_len = len(obj.text)
+    prefill_obj.logprob_start_len = len(tokenizer.encode(obj.text)) - 1
+    prefill_obj.top_logprobs_num = 2
 
     # Get logprobs
     prefill_result = await tokenizer_manager.generate_request(prefill_obj, request).__anext__()
-    logprobs = prefill_result["meta_info"]["output_token_logprobs"]
+    logprobs = prefill_result["meta_info"]["input_top_logprobs"]
 
+    # TODO: Move this inside scheduler so it can only cache matched tokens.
     match_length = 0
-    for i, (pred_token, token_logprobs) in enumerate(zip(predicted_tokens, logprobs)):
-        top_token = max(token_logprobs, key=lambda x: x[0])[1]
+    for i, (pred_token, top_logprobs) in enumerate(zip(predicted_ids, logprobs)):
+        top_token = max(top_logprobs, key=lambda x: x[0])[1]
         if pred_token != top_token:
-            match_length = i-1
+            match_length = i
             break
+    else:
+        match_length = len(predicted_ids)
         
     if match_length == 0:
         return await _generate_request(obj, request)
         
     # Continue generation after accepted predictions
-    accepted_tokens = predicted_tokens[:match_length]
-    obj.text = obj.text + tokenizer.decode(accepted_tokens) 
+    accepted_tokens = predicted_ids[:match_length]
+    obj.text = obj.text + tokenizer.decode(accepted_tokens)  # TODO: Will decoding like this match text?
     obj.sampling_params["max_new_tokens"] = obj.sampling_params.get("max_new_tokens", 16) - match_length
     
     continue_result = await _generate_request(obj, request)
 
     # Add metadata on accepted tokens for benchmarking
-    if "meta_info" in continue_result:
-        continue_result["meta_info"]["speculative_tokens_accepted"] = match_length
+    continue_result["meta_info"]["speculative_tokens_accepted"] = match_length
+    continue_result['text'] = tokenizer.decode(predicted_ids[:match_length]) + continue_result['text']
         
     return continue_result
     
