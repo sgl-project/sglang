@@ -32,7 +32,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import monkey_patch_vllm_all_gather
+from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -92,7 +92,7 @@ def set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 
-@torch.compile(dynamic=True)
+@maybe_torch_compile(dynamic=True)
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
