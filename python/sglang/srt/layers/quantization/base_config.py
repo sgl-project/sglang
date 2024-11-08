@@ -122,16 +122,14 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError
 
-def method_has_implemented_embedding(
-        method_class: Type[QuantizeMethodBase]) -> bool:
+
+def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> bool:
     """
     Not all quant methods have embedding implemented, so we need to check that
     it exists for our given method. We check this by making sure the function
     has been changed from the base implementation.
     """
-    base_embedding = inspect.getattr_static(QuantizeMethodBase, "embedding",
-                                            None)
+    base_embedding = inspect.getattr_static(QuantizeMethodBase, "embedding", None)
     class_embedding = inspect.getattr_static(method_class, "embedding", None)
 
-    return (class_embedding is not None
-            and class_embedding is not base_embedding)
+    return class_embedding is not None and class_embedding is not base_embedding

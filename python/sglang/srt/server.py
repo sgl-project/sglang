@@ -419,6 +419,7 @@ def launch_engine(
     for i in range(len(scheduler_pipe_readers)):
         scheduler_pipe_readers[i].recv()
 
+
 def add_prometheus_middleware(app: FastAPI):
     # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/entrypoints/openai/api_server.py#L216
     from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
@@ -490,6 +491,7 @@ def launch_server(
     finally:
         t.join()
 
+
 def _set_prometheus_env():
     # Set prometheus multiprocess directory
     # sglang uses prometheus multiprocess mode
@@ -505,6 +507,7 @@ def _set_prometheus_env():
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
     logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
@@ -763,8 +766,8 @@ class Engine:
         # runtime server default log level is log
         # offline engine works in scripts, so we set it to error
 
-        if 'log_level' not in kwargs:
-            kwargs['log_level'] = 'error'
+        if "log_level" not in kwargs:
+            kwargs["log_level"] = "error"
 
         server_args = ServerArgs(*args, **kwargs)
         launch_engine(server_args=server_args)
