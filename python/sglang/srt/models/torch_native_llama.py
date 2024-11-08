@@ -53,13 +53,13 @@ def gate_up_proj_weight_loader(
     loaded_shard_id: Optional[int] = None,
 ):
     # shard_id: (shard_offset, shard_size)
-    gate_up_proj_shard_offsets = {}
+    gate_up_offsets = {}
     current_shard_offset = 0
     for i, output_size in enumerate(self.output_sizes):
-        gate_up_proj_shard_offsets[i] = (current_shard_offset, output_size)
+        gate_up_offsets[i] = (current_shard_offset, output_size)
         current_shard_offset += output_size
     if loaded_shard_id is None:
-        for shard_id, (shard_offset, shard_size) in gate_up_proj_shard_offsets.items():
+        for shard_id, (shard_offset, shard_size) in gate_up_offsets.items():
             loaded_weight_shard = loaded_weight.narrow(
                 0, shard_offset, shard_size
             )
@@ -67,7 +67,7 @@ def gate_up_proj_weight_loader(
     else:
         assert loaded_shard_id < len(self.output_sizes)
         param_data = param.data
-        shard_offset, shard_size = gate_up_proj_shard_offsets[loaded_shard_id]
+        shard_offset, shard_size = gate_up_offsets[loaded_shard_id]
         param_data = param_data.narrow(0, shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
         assert param_data.shape == loaded_weight.shape
@@ -122,19 +122,19 @@ def qkv_proj_weight_loader(
     loaded_shard_id: Optional[str] = None,
 ):
     # shard_id: (shard_offset, shard_size)
-    qkv_proj_shard_offsets = {
+    qkv_offsets = {
         "q": (0, self.num_heads * self.head_size),
         "k": (self.num_heads * self.head_size, self.num_kv_heads * self.head_size),
         "v": ((self.num_heads + self.num_kv_heads) * self.head_size, self.num_kv_heads * self.head_size),
     }
     if loaded_shard_id is None:
-        for shard_id, (shard_offset, shard_size) in qkv_proj_shard_offsets.items():
+        for shard_id, (shard_offset, shard_size) in qkv_offsets.items():
             loaded_weight_shard = loaded_weight.narrow(
                 param.output_dim, shard_offset, shard_size
             )
             self.weight_loader(param, loaded_weight_shard, shard_id)
     else:
-        shard_offset, shard_size = qkv_proj_shard_offsets[loaded_shard_id]
+        shard_offset, shard_size = qkv_offsets[loaded_shard_id]
         param_data = param.data
         param_data = param_data.narrow(0, shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
@@ -367,6 +367,7 @@ class TorchNativeLlamaForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.torchao_config = global_server_args_dict["torchao_config"]
+        self.supports_torch_tp = True
         self.model = LlamaModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)

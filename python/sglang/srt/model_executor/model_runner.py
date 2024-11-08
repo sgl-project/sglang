@@ -154,8 +154,9 @@ class ModelRunner:
         min_per_gpu_memory = self.init_torch_distributed()
         self.sampler = Sampler()
         self.load_model()
-        if self.tp_size > 1:
-            logger.info(f"Tensor parallelism is enabled, {self.tp_size} devices will be used.")
+        supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
+        if self.tp_size > 1 and supports_torch_tp:
+            logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
             device_mesh = torch.distributed.init_device_mesh(
                 self.device, (self.tp_size,)
             )
