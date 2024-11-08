@@ -16,7 +16,6 @@ limitations under the License.
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import logging
-import multiprocessing
 import os
 import threading
 import time
@@ -305,8 +304,6 @@ class Scheduler:
             )
             if self.server_args.load_balance_method == "pre_radix":
                 self.pre_radix = True
-                import threading
-
                 self.change_cnt_lock = threading.Lock()
                 threading.Thread(target=self.loop_for_send_tree_cache).start()
         else:
@@ -1232,7 +1229,7 @@ def run_scheduler_process(
     tp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
-    controller_info,
+    controller_info: Optional[ControllerInfo] = None,
 ):
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
