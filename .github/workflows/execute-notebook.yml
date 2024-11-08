@@ -18,7 +18,7 @@ concurrency:
   group: execute-notebook-${{ github.ref }}
   cancel-in-progress: true
 
-  
+
 jobs:
   run-all-notebooks:
     runs-on: 1-gpu-runner
@@ -42,13 +42,8 @@ jobs:
           python -m ipykernel install --user --name python3 --display-name "Python 3"
 
       - name: Execute notebooks
+        timeout-minutes: 30
         run: |
           cd docs
-          for nb in *.ipynb; do
-            if [ -f "$nb" ]; then
-              echo "Executing $nb"
-              jupyter nbconvert --to notebook --execute --inplace "$nb" \
-                --ExecutePreprocessor.timeout=600 \
-                --ExecutePreprocessor.kernel_name=python3
-            fi
-          done
+          make clean
+          make compile

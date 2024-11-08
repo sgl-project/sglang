@@ -155,7 +155,7 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
     frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
 
     frames = []
-    for i in range(total_frames):
+    for _ in range(total_frames):
         ret, frame = cap.read()
         if ret:
             frames.append(frame)
@@ -305,7 +305,7 @@ def execute_shell_command(command: str) -> subprocess.Popen:
     Execute a shell command and return the process handle
 
     Args:
-        command: Shell command as a string (can include \ line continuations)
+        command: Shell command as a string (can include \\ line continuations)
     Returns:
         subprocess.Popen: Process handle
     """
@@ -349,6 +349,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 def terminate_process(process):
     from sglang.srt.utils import kill_child_process
+
     kill_child_process(process.pid, include_self=True)
 
 

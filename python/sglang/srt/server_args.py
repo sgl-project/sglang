@@ -63,12 +63,14 @@ class ServerArgs:
     stream_interval: int = 1
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
+    decode_log_interval: int = 40
 
     # Logging
     log_level: str = "info"
     log_level_http: Optional[str] = None
     log_requests: bool = False
     show_time_cost: bool = False
+    enable_metrics: bool = False
 
     # Other
     api_key: Optional[str] = None
@@ -414,6 +416,12 @@ class ServerArgs:
             help="Show time cost of custom marks.",
         )
         parser.add_argument(
+            "--enable-metrics",
+            action="store_true",
+            help="Enable log prometheus metrics.",
+        )
+
+        parser.add_argument(
             "--api-key",
             type=str,
             default=ServerArgs.api_key,
@@ -435,6 +443,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.watchdog_timeout,
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
+        parser.add_argument(
+            "--decode-log-interval",
+            type=int,
+            default=ServerArgs.decode_log_interval,
+            help="The log interval of decode batch",
         )
 
         # Data parallelism

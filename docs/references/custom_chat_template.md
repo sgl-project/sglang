@@ -11,8 +11,10 @@ If needed, you can also override the chat template when launching the server:
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --chat-template llama-2
 ```
 
-If the chat template you are looking for is missing, you are welcome to contribute it.
-Meanwhile, you can also temporarily register your chat template as follows:
+If the chat template you are looking for is missing, you are welcome to contribute it or load it from a file.
+
+## JSON Format
+You can load the JSON format, which is defined by `conversation.py`.
 
 ```json
 {
@@ -28,4 +30,11 @@ Meanwhile, you can also temporarily register your chat template as follows:
 
 ```
 python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --chat-template ./my_model_template.json
+```
+
+## Jinja Format
+You can also use the Jinja template format, defined by Hugging Face transformers https://huggingface.co/docs/transformers/main/en/chat_templating
+
+```
+python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --chat-template ./my_model_template.jinja
 ```

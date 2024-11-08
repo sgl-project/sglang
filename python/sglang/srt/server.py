@@ -25,12 +25,15 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import re
+import tempfile
 import threading
 import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, List, Optional, Union
 
 import orjson
+from starlette.routing import Mount
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -53,7 +56,6 @@ from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
-    RewardReqInput,
     UpdateWeightReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -87,11 +89,15 @@ from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+# Temporary directory for prometheus multiprocess mode
+# Cleaned up automatically when this object is garbage collected
+prometheus_multiproc_dir: tempfile.TemporaryDirectory
+
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 app = FastAPI()
-tokenizer_manager = None
+tokenizer_manager: TokenizerManager = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -254,8 +260,8 @@ app.post("/encode")(encode_request)
 app.put("/encode")(encode_request)
 
 
-async def judge_request(obj: RewardReqInput, request: Request):
-    """Handle a reward model request."""
+async def classify_request(obj: EmbeddingReqInput, request: Request):
+    """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
@@ -265,8 +271,8 @@ async def judge_request(obj: RewardReqInput, request: Request):
         )
 
 
-app.post("/judge")(judge_request)
-app.put("/judge")(judge_request)
+app.post("/classify")(classify_request)
+app.put("/classify")(classify_request)
 
 
 @app.post("/v1/completions")
@@ -414,6 +420,19 @@ def launch_engine(
         scheduler_pipe_readers[i].recv()
 
 
+def add_prometheus_middleware(app: FastAPI):
+    # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/entrypoints/openai/api_server.py#L216
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)
+
+
 def launch_server(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,
@@ -439,6 +458,11 @@ def launch_server(
     # Add api key authorization
     if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)
+
+    # add prometheus middleware
+    if server_args.enable_metrics:
+        _set_prometheus_env()
+        add_prometheus_middleware(app)
 
     # Send a warmup request
     t = threading.Thread(
@@ -466,6 +490,23 @@ def launch_server(
         )
     finally:
         t.join()
+
+
+def _set_prometheus_env():
+    # Set prometheus multiprocess directory
+    # sglang uses prometheus multiprocess mode
+    # we need to set this before importing prometheus_client
+    # https://prometheus.github.io/client_python/multiprocess/
+    global prometheus_multiproc_dir
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.debug(f"User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        )
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
 def _set_envs_and_config(server_args: ServerArgs):
@@ -697,24 +738,8 @@ class Runtime:
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
     ):
-        if isinstance(prompt, str) or isinstance(prompt[0], str):
-            # embedding
-            json_data = {
-                "text": prompt,
-            }
-            response = requests.post(
-                self.url + "/encode",
-                json=json_data,
-            )
-        else:
-            # reward
-            json_data = {
-                "conv": prompt,
-            }
-            response = requests.post(
-                self.url + "/judge",
-                json=json_data,
-            )
+        json_data = {"text": prompt}
+        response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
 
     def __del__(self):
@@ -737,6 +762,12 @@ class Engine:
 
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
+
+        # runtime server default log level is log
+        # offline engine works in scripts, so we set it to error
+
+        if "log_level" not in kwargs:
+            kwargs["log_level"] = "error"
 
         server_args = ServerArgs(*args, **kwargs)
         launch_engine(server_args=server_args)

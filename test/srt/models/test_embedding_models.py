@@ -30,6 +30,10 @@ TORCH_DTYPES = [torch.float16]
 
 class TestEmbeddingModels(unittest.TestCase):
 
+    @classmethod
+    def setUpClass(cls):
+        mp.set_start_method("spawn", force=True)
+
     def assert_close_prefill_logits(
         self,
         prompts,
@@ -74,9 +78,4 @@ class TestEmbeddingModels(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    try:
-        mp.set_start_method("spawn")
-    except RuntimeError:
-        pass
-
     unittest.main()
