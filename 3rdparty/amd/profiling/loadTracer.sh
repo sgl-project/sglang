@@ -21,23 +21,23 @@
 # THE SOFTWARE.
 ################################################################################
 OUTPUT_FILE="trace.rpd"
- 
+
 if [ "$1" = "-o" ] ; then
   OUTPUT_FILE=$2
   shift
   shift
 fi
-  
+
 if [ -e ${OUTPUT_FILE} ] ; then
   rm ${OUTPUT_FILE}
 fi
- 
+
 python3 -m rocpd.schema --create ${OUTPUT_FILE}
 if [ $? != 0 ] ; then
   echo "Error: Could not create rpd file. Please run 'python setup.py install' from the rocpd_python dir"
   exit
 fi
- 
+
 export RPDT_FILENAME=${OUTPUT_FILE}
 export RPDT_AUTOSTART=0
 LD_PRELOAD=librocm-smi_64:librpd_tracer.so "$@"

@@ -8,15 +8,15 @@ index 62d1ff9..9021c01 100644
  from sglang.utils import get_exception_traceback
 +from rpdTracerControl import rpdTracerControl
 +rpdTracerControl.skipCreate()
- 
+
  logger = logging.getLogger(__name__)
- 
+
 @@ -245,6 +247,7 @@ class Scheduler:
                  ],
                  with_stack=True,
              )
 +            self.rpd = rpdTracerControl()
- 
+
      @torch.inference_mode()
      def event_loop(self):
 @@ -1027,15 +1030,24 @@ class Scheduler:
@@ -29,7 +29,7 @@ index 62d1ff9..9021c01 100644
 +            self.rpd.start()
 +            self.rpd.rangePush("", "rpd profile range", "")
 +            logger.info("rpd is enabled")
- 
+
      def stop_profile(self) -> None:
          if self.profiler is None:
              raise RuntimeError("Profiler is not enabled.")
@@ -47,5 +47,3 @@ index 62d1ff9..9021c01 100644
 +            self.rpd.flush()
 +            logger.info("rpd is done")
          logger.info("Profiler is done")
- 
- 

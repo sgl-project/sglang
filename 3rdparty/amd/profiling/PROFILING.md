@@ -14,12 +14,12 @@ install_rpd.sh
 ```bash
 # download and install RPD
 apt update && apt install -y sqlite3 libsqlite3-dev libfmt-dev
-   
+
 # install rpd module
 git clone https://github.com/ROCmSoftwarePlatform/rocmProfileData
 cd rocmProfileData
 git checkout 976899e9c6dbc6dd2bccf770818e4e44125590ac
-git apply rpd.patch 
+git apply rpd.patch
 make && make install
 cd rocpd_python && python setup.py install && cd ..
 cd rpd_tracer && make clean;make install && python setup.py install && cd ..
@@ -69,28 +69,28 @@ loadTracer.sh
 # THE SOFTWARE.
 ################################################################################
 OUTPUT_FILE="trace.rpd"
- 
+
 if [ "$1" = "-o" ] ; then
   OUTPUT_FILE=$2
   shift
   shift
 fi
-  
+
 if [ -e ${OUTPUT_FILE} ] ; then
   rm ${OUTPUT_FILE}
 fi
- 
+
 python3 -m rocpd.schema --create ${OUTPUT_FILE}
 if [ $? != 0 ] ; then
   echo "Error: Could not create rpd file. Please run 'python setup.py install' from the rocpd_python dir"
   exit
 fi
- 
+
 export RPDT_FILENAME=${OUTPUT_FILE}
 export RPDT_AUTOSTART=0
 LD_PRELOAD=librocm-smi_64:librpd_tracer.so "$@"
 ```
-3. Apply patch (provided in this directory) with "git apply rpd_profile_server_enable.patch" if the main profiling purpose is to get info on gpu kernels as well as limited cpu activity info. 
+3. Apply patch (provided in this directory) with "git apply rpd_profile_server_enable.patch" if the main profiling purpose is to get info on gpu kernels as well as limited cpu activity info.
 
 #### Common Notes 1
 Please note that although we are doing TP=8 in the example, we purposely only log RPD profiling on 2 ranks in the patch file (i.e.tp_rank=0/1) for profiling/visualization convenience, as even Perfetto streaming mode can only load maximal 8GB json file for visualization. With 2 ranks logged in RPD profiling, we could still check whether there are issues among ranks (e.g. load imbalance issue, nccl issue), and at the same time, we could log relatively longer time duration before the json file generated from RPD file hits 8GB size.
@@ -108,15 +108,15 @@ index 62d1ff9..9021c01 100644
  from sglang.utils import get_exception_traceback
 +from rpdTracerControl import rpdTracerControl
 +rpdTracerControl.skipCreate()
- 
+
  logger = logging.getLogger(__name__)
- 
+
 @@ -245,6 +247,7 @@ class Scheduler:
                  ],
                  with_stack=True,
              )
 +            self.rpd = rpdTracerControl()
- 
+
      @torch.inference_mode()
      def event_loop(self):
 @@ -1027,15 +1030,24 @@ class Scheduler:
@@ -129,7 +129,7 @@ index 62d1ff9..9021c01 100644
 +            self.rpd.start()
 +            self.rpd.rangePush("", "rpd profile range", "")
 +            logger.info("rpd is enabled")
- 
+
      def stop_profile(self) -> None:
          if self.profiler is None:
              raise RuntimeError("Profiler is not enabled.")
@@ -165,15 +165,15 @@ index 62d1ff9..2edb427 100644
  from sglang.utils import get_exception_traceback
 +from rpdTracerControl import rpdTracerControl
 +rpdTracerControl.skipCreate()
- 
+
  logger = logging.getLogger(__name__)
- 
+
 @@ -245,6 +247,7 @@ class Scheduler:
                  ],
                  with_stack=True,
              )
 +            self.rpd = rpdTracerControl()
- 
+
      @torch.inference_mode()
      def event_loop(self):
 @@ -1027,15 +1030,26 @@ class Scheduler:
@@ -188,7 +188,7 @@ index 62d1ff9..2edb427 100644
 +            self.rpd.start()
 +            self.rpd.rangePush("", "scheduler", "")
 +        logger.info("rpd is enabled inside scheduler profiling")
- 
+
      def stop_profile(self) -> None:
          if self.profiler is None:
              raise RuntimeError("Profiler is not enabled.")
@@ -206,8 +206,8 @@ index 62d1ff9..2edb427 100644
 +            self.rpd.flush()
 +            logger.info("rpd is done inside scheduler")
          logger.info("Profiler is done")
- 
- 
+
+
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
 index 2621ccd..181df85 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
@@ -215,17 +215,17 @@ index 2621ccd..181df85 100644
 @@ -58,6 +58,10 @@ from sglang.srt.sampling.sampling_params import SamplingParams
  from sglang.srt.server_args import PortArgs, ServerArgs
  from sglang.srt.utils import is_generation_model, is_multimodal_model
- 
+
 +from rpdTracerControl import rpdTracerControl
 +rpdTracerControl.skipCreate()
 +
 +
  asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
- 
+
  logger = logging.getLogger(__name__)
 @@ -514,10 +518,20 @@ class TokenizerManager:
          self.send_to_scheduler.send_pyobj(req)
- 
+
      def start_profile(self):
 +        rpd = rpdTracerControl()
 +        rpd.setPythonTrace(True)
@@ -234,7 +234,7 @@ index 2621ccd..181df85 100644
 +        logger.info("tokenizer_manager rpd profiling started!")
          req = ProfileReq.START_PROFILE
          self.send_to_scheduler.send_pyobj(req)
- 
+
      def stop_profile(self):
 +        rpd = rpdTracerControl()
 +        rpd.rangePop()
@@ -243,7 +243,7 @@ index 2621ccd..181df85 100644
 +        logger.info("rpd profiling is done inside tokenizer_manager!")
          req = ProfileReq.STOP_PROFILE
          self.send_to_scheduler.send_pyobj(req)
- 
+
 diff --git a/python/sglang/srt/server.py b/python/sglang/srt/server.py
 index 7111c93..2bd722c 100644
 --- a/python/sglang/srt/server.py
@@ -254,7 +254,7 @@ index 7111c93..2bd722c 100644
  from typing import Dict, List, Optional, Union
 +from rpdTracerControl import rpdTracerControl
 +rpdTracerControl.skipCreate()
- 
+
  # Fix a bug of Python threading
  setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 @@ -152,6 +154,11 @@ async def flush_cache():
@@ -308,29 +308,29 @@ cat ../dummy_grok1/config.json
   "torch_dtype": "bfloat16"
 }
 ```
-5. Launch server with rpd enabled script ./server.sh in one terminal inside the docker container. 
+5. Launch server with rpd enabled script ./server.sh in one terminal inside the docker container.
 
 #### Common Notes 2
 - Remember to change model-path to the correct path
 - loadTracer.sh is needed to conduct profiling
 - SGLANG_TORCH_PROFILER_DIR is used for default torch profiler
-- Do not use loadTracer.sh if you are using the torch profiler, simply use python3 -m sglang.launch_server.  
+- Do not use loadTracer.sh if you are using the torch profiler, simply use python3 -m sglang.launch_server.
 
 
 server.sh
 
 ```bash
 #!/bin/bash
- 
+
 # export SGLANG_TORCH_PROFILER_DIR=/data/sglang/
 export SGLANG_TORCH_PROFILER_DIR=/sgl-workspace/sglang/profile/
- 
+
 # Get the current timestamp
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
- 
+
 # Define the log file with a timestamp
 LOGFILE="sglang_server_log_$TIMESTAMP.json"
- 
+
 # Run the Python command and save the output to the log file
 loadTracer.sh python3 -m sglang.launch_server \
     --model-path /sgl-workspace/sglang/dummy_grok1 \
@@ -352,15 +352,15 @@ client.sh
 
 ```bash
 #!/bin/bash
- 
+
 # Start profiling via API
 curl http://localhost:30000/start_profile -H "Content-Type: application/json"
- 
+
 # Benchmark serving using sglang with random dataset and tokenizer
 # Define the log file with a timestamp
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOGFILE="sglang_client_log_$TIMESTAMP.json"
- 
+
 # Run the benchmark with specified parameters and save logs
 python3 -m sglang.bench_serving \
     --backend sglang \
@@ -371,10 +371,10 @@ python3 -m sglang.bench_serving \
     --num-prompts 120 \
     --request-rate 8 \
     --output-file online.jsonl 2>&1 | tee "$LOGFILE"
- 
+
 # Stop profiling via API
 curl http://localhost:30000/stop_profile -H "Content-Type: application/json"
- 
+
 # Convert tracing file to csv & json
 sqlite3 trace.rpd ".mode csv" ".header on" ".output trace.csv" "select * from top;" ".output stdout"
 python3 ./rocmProfileData/tools/rpd2tracing.py trace.rpd trace.json
@@ -418,7 +418,7 @@ index 62d1ff9..6ecd78c 100644
 
 2. Create the model path directory and copy it to the right path for "--model-path" if you want to use the server.sh file provided.
 
-3. Modify the included server.sh by removing "loadTracer.sh" before python command and launch script ./server.sh in one terminal inside the docker container. 
+3. Modify the included server.sh by removing "loadTracer.sh" before python command and launch script ./server.sh in one terminal inside the docker container.
 
 4. Similar to step 6 in RPD profiling section, but remove the last 2 lines in client.sh, which converted rpd file into csv and json files. Run modified client.sh for PyTorch profiling.
 =======
