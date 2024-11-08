@@ -40,7 +40,8 @@
 
 - LlamaForSequenceClassification
   - `python -m sglang.launch_server --model-path Skywork/Skywork-Reward-Llama-3.1-8B-v0.2 --is-embedding`
-
+- Gemma2ForSequenceClassification
+  - `python -m sglang.launch_server --model-path Skywork/Skywork-Reward-Gemma-2-27B-v0.2 --is-embedding`
 
 ## How to Support a New Model
 
