@@ -1,15 +1,17 @@
 [package]
-name = "sglang-router"
+name = "sglang_router"
 version = "0.0.0"
 edition = "2021"
 
 [[bin]]
-name = "router"
+name = "sglang_router"
 path = "src/main.rs"
 
 [lib]
-name = "router"
-crate-type = ["cdylib"]
+name = "sglang_router"
+# Pure Rust library: Just omit crate-type (defaults to rlib)
+# Python/C binding + Rust library: Use ["cdylib", "rlib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 actix-web = "4.0"

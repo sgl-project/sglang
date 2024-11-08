@@ -31,6 +31,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
+import time
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -253,6 +254,16 @@ class Req:
 
         # For Qwen2-VL
         self.mrope_position_delta = []  # use mutable object
+
+        # Lifetime traces
+        # time when request is created and added to waitlist
+        self.created_time = None
+        # time when request is added to prefill batch
+        self.queued_time = None
+        # time when request is being processed
+        self.started_time = None
+        # time when request is finished
+        self.finished_time = None
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -900,8 +911,7 @@ class ScheduleBatch:
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
-                and self.reqs[i] is not being_chunked_req
+                if not self.reqs[i].finished() and self.reqs[i] is not being_chunked_req
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -1027,6 +1037,10 @@ class ScheduleBatch:
             f"ScheduleBatch(forward_mode={self.forward_mode.name}, "
             f"#req={(len(self.reqs))})"
         )
+
+    def mark_reqs_started(self):
+        for req in self.reqs:
+            req.started_time = time.time()
 
 
 @dataclasses.dataclass

@@ -17,7 +17,7 @@ limitations under the License.
 """
 Utilities for multi-modal models.
 
-This python file mainly contains utilities that were used in the 
+This python file mainly contains utilities that were used in the
 image processing logic of llava-next including operations such as
 anyres and anyres_max
 

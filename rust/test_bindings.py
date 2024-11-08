@@ -1,4 +1,4 @@
-import router
+import sglang_router as router
 
 # Create a Router instance with:
 # - host: the address to bind to (e.g., "127.0.0.1")
@@ -11,6 +11,7 @@ router = router.Router(
         "http://localhost:30000",
         "http://localhost:30002",
     ],
+    policy="random",
 )
 
 # Start the router - this will block and run the server

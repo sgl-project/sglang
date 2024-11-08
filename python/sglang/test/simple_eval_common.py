@@ -320,7 +320,7 @@ jinja_env = jinja2.Environment(
 _message_template = """
 <div class="message {{ role }}">
     <div class="role">
-    {{ role }} 
+    {{ role }}
     {% if variant %}<span class="variant">({{ variant }})</span>{% endif %}
     </div>
     <div class="content">

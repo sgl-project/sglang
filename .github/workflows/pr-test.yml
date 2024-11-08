@@ -237,7 +237,7 @@ jobs:
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
-      
+
       - name: Evaluate MLA Accuracy (TP=2)
         timeout-minutes: 10
         run: |

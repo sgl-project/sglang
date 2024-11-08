@@ -349,6 +349,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 def terminate_process(process):
     from sglang.srt.utils import kill_child_process
+
     kill_child_process(process.pid, include_self=True)
 
 
