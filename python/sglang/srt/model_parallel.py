@@ -9,6 +9,7 @@ from torch.distributed.device_mesh import DeviceMesh
 try:
     from torch.distributed.tensor import DTensor, Shard
 except ImportError:
+    # torch 2.4 or older
     from torch.distributed._tensor import DTensor, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
