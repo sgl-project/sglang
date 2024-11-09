@@ -88,6 +88,23 @@ $ maturin develop
 🛠 Installed sglang_router-0.0.0
 ```
 
+4. Alternatively, if you don't want to create a venv, you can also build the binding as a wheel and install it
+
+```bash
+$ maturin build --interpreter python
+...
+   Compiling pyo3 v0.22.6
+   Compiling pyo3-macros v0.22.6
+   Compiling sglang_router v0.0.0 (/home/jobuser/sglang/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.67s
+🖨  Copied external shared libraries to package sglang_router.libs directory:
+    /usr/lib/libssl.so.1.1.1k
+    /usr/lib/libcrypto.so.1.1.1k
+📦 Built wheel for CPython 3.10 to <wheel path>
+
+$ pip install <wheel path>
+```
+
 ## Usage
 
 1. Launch worker instances
