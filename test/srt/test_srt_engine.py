@@ -11,7 +11,10 @@ from types import SimpleNamespace
 import sglang as sgl
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.few_shot_gsm8k_engine import run_eval
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+)
 
 
 class TestSRTEngine(unittest.TestCase):
@@ -98,7 +101,7 @@ class TestSRTEngine(unittest.TestCase):
     def test_4_gsm8k(self):
 
         args = SimpleNamespace(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            model_path=DEFAULT_MODEL_NAME_FOR_TEST,
             local_data_path=None,
             num_shots=5,
             num_questions=200,
