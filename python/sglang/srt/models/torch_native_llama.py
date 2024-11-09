@@ -68,6 +68,8 @@ def gate_up_proj_weight_loader(
         assert loaded_shard_id < len(self.output_sizes)
         param_data = param.data
         shard_offset, shard_size = gate_up_offsets[loaded_shard_id]
+        # Everything shrinks by tp_size if TP enabled
+        shard_offset, shard_size = shard_offset // tp_size, shard_size // tp_size
         param_data = param_data.narrow(0, shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
         assert param_data.shape == loaded_weight.shape
@@ -95,7 +97,7 @@ class LlamaMLP(nn.Module):
             intermediate_size * 2,
             bias=False,
         )
-        self.gate_up_proj.output_sizes = [intermediate_size // tp_size] * 2
+        self.gate_up_proj.output_sizes = [intermediate_size] * 2
         self.gate_up_proj.weight_loader = types.MethodType(
             gate_up_proj_weight_loader, self.gate_up_proj
         )
@@ -135,6 +137,8 @@ def qkv_proj_weight_loader(
             self.weight_loader(param, loaded_weight_shard, shard_id)
     else:
         shard_offset, shard_size = qkv_offsets[loaded_shard_id]
+        # Everything shrinks by tp_size if TP enabled
+        shard_offset, shard_size = shard_offset // tp_size, shard_size // tp_size
         param_data = param.data
         param_data = param_data.narrow(0, shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
@@ -193,11 +197,9 @@ class LlamaAttention(nn.Module):
             (self.total_num_heads + 2 * self.total_num_kv_heads) * self.head_dim,
             bias=False,
         )
-        self.qkv_proj.total_num_heads = self.total_num_heads
         self.qkv_proj.head_size = self.head_dim
-        self.qkv_proj.total_num_kv_heads = self.total_num_kv_heads
-        self.qkv_proj.num_heads = self.num_heads
-        self.qkv_proj.num_kv_heads = self.num_kv_heads
+        self.qkv_proj.num_heads = self.total_num_heads
+        self.qkv_proj.num_kv_heads = self.total_num_kv_heads
         self.qkv_proj.weight_loader = types.MethodType(
             qkv_proj_weight_loader, self.qkv_proj
         )
