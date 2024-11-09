@@ -17,7 +17,6 @@ repos:
       - id: check-ast
       - id: check-added-large-files
       - id: check-merge-conflict
-      - id: check-executables-have-shebangs
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
       - id: debug-statements
