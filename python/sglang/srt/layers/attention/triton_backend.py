@@ -114,7 +114,13 @@ class TritonAttnBackend(AttentionBackend):
         return 1
 
     def forward_extend(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
     ):
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
@@ -122,9 +128,10 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer, forward_batch.out_cache_loc, k, v
-        )
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
 
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
@@ -146,7 +153,13 @@ class TritonAttnBackend(AttentionBackend):
         return o
 
     def forward_decode(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -160,9 +173,10 @@ class TritonAttnBackend(AttentionBackend):
 
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
 
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer, forward_batch.out_cache_loc, k, v
-        )
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
