@@ -871,8 +871,12 @@ class ScheduleBatch:
 
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
-        self.input_ids = torch.empty(0, dtype=torch.int32).to(self.device, non_blocking=True)
-        self.seq_lens = torch.empty(0, dtype=torch.int32).to(self.device, non_blocking=True)
+        self.input_ids = torch.empty(0, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens = torch.empty(0, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
         self.extend_num_tokens = 0
 
     def prepare_for_decode(self, enable_overlap: bool = False):

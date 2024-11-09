@@ -574,7 +574,9 @@ class ModelRunner:
             )
 
     def forward_idle(self, forward_batch: ForwardBatch):
-        return self.model.forward(forward_batch.input_ids, forward_batch.positions, forward_batch)
+        return self.model.forward(
+            forward_batch.input_ids, forward_batch.positions, forward_batch
+        )
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         if forward_batch.forward_mode.is_decode():

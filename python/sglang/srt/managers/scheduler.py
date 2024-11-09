@@ -332,7 +332,11 @@ class Scheduler:
 
             batch = self.get_next_batch_to_run()
 
-            if self.server_args.enable_dp_mla and self.check_dp_batch_running(batch) and batch is None:
+            if (
+                self.server_args.enable_dp_mla
+                and self.check_dp_batch_running(batch)
+                and batch is None
+            ):
                 batch = self.get_idle_batch()
 
             self.cur_batch = batch
@@ -397,7 +401,9 @@ class Scheduler:
 
     def check_dp_batch_running(self, local_batch):
         # Check if other DP workers have running batches
-        local_value = torch.tensor([1 if local_batch is not None else 0], dtype=torch.int32, device=self.device)
+        local_value = torch.tensor(
+            [1 if local_batch is not None else 0], dtype=torch.int32, device=self.device
+        )
         torch.distributed.all_reduce(
             local_value,
             op=torch.distributed.ReduceOp.MAX,

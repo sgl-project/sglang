@@ -531,6 +531,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return output
 
+
 def all_gather(input_tensor: torch.Tensor, rank, world_size, group):
     if world_size == 1:
         return input_tensor
@@ -580,7 +581,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.enable_dp_mla = not global_server_args_dict["disable_mla"] and global_server_args_dict["enable_dp_mla"]
+        self.enable_dp_mla = (
+            not global_server_args_dict["disable_mla"]
+            and global_server_args_dict["enable_dp_mla"]
+        )
         if self.enable_dp_mla:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
@@ -662,11 +666,15 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
 
         # Fully Connected
         if self.enable_dp_mla:
-            hidden_states, start_idx, end_idx = all_gather(hidden_states, self.tp_rank, self.tp_size, self.tp_group)
+            hidden_states, start_idx, end_idx = all_gather(
+                hidden_states, self.tp_rank, self.tp_size, self.tp_group
+            )
             hidden_states = self.mlp(hidden_states)
             hidden_states = hidden_states[start_idx:end_idx]
         else:
@@ -739,7 +747,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.model = DeepseekV2Model(config, cache_config, quant_config)
         if global_server_args_dict["enable_dp_mla"]:
             self.lm_head = ReplicatedLinear(
-                config.hidden_size, config.vocab_size, bias=False, quant_config=quant_config
+                config.hidden_size,
+                config.vocab_size,
+                bias=False,
+                quant_config=quant_config,
             )
             self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
