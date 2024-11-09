@@ -231,7 +231,7 @@ async def async_request_sglang_offline_engine(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
-    engine = request_func_input.llm_engine
+    engine = request_func_input.engine
     if not engine:
         raise ValueError("Please pass in an Engine")
 
