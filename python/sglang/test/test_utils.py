@@ -522,6 +522,7 @@ def run_bench_serving(
     num_prompts,
     request_rate,
     other_server_args,
+    backend="sglang",
     dataset_name="random",
     random_input_len=4096,
     random_output_len=2048,
@@ -529,16 +530,17 @@ def run_bench_serving(
 ):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_server_args,
-    )
+    if backend == "sglang":
+        process = popen_launch_server(
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_server_args,
+        )
 
     # Run benchmark
     args = SimpleNamespace(
-        backend="sglang",
+        backend=backend,
         base_url=base_url,
         host=None,
         port=None,

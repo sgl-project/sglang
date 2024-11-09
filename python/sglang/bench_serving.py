@@ -37,6 +37,9 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from sglang.api import Engine as getEngine
+from sglang.srt.server import Engine
+
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 global args
@@ -45,7 +48,9 @@ global args
 @dataclass
 class RequestFuncInput:
     prompt: str
-    api_url: str
+    # one or the other must be defined but not both
+    api_url: Optional[str]
+    engine: Optional[Engine]
     prompt_len: int
     output_len: int
     model: str
@@ -216,6 +221,68 @@ async def async_request_openai_completions(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_sglang_offline_engine(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    engine = request_func_input.llm_engine
+    if not engine:
+        raise ValueError("Please pass in an Engine")
+
+    prompt = request_func_input.prompt
+
+    payload = {
+        "temperature": 0.0,
+        "best_of": 1,
+        "max_tokens": request_func_input.output_len,
+        "stream": not args.disable_stream,
+        "ignore_eos": not args.disable_ignore_eos,
+        **request_func_input.extra_request_body,
+    }
+
+    output = RequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+
+    generated_text = ""
+    ttft = 0.0
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    try:
+        gen_out = await engine.async_generate(prompt, **payload)
+        if payload["stream"]:
+            async for chunk in gen_out:
+                latency = time.perf_counter() - st
+                if chunk["text"]:
+                    timestamp = time.perf_counter()
+                    if ttft == 0.0:
+                        ttft = time.perf_counter() - st
+                        output.ttft = ttft
+                    else:
+                        output.itl.append(timestamp - most_recent_timestamp)
+
+                    most_recent_timestamp = timestamp
+                    generated_text += chunk["text"]
+        else:
+            if gen_out[0]["text"]:
+                # not sure why you'd ever want this
+                latency = time.perf_counter() - st
+                ttft = latency
+                output.ttft = ttft
+                generated_text = gen_out[0]["text"]
+        output.generated_text = generated_text
+        output.success = True
+        output.latency = latency
+        output.output_len = request_func_input.output_len
+    except Exception:
+        output.success = False
+        exc_info = sys.exc_info()
+        output.error = "".join(traceback.format_exception(*exc_info))
 
     if pbar:
         pbar.update(1)
@@ -425,6 +492,7 @@ ASYNC_REQUEST_FUNCS = {
     "sglang": async_request_sglang_generate,
     "sglang-native": async_request_sglang_generate,
     "sglang-oai": async_request_openai_completions,
+    "sglang-offline-engine": async_request_sglang_offline_engine,
     "vllm": async_request_openai_completions,
     "lmdeploy": async_request_openai_completions,
     "trt": async_request_trt_llm,
@@ -718,7 +786,7 @@ def calculate_metrics(
 
 async def benchmark(
     backend: str,
-    api_url: str,
+    api_url: Optional[str],
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
     input_requests: List[Tuple[str, int, int]],
@@ -730,6 +798,9 @@ async def benchmark(
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
+    engine = None
+    if backend == "sglang-offline-engine":
+        engine = getEngine(model_path=model_id)
 
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
@@ -737,6 +808,7 @@ async def benchmark(
         model=model_id,
         prompt=test_prompt,
         api_url=api_url,
+        engine=engine,
         prompt_len=test_prompt_len,
         output_len=test_output_len,
         extra_request_body=extra_request_body,
@@ -762,6 +834,7 @@ async def benchmark(
             model=model_id,
             prompt=prompt,
             api_url=api_url,
+            engine=engine,
             prompt_len=prompt_len,
             output_len=output_len,
             extra_request_body=extra_request_body,
@@ -974,6 +1047,8 @@ def run_benchmark(args_: argparse.Namespace):
             if args.base_url
             else f"http://{args.host}:{args.port}/v1/completions"
         )
+    elif args.backend in ["sglang-offline-engine"]:
+        api_url = None
     elif args.backend == "trt":
         api_url = (
             f"{args.base_url}/v2/models/ensemble/generate_stream"
