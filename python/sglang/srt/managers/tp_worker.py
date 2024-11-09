@@ -128,6 +128,9 @@ class TpModelWorker:
     def get_tp_cpu_group(self):
         return self.model_runner.tp_group.cpu_group
 
+    def get_tp_device_group(self):
+        return self.model_runner.tp_group.device_group
+
     def get_memory_pool(self):
         return (
             self.model_runner.req_to_token_pool,
