@@ -33,9 +33,16 @@ class TestLargeMaxNewTokens(unittest.TestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=("--max-total-token", "1024", "--context-len", "8192"),
+            other_args=(
+                "--max-total-token",
+                "1024",
+                "--context-len",
+                "8192",
+                "--decode-log-interval",
+                "2",
+            ),
             env={"SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "256", **os.environ},
-            return_stdout_stderr=(cls.stdout, cls.stderr),
+            # return_stdout_stderr=(cls.stdout, cls.stderr),
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
