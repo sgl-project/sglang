@@ -3,6 +3,7 @@ python3 -m unittest test_large_max_new_tokens.TestLargeMaxNewTokens.test_chat_co
 """
 
 import os
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -42,7 +43,7 @@ class TestLargeMaxNewTokens(unittest.TestCase):
                 "2",
             ),
             env={"SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "256", **os.environ},
-            # return_stdout_stderr=(cls.stdout, cls.stderr),
+            return_stdout_stderr=(cls.stdout, cls.stderr),
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
@@ -82,6 +83,7 @@ class TestLargeMaxNewTokens(unittest.TestCase):
             # Ensure that they are running concurrently
             pt = 0
             while pt >= 0:
+                time.sleep(5)
                 lines = open("stderr.txt").readlines()
                 for line in lines[pt:]:
                     print(line, end="", flush=True)
