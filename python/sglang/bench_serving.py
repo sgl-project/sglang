@@ -239,12 +239,12 @@ async def async_request_sglang_offline_engine(
 
     payload = {
         "temperature": 0.0,
-        "best_of": 1,
-        "max_tokens": request_func_input.output_len,
-        "stream": not args.disable_stream,
+        "n": 1,
+        "max_new_tokens": request_func_input.output_len,
         "ignore_eos": not args.disable_ignore_eos,
         **request_func_input.extra_request_body,
     }
+    stream = not args.disable_stream
 
     output = RequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
@@ -254,8 +254,8 @@ async def async_request_sglang_offline_engine(
     st = time.perf_counter()
     most_recent_timestamp = st
     try:
-        gen_out = await engine.async_generate(prompt, **payload)
-        if payload["stream"]:
+        gen_out = await engine.async_generate(prompt, payload, stream=stream)
+        if stream:
             async for chunk in gen_out:
                 latency = time.perf_counter() - st
                 if chunk["text"]:

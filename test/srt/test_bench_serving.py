@@ -94,6 +94,18 @@ class TestBenchServing(unittest.TestCase):
             other_server_args=[],
         )
 
+    def test_offline_throughput_llm_engine(self):
+        res = run_bench_serving(
+            backend="sgl-offline-engine",
+            model=DEFAULT_MODEL_NAME_FOR_TEST,
+            num_prompts=500,
+            request_rate=float("inf"),
+            other_server_args=[],
+        )
+
+        if is_in_ci():
+            assert res["output_throughput"] > 2830
+
     def test_online_latency_default(self):
         res = run_bench_serving(
             model=DEFAULT_MODEL_NAME_FOR_TEST,
@@ -120,7 +132,6 @@ class TestBenchServing(unittest.TestCase):
 
     def test_moe_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
-            backend="sglang-offline-engine",
             model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
             num_prompts=300,
             request_rate=float("inf"),
@@ -128,7 +139,7 @@ class TestBenchServing(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert res["output_throughput"] > 2830
+            assert res["output_throughput"] > 1950
 
 
 if __name__ == "__main__":
