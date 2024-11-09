@@ -54,7 +54,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_parallel import tensor_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -154,13 +153,11 @@ class ModelRunner:
         min_per_gpu_memory = self.init_torch_distributed()
         self.sampler = Sampler()
         self.load_model()
+
+        # Apply torch TP if model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.tp_size > 1 and supports_torch_tp:
-            logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
-            device_mesh = torch.distributed.init_device_mesh(
-                self.device, (self.tp_size,)
-            )
-            tensor_parallel(self.model, device_mesh)
+            self.apply_torch_tp()
 
         if server_args.lora_paths is not None:
             self.init_lora_manager()
@@ -564,6 +561,15 @@ class ModelRunner:
 
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
+
+    def apply_torch_tp(self):
+        logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
+        from sglang.srt.model_parallel import tensor_parallel
+
+        device_mesh = torch.distributed.init_device_mesh(
+            self.device, (self.tp_size,)
+        )
+        tensor_parallel(self.model, device_mesh)
 
     def forward_decode(self, forward_batch: ForwardBatch):
         if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
