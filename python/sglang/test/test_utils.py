@@ -27,6 +27,7 @@ from sglang.utils import get_exception_traceback
 
 DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
@@ -404,7 +405,6 @@ def popen_launch_server(
     other_args: tuple = (),
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
-    enable_metrics: bool = False,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -423,8 +423,6 @@ def popen_launch_server(
     ]
     if api_key:
         command += ["--api-key", api_key]
-    if enable_metrics:
-        command += ["--enable-metrics"]
 
     if return_stdout_stderr:
         process = subprocess.Popen(

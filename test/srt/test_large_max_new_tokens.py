@@ -11,7 +11,7 @@ import openai
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 class TestLargeMaxNewTokens(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
@@ -38,7 +38,7 @@ class TestLargeMaxNewTokens(unittest.TestCase):
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
     @classmethod
     def tearDownClass(cls):

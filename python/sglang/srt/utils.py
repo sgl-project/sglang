@@ -22,10 +22,12 @@ import logging
 import os
 import pickle
 import random
+import re
 import resource
 import shutil
 import signal
 import socket
+import tempfile
 import time
 import warnings
 from importlib.metadata import PackageNotFoundError, version
@@ -41,6 +43,7 @@ import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
+from starlette.routing import Mount
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 from triton.runtime.cache import (
@@ -752,3 +755,38 @@ def delete_directory(dirpath):
         shutil.rmtree(dirpath)
     except OSError as e:
         print(f"Warning: {dirpath} : {e.strerror}")
+
+
+# Temporary directory for prometheus multiprocess mode
+# Cleaned up automatically when this object is garbage collected
+prometheus_multiproc_dir: tempfile.TemporaryDirectory
+
+
+def set_prometheus_multiproc_dir():
+    # Set prometheus multiprocess directory
+    # sglang uses prometheus multiprocess mode
+    # we need to set this before importing prometheus_client
+    # https://prometheus.github.io/client_python/multiprocess/
+    global prometheus_multiproc_dir
+
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        )
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+def add_prometheus_middleware(app):
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)
