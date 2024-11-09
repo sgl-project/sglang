@@ -81,19 +81,21 @@ class DataParallelController:
         # Start data parallel workers
         base_gpu_id = 0
         self.workers = []
+        scheduler_pipe_readers = []
         for dp_rank in range(server_args.dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
 
             if server_args.enable_dp_mla:
                 # Share workers for DP and TP
-                send_to = self.launch_tensor_parallel_process(
+                send_to, reader = self.launch_tensor_parallel_process(
                     server_args,
                     tmp_port_args,
                     base_gpu_id,
                     dp_rank,
                 )
                 base_gpu_id += 1
+                scheduler_pipe_readers.append(reader)
             else:
                 send_to = self.launch_tensor_parallel_group(
                     server_args,
@@ -103,6 +105,9 @@ class DataParallelController:
                 )
                 base_gpu_id += server_args.tp_size
             self.workers.append(send_to)
+
+        for reader in scheduler_pipe_readers:
+            reader.recv()
 
     def launch_tensor_parallel_group(
         self,
@@ -158,9 +163,8 @@ class DataParallelController:
         send_to = get_zmq_socket(
             self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
         )
-        reader.recv()
 
-        return send_to
+        return send_to, reader
 
     def round_robin_scheduler(self, req):
         self.workers[self.round_robin_counter].send_pyobj(req)

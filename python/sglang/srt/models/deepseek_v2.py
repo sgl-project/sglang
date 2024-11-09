@@ -536,7 +536,7 @@ def all_gather(input_tensor: torch.Tensor, rank, world_size, group):
         return input_tensor
 
     seq_len = input_tensor.size(0)
-    local_len = torch.tensor([seq_len], dtype=torch.int64).cuda()
+    local_len = torch.tensor([seq_len], dtype=torch.int64, device=input_tensor.device)
     all_lens = [torch.zeros_like(local_len) for _ in range(world_size)]
 
     torch.distributed.all_gather(all_lens, local_len, group=group)

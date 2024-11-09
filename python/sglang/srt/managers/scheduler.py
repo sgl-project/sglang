@@ -401,7 +401,7 @@ class Scheduler:
         torch.distributed.all_reduce(
             local_value,
             op=torch.distributed.ReduceOp.MAX,
-            group=self.tp_worker.model_runner.tp_group,
+            group=self.tp_worker.model_runner.tp_group.device_group,
         )
         return local_value.item() == 1
 
