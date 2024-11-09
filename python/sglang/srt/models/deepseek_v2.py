@@ -750,7 +750,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
-                quant_config=quant_config,
             )
             self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
