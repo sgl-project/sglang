@@ -442,7 +442,7 @@ def popen_launch_server(
                 "Content-Type": "application/json; charset=utf-8",
                 "Authorization": f"Bearer {api_key}",
             }
-            response = requests.get(f"{base_url}/v1/models", headers=headers)
+            response = requests.get(f"{base_url}/health_generate", headers=headers)
             if response.status_code == 200:
                 return process
         except requests.RequestException:
@@ -637,8 +637,8 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
     return rouge_l_scores
 
 
-STDOUT_FILENAME = "stdout.txt"
 STDERR_FILENAME = "stderr.txt"
+STDOUT_FILENAME = "stdout.txt"
 
 
 def read_output(output_lines):

@@ -114,9 +114,16 @@ async def health() -> Response:
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
-    gri = GenerateReqInput(
-        text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-    )
+
+    if tokenizer_manager.is_generation:
+        gri = GenerateReqInput(
+            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+        )
+    else:
+        gri = EmbeddingReqInput(
+            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+        )
+
     try:
         async for _ in tokenizer_manager.generate_request(gri, request):
             break

@@ -15,6 +15,8 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    STDERR_FILENAME,
+    STDOUT_FILENAME,
     popen_launch_server,
 )
 
@@ -26,8 +28,8 @@ class TestLargeMaxNewTokens(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
-        cls.stdout = open("stdout.txt", "w")
-        cls.stderr = open("stderr.txt", "w")
+        cls.stdout = open(STDOUT_FILENAME, "w")
+        cls.stderr = open(STDERR_FILENAME, "w")
 
         cls.process = popen_launch_server(
             cls.model,
@@ -53,8 +55,8 @@ class TestLargeMaxNewTokens(unittest.TestCase):
         kill_child_process(cls.process.pid, include_self=True)
         cls.stdout.close()
         cls.stderr.close()
-        os.remove("stdout.txt")
-        os.remove("stderr.txt")
+        os.remove(STDOUT_FILENAME)
+        os.remove(STDERR_FILENAME)
 
     def run_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -84,7 +86,7 @@ class TestLargeMaxNewTokens(unittest.TestCase):
             pt = 0
             while pt >= 0:
                 time.sleep(5)
-                lines = open("stderr.txt").readlines()
+                lines = open(STDERR_FILENAME).readlines()
                 for line in lines[pt:]:
                     print(line, end="", flush=True)
                     if f"#running-req: {num_requests}" in line:
