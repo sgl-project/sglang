@@ -15,10 +15,7 @@ limitations under the License.
 
 """Utilities for Prometheus Metrics Collection."""
 
-from typing import Counter as CollectionsCounter
-from typing import Dict, List, Union
-
-from prometheus_client import Counter, Gauge, Histogram
+from typing import Dict
 
 from sglang.srt.metrics.metrics_types import Stats
 
@@ -26,47 +23,50 @@ from sglang.srt.metrics.metrics_types import Stats
 class PrometheusMetricsCollector:
 
     def __init__(self, labels: Dict[str, str], context_len: int) -> None:
+        # We need to import this one after the environment variable `PROMETHEUS_MULTIPROC_DIR` is set
+        from prometheus_client import Counter, Gauge, Histogram
+
         self.labels = labels
 
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
             documentation="The number of running requests",
-            labelnames=labels,
+            labelnames=list(labels.keys()),
             multiprocess_mode="sum",
         )
 
         self.num_used_tokens = Gauge(
             name="sglang:num_used_tokens",
             documentation="The number of used tokens",
-            labelnames=labels,
+            labelnames=list(labels.keys()),
             multiprocess_mode="sum",
         )
 
         self.token_usage = Gauge(
             name="sglang:token_usage",
             documentation="The token usage",
-            labelnames=labels,
+            labelnames=list(labels.keys()),
             multiprocess_mode="mostrecent",
         )
 
         self.gen_throughput = Gauge(
             name="sglang:gen_throughput",
             documentation="The generate throughput (token/s)",
-            labelnames=labels,
+            labelnames=list(labels.keys()),
             multiprocess_mode="sum",
         )
 
         self.num_queue_reqs = Gauge(
             name="sglang:num_queue_reqs",
             documentation="The number of requests in the waiting queue",
-            labelnames=labels,
+            labelnames=list(labels.keys()),
             multiprocess_mode="sum",
         )
 
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
             documentation="The cache hit rate",
-            labelnames=labels,
+            labelnames=list(labels.keys()),
             multiprocess_mode="mostrecent",
         )
 

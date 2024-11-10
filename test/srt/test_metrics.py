@@ -22,9 +22,20 @@ class TestEnableMetrics(unittest.TestCase):
         )
 
         try:
-            # Make a request to generate some metrics
+            # Make some requests to generate some metrics
             response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
             self.assertEqual(response.status_code, 200)
+
+            response = requests.post(
+                f"{DEFAULT_URL_FOR_TEST}/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 32,
+                    },
+                },
+            )
 
             # Get metrics
             metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
