@@ -574,6 +574,10 @@ class TokenizerManager:
                         self.metrics_collector.observe_e2e_request_latency(
                             time.time() - state.created_time
                         )
+                        self.metrics_collector.observe_time_per_output_token(
+                            (time.time() - state.created_time)
+                            / recv_obj.meta_info[i]["completion_tokens"]
+                        )
 
     def convert_logprob_style(
         self,

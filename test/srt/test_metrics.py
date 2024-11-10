@@ -34,8 +34,12 @@ class TestEnableMetrics(unittest.TestCase):
                         "temperature": 0,
                         "max_new_tokens": 32,
                     },
+                    "stream": True,
                 },
+                stream=True,
             )
+            for _ in response.iter_lines(decode_unicode=False):
+                pass
 
             # Get metrics
             metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
