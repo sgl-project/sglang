@@ -254,10 +254,6 @@ class Req:
         # For Qwen2-VL
         self.mrope_position_delta = []  # use mutable object
 
-        # Lifetime traces
-        # time when request is created, started, and finished
-        self.created_time = self.started_time = self.finished_time = None
-
     # whether request reached finished condition
     def finished(self) -> bool:
         return self.finished_reason is not None

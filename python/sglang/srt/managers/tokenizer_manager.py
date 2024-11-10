@@ -554,7 +554,7 @@ class TokenizerManager:
 
                 if self.enable_metrics:
                     if state.first_token_time is None:
-                        self.metrics_collector.observe_e2e_request_latency(
+                        self.metrics_collector.observe_time_to_first_token(
                             time.time() - state.created_time
                         )
                         state.first_token_time = time.time()
