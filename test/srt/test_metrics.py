@@ -50,6 +50,7 @@ class TestEnableMetrics(unittest.TestCase):
                 "sglang:token_usage",
                 "sglang:gen_throughput",
                 "sglang:cache_hit_rate",
+                "sglang:func_latency_seconds",
             ]
 
             for metric in essential_metrics:
@@ -58,6 +59,11 @@ class TestEnableMetrics(unittest.TestCase):
             # Verify model name label is present and correct
             expected_model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
             self.assertIn(f'model_name="{expected_model_name}"', metrics_content)
+
+            # Verify metrics have values (not empty)
+            self.assertIn("_sum{", metrics_content)
+            self.assertIn("_count{", metrics_content)
+            self.assertIn("_bucket{", metrics_content)
 
         finally:
             kill_child_process(process.pid, include_self=True)

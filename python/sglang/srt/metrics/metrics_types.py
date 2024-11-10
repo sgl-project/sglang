@@ -64,7 +64,9 @@ def exponential_buckets(start: float, width: float, length: int) -> List[float]:
     return buckets
 
 
-def time_func_latency(name: Optional[str] = None) -> Callable[..., Any]:
+def time_func_latency(
+    func: Callable = None, name: Optional[str] = None
+) -> Callable[..., Any]:
     """
     A decorator to observe the latency of a function's execution. Supports both sync and async functions.
 
@@ -74,10 +76,6 @@ def time_func_latency(name: Optional[str] = None) -> Callable[..., Any]:
     Overhead: The overhead introduced here in case of an async function could likely be because of `await` introduced
     which will return in another coroutine object creation and under heavy load could see longer wall time
     (scheduling delays due to introduction of another awaitable).
-
-    @param name: The name of this function
-
-    @return: A function that wraps the given function and measures its execution time in prometheus metric.
     """
 
     def measure(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -117,4 +115,7 @@ def time_func_latency(name: Optional[str] = None) -> Callable[..., Any]:
             return async_wrapper
         return sync_wrapper
 
-    return measure
+    if func:
+        return measure(func)
+    else:
+        return measure
