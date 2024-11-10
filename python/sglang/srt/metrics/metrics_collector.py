@@ -15,7 +15,6 @@ limitations under the License.
 
 """Utilities for Prometheus Metrics Collection."""
 
-from typing import Counter as CollectionsCounter
 from typing import Dict, List, Union
 
 from sglang.srt.metrics.metrics_types import Stats
@@ -25,7 +24,7 @@ class PrometheusMetricsCollector:
 
     def __init__(self, labels: Dict[str, str]) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Gauge, Histogram
+        from prometheus_client import Gauge, Histogram
 
         self.labels = labels
 
