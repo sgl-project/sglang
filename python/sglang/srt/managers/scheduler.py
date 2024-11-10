@@ -715,7 +715,7 @@ class Scheduler:
 
         # Print stats
         if self.tp_rank == 0:
-            self.log_prefill_stats()
+            self.log_prefill_stats(adder, can_run_list, running_bs, has_inflight)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
