@@ -33,7 +33,7 @@ CUR_NODES_IDX=$2
 
 VIDEO_DIR=$3
 
-MODEL_PATH=$4   
+MODEL_PATH=$4
 
 NUM_FRAMES=$5
 
@@ -73,16 +73,16 @@ for IDX in $(seq 1 $LOCAL_CHUNKS); do
     (
         START=$(((IDX-1) * GPUS_PER_CHUNK))
         LENGTH=$GPUS_PER_CHUNK # Length for slicing, not the end index
-        
+
         CHUNK_GPUS=(${GPULIST[@]:$START:$LENGTH})
-        
+
         # Convert the chunk GPUs array to a comma-separated string
         CHUNK_GPUS_STR=$(IFS=,; echo "${CHUNK_GPUS[*]}")
 
         LOCAL_IDX=$((CUR_NODES_IDX * LOCAL_CHUNKS + IDX))
 
         echo "Chunk $(($LOCAL_IDX - 1)) will run on GPUs $CHUNK_GPUS_STR"
-        
+
         # Calculate the port for this chunk. Ensure it's incremented by 5 for each chunk.
         PORT=$((10000 + RANDOM % 55536))
 
@@ -92,7 +92,7 @@ for IDX in $(seq 1 $LOCAL_CHUNKS); do
 
         while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ $COMMAND_STATUS -ne 0 ]; do
             echo "Running chunk $(($LOCAL_IDX - 1)) on GPUs $CHUNK_GPUS_STR with port $PORT. Attempt $(($RETRY_COUNT + 1))"
-            
+
 #!/bin/bash
             CUDA_VISIBLE_DEVICES=$CHUNK_GPUS_STR python3 srt_example_llava_v.py \
             --port $PORT \
@@ -102,10 +102,10 @@ for IDX in $(seq 1 $LOCAL_CHUNKS); do
             --video-dir $VIDEO_DIR \
             --model-path $MODEL_PATH \
             --num-frames $NUM_FRAMES #&
-            
+
             wait $!  # Wait for the process to finish and capture its exit status
             COMMAND_STATUS=$?
-            
+
             if [ $COMMAND_STATUS -ne 0 ]; then
                 echo "Execution failed for chunk $(($LOCAL_IDX - 1)), attempt $(($RETRY_COUNT + 1)). Retrying..."
                 RETRY_COUNT=$(($RETRY_COUNT + 1))
@@ -124,7 +124,7 @@ done
 
 wait
 
-cat work_dirs/llava_next_video_inference_results/final_results_chunk_*.csv > work_dirs/llava_next_video_inference_results/final_results_node_${CUR_NODES_IDX}.csv   
+cat work_dirs/llava_next_video_inference_results/final_results_chunk_*.csv > work_dirs/llava_next_video_inference_results/final_results_node_${CUR_NODES_IDX}.csv
 
 END_TIME=$(date +%s)  # Capture end time
 ELAPSED_TIME=$(($END_TIME - $START_TIME))

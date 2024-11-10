@@ -1,5 +1,6 @@
 """
 python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_simple_decode
+python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_parallel_sample
 """
 
 import json
@@ -9,7 +10,7 @@ import requests
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -19,7 +20,7 @@ from sglang.test.test_utils import (
 class TestSRTEndpoint(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model, cls.base_url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
@@ -27,7 +28,7 @@ class TestSRTEndpoint(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def run_decode(
         self,
@@ -36,11 +37,17 @@ class TestSRTEndpoint(unittest.TestCase):
         return_text=False,
         n=1,
         stream=False,
+        batch=False,
     ):
+        if batch:
+            text = ["The capital of France is"]
+        else:
+            text = "The capital of France is"
+
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": "The capital of France is",
+                "text": text,
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": 16,
@@ -66,6 +73,9 @@ class TestSRTEndpoint(unittest.TestCase):
 
     def test_simple_decode(self):
         self.run_decode()
+
+    def test_simple_decode_batch(self):
+        self.run_decode(batch=True)
 
     def test_parallel_sample(self):
         self.run_decode(n=3)

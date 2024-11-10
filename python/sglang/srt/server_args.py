@@ -63,14 +63,17 @@ class ServerArgs:
     stream_interval: int = 1
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
+    watchdog_timeout: float = 300
 
     # Logging
     log_level: str = "info"
     log_level_http: Optional[str] = None
     log_requests: bool = False
     show_time_cost: bool = False
+    enable_metrics: bool = False
+    decode_log_interval: int = 40
 
-    # Other
+    # API related
     api_key: Optional[str] = None
     file_storage_pth: str = "SGLang_storage"
     enable_cache_report: bool = False
@@ -79,7 +82,7 @@ class ServerArgs:
     dp_size: int = 1
     load_balance_method: str = "round_robin"
 
-    # Distributed args
+    # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
@@ -119,11 +122,13 @@ class ServerArgs:
     enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
-    max_torch_compile_bs: int = 32
+    torch_compile_max_bs: int = 32
+    cuda_graph_max_bs: int = 160
     torchao_config: str = ""
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     num_continuous_decode_steps: int = 1
+    delete_ckpt_after_loading: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -201,6 +206,7 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        # Model and port args
         parser.add_argument(
             "--model-path",
             type=str,
@@ -320,6 +326,8 @@ class ServerArgs:
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
         )
+
+        # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
             type=float,
@@ -364,6 +372,8 @@ class ServerArgs:
             default=ServerArgs.schedule_conservativeness,
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
+
+        # Other runtime options
         parser.add_argument(
             "--tensor-parallel-size",
             "--tp-size",
@@ -390,6 +400,14 @@ class ServerArgs:
             help=r"Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
         )
         parser.add_argument(
+            "--watchdog-timeout",
+            type=float,
+            default=ServerArgs.watchdog_timeout,
+            help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
+
+        # Logging
+        parser.add_argument(
             "--log-level",
             type=str,
             default=ServerArgs.log_level,
@@ -411,6 +429,19 @@ class ServerArgs:
             action="store_true",
             help="Show time cost of custom marks.",
         )
+        parser.add_argument(
+            "--enable-metrics",
+            action="store_true",
+            help="Enable log prometheus metrics.",
+        )
+        parser.add_argument(
+            "--decode-log-interval",
+            type=int,
+            default=ServerArgs.decode_log_interval,
+            help="The log interval of decode batch",
+        )
+
+        # API related
         parser.add_argument(
             "--api-key",
             type=str,
@@ -448,7 +479,7 @@ class ServerArgs:
             ],
         )
 
-        # Multi-node distributed serving args
+        # Multi-node distributed serving
         parser.add_argument(
             "--dist-init-addr",
             "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
@@ -619,10 +650,16 @@ class ServerArgs:
             help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
-            "--max-torch-compile-bs",
+            "--torch-compile-max-bs",
             type=int,
-            default=ServerArgs.max_torch_compile_bs,
+            default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--cuda-graph-max-bs",
+            type=int,
+            default=ServerArgs.cuda_graph_max_bs,
+            help="Set the maximum batch size for cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -648,6 +685,12 @@ class ServerArgs:
             help="Run multiple continuous decoding steps to reduce scheduling overhead. "
             "This can potentially increase throughput but may also increase time-to-first-token latency. "
             "The default value is 1, meaning only run one decoding step at a time.",
+        )
+        parser.add_argument(
+            "--delete-ckpt-after-loading",
+            default=ServerArgs.delete_ckpt_after_loading,
+            action="store_true",
+            help="Delete the model checkpoint after loading the model.",
         )
 
     @classmethod
@@ -720,11 +763,11 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args) -> "PortArgs":
-        port = server_args.port + 1
+        port = server_args.port + 42
         while True:
             if is_port_available(port):
                 break
-            port += 1
+            port += 42
 
         return PortArgs(
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,

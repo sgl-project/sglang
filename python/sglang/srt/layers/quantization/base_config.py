@@ -1,7 +1,8 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/base_config.py
 
+import inspect
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type
 
 import torch
 from torch import nn
@@ -120,3 +121,15 @@ class QuantizationConfig(ABC):
         For now, this is only used by AWQ.
         """
         raise NotImplementedError
+
+
+def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> bool:
+    """
+    Not all quant methods have embedding implemented, so we need to check that
+    it exists for our given method. We check this by making sure the function
+    has been changed from the base implementation.
+    """
+    base_embedding = inspect.getattr_static(QuantizeMethodBase, "embedding", None)
+    class_embedding = inspect.getattr_static(method_class, "embedding", None)
+
+    return class_embedding is not None and class_embedding is not base_embedding

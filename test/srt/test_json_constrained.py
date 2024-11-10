@@ -41,7 +41,7 @@ class TestJSONConstrained(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def run_decode(self, json_schema, return_logprob=False, top_logprobs_num=0, n=1):
         response = requests.post(

@@ -3,9 +3,11 @@
 import argparse
 import asyncio
 import os
+import random
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
 from typing import Callable, List, Optional
@@ -20,10 +22,12 @@ from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.utils import kill_child_process
+from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
 DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
@@ -400,7 +404,7 @@ def popen_launch_server(
     api_key: Optional[str] = None,
     other_args: tuple = (),
     env: Optional[dict] = None,
-    return_stdout_stderr: bool = False,
+    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -423,8 +427,8 @@ def popen_launch_server(
     if return_stdout_stderr:
         process = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=return_stdout_stderr[0],
+            stderr=return_stdout_stderr[1],
             env=env,
             text=True,
         )
@@ -438,7 +442,7 @@ def popen_launch_server(
                 "Content-Type": "application/json; charset=utf-8",
                 "Authorization": f"Bearer {api_key}",
             }
-            response = requests.get(f"{base_url}/v1/models", headers=headers)
+            response = requests.get(f"{base_url}/health_generate", headers=headers)
             if response.status_code == 200:
                 return process
         except requests.RequestException:
@@ -493,7 +497,7 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
             )
             assert ret_code == 0
         except TimeoutError:
-            kill_child_process(process.pid)
+            kill_child_process(process.pid, include_self=True)
             time.sleep(5)
             print(
                 f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
@@ -561,7 +565,7 @@ def run_bench_serving(
     try:
         res = run_benchmark(args)
     finally:
-        kill_child_process(process.pid)
+        kill_child_process(process.pid, include_self=True)
 
     assert res["completed"] == num_prompts
     return res
@@ -594,7 +598,7 @@ def run_bench_latency(model, other_args):
         lastline = output.split("\n")[-3]
         output_throughput = float(lastline.split(" ")[-2])
     finally:
-        kill_child_process(process.pid)
+        kill_child_process(process.pid, include_self=True)
 
     return output_throughput
 
@@ -631,3 +635,157 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
         rouge_l_scores.append(fmeasure)
 
     return rouge_l_scores
+
+
+STDERR_FILENAME = "stderr.txt"
+STDOUT_FILENAME = "stdout.txt"
+
+
+def read_output(output_lines):
+    """Print the output in real time with another thread."""
+    while not os.path.exists(STDERR_FILENAME):
+        time.sleep(1)
+
+    pt = 0
+    while pt >= 0:
+        if pt > 0 and not os.path.exists(STDERR_FILENAME):
+            break
+        lines = open(STDERR_FILENAME).readlines()
+        for line in lines[pt:]:
+            print(line, end="", flush=True)
+            output_lines.append(line)
+            pt += 1
+        time.sleep(0.1)
+
+
+def run_and_check_memory_leak(
+    workload_func,
+    disable_radix_cache,
+    enable_mixed_chunk,
+    enable_overlap,
+    chunked_prefill_size,
+):
+    other_args = ["--chunked-prefill-size", str(chunked_prefill_size)]
+    if disable_radix_cache:
+        other_args += ["--disable-radix-cache"]
+    if enable_mixed_chunk:
+        other_args += ["--enable-mixed-chunk"]
+    if enable_overlap:
+        other_args += ["--enable-overlap-scheduler"]
+
+    model = DEFAULT_MODEL_NAME_FOR_TEST
+    port = random.randint(4000, 5000)
+    base_url = f"http://127.0.0.1:{port}"
+
+    # Create files and launch the server
+    stdout = open(STDOUT_FILENAME, "w")
+    stderr = open(STDERR_FILENAME, "w")
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+        return_stdout_stderr=(stdout, stderr),
+    )
+
+    # Launch a thread to stream the output
+    output_lines = []
+    t = threading.Thread(target=read_output, args=(output_lines,))
+    t.start()
+
+    # Run the workload
+    workload_func(base_url, model)
+
+    # Clean up everything
+    kill_child_process(process.pid, include_self=True)
+    kill_child_process(process.pid, include_self=True)
+    stdout.close()
+    stderr.close()
+    if os.path.exists(STDOUT_FILENAME):
+        os.remove(STDOUT_FILENAME)
+    if os.path.exists(STDERR_FILENAME):
+        os.remove(STDERR_FILENAME)
+    t.join()
+
+    # Assert success
+    has_new_server = False
+    has_leak = False
+    for line in output_lines:
+        if "The server is fired" in line:
+            has_new_server = True
+        if "leak" in line:
+            has_leak = True
+
+    assert has_new_server
+    assert not has_leak
+
+
+def run_mmlu_test(
+    disable_radix_cache=False,
+    enable_mixed_chunk=False,
+    enable_overlap=False,
+    chunked_prefill_size=32,
+):
+    def workload_func(base_url, model):
+        # Run the eval
+        args = SimpleNamespace(
+            base_url=base_url,
+            model=model,
+            eval_name="mmlu",
+            num_examples=128,
+            num_threads=128,
+        )
+
+        try:
+            metrics = run_eval(args)
+            print(f"{metrics=}")
+            assert metrics["score"] >= 0.65
+        finally:
+            pass
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        enable_overlap,
+        chunked_prefill_size,
+    )
+
+
+def run_mulit_request_test(
+    disable_radix_cache=False,
+    enable_mixed_chunk=False,
+    enable_overlap=False,
+    chunked_prefill_size=32,
+):
+
+    def workload_func(base_url, model):
+        def run_one(_):
+            prompt = """
+            System: You are a helpful assistant.
+            User: What is the capital of France?
+            Assistant: The capital of France is
+            """
+
+            response = requests.post(
+                f"{base_url}/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 8,
+                    },
+                },
+            )
+            ret = response.json()
+
+        with ThreadPoolExecutor(2) as executor:
+            list(executor.map(run_one, list(range(4))))
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        enable_overlap,
+        chunked_prefill_size,
+    )

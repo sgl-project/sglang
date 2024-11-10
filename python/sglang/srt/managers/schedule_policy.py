@@ -17,6 +17,7 @@ limitations under the License.
 
 import os
 import random
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -30,7 +31,9 @@ from sglang.srt.mem_cache.radix_cache import TreeNode
 # This can prevent the server from being too conservative.
 # Note that this only clips the estimation in the scheduler but does not change the stop
 # condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
-CLIP_MAX_NEW_TOKENS = int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS", "4096"))
+CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
+    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
+)
 
 
 class SchedulePolicy:
@@ -43,9 +46,15 @@ class SchedulePolicy:
         self.tree_cache = tree_cache
 
     def calc_priority(self, waiting_queue: List[Req]):
+        if len(waiting_queue) > 128 and self.policy == "lpm":
+            # Turn off the expensive prefix matching and sorting when the #queue is large.
+            policy = "fcfs"
+        else:
+            policy = self.policy
+
         # Compute matched prefix length
         prefix_computed = False
-        if self.policy == "lpm" or self.policy == "dfs-weight":
+        if policy == "lpm" or policy == "dfs-weight":
             for r in waiting_queue:
                 # NOTE: the prefix_indices must always be aligned with last_node
                 r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
@@ -54,18 +63,18 @@ class SchedulePolicy:
 
             prefix_computed = True
 
-        if self.policy == "lpm":
+        if policy == "lpm":
             # Longest Prefix Match
             waiting_queue.sort(key=lambda x: -len(x.prefix_indices))
-        elif self.policy == "fcfs":
+        elif policy == "fcfs":
             # first come first serve
             pass
-        elif self.policy == "lof":
+        elif policy == "lof":
             # longest output first
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
-        elif self.policy == "random":
+        elif policy == "random":
             random.shuffle(waiting_queue)
-        elif self.policy == "dfs-weight":
+        elif policy == "dfs-weight":
             last_node_to_reqs = defaultdict(list)
             for req in waiting_queue:
                 last_node_to_reqs[req.last_node].append(req)
@@ -83,7 +92,7 @@ class SchedulePolicy:
                 waiting_queue,
             )
         else:
-            raise ValueError(f"Unknown schedule_policy: {self.policy}")
+            raise ValueError(f"Unknown schedule_policy: {policy=}")
 
         return prefix_computed
 
@@ -146,7 +155,7 @@ class PrefillAdder:
                 [
                     min(
                         (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                        CLIP_MAX_NEW_TOKENS,
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
                     )
                     * self.new_token_ratio
                     for r in running_batch.reqs
@@ -186,7 +195,7 @@ class PrefillAdder:
             len(req.prefix_indices),
             req.extend_input_len,
             (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
                 if not truncated
                 else 0
             ),
@@ -258,7 +267,7 @@ class PrefillAdder:
             self._prefill_one_req(
                 0,
                 req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
             )
         else:
             # Chunked prefill
@@ -276,7 +285,7 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req)
 
         total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
         input_tokens = req.extend_input_len
         prefix_len = len(req.prefix_indices)
@@ -298,11 +307,15 @@ class PrefillAdder:
             ):
                 # Non-chunked prefill
                 self.can_run_list.append(req)
+                req.queued_time = time.time()
                 self.tree_cache.inc_lock_ref(req.last_node)
                 self._prefill_one_req(
                     prefix_len,
                     input_tokens,
-                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                    min(
+                        req.sampling_params.max_new_tokens,
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                    ),
                 )
             else:
                 # Chunked prefill
@@ -313,6 +326,7 @@ class PrefillAdder:
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
                 self.can_run_list.append(req)
+                req.queued_time = time.time()
                 self.new_inflight_req = req
                 self.tree_cache.inc_lock_ref(req.last_node)
                 self._prefill_one_req(prefix_len, trunc_len, 0)

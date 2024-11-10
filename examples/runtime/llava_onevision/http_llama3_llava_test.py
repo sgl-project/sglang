@@ -3,7 +3,7 @@ Usage:
 # Installing latest llava-next: pip install git+https://github.com/LLaVA-VL/LLaVA-NeXT.git
 # Installing latest sglang.
 
-# Endpoint Service CLI: 
+# Endpoint Service CLI:
 python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --port=30000
 
 python3 http_llama3_llava_test.py

@@ -30,12 +30,11 @@ import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, List, Optional, Union
 
-import orjson
-
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
+import orjson
 import requests
 import uvicorn
 import uvloop
@@ -53,7 +52,6 @@ from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
-    RewardReqInput,
     UpdateWeightReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -75,12 +73,15 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
+    add_prometheus_middleware,
     assert_pkg_version,
     configure_logger,
+    delete_directory,
     is_port_available,
     kill_child_process,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
+    set_prometheus_multiproc_dir,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
@@ -91,8 +92,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 app = FastAPI()
-tokenizer_manager = None
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -100,6 +99,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+tokenizer_manager: TokenizerManager = None
+
+##### Native API endpoints #####
 
 
 @app.get("/health")
@@ -111,9 +114,16 @@ async def health() -> Response:
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
-    gri = GenerateReqInput(
-        text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-    )
+
+    if tokenizer_manager.is_generation:
+        gri = GenerateReqInput(
+            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+        )
+    else:
+        gri = EmbeddingReqInput(
+            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+        )
+
     try:
         async for _ in tokenizer_manager.generate_request(gri, request):
             break
@@ -139,7 +149,7 @@ async def get_server_args():
     return dataclasses.asdict(tokenizer_manager.server_args)
 
 
-@app.get("/flush_cache")
+@app.post("/flush_cache")
 async def flush_cache():
     """Flush the radix cache."""
     tokenizer_manager.flush_cache()
@@ -177,9 +187,10 @@ async def get_memory_pool_size():
     """Get the memory pool size in number of tokens"""
     try:
         ret = await tokenizer_manager.get_memory_pool_size()
-        return ret.size
+
+        return ret
     except Exception as e:
-        return JSONResponse(
+        return ORJSONResponse(
             {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
         )
 
@@ -253,8 +264,8 @@ app.post("/encode")(encode_request)
 app.put("/encode")(encode_request)
 
 
-async def judge_request(obj: RewardReqInput, request: Request):
-    """Handle a reward model request."""
+async def classify_request(obj: EmbeddingReqInput, request: Request):
+    """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
@@ -264,8 +275,11 @@ async def judge_request(obj: RewardReqInput, request: Request):
         )
 
 
-app.post("/judge")(judge_request)
-app.put("/judge")(judge_request)
+app.post("/classify")(classify_request)
+app.put("/classify")(classify_request)
+
+
+##### OpenAI-compatible API endpoints #####
 
 
 @app.post("/v1/completions")
@@ -432,16 +446,19 @@ def launch_server(
     1. The HTTP server and Tokenizer Manager both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
-
     launch_engine(server_args=server_args)
 
     # Add api key authorization
     if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)
 
+    # add prometheus middleware
+    if server_args.enable_metrics:
+        add_prometheus_middleware(app)
+
     # Send a warmup request
     t = threading.Thread(
-        target=_wait_and_warmup, args=(server_args, pipe_finish_writer, os.getpid())
+        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
     )
     t.start()
 
@@ -493,10 +510,14 @@ def _set_envs_and_config(server_args: ServerArgs):
             "at https://docs.flashinfer.ai/installation.html.",
         )
 
+    # Set prometheus env vars
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
+
     mp.set_start_method("spawn", force=True)
 
 
-def _wait_and_warmup(server_args, pipe_finish_writer, pid):
+def _wait_and_warmup(server_args, pipe_finish_writer):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
@@ -519,10 +540,11 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_child_process(pid, including_parent=False)
+        kill_child_process(include_self=True)
         return
 
     model_info = res.json()
+
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
@@ -551,7 +573,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_child_process(pid, including_parent=False)
+        kill_child_process(include_self=True)
         return
 
     # logger.info(f"{res.json()=}")
@@ -559,6 +581,9 @@ def _wait_and_warmup(server_args, pipe_finish_writer, pid):
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
         pipe_finish_writer.send("ready")
+
+    if server_args.delete_ckpt_after_loading:
+        delete_directory(server_args.model_path)
 
 
 class Runtime:
@@ -617,7 +642,7 @@ class Runtime:
 
     def shutdown(self):
         if self.pid is not None:
-            kill_child_process(self.pid)
+            kill_child_process(self.pid, include_self=True)
             self.pid = None
 
     def cache_prefix(self, prefix: str):
@@ -696,24 +721,8 @@ class Runtime:
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
     ):
-        if isinstance(prompt, str) or isinstance(prompt[0], str):
-            # embedding
-            json_data = {
-                "text": prompt,
-            }
-            response = requests.post(
-                self.url + "/encode",
-                json=json_data,
-            )
-        else:
-            # reward
-            json_data = {
-                "conv": prompt,
-            }
-            response = requests.post(
-                self.url + "/judge",
-                json=json_data,
-            )
+        json_data = {"text": prompt}
+        response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
 
     def __del__(self):
@@ -737,23 +746,31 @@ class Engine:
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
 
+        # runtime server default log level is log
+        # offline engine works in scripts, so we set it to error
+
+        if "log_level" not in kwargs:
+            kwargs["log_level"] = "error"
+
         server_args = ServerArgs(*args, **kwargs)
         launch_engine(server_args=server_args)
 
     def generate(
         self,
-        prompt: Union[str, List[str]],
+        # The input prompt. It can be a single prompt or a batch of prompts.
+        prompt: Optional[Union[List[str], str]] = None,
         sampling_params: Optional[Dict] = None,
+        # The token ids for text; one can either specify text or input_ids.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         stream: bool = False,
     ):
-        # TODO (ByronHsu): refactor to reduce the duplicated code
-
         obj = GenerateReqInput(
             text=prompt,
+            input_ids=input_ids,
             sampling_params=sampling_params,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
@@ -791,8 +808,11 @@ class Engine:
 
     async def async_generate(
         self,
-        prompt: Union[str, List[str]],
+        # The input prompt. It can be a single prompt or a batch of prompts.
+        prompt: Optional[Union[List[str], str]] = None,
         sampling_params: Optional[Dict] = None,
+        # The token ids for text; one can either specify text or input_ids.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -801,6 +821,7 @@ class Engine:
     ):
         obj = GenerateReqInput(
             text=prompt,
+            input_ids=input_ids,
             sampling_params=sampling_params,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
@@ -834,7 +855,7 @@ class Engine:
             return ret
 
     def shutdown(self):
-        kill_child_process(os.getpid(), including_parent=False)
+        kill_child_process()
 
     def get_tokenizer(self):
         global tokenizer_manager

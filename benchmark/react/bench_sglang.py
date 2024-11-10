@@ -13,7 +13,7 @@ from sglang.utils import dump_state_text, read_jsonl
 @sgl.function
 def webthink(s, question, triplets):
     s += (
-        """Solve a question answering task with interleaving Thought, Action, Observation steps. Thought can reason about the current situation, and Action can be three types: 
+        """Solve a question answering task with interleaving Thought, Action, Observation steps. Thought can reason about the current situation, and Action can be three types:
 (1) Search[entity], which searches the exact entity on Wikipedia and returns the first paragraph if it exists. If not, it will return some similar entities to search.
 (2) Lookup[keyword], which returns the next sentence containing keyword in the current passage.
 (3) Finish[answer], which returns the answer and finishes the task.
@@ -39,7 +39,7 @@ Action 1: Search[Milhouse]
 Observation 1: Milhouse Mussolini Van Houten is a recurring character in the Fox animated television series The Simpsons voiced by Pamela Hayden and created by Matt Groening.
 Thought 2: The paragraph does not tell who Milhouse is named after, maybe I can look up "named after".
 Action 2: Lookup[named after]
-Observation 2: (Result 1 / 1) Milhouse was named after U.S. president Richard Nixon, whose middle name was Milhous. 
+Observation 2: (Result 1 / 1) Milhouse was named after U.S. president Richard Nixon, whose middle name was Milhous.
 Thought 3: Milhouse was named after U.S. president Richard Nixon, so the answer is Richard Nixon.
 Action 3: Finish[Richard Nixon]
 Question: Which documentary is about Finnish rock groups, Adam Clayton Powell or The Saimaa Gesture?
@@ -64,10 +64,10 @@ Action 3: Finish[director, screenwriter, actor]
 Question: Which magazine was started first Arthur's Magazine or First for Women?
 Thought 1: I need to search Arthur's Magazine and First for Women, and find which was started first.
 Action 1: Search[Arthur's Magazine]
-Observation 1: Arthur's Magazine (1844-1846) was an American literary periodical published in Philadelphia in the 19th century. 
+Observation 1: Arthur's Magazine (1844-1846) was an American literary periodical published in Philadelphia in the 19th century.
 Thought 2: Arthur's Magazine was started in 1844. I need to search First for Women next.
 Action 2: Search[First for Women]
-Observation 2: First for Women is a woman's magazine published by Bauer Media Group in the USA.[1] The magazine was started in 1989. 
+Observation 2: First for Women is a woman's magazine published by Bauer Media Group in the USA.[1] The magazine was started in 1989.
 Thought 3: First for Women was started in 1989. 1844 (Arthur's Magazine) < 1989 (First for Women), so Arthur's Magazine was started first.
 Action 3: Finish[Arthur's Magazine]
 Question: Were Pavel Urysohn and Leonid Levin known for the same type of work?
@@ -76,8 +76,8 @@ Action 1: Search[Pavel Urysohn]
 Observation 1: Pavel Samuilovich Urysohn (February 3, 1898 â August 17, 1924) was a Soviet mathematician who is best known for his contributions in dimension theory.
 Thought 2: Pavel Urysohn is a mathematician. I need to search Leonid Levin next and find its type of work.
 Action 2: Search[Leonid Levin]
-Observation 2: Leonid Anatolievich Levin is a Soviet-American mathematician and computer scientist. 
-Thought 3: Leonid Levin is a mathematician and computer scientist. So Pavel Urysohn and Leonid Levin have the same type of work. 
+Observation 2: Leonid Anatolievich Levin is a Soviet-American mathematician and computer scientist.
+Thought 3: Leonid Levin is a mathematician and computer scientist. So Pavel Urysohn and Leonid Levin have the same type of work.
 Action 3: Finish[yes]
 """
         + question

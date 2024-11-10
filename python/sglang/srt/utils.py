@@ -22,8 +22,12 @@ import logging
 import os
 import pickle
 import random
+import re
 import resource
+import shutil
+import signal
 import socket
+import tempfile
 import time
 import warnings
 from importlib.metadata import PackageNotFoundError, version
@@ -35,8 +39,11 @@ import psutil
 import requests
 import torch
 import torch.distributed as dist
+import triton
+import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
+from starlette.routing import Mount
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 from triton.runtime.cache import (
@@ -203,56 +210,6 @@ def is_port_available(port):
             return False
 
 
-def is_multimodal_model(model_architectures):
-    if (
-        "LlavaLlamaForCausalLM" in model_architectures
-        or "LlavaQwenForCausalLM" in model_architectures
-        or "LlavaMistralForCausalLM" in model_architectures
-        or "LlavaVidForCausalLM" in model_architectures
-        or "MllamaForConditionalGeneration" in model_architectures
-        or "Qwen2VLForConditionalGeneration" in model_architectures
-    ):
-        return True
-    else:
-        return False
-
-
-def is_attention_free_model(model_architectures):
-    return False
-
-
-def model_has_inner_state(model_architectures):
-    return False
-
-
-def is_embedding_model(model_architectures):
-    if (
-        "LlamaEmbeddingModel" in model_architectures
-        or "MistralModel" in model_architectures
-        or "LlamaForSequenceClassification" in model_architectures
-        or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
-    ):
-        return True
-    else:
-        return False
-
-
-def is_generation_model(model_architectures, is_embedding: bool = False):
-    # We have two ways to determine whether a model is a generative model.
-    # 1. Check the model architectue
-    # 2. check the `is_embedding` server args
-
-    if (
-        "LlamaEmbeddingModel" in model_architectures
-        or "MistralModel" in model_architectures
-        or "LlamaForSequenceClassification" in model_architectures
-        or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
-    ):
-        return False
-    else:
-        return not is_embedding
-
-
 def decode_video_base64(video_base64):
     from PIL import Image
 
@@ -397,17 +354,26 @@ def kill_parent_process():
     """Kill the parent process and all children of the parent process."""
     current_process = psutil.Process()
     parent_process = current_process.parent()
-    kill_child_process(parent_process.pid, skip_pid=current_process.pid)
-
-
-def kill_child_process(pid, including_parent=True, skip_pid=None):
-    """Kill the process and all its children process."""
+    kill_child_process(
+        parent_process.pid, include_self=True, skip_pid=current_process.pid
+    )
     try:
-        parent = psutil.Process(pid)
+        current_process.kill()
+    except psutil.NoSuchProcess:
+        pass
+
+
+def kill_child_process(pid=None, include_self=False, skip_pid=None):
+    """Kill the process and all its children process."""
+    if pid is None:
+        pid = os.getpid()
+
+    try:
+        itself = psutil.Process(pid)
     except psutil.NoSuchProcess:
         return
 
-    children = parent.children(recursive=True)
+    children = itself.children(recursive=True)
     for child in children:
         if child.pid == skip_pid:
             continue
@@ -416,9 +382,13 @@ def kill_child_process(pid, including_parent=True, skip_pid=None):
         except psutil.NoSuchProcess:
             pass
 
-    if including_parent:
+    if include_self:
         try:
-            parent.kill()
+            itself.kill()
+
+            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
+            # so we send an additional signal to kill them.
+            itself.send_signal(signal.SIGINT)
         except psutil.NoSuchProcess:
             pass
 
@@ -720,3 +690,103 @@ def first_rank_print(*args, **kwargs):
         print(*args, **kwargs)
     else:
         pass
+
+
+def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
+    mem = psutil.virtual_memory()
+    total_mem = mem.total / 1024**3
+    available_mem = mem.available / 1024**3
+    if total_mem > 32 and available_mem > 16:
+        buf_size = int(0.5 * 1024**3)
+    else:
+        buf_size = -1
+
+    socket = context.socket(socket_type)
+    if socket_type == zmq.PUSH:
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDBUF, buf_size)
+        socket.connect(f"ipc://{endpoint}")
+    elif socket_type == zmq.PULL:
+        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVBUF, buf_size)
+        socket.bind(f"ipc://{endpoint}")
+    else:
+        raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    return socket
+
+
+def dump_to_file(dirpath, name, value):
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() != 0:
+        return
+
+    os.makedirs(dirpath, exist_ok=True)
+    if value.dtype is torch.bfloat16:
+        value = value.float()
+    value = value.cpu().numpy()
+    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
+    logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
+    np.save(output_filename, value)
+
+
+def is_triton_3():
+    return triton.__version__.startswith("3.")
+
+
+def maybe_torch_compile(*args, **kwargs):
+    """
+    torch.compile does not work for triton 2.2.0, which is needed in xlm1's jax.
+    Therefore, we disable it here.
+    """
+
+    def decorator(func):
+        if is_triton_3():
+            return torch.compile(*args, **kwargs)(func)
+        return func
+
+    return decorator
+
+
+def delete_directory(dirpath):
+    try:
+        # This will remove the directory and all its contents
+        shutil.rmtree(dirpath)
+    except OSError as e:
+        print(f"Warning: {dirpath} : {e.strerror}")
+
+
+# Temporary directory for prometheus multiprocess mode
+# Cleaned up automatically when this object is garbage collected
+prometheus_multiproc_dir: tempfile.TemporaryDirectory
+
+
+def set_prometheus_multiproc_dir():
+    # Set prometheus multiprocess directory
+    # sglang uses prometheus multiprocess mode
+    # we need to set this before importing prometheus_client
+    # https://prometheus.github.io/client_python/multiprocess/
+    global prometheus_multiproc_dir
+
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        )
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+def add_prometheus_middleware(app):
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)
