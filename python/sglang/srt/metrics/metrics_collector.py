@@ -31,42 +31,42 @@ class PrometheusMetricsCollector:
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
             documentation="The number of running requests",
-            labelnames=list(labels.keys()),
+            labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.num_used_tokens = Gauge(
             name="sglang:num_used_tokens",
             documentation="The number of used tokens",
-            labelnames=list(labels.keys()),
+            labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.token_usage = Gauge(
             name="sglang:token_usage",
             documentation="The token usage",
-            labelnames=list(labels.keys()),
+            labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
 
         self.gen_throughput = Gauge(
             name="sglang:gen_throughput",
             documentation="The generate throughput (token/s)",
-            labelnames=list(labels.keys()),
+            labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.num_queue_reqs = Gauge(
             name="sglang:num_queue_reqs",
             documentation="The number of requests in the waiting queue",
-            labelnames=list(labels.keys()),
+            labelnames=labels.keys(),
             multiprocess_mode="sum",
         )
 
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
             documentation="The cache hit rate",
-            labelnames=list(labels.keys()),
+            labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
 
