@@ -56,7 +56,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.metrics.metrics_types import set_enable_metrics, time_func_latency
+from sglang.srt.metrics.func_timer import enable_func_timer, time_func_latency
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_batches,
@@ -456,7 +456,7 @@ def launch_server(
     # add prometheus middleware
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
-        set_enable_metrics(True)
+        enable_func_timer()
 
     # Send a warmup request
     t = threading.Thread(

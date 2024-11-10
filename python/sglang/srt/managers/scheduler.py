@@ -62,8 +62,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.metrics.metrics_collector import PrometheusMetricsCollector
-from sglang.srt.metrics.metrics_types import Stats
+from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
@@ -296,9 +295,9 @@ class Scheduler:
             )
 
         # Init metrics stats
-        self.stats = Stats()
+        self.stats = SchedulerStats()
         if self.enable_metrics:
-            self.metrics_collector = PrometheusMetricsCollector(
+            self.metrics_collector = SchedulerMetricsCollector(
                 labels={
                     "model_name": self.server_args.served_model_name,
                     # TODO: Add lora name/path in the future,

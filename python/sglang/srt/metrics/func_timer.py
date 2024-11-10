@@ -13,44 +13,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Metrics Types"""
+"""
+Records the latency of some functions
+"""
 
 import asyncio
-import logging
 import time
-from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable, List, Optional
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class Stats:
-    num_running_reqs: int = 0
-    num_used_tokens: int = 0
-    token_usage: float = 0.0
-    gen_throughput: float = 0.0
-    num_queue_reqs: int = 0
-    cache_hit_rate: float = 0.0
-
-    prompt_tokens_total: int = 0
-    generation_tokens_total: int = 0
-
-    time_to_first_token_list: List[float] = field(default_factory=list)
-    time_per_output_token_list: List[float] = field(default_factory=list)
-    e2e_request_latency_list: List[float] = field(default_factory=list)
-
 
 enable_metrics = False
 
 
-def set_enable_metrics(value: bool):
+def enable_func_timer():
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import Histogram
 
     global enable_metrics, FUNC_LATENCY
-    enable_metrics = value
+    enable_metrics = True
 
     FUNC_LATENCY = Histogram(
         "sglang:func_latency_seconds",

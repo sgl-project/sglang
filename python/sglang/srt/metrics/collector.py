@@ -15,16 +15,25 @@ limitations under the License.
 
 """Utilities for Prometheus Metrics Collection."""
 
-from typing import Dict, List, Union
+from dataclasses import dataclass
+from typing import Dict, Union
 
-from sglang.srt.metrics.metrics_types import Stats
+
+@dataclass
+class SchedulerStats:
+    num_running_reqs: int = 0
+    num_used_tokens: int = 0
+    token_usage: float = 0.0
+    gen_throughput: float = 0.0
+    num_queue_reqs: int = 0
+    cache_hit_rate: float = 0.0
 
 
-class PrometheusMetricsCollector:
+class SchedulerMetricsCollector:
 
     def __init__(self, labels: Dict[str, str]) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Gauge, Histogram
+        from prometheus_client import Gauge
 
         self.labels = labels
 
@@ -70,18 +79,36 @@ class PrometheusMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-        self.prompt_tokens_total = Gauge(
+    def _log_gauge(self, gauge, data: Union[int, float]) -> None:
+        # Convenience function for logging to gauge.
+        gauge.labels(**self.labels).set(data)
+
+    def log_stats(self, stats: SchedulerStats) -> None:
+        self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
+        self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
+        self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(self.gen_throughput, stats.gen_throughput)
+        self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
+        self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+
+
+class TokenizerMetricsCollector:
+    def __init__(self, labels: Dict[str, str]) -> None:
+        # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+        from prometheus_client import Counter, Histogram
+
+        self.labels = labels
+
+        self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
             documentation="Number of prefill tokens processed.",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
         )
 
-        self.generation_tokens_total = Gauge(
+        self.generation_tokens_total = Counter(
             name="sglang:generation_tokens_total",
             documentation="Number of generation tokens processed.",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
         )
 
         self.histogram_time_to_first_token = Histogram(
@@ -161,32 +188,24 @@ class PrometheusMetricsCollector:
             ],
         )
 
-    def _log_gauge(self, gauge, data: Union[int, float]) -> None:
-        # Convenience function for logging to gauge.
-        gauge.labels(**self.labels).set(data)
+    def _log_histogram(self, histogram, data: Union[int, float]) -> None:
+        histogram.labels(**self.labels).observe(data)
 
-    def _log_histogram(self, histogram, data: Union[List[int], List[float]]) -> None:
-        # Convenience function for logging list to histogram.
-        for datum in data:
-            histogram.labels(**self.labels).observe(datum)
+    def _log_counter(self, counter, data: Union[int, float]) -> None:
+        # Convenience function for logging to counter.
+        counter.labels(**self.labels).inc(data)
 
-    def log_stats(self, stats: Stats) -> None:
-        self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
-        self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
-        self._log_gauge(self.token_usage, stats.token_usage)
-        self._log_gauge(self.gen_throughput, stats.gen_throughput)
-        self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
-        self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+    def inc_prompt_tokens(self, value: int):
+        self._log_counter(self.prompt_tokens_total, value)
 
-        self._log_gauge(self.prompt_tokens_total, stats.prompt_tokens_total)
-        self._log_gauge(self.generation_tokens_total, stats.generation_tokens_total)
+    def inc_generation_tokens(self, value: int):
+        self._log_counter(self.generation_tokens_total, value)
 
-        self._log_histogram(
-            self.histogram_time_to_first_token, stats.time_to_first_token_list
-        )
-        self._log_histogram(
-            self.histogram_time_per_output_token, stats.time_per_output_token_list
-        )
-        self._log_histogram(
-            self.histogram_e2e_request_latency, stats.e2e_request_latency_list
-        )
+    def observe_time_to_first_token(self, value: Union[float, int]):
+        self._log_histogram(self.histogram_time_to_first_token, value)
+
+    def observe_time_per_output_token(self, value: Union[float, int]):
+        self._log_histogram(self.histogram_time_per_output_token, value)
+
+    def observe_e2e_request_latency(self, value: Union[float, int]):
+        self._log_histogram(self.histogram_e2e_request_latency, value)

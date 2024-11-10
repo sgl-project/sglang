@@ -52,6 +52,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
 )
+from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_child_process
@@ -80,6 +81,7 @@ class TokenizerManager:
     ):
         # Parse args
         self.server_args = server_args
+        self.enable_metrics = server_args.enable_metrics
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -141,6 +143,15 @@ class TokenizerManager:
 
         # Others
         self.gracefully_exit = False
+
+        # Metrics
+        if self.enable_metrics:
+            self.metrics_collector = TokenizerMetricsCollector(
+                labels={
+                    "model_name": self.server_args.served_model_name,
+                    # TODO: Add lora name/path in the future,
+                },
+            )
 
     async def generate_request(
         self,
@@ -523,6 +534,14 @@ class TokenizerManager:
                 state.out_list.append(out_dict)
                 state.finished = recv_obj.finished_reason[i] is not None
                 state.event.set()
+
+                if self.enable_metrics and state.finished:
+                    self.metrics_collector.inc_prompt_tokens(
+                        recv_obj.meta_info[i]["prompt_tokens"]
+                    )
+                    self.metrics_collector.inc_generation_tokens(
+                        recv_obj.meta_info[i]["completion_tokens"]
+                    )
 
     def convert_logprob_style(
         self,
