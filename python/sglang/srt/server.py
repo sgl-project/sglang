@@ -190,7 +190,7 @@ async def get_memory_pool_size():
 
 
 @app.post("/update_weights")
-@time_func_latency(name="/update_weights")
+@time_func_latency
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
     """Update the weights inplace without re-launching the server."""
     success, message = await tokenizer_manager.update_weights(obj, request)
@@ -207,7 +207,7 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
         )
 
 
-@time_func_latency(name="/generate_request")
+@time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if obj.stream:
@@ -245,7 +245,7 @@ app.post("/generate")(generate_request)
 app.put("/generate")(generate_request)
 
 
-@time_func_latency(name="/encode")
+@time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
@@ -261,7 +261,7 @@ app.post("/encode")(encode_request)
 app.put("/encode")(encode_request)
 
 
-@time_func_latency(name="/classify")
+@time_func_latency
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
@@ -281,19 +281,19 @@ app.put("/classify")(classify_request)
 
 
 @app.post("/v1/completions")
-@time_func_latency(name="/v1/completions")
+@time_func_latency
 async def openai_v1_completions(raw_request: Request):
     return await v1_completions(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/chat/completions")
-@time_func_latency(name="/v1/chat/completions")
+@time_func_latency
 async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/embeddings", response_class=ORJSONResponse)
-@time_func_latency(name="/v1/embeddings")
+@time_func_latency
 async def openai_v1_embeddings(raw_request: Request):
     response = await v1_embeddings(tokenizer_manager, raw_request)
     return response

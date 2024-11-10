@@ -20,7 +20,7 @@ import logging
 import time
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -64,25 +64,27 @@ def exponential_buckets(start: float, width: float, length: int) -> List[float]:
     return buckets
 
 
-def time_func_latency(*labelvalues: Any, **labelkwargs: Any) -> Callable[..., Any]:
+def time_func_latency(name: Optional[str] = None) -> Callable[..., Any]:
     """
-    A decorator to measure latency of a function's execution. Supports both sync and async functions.
+    A decorator to observe the latency of a function's execution. Supports both sync and async functions.
 
-    NOTE: We invent our own implementation of a timer decorator since prometheus_client does not support async
+    NOTE: We use our own implementation of a timer decorator since prometheus_client does not support async
     context manager yet.
 
     Overhead: The overhead introduced here in case of an async function could likely be because of `await` introduced
     which will return in another coroutine object creation and under heavy load could see longer wall time
     (scheduling delays due to introduction of another awaitable).
 
-    @param metric: The prometheus histogram to record the time elapsed in.
-    @param labelvalues: The label values to record in the prometheus metric.
-    @param labelkwargs: The label kwargs to record in the prometheus metric.
+    @param name: The name of this function
 
     @return: A function that wraps the given function and measures its execution time in prometheus metric.
     """
 
     def measure(func: Callable[..., Any]) -> Callable[..., Any]:
+        nonlocal name
+
+        name = name or func.__name__
+
         @wraps(func)
         async def async_wrapper(*args, **kwargs):
             if not enable_metrics:
@@ -95,9 +97,7 @@ def time_func_latency(*labelvalues: Any, **labelkwargs: Any) -> Callable[..., An
                 try:
                     ret = await ret
                 finally:
-                    metric.labels(*labelvalues, **labelkwargs).observe(
-                        time.monotonic() - start
-                    )
+                    metric.labels(name=name).observe(time.monotonic() - start)
             return ret
 
         @wraps(func)
@@ -110,9 +110,7 @@ def time_func_latency(*labelvalues: Any, **labelkwargs: Any) -> Callable[..., An
             try:
                 ret = func(*args, **kwargs)
             finally:
-                metric.labels(*labelvalues, **labelkwargs).observe(
-                    time.monotonic() - start
-                )
+                metric.labels(name=name).observe(time.monotonic() - start)
             return ret
 
         if asyncio.iscoroutinefunction(func):
