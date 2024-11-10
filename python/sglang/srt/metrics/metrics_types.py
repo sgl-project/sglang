@@ -18,7 +18,7 @@ limitations under the License.
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable, List, Optional
 
@@ -33,6 +33,13 @@ class Stats:
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
     cache_hit_rate: float = 0.0
+
+    prompt_tokens_total: int = 0
+    generation_tokens_total: int = 0
+
+    time_to_first_token_list: List[float] = field(default_factory=list)
+    time_per_output_token_list: List[float] = field(default_factory=list)
+    e2e_request_latency_list: List[float] = field(default_factory=list)
 
 
 enable_metrics = False

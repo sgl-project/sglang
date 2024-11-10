@@ -303,7 +303,6 @@ class Scheduler:
                     "model_name": self.server_args.served_model_name,
                     # TODO: Add lora name/path in the future,
                 },
-                context_len=self.model_config.context_len,
             )
 
     def watchdog_thread(self):
