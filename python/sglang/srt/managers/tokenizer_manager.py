@@ -22,6 +22,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from typing import Dict, List, Optional, Tuple, Union
 
 import fastapi
@@ -69,6 +70,10 @@ class ReqState:
     out_list: List
     finished: bool
     event: asyncio.Event
+
+    # For metrics
+    created_time: float
+    first_token_time: Optional[float] = None
 
 
 class TokenizerManager:
@@ -158,6 +163,8 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        created_time = time.time()
+
         if self.to_create_loop:
             self.create_handle_loop()
 
@@ -175,10 +182,12 @@ class TokenizerManager:
         if is_single:
             tokenized_obj = await self._tokenize_one_request(obj)
             self.send_to_scheduler.send_pyobj(tokenized_obj)
-            async for response in self._wait_one_response(obj, request):
+            async for response in self._wait_one_response(obj, request, created_time):
                 yield response
         else:
-            async for response in self._handle_batch_request(obj, request):
+            async for response in self._handle_batch_request(
+                obj, request, created_time
+            ):
                 yield response
 
     async def _tokenize_one_request(
@@ -242,10 +251,11 @@ class TokenizerManager:
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        created_time: Optional[float] = None,
     ):
         """Wait for the response of one request."""
         event = asyncio.Event()
-        state = ReqState([], False, event)
+        state = ReqState([], False, event, created_time=created_time)
         self.rid_to_state[obj.rid] = state
 
         while True:
@@ -283,6 +293,7 @@ class TokenizerManager:
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        created_time: Optional[float] = None,
     ):
         batch_size = obj.batch_size
 
@@ -294,7 +305,9 @@ class TokenizerManager:
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
                 self.send_to_scheduler.send_pyobj(tokenized_obj)
-                generators.append(self._wait_one_response(tmp_obj, request))
+                generators.append(
+                    self._wait_one_response(tmp_obj, request, created_time)
+                )
                 rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
@@ -314,7 +327,9 @@ class TokenizerManager:
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self.send_to_scheduler.send_pyobj(tokenized_obj)
-                await self._wait_one_response(tmp_obj, request).__anext__()
+                await self._wait_one_response(
+                    tmp_obj, request, created_time
+                ).__anext__()
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -323,7 +338,9 @@ class TokenizerManager:
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self.send_to_scheduler.send_pyobj(tokenized_obj)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    generators.append(
+                        self._wait_one_response(tmp_obj, request, created_time)
+                    )
                     rids.append(tmp_obj.rid)
 
         # Wait for all requests
@@ -535,13 +552,28 @@ class TokenizerManager:
                 state.finished = recv_obj.finished_reason[i] is not None
                 state.event.set()
 
-                if self.enable_metrics and state.finished:
-                    self.metrics_collector.inc_prompt_tokens(
-                        recv_obj.meta_info[i]["prompt_tokens"]
-                    )
-                    self.metrics_collector.inc_generation_tokens(
-                        recv_obj.meta_info[i]["completion_tokens"]
-                    )
+                if self.enable_metrics:
+                    if state.first_token_time is None:
+                        self.metrics_collector.observe_e2e_request_latency(
+                            time.time() - state.created_time
+                        )
+                        state.first_token_time = time.time()
+                    else:
+                        self.metrics_collector.observe_time_per_output_token(
+                            (time.time() - state.first_token_time)
+                            / (recv_obj.meta_info[i]["completion_tokens"] - 1)
+                        )
+
+                    if state.finished:
+                        self.metrics_collector.inc_prompt_tokens(
+                            recv_obj.meta_info[i]["prompt_tokens"]
+                        )
+                        self.metrics_collector.inc_generation_tokens(
+                            recv_obj.meta_info[i]["completion_tokens"]
+                        )
+                        self.metrics_collector.observe_e2e_request_latency(
+                            time.time() - state.created_time
+                        )
 
     def convert_logprob_style(
         self,
