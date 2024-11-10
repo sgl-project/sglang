@@ -34,6 +34,7 @@ Replace `<secret>` below with your huggingface hub [token](https://huggingface.c
 
 ```bash
 docker run --gpus all \
+    --shm-size 32g \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<secret>" \
