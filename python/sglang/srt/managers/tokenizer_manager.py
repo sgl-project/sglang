@@ -553,31 +553,32 @@ class TokenizerManager:
                 state.event.set()
 
                 if self.enable_metrics:
+                    completion_tokens = recv_obj.meta_info[i]["completion_tokens"]
+
                     if state.first_token_time is None:
-                        self.metrics_collector.observe_time_to_first_token(
-                            time.time() - state.created_time
-                        )
                         state.first_token_time = time.time()
-                    else:
-                        self.metrics_collector.observe_time_per_output_token(
-                            (time.time() - state.first_token_time)
-                            / (recv_obj.meta_info[i]["completion_tokens"] - 1)
+                        self.metrics_collector.observe_time_to_first_token(
+                            state.first_token_time - state.created_time
                         )
+                    else:
+                        if completion_tokens >= 2:
+                            self.metrics_collector.observe_time_per_output_token(
+                                (time.time() - state.first_token_time)
+                                / (completion_tokens - 1)
+                            )
 
                     if state.finished:
                         self.metrics_collector.inc_prompt_tokens(
                             recv_obj.meta_info[i]["prompt_tokens"]
                         )
-                        self.metrics_collector.inc_generation_tokens(
-                            recv_obj.meta_info[i]["completion_tokens"]
-                        )
+                        self.metrics_collector.inc_generation_tokens(completion_tokens)
                         self.metrics_collector.observe_e2e_request_latency(
                             time.time() - state.created_time
                         )
-                        self.metrics_collector.observe_time_per_output_token(
-                            (time.time() - state.created_time)
-                            / recv_obj.meta_info[i]["completion_tokens"]
-                        )
+                        if completion_tokens >= 1:
+                            self.metrics_collector.observe_time_per_output_token(
+                                (time.time() - state.created_time) / completion_tokens
+                            )
 
     def convert_logprob_style(
         self,
