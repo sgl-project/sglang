@@ -33,6 +33,21 @@ class TestEnableMetrics(unittest.TestCase):
 
             print(f"metrics_content=\n{metrics_content}")
 
+            # Verify essential metrics are present
+            essential_metrics = [
+                "sglang:num_running_reqs",
+                "sglang:token_usage",
+                "sglang:gen_throughput",
+                "sglang:cache_hit_rate",
+            ]
+
+            for metric in essential_metrics:
+                self.assertIn(metric, metrics_content, f"Missing metric: {metric}")
+
+            # Verify model name label is present and correct
+            expected_model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+            self.assertIn(f'model_name="{expected_model_name}"', metrics_content)
+
         finally:
             kill_child_process(process.pid, include_self=True)
 
