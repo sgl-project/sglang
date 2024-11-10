@@ -117,11 +117,11 @@ async def health_generate(request: Request) -> Response:
 
     if tokenizer_manager.is_generation:
         gri = GenerateReqInput(
-            text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
         )
     else:
         gri = EmbeddingReqInput(
-            text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
         )
 
     try:
