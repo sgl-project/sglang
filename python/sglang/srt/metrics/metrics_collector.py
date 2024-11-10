@@ -71,4 +71,9 @@ class PrometheusMetricsCollector:
         )
 
     def log_stats(self, stats: Stats) -> None:
-        self.num_running_reqs.set(stats.num_running_reqs)
+        self.num_running_reqs.labels(**self.labels).set(stats.num_running_reqs)
+        self.num_used_tokens.labels(**self.labels).set(stats.num_used_tokens)
+        self.token_usage.labels(**self.labels).set(stats.token_usage)
+        self.gen_throughput.labels(**self.labels).set(stats.gen_throughput)
+        self.num_queue_reqs.labels(**self.labels).set(stats.num_queue_reqs)
+        self.cache_hit_rate.labels(**self.labels).set(stats.cache_hit_rate)
