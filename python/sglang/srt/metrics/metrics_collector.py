@@ -23,7 +23,7 @@ from sglang.srt.metrics.metrics_types import Stats
 class PrometheusMetricsCollector:
 
     def __init__(self, labels: Dict[str, str], context_len: int) -> None:
-        # We need to import this one after the environment variable `PROMETHEUS_MULTIPROC_DIR` is set
+        # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels

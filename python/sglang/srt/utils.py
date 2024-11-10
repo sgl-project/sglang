@@ -781,7 +781,7 @@ def set_prometheus_multiproc_dir():
 
 
 def add_prometheus_middleware(app):
-    # We need to import this one after the environment variable `PROMETHEUS_MULTIPROC_DIR` is set
+    # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
 
     registry = CollectorRegistry()
