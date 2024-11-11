@@ -34,7 +34,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 import dataclasses
 import logging
 import time
-from typing import List, Optional, Tuple, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 

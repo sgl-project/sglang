@@ -1,13 +1,23 @@
+from typing import List, Optional, Union
+
 import torch
-from typing import Union, List, Optional
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.speculative.speculative_worker import SpeculativeWorker, spec_worker_factory
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch, Req
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode, CaptureHiddenMode
-from sglang.srt.speculative.eagle_utils import EAGLEDraftInput, EagleVerifyInput
+
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req, ScheduleBatch
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_utils import EAGLEDraftInput, EagleVerifyInput
+from sglang.srt.speculative.speculative_worker import (
+    SpeculativeWorker,
+    spec_worker_factory,
+)
+
 
 @spec_worker_factory.register('EAGLE')
 class EAGLEWorker(SpeculativeWorker):

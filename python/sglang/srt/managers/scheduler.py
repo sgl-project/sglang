@@ -58,7 +58,6 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.speculative.speculative_worker import spec_worker_factory
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -66,6 +65,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.metrics_collector import PrometheusMetricsCollector
 from sglang.srt.metrics.metrics_types import Stats
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.speculative.speculative_worker import spec_worker_factory
 from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,

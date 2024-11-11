@@ -6,9 +6,14 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.speculative_utils import (
+    DraftInfoFactory,
+    SpecDraftInput,
+    SpecVerifyInput,
+)
+
 from .build_eagle_tree import build_tree_kernel
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, ForwardBatch
-from sglang.srt.speculative.speculative_utils import SpecDraftInput, SpecVerifyInput, DraftInfoFactory
 
 if TYPE_CHECKING:
     from python.sglang.srt.layers.sampler import SampleOutput

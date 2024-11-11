@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import nn
@@ -7,6 +7,7 @@ from torch import nn
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.speculative_utils import SpecInput
+
 
 class AttentionBackend(ABC):
     """The base class of attention backends"""

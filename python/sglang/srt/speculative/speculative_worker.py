@@ -1,7 +1,8 @@
-from typing import Type, Union, List, Optional
-from sglang.srt.server_args import ServerArgs
+from typing import List, Optional, Type, Union
+
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.schedule_batch import ScheduleBatch, Req
+from sglang.srt.server_args import ServerArgs
 
 
 class SpeculativeWorker(TpModelWorker):
