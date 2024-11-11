@@ -6,7 +6,7 @@ import threading
 import time
 from argparse import ArgumentParser
 
-from vllm.transformers_utils.tokenizer import get_tokenizer
+from sglang.srt.hf_transformers_utils import get_tokenize
 
 import sglang as sgl
 from sglang.test.test_utils import (
