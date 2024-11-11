@@ -874,4 +874,17 @@ class Engine:
         else:
             return tokenizer_manager.tokenizer
 
-    # TODO (ByronHsu): encode
+    def encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+    ):
+        global tokenizer_manager
+
+        if tokenizer_manager is None:
+            raise ReferenceError("Tokenizer Manager is not initialized.")
+
+        obj = EmbeddingReqInput(text=prompt)
+
+        # get the current event loop
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(encode_request(obj, None))
