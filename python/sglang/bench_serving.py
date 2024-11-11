@@ -659,14 +659,14 @@ def sample_generated_shared_prefix_requests(
     input_requests = []
     total_input_tokens = 0
     total_output_tokens = 0
-    
+
     for group_idx in range(num_groups):
         system_prompt = system_prompts[group_idx]
         for prompt_idx in range(prompts_per_group):
             question = questions[group_idx * prompts_per_group + prompt_idx]
             full_prompt = f"{system_prompt}\n\n{question}"
             prompt_len = len(tokenizer.encode(full_prompt))
-            
+
             input_requests.append((full_prompt, prompt_len, output_len))
             total_input_tokens += prompt_len
             total_output_tokens += output_len
@@ -677,10 +677,15 @@ def sample_generated_shared_prefix_requests(
     print(f"Total prompts: {len(input_requests)}")
     print(f"Total input tokens: {total_input_tokens}")
     print(f"Total output tokens: {total_output_tokens}")
-    print(f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens")
-    print(f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n")
-    
+    print(
+        f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens"
+    )
+    print(
+        f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
+    )
+
     return input_requests
+
 
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
@@ -1273,7 +1278,6 @@ if __name__ == "__main__":
         "additional generate params like sampling params.",
     )
 
-
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
     group.add_argument(
         "--gen-num-groups",
@@ -1282,7 +1286,7 @@ if __name__ == "__main__":
         help="Number of system prompt groups for generated-shared-prefix dataset",
     )
     group.add_argument(
-        "--gen-prompts-per-group", 
+        "--gen-prompts-per-group",
         type=int,
         default=16,
         help="Number of prompts per system prompt group for generated-shared-prefix dataset",
@@ -1305,6 +1309,6 @@ if __name__ == "__main__":
         default=256,
         help="Target length in tokens for outputs in generated-shared-prefix dataset",
     )
-    
+
     args = parser.parse_args()
     run_benchmark(args)
