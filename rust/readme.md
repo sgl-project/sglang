@@ -2,6 +2,11 @@
 
 SGLang router is a standalone module implemented in Rust to achieve data parallelism across SGLang instances.
 
+## Architecture
+
+1. `src/`: rust impl of the router
+2. `py_src/`: lightweight python interafce on top of rust python binding. This will be published as `sglang-router` pypi package
+
 ## Installation
 
 WIP. Ideally just
@@ -81,6 +86,23 @@ $ maturin develop
 📦 Built wheel for CPython 3.10 to /tmp/.tmpJb65sc/sglang_router-0.0.0-cp310-cp310-linux_x86_64.whl
 ✏️  Setting installed package as editable
 🛠 Installed sglang_router-0.0.0
+```
+
+4. Alternatively, if you don't want to create a venv, you can also build the binding as a wheel and install it
+
+```bash
+$ maturin build --interpreter python
+...
+   Compiling pyo3 v0.22.6
+   Compiling pyo3-macros v0.22.6
+   Compiling sglang_router v0.0.0 (/home/jobuser/sglang/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.67s
+🖨  Copied external shared libraries to package sglang_router.libs directory:
+    /usr/lib/libssl.so.1.1.1k
+    /usr/lib/libcrypto.so.1.1.1k
+📦 Built wheel for CPython 3.10 to <wheel path>
+
+$ pip install <wheel path>
 ```
 
 ## Usage
