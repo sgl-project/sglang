@@ -48,7 +48,7 @@ class BNFCache:
     def get_context(self, key: Tuple[str, str]) -> GrammarMatcherInitContext:
         key_type, key_string = key
         if key_type == "json":
-            return self.grammar_cache.get_init_context_for_json_schema(key_string)
+            return self.grammar_cache.get_compiled_grammar_for_json_schema(key_string)
         elif key_type == "regex":
             raise ValueError(f"regex hasn't been supported by xgrammar yet")
         else:
@@ -59,3 +59,6 @@ class BNFCache:
         return GrammarMatcher(
             ctx, max_rollback_tokens=MAX_ROLLBACK_TOKENS, mask_vocab_size=vocab_size
         )
+
+    def reset(self):
+        self.grammar_cache.clear()

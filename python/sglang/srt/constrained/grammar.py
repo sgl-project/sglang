@@ -130,7 +130,7 @@ class GrammarInner:
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, vocab_size: int):
         if isinstance(self.grammar, GrammarMatcher):
             # Note that this bitmask is a bitset, not bool
-            bitmask = self.grammar.find_next_token_bitmask()
+            bitmask = self.grammar.get_next_token_bitmask()
             # Mask the tokens that are not allowed
             vocab_mask[
                 self.grammar.get_rejected_tokens_from_bitmask(bitmask, vocab_size)
@@ -232,7 +232,6 @@ class GrammarCache:
         return Grammar(FutureObject(lambda: self._query(key, vocab_size)))
 
     def reset(self):
-        if isinstance(self.grammar_cache, FSMCache):
-            self.grammar_cache.reset()
+        self.grammar_cache.reset()
         if isinstance(self.jump_cache, JumpForwardCache):
             self.jump_cache.reset()

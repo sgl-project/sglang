@@ -52,19 +52,13 @@ except ImportError:
 
 
 try:
-    from xgrammar import (
-        GrammarMatcher,
-        GrammarMatcherInitContext,
-        GrammarMatcherInitContextCache,
-    )
+    from xgrammar import CachedGrammarCompiler as GrammarMatcherInitContextCache
+    from xgrammar import CompiledGrammar as GrammarMatcherInitContext
+    from xgrammar import GrammarMatcher
 except ImportError as e:
-
-    class Dummy:
-        pass
-
-    GrammarMatcher = Dummy
-    GrammarMatcherInitContext = Dummy
-    GrammarMatcherInitContextCache = Dummy
+    GrammarMatcher = object
+    GrammarMatcherInitContext = object
+    GrammarMatcherInitContextCache = object
 
 __all__ = [
     "RegexGuide",
