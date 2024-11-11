@@ -1,14 +1,14 @@
 [package]
-name = "sglang_router"
+name = "sglang_router_rs"
 version = "0.0.0"
 edition = "2021"
 
 [[bin]]
-name = "sglang_router"
+name = "sglang_router_rs"
 path = "src/main.rs"
 
 [lib]
-name = "sglang_router"
+name = "sglang_router_rs"
 # Pure Rust library: Just omit crate-type (defaults to rlib)
 # Python/C binding + Rust library: Use ["cdylib", "rlib"]
 crate-type = ["cdylib", "rlib"]
