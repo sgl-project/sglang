@@ -3,6 +3,7 @@ python3 -m unittest test_large_max_new_tokens.TestLargeMaxNewTokens.test_chat_co
 """
 
 import os
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -11,9 +12,11 @@ import openai
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    STDERR_FILENAME,
+    STDOUT_FILENAME,
     popen_launch_server,
 )
 
@@ -21,32 +24,39 @@ from sglang.test.test_utils import (
 class TestLargeMaxNewTokens(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
-        cls.stdout = open("stdout.txt", "w")
-        cls.stderr = open("stderr.txt", "w")
+        cls.stdout = open(STDOUT_FILENAME, "w")
+        cls.stderr = open(STDERR_FILENAME, "w")
 
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=("--max-total-token", "1024", "--context-len", "8192"),
+            other_args=(
+                "--max-total-token",
+                "1024",
+                "--context-len",
+                "8192",
+                "--decode-log-interval",
+                "2",
+            ),
             env={"SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "256", **os.environ},
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
     @classmethod
     def tearDownClass(cls):
         kill_child_process(cls.process.pid, include_self=True)
         cls.stdout.close()
         cls.stderr.close()
-        os.remove("stdout.txt")
-        os.remove("stderr.txt")
+        os.remove(STDOUT_FILENAME)
+        os.remove(STDERR_FILENAME)
 
     def run_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -75,7 +85,8 @@ class TestLargeMaxNewTokens(unittest.TestCase):
             # Ensure that they are running concurrently
             pt = 0
             while pt >= 0:
-                lines = open("stderr.txt").readlines()
+                time.sleep(5)
+                lines = open(STDERR_FILENAME).readlines()
                 for line in lines[pt:]:
                     print(line, end="", flush=True)
                     if f"#running-req: {num_requests}" in line:
