@@ -878,11 +878,6 @@ class Engine:
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
     ):
-        global tokenizer_manager
-
-        if tokenizer_manager is None:
-            raise ReferenceError("Tokenizer Manager is not initialized.")
-
         obj = EmbeddingReqInput(text=prompt)
 
         # get the current event loop
