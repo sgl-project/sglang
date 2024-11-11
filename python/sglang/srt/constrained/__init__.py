@@ -56,9 +56,14 @@ try:
     from xgrammar import CompiledGrammar as GrammarMatcherInitContext
     from xgrammar import GrammarMatcher
 except ImportError as e:
-    GrammarMatcher = object
-    GrammarMatcherInitContext = object
-    GrammarMatcherInitContextCache = object
+    # we rely on type information, so we have a dummy class here
+    class Dummy:
+        def __init__(self):
+            pass
+
+    GrammarMatcher = Dummy
+    GrammarMatcherInitContext = Dummy
+    GrammarMatcherInitContextCache = Dummy
 
 __all__ = [
     "RegexGuide",
