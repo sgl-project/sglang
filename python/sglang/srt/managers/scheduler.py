@@ -237,6 +237,7 @@ class Scheduler:
 
         # Init the FSM cache for constrained generation
         self.grammar_cache = None
+        self.grammar_queue: List[Req] = []
 
         if not server_args.skip_tokenizer_init:
             self.grammar_cache = GrammarCache(
@@ -494,7 +495,11 @@ class Scheduler:
         )
 
         req.created_time = time.time()
-        self.waiting_queue.append(req)
+
+        if req.grammar is not None:
+            self.grammar_queue.append(req)
+        else:
+            self.waiting_queue.append(req)
 
     def handle_embedding_request(
         self,
@@ -597,6 +602,16 @@ class Scheduler:
         return self.running_batch
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        # Check if the grammar queue is ready
+        new_grammar_queue = []
+        for req in self.grammar_queue:
+            assert req.grammar is not None
+            if req.grammar.is_complete():
+                self.waiting_queue.append(req)
+            else:
+                new_grammar_queue.append(req)
+        self.grammar_queue = new_grammar_queue
+
         # Handle the cases where prefill is not allowed
         if (
             self.batch_is_full or len(self.waiting_queue) == 0

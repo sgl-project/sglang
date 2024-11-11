@@ -153,6 +153,11 @@ class Grammar:
         assert isinstance(self.data, GrammarInner)
         return self.data
 
+    def is_complete(self) -> bool:
+        if isinstance(self.data, FutureObject):
+            return self.data.is_complete()
+        return True
+
     def accept_token(self, token: int):
         self._get().accept_token(token)
 

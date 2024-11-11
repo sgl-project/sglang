@@ -43,3 +43,6 @@ class FutureObject:
         self._done.wait()
         assert self._result is not None
         return self._result
+
+    def is_complete(self) -> bool:
+        return self._done.is_set()
