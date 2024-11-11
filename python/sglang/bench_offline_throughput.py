@@ -13,8 +13,9 @@ import dataclasses
 import itertools
 import logging
 import time
-import jsonlines
 from typing import Dict, List, Tuple
+
+import jsonlines
 
 from sglang.api import Engine as getEngine
 from sglang.srt.server import Engine
