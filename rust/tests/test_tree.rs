@@ -1,4 +1,4 @@
-use sglang_router::tree::RadixTree;
+use sglang_router_rs::tree::RadixTree;
 
 #[test]
 fn test_new_tree() {
