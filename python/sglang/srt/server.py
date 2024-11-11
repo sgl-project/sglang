@@ -56,6 +56,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.metrics.func_timer import enable_func_timer, time_func_latency
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_batches,
@@ -196,6 +197,7 @@ async def get_memory_pool_size():
 
 
 @app.post("/update_weights")
+@time_func_latency
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
     """Update the weights inplace without re-launching the server."""
     success, message = await tokenizer_manager.update_weights(obj, request)
@@ -212,7 +214,7 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
         )
 
 
-# fastapi implicitly converts json in the request to obj (dataclass)
+@time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if obj.stream:
@@ -245,10 +247,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             )
 
 
+# fastapi implicitly converts json in the request to obj (dataclass)
 app.post("/generate")(generate_request)
 app.put("/generate")(generate_request)
 
 
+@time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
@@ -264,6 +268,7 @@ app.post("/encode")(encode_request)
 app.put("/encode")(encode_request)
 
 
+@time_func_latency
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
@@ -283,16 +288,19 @@ app.put("/classify")(classify_request)
 
 
 @app.post("/v1/completions")
+@time_func_latency
 async def openai_v1_completions(raw_request: Request):
     return await v1_completions(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/chat/completions")
+@time_func_latency
 async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/embeddings", response_class=ORJSONResponse)
+@time_func_latency
 async def openai_v1_embeddings(raw_request: Request):
     response = await v1_embeddings(tokenizer_manager, raw_request)
     return response
@@ -455,6 +463,7 @@ def launch_server(
     # add prometheus middleware
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
+        enable_func_timer()
 
     # Send a warmup request
     t = threading.Thread(
@@ -492,6 +501,10 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
 
+    # Set prometheus env vars
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
+
     # Set ulimit
     set_ulimit()
 
@@ -509,10 +522,6 @@ def _set_envs_and_config(server_args: ServerArgs):
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
-
-    # Set prometheus env vars
-    if server_args.enable_metrics:
-        set_prometheus_multiproc_dir()
 
     mp.set_start_method("spawn", force=True)
 
