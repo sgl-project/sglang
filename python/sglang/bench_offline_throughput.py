@@ -2,6 +2,10 @@
 Benchmark the throughput of using the offline LLM engine.
 This script does not launch a server.
 It accepts the same arguments as bench_latency.py
+
+# Usage
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --output-len 32 256 --result-filename out.jsonl
+
 """
 
 import argparse
@@ -9,11 +13,9 @@ import dataclasses
 import itertools
 import logging
 import time
+import jsonlines
 from typing import Dict, List, Tuple
 
-import numpy as np
-
-from python.sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.api import Engine as getEngine
 from sglang.srt.server import Engine
 from sglang.srt.server_args import ServerArgs
@@ -106,10 +108,10 @@ def throughput_test_once(
 
 
 def throughput_test(
-    server_args,
+    server_args: ServerArgs,
     bench_args: BenchArgs,
 ):
-    engine = getEngine(**server_args)
+    engine = getEngine(**dataclasses.asdict(server_args))
     if not engine:
         raise ValueError("Please provide valid engine arguments")
 
@@ -131,7 +133,11 @@ def throughput_test(
         if ret is not None:
             result_list.append(ret)
 
-    print(result_list)
+    if bench_args.result_filename:
+        with jsonlines.open(bench_args.result_filename, "a") as f:
+            f.write_all(result_list)
+    else:
+        print(result_list)
 
 
 if __name__ == "__main__":
