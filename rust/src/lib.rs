@@ -90,7 +90,7 @@ impl Router {
 }
 
 #[pymodule]
-fn sglang_router(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PolicyType>()?;
     m.add_class::<Router>()?;
     Ok(())
