@@ -19,13 +19,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
-
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-from .internlm2 import InternLM2Model, InternLM2ForCausalLM
+from .internlm2 import InternLM2ForCausalLM, InternLM2Model
 
 
 class InternLM2ForRewardModel(nn.Module):
@@ -52,9 +50,7 @@ class InternLM2ForRewardModel(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "InternLM2ForRewardModel is only used for embedding"
+        assert get_embedding, "InternLM2ForRewardModel is only used for embedding"
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
         scores = self.v_head(last_token_hidden)
