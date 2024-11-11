@@ -3,9 +3,11 @@
 import argparse
 import asyncio
 import os
+import random
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
 from typing import Callable, List, Optional
@@ -20,6 +22,7 @@ from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.utils import kill_child_process
+from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
 DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
@@ -402,7 +405,7 @@ def popen_launch_server(
     api_key: Optional[str] = None,
     other_args: tuple = (),
     env: Optional[dict] = None,
-    return_stdout_stderr: bool = False,
+    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -425,8 +428,8 @@ def popen_launch_server(
     if return_stdout_stderr:
         process = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=return_stdout_stderr[0],
+            stderr=return_stdout_stderr[1],
             env=env,
             text=True,
         )
@@ -495,7 +498,7 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
             )
             assert ret_code == 0
         except TimeoutError:
-            kill_child_process(process.pid)
+            kill_child_process(process.pid, include_self=True)
             time.sleep(5)
             print(
                 f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
@@ -563,7 +566,7 @@ def run_bench_serving(
     try:
         res = run_benchmark(args)
     finally:
-        kill_child_process(process.pid)
+        kill_child_process(process.pid, include_self=True)
 
     assert res["completed"] == num_prompts
     return res
@@ -596,7 +599,7 @@ def run_bench_latency(model, other_args):
         lastline = output.split("\n")[-3]
         output_throughput = float(lastline.split(" ")[-2])
     finally:
-        kill_child_process(process.pid)
+        kill_child_process(process.pid, include_self=True)
 
     return output_throughput
 
