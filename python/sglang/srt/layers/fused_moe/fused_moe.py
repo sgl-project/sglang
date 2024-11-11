@@ -131,42 +131,32 @@ def fused_moe_kernel(
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    if even_Ks:
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            # Load the next block of A and B, generate a mask by checking the
-            # K dimension.
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Load the next block of A and B, generate a mask by checking the
+        # K dimension.
+        if even_Ks:
             a = tl.load(
                 a_ptrs,
                 mask=token_mask[:, None],
                 other=0.0,
             )
             b = tl.load(b_ptrs)
-            # We accumulate along the K dimension.
-            if use_fp8:
-                accumulator = tl.dot(a, b, acc=accumulator)
-            else:
-                accumulator += tl.dot(a, b)
-            # Advance the ptrs to the next K block.
-            a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * stride_bk
-    else:
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            # Load the next block of A and B, generate a mask by checking the
-            # K dimension.
+        else:
             a = tl.load(
                 a_ptrs,
                 mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                 other=0.0,
             )
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-            # We accumulate along the K dimension.
-            if use_fp8:
-                accumulator = tl.dot(a, b, acc=accumulator)
-            else:
-                accumulator += tl.dot(a, b)
-            # Advance the ptrs to the next K block.
-            a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+        # We accumulate along the K dimension.
+        if use_fp8:
+            accumulator = tl.dot(a, b, acc=accumulator)
+        else:
+            accumulator += tl.dot(a, b)
+        # Advance the ptrs to the next K block.
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
