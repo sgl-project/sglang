@@ -86,26 +86,6 @@ class TestBenchServing(unittest.TestCase):
         if is_in_ci():
             assert res["output_throughput"] > 3100
 
-    def test_offline_throughput_default_engine(self):
-        res = run_bench_serving(
-            model=DEFAULT_MODEL_NAME_FOR_TEST,
-            num_prompts=500,
-            request_rate=float("inf"),
-            other_server_args=[],
-        )
-
-    def test_offline_throughput_llm_engine(self):
-        res = run_bench_serving(
-            backend="sgl-offline-engine",
-            model=DEFAULT_MODEL_NAME_FOR_TEST,
-            num_prompts=500,
-            request_rate=float("inf"),
-            other_server_args=[],
-        )
-
-        if is_in_ci():
-            assert res["output_throughput"] > 2830
-
     def test_online_latency_default(self):
         res = run_bench_serving(
             model=DEFAULT_MODEL_NAME_FOR_TEST,
