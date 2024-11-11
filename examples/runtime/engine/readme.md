@@ -4,7 +4,8 @@
 SGLang provides a direct inference engine without the need for an HTTP server. There are generally two use cases:
 
 1. **Offline Batch Inference**
-2. **Custom Server on Top of the Engine**
+2. **Embedding Generation**
+3. **Custom Server on Top of the Engine**
 
 ## Examples
 
@@ -12,7 +13,11 @@ SGLang provides a direct inference engine without the need for an HTTP server. T
 
 In this example, we launch an SGLang engine and feed a batch of inputs for inference. If you provide a very large batch, the engine will intelligently schedule the requests to process efficiently and prevent OOM (Out of Memory) errors.
 
-### 2. [Custom Server](./custom_server.py)
+### 2. [Embedding Generation](./embedding.py)
+
+In this example, we launch an SGLang engine and feed a batch of inputs for embedding generation.
+
+### 3. [Custom Server](./custom_server.py)
 
 This example demonstrates how to create a custom server on top of the SGLang Engine. We use [Sanic](https://sanic.dev/en/) as an example. The server supports both non-streaming and streaming endpoints.
 
