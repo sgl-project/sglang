@@ -23,7 +23,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-from .internlm2 import InternLM2ForCausalLM, InternLM2Model
+from sglang.srt.models.internlm2 import InternLM2ForCausalLM, InternLM2Model
 
 
 class InternLM2ForRewardModel(nn.Module):
