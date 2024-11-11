@@ -498,6 +498,10 @@ def v1_generate_request(
             )
 
         prompts.append(request.prompt)
+        if request.echo and request.logprobs:
+            current_logprob_start_len = 0
+        else:
+            current_logprob_start_len = -1
         sampling_params_list.append(
             {
                 "temperature": request.temperature,
@@ -517,7 +521,7 @@ def v1_generate_request(
             }
         )
         return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
-        logprob_start_lens.append(-1)
+        logprob_start_lens.append(current_logprob_start_len)
         top_logprobs_nums.append(
             request.logprobs if request.logprobs is not None else 0
         )
