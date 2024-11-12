@@ -8,11 +8,14 @@ import json
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 import sglang as sgl
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
 )
 
@@ -132,6 +135,22 @@ class TestSRTEngine(unittest.TestCase):
         print("==== Answer 2 ====")
         print(out2)
         assert out1 == out2, f"{out1} != {out2}"
+
+    def test_6_engine_runtime_encode_consistency(self):
+        prompt = "Today is a sunny day and I like"
+        model_path = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
+
+        engine = sgl.Engine(
+            model_path=model_path, is_embedding=True, random_seed=42, log_level="error"
+        )
+        out1 = torch.tensor(engine.encode(prompt)["embedding"])
+        engine.shutdown()
+
+        runtime = sgl.Runtime(model_path=model_path, is_embedding=True, random_seed=42)
+        out2 = torch.tensor(json.loads(runtime.encode(prompt))["embedding"])
+        runtime.shutdown()
+
+        self.assertTrue(torch.allclose(out1, out2, atol=1e-5, rtol=1e-3))
 
 
 if __name__ == "__main__":
