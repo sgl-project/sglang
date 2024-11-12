@@ -158,6 +158,9 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
+            self.torch_tp_applied = True
+        else:
+            self.torch_tp_applied = False
 
         if server_args.lora_paths is not None:
             self.init_lora_manager()

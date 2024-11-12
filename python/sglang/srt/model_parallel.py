@@ -16,6 +16,7 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     parallelize_module,
 )
+from torch.distributed._functional_collectives import AsyncCollectiveTensor
 
 
 class ColwiseParallelSharded(ColwiseParallel):
@@ -35,6 +36,22 @@ class ColwiseParallelSharded(ColwiseParallel):
             )
             dist_param = torch.nn.Parameter(dtensor, requires_grad=False)
             module.register_parameter(name, dist_param)
+
+class RowwiseParallelMaybeWait(RowwiseParallel):
+    """
+    A version of RowwiseParallel that waits for the output (establish dependency
+    between comm stream and compute stream in CUDA sense) before going into the
+    next op. This is needed to workaround the current interaction between
+    AsyncCollectiveTensor and custom ops, such as `class RMSNorm(CustomOp)`.
+    """
+    @staticmethod
+    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
+        outputs = super(RowwiseParallelMaybeWait, RowwiseParallelMaybeWait)._prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh)
+        # wait for the output to be ready
+        if isinstance(outputs, AsyncCollectiveTensor):
+            return outputs.wait()
+        else:
+            return outputs
 
 
 def tensor_parallel(
@@ -62,7 +79,7 @@ def tensor_parallel(
             if tp_style == "Colwise":
                 parallelize_module(submod, device_mesh, ColwiseParallel())
             elif tp_style == "Rowwise":
-                parallelize_module(submod, device_mesh, RowwiseParallel())
+                parallelize_module(submod, device_mesh, RowwiseParallelMaybeWait())
             elif tp_style == "Colwise_Sharded":
                 parallelize_module(submod, device_mesh, ColwiseParallelSharded())
             else:

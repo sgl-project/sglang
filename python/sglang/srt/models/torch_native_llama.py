@@ -50,31 +50,29 @@ def gate_up_proj_weight_loader(
     self,
     param: Parameter,
     loaded_weight: torch.Tensor,
-    loaded_shard_id: Optional[int] = None,
+    loaded_shard_id: int,
 ):
     # shard_id: (shard_offset, shard_size)
     gate_up_offsets = {}
     current_shard_offset = 0
     for i, output_size in enumerate(self.output_sizes):
+        # Everything shrinks by tp_size if TP enabled
+        output_size = output_size // tp_size
         gate_up_offsets[i] = (current_shard_offset, output_size)
         current_shard_offset += output_size
-    if loaded_shard_id is None:
-        for shard_id, (shard_offset, shard_size) in gate_up_offsets.items():
-            loaded_weight_shard = loaded_weight.narrow(
-                0, shard_offset, shard_size
-            )
-            self.weight_loader(param, loaded_weight_shard, shard_id)
-    else:
-        assert loaded_shard_id < len(self.output_sizes)
-        param_data = param.data
-        shard_offset, shard_size = gate_up_offsets[loaded_shard_id]
-        # Everything shrinks by tp_size if TP enabled
-        shard_offset, shard_size = shard_offset // tp_size, shard_size // tp_size
-        param_data = param_data.narrow(0, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
-    return
+    # Re-size the param to the size after TP
+    if current_shard_offset != param.shape[0]:
+        # The clone will free the original, full tensor
+        param.data = param.data.narrow(0, 0, current_shard_offset).clone()
+
+    # Now load gate or up
+    assert loaded_shard_id < len(self.output_sizes)
+    param_data = param.data
+    shard_offset, shard_size = gate_up_offsets[loaded_shard_id]
+    param_data = param_data.narrow(0, shard_offset, shard_size)
+    loaded_weight = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
+    assert param_data.shape == loaded_weight.shape
+    param_data.copy_(loaded_weight)
 
 
 class LlamaMLP(nn.Module):
@@ -121,30 +119,29 @@ def qkv_proj_weight_loader(
     self,
     param: Parameter,
     loaded_weight: torch.Tensor,
-    loaded_shard_id: Optional[str] = None,
+    loaded_shard_id: str,
 ):
+    num_heads = self.num_heads // tp_size
+    num_kv_heads = self.num_kv_heads // tp_size
     # shard_id: (shard_offset, shard_size)
     qkv_offsets = {
-        "q": (0, self.num_heads * self.head_size),
-        "k": (self.num_heads * self.head_size, self.num_kv_heads * self.head_size),
-        "v": ((self.num_heads + self.num_kv_heads) * self.head_size, self.num_kv_heads * self.head_size),
+        "q": (0, num_heads * self.head_size),
+        "k": (num_heads * self.head_size, num_kv_heads * self.head_size),
+        "v": ((num_heads + num_kv_heads) * self.head_size, num_kv_heads * self.head_size),
     }
-    if loaded_shard_id is None:
-        for shard_id, (shard_offset, shard_size) in qkv_offsets.items():
-            loaded_weight_shard = loaded_weight.narrow(
-                param.output_dim, shard_offset, shard_size
-            )
-            self.weight_loader(param, loaded_weight_shard, shard_id)
-    else:
-        shard_offset, shard_size = qkv_offsets[loaded_shard_id]
-        # Everything shrinks by tp_size if TP enabled
-        shard_offset, shard_size = shard_offset // tp_size, shard_size // tp_size
-        param_data = param.data
-        param_data = param_data.narrow(0, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
-    return
+    total_size = qkv_offsets["v"][0] + qkv_offsets["v"][1]
+    # Re-size the param to the size after TP
+    if total_size != param.shape[0]:
+        # The clone will free the original, full tensor
+        param.data = param.data.narrow(0, 0, total_size).clone()
+
+    # Now load q, k or v
+    shard_offset, shard_size = qkv_offsets[loaded_shard_id]
+    param_data = param.data
+    param_data = param_data.narrow(0, shard_offset, shard_size)
+    loaded_weight = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
+    assert param_data.shape == loaded_weight.shape
+    param_data.copy_(loaded_weight)
 
 
 class LlamaAttention(nn.Module):
