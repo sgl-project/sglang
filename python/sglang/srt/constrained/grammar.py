@@ -13,17 +13,15 @@ limitations under the License.
 
 """Cache for the compressed finite state machine."""
 import logging
-from typing import List, Optional, Tuple, Union
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import List, Tuple, Union
 
 import torch
 
 from sglang.srt.constrained import GrammarMatcher, RegexGuide
 from sglang.srt.constrained.bnf_cache import BNFCache
 from sglang.srt.constrained.fsm_cache import FSMCache
-from sglang.srt.constrained.future import FutureObject
 from sglang.srt.constrained.jump_forward import JumpForwardCache, JumpForwardMap
-
-# from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
@@ -142,20 +140,20 @@ class GrammarInner:
 
 
 class Grammar:
-    data: Union[FutureObject, GrammarInner]
+    data: Union[Future, GrammarInner]
 
-    def __init__(self, data: FutureObject) -> None:
+    def __init__(self, data: Future) -> None:
         self.data = data
 
     def _get(self) -> GrammarInner:
-        if isinstance(self.data, FutureObject):
-            self.data = self.data.get()
+        if isinstance(self.data, Future):
+            self.data = self.data.result()
         assert isinstance(self.data, GrammarInner)
         return self.data
 
     def is_complete(self) -> bool:
-        if isinstance(self.data, FutureObject):
-            return self.data.is_complete()
+        if isinstance(self.data, Future):
+            return self.data.done()
         return True
 
     def accept_token(self, token: int):
@@ -186,6 +184,7 @@ class Grammar:
 class GrammarCache:
     grammar_cache: Union[BNFCache, FSMCache]
     jump_cache: Union[XGrammarJump, JumpForwardCache, None]
+    executor: ThreadPoolExecutor
 
     def __init__(
         self,
@@ -196,6 +195,7 @@ class GrammarCache:
         backend=None,
         allow_jump=False,
     ):
+        self.executor = ThreadPoolExecutor()
         if backend == "xgrammar":
             self.grammar_cache = BNFCache(
                 tokenizer_path=tokenizer_path,
@@ -229,7 +229,7 @@ class GrammarCache:
             return GrammarInner((guide, 0), jump_map)
 
     def query(self, key: Tuple[str, str], vocab_size: int) -> Grammar:
-        return Grammar(FutureObject(lambda: self._query(key, vocab_size)))
+        return Grammar(self.executor.submit(self._query, key, vocab_size))
 
     def reset(self):
         self.grammar_cache.reset()
