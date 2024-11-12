@@ -6,17 +6,19 @@ from typing import Optional, Sequence
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
+
 try:
     from torch.distributed.tensor import DTensor, Shard
 except ImportError:
     # torch 2.4 or older
     from torch.distributed._tensor import DTensor, Shard
+
+from torch.distributed._functional_collectives import AsyncCollectiveTensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
     parallelize_module,
 )
-from torch.distributed._functional_collectives import AsyncCollectiveTensor
 
 
 class ColwiseParallelSharded(ColwiseParallel):

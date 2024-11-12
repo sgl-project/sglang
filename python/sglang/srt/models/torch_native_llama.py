@@ -24,7 +24,10 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter
 from transformers import LlamaConfig
-from vllm.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -40,7 +43,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
 
 tp_size = get_tensor_model_parallel_world_size()
 tp_rank = get_tensor_model_parallel_rank()
