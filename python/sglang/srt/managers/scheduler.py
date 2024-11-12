@@ -93,7 +93,7 @@ class Scheduler:
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
-        dp_rank: Optional[int],
+        dp_rank,
     ):
         # Parse args
         self.server_args = server_args
