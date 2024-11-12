@@ -11,15 +11,21 @@ python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8
 import argparse
 import dataclasses
 import itertools
+import json
 import logging
 import random
 import time
 from typing import Dict, List, Tuple
-import json
 
 import numpy as np
-from sglang.bench_serving import set_ulimit, sample_sharegpt_requests, sample_random_requests, get_tokenizer
+
 from sglang.api import Engine as getEngine
+from sglang.bench_serving import (
+    get_tokenizer,
+    sample_random_requests,
+    sample_sharegpt_requests,
+    set_ulimit,
+)
 from sglang.srt.server import Engine
 from sglang.srt.server_args import ServerArgs
 
@@ -77,7 +83,6 @@ class BenchArgs:
         )
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
 
-
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to case the args into correct types.
@@ -98,19 +103,21 @@ def throughput_test_once(
     }
 
     st = time.perf_counter()
-    gen_out = engine.generate(prompt=[r[0] for r in reqs], sampling_params={ "temperature": 0 })
+    gen_out = engine.generate(
+        prompt=[r[0] for r in reqs], sampling_params={"temperature": 0}
+    )
     latency = time.perf_counter() - st
 
     measurement_results["total_latency"] = latency
-    measurement_results["total_output_tokens"] = sum(o["meta_info"]["completion_tokens"] for o in gen_out)
+    measurement_results["total_output_tokens"] = sum(
+        o["meta_info"]["completion_tokens"] for o in gen_out
+    )
     measurement_results["throughput"] = (
-        measurement_results["total_input_tokens"] +
-        measurement_results["total_output_tokens"]
+        measurement_results["total_input_tokens"]
+        + measurement_results["total_output_tokens"]
     ) / latency
 
-    print(
-        f"Throughput: {measurement_results['throughput']} tokens/s"
-    )
+    print(f"Throughput: {measurement_results['throughput']} tokens/s")
     return measurement_results
 
 

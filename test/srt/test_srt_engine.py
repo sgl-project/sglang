@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import torch
 
 import sglang as sgl
+from sglang.bench_offline_throughput import throughput_test
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
@@ -18,7 +19,6 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
 )
-from sglang.bench_offline_throughput import throughput_test
 
 
 class TestSRTEngine(unittest.TestCase):
@@ -157,13 +157,8 @@ class TestSRTEngine(unittest.TestCase):
         server_args = SimpleNamespace(
             model_path=DEFAULT_MODEL_NAME_FOR_TEST,
         )
-        bench_args = SimpleNamespace(
-            num_prompts=10
-        )
-        result = throughput_test(
-            server_args=server_args,
-            bench_args=bench_args
-        )
+        bench_args = SimpleNamespace(num_prompts=10)
+        result = throughput_test(server_args=server_args, bench_args=bench_args)
         self.assertTrue(result["throughput"] > 3800)
 
 
