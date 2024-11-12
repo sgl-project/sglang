@@ -78,7 +78,7 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
-        is_draft_runner: bool
+        is_draft_runner: bool = False,
     ):
         # Parse args
         self.model_config = model_config
@@ -181,7 +181,9 @@ class ModelRunner:
         if self.server_args.dist_init_addr:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr[1 if self.is_draft_runner else 0]}"
         else:
-            dist_init_method = f"tcp://127.0.0.1:{self.dist_port[1 if self.is_draft_runner else 0]}"
+            dist_init_method = (
+                f"tcp://127.0.0.1:{self.dist_port[1 if self.is_draft_runner else 0]}"
+            )
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         init_distributed_environment(
             backend=backend,
@@ -238,7 +240,11 @@ class ModelRunner:
         monkey_patch_vllm_dummy_weight_loader()
         self.load_config = LoadConfig(load_format=self.server_args.load_format)
         self.vllm_model_config = VllmModelConfig(
-            model=self.server_args.model_path if not self.is_draft_runner else self.server_args.draft_model_path,
+            model=(
+                self.server_args.model_path
+                if not self.is_draft_runner
+                else self.server_args.draft_model_path
+            ),
             quantization=self.server_args.quantization,
             tokenizer=None,
             tokenizer_mode=None,
@@ -419,7 +425,7 @@ class ModelRunner:
             )
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-        
+
         if max_num_reqs is None:
             max_num_reqs = min(
                 max(
@@ -435,10 +441,12 @@ class ModelRunner:
             if self.is_draft_runner:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
             else:
-                self.server_args.draft_runner_cache_size = self.max_total_num_tokens + \
-                    max_num_reqs * self.server_args.num_speculative_steps + 100
-            
-        
+                self.server_args.draft_runner_cache_size = (
+                    self.max_total_num_tokens
+                    + max_num_reqs * self.server_args.num_speculative_steps
+                    + 100
+                )
+
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(
@@ -561,12 +569,14 @@ class ModelRunner:
         self.cuda_graph_runner = CudaGraphRunner(self)
 
     def forward_decode(self, forward_batch: ForwardBatch):
-        
-        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            forward_batch
-        ) and forward_batch.forward_mode.is_cuda_graph():
+
+        if (
+            self.cuda_graph_runner
+            and self.cuda_graph_runner.can_run(forward_batch)
+            and forward_batch.forward_mode.is_cuda_graph()
+        ):
             return self.cuda_graph_runner.replay(forward_batch)
-        if hasattr(forward_batch.spec_info, 'positions'):
+        if hasattr(forward_batch.spec_info, "positions"):
             forward_batch.positions = forward_batch.spec_info.positions
         else:
             forward_batch.positions = (forward_batch.seq_lens - 1).to(torch.int64)
@@ -578,7 +588,7 @@ class ModelRunner:
     def forward_extend(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
-            if getattr(forward_batch.spec_info, 'positions', None) is not None:
+            if getattr(forward_batch.spec_info, "positions", None) is not None:
                 forward_batch.positions = forward_batch.spec_info.positions
             return self.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch

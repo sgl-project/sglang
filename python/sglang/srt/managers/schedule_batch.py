@@ -492,7 +492,7 @@ class ScheduleBatch:
         token_to_kv_pool,
         tree_cache,
         model_config,
-        speculative_algorithm,
+        speculative_algorithm=None,
     ):
         return cls(
             reqs=reqs,
