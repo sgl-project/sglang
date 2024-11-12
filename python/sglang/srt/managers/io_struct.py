@@ -184,7 +184,7 @@ class TokenizedGenerateReqInput:
     input_text: str
     # The input token ids
     input_ids: List[int]
-    # The image input
+    # The image inputs
     image_inputs: dict
     # The sampling parameters
     sampling_params: SamplingParams
