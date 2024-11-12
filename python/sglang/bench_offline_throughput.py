@@ -12,11 +12,13 @@ import argparse
 import dataclasses
 import itertools
 import logging
+import random
 import time
 from typing import Dict, List, Tuple
+import json
 
-import jsonlines
-
+import numpy as np
+from sglang.bench_serving import set_ulimit, sample_sharegpt_requests, sample_random_requests, get_tokenizer
 from sglang.api import Engine as getEngine
 from sglang.srt.server import Engine
 from sglang.srt.server_args import ServerArgs
@@ -25,36 +27,56 @@ from sglang.srt.server_args import ServerArgs
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "before"
-    batch_size: Tuple[int] = (1,)
-    input_len: Tuple[int] = (1024,)
-    output_len: Tuple[int] = (16,)
     result_filename: str = ""
-    # Plotting args
-    graph_sql: str = (
-        "select run_name, batch_size, prefill_throughput from results where run_name='before'"
-    )
-    graph_filename: str = "out.png"
+    seed: int = 1
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
         parser.add_argument(
-            "--batch-size", type=int, nargs="+", default=BenchArgs.batch_size
-        )
-        parser.add_argument(
-            "--input-len", type=int, nargs="+", default=BenchArgs.input_len
-        )
-        parser.add_argument(
-            "--output-len", type=int, nargs="+", default=BenchArgs.output_len
-        )
-        parser.add_argument(
             "--result-filename", type=str, default=BenchArgs.result_filename
         )
-        # graphing
-        parser.add_argument("--graph-sql", type=str, default=BenchArgs.graph_sql)
         parser.add_argument(
-            "--graph-filename", type=str, default=BenchArgs.graph_filename
+            "--dataset-name",
+            type=str,
+            default="sharegpt",
+            choices=["sharegpt", "random", "generated-shared-prefix"],
+            help="Name of the dataset to benchmark on.",
         )
+        parser.add_argument(
+            "--dataset-path", type=str, default="", help="Path to the dataset."
+        )
+        parser.add_argument(
+            "--num-prompts",
+            type=int,
+            default=1000,
+            help="Number of prompts to process. Default is 1000.",
+        )
+        parser.add_argument(
+            "--sharegpt-output-len",
+            type=int,
+            default=None,
+            help="Output length for each request. Overrides the output length from the ShareGPT dataset.",
+        )
+        parser.add_argument(
+            "--random-input-len",
+            type=int,
+            help="Number of input tokens per request, used only for random dataset.",
+        )
+        parser.add_argument(
+            "--random-output-len",
+            type=int,
+            help="Number of output tokens per request, used only for random dataset.",
+        )
+        parser.add_argument(
+            "--random-range-ratio",
+            type=float,
+            default=0.0,
+            help="Range of sampled ratio of input/output length, "
+            "used only for random dataset.",
+        )
+        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -65,45 +87,29 @@ class BenchArgs:
         )
 
 
-def prepare_synthetic_inputs_for_throughput_test(
-    batch_size: int, input_len: int, output_len: int
-):
-    input_ids = [[1] * input_len for _ in range(batch_size)]
-    sampling_params = {
-        "temperature": 0,
-        "min_new_tokens": output_len,
-        "max_new_tokens": output_len,
-    }
-    return input_ids, sampling_params
-
-
 def throughput_test_once(
     run_name: str,
     engine: Engine,
-    reqs: Tuple[List[List[int]], Dict],
-    output_len: int,
+    reqs: List[Tuple[str, int, int]],
 ):
     measurement_results = {
         "run_name": run_name,
-        "batch_size": len(reqs[0]),
-        "input_len": len(reqs[0][0]),
-        "output_len": output_len,
+        "total_input_tokens": sum(r[1] for r in reqs),
     }
 
     st = time.perf_counter()
-    gen_out = engine.generate(input_ids=reqs[0], sampling_params=reqs[1])
+    gen_out = engine.generate(prompt=[r[0] for r in reqs], sampling_params={ "temperature": 0 })
     latency = time.perf_counter() - st
 
     measurement_results["total_latency"] = latency
+    measurement_results["total_output_tokens"] = sum(o["meta_info"]["completion_tokens"] for o in gen_out)
     measurement_results["throughput"] = (
-        (measurement_results["input_len"] + output_len)
-        * measurement_results["batch_size"]
+        measurement_results["total_input_tokens"] +
+        measurement_results["total_output_tokens"]
     ) / latency
 
     print(
-        f"Throughput: BSZ {measurement_results['batch_size']} tokens, "
-        f"Num sequences {len(reqs[0])}, throughput: "
-        f"{measurement_results['throughput']} tokens/s"
+        f"Throughput: {measurement_results['throughput']} tokens/s"
     )
     return measurement_results
 
@@ -116,29 +122,62 @@ def throughput_test(
     if not engine:
         raise ValueError("Please provide valid engine arguments")
 
-    warmup_reqs = prepare_synthetic_inputs_for_throughput_test(
-        bench_args.batch_size[0], bench_args.input_len[0], bench_args.output_len[0]
+    tokenizer_id = args.model_path
+    tokenizer = get_tokenizer(tokenizer_id)
+
+    # Set global environmnets
+    set_ulimit()
+    random.seed(bench_args.seed)
+    np.random.seed(bench_args.seed)
+
+    if args.dataset_name == "sharegpt":
+        assert args.random_input_len is None and args.random_output_len is None
+        input_requests = sample_sharegpt_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.sharegpt_output_len,
+        )
+    elif args.dataset_name == "random":
+        assert args.random_input_len is not None and args.random_output_len is not None
+        input_requests = sample_random_requests(
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            num_prompts=args.num_prompts,
+            range_ratio=args.random_range_ratio,
+            tokenizer=tokenizer,
+            dataset_path=args.dataset_path,
+        )
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset_name}")
+
+    warmup_requests = sample_random_requests(
+        input_len=20,
+        output_len=4,
+        num_prompts=2,
+        range_ratio=0.8,
+        tokenizer=tokenizer,
+        dataset_path=args.dataset_path,
     )
 
     # Warm up
-    throughput_test_once("warmup", engine, warmup_reqs, bench_args.output_len[0])
+    throughput_test_once(
+        run_name="warmup",
+        engine=engine,
+        reqs=warmup_requests,
+    )
 
-    result_list = []
-    for bs, il, ol in itertools.product(
-        bench_args.batch_size, bench_args.input_len, bench_args.output_len
-    ):
-        reqs = prepare_synthetic_inputs_for_throughput_test(bs, il, ol)
-        ret = throughput_test_once(
-            bench_args.run_name, engine, reqs, bench_args.output_len[0]
-        )
-        if ret is not None:
-            result_list.append(ret)
+    result = throughput_test_once(
+        run_name=bench_args.run_name,
+        engine=engine,
+        reqs=input_requests,
+    )
 
     if bench_args.result_filename:
-        with jsonlines.open(bench_args.result_filename, "a") as f:
-            f.write_all(result_list)
+        with open(bench_args.result_filename, "a") as fout:
+            fout.write(json.dumps(result) + "\n")
     else:
-        print(result_list)
+        print(result)
 
 
 if __name__ == "__main__":
