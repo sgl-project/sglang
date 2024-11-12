@@ -2091,7 +2091,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sglang_router"
+name = "sglang_router_rs"
 version = "0.0.0"
 dependencies = [
  "actix-web",

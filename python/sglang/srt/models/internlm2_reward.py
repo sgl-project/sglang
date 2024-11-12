@@ -17,31 +17,28 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import Gemma2Config
+from transformers import PretrainedConfig
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.gemma2 import Gemma2ForCausalLM, Gemma2Model
+from sglang.srt.models.internlm2 import InternLM2ForCausalLM, InternLM2Model
 
 
-class Gemma2ForSequenceClassification(nn.Module):
+class InternLM2ForRewardModel(nn.Module):
     def __init__(
         self,
-        config: Gemma2Config,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config
-        self.torchao_config = None
         self.quant_config = quant_config
-        self.num_labels = config.num_labels
-        self.model = Gemma2Model(config, quant_config=quant_config)
-        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+        self.vocab_size = config.vocab_size
+        self.model = InternLM2Model(config, quant_config)
+        self.v_head = nn.Linear(config.hidden_size, 1, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
-
-        self.eos_token_id = config.eos_token_id
 
     @torch.no_grad()
     def forward(
@@ -52,18 +49,14 @@ class Gemma2ForSequenceClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "Gemma2ForSequenceClassification is only used for embedding"
-
+        assert get_embedding, "InternLM2ForRewardModel is only used for embedding"
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
-        scores = self.score(last_token_hidden)
-
+        scores = self.v_head(last_token_hidden)
         return EmbeddingPoolerOutput(scores)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        Gemma2ForCausalLM.load_weights(self, weights)
+        return InternLM2ForCausalLM.load_weights(self, weights)
 
 
-EntryClass = [Gemma2ForSequenceClassification]
+EntryClass = InternLM2ForRewardModel
