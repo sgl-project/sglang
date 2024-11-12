@@ -596,11 +596,19 @@ def sample_random_requests(
 
         # Filter out sequences that are too long or too short
         input_requests: List[Tuple[str, int, int]] = []
-        for i in range(num_prompts):
+        for data in dataset:
+            i = len(input_requests)
+            if i == num_prompts:
+                break
+
             # Tokenize the prompts and completions.
-            prompt = dataset[i][0]
+            prompt = data[0]
             prompt_token_ids = tokenizer.encode(prompt)
             prompt_len = len(prompt_token_ids)
+
+            # Skip empty prompt
+            if prompt_len == 0:
+                continue
 
             if prompt_len > input_lens[i]:
                 input_ids = prompt_token_ids[: input_lens[i]]
