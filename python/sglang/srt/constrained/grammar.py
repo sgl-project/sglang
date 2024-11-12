@@ -13,50 +13,44 @@ limitations under the License.
 
 """Cache for the compressed finite state machine."""
 import logging
-from typing import List, Optional, Tuple, Union
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import List, Tuple, Union
 
 import torch
 
-from sglang.srt.constrained import GrammarMatcher, RegexGuide
-from sglang.srt.constrained.bnf_cache import BNFCache
-from sglang.srt.constrained.fsm_cache import FSMCache
-from sglang.srt.constrained.jump_forward import JumpForwardCache, JumpForwardMap
-
-# from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.constrained.outlines_cache import OutlinesCache, RegexGuide
+from sglang.srt.constrained.outlines_jump_forward import (
+    OutlinesJumpCache,
+    OutlinesJumpForwardMap,
+)
+from sglang.srt.constrained.xgrammar_cache import (
+    GrammarMatcher,
+    XGrammarBackend,
+    XGrammarJumpCache,
+)
 
 logger = logging.getLogger(__name__)
 
-INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
-
-
-class XGrammarJump:
-    pass
-
 
 class JumpHelper:
-    data: Union[List, str]
-    state: int
-    suffix_ids: List[int]
 
     def __init__(
         self, data: Union[List, str] = "", state: int = -1, suffix_ids=[]
     ) -> None:
-        self.data = data
-        self.state = state
-        self.suffix_ids = suffix_ids
+        self.data: Union[List, str] = data
+        self.state: int = state
+        self.suffix_ids: List[int] = suffix_ids
 
     def can_jump(self):
         return len(self.data) > 0
 
 
 class Grammar:
-    grammar: Union[GrammarMatcher, Tuple[RegexGuide, int]]
-    jump_map: Union[XGrammarJump, JumpForwardMap, None]
 
     def __init__(
         self,
         grammar: Union[GrammarMatcher, Tuple[RegexGuide, int]],
-        jump_map: Union[XGrammarJump, JumpForwardMap, None],
+        jump_map: Union[XGrammarJumpCache, OutlinesJumpForwardMap, None],
     ) -> None:
         self.grammar = grammar
         self.jump_map = jump_map
@@ -69,10 +63,10 @@ class Grammar:
             self.grammar = guide, guide.get_next_state(state, token)
 
     def try_jump(self, tokenizer) -> JumpHelper:
-        if isinstance(self.jump_map, XGrammarJump):
+        if isinstance(self.jump_map, XGrammarJumpCache):
             assert isinstance(self.grammar, GrammarMatcher)
             return JumpHelper(self.grammar.find_jump_forward_string())
-        elif isinstance(self.jump_map, JumpForwardMap):
+        elif isinstance(self.jump_map, OutlinesJumpForwardMap):
             assert isinstance(self.grammar, Tuple)
 
             _, state = self.grammar
@@ -103,7 +97,7 @@ class Grammar:
         if isinstance(helper.data, str):
             return helper.data, -1
         else:
-            assert isinstance(self.jump_map, JumpForwardMap)
+            assert isinstance(self.jump_map, OutlinesJumpForwardMap)
             return self.jump_map.jump_forward_symbol(helper.state)
 
     def jump_and_retokenize(
@@ -129,7 +123,7 @@ class Grammar:
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, vocab_size: int):
         if isinstance(self.grammar, GrammarMatcher):
             # Note that this bitmask is a bitset, not bool
-            bitmask = self.grammar.find_next_token_bitmask()
+            bitmask = self.grammar.get_next_token_bitmask()
             # Mask the tokens that are not allowed
             vocab_mask[
                 self.grammar.get_rejected_tokens_from_bitmask(bitmask, vocab_size)
@@ -140,9 +134,7 @@ class Grammar:
             vocab_mask[guide.get_next_instruction(state).tokens] = 0
 
 
-class GrammarCache:
-    grammar_cache: Union[BNFCache, FSMCache]
-    jump_cache: Union[XGrammarJump, JumpForwardCache, None]
+class GrammarBackend:
 
     def __init__(
         self,
@@ -153,38 +145,38 @@ class GrammarCache:
         backend=None,
         allow_jump=False,
     ):
+        self.executor = ThreadPoolExecutor()
+        self.backend = backend
+
         if backend == "xgrammar":
-            self.grammar_cache = BNFCache(
+            self.grammar_cache = XGrammarBackend(
                 tokenizer_path=tokenizer_path,
                 tokenizer_args_dict=tokenizer_args_dict,
                 skip_tokenizer_init=skip_tokenizer_init,
                 whitespace_patterns=whitespace_patterns,
             )
-            self.jump_cache = XGrammarJump() if allow_jump else None
+            self.jump_cache = XGrammarJumpCache() if allow_jump else None
         else:
             assert backend == "outlines"
-            self.grammar_cache = FSMCache(
+            self.grammar_cache = OutlinesCache(
                 tokenizer_path=tokenizer_path,
                 tokenizer_args_dict=tokenizer_args_dict,
                 skip_tokenizer_init=skip_tokenizer_init,
                 constrained_json_whitespace_pattern=whitespace_patterns,
-                enable=True,
             )
-            self.jump_cache = JumpForwardCache() if allow_jump else None
+            self.jump_cache = OutlinesJumpCache() if allow_jump else None
 
-    def query(self, key: Tuple[str, str], vocab_size: int) -> Grammar:
-        if isinstance(self.grammar_cache, BNFCache):
-            assert not isinstance(self.jump_cache, JumpForwardCache)
+    def _query(self, key: Tuple[str, str], vocab_size: int) -> Grammar:
+        if isinstance(self.grammar_cache, XGrammarBackend):
             return Grammar(self.grammar_cache.query(key, vocab_size), self.jump_cache)
         else:
-            jump_map = None
             guide, regex = self.grammar_cache.query(key)
-            if isinstance(self.jump_cache, JumpForwardCache):
-                jump_map = self.jump_cache.query(regex)
+            jump_map = self.jump_cache.query(regex)
             return Grammar((guide, 0), jump_map)
 
+    def query(self, key: Tuple[str, str], vocab_size: int) -> Future:
+        return self.executor.submit(self._query, key, vocab_size)
+
     def reset(self):
-        if isinstance(self.grammar_cache, FSMCache):
-            self.grammar_cache.reset()
-        if isinstance(self.jump_cache, JumpForwardCache):
-            self.jump_cache.reset()
+        self.grammar_cache.reset()
+        self.jump_cache.reset()

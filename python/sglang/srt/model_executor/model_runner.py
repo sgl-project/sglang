@@ -39,7 +39,6 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
-from sglang.srt.constrained import disable_cache
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -129,6 +128,8 @@ class ModelRunner:
         if server_args.show_time_cost:
             enable_show_time_cost()
         if server_args.disable_disk_cache:
+            from outlines.caching import disable_cache
+
             disable_cache()
 
         global_server_args_dict.update(
