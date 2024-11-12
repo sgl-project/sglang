@@ -107,12 +107,14 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self):
+    def __init__(self, message="Unknown error"):
         super().__init__(is_error=True)
+        self.message = message
 
     def to_json(self):
         return {
             "type": "abort",
+            "message": self.message,
         }
 
 
