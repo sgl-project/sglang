@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Base tool cache for constrained decoding tools."""
+"""Base cache class for constrained decoding tools."""
 
 import time
 from dataclasses import dataclass
@@ -31,16 +31,13 @@ class MapEntry:
 
 
 class BaseToolCache:
-    enable: bool
-    cache: Dict[str, MapEntry]
-    metrics: Dict[str, Any]
-    lock_cache: Lock
-    lock_metrics: Lock
 
     def __init__(self, enable=True):
-        self.enable = enable
-        self.lock_cache = Lock()
-        self.lock_metrics = Lock()
+        self.enable: bool = enable
+        self.cache: Dict[str, MapEntry] = {}
+        self.metrics: Dict[str, Any] = {}
+        self.lock_cache: Lock = Lock()
+        self.lock_metrics: Lock = Lock()
         self.reset()
 
     def reset(self):
@@ -71,8 +68,6 @@ class BaseToolCache:
             self.update_time(init_time)
             return value
 
-        cache_hit = False
-
         with self.lock_cache:
             if key in self.cache:
                 entry = self.cache[key]
@@ -80,6 +75,7 @@ class BaseToolCache:
             else:
                 entry = MapEntry(Event(), None)
                 self.cache[key] = entry
+                cache_hit = False
 
         with self.lock_metrics:
             self.metrics["total"] += 1

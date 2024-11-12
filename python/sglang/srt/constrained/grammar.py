@@ -18,44 +18,39 @@ from typing import List, Tuple, Union
 
 import torch
 
-from sglang.srt.constrained import GrammarMatcher, RegexGuide
-from sglang.srt.constrained.bnf_cache import BNFCache
-from sglang.srt.constrained.fsm_cache import FSMCache
-from sglang.srt.constrained.jump_forward import JumpForwardCache, JumpForwardMap
+from sglang.srt.constrained.outlines_cache import OutlinesCache, RegexGuide
+from sglang.srt.constrained.outlines_jump_forward import (
+    OutlinesJumpCache,
+    OutlinesJumpForwardMap,
+)
+from sglang.srt.constrained.xgrammar_cache import (
+    GrammarMatcher,
+    XGrammarBackend,
+    XGrammarJumpCache,
+)
 
 logger = logging.getLogger(__name__)
 
-INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
-
-
-class XGrammarJump:
-    pass
-
 
 class JumpHelper:
-    data: Union[List, str]
-    state: int
-    suffix_ids: List[int]
 
     def __init__(
         self, data: Union[List, str] = "", state: int = -1, suffix_ids=[]
     ) -> None:
-        self.data = data
-        self.state = state
-        self.suffix_ids = suffix_ids
+        self.data: Union[List, str] = data
+        self.state: int = state
+        self.suffix_ids: List[int] = suffix_ids
 
     def can_jump(self):
         return len(self.data) > 0
 
 
-class GrammarInner:
-    grammar: Union[GrammarMatcher, Tuple[RegexGuide, int]]
-    jump_map: Union[XGrammarJump, JumpForwardMap, None]
+class Grammar:
 
     def __init__(
         self,
         grammar: Union[GrammarMatcher, Tuple[RegexGuide, int]],
-        jump_map: Union[XGrammarJump, JumpForwardMap, None],
+        jump_map: Union[XGrammarJumpCache, OutlinesJumpForwardMap, None],
     ) -> None:
         self.grammar = grammar
         self.jump_map = jump_map
@@ -68,10 +63,10 @@ class GrammarInner:
             self.grammar = guide, guide.get_next_state(state, token)
 
     def try_jump(self, tokenizer) -> JumpHelper:
-        if isinstance(self.jump_map, XGrammarJump):
+        if isinstance(self.jump_map, XGrammarJumpCache):
             assert isinstance(self.grammar, GrammarMatcher)
             return JumpHelper(self.grammar.find_jump_forward_string())
-        elif isinstance(self.jump_map, JumpForwardMap):
+        elif isinstance(self.jump_map, OutlinesJumpForwardMap):
             assert isinstance(self.grammar, Tuple)
 
             _, state = self.grammar
@@ -102,7 +97,7 @@ class GrammarInner:
         if isinstance(helper.data, str):
             return helper.data, -1
         else:
-            assert isinstance(self.jump_map, JumpForwardMap)
+            assert isinstance(self.jump_map, OutlinesJumpForwardMap)
             return self.jump_map.jump_forward_symbol(helper.state)
 
     def jump_and_retokenize(
@@ -139,52 +134,7 @@ class GrammarInner:
             vocab_mask[guide.get_next_instruction(state).tokens] = 0
 
 
-class Grammar:
-    data: Union[Future, GrammarInner]
-
-    def __init__(self, data: Future) -> None:
-        self.data = data
-
-    def _get(self) -> GrammarInner:
-        if isinstance(self.data, Future):
-            self.data = self.data.result()
-        assert isinstance(self.data, GrammarInner)
-        return self.data
-
-    def is_complete(self) -> bool:
-        if isinstance(self.data, Future):
-            return self.data.done()
-        return True
-
-    def accept_token(self, token: int):
-        self._get().accept_token(token)
-
-    def try_jump(self, tokenizer) -> JumpHelper:
-        return self._get().try_jump(tokenizer)
-
-    def jump_forward_str_state(self, helper: JumpHelper) -> Tuple[str, int]:
-        return self._get().jump_forward_str_state(helper)
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ):
-        self._get().jump_and_retokenize(old_output_ids, new_output_ids, next_state)
-
-    def fill_vocab_mask(self, vocab_mask: torch.Tensor, vocab_size: int):
-        self._get().fill_vocab_mask(vocab_mask, vocab_size)
-
-    # forward all the function calls to the inner object
-    # def __getattr__(self, name):
-    #     if isinstance(self.data, FutureObject):
-    #         self.data = self.data.get()
-    #     assert isinstance(self.data, GrammarInner)
-    #     return getattr(self.data, name)
-
-
-class GrammarCache:
-    grammar_cache: Union[BNFCache, FSMCache]
-    jump_cache: Union[XGrammarJump, JumpForwardCache, None]
-    executor: ThreadPoolExecutor
+class GrammarBackend:
 
     def __init__(
         self,
@@ -196,42 +146,37 @@ class GrammarCache:
         allow_jump=False,
     ):
         self.executor = ThreadPoolExecutor()
+        self.backend = backend
+
         if backend == "xgrammar":
-            self.grammar_cache = BNFCache(
+            self.grammar_cache = XGrammarBackend(
                 tokenizer_path=tokenizer_path,
                 tokenizer_args_dict=tokenizer_args_dict,
                 skip_tokenizer_init=skip_tokenizer_init,
                 whitespace_patterns=whitespace_patterns,
             )
-            self.jump_cache = XGrammarJump() if allow_jump else None
+            self.jump_cache = XGrammarJumpCache() if allow_jump else None
         else:
             assert backend == "outlines"
-            self.grammar_cache = FSMCache(
+            self.grammar_cache = OutlinesCache(
                 tokenizer_path=tokenizer_path,
                 tokenizer_args_dict=tokenizer_args_dict,
                 skip_tokenizer_init=skip_tokenizer_init,
                 constrained_json_whitespace_pattern=whitespace_patterns,
-                enable=True,
             )
-            self.jump_cache = JumpForwardCache() if allow_jump else None
+            self.jump_cache = OutlinesJumpCache() if allow_jump else None
 
-    def _query(self, key: Tuple[str, str], vocab_size: int) -> GrammarInner:
-        if isinstance(self.grammar_cache, BNFCache):
-            assert not isinstance(self.jump_cache, JumpForwardCache)
-            return GrammarInner(
-                self.grammar_cache.query(key, vocab_size), self.jump_cache
-            )
+    def _query(self, key: Tuple[str, str], vocab_size: int) -> Grammar:
+        if isinstance(self.grammar_cache, XGrammarBackend):
+            return Grammar(self.grammar_cache.query(key, vocab_size), self.jump_cache)
         else:
-            jump_map = None
             guide, regex = self.grammar_cache.query(key)
-            if isinstance(self.jump_cache, JumpForwardCache):
-                jump_map = self.jump_cache.query(regex)
-            return GrammarInner((guide, 0), jump_map)
+            jump_map = self.jump_cache.query(regex)
+            return Grammar((guide, 0), jump_map)
 
-    def query(self, key: Tuple[str, str], vocab_size: int) -> Grammar:
-        return Grammar(self.executor.submit(self._query, key, vocab_size))
+    def query(self, key: Tuple[str, str], vocab_size: int) -> Future:
+        return self.executor.submit(self._query, key, vocab_size)
 
     def reset(self):
         self.grammar_cache.reset()
-        if isinstance(self.jump_cache, JumpForwardCache):
-            self.jump_cache.reset()
+        self.jump_cache.reset()

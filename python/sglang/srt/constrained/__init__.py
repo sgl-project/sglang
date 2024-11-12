@@ -13,24 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""For constrained decoding."""
-
 import json
 from typing import Dict, Optional, Union
 
 from pydantic import BaseModel
-
-try:
-    from outlines.caching import cache as disk_cache
-    from outlines.caching import disable_cache
-    from outlines.fsm.guide import RegexGuide
-    from outlines.fsm.regex import FSMInfo, make_byte_level_fsm, make_deterministic_fsm
-    from outlines.models.transformers import TransformerTokenizer
-except ImportError as e:
-    print(
-        f'\nError: {e}. Please install a new version of outlines by `pip install "outlines>=0.0.44"`\n'
-    )
-    raise
 
 try:
     from outlines.fsm.json_schema import build_regex_from_object
@@ -51,27 +37,6 @@ except ImportError:
         return build_regex_from_schema(schema, whitespace_pattern)
 
 
-try:
-    from xgrammar import CachedGrammarCompiler, CompiledGrammar, GrammarMatcher
-except ImportError as e:
-    # we rely on type information, so we have a dummy class here
-    class Dummy:
-        pass
-
-    GrammarMatcher = Dummy
-    CompiledGrammar = Dummy
-    CachedGrammarCompiler = Dummy
-
 __all__ = [
-    "RegexGuide",
-    "FSMInfo",
-    "make_deterministic_fsm",
     "build_regex_from_object",
-    "TransformerTokenizer",
-    "disk_cache",
-    "disable_cache",
-    "make_byte_level_fsm",
-    "GrammarMatcher",
-    "CompiledGrammar",
-    "CachedGrammarCompiler",
 ]
