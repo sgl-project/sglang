@@ -85,7 +85,9 @@ class TestOpenAIServer(unittest.TestCase):
             # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
             assert ret_num_top_logprobs > 0
 
-            assert response.choices[0].logprobs.token_logprobs[0]
+            # when echo=True and request.logprobs>0, logprob_start_len is 0, so the first token's logprob would be None.
+            if not echo:
+                assert response.choices[0].logprobs.token_logprobs[0]
 
         assert response.id
         assert response.created
