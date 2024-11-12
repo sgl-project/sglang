@@ -86,8 +86,10 @@ class GenerateReqInput:
             self.parallel_sample_num = self.sampling_params.get("n", 1)
         else:  # isinstance(self.sampling_params, list):
             self.parallel_sample_num = self.sampling_params[0].get("n", 1)
-            assert all(self.parallel_sample_num == sampling_params.get("n", 1) for sampling_params in self.sampling_params), (
-                "The parallel_sample_num should be the same for all samples in sample params.")
+            assert all(
+                self.parallel_sample_num == sampling_params.get("n", 1)
+                for sampling_params in self.sampling_params
+            ), "The parallel_sample_num should be the same for all samples in sample params."
 
         if self.parallel_sample_num > 1 and self.is_single:
             self.is_single = False
@@ -182,7 +184,7 @@ class TokenizedGenerateReqInput:
     input_text: str
     # The input token ids
     input_ids: List[int]
-    # The image input
+    # The image inputs
     image_inputs: dict
     # The sampling parameters
     sampling_params: SamplingParams

@@ -27,6 +27,8 @@ from sglang.utils import get_exception_traceback
 
 DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
@@ -441,7 +443,7 @@ def popen_launch_server(
                 "Content-Type": "application/json; charset=utf-8",
                 "Authorization": f"Bearer {api_key}",
             }
-            response = requests.get(f"{base_url}/v1/models", headers=headers)
+            response = requests.get(f"{base_url}/health_generate", headers=headers)
             if response.status_code == 200:
                 return process
         except requests.RequestException:
@@ -636,8 +638,8 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
     return rouge_l_scores
 
 
-STDOUT_FILENAME = "stdout.txt"
 STDERR_FILENAME = "stderr.txt"
+STDOUT_FILENAME = "stdout.txt"
 
 
 def read_output(output_lines):
@@ -742,7 +744,13 @@ def run_mmlu_test(
         finally:
             pass
 
-    run_and_check_memory_leak(workload_func, disable_radix_cache, enable_mixed_chunk, enable_overlap, chunked_prefill_size)
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        enable_overlap,
+        chunked_prefill_size,
+    )
 
 
 def run_mulit_request_test(
@@ -775,4 +783,10 @@ def run_mulit_request_test(
         with ThreadPoolExecutor(2) as executor:
             list(executor.map(run_one, list(range(4))))
 
-    run_and_check_memory_leak(workload_func, disable_radix_cache, enable_mixed_chunk, enable_overlap, chunked_prefill_size)
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        enable_overlap,
+        chunked_prefill_size,
+    )

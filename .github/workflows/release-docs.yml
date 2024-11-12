@@ -47,7 +47,7 @@ jobs:
 
           make html
           cd _build/html
-          
+
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io --depth 1
           rm -rf  ../sgl-project.github.io/*
           cp -r * ../sgl-project.github.io

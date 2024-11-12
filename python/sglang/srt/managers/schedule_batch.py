@@ -33,7 +33,6 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
-import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -139,6 +138,7 @@ class ImageInputs:
     aspect_ratio_mask: Optional[List[torch.Tensor]] = None
     # QWen2-VL related
     image_grid_thws: List[Tuple[int, int, int]] = None
+    mrope_position_delta: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_dict(obj, vocab_size):
@@ -217,7 +217,7 @@ class Req:
         # this does not include the jump forward tokens.
         self.completion_tokens_wo_jump_forward = 0
 
-        # For vision inputs
+        # For multimodal inputs
         self.image_inputs: Optional[ImageInputs] = None
 
         # Prefix info
@@ -256,19 +256,6 @@ class Req:
 
         # The number of cached tokens, that were already cached in the KV cache
         self.cached_tokens = 0
-
-        # For Qwen2-VL
-        self.mrope_position_delta = []  # use mutable object
-
-        # Lifetime traces
-        # time when request is created and added to waitlist
-        self.created_time = None
-        # time when request is added to prefill batch
-        self.queued_time = None
-        # time when request is being processed
-        self.started_time = None
-        # time when request is finished
-        self.finished_time = None
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -517,7 +504,7 @@ class ScheduleBatch:
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
-            spec_algorithm=speculative_algorithm
+            spec_algorithm=speculative_algorithm,
         )
 
     def batch_size(self):
@@ -732,7 +719,7 @@ class ScheduleBatch:
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
     def check_decode_mem(self, buf_multiplier=1):
-        bs = len(self.reqs)*buf_multiplier
+        bs = len(self.reqs) * buf_multiplier
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 
@@ -881,7 +868,7 @@ class ScheduleBatch:
 
     def prepare_for_decode(self, enable_overlap: bool = False):
         self.forward_mode = ForwardMode.DECODE
-        if self.spec_algorithm == 'EAGLE':
+        if self.spec_algorithm == "EAGLE":
             return
 
         self.input_ids = self.output_ids
@@ -924,8 +911,7 @@ class ScheduleBatch:
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
-                and self.reqs[i] is not being_chunked_req
+                if not self.reqs[i].finished() and self.reqs[i] is not being_chunked_req
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -1010,8 +996,6 @@ class ScheduleBatch:
         global bid
         bid += 1
 
-        mrope_positions_delta = [req.mrope_position_delta for req in self.reqs]
-
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1036,7 +1020,6 @@ class ScheduleBatch:
             sampling_info=self.sampling_info,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
-            mrope_positions_delta=mrope_positions_delta,
         )
 
     def copy(self):
@@ -1056,9 +1039,6 @@ class ScheduleBatch:
             f"#req={(len(self.reqs))})"
         )
 
-    def mark_reqs_started(self):
-        for req in self.reqs:
-            req.started_time = time.time()
 
 @dataclasses.dataclass
 class ModelWorkerBatch:
@@ -1105,14 +1085,10 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
-    
-    # For Qwen2-VL
-    mrope_positions_delta: List[List[int]]
-    
+
     # Speclulative decoding
     spec_algorithm: str = None
     spec_info: SpecInput = None
-
 
     def copy(self):
         return dataclasses.replace(self, sampling_info=self.sampling_info.copy())

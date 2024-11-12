@@ -25,20 +25,16 @@ import json
 import logging
 import multiprocessing as mp
 import os
-import re
-import tempfile
 import threading
 import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, List, Optional, Union
 
-import orjson
-from starlette.routing import Mount
-
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
+import orjson
 import requests
 import uvicorn
 import uvloop
@@ -60,6 +56,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.metrics.func_timer import enable_func_timer, time_func_latency
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_batches,
@@ -77,28 +74,25 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
+    add_prometheus_middleware,
     assert_pkg_version,
     configure_logger,
+    delete_directory,
     is_port_available,
     kill_child_process,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
+    set_prometheus_multiproc_dir,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
-# Temporary directory for prometheus multiprocess mode
-# Cleaned up automatically when this object is garbage collected
-prometheus_multiproc_dir: tempfile.TemporaryDirectory
-
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 app = FastAPI()
-tokenizer_manager: TokenizerManager = None
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -106,6 +100,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+tokenizer_manager: TokenizerManager = None
+
+##### Native API endpoints #####
 
 
 @app.get("/health")
@@ -117,9 +115,16 @@ async def health() -> Response:
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
-    gri = GenerateReqInput(
-        text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-    )
+
+    if tokenizer_manager.is_generation:
+        gri = GenerateReqInput(
+            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+        )
+    else:
+        gri = EmbeddingReqInput(
+            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+        )
+
     try:
         async for _ in tokenizer_manager.generate_request(gri, request):
             break
@@ -192,6 +197,7 @@ async def get_memory_pool_size():
 
 
 @app.post("/update_weights")
+@time_func_latency
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
     """Update the weights inplace without re-launching the server."""
     success, message = await tokenizer_manager.update_weights(obj, request)
@@ -208,7 +214,7 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
         )
 
 
-# fastapi implicitly converts json in the request to obj (dataclass)
+@time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if obj.stream:
@@ -241,10 +247,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             )
 
 
+# fastapi implicitly converts json in the request to obj (dataclass)
 app.post("/generate")(generate_request)
 app.put("/generate")(generate_request)
 
 
+@time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
@@ -260,6 +268,7 @@ app.post("/encode")(encode_request)
 app.put("/encode")(encode_request)
 
 
+@time_func_latency
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
@@ -275,17 +284,23 @@ app.post("/classify")(classify_request)
 app.put("/classify")(classify_request)
 
 
+##### OpenAI-compatible API endpoints #####
+
+
 @app.post("/v1/completions")
+@time_func_latency
 async def openai_v1_completions(raw_request: Request):
     return await v1_completions(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/chat/completions")
+@time_func_latency
 async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/embeddings", response_class=ORJSONResponse)
+@time_func_latency
 async def openai_v1_embeddings(raw_request: Request):
     response = await v1_embeddings(tokenizer_manager, raw_request)
     return response
@@ -419,18 +434,6 @@ def launch_engine(
     for i in range(len(scheduler_pipe_readers)):
         scheduler_pipe_readers[i].recv()
 
-def add_prometheus_middleware(app: FastAPI):
-    # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/entrypoints/openai/api_server.py#L216
-    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
-
-    registry = CollectorRegistry()
-    multiprocess.MultiProcessCollector(registry)
-    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
-
-    # Workaround for 307 Redirect for /metrics
-    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
-    app.routes.append(metrics_route)
-
 
 def launch_server(
     server_args: ServerArgs,
@@ -451,7 +454,6 @@ def launch_server(
     1. The HTTP server and Tokenizer Manager both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
-
     launch_engine(server_args=server_args)
 
     # Add api key authorization
@@ -460,8 +462,8 @@ def launch_server(
 
     # add prometheus middleware
     if server_args.enable_metrics:
-        _set_prometheus_env()
         add_prometheus_middleware(app)
+        enable_func_timer()
 
     # Send a warmup request
     t = threading.Thread(
@@ -490,21 +492,6 @@ def launch_server(
     finally:
         t.join()
 
-def _set_prometheus_env():
-    # Set prometheus multiprocess directory
-    # sglang uses prometheus multiprocess mode
-    # we need to set this before importing prometheus_client
-    # https://prometheus.github.io/client_python/multiprocess/
-    global prometheus_multiproc_dir
-    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
-        logger.debug(f"User set PROMETHEUS_MULTIPROC_DIR detected.")
-        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
-            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
-        )
-    else:
-        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
-        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
-    logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
@@ -513,6 +500,10 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+
+    # Set prometheus env vars
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
 
     # Set ulimit
     set_ulimit()
@@ -562,6 +553,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         return
 
     model_info = res.json()
+
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
@@ -598,6 +590,9 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
         pipe_finish_writer.send("ready")
+
+    if server_args.delete_ckpt_after_loading:
+        delete_directory(server_args.model_path)
 
 
 class Runtime:
@@ -759,12 +754,12 @@ class Engine:
 
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
-        
+
         # runtime server default log level is log
         # offline engine works in scripts, so we set it to error
 
-        if 'log_level' not in kwargs:
-            kwargs['log_level'] = 'error'
+        if "log_level" not in kwargs:
+            kwargs["log_level"] = "error"
 
         server_args = ServerArgs(*args, **kwargs)
         launch_engine(server_args=server_args)
@@ -879,4 +874,12 @@ class Engine:
         else:
             return tokenizer_manager.tokenizer
 
-    # TODO (ByronHsu): encode
+    def encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+    ):
+        obj = EmbeddingReqInput(text=prompt)
+
+        # get the current event loop
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(encode_request(obj, None))

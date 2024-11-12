@@ -22,8 +22,12 @@ import logging
 import os
 import pickle
 import random
+import re
 import resource
+import shutil
+import signal
 import socket
+import tempfile
 import time
 import warnings
 from importlib.metadata import PackageNotFoundError, version
@@ -35,9 +39,11 @@ import psutil
 import requests
 import torch
 import torch.distributed as dist
+import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
+from starlette.routing import Mount
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 from triton.runtime.cache import (
@@ -379,6 +385,10 @@ def kill_child_process(pid=None, include_self=False, skip_pid=None):
     if include_self:
         try:
             itself.kill()
+
+            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
+            # so we send an additional signal to kill them.
+            itself.send_signal(signal.SIGINT)
         except psutil.NoSuchProcess:
             pass
 
@@ -704,3 +714,80 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
     return socket
+
+
+def dump_to_file(dirpath, name, value):
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() != 0:
+        return
+
+    os.makedirs(dirpath, exist_ok=True)
+    if value.dtype is torch.bfloat16:
+        value = value.float()
+    value = value.cpu().numpy()
+    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
+    logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
+    np.save(output_filename, value)
+
+
+def is_triton_3():
+    return triton.__version__.startswith("3.")
+
+
+def maybe_torch_compile(*args, **kwargs):
+    """
+    torch.compile does not work for triton 2.2.0, which is needed in xlm1's jax.
+    Therefore, we disable it here.
+    """
+
+    def decorator(func):
+        if is_triton_3():
+            return torch.compile(*args, **kwargs)(func)
+        return func
+
+    return decorator
+
+
+def delete_directory(dirpath):
+    try:
+        # This will remove the directory and all its contents
+        shutil.rmtree(dirpath)
+    except OSError as e:
+        print(f"Warning: {dirpath} : {e.strerror}")
+
+
+# Temporary directory for prometheus multiprocess mode
+# Cleaned up automatically when this object is garbage collected
+prometheus_multiproc_dir: tempfile.TemporaryDirectory
+
+
+def set_prometheus_multiproc_dir():
+    # Set prometheus multiprocess directory
+    # sglang uses prometheus multiprocess mode
+    # we need to set this before importing prometheus_client
+    # https://prometheus.github.io/client_python/multiprocess/
+    global prometheus_multiproc_dir
+
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        )
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+def add_prometheus_middleware(app):
+    # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)

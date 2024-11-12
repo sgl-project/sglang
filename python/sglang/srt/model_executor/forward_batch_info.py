@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.speculative_utils import SpecInput
 
+
 class ForwardMode(IntEnum):
     # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
     PREFILL = auto()
@@ -65,20 +66,24 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.PREFILL
 
     def is_extend(self):
-        return self in (ForwardMode.EXTEND, self == ForwardMode.MIXED, ForwardMode.SPECEXTEND)
+        return self in (
+            ForwardMode.EXTEND,
+            self == ForwardMode.MIXED,
+            ForwardMode.SPECEXTEND,
+        )
 
     def is_decode(self):
         return self in (ForwardMode.DECODE, ForwardMode.SPECVERIFY)
 
     def is_mixed(self):
         return self == ForwardMode.MIXED
-    
+
     def is_verify(self):
         return self == ForwardMode.SPECVERIFY
-    
+
     def is_spec_extend(self):
         return self == ForwardMode.SPECEXTEND
-    
+
     def is_cuda_graph(self):
         return self in (ForwardMode.DECODE, ForwardMode.SPECVERIFY)
 
@@ -87,15 +92,16 @@ class CaptureHiddenMode(IntEnum):
     NULL = auto()
     FULL = auto()
     LAST = auto()
-    
+
     def need_capture(self):
         return self != CaptureHiddenMode.NULL
-    
+
     def is_full(self):
         return self == CaptureHiddenMode.FULL
-    
+
     def is_last(self):
         return self == CaptureHiddenMode.LAST
+
 
 @dataclass
 class ForwardBatch:
@@ -151,7 +157,7 @@ class ForwardBatch:
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: BaseTokenToKVPool = None
     attn_backend: AttentionBackend = None
-    
+
     # Speculative decoding
     spec_info: SpecInput = None
     spec_algorithm: str = None
@@ -167,8 +173,13 @@ class ForwardBatch:
         mrope_positions_list = [None] * self.seq_lens.shape[0]
         if self.forward_mode.is_decode():
             for i, _ in enumerate(mrope_positions_list):
+                mrope_position_delta = (
+                    0
+                    if batch.image_inputs[i] is None
+                    else batch.image_inputs[i].mrope_position_delta
+                )
                 mrope_positions_list[i] = MRotaryEmbedding.get_next_input_positions(
-                    batch.mrope_positions_delta[i][0],
+                    mrope_position_delta,
                     int(self.seq_lens[i]) - 1,
                     int(self.seq_lens[i]),
                 )
@@ -190,7 +201,6 @@ class ForwardBatch:
                             )
                         ]
                     ] * 3
-                    mrope_position_delta = 0
                 else:
                     # TODO: current qwen2-vl do not support radix cache since mrope position calculation
                     mrope_positions, mrope_position_delta = (
@@ -204,8 +214,8 @@ class ForwardBatch:
                             context_len=0,
                         )
                     )
+                    batch.image_inputs[i].mrope_position_delta = mrope_position_delta
                 mrope_positions_list[i] = mrope_positions
-                batch.mrope_positions_delta[i].append(mrope_position_delta)
 
         self.mrope_positions = torch.concat(
             [torch.tensor(pos, device=device) for pos in mrope_positions_list],
@@ -242,7 +252,10 @@ class ForwardBatch:
             spec_info=batch.spec_info,
         )
 
-        if ret.spec_info is not None and getattr(ret.spec_info, 'positions', None) is not None:
+        if (
+            ret.spec_info is not None
+            and getattr(ret.spec_info, "positions", None) is not None
+        ):
             ret.positions = ret.spec_info.positions
         # Init position information
         if not ret.forward_mode.is_decode():

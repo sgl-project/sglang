@@ -64,7 +64,7 @@ class ServerArgs:
     stream_interval: int = 1
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
-    decode_log_interval: int = 40
+    watchdog_timeout: float = 300
 
     # Logging
     log_level: str = "info"
@@ -72,18 +72,18 @@ class ServerArgs:
     log_requests: bool = False
     show_time_cost: bool = False
     enable_metrics: bool = False
+    decode_log_interval: int = 40
 
-    # Other
+    # API related
     api_key: Optional[str] = None
     file_storage_pth: str = "SGLang_storage"
     enable_cache_report: bool = False
-    watchdog_timeout: float = 600
 
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
 
-    # Distributed args
+    # Multi-node distributed serving
     dist_init_addr: Optional[List[str]] = None
     nnodes: int = 1
     node_rank: int = 0
@@ -129,8 +129,9 @@ class ServerArgs:
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     num_continuous_decode_steps: int = 1
+    delete_ckpt_after_loading: bool = False
 
-    #speculative decoding
+    # speculative decoding
     draft_model_path: str = None
     speculative_algorithm: str = None
     num_speculative_steps: int = None
@@ -138,10 +139,9 @@ class ServerArgs:
     num_draft_tokens: int = None
     # should been set as [1, 2, 4, 8]
     eagle_topk: int = None
-    # should not been set by cli, it is only a placeholder 
+    # should not been set by cli, it is only a placeholder
     # which would be set and used in model_runner
     draft_runner_cache_size: int = None
-    
 
     def __post_init__(self):
         # Set missing default values
@@ -216,15 +216,16 @@ class ServerArgs:
         if "gemma-2" in self.model_path.lower():
             logger.info("When using sliding window in gemma-2, turn on flashinfer.")
             self.attention_backend = "flashinfer"
-            
+
         # Speculative Decoding
-        if self.speculative_algorithm=='EAGLE':
+        if self.speculative_algorithm == "EAGLE":
             self.split_prefill_batch = True
             # EAGLE don't support it currently.
             self.disable_cuda_graph_padding = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        # Model and port args
         parser.add_argument(
             "--model-path",
             type=str,
@@ -344,6 +345,8 @@ class ServerArgs:
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
         )
+
+        # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
             type=float,
@@ -388,6 +391,8 @@ class ServerArgs:
             default=ServerArgs.schedule_conservativeness,
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
+
+        # Other runtime options
         parser.add_argument(
             "--tensor-parallel-size",
             "--tp-size",
@@ -413,6 +418,14 @@ class ServerArgs:
             default=ServerArgs.constrained_json_whitespace_pattern,
             help=r"Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
         )
+        parser.add_argument(
+            "--watchdog-timeout",
+            type=float,
+            default=ServerArgs.watchdog_timeout,
+            help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
+
+        # Logging
         parser.add_argument(
             "--log-level",
             type=str,
@@ -440,7 +453,14 @@ class ServerArgs:
             action="store_true",
             help="Enable log prometheus metrics.",
         )
+        parser.add_argument(
+            "--decode-log-interval",
+            type=int,
+            default=ServerArgs.decode_log_interval,
+            help="The log interval of decode batch",
+        )
 
+        # API related
         parser.add_argument(
             "--api-key",
             type=str,
@@ -457,18 +477,6 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
-        )
-        parser.add_argument(
-            "--watchdog-timeout",
-            type=float,
-            default=ServerArgs.watchdog_timeout,
-            help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
-        )
-        parser.add_argument(
-            "--decode-log-interval",
-            type=int,
-            default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch"
         )
 
         # Data parallelism
@@ -490,7 +498,7 @@ class ServerArgs:
             ],
         )
 
-        # Multi-node distributed serving args
+        # Multi-node distributed serving
         parser.add_argument(
             "--dist-init-addr",
             "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
@@ -743,10 +751,16 @@ class ServerArgs:
         parser.add_argument(
             "--draft-runner-cache-size",
             type=int,
-            help="""It should not been set by cli, it is only a placeholder which 
+            help="""It should not been set by cli, it is only a placeholder which
             would be set and used in model_runner when using speculative inference.""",
             required=False,
             default=-1,
+        )
+        parser.add_argument(
+            "--delete-ckpt-after-loading",
+            default=ServerArgs.delete_ckpt_after_loading,
+            action="store_true",
+            help="Delete the model checkpoint after loading the model.",
         )
 
     @classmethod
@@ -825,7 +839,11 @@ class PortArgs:
         while True:
             if is_port_available(port):
                 all_port.append(port)
-            if len(all_port) == 2 if server_args.speculative_algorithm is not None else 1:
+            if (
+                len(all_port) == 2
+                if server_args.speculative_algorithm is not None
+                else 1
+            ):
                 break
             port += 42
 

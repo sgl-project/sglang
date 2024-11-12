@@ -22,6 +22,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from typing import Dict, List, Optional, Tuple, Union
 
 import fastapi
@@ -52,6 +53,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightReqInput,
     UpdateWeightReqOutput,
 )
+from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_child_process
@@ -69,6 +71,10 @@ class ReqState:
     finished: bool
     event: asyncio.Event
 
+    # For metrics
+    created_time: float
+    first_token_time: Optional[float] = None
+
 
 class TokenizerManager:
     """TokenizerManager is a process that tokenizes the text."""
@@ -80,6 +86,7 @@ class TokenizerManager:
     ):
         # Parse args
         self.server_args = server_args
+        self.enable_metrics = server_args.enable_metrics
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -142,11 +149,22 @@ class TokenizerManager:
         # Others
         self.gracefully_exit = False
 
+        # Metrics
+        if self.enable_metrics:
+            self.metrics_collector = TokenizerMetricsCollector(
+                labels={
+                    "model_name": self.server_args.served_model_name,
+                    # TODO: Add lora name/path in the future,
+                },
+            )
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        created_time = time.time()
+
         if self.to_create_loop:
             self.create_handle_loop()
 
@@ -164,10 +182,12 @@ class TokenizerManager:
         if is_single:
             tokenized_obj = await self._tokenize_one_request(obj)
             self.send_to_scheduler.send_pyobj(tokenized_obj)
-            async for response in self._wait_one_response(obj, request):
+            async for response in self._wait_one_response(obj, request, created_time):
                 yield response
         else:
-            async for response in self._handle_batch_request(obj, request):
+            async for response in self._handle_batch_request(
+                obj, request, created_time
+            ):
                 yield response
 
     async def _tokenize_one_request(
@@ -215,7 +235,7 @@ class TokenizerManager:
                 logprob_start_len,
                 top_logprobs_num,
                 obj.stream,
-                obj.lora_path
+                obj.lora_path,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -231,10 +251,11 @@ class TokenizerManager:
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        created_time: Optional[float] = None,
     ):
         """Wait for the response of one request."""
         event = asyncio.Event()
-        state = ReqState([], False, event)
+        state = ReqState([], False, event, created_time=created_time)
         self.rid_to_state[obj.rid] = state
 
         while True:
@@ -272,6 +293,7 @@ class TokenizerManager:
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        created_time: Optional[float] = None,
     ):
         batch_size = obj.batch_size
 
@@ -283,14 +305,18 @@ class TokenizerManager:
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
                 self.send_to_scheduler.send_pyobj(tokenized_obj)
-                generators.append(self._wait_one_response(tmp_obj, request))
+                generators.append(
+                    self._wait_one_response(tmp_obj, request, created_time)
+                )
                 rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
 
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
-            tokenized_objs = await asyncio.gather(*(self._tokenize_one_request(obj) for obj in objs))
+            tokenized_objs = await asyncio.gather(
+                *(self._tokenize_one_request(obj) for obj in objs)
+            )
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
@@ -301,7 +327,9 @@ class TokenizerManager:
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self.send_to_scheduler.send_pyobj(tokenized_obj)
-                await self._wait_one_response(tmp_obj, request).__anext__()
+                await self._wait_one_response(
+                    tmp_obj, request, created_time
+                ).__anext__()
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -310,7 +338,9 @@ class TokenizerManager:
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self.send_to_scheduler.send_pyobj(tokenized_obj)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    generators.append(
+                        self._wait_one_response(tmp_obj, request, created_time)
+                    )
                     rids.append(tmp_obj.rid)
 
         # Wait for all requests
@@ -322,7 +352,9 @@ class TokenizerManager:
             rid_to_index = {rid: i for i, rid in enumerate(rids)}
             task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
             while task_map:
-                done, _ = await asyncio.wait(task_map.keys(), return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                )
 
                 for task in done:
                     gen = task_map.pop(task)
@@ -367,7 +399,7 @@ class TokenizerManager:
         if self.server_args.dp_size == 1:
             res = await self.mem_pool_size
             return res.size
-        else: # self.server_args.dp_size > 1
+        else:  # self.server_args.dp_size > 1
             self.mem_pool_size_tmp = []
             res = await self.mem_pool_size
             ret = [r.size for r in res]
@@ -384,11 +416,15 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
 
         if not self.model_update_lock.locked():
-        
+
             async with self.model_update_lock:
                 # wait for the previous generation requests to finish
-                while len(self.rid_to_state) > 0:
-                    await asyncio.sleep(0.001)
+                for i in range(3):
+                    while len(self.rid_to_state) > 0:
+                        await asyncio.sleep(0.001)
+                    # FIXME: We add some sleep here to avoid some race conditions.
+                    # We can use a read-write lock as a better fix.
+                    await asyncio.sleep(0.01)
                 self.send_to_scheduler.send_pyobj(obj)
                 self.model_update_result = asyncio.Future()
 
@@ -399,7 +435,7 @@ class TokenizerManager:
                         self.server_args.load_format = obj.load_format
                         self.model_path = obj.model_path
                     return result.success, result.message
-                else: # self.server_args.dp_size > 1
+                else:  # self.server_args.dp_size > 1
                     self.model_update_tmp = []
                     result = await self.model_update_result
 
@@ -457,7 +493,7 @@ class TokenizerManager:
                 break
 
         kill_child_process(include_self=True)
-        sys.exit(-1)
+        sys.exit(0)
 
     async def handle_loop(self):
         """The event loop that handles requests"""
@@ -470,7 +506,7 @@ class TokenizerManager:
             if isinstance(recv_obj, UpdateWeightReqOutput):
                 if self.server_args.dp_size == 1:
                     self.model_update_result.set_result(recv_obj)
-                else: # self.server_args.dp_size > 1
+                else:  # self.server_args.dp_size > 1
                     self.model_update_tmp.append(recv_obj)
                     # set future if the all results are recevied
                     if len(self.model_update_tmp) == self.server_args.dp_size:
@@ -479,7 +515,7 @@ class TokenizerManager:
             elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
                 if self.server_args.dp_size == 1:
                     self.mem_pool_size.set_result(recv_obj)
-                else: # self.sever_args.dp_size > 1
+                else:  # self.sever_args.dp_size > 1
                     self.mem_pool_size_tmp.append(recv_obj)
                     # set future if the all results are received
                     if len(self.mem_pool_size_tmp) == self.server_args.dp_size:
@@ -515,6 +551,34 @@ class TokenizerManager:
                 state.out_list.append(out_dict)
                 state.finished = recv_obj.finished_reason[i] is not None
                 state.event.set()
+
+                if self.enable_metrics:
+                    completion_tokens = recv_obj.meta_info[i]["completion_tokens"]
+
+                    if state.first_token_time is None:
+                        state.first_token_time = time.time()
+                        self.metrics_collector.observe_time_to_first_token(
+                            state.first_token_time - state.created_time
+                        )
+                    else:
+                        if completion_tokens >= 2:
+                            self.metrics_collector.observe_time_per_output_token(
+                                (time.time() - state.first_token_time)
+                                / (completion_tokens - 1)
+                            )
+
+                    if state.finished:
+                        self.metrics_collector.inc_prompt_tokens(
+                            recv_obj.meta_info[i]["prompt_tokens"]
+                        )
+                        self.metrics_collector.inc_generation_tokens(completion_tokens)
+                        self.metrics_collector.observe_e2e_request_latency(
+                            time.time() - state.created_time
+                        )
+                        if completion_tokens >= 1:
+                            self.metrics_collector.observe_time_per_output_token(
+                                (time.time() - state.created_time) / completion_tokens
+                            )
 
     def convert_logprob_style(
         self,

@@ -1,10 +1,10 @@
 # Adapted from https://github.com/openai/simple-evals/
 
 """
-MGSM: Multilingual Grade School Math Benchmark (MGSM) is a benchmark of grade-school math problems. 
+MGSM: Multilingual Grade School Math Benchmark (MGSM) is a benchmark of grade-school math problems.
 Language Models are Multilingual Chain-of-Thought Reasoners
 Freda Shi, Mirac Suzgun, Markus Freitag, Xuezhi Wang, Suraj Srivats, Soroush Vosoughi, Hyung Won Chung, Yi Tay, Sebastian Ruder, Denny Zhou, Dipanjan Das, Jason Wei
-https://arxiv.org/abs/2210.03057 reference: https://github.com/google-research/url-nlp 
+https://arxiv.org/abs/2210.03057 reference: https://github.com/google-research/url-nlp
 """
 
 import re

@@ -16,6 +16,7 @@ suites = {
         "test_eval_accuracy_mini.py",
         "test_json_constrained.py",
         "test_large_max_new_tokens.py",
+        "test_metrics.py",
         "test_openai_server.py",
         "test_overlap_schedule.py",
         "test_pytorch_sampling_backend.py",

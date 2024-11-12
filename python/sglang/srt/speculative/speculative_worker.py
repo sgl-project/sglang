@@ -1,4 +1,4 @@
-from typing import List, Optional, Type, Union
+from typing import TYPE_CHECKING, List, Optional, Type, Union
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -7,6 +7,7 @@ from sglang.srt.server_args import ServerArgs
 
 class SpeculativeWorker(TpModelWorker):
     is_draft_worker = True
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -14,17 +15,24 @@ class SpeculativeWorker(TpModelWorker):
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
-        target_worker: TpModelWorker
+        target_worker: TpModelWorker,
     ):
-        super().__init__(gpu_id=gpu_id, tp_rank=tp_rank, server_args=server_args, nccl_port=nccl_port, dp_rank=dp_rank)
+        super().__init__(
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            server_args=server_args,
+            nccl_port=nccl_port,
+            dp_rank=dp_rank,
+        )
         self.target_worker = target_worker
-    
+
     def forward_batch_speculative_generate(self, batch: ScheduleBatch):
         raise NotImplementedError()
-    
+
     def finish_request(self, reqs: Union[Req, List[Req]]):
         raise NotImplementedError()
-    
+
+
 class SpecWorkerFactory:
     def __init__(self):
         self.factory = {}
@@ -38,5 +46,6 @@ class SpecWorkerFactory:
 
     def get(self, name):
         return self.factory[name]
-    
+
+
 spec_worker_factory = SpecWorkerFactory()

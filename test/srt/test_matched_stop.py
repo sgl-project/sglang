@@ -11,9 +11,9 @@ from sglang.test.test_utils import (
 )
 
 MANY_NEW_TOKENS_PROMPT = """
-Please write an extremely detailed and vivid fantasy story, set in a world full of intricate magic systems, political intrigue, and complex characters. 
-Ensure that you thoroughly describe every scene, character's motivations, and the environment. Include long, engaging dialogues and elaborate on the inner thoughts of the characters. 
-Each section should be as comprehensive as possible to create a rich and immersive experience for the reader. 
+Please write an extremely detailed and vivid fantasy story, set in a world full of intricate magic systems, political intrigue, and complex characters.
+Ensure that you thoroughly describe every scene, character's motivations, and the environment. Include long, engaging dialogues and elaborate on the inner thoughts of the characters.
+Each section should be as comprehensive as possible to create a rich and immersive experience for the reader.
 The story should span multiple events, challenges, and character developments over time. Aim to make the story at least 3,000 words long.
 """
 
@@ -109,7 +109,7 @@ class TestMatchedStop(unittest.TestCase):
         llama_format_prompt = """
         <|begin_of_text|><|start_header_id|>system<|end_header_id|>
         You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
-        
+
         What is 2 + 2?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
         """
         eos_token_id = 128009

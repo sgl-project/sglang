@@ -1,0 +1,55 @@
+name: Release Docker Images (AMD)
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "python/sglang/version.py"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: docker-builder-amd
+    environment: 'prod'
+    strategy:
+      matrix:
+        rocm_version: ['6.2.0']
+        build_type: ['all', 'srt']
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+
+          if [ "${{ matrix.rocm_version }}" = "6.2.0" ]; then
+            rocm_tag="rocm620"
+          else
+            echo "Unsupported ROCm version"
+            exit 1
+          fi
+
+          tag=v${version}-${rocm_tag}
+
+          if [ "${{ matrix.build_type }}" = "all" ]; then
+            tag_suffix=""
+          elif [ "${{ matrix.build_type }}" = "srt" ]; then
+            tag_suffix="-srt"
+          else
+            echo "Unsupported build type"
+            exit 1
+          fi
+
+          docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache
+          docker push lmsysorg/sglang:${tag}${tag_suffix}

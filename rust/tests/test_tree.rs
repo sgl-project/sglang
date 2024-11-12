@@ -1,4 +1,4 @@
-use sglang_router::tree::RadixTree;
+use sglang_router_rs::tree::RadixTree;
 
 #[test]
 fn test_new_tree() {
@@ -67,7 +67,7 @@ fn test_prefix_match_partial() {
 fn test_prefix_match_no_match() {
     let mut tree = RadixTree::new();
     tree.insert(&[1, 2, 3, 4]);
-    let empty_slices: &[usize] = &[];
+    let empty_slices: &[u32] = &[];
     assert_eq!(tree.prefix_match(&[5, 6, 7]), empty_slices);
 }
 
@@ -124,7 +124,7 @@ fn test_delete_nonexistent() {
 #[test]
 fn test_empty_input() {
     let mut tree = RadixTree::new();
-    let empty_slice: &[usize] = &[];
+    let empty_slice: &[u32] = &[];
     tree.insert(empty_slice);
     assert_eq!(tree.prefix_match(empty_slice), empty_slice);
     tree.delete(empty_slice); // Should not panic

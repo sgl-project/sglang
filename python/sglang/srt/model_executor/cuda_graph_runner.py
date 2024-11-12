@@ -37,7 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.speculative_utils import DraftInfoFactory
-from sglang.srt.utils import monkey_patch_vllm_all_gather
+from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -97,7 +97,7 @@ def set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 
-@torch.compile(dynamic=True)
+@maybe_torch_compile(dynamic=True)
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
@@ -129,7 +129,7 @@ class CudaGraphRunner:
             and bs <= model_runner.server_args.cuda_graph_max_bs
         ]
         self.capture_forward_mode = ForwardMode.DECODE
-        if model_runner.server_args.speculative_algorithm == 'EAGLE':
+        if model_runner.server_args.speculative_algorithm == "EAGLE":
             if self.model_runner.is_draft_runner:
                 expand_num = self.model_runner.server_args.eagle_topk
             else:
@@ -138,7 +138,7 @@ class CudaGraphRunner:
             self.num_tokens = [bs * expand_num for bs in self.capture_bs]
         else:
             self.num_tokens = [bs for bs in self.capture_bs]
-                
+
         self.compile_bs = (
             [
                 bs
@@ -171,12 +171,15 @@ class CudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int32)
-            self.positions = torch.zeros((self.max_num_token, ), dtype=torch.int64)
+            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int32)
-            
+
             # speculative_inference
-            if self.model_runner.server_args.speculative_algorithm == 'EAGLE':
-                self.hidden_states = torch.zeros((self.max_num_token, self.model_runner.model_config.hidden_size), dtype=self.model_runner.dtype)
+            if self.model_runner.server_args.speculative_algorithm == "EAGLE":
+                self.hidden_states = torch.zeros(
+                    (self.max_num_token, self.model_runner.model_config.hidden_size),
+                    dtype=self.model_runner.dtype,
+                )
 
             if self.is_encoder_decoder:
                 # NOTE: encoder_lens can influence the full_text_row_masked_out_mask tensor when doing mixed batch
@@ -253,23 +256,36 @@ class CudaGraphRunner:
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:num_token]
         positions = self.positions[:num_token]
-        
+
         spec_info = None
-        if self.model_runner.server_args.speculative_algorithm == 'EAGLE':
+        if self.model_runner.server_args.speculative_algorithm == "EAGLE":
             if self.model_runner.is_draft_runner:
-                spec_info = DraftInfoFactory.get(self.model_runner.server_args.speculative_algorithm, 'DraftInput')()
+                spec_info = DraftInfoFactory.get(
+                    self.model_runner.server_args.speculative_algorithm, "DraftInput"
+                )()
                 spec_info.hidden_states = self.hidden_states[:num_token]
                 spec_info.positions = positions
                 spec_info.init(self.model_runner.server_args)
                 spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
             else:
-                spec_info = DraftInfoFactory.get(self.model_runner.server_args.speculative_algorithm, 'VerifyInput')(
-                    None, None, None, None, None, None, self.model_runner.server_args.num_draft_tokens)
-                spec_info.custom_mask = torch.zeros((num_token*self.model_runner.model_config.context_len), dtype=torch.bool,
-                    device="cuda",)
+                spec_info = DraftInfoFactory.get(
+                    self.model_runner.server_args.speculative_algorithm, "VerifyInput"
+                )(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.model_runner.server_args.num_draft_tokens,
+                )
+                spec_info.custom_mask = torch.zeros(
+                    (num_token * self.model_runner.model_config.context_len),
+                    dtype=torch.bool,
+                    device="cuda",
+                )
                 spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
-                
-            
+
         if self.is_encoder_decoder:
             encoder_lens = self.encoder_lens[:bs]
         else:
@@ -293,7 +309,7 @@ class CudaGraphRunner:
             return_logprob=False,
             top_logprobs_nums=[0] * num_token,
             positions=positions,
-            #positions=clamp_position(seq_lens),
+            # positions=clamp_position(seq_lens),
             spec_info=spec_info,
             spec_algorithm=self.model_runner.server_args.speculative_algorithm,
             mrope_positions=mrope_positions,
@@ -338,14 +354,14 @@ class CudaGraphRunner:
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         raw_bs = forward_batch.batch_size
-        # In most case, raw_bs == num_token in decode stage. 
+        # In most case, raw_bs == num_token in decode stage.
         # But for speculative, the token num maybe large than raw_bs
         raw_num_token = forward_batch.input_ids.numel()
 
         # Pad
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
-        num_token = self.num_tokens[index] 
+        num_token = self.num_tokens[index]
         if bs != raw_bs:
             self.seq_lens.fill_(1)
             self.out_cache_loc.zero_()
@@ -359,15 +375,16 @@ class CudaGraphRunner:
         if positions is None:
             positions = clamp_position(forward_batch.seq_lens)
         self.positions[:raw_num_token].copy_(positions)
-        
+
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
 
-        
         # EAGLE speculative decoding
-        if isinstance(forward_batch.spec_info, DraftInfoFactory.get('EAGLE', 'DraftInput')):
+        if isinstance(
+            forward_batch.spec_info, DraftInfoFactory.get("EAGLE", "DraftInput")
+        ):
             self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
 
         # Attention backend
@@ -378,7 +395,7 @@ class CudaGraphRunner:
             self.seq_lens,
             forward_batch.seq_lens_sum + (bs - raw_bs),
             self.encoder_lens,
-            forward_batch=forward_batch
+            forward_batch=forward_batch,
         )
 
         # Replay

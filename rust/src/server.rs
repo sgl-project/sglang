@@ -1,3 +1,4 @@
+use crate::router::PolicyConfig;
 use crate::router::Router;
 use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use bytes::Bytes;
@@ -9,9 +10,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(worker_urls: Vec<String>, policy: String, client: reqwest::Client) -> Self {
+    pub fn new(
+        worker_urls: Vec<String>,
+        client: reqwest::Client,
+        policy_config: PolicyConfig,
+    ) -> Self {
         // Create router based on policy
-        let router = Router::new(worker_urls, policy);
+        let router = Router::new(worker_urls, policy_config);
 
         Self { router, client }
     }
@@ -40,7 +45,6 @@ async fn forward_request(
 
 #[get("/v1/models")]
 async fn v1_model(data: web::Data<AppState>) -> impl Responder {
-    // TODO: extract forward_to_route
     let worker_url = match data.router.get_first() {
         Some(url) => url,
         None => return HttpResponse::InternalServerError().finish(),
@@ -59,7 +63,6 @@ async fn get_model_info(data: web::Data<AppState>) -> impl Responder {
     forward_request(&data.client, worker_url, "/get_model_info".to_string()).await
 }
 
-// no deser and ser, just forward and return
 #[post("/generate")]
 async fn generate(req: HttpRequest, body: Bytes, data: web::Data<AppState>) -> impl Responder {
     data.router.dispatch(&data.client, req, body).await
@@ -69,7 +72,7 @@ pub async fn startup(
     host: String,
     port: u16,
     worker_urls: Vec<String>,
-    routing_policy: String,
+    policy_config: PolicyConfig,
 ) -> std::io::Result<()> {
     println!("Starting server on {}:{}", host, port);
     println!("Worker URLs: {:?}", worker_urls);
@@ -80,7 +83,7 @@ pub async fn startup(
         .expect("Failed to create HTTP client");
 
     // Store both worker_urls and client in AppState
-    let app_state = web::Data::new(AppState::new(worker_urls, routing_policy, client));
+    let app_state = web::Data::new(AppState::new(worker_urls, client, policy_config));
 
     HttpServer::new(move || {
         App::new()
