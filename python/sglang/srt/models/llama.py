@@ -416,6 +416,7 @@ class LlamaForCausalLM(nn.Module):
             hasattr(self.config, "tie_word_embeddings")
             and self.config.tie_word_embeddings
             and "lm_head.weight" in params_dict
+            and self.lm_head.weight.shape == self.model.embed_tokens.weight
         ):
             # Tie output embedding layer to input embedding layer, to solve issues where lm_head.weight is missing
             param = self.lm_head.weight
