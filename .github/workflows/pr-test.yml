@@ -47,10 +47,10 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 0 --range-end 6
+          python3 run_suite.py --suite minimal --range-begin 0 --range-end 5
 
   unit-test-backend-part-2:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -64,10 +64,10 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 6 --range-end 14
+          python3 run_suite.py --suite minimal --range-begin 5 --range-end 14
 
   unit-test-backend-part-3:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -81,10 +81,10 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 14 --range-end 20
+          python3 run_suite.py --suite minimal --range-begin 14 --range-end 21
 
   unit-test-backend-part-4:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -98,10 +98,10 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 20
+          python3 run_suite.py --suite minimal --range-begin 21
 
   performance-test-1-gpu-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -114,25 +114,25 @@ jobs:
         run: |
           bash scripts/ci_install_dependency.sh
 
-      - name: Benchmark Single Latency
+      - name: Benchmark single latency
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_latency.TestBenchLatency.test_default
 
-      - name: Benchmark Online Latency
+      - name: Benchmark online latency
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
 
-      - name: Benchmark Offline Throughput
+      - name: Benchmark offline throughput
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
 
-      - name: Benchmark Offline Throughput (Non-streaming, small batch size)
+      - name: Benchmark offline throughput (Non-streaming, small batch size)
         timeout-minutes: 10
         run: |
           cd test/srt
@@ -149,19 +149,19 @@ jobs:
         run: |
           bash scripts/ci_install_dependency.sh
 
-      - name: Benchmark Offline Throughput (w/o RadixAttention)
+      - name: Benchmark offline throughput (w/o RadixAttention)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
 
-      - name: Benchmark Offline Throughput (w/ Triton)
+      - name: Benchmark offline throughput (w/ Triton)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
 
-      - name: Benchmark Offline Throughput (w/ FP8)
+      - name: Benchmark offline throughput (w/ FP8)
         timeout-minutes: 10
         run: |
           cd test/srt
@@ -178,19 +178,19 @@ jobs:
         run: |
           bash scripts/ci_install_dependency.sh
 
-      - name: Benchmark Offline Throughput (TP=2)
+      - name: Benchmark offline throughput (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
 
-      - name: Benchmark Offline Throughput (w/o RadixAttention) (TP=2)
+      - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
-      - name: Benchmark Single Latency (TP=2)
+      - name: Benchmark single latency (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
@@ -211,7 +211,7 @@ jobs:
           cd human-eval
           pip install -e .
 
-      - name: Evaluate Accuracy
+      - name: Evaluate accuracy
         timeout-minutes: 20
         run: |
           cd test/srt
@@ -232,20 +232,20 @@ jobs:
           cd human-eval
           pip install -e .
 
-      - name: Evaluate Accuracy (TP=2)
+      - name: Evaluate accuracy (TP=2)
         timeout-minutes: 20
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
 
-      - name: Evaluate MLA Accuracy (TP=2)
+      - name: Evaluate MLA accuracy (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 test_mla.py
           python3 test_mla_fp8.py
 
-      - name: Evaluate Data Parallelism Accuracy (DP=2)
+      - name: Evaluate data parallelism accuracy (DP=2)
         timeout-minutes: 10
         run: |
           cd test/srt

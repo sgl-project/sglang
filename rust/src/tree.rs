@@ -1,18 +1,19 @@
 use std::collections::HashMap;
 use std::mem;
 
-#[derive(Clone)]
+#[derive(Debug)]
 pub struct Node {
-    pub children: HashMap<usize, Node>, // the key is first id of the child because each child must have unique first id
-    pub ids: Vec<usize>,
-    pub count: usize,
+    pub children: HashMap<u32, Node>, // the key is first id of the child because each child must have unique first id
+    pub ids: Vec<u32>,
+    pub count: u32,
 }
 
+#[derive(Debug)]
 pub struct RadixTree {
     pub root: Node,
 }
 
-fn common_prefix_len(a: &[usize], b: &[usize]) -> usize {
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     let mut i = 0;
     while i < a.len() && i < b.len() && a[i] == b[i] {
         i += 1;
@@ -37,7 +38,7 @@ impl RadixTree {
         }
     }
 
-    pub fn insert(&mut self, input_ids: &[usize]) {
+    pub fn insert(&mut self, input_ids: &[u32]) {
         let mut curr = &mut self.root;
         curr.count += 1;
 
@@ -93,7 +94,7 @@ impl RadixTree {
         }
     }
 
-    pub fn prefix_match<'a>(&self, input_ids: &'a [usize]) -> &'a [usize] {
+    pub fn prefix_match<'a>(&self, input_ids: &'a [u32]) -> &'a [u32] {
         let mut curr = &self.root;
 
         let mut curr_idx = 0;
@@ -121,7 +122,7 @@ impl RadixTree {
         &input_ids[..curr_idx]
     }
 
-    pub fn delete(&mut self, input_ids: &[usize]) {
+    pub fn delete(&mut self, input_ids: &[u32]) {
         let mut curr = &mut self.root;
         curr.count -= 1;
 

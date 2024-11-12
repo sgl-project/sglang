@@ -596,11 +596,19 @@ def sample_random_requests(
 
         # Filter out sequences that are too long or too short
         input_requests: List[Tuple[str, int, int]] = []
-        for i in range(num_prompts):
+        for data in dataset:
+            i = len(input_requests)
+            if i == num_prompts:
+                break
+
             # Tokenize the prompts and completions.
-            prompt = dataset[i][0]
+            prompt = data[0]
             prompt_token_ids = tokenizer.encode(prompt)
             prompt_len = len(prompt_token_ids)
+
+            # Skip empty prompt
+            if prompt_len == 0:
+                continue
 
             if prompt_len > input_lens[i]:
                 input_ids = prompt_token_ids[: input_lens[i]]
@@ -624,6 +632,66 @@ def sample_random_requests(
 
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
+    return input_requests
+
+
+def gen_prompt(tokenizer, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = list(tokenizer.get_vocab().values())
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
+
+
+def sample_generated_shared_prefix_requests(
+    num_groups: int,
+    prompts_per_group: int,
+    system_prompt_len: int,
+    question_len: int,
+    output_len: int,
+    tokenizer: PreTrainedTokenizerBase,
+) -> List[Tuple[str, int, int]]:
+    """Generate benchmark requests with shared system prompts using random tokens."""
+    # Generate system prompts for each group
+    system_prompts = []
+    for _ in range(num_groups):
+        system_prompt = gen_prompt(tokenizer, system_prompt_len)
+        system_prompts.append(system_prompt)
+
+    # Generate questions
+    questions = []
+    for _ in range(num_groups * prompts_per_group):
+        question = gen_prompt(tokenizer, question_len)
+        questions.append(question)
+
+    # Combine system prompts with questions
+    input_requests = []
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for group_idx in range(num_groups):
+        system_prompt = system_prompts[group_idx]
+        for prompt_idx in range(prompts_per_group):
+            question = questions[group_idx * prompts_per_group + prompt_idx]
+            full_prompt = f"{system_prompt}\n\n{question}"
+            prompt_len = len(tokenizer.encode(full_prompt))
+
+            input_requests.append((full_prompt, prompt_len, output_len))
+            total_input_tokens += prompt_len
+            total_output_tokens += output_len
+
+    print(f"\nGenerated shared prefix dataset statistics:")
+    print(f"Number of groups: {num_groups}")
+    print(f"Prompts per group: {prompts_per_group}")
+    print(f"Total prompts: {len(input_requests)}")
+    print(f"Total input tokens: {total_input_tokens}")
+    print(f"Total output tokens: {total_output_tokens}")
+    print(
+        f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens"
+    )
+    print(
+        f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
+    )
+
     return input_requests
 
 
@@ -1048,6 +1116,15 @@ def run_benchmark(args_: argparse.Namespace):
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
         )
+    elif args.dataset_name == "generated-shared-prefix":
+        input_requests = sample_generated_shared_prefix_requests(
+            num_groups=args.gen_num_groups,
+            prompts_per_group=args.gen_prompts_per_group,
+            system_prompt_len=args.gen_system_prompt_len,
+            question_len=args.gen_question_len,
+            output_len=args.gen_output_len,
+            tokenizer=tokenizer,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
@@ -1121,7 +1198,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random"],
+        choices=["sharegpt", "random", "generated-shared-prefix"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1208,5 +1285,38 @@ if __name__ == "__main__":
         help="Append given JSON object to the request payload. You can use this to specify"
         "additional generate params like sampling params.",
     )
+
+    group = parser.add_argument_group("generated-shared-prefix dataset arguments")
+    group.add_argument(
+        "--gen-num-groups",
+        type=int,
+        default=64,
+        help="Number of system prompt groups for generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gen-prompts-per-group",
+        type=int,
+        default=16,
+        help="Number of prompts per system prompt group for generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gen-system-prompt-len",
+        type=int,
+        default=2048,
+        help="Target length in tokens for system prompts in generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gen-question-len",
+        type=int,
+        default=128,
+        help="Target length in tokens for questions in generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gen-output-len",
+        type=int,
+        default=256,
+        help="Target length in tokens for outputs in generated-shared-prefix dataset",
+    )
+
     args = parser.parse_args()
     run_benchmark(args)
