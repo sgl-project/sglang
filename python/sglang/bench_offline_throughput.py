@@ -15,7 +15,7 @@ import json
 import logging
 import random
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 
@@ -26,7 +26,7 @@ from sglang.bench_serving import (
     sample_sharegpt_requests,
     set_ulimit,
 )
-from sglang.srt.server import Engine
+from sglang.srt.server import Engine, Runtime
 from sglang.srt.server_args import ServerArgs
 
 
@@ -35,10 +35,12 @@ class BenchArgs:
     run_name: str = "before"
     result_filename: str = ""
     seed: int = 1
+    backend: str = "engine"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
+        parser.add_argument("--backend", type=str, default=BenchArgs.backend)
         parser.add_argument(
             "--result-filename", type=str, default=BenchArgs.result_filename
         )
@@ -94,7 +96,7 @@ class BenchArgs:
 
 def throughput_test_once(
     run_name: str,
-    engine: Engine,
+    backend: Union[Engine, Runtime],
     reqs: List[Tuple[str, int, int]],
 ):
     measurement_results = {
@@ -103,7 +105,7 @@ def throughput_test_once(
     }
 
     st = time.perf_counter()
-    gen_out = engine.generate(
+    gen_out = backend.generate(
         prompt=[r[0] for r in reqs], sampling_params={"temperature": 0}
     )
     latency = time.perf_counter() - st
@@ -125,9 +127,14 @@ def throughput_test(
     server_args: ServerArgs,
     bench_args: BenchArgs,
 ):
-    engine = getEngine(**dataclasses.asdict(server_args))
-    if not engine:
-        raise ValueError("Please provide valid engine arguments")
+    if bench_args.backend == "engine":
+        backend = getEngine(**dataclasses.asdict(server_args))
+        if not backend:
+            raise ValueError("Please provide valid engine arguments")
+    elif bench_args.backend == "runtime":
+        backend = Runtime(**dataclasses.asdict(server_args))
+    else:
+        raise ValueError('Please set backend to either "engine" or "runtime"')
 
     tokenizer_id = args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
@@ -170,13 +177,13 @@ def throughput_test(
     # Warm up
     throughput_test_once(
         run_name="warmup",
-        engine=engine,
+        backend=backend,
         reqs=warmup_requests,
     )
 
     result = throughput_test_once(
         run_name=bench_args.run_name,
-        engine=engine,
+        backend=backend,
         reqs=input_requests,
     )
 

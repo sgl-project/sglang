@@ -18,6 +18,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    GenericArgs,
 )
 
 
@@ -154,10 +155,10 @@ class TestSRTEngine(unittest.TestCase):
         self.assertTrue(torch.allclose(out1, out2, atol=1e-5, rtol=1e-3))
 
     def test_7_engine_offline_throughput(self):
-        server_args = SimpleNamespace(
+        server_args = GenericArgs(
             model_path=DEFAULT_MODEL_NAME_FOR_TEST,
         )
-        bench_args = SimpleNamespace(num_prompts=10)
+        bench_args = GenericArgs(num_prompts=10)
         result = throughput_test(server_args=server_args, bench_args=bench_args)
         self.assertTrue(result["throughput"] > 3800)
 
