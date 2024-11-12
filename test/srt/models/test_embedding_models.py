@@ -17,7 +17,7 @@ import multiprocessing as mp
 import unittest
 
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import get_similarities
@@ -38,15 +38,16 @@ class TestEmbeddingModels(unittest.TestCase):
     def _truncate_prompts(self, prompts, model_path):
         config = AutoConfig.from_pretrained(model_path)
         max_length = getattr(config, "max_position_embeddings", 2048)
-        
-        from transformers import AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-        
+
         truncated_prompts = []
         for prompt in prompts:
             tokens = tokenizer(prompt, return_tensors="pt", truncation=False)
             if len(tokens.input_ids[0]) > max_length:
-                truncated_text = tokenizer.decode(tokens.input_ids[0][:max_length-1], skip_special_tokens=True)
+                truncated_text = tokenizer.decode(
+                    tokens.input_ids[0][: max_length - 1], skip_special_tokens=True
+                )
                 truncated_prompts.append(truncated_text)
             else:
                 truncated_prompts.append(prompt)
