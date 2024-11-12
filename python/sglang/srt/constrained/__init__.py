@@ -52,18 +52,15 @@ except ImportError:
 
 
 try:
-    from xgrammar import CachedGrammarCompiler as GrammarMatcherInitContextCache
-    from xgrammar import CompiledGrammar as GrammarMatcherInitContext
-    from xgrammar import GrammarMatcher
+    from xgrammar import CachedGrammarCompiler, CompiledGrammar, GrammarMatcher
 except ImportError as e:
     # we rely on type information, so we have a dummy class here
     class Dummy:
-        def __init__(self):
-            pass
+        pass
 
     GrammarMatcher = Dummy
-    GrammarMatcherInitContext = Dummy
-    GrammarMatcherInitContextCache = Dummy
+    CompiledGrammar = Dummy
+    CachedGrammarCompiler = Dummy
 
 __all__ = [
     "RegexGuide",
@@ -75,6 +72,6 @@ __all__ = [
     "disable_cache",
     "make_byte_level_fsm",
     "GrammarMatcher",
-    "GrammarMatcherInitContext",
-    "GrammarMatcherInitContextCache",
+    "CompiledGrammar",
+    "CachedGrammarCompiler",
 ]

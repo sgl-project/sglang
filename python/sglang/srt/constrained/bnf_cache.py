@@ -18,16 +18,16 @@ from typing import Tuple
 from transformers import AutoTokenizer
 
 from sglang.srt.constrained import (
+    CachedGrammarCompiler,
+    CompiledGrammar,
     GrammarMatcher,
-    GrammarMatcherInitContext,
-    GrammarMatcherInitContextCache,
 )
 
 MAX_ROLLBACK_TOKENS = 10
 
 
 class BNFCache:
-    grammar_cache: GrammarMatcherInitContextCache
+    grammar_cache: CachedGrammarCompiler
 
     def __init__(
         self,
@@ -41,11 +41,9 @@ class BNFCache:
             return
 
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_args_dict)
-        self.grammar_cache = GrammarMatcherInitContextCache(
-            tokenizer_or_vocab=tokenizer
-        )
+        self.grammar_cache = CachedGrammarCompiler(tokenizer_or_vocab=tokenizer)
 
-    def get_context(self, key: Tuple[str, str]) -> GrammarMatcherInitContext:
+    def get_context(self, key: Tuple[str, str]) -> CompiledGrammar:
         key_type, key_string = key
         if key_type == "json":
             return self.grammar_cache.get_compiled_grammar_for_json_schema(key_string)
