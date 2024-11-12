@@ -17,16 +17,17 @@ limitations under the License.
 import logging
 
 from interegular import InvalidSyntax, parse_pattern
-from outlines.fsm.json_schema import build_regex_from_schema
+from outlines.fsm.guide import RegexGuide
+from outlines.models.transformers import TransformerTokenizer
 from transformers import AutoTokenizer
 
-from sglang.srt.constrained import RegexGuide, TransformerTokenizer
+from sglang.srt.constrained import build_regex_from_object
 from sglang.srt.constrained.base_tool_cache import BaseToolCache
 
 logger = logging.getLogger(__name__)
 
 
-class FSMCache(BaseToolCache):
+class OutlinesCache(BaseToolCache):
     def __init__(
         self,
         tokenizer_path,
@@ -74,7 +75,7 @@ class FSMCache(BaseToolCache):
         key_type, key_string = key
         if key_type == "json":
             try:
-                regex = build_regex_from_schema(
+                regex = build_regex_from_object(
                     key_string,
                     whitespace_pattern=self.constrained_json_whitespace_pattern,
                 )
