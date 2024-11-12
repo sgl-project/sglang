@@ -138,7 +138,7 @@ class FlashinferUpdater:
             self.head_dim,
             1,
         )
-        
+
     def _update_verify_indices(self, paged_wrapper):
         custom_mask = getattr(self.spec_info, "custom_mask", None)
         paged_wrapper.end_forward()
@@ -153,7 +153,7 @@ class FlashinferUpdater:
             1,
             custom_mask=custom_mask,
         )
-        
+
     def _update_spec_extend(self, paged_wrapper):
         assert not isinstance(paged_wrapper, list)
         paged_wrapper.end_forward()
@@ -197,11 +197,11 @@ class FlashinferUpdater:
 
         if self.spec_info is not None and self.forward_mode.is_spec_extend():
             self.kv_indices, self.kv_indptr, self.kv_last_page_len, self.qo_indptr = (
-                    self.spec_info.generate_attn_arg_spec_extend(
-                        self.req_pool_indices,
-                        paged_kernel_lens,
-                        self.model_runner.req_to_token_pool,
-                    )
+                self.spec_info.generate_attn_arg_spec_extend(
+                    self.req_pool_indices,
+                    paged_kernel_lens,
+                    self.model_runner.req_to_token_pool,
+                )
             )
         elif self.spec_info is not None and self.forward_mode.is_decode():
             self.kv_indices, self.kv_indptr, self.kv_last_page_len, self.qo_indptr = (

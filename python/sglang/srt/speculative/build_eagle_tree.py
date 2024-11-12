@@ -17,7 +17,7 @@ import torch
 kernels = cutex.SourceModule(
     """
 //cuda
-__global__ void build_tree(Tensor<long, 2> parent_list, Tensor<long, 2> selected_index, Tensor<int, 1> verified_seq_len, 
+__global__ void build_tree(Tensor<long, 2> parent_list, Tensor<long, 2> selected_index, Tensor<int, 1> verified_seq_len,
         Tensor<bool, 1> tree_mask, Tensor<long, 1> positions, Tensor<long, 3> retrive_index, int topk, int depth, int draft_token_num) {
         int bid = blockIdx.x;
         int tid = threadIdx.x;
@@ -33,14 +33,14 @@ __global__ void build_tree(Tensor<long, 2> parent_list, Tensor<long, 2> selected
         for(int i=0; i<draft_token_num-1; i++){
             tree_mask[token_tree_idx+i] = false;
         }
-        
+
         int position = 0;
         if (tid==0){
             positions[bid*draft_token_num] = seq_len;
             retrive_index[bid][0][0] = bid * draft_token_num;
             return;
         }
-        
+
         int depends_order[10];
 
         int cur_position = tid-1;
@@ -60,8 +60,8 @@ __global__ void build_tree(Tensor<long, 2> parent_list, Tensor<long, 2> selected
                 }
             }
         }
-        positions[bid*draft_token_num+tid] = position + seq_len; 
-        
+        positions[bid*draft_token_num+tid] = position + seq_len;
+
         int is_leaf = 0;
         for(int i=1;i<draft_token_num;i++){
             if(tree_mask[seq_tree_idx + i * (draft_token_num+seq_len) + seq_len + tid])
@@ -77,7 +77,7 @@ __global__ void build_tree(Tensor<long, 2> parent_list, Tensor<long, 2> selected
         }
 
 
-        
+
 }
 //!cuda
 """,

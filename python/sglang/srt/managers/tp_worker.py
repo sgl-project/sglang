@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 class TpModelWorker:
     """A tensor parallel model worker."""
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -46,11 +47,15 @@ class TpModelWorker:
         # Parse args
         self.tp_rank = tp_rank
         self.server_args = server_args
-        is_draft_worker = getattr(self, 'is_draft_worker', False)
+        is_draft_worker = getattr(self, "is_draft_worker", False)
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
-            server_args.model_path if not is_draft_worker else server_args.draft_model_path,
+            (
+                server_args.model_path
+                if not is_draft_worker
+                else server_args.draft_model_path
+            ),
             trust_remote_code=server_args.trust_remote_code,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
@@ -65,7 +70,7 @@ class TpModelWorker:
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
-            is_draft_runner=is_draft_worker
+            is_draft_runner=is_draft_worker,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -140,7 +145,9 @@ class TpModelWorker:
             self.model_runner.token_to_kv_pool,
         )
 
-    def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch, need_token_id=True):
+    def forward_batch_generation(
+        self, model_worker_batch: ModelWorkerBatch, need_token_id=True
+    ):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
         if need_token_id:

@@ -89,9 +89,9 @@ class TritonAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         encoder_lens: torch.Tensor = None,
-        spec_info:SpecInput=None,
-        is_draft_runner:bool=False,
-        forward_batch: ForwardBatch=None
+        spec_info: SpecInput = None,
+        is_draft_runner: bool = False,
+        forward_batch: ForwardBatch = None,
     ):
         # NOTE: encoder_lens expected to be zeros or None
         self.forward_metadata = (

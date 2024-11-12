@@ -286,9 +286,7 @@ class LlamaModel(nn.Module):
             hidden_states = input_embeds
 
         hidden_states = self.fc(
-            torch.cat(
-                (hidden_states, forward_batch.spec_info.hidden_states), dim=-1
-            )
+            torch.cat((hidden_states, forward_batch.spec_info.hidden_states), dim=-1)
         )
 
         residual = None
@@ -330,7 +328,7 @@ class LlamaForCausalLMEagle(nn.Module):
             None, hidden_states, self.lm_head.weight, forward_batch
         )
         return logits_output
-    
+
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim
         if module_name in ["q_proj", "o_proj", "qkv_proj"]:

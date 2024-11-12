@@ -129,8 +129,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode():
-            wrappers = self.prefill_wrappers_verify if forward_batch.forward_mode.is_verify() \
+            wrappers = (
+                self.prefill_wrappers_verify
+                if forward_batch.forward_mode.is_verify()
                 else self.decode_wrappers
+            )
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -161,8 +164,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
             # Some heuristics to check whether to use ragged forward
             use_ragged = False
-            if (forward_batch.extend_num_tokens >= 4096 and self.num_wrappers == 1 and 
-                    not forward_batch.forward_mode.is_verify()):
+            if (
+                forward_batch.extend_num_tokens >= 4096
+                and self.num_wrappers == 1
+                and not forward_batch.forward_mode.is_verify()
+            ):
                 use_ragged = True
 
             extend_no_prefix = not torch.any(forward_batch.extend_prefix_lens).item()
@@ -187,9 +193,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
             cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
         ]
-        
+
         self.cuda_graph_custom_mask = torch.zeros(
-            (max_bs * (self.max_context_len+7)//8),
+            (max_bs * (self.max_context_len + 7) // 8),
             dtype=torch.uint8,
             device="cuda",
         )
@@ -203,9 +209,9 @@ class FlashInferAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         encoder_lens: torch.Tensor = None,
-        spec_info:SpecInput=None,
-        is_draft_runner:bool=False,
-        forward_batch: ForwardBatch=None
+        spec_info: SpecInput = None,
+        is_draft_runner: bool = False,
+        forward_batch: ForwardBatch = None,
     ):
         decode_wrappers = []
         for i in range(self.num_wrappers):
@@ -216,16 +222,16 @@ class FlashInferAttnBackend(AttentionBackend):
                         self.workspace_buffer,
                         "NHD",
                         use_cuda_graph=True,
-                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][:bs+1],
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
                         custom_mask_buf=self.cuda_graph_custom_mask,
-                        qk_indptr_buf=self.cuda_graph_qk_indptr[i][:bs+1],
+                        qk_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
                     )
                 )
                 self.forward_metadata = (False, False, decode_wrappers)
-                
+
             else:
                 decode_wrappers.append(
                     BatchDecodeWithPagedKVCacheWrapper(
@@ -250,7 +256,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch=forward_batch,
             )
         self.cuda_graph_metadata[num_token] = decode_wrappers
-        
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -268,7 +273,7 @@ class FlashInferAttnBackend(AttentionBackend):
             seq_lens_sum,
             decode_wrappers=self.cuda_graph_metadata[num_token],
             encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-            forward_batch=forward_batch
+            forward_batch=forward_batch,
         )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -410,8 +415,13 @@ class FlashInferIndicesUpdaterDecode:
             self.update = self.update_single_wrapper
 
     def update(
-        self, req_pool_indices, seq_lens, seq_lens_sum, decode_wrappers, 
-        encoder_lens, forward_batch
+        self,
+        req_pool_indices,
+        seq_lens,
+        seq_lens_sum,
+        decode_wrappers,
+        encoder_lens,
+        forward_batch,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -512,7 +522,7 @@ class FlashInferIndicesUpdaterDecode:
         kv_start_idx,
         forward_batch=None,
     ):
-        
+
         if forward_batch.spec_info is not None:
             bs = forward_batch.input_ids.numel()
             kv_indices, kv_indptr, kv_last_page_len, qo_indptr = (
@@ -538,7 +548,6 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indices,
                 self.max_context_len,
             )
-
 
         if forward_batch.forward_mode.is_verify():
             bs = len(req_pool_indices)
@@ -604,14 +613,26 @@ class FlashInferIndicesUpdaterPrefill:
             assert self.attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
 
-    def update(self, req_pool_indices, seq_lens, prefix_lens, use_ragged, 
-               encoder_lens, forward_batch):
+    def update(
+        self,
+        req_pool_indices,
+        seq_lens,
+        prefix_lens,
+        use_ragged,
+        encoder_lens,
+        forward_batch,
+    ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
 
     def update_single_wrapper(
-        self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens, 
-        forward_batch
+        self,
+        req_pool_indices,
+        seq_lens,
+        prefix_lens,
+        use_ragged,
+        encoder_lens,
+        forward_batch,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -629,12 +650,17 @@ class FlashInferIndicesUpdaterPrefill:
             self.kv_indptr[0],
             self.qo_indptr[0],
             use_ragged,
-            forward_batch
+            forward_batch,
         )
 
     def update_sliding_window(
-        self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens, 
-        forward_batch
+        self,
+        req_pool_indices,
+        seq_lens,
+        prefix_lens,
+        use_ragged,
+        encoder_lens,
+        forward_batch,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -663,8 +689,13 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
     def update_cross_attention(
-        self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens, 
-        forward_batch
+        self,
+        req_pool_indices,
+        seq_lens,
+        prefix_lens,
+        use_ragged,
+        encoder_lens,
+        forward_batch,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -687,7 +718,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.kv_indptr[wrapper_id],
                 self.qo_indptr[wrapper_id],
                 use_ragged,
-                forward_batch
+                forward_batch,
             )
 
     def call_begin_forward(

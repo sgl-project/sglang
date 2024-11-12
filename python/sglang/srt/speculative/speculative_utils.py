@@ -18,10 +18,12 @@ if TYPE_CHECKING:
 
 
 class SpecInput:
-    capture_hidden_mode:CaptureHiddenMode = CaptureHiddenMode.NULL
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+
 
 class SpecVerifyInput(SpecInput):
     pass
+
 
 class SpecDraftInput(SpecInput):
     def prepare_for_extend(self, batch):
@@ -40,7 +42,7 @@ class SpecDraftInput(SpecInput):
 
     def clear():
         pass
-    
+
     def merge_batch(self, batch: SpecDraftInput):
         raise NotImplementedError()
 
@@ -51,7 +53,7 @@ class SpecInfoFactory:
 
     def register(self, alg_name: str, type_name: str) -> SpecInput:
         def wrapper(info: Type[SpecInput]) -> Type[SpecInput]:
-            assert type_name in ['DraftInput', 'VerifyInput']
+            assert type_name in ["DraftInput", "VerifyInput"]
             if alg_name not in self.factory:
                 self.factory[alg_name] = {}
             self.factory[alg_name].update({type_name: info})
@@ -66,5 +68,3 @@ class SpecInfoFactory:
 
 
 DraftInfoFactory = SpecInfoFactory()
-
-
