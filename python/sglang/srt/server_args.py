@@ -196,6 +196,7 @@ class ServerArgs:
 
         if self.enable_dp_mla:
             self.dp_size = self.tp_size
+            self.chunked_prefill_size = 4096
 
         # Model-specific patches
         if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
