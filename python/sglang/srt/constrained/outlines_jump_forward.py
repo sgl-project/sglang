@@ -14,7 +14,7 @@ limitations under the License.
 """
 
 """
-Faster constrained decoding.
+Faster constrained decoding with jump forward decoding / compressed finite state machine.
 Reference: https://lmsys.org/blog/2024-02-05-compressed-fsm/
 """
 
@@ -23,15 +23,10 @@ import logging
 from collections import defaultdict
 
 import interegular
-import outlines.caching
 from interegular import InvalidSyntax
+from outlines.caching import cache as disk_cache
+from outlines.fsm.regex import FSMInfo, make_byte_level_fsm, make_deterministic_fsm
 
-from sglang.srt.constrained import (
-    FSMInfo,
-    disk_cache,
-    make_byte_level_fsm,
-    make_deterministic_fsm,
-)
 from sglang.srt.constrained.base_tool_cache import BaseToolCache
 
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
@@ -47,7 +42,7 @@ class JumpEdge:
     byte_next_state: int = None
 
 
-class JumpForwardMap:
+class OutlinesJumpForwardMap:
     def __init__(self, regex_string):
         @disk_cache()
         def _init_state_to_jump_forward(regex_string):
@@ -169,12 +164,12 @@ class JumpForwardMap:
         )
 
 
-class JumpForwardCache(BaseToolCache):
+class OutlinesJumpCache(BaseToolCache):
     def __init__(self):
         super().__init__()
 
     def init_value(self, regex):
-        forward_map = JumpForwardMap(regex)
+        forward_map = OutlinesJumpForwardMap(regex)
         if forward_map.state_to_jump_forward:
             return forward_map
         else:
@@ -182,7 +177,7 @@ class JumpForwardCache(BaseToolCache):
 
 
 def test_main(regex_string):
-    jump_forward_map = JumpForwardMap(regex_string)
+    jump_forward_map = OutlinesJumpForwardMap(regex_string)
     for state, e in jump_forward_map.state_to_jump_forward.items():
         if e.symbol is not None:
             jump_forward_str, next_state = jump_forward_map.jump_forward_symbol(state)

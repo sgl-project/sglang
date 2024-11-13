@@ -107,12 +107,14 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self):
+    def __init__(self, message="Unknown error"):
         super().__init__(is_error=True)
+        self.message = message
 
     def to_json(self):
         return {
             "type": "abort",
+            "message": self.message,
         }
 
 
@@ -212,7 +214,7 @@ class Req:
         # this does not include the jump forward tokens.
         self.completion_tokens_wo_jump_forward = 0
 
-        # For vision inputs
+        # For multimodal inputs
         self.image_inputs: Optional[ImageInputs] = None
 
         # Prefix info

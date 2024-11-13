@@ -18,7 +18,6 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import Gemma2Config
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
