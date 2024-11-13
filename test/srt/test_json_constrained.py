@@ -68,6 +68,7 @@ class TestJSONConstrained(unittest.TestCase):
         if not json_schema:
             return
 
+        # Make sure the json output is valid
         try:
             js_obj = json.loads(ret["text"])
         except (TypeError, json.decoder.JSONDecodeError):
@@ -76,6 +77,7 @@ class TestJSONConstrained(unittest.TestCase):
         self.assertIsInstance(js_obj["name"], str)
         self.assertIsInstance(js_obj["population"], int)
 
+        # Make sure jump forward is triggered
         self.assertGreater(
             ret["meta_info"]["completion_tokens"],
             ret["meta_info"]["completion_tokens_wo_jump_forward"],
