@@ -20,48 +20,43 @@ import torch
 
 from sglang.srt.constrained.outlines_cache import OutlinesCache, RegexGuide
 from sglang.srt.constrained.outlines_jump_forward import (
-    OutlinesJumpCache,
+    OutlinesJumpForwardCache,
     OutlinesJumpForwardMap,
 )
-from sglang.srt.constrained.xgrammar_cache import XGrammarCache, XGrammarJumpCache
 
 logger = logging.getLogger(__name__)
 
 
 class JumpHelper:
 
-    def __init__(self, suffix_id, state: int = -1) -> None:
+    def __init__(self, suffix_id, cur_state: int = -1) -> None:
         self.suffix_ids = suffix_id
-        self.state = state
-
-
-class Grammar:
-    pass
+        self.cur_state = cur_state
 
 
 class OutlinesGrammar:
     def __init__(
         self,
-        grammar: Tuple[RegexGuide, int],
+        guide: RegexGuide,
+        state: int,
         jump_foward_map: Union[OutlinesJumpForwardMap, None],
     ) -> None:
-        self.grammar = grammar
+        self.guide = guide
+        self.state = state
         self.jump_foward_map = jump_foward_map
 
     def accept_token(self, token: int):
-        guide, state = self.grammar
-        self.grammar = guide, guide.get_next_state(state, token)
+        self.state = self.guide.get_next_state(self.state, token)
 
     def try_jump_forward(self, tokenizer) -> JumpHelper:
-        _, state = self.grammar
-        jump_forward_bytes = self.jump_foward_map.jump_forward_byte(state)
-        if jump_forward_bytes is None or len(jump_forward_bytes) == 0:
+        jump_forward_bytes = self.jump_forward_map.jump_forward_byte(self.state)
+        if jump_forward_bytes is None or len(jump_forward_bytes) <= 1:
             return None
 
         # preprocess the jump forward string
         suffix_bytes = []
         continuation_range = range(0x80, 0xC0)
-        cur_state = state
+        cur_state = self.state
         while (
             len(jump_forward_bytes) and jump_forward_bytes[0][0] in continuation_range
         ):
@@ -72,20 +67,19 @@ class OutlinesGrammar:
 
         suffix_tokens = [f"<0x{hex(b)[2:].upper()}>" for b in suffix_bytes]
         suffix_ids = tokenizer.convert_tokens_to_ids(suffix_tokens)
-        return JumpHelper(suffix_ids, cur_state)
+        return JumpHelper(suffix_ids=suffix_ids, cur_state=cur_state)
 
     def jump_forward_str_state(self, helper: JumpHelper) -> Tuple[str, int]:
-        return self.jump_foward_map.jump_forward_symbol(helper.state)
+        return self.jump_foward_map.jump_forward_symbol(helper.cur_state)
 
     def jump_and_retokenize(
         self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
     ):
-        self.grammar = self.grammar[0], next_state
+        self.state = next_state
 
-    def fill_vocab_mask(self, vocab_mask: torch.Tensor, vocab_size: int):
-        guide, state = self.grammar
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor):
         vocab_mask.fill_(1)
-        vocab_mask[guide.get_next_instruction(state).tokens] = 0
+        vocab_mask[self.guide.get_next_instruction(self.state).tokens] = 0
 
 
 class GrammarBackend:
@@ -93,36 +87,31 @@ class GrammarBackend:
     def __init__(
         self,
         tokenizer,
-        vocab_size: int,
         whitespace_patterns: bool,
         allow_jump_forward: bool,
         backend: str,
     ):
         self.executor = ThreadPoolExecutor()
         self.backend = backend
+        self.grammar_cache = OutlinesCache(
+            tokenizer,
+            whitespace_pattern=whitespace_patterns,
+        )
+        self.jump_forward_cache = (
+            OutlinesJumpForwardCache() if allow_jump_forward else None
+        )
 
-        if backend == "xgrammar":
-            self.grammar_cache = XGrammarCache(tokenizer, vocab_size)
-            self.jump_cache = XGrammarJumpCache() if allow_jump_forward else None
-        else:
-            assert backend == "outlines"
-            self.grammar_cache = OutlinesCache(
-                tokenizer,
-                whitespace_pattern=whitespace_patterns,
-            )
-            self.jump_cache = OutlinesJumpCache() if allow_jump_forward else None
-
-    def _query(self, key: Tuple[str, str]) -> Grammar:
-        if isinstance(self.grammar_cache, XGrammarCache):
-            return Grammar(self.grammar_cache.query(key), self.jump_cache)
-        else:
-            guide, regex = self.grammar_cache.query(key)
-            jump_foward_map = self.jump_cache.query(regex) if self.jump_cache else None
-            return OutlinesGrammar((guide, 0), jump_foward_map)
+    def _query(self, key: Tuple[str, str]):
+        guide, regex = self.grammar_cache.query(key)
+        jump_foward_map = (
+            self.jump_forward_cache.query(regex) if self.jump_forward_cache else None
+        )
+        return OutlinesGrammar(guide, 0, jump_foward_map)
 
     def query(self, key: Tuple[str, str]) -> Future:
         return self.executor.submit(self._query, key)
 
     def reset(self):
         self.grammar_cache.reset()
-        self.jump_cache.reset()
+        if self.jump_forward_cache:
+            self.jump_forward_cache.reset()

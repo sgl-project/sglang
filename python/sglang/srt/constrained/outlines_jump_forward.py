@@ -164,7 +164,7 @@ class OutlinesJumpForwardMap:
         )
 
 
-class OutlinesJumpCache(BaseToolCache):
+class OutlinesJumpForwardCache(BaseToolCache):
     def __init__(self):
         super().__init__()
 

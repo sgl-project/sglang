@@ -359,8 +359,6 @@ class Req:
                     return
 
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
-        assert self.grammar is not None and self.tokenizer is not None
-
         if self.origin_input_text is None:
             # Recovering text can only use unpadded ids
             self.origin_input_text = self.tokenizer.decode(
@@ -827,6 +825,8 @@ class ScheduleBatch:
                         next_state,
                     ) = req.grammar.jump_forward_str_state(jump_helper)
 
+                    # Make the incrementally decoded text part of jump_forward_str
+                    # so that the UTF-8 will not corrupt
                     jump_forward_str = new_text + jump_forward_str
                     if not req.jump_forward_and_retokenize(
                         jump_forward_str, next_state

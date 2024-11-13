@@ -235,18 +235,17 @@ class Scheduler:
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
 
-        # Init the grammar cache for constrained generation
-        self.grammar_cache = None
+        # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
-
         if not server_args.skip_tokenizer_init:
-            self.grammar_cache = GrammarBackend(
+            self.grammar_backend_cache = GrammarBackend(
                 self.tokenizer,
-                self.model_config.vocab_size,
                 whitespace_patterns=server_args.constrained_json_whitespace_pattern,
                 allow_jump_forward=not server_args.disable_jump_forward,
                 backend=server_args.grammar_backend,
             )
+        else:
+            self.grammar_backend_cache = None
 
         # Init new token estimation
         assert (
@@ -458,13 +457,13 @@ class Scheduler:
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
         ):
-            assert self.grammar_cache is not None
+            assert self.grammar_backend_cache is not None
             if req.sampling_params.json_schema is not None:
-                req.grammar = self.grammar_cache.query(
+                req.grammar = self.grammar_backend_cache.query(
                     ("json", req.sampling_params.json_schema),
                 )
             elif req.sampling_params.regex is not None:
-                req.grammar = self.grammar_cache.query(
+                req.grammar = self.grammar_backend_cache.query(
                     ("regex", req.sampling_params.regex)
                 )
 
@@ -1138,8 +1137,8 @@ class Scheduler:
         ):
             self.tree_cache.reset()
             self.tree_cache_metrics = {"total": 0, "hit": 0}
-            if self.grammar_cache is not None:
-                self.grammar_cache.reset()
+            if self.grammar_backend_cache is not None:
+                self.grammar_backend_cache.reset()
             # TODO(dark): reset the bnf cache
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
