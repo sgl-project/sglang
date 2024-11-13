@@ -590,7 +590,6 @@ def sample_random_requests(
             (data["conversations"][0]["value"], data["conversations"][1]["value"])
             for data in dataset
         ]
-
         # Shuffle the dataset.
         random.shuffle(dataset)
 

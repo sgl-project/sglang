@@ -30,9 +30,9 @@ import numpy as np
 from sglang.api import Engine as getEngine
 from sglang.bench_serving import (
     get_tokenizer,
+    sample_generated_shared_prefix_requests,
     sample_random_requests,
     sample_sharegpt_requests,
-    sample_generated_shared_prefix_requests,
     set_ulimit,
 )
 from sglang.srt.server import Engine, Runtime
@@ -50,10 +50,10 @@ class BenchArgs:
     random_input_len: int = 256
     random_output_len: int = 256
     random_range_ratio: float = 0.0
-    gen_num_groups: int = (8,)
-    gen_prompts_per_group: int = (16,)
-    gen_system_prompt_len: int = (128,)
-    gen_question_len: int = (256,)
+    gen_num_groups: int = 8
+    gen_prompts_per_group: int = 16
+    gen_system_prompt_len: int = 128
+    gen_question_len: int = 256
     seed: int = 1
 
     @staticmethod
