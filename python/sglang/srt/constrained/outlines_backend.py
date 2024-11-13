@@ -148,7 +148,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                     key_string,
                     whitespace_pattern=self.whitespace_pattern,
                 )
-            except NotImplementedError as e:
+            except (NotImplementedError, json.decoder.JSONDecodeError) as e:
                 logger.warning(
                     f"Skip invalid json_schema: json_schema={key_string}, {e=}"
                 )
