@@ -95,9 +95,7 @@ class BaseToolCache:
 
     def get_cache_hit_rate(self):
         with self.lock_metrics:
-            if self.metrics["total"] == 0:
-                return 0
-            return self.metrics["hit"] / self.metrics["total"]
+            return self.metrics["hit"] / max(self.metrics["total"], 1)
 
     def get_avg_init_time(self):
         with self.lock_metrics:
