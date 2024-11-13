@@ -30,15 +30,9 @@ logger = logging.getLogger(__name__)
 
 class JumpHelper:
 
-    def __init__(
-        self, data: Union[List, str] = "", state: int = -1, suffix_ids=[]
-    ) -> None:
-        self.data: Union[List, str] = data
-        self.state: int = state
-        self.suffix_ids: List[int] = suffix_ids
-
-    def can_jump(self):
-        return len(self.data) > 0
+    def __init__(self, suffix_id, state: int = -1) -> None:
+        self.suffix_ids = suffix_id
+        self.state = state
 
 
 class Grammar:
@@ -78,7 +72,7 @@ class OutlinesGrammar:
 
         suffix_tokens = [f"<0x{hex(b)[2:].upper()}>" for b in suffix_bytes]
         suffix_ids = tokenizer.convert_tokens_to_ids(suffix_tokens)
-        return JumpHelper(suffix_ids, cur_state, suffix_bytes)
+        return JumpHelper(suffix_ids, cur_state)
 
     def jump_forward_str_state(self, helper: JumpHelper) -> Tuple[str, int]:
         return self.jump_foward_map.jump_forward_symbol(helper.state)
