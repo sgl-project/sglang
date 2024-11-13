@@ -77,7 +77,8 @@ class TestJSONConstrained(unittest.TestCase):
         self.assertIsInstance(js_obj["population"], int)
 
         self.assertGreater(
-            ret["completion_tokens"], ret["completion_tokens_wo_jump_forward"]
+            ret["meta_info"]["completion_tokens"],
+            ret["meta_info"]["completion_tokens_wo_jump_forward"],
         )
 
     def test_json_generate(self):
