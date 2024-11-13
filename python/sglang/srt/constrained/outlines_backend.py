@@ -19,6 +19,7 @@ import json
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
+import interegular
 import torch
 from outlines.fsm.guide import RegexGuide
 from outlines.models.transformers import TransformerTokenizer
@@ -151,13 +152,18 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 logger.warning(
                     f"skip invalid json schema: json_schema={key_string}, {e=}"
                 )
-                return None, key_string
+                return None
         elif key_type == "regex":
             regex = key_string
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
-        guide = RegexGuide(regex, self.outlines_tokenizer)
+        try:
+            guide = RegexGuide(regex, self.outlines_tokenizer)
+        except interegular.patterns.InvalidSyntax as e:
+            logger.warning(f"skip invalid regex schema: {regex=}, {e=}")
+            return None
+
         if self.allow_jump_forward:
             jump_forward_map = OutlinesJumpForwardMap(regex)
         else:
