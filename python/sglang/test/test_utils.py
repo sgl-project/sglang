@@ -2,7 +2,6 @@
 
 import argparse
 import asyncio
-import dataclasses
 import os
 import random
 import subprocess

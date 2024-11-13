@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import torch
 
 import sglang as sgl
-from sglang.bench_offline_throughput import throughput_test, BenchArgs
-from sglang.srt.server_args import ServerArgs
+from sglang.bench_offline_throughput import BenchArgs, throughput_test
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.server_args import ServerArgs
 from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
