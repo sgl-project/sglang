@@ -18,7 +18,7 @@ limitations under the License.
 from typing import List, Tuple
 
 import torch
-from xgrammar import CachedGrammarCompiler, GrammarMatcher
+from xgrammar import CachedGrammarCompiler, CompiledGrammar, GrammarMatcher
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
@@ -30,15 +30,21 @@ MAX_ROLLBACK_TOKENS = 10
 
 class XGrammarGrammar(BaseGrammarObject):
 
-    def __init__(self, matcher: GrammarMatcher, vocab_size: int) -> None:
+    def __init__(
+        self, matcher: GrammarMatcher, vocab_size: int, ctx: CompiledGrammar
+    ) -> None:
         self.matcher = matcher
         self.vocab_size = vocab_size
+        self.ctx = ctx
 
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
 
     def try_jump_forward(self, tokenizer) -> Tuple[List[int], str]:
-        return [], self.matcher.find_jump_forward_string()
+        s = self.matcher.find_jump_forward_string()
+        if s:
+            return [], s
+        return None
 
     def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
         _, data = helper
@@ -69,6 +75,14 @@ class XGrammarGrammar(BaseGrammarObject):
             self.matcher.get_rejected_tokens_from_bitmask(bitmask, self.vocab_size)
         ] = 1
 
+    def copy(self):
+        matcher = GrammarMatcher(
+            self.ctx,
+            max_rollback_tokens=MAX_ROLLBACK_TOKENS,
+            mask_vocab_size=self.vocab_size,
+        )
+        return XGrammarGrammar(matcher, self.vocab_size, self.ctx)
+
 
 class XGrammarGrammarBackend(BaseGrammarBackend):
     def __init__(
@@ -89,11 +103,12 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
-        return GrammarMatcher(
+        matcher = GrammarMatcher(
             ctx,
             max_rollback_tokens=MAX_ROLLBACK_TOKENS,
             mask_vocab_size=self.vocab_size,
         )
+        return XGrammarGrammar(matcher, self.vocab_size, ctx)
 
     def reset(self):
         self.grammar_cache.clear()
