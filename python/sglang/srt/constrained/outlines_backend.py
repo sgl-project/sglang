@@ -25,7 +25,6 @@ from outlines.fsm.guide import RegexGuide
 from outlines.models.transformers import TransformerTokenizer
 from pydantic import BaseModel
 
-from sglang.srt.constrained import build_regex_from_object
 from sglang.srt.constrained.base_tool_cache import BaseToolCache
 from sglang.srt.constrained.outlines_jump_forward import (
     OutlinesJumpForwardCache,
@@ -35,7 +34,6 @@ from sglang.srt.constrained.outlines_jump_forward import (
 logger = logging.getLogger(__name__)
 
 
-# TODO(lmzheng): make outline an optional dependency.
 try:
     from outlines.fsm.json_schema import build_regex_from_object
 except ImportError:
@@ -70,6 +68,9 @@ class OutlinesGrammar:
         self.state = self.guide.get_next_state(self.state, token)
 
     def try_jump_forward(self, tokenizer):
+        if not self.jump_forward_map:
+            return None
+
         jump_forward_bytes = self.jump_forward_map.jump_forward_byte(self.state)
         if jump_forward_bytes is None or len(jump_forward_bytes) <= 1:
             return None
