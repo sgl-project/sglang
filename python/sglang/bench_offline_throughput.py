@@ -30,8 +30,8 @@ import numpy as np
 
 from sglang.api import Engine as getEngine
 from sglang.bench_serving import (
-    get_tokenizer,
     get_dataset,
+    get_tokenizer,
     sample_generated_shared_prefix_requests,
     sample_random_requests,
     sample_sharegpt_requests,
