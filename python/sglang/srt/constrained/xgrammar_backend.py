@@ -104,7 +104,7 @@ class XGrammarGrammarBackend:
             raise import_error
 
         self.executor = ThreadPoolExecutor()
-        self.grammar_cache = XGrammarCache(tokenizer)
+        self.grammar_cache = XGrammarCache(tokenizer, vocab_size)
         self.vocab_size = vocab_size
 
     def _query(self, key: Tuple[str, str]) -> XGrammarGrammar:
