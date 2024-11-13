@@ -496,9 +496,8 @@ class Scheduler:
             elif req.sampling_params.regex is not None:
                 key = ("regex", req.sampling_params.regex)
 
-            if self.grammar_backend.is_cached(key):
-                req.grammar = self.grammar_backend.get_cached_value(key)
-            else:
+            req.grammar = self.grammar_backend.get_cached_value(key)
+            if not req.grammar:
                 req.grammar = self.grammar_backend.get_future_value(key)
                 add_to_grammar_queue = True
 

@@ -18,7 +18,7 @@ limitations under the License.
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Event, Lock
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 
 @dataclass
@@ -36,10 +36,6 @@ class BaseGrammarBackend:
         self.executor = ThreadPoolExecutor()
         self.cache = {}
         self.cache_lock = Lock()
-
-    def is_cached(self, key: Tuple[str, str]) -> bool:
-        with self.cache_lock:
-            return key in self.cache and self.cache[key].event.is_set()
 
     def init_value(self, key: Tuple[str, str]) -> BaseGrammarObject:
         with self.cache_lock:
@@ -61,8 +57,11 @@ class BaseGrammarBackend:
     def init_value_impl(self, key: Tuple[str, str]) -> BaseGrammarObject:
         raise NotImplementedError()
 
-    def get_cached_value(self, key: Tuple[str, str]) -> BaseGrammarObject:
+    def get_cached_value(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
         with self.cache_lock:
+            entry = self.cache.get(key)
+            if not entry or not entry.event.is_set():
+                return None
             return self.cache[key].value.copy()
 
     def get_future_value(self, key: Tuple[str, str]) -> Future:
