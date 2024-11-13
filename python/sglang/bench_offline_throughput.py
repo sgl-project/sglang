@@ -25,8 +25,6 @@ import random
 import time
 from typing import Dict, List, Tuple, Union
 
-import numpy as np
-
 from sglang.api import Engine as getEngine
 from sglang.bench_serving import (
     get_tokenizer,
@@ -54,6 +52,7 @@ class BenchArgs:
     gen_prompts_per_group: int = 16
     gen_system_prompt_len: int = 128
     gen_question_len: int = 256
+    disable_ignore_eos: bool = False
     seed: int = 1
 
     @staticmethod
@@ -129,6 +128,12 @@ class BenchArgs:
             default=BenchArgs.gen_question_len,
             help="Question length, used" "only for generate-shared-prefix",
         )
+        parser.add_argument(
+            "--disable-ignore-eos",
+            type=bool,
+            default=BenchArgs.disable_ignore_eos,
+            help="Disable ignore EOS token",
+        )
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
 
     @classmethod
@@ -145,15 +150,22 @@ def throughput_test_once(
     backend_name: str,
     backend: Union[Engine, Runtime],
     reqs: List[Tuple[str, int, int]],
+    output_len: int,
+    ignore_eos: bool,
 ):
     measurement_results = {
         "total_input_tokens": sum(r[1] for r in reqs),
     }
 
+    prompt = [r[0] for r in reqs]
+    sampling_params = {
+        "temperature": 0,
+        "max_new_tokens": output_len,
+        "ignore_eos": ignore_eos,
+    }
+
     st = time.perf_counter()
-    gen_out = backend.generate(
-        prompt=[r[0] for r in reqs], sampling_params={"temperature": 0}
-    )
+    gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
     latency = time.perf_counter() - st
 
     if backend_name == "runtime":
@@ -200,6 +212,7 @@ def throughput_test(
             tokenizer=tokenizer,
             fixed_output_len=bench_args.sharegpt_output_len,
         )
+        output_len = bench_args.sharegpt_output_len
     elif bench_args.dataset_name == "random":
         input_requests = sample_random_requests(
             input_len=bench_args.random_input_len,
@@ -209,6 +222,7 @@ def throughput_test(
             tokenizer=tokenizer,
             dataset_path=bench_args.dataset_path,
         )
+        output_len = bench_args.random_output_len
     elif bench_args.dataset_name == "generated-shared-prefix":
         input_requests = sample_generated_shared_prefix_requests(
             num_groups=bench_args.gen_num_groups,
@@ -218,6 +232,7 @@ def throughput_test(
             output_len=bench_args.gen_output_len,
             tokenizer=tokenizer,
         )
+        output_len = bench_args.gen_output_len
     else:
         raise ValueError(f"Unknown dataset: {bench_args.dataset_name}")
 
@@ -235,19 +250,23 @@ def throughput_test(
         backend_name=bench_args.backend,
         backend=backend,
         reqs=warmup_requests,
+        output_len=output_len,
+        ignore_eos=not bench_args.disable_ignore_eos,
     )
 
     result = throughput_test_once(
         backend_name=bench_args.backend,
         backend=backend,
         reqs=input_requests,
+        output_len=output_len,
+        ignore_eos=not bench_args.disable_ignore_eos,
     )
 
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:
             fout.write(json.dumps(result) + "\n")
-    else:
-        return result
+
+    return result
 
 
 if __name__ == "__main__":
