@@ -14,16 +14,17 @@ limitations under the License.
 """
 
 """Cache for the compressed finite state machine."""
+import json
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from interegular import InvalidSyntax, parse_pattern
 from outlines.fsm.guide import RegexGuide
 from outlines.models.transformers import TransformerTokenizer
+from pydantic import BaseModel
 
-from python.sglang.srt.constrained.outlines_backend import OutlinesCache, RegexGuide
 from sglang.srt.constrained import build_regex_from_object
 from sglang.srt.constrained.base_tool_cache import BaseToolCache
 from sglang.srt.constrained.outlines_jump_forward import (
@@ -32,6 +33,26 @@ from sglang.srt.constrained.outlines_jump_forward import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# TODO(lmzheng): make outline an optional dependency.
+try:
+    from outlines.fsm.json_schema import build_regex_from_object
+except ImportError:
+    # Since outlines 0.0.32, build_regex_from_object is replaced by build_regex_from_schema,
+    # which only accepts string schema as input.
+    from outlines.fsm.json_schema import build_regex_from_schema
+
+    def build_regex_from_object(
+        object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
+    ):
+        if isinstance(object, type(BaseModel)):
+            schema = json.dumps(object.model_json_schema())
+        elif isinstance(object, Dict):
+            schema = json.dumps(object)
+        else:
+            schema = object
+        return build_regex_from_schema(schema, whitespace_pattern)
 
 
 class OutlinesGrammar:
