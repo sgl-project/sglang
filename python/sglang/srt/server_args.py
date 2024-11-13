@@ -63,25 +63,26 @@ class ServerArgs:
     stream_interval: int = 1
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
-    decode_log_interval: int = 40
+    watchdog_timeout: float = 300
 
     # Logging
     log_level: str = "info"
     log_level_http: Optional[str] = None
     log_requests: bool = False
     show_time_cost: bool = False
+    enable_metrics: bool = False
+    decode_log_interval: int = 40
 
-    # Other
+    # API related
     api_key: Optional[str] = None
     file_storage_pth: str = "SGLang_storage"
     enable_cache_report: bool = False
-    watchdog_timeout: float = 600
 
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
 
-    # Distributed args
+    # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
@@ -110,7 +111,7 @@ class ServerArgs:
     disable_flashinfer: bool = False
     disable_flashinfer_sampling: bool = False
     disable_radix_cache: bool = False
-    disable_regex_jump_forward: bool = False
+    disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     disable_disk_cache: bool = False
@@ -127,6 +128,7 @@ class ServerArgs:
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     num_continuous_decode_steps: int = 1
+    delete_ckpt_after_loading: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -204,6 +206,7 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        # Model and port args
         parser.add_argument(
             "--model-path",
             type=str,
@@ -323,6 +326,8 @@ class ServerArgs:
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
         )
+
+        # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
             type=float,
@@ -367,6 +372,8 @@ class ServerArgs:
             default=ServerArgs.schedule_conservativeness,
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
+
+        # Other runtime options
         parser.add_argument(
             "--tensor-parallel-size",
             "--tp-size",
@@ -393,6 +400,14 @@ class ServerArgs:
             help=r"Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
         )
         parser.add_argument(
+            "--watchdog-timeout",
+            type=float,
+            default=ServerArgs.watchdog_timeout,
+            help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
+
+        # Logging
+        parser.add_argument(
             "--log-level",
             type=str,
             default=ServerArgs.log_level,
@@ -415,6 +430,19 @@ class ServerArgs:
             help="Show time cost of custom marks.",
         )
         parser.add_argument(
+            "--enable-metrics",
+            action="store_true",
+            help="Enable log prometheus metrics.",
+        )
+        parser.add_argument(
+            "--decode-log-interval",
+            type=int,
+            default=ServerArgs.decode_log_interval,
+            help="The log interval of decode batch",
+        )
+
+        # API related
+        parser.add_argument(
             "--api-key",
             type=str,
             default=ServerArgs.api_key,
@@ -430,18 +458,6 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
-        )
-        parser.add_argument(
-            "--watchdog-timeout",
-            type=float,
-            default=ServerArgs.watchdog_timeout,
-            help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
-        )
-        parser.add_argument(
-            "--decode-log-interval",
-            type=int,
-            default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch"
         )
 
         # Data parallelism
@@ -463,7 +479,7 @@ class ServerArgs:
             ],
         )
 
-        # Multi-node distributed serving args
+        # Multi-node distributed serving
         parser.add_argument(
             "--dist-init-addr",
             "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
@@ -558,7 +574,7 @@ class ServerArgs:
             type=str,
             choices=["xgrammar", "outlines"],
             default=ServerArgs.grammar_backend,
-            help="Choose the backend for constrained decoding.",
+            help="Choose the backend for grammar-guided decoding.",
         )
 
         # Optimization/debug options
@@ -578,9 +594,9 @@ class ServerArgs:
             help="Disable RadixAttention for prefix caching.",
         )
         parser.add_argument(
-            "--disable-regex-jump-forward",
+            "--disable-jump-forward",
             action="store_true",
-            help="Disable regex jump-forward.",
+            help="Disable jump-forward for grammar-guided decoding.",
         )
         parser.add_argument(
             "--disable-cuda-graph",
@@ -600,7 +616,6 @@ class ServerArgs:
         parser.add_argument(
             "--disable-custom-all-reduce",
             action="store_true",
-            default=False,
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
@@ -669,6 +684,11 @@ class ServerArgs:
             help="Run multiple continuous decoding steps to reduce scheduling overhead. "
             "This can potentially increase throughput but may also increase time-to-first-token latency. "
             "The default value is 1, meaning only run one decoding step at a time.",
+        )
+        parser.add_argument(
+            "--delete-ckpt-after-loading",
+            action="store_true",
+            help="Delete the model checkpoint after loading the model.",
         )
 
     @classmethod

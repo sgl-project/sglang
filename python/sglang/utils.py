@@ -305,7 +305,7 @@ def execute_shell_command(command: str) -> subprocess.Popen:
     Execute a shell command and return the process handle
 
     Args:
-        command: Shell command as a string (can include \ line continuations)
+        command: Shell command as a string (can include \\ line continuations)
     Returns:
         subprocess.Popen: Process handle
     """
@@ -349,6 +349,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 def terminate_process(process):
     from sglang.srt.utils import kill_child_process
+
     kill_child_process(process.pid, include_self=True)
 
 

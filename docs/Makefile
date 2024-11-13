@@ -1,7 +1,7 @@
 # Minimal makefile for Sphinx documentation
 #
 
-# You can set these variables from the command line, and also
+# You can set these variables from the terminal, and also
 # from the environment for the first two.
 SPHINXOPTS    ?=
 SPHINXBUILD   ?= sphinx-build
@@ -14,7 +14,7 @@ help:
 
 # New target to compile Markdown and Jupyter Notebook files
 compile:
-	find $(SOURCEDIR) -name '*.ipynb' | while read nb; do \
+	find $(SOURCEDIR) -path "*/_build/*" -prune -o -name "*.ipynb" -print | while read nb; do \
 		if [ -f "$$nb" ]; then \
 			echo "Executing $$nb"; \
 			jupyter nbconvert --to notebook --execute --inplace "$$nb" \

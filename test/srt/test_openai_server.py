@@ -1,3 +1,9 @@
+"""
+python3 -m unittest test_openai_server.TestOpenAIServer.test_batch
+python3 -m unittest test_openai_server.TestOpenAIServer.test_completion
+
+"""
+
 import json
 import time
 import unittest
@@ -7,7 +13,7 @@ import openai
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -17,7 +23,7 @@ from sglang.test.test_utils import (
 class TestOpenAIServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -27,7 +33,7 @@ class TestOpenAIServer(unittest.TestCase):
             api_key=cls.api_key,
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
     @classmethod
     def tearDownClass(cls):
@@ -79,7 +85,9 @@ class TestOpenAIServer(unittest.TestCase):
             # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
             assert ret_num_top_logprobs > 0
 
-            assert response.choices[0].logprobs.token_logprobs[0]
+            # when echo=True and request.logprobs>0, logprob_start_len is 0, so the first token's logprob would be None.
+            if not echo:
+                assert response.choices[0].logprobs.token_logprobs[0]
 
         assert response.id
         assert response.created

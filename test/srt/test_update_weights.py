@@ -5,7 +5,7 @@ import requests
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 class TestUpdateWeights(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model, cls.base_url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
@@ -64,7 +64,7 @@ class TestUpdateWeights(unittest.TestCase):
         origin_response = self.run_decode()
 
         # update weights
-        new_model_path = "meta-llama/Meta-Llama-3.1-8B"
+        new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "")
         ret = self.run_update_weights(new_model_path)
         assert ret["success"]
 
@@ -92,7 +92,7 @@ class TestUpdateWeights(unittest.TestCase):
         origin_response = self.run_decode()
 
         # update weights
-        new_model_path = "meta-llama/Meta-Llama-3.1-8B-1"
+        new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "wrong")
         ret = self.run_update_weights(new_model_path)
         assert not ret["success"]
 

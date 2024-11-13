@@ -1,5 +1,5 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.3.4.post2 -t testImage -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.3.5 -t testImage -f Dockerfile.rocm .
 
 # default base image
 ARG BASE_IMAGE="rocm/vllm-dev:20241022"
@@ -8,7 +8,7 @@ FROM $BASE_IMAGE AS base
 USER root
 
 WORKDIR /sgl-workspace
-
+ARG BUILD_TYPE=all
 ARG SGL_REPO="https://github.com/sgl-project/sglang"
 ENV SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
@@ -41,5 +41,7 @@ ENV VLLM_FP8_PADDING=1
 ENV VLLM_FP8_ACT_PADDING=1
 ENV VLLM_FP8_WEIGHT_PADDING=1
 ENV VLLM_FP8_REDUCE_CONV=1
+ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
+ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
 
 CMD ["/bin/bash"]

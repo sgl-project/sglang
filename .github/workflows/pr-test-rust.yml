@@ -1,0 +1,48 @@
+name: PR Test (Rust)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "rust/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "rust/**"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-test-rust:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_rust.sh
+
+      - name: Run fmt
+        run: |
+          source "$HOME/.cargo/env"
+          cd rust/
+          cargo fmt -- --check
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          source "$HOME/.cargo/env"
+          cd rust/
+          cargo test
+
+  finish:
+    needs: [unit-test-rust]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Finish
+        run: echo "This is an empty step to ensure that all jobs are completed."

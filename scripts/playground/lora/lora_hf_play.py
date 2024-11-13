@@ -10,7 +10,7 @@ HF_TOKEN = "..."
 
 prompt = """
 ### Instruction:
-Write a poem about the transformers Python library. 
+Write a poem about the transformers Python library.
 Mention the word "large language models" in that poem.
 ### Response:
 The Transformers are large language models,

@@ -1,5 +1,4 @@
 import asyncio
-import json
 import unittest
 
 import openai
@@ -7,7 +6,7 @@ import requests
 
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
@@ -16,7 +15,7 @@ from sglang.test.test_utils import (
 class TestCacheReport(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.min_cached = 5
         cls.process = popen_launch_server(
