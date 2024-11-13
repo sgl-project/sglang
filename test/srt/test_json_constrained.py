@@ -100,8 +100,8 @@ class TestJSONConstrained(unittest.TestCase):
         except (TypeError, json.decoder.JSONDecodeError):
             print("JSONDecodeError", text)
             raise
-        assert isinstance(js_obj["name"], str)
-        assert isinstance(js_obj["population"], int)
+        assert isinstance(js_obj["name"], str), f"{js_obj=}"
+        assert isinstance(js_obj["population"], int), f"{js_obj=}"
 
     def test_mix_json_and_other(self):
         json_schemas = [None, None, self.json_schema, self.json_schema] * 10
