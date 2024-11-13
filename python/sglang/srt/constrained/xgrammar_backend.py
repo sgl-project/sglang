@@ -38,6 +38,8 @@ import torch
 
 try:
     from xgrammar import CachedGrammarCompiler, CompiledGrammar, GrammarMatcher
+
+    import_error = None
 except ImportError as e:
     import_error = e
 
@@ -98,6 +100,9 @@ class XGrammarGrammarBackend:
         tokenizer,
         vocab_size: int,
     ):
+        if import_error:
+            raise import_error
+
         self.executor = ThreadPoolExecutor()
         self.grammar_cache = XGrammarCache(tokenizer)
         self.vocab_size = vocab_size
