@@ -27,17 +27,17 @@ class ColwiseParallelSharded(ColwiseParallel):
     sharded.  This is used for the fused wqkv case, where during loading, we
     already sharded wq, wk, wv before fusing them.
     """
+
     # Override the _partition_linear_fn in ColwiseParallel
     def _partition_linear_fn(self, name, module, device_mesh):
         # colwise shard weight/bias to Shard(0), weight be Shard(0)
         # means Colwise as Linear is input * weight^T + bias, where
         # weight would become Shard(1)
         for name, param in module.named_parameters():
-            dtensor = DTensor.from_local(
-                param, device_mesh, [Shard(0)]
-            )
+            dtensor = DTensor.from_local(param, device_mesh, [Shard(0)])
             dist_param = torch.nn.Parameter(dtensor, requires_grad=False)
             module.register_parameter(name, dist_param)
+
 
 class RowwiseParallelMaybeWait(RowwiseParallel):
     """
@@ -46,9 +46,14 @@ class RowwiseParallelMaybeWait(RowwiseParallel):
     next op. This is needed to workaround the current interaction between
     AsyncCollectiveTensor and custom ops, such as `class RMSNorm(CustomOp)`.
     """
+
     @staticmethod
     def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
-        outputs = super(RowwiseParallelMaybeWait, RowwiseParallelMaybeWait)._prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh)
+        outputs = super(
+            RowwiseParallelMaybeWait, RowwiseParallelMaybeWait
+        )._prepare_output_fn(
+            output_layouts, use_local_output, mod, outputs, device_mesh
+        )
         # wait for the output to be ready
         if isinstance(outputs, AsyncCollectiveTensor):
             return outputs.wait()
@@ -68,6 +73,7 @@ def tensor_parallel(
         device_mesh (`torch.distributed.DeviceMesh`):
             The device mesh to use for tensor parallelism.
     """
+
     # Tensor parallelize a nn.Module based on the `_tp_plan` attribute of the module.
     # No op if `_tp_plan` attribute does not exist under the module.
     # This is a helper function to be used with `model.apply` to recursively

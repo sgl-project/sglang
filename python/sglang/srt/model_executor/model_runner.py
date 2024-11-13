@@ -569,9 +569,7 @@ class ModelRunner:
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
         from sglang.srt.model_parallel import tensor_parallel
 
-        device_mesh = torch.distributed.init_device_mesh(
-            self.device, (self.tp_size,)
-        )
+        device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
         tensor_parallel(self.model, device_mesh)
 
     def forward_decode(self, forward_batch: ForwardBatch):

@@ -129,7 +129,10 @@ def qkv_proj_weight_loader(
     qkv_offsets = {
         "q": (0, num_heads * self.head_size),
         "k": (num_heads * self.head_size, num_kv_heads * self.head_size),
-        "v": ((num_heads + num_kv_heads) * self.head_size, num_kv_heads * self.head_size),
+        "v": (
+            (num_heads + num_kv_heads) * self.head_size,
+            num_kv_heads * self.head_size,
+        ),
     }
     total_size = qkv_offsets["v"][0] + qkv_offsets["v"][1]
     # Re-size the param to the size after TP
