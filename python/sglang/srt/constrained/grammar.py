@@ -29,21 +29,25 @@ logger = logging.getLogger(__name__)
 
 class JumpHelper:
 
-    def __init__(self, suffix_id, cur_state: int = -1) -> None:
-        self.suffix_ids = suffix_id
+    def __init__(self, suffix_ids, cur_state: int = -1) -> None:
+        self.suffix_ids = suffix_ids
         self.cur_state = cur_state
 
 
-class OutlinesGrammar:
+class Grammar:
+    pass
+
+
+class OutlinesGrammar(Grammar):
     def __init__(
         self,
         guide: RegexGuide,
         state: int,
-        jump_foward_map: Union[OutlinesJumpForwardMap, None],
+        jump_forward_map: Union[OutlinesJumpForwardMap, None],
     ) -> None:
         self.guide = guide
         self.state = state
-        self.jump_foward_map = jump_foward_map
+        self.jump_forward_map = jump_forward_map
 
     def accept_token(self, token: int):
         self.state = self.guide.get_next_state(self.state, token)
@@ -70,7 +74,7 @@ class OutlinesGrammar:
         return JumpHelper(suffix_ids=suffix_ids, cur_state=cur_state)
 
     def jump_forward_str_state(self, helper: JumpHelper) -> Tuple[str, int]:
-        return self.jump_foward_map.jump_forward_symbol(helper.cur_state)
+        return self.jump_forward_map.jump_forward_symbol(helper.cur_state)
 
     def jump_and_retokenize(
         self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
@@ -103,10 +107,10 @@ class GrammarBackend:
 
     def _query(self, key: Tuple[str, str]):
         guide, regex = self.grammar_cache.query(key)
-        jump_foward_map = (
+        jump_forward_map = (
             self.jump_forward_cache.query(regex) if self.jump_forward_cache else None
         )
-        return OutlinesGrammar(guide, 0, jump_foward_map)
+        return OutlinesGrammar(guide, 0, jump_forward_map)
 
     def query(self, key: Tuple[str, str]) -> Future:
         return self.executor.submit(self._query, key)
