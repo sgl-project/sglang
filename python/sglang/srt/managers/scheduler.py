@@ -1170,9 +1170,8 @@ class Scheduler:
         ):
             self.tree_cache.reset()
             self.tree_cache_metrics = {"total": 0, "hit": 0}
-            if self.grammar_backend is not None:
+            if self.grammar_backend:
                 self.grammar_backend.reset()
-            # TODO(dark): reset the bnf cache
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()

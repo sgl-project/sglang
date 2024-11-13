@@ -15,7 +15,6 @@ limitations under the License.
 
 """The baseclass of backends for grammar-guided constrained decoding."""
 
-
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Event, Lock
@@ -42,7 +41,7 @@ class BaseGrammarBackend:
         with self.cache_lock:
             return key in self.cache and self.cache[key].event.is_set()
 
-    def init_value(self, key: Tuple[str, str]):
+    def init_value(self, key: Tuple[str, str]) -> BaseGrammarObject:
         with self.cache_lock:
             if key in self.cache:
                 cache_hit = True
@@ -57,6 +56,7 @@ class BaseGrammarBackend:
         else:
             entry.value = self.init_value_impl(key)
             entry.event.set()
+        return entry.value
 
     def init_value_impl(self, key: Tuple[str, str]) -> BaseGrammarObject:
         raise NotImplementedError()
