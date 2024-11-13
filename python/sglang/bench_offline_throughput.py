@@ -33,9 +33,16 @@ from sglang.srt.server_args import ServerArgs
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "before"
-    result_filename: str = ""
-    seed: int = 1
     backend: str = "engine"
+    result_filename: str = ""
+    dataset_name: str = "sharegpt"
+    dataset_path: str = ""
+    num_prompts: int = 1000
+    sharegpt_output_len: Union[int, None] = None
+    random_input_len: Union[int, None] = None
+    random_output_len: Union[int, None] = None
+    random_range_ratio: Union[int, None] = None
+    seed: int = 1
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -57,7 +64,7 @@ class BenchArgs:
         parser.add_argument(
             "--num-prompts",
             type=int,
-            default=1000,
+            default=BenchArgs.num_prompts,
             help="Number of prompts to process. Default is 1000.",
         )
         parser.add_argument(
@@ -96,6 +103,7 @@ class BenchArgs:
 
 def throughput_test_once(
     run_name: str,
+    backend_name: str,
     backend: Union[Engine, Runtime],
     reqs: List[Tuple[str, int, int]],
 ):
@@ -109,6 +117,9 @@ def throughput_test_once(
         prompt=[r[0] for r in reqs], sampling_params={"temperature": 0}
     )
     latency = time.perf_counter() - st
+
+    if backend_name == "runtime":
+        gen_out = json.loads(gen_out)
 
     measurement_results["total_latency"] = latency
     measurement_results["total_output_tokens"] = sum(
@@ -136,7 +147,7 @@ def throughput_test(
     else:
         raise ValueError('Please set backend to either "engine" or "runtime"')
 
-    tokenizer_id = args.model_path
+    tokenizer_id = server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
     # Set global environmnets
@@ -144,26 +155,31 @@ def throughput_test(
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)
 
-    if args.dataset_name == "sharegpt":
-        assert args.random_input_len is None and args.random_output_len is None
-        input_requests = sample_sharegpt_requests(
-            dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=args.sharegpt_output_len,
+    if bench_args.dataset_name == "sharegpt":
+        assert (
+            bench_args.random_input_len is None and bench_args.random_output_len is None
         )
-    elif args.dataset_name == "random":
-        assert args.random_input_len is not None and args.random_output_len is not None
-        input_requests = sample_random_requests(
-            input_len=args.random_input_len,
-            output_len=args.random_output_len,
-            num_prompts=args.num_prompts,
-            range_ratio=args.random_range_ratio,
+        input_requests = sample_sharegpt_requests(
+            dataset_path=bench_args.dataset_path,
+            num_requests=bench_args.num_prompts,
             tokenizer=tokenizer,
-            dataset_path=args.dataset_path,
+            fixed_output_len=bench_args.sharegpt_output_len,
+        )
+    elif bench_args.dataset_name == "random":
+        assert (
+            bench_args.random_input_len is not None
+            and bench_args.random_output_len is not None
+        )
+        input_requests = sample_random_requests(
+            input_len=bench_args.random_input_len,
+            output_len=bench_args.random_output_len,
+            num_prompts=bench_args.num_prompts,
+            range_ratio=bench_args.random_range_ratio,
+            tokenizer=tokenizer,
+            dataset_path=bench_args.dataset_path,
         )
     else:
-        raise ValueError(f"Unknown dataset: {args.dataset_name}")
+        raise ValueError(f"Unknown dataset: {bench_args.dataset_name}")
 
     warmup_requests = sample_random_requests(
         input_len=20,
@@ -171,18 +187,20 @@ def throughput_test(
         num_prompts=2,
         range_ratio=0.8,
         tokenizer=tokenizer,
-        dataset_path=args.dataset_path,
+        dataset_path=bench_args.dataset_path,
     )
 
     # Warm up
     throughput_test_once(
         run_name="warmup",
+        backend_name=bench_args.backend,
         backend=backend,
         reqs=warmup_requests,
     )
 
     result = throughput_test_once(
         run_name=bench_args.run_name,
+        backend_name=bench_args.backend,
         backend=backend,
         reqs=input_requests,
     )
@@ -191,7 +209,7 @@ def throughput_test(
         with open(bench_args.result_filename, "a") as fout:
             fout.write(json.dumps(result) + "\n")
     else:
-        print(result)
+        return result
 
 
 if __name__ == "__main__":
@@ -208,6 +226,6 @@ if __name__ == "__main__":
     )
 
     try:
-        throughput_test(server_args, bench_args)
+        print(throughput_test(server_args, bench_args))
     except Exception as e:
         raise e
