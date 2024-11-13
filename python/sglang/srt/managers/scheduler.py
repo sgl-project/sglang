@@ -21,6 +21,7 @@ import threading
 import time
 import warnings
 from collections import deque
+from concurrent import futures
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -633,14 +634,14 @@ class Scheduler:
         return self.running_batch
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        # Check if the grammar queue is ready
+        # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             new_grammar_queue = []
             for req in self.grammar_queue:
-                if req.grammar.done():
-                    req.grammar = req.grammar.result()
+                try:
+                    req.grammar = req.grammar.result(timeout=0.05)
                     self.waiting_queue.append(req)
-                else:
+                except futures._base.TimeoutError:
                     new_grammar_queue.append(req)
             self.grammar_queue = new_grammar_queue
 
