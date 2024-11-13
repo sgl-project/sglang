@@ -662,8 +662,8 @@ class Scheduler:
                     break
 
             if self.tp_size > 1:
-                # Sync between TP ranks to make sure they have the same number of ready requests
-                tensor = torch.tensor(num_ready_reqs, dtype=torch.int16)
+                # Sync across TP ranks to make sure they have the same number of ready requests
+                tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
                 torch.distributed.all_reduce(
                     tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
                 )
