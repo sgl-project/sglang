@@ -40,7 +40,7 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.65
+        self.assertGreaterEqual(metrics["score"], 0.65)
 
     def test_greedy(self):
 
@@ -62,7 +62,7 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
             if first_text is None:
                 first_text = text
 
-            assert text == first_text, f'"{text}" is not identical to "{first_text}"'
+            self.assertEqual(text, first_text)
 
         first_text = None
 
@@ -82,7 +82,7 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
             text = response_batch[i]["text"]
             if first_text is None:
                 first_text = text
-            assert text == first_text, f'"{text}" is not identical to "{first_text}"'
+            self.assertEqual(text, first_text)
 
 
 if __name__ == "__main__":
