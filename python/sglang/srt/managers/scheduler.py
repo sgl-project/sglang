@@ -100,7 +100,7 @@ class Scheduler:
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
-        self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
+        self.disable_jump_forward = server_args.disable_jump_forward
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = server_args.enable_overlap_schedule
@@ -243,7 +243,7 @@ class Scheduler:
                 self.tokenizer,
                 self.model_config.vocab_size,
                 whitespace_patterns=server_args.constrained_json_whitespace_pattern,
-                allow_jump=not server_args.disable_regex_jump_forward,
+                allow_jump_forward=not server_args.disable_jump_forward,
                 backend=server_args.grammar_backend,
             )
 
@@ -461,11 +461,10 @@ class Scheduler:
             if req.sampling_params.json_schema is not None:
                 req.grammar = self.grammar_cache.query(
                     ("json", req.sampling_params.json_schema),
-                    self.model_config.vocab_size,
                 )
             elif req.sampling_params.regex is not None:
                 req.grammar = self.grammar_cache.query(
-                    ("regex", req.sampling_params.regex), self.model_config.vocab_size
+                    ("regex", req.sampling_params.regex)
                 )
 
         # Truncate prompts that are too long
@@ -779,7 +778,7 @@ class Scheduler:
             )
 
         # Check for jump-forward
-        if not self.disable_regex_jump_forward:
+        if not self.disable_jump_forward:
             jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
             self.waiting_queue.extend(jump_forward_reqs)
             if batch.is_empty():
