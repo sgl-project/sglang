@@ -808,7 +808,8 @@ class ScheduleBatch:
             if req.grammar is not None:
                 jump_helper = req.grammar.try_jump_forward(req.tokenizer)
                 if jump_helper:
-                    suffix_ids = jump_helper.suffix_ids
+                    suffix_ids, _ = jump_helper
+
                     # Current ids, for cache and revert
                     cur_all_ids = tuple(req.origin_input_ids + req.output_ids)[:-1]
                     cur_output_ids = req.output_ids

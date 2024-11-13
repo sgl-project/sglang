@@ -92,8 +92,9 @@ class OutlinesGrammar:
         suffix_ids = tokenizer.convert_tokens_to_ids(suffix_tokens)
         return suffix_ids, cur_state
 
-    def jump_forward_str_state(self, helper: Tuple) -> Tuple[str, int]:
-        return self.jump_forward_map.jump_forward_symbol(helper.cur_state)
+    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
+        _, cur_state = helper
+        return self.jump_forward_map.jump_forward_symbol(cur_state)
 
     def jump_and_retokenize(
         self, old_output_ids: List[int], new_output_ids: List[int], next_state: int

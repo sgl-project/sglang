@@ -59,11 +59,12 @@ class XGrammarGrammar:
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
 
-    def try_jump_forward(self, tokenizer) -> str:
-        return self.matcher.find_jump_forward_string()
+    def try_jump_forward(self, tokenizer) -> Tuple[List[int], str]:
+        return [], self.matcher.find_jump_forward_string()
 
-    def jump_forward_str_state(self, helper: str) -> Tuple[str, int]:
-        return helper.data, -1
+    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
+        _, data = helper
+        return data, -1
 
     def jump_and_retokenize(
         self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
