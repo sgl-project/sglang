@@ -15,6 +15,7 @@ limitations under the License.
 
 """Constrained decoding with xgrammar backend."""
 
+import logging
 from typing import List, Tuple
 
 import torch
@@ -24,6 +25,9 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+
+logger = logging.getLogger(__name__)
+
 
 MAX_ROLLBACK_TOKENS = 10
 
@@ -97,9 +101,20 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def init_value_impl(self, key: Tuple[str, str]) -> XGrammarGrammar:
         key_type, key_string = key
         if key_type == "json":
-            ctx = self.grammar_cache.get_compiled_grammar_for_json_schema(key_string)
+            try:
+                ctx = self.grammar_cache.get_compiled_grammar_for_json_schema(
+                    key_string
+                )
+            except RuntimeError as e:
+                logging.warning(
+                    f"Skip invalid json_schema: json_schema={key_string}, {e=}"
+                )
+                return None
         elif key_type == "regex":
-            raise ValueError("regex hasn't been supported by xgrammar yet")
+            logger.warning(
+                "regex hasn't been supported by xgrammar yet. This is skipped."
+            )
+            return None
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 

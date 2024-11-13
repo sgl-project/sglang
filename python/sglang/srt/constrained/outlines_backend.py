@@ -150,7 +150,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 )
             except NotImplementedError as e:
                 logger.warning(
-                    f"skip invalid json schema: json_schema={key_string}, {e=}"
+                    f"Skip invalid json_schema: json_schema={key_string}, {e=}"
                 )
                 return None
         elif key_type == "regex":
