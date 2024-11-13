@@ -653,29 +653,7 @@ class Scheduler:
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
-            num_ready_reqs = 0
-            for req in self.grammar_queue:
-                try:
-                    req.grammar = req.grammar.result(timeout=0.05)
-                    num_ready_reqs += 1
-                except futures._base.TimeoutError:
-                    break
-
-            if self.tp_size > 1:
-                # Sync across TP ranks to make sure they have the same number of ready requests
-                tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
-                torch.distributed.all_reduce(
-                    tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
-                )
-                num_ready_reqs_max = tensor.item()
-                for i in range(num_ready_reqs, num_ready_reqs_max):
-                    self.grammar_queue[i].grammar = self.grammar_queue[
-                        i
-                    ].grammar.result()
-                num_ready_reqs = num_ready_reqs_max
-
-            self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
-            self.grammar_queue = self.grammar_queue[num_ready_reqs:]
+            self.move_ready_grammar_requests()
 
         # Handle the cases where prefill is not allowed
         if (
@@ -1162,6 +1140,30 @@ class Scheduler:
                         output_finished_reason,
                     )
                 )
+
+    def move_ready_grammar_requests(self):
+        """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
+        num_ready_reqs = 0
+        for req in self.grammar_queue:
+            try:
+                req.grammar = req.grammar.result(timeout=0.05)
+                num_ready_reqs += 1
+            except futures._base.TimeoutError:
+                break
+
+        if self.tp_size > 1:
+            # Sync across TP ranks to make sure they have the same number of ready requests
+            tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+            )
+            num_ready_reqs_max = tensor.item()
+            for i in range(num_ready_reqs, num_ready_reqs_max):
+                self.grammar_queue[i].grammar = self.grammar_queue[i].grammar.result()
+            num_ready_reqs = num_ready_reqs_max
+
+        self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
+        self.grammar_queue = self.grammar_queue[num_ready_reqs:]
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
