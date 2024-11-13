@@ -421,6 +421,40 @@ def get_tokenizer(
     )
 
 
+def get_dataset(args, tokenizer):
+    if args.dataset_name == "sharegpt":
+        input_requests = sample_sharegpt_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.sharegpt_output_len,
+        )
+        output_len = args.sharegpt_output_len
+    elif args.dataset_name == "random":
+        input_requests = sample_random_requests(
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            num_prompts=args.num_prompts,
+            range_ratio=args.random_range_ratio,
+            tokenizer=tokenizer,
+            dataset_path=args.dataset_path,
+        )
+        output_len = args.random_output_len
+    elif args.dataset_name == "generated-shared-prefix":
+        input_requests = sample_generated_shared_prefix_requests(
+            num_groups=args.gen_num_groups,
+            prompts_per_group=args.gen_prompts_per_group,
+            system_prompt_len=args.gen_system_prompt_len,
+            question_len=args.gen_question_len,
+            output_len=args.gen_output_len,
+            tokenizer=tokenizer,
+        )
+        output_len = args.gen_output_len
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset_name}")
+    return output_len
+
+
 ASYNC_REQUEST_FUNCS = {
     "sglang": async_request_sglang_generate,
     "sglang-native": async_request_sglang_generate,
@@ -1097,35 +1131,7 @@ def run_benchmark(args_: argparse.Namespace):
 
     tokenizer = get_tokenizer(tokenizer_id)
 
-    if args.dataset_name == "sharegpt":
-        assert args.random_input_len is None and args.random_output_len is None
-        input_requests = sample_sharegpt_requests(
-            dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=args.sharegpt_output_len,
-        )
-    elif args.dataset_name == "random":
-        assert args.random_input_len is not None and args.random_output_len is not None
-        input_requests = sample_random_requests(
-            input_len=args.random_input_len,
-            output_len=args.random_output_len,
-            num_prompts=args.num_prompts,
-            range_ratio=args.random_range_ratio,
-            tokenizer=tokenizer,
-            dataset_path=args.dataset_path,
-        )
-    elif args.dataset_name == "generated-shared-prefix":
-        input_requests = sample_generated_shared_prefix_requests(
-            num_groups=args.gen_num_groups,
-            prompts_per_group=args.gen_prompts_per_group,
-            system_prompt_len=args.gen_system_prompt_len,
-            question_len=args.gen_question_len,
-            output_len=args.gen_output_len,
-            tokenizer=tokenizer,
-        )
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset_name}")
+    input_requests = get_dataset(args, tokenizer)
 
     if not args.multi:
         return asyncio.run(

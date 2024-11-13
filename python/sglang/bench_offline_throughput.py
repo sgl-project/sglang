@@ -8,12 +8,13 @@ It accepts the same arguments as bench_latency.py
 python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct
 
 ## Random dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --backend random
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --dataset-name random
 
 ## Shared prefix dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --backend generated-shared-prefix
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --dataset-name generated-shared-prefix
 
-# TODO: add running command for shared gpt, random, and gen-shared-prefix dataset
+## Sharegpt dataset on runtime backend
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --backend runtime
 """
 
 import argparse
@@ -25,9 +26,12 @@ import random
 import time
 from typing import Dict, List, Tuple, Union
 
+import numpy as np
+
 from sglang.api import Engine as getEngine
 from sglang.bench_serving import (
     get_tokenizer,
+    get_dataset,
     sample_generated_shared_prefix_requests,
     sample_random_requests,
     sample_sharegpt_requests,
@@ -205,36 +209,7 @@ def throughput_test(
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)
 
-    if bench_args.dataset_name == "sharegpt":
-        input_requests = sample_sharegpt_requests(
-            dataset_path=bench_args.dataset_path,
-            num_requests=bench_args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=bench_args.sharegpt_output_len,
-        )
-        output_len = bench_args.sharegpt_output_len
-    elif bench_args.dataset_name == "random":
-        input_requests = sample_random_requests(
-            input_len=bench_args.random_input_len,
-            output_len=bench_args.random_output_len,
-            num_prompts=bench_args.num_prompts,
-            range_ratio=bench_args.random_range_ratio,
-            tokenizer=tokenizer,
-            dataset_path=bench_args.dataset_path,
-        )
-        output_len = bench_args.random_output_len
-    elif bench_args.dataset_name == "generated-shared-prefix":
-        input_requests = sample_generated_shared_prefix_requests(
-            num_groups=bench_args.gen_num_groups,
-            prompts_per_group=bench_args.gen_prompts_per_group,
-            system_prompt_len=bench_args.gen_system_prompt_len,
-            question_len=bench_args.gen_question_len,
-            output_len=bench_args.gen_output_len,
-            tokenizer=tokenizer,
-        )
-        output_len = bench_args.gen_output_len
-    else:
-        raise ValueError(f"Unknown dataset: {bench_args.dataset_name}")
+    input_requests = get_dataset(bench_args, tokenizer)
 
     warmup_requests = sample_random_requests(
         input_len=20,
