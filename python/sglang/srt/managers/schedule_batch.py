@@ -37,7 +37,7 @@ import torch
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.grammar import Grammar
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -107,12 +107,14 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self):
+    def __init__(self, message="Unknown error"):
         super().__init__(is_error=True)
+        self.message = message
 
     def to_json(self):
         return {
             "type": "abort",
+            "message": self.message,
         }
 
 
@@ -133,6 +135,7 @@ class ImageInputs:
     aspect_ratio_mask: Optional[List[torch.Tensor]] = None
     # QWen2-VL related
     image_grid_thws: List[Tuple[int, int, int]] = None
+    mrope_position_delta: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_dict(obj, vocab_size):
@@ -211,17 +214,17 @@ class Req:
         # this does not include the jump forward tokens.
         self.completion_tokens_wo_jump_forward = 0
 
-        # The number of cached tokens, that were already cached in the KV store
-        self.cached_tokens = 0
-
-        # For vision inputs
+        # For multimodal inputs
         self.image_inputs: Optional[ImageInputs] = None
 
         # Prefix info
         self.prefix_indices = []
         self.extend_input_len = 0
         self.last_node = None
-        self.is_inflight_req = 0
+        self.is_being_chunked = 0
+
+        # For retraction
+        self.is_retracted = False
 
         # Logprobs (arguments)
         self.return_logprob = False
@@ -242,14 +245,14 @@ class Req:
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
 
-        # Embedding
+        # Embedding (return values)
         self.embedding = None
 
         # Constrained decoding
-        self.grammar: Optional[Grammar] = None
+        self.grammar: Optional[BaseGrammarObject] = None
 
-        # For Qwen2-VL
-        self.mrope_position_delta = []  # use mutable object
+        # The number of cached tokens, that were already cached in the KV cache
+        self.cached_tokens = 0
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -356,8 +359,6 @@ class Req:
                     return
 
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
-        assert self.grammar is not None and self.tokenizer is not None
-
         if self.origin_input_text is None:
             # Recovering text can only use unpadded ids
             self.origin_input_text = self.tokenizer.decode(
@@ -561,7 +562,7 @@ class ScheduleBatch:
             seq_lens[i] -= encoder_len
 
             if len(req.prefix_indices) < encoder_len:
-                # NOTE: the encoder part should considered as a whole
+                # NOTE: the encoder part should be considered as a whole
                 assert len(req.prefix_indices) == 0
                 input_ids[i] = input_ids[i][encoder_len:]
                 encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
@@ -648,6 +649,7 @@ class ScheduleBatch:
 
             req.extend_logprob_start_len = extend_logprob_start_len
             pt += req.extend_input_len
+            req.is_retracted = False
 
         # Set fields
         self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
@@ -780,6 +782,7 @@ class ScheduleBatch:
             req.prefix_indices = []
             req.last_node = None
             req.extend_input_len = 0
+            req.is_retracted = True
 
             # For incremental logprobs
             req.last_update_decode_tokens = 0
@@ -804,9 +807,10 @@ class ScheduleBatch:
 
         for i, req in enumerate(self.reqs):
             if req.grammar is not None:
-                jump_helper = req.grammar.try_jump(req.tokenizer)
-                if jump_helper.can_jump():
-                    suffix_ids = jump_helper.suffix_ids
+                jump_helper = req.grammar.try_jump_forward(req.tokenizer)
+                if jump_helper:
+                    suffix_ids, _ = jump_helper
+
                     # Current ids, for cache and revert
                     cur_all_ids = tuple(req.origin_input_ids + req.output_ids)[:-1]
                     cur_output_ids = req.output_ids
@@ -822,6 +826,8 @@ class ScheduleBatch:
                         next_state,
                     ) = req.grammar.jump_forward_str_state(jump_helper)
 
+                    # Make the incrementally decoded text part of jump_forward_str
+                    # so that the UTF-8 will not corrupt
                     jump_forward_str = new_text + jump_forward_str
                     if not req.jump_forward_and_retokenize(
                         jump_forward_str, next_state
@@ -888,15 +894,14 @@ class ScheduleBatch:
 
     def filter_batch(
         self,
-        current_inflight_req: Optional[Req] = None,
+        being_chunked_req: Optional[Req] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
-                and self.reqs[i] is not current_inflight_req
+                if not self.reqs[i].finished() and self.reqs[i] is not being_chunked_req
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -979,8 +984,6 @@ class ScheduleBatch:
         global bid
         bid += 1
 
-        mrope_positions_delta = [req.mrope_position_delta for req in self.reqs]
-
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1003,7 +1006,6 @@ class ScheduleBatch:
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
-            mrope_positions_delta=mrope_positions_delta,
         )
 
     def copy(self):
@@ -1069,9 +1071,6 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
-
-    # For Qwen2-VL
-    mrope_positions_delta: List[List[int]]
 
     def copy(self):
         return dataclasses.replace(self, sampling_info=self.sampling_info.copy())

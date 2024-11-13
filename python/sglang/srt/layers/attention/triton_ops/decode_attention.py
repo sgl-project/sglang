@@ -24,6 +24,8 @@ It supports page size = 1.
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hip
+
 
 @triton.jit
 def tanh(x):
@@ -505,6 +507,12 @@ def _decode_grouped_att_m_fwd(
 
     num_warps = 4
 
+    extra_kargs = {}
+    if is_hip():
+        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
+        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
+        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+
     _fwd_grouped_kernel_stage1[grid](
         q,
         k_buffer,
@@ -530,6 +538,7 @@ def _decode_grouped_att_m_fwd(
         num_warps=num_warps,
         num_stages=1,
         Lk=Lk,
+        **extra_kargs,
     )
 
 
@@ -553,6 +562,12 @@ def _decode_grouped_softmax_reducev_fwd(
     Lv = v_buffer.shape[-1]
     BLOCK_DMODEL = triton.next_power_of_2(Lv)
 
+    extra_kargs = {}
+    if is_hip():
+        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
+        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
+        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+
     _fwd_grouped_kernel_stage2[grid](
         logits,
         v_buffer,
@@ -575,6 +590,7 @@ def _decode_grouped_softmax_reducev_fwd(
         Lv=Lv,
         num_warps=num_warps,
         num_stages=1,
+        **extra_kargs,
     )
 
 

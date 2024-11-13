@@ -30,12 +30,11 @@ import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, List, Optional, Union
 
-import orjson
-
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
+import orjson
 import requests
 import uvicorn
 import uvloop
@@ -53,11 +52,11 @@ from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
-    RewardReqInput,
     UpdateWeightReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.metrics.func_timer import enable_func_timer, time_func_latency
 from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
     v1_batches,
@@ -75,12 +74,15 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
+    add_prometheus_middleware,
     assert_pkg_version,
     configure_logger,
+    delete_directory,
     is_port_available,
     kill_child_process,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
+    set_prometheus_multiproc_dir,
     set_ulimit,
 )
 from sglang.utils import get_exception_traceback
@@ -91,8 +93,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 app = FastAPI()
-tokenizer_manager = None
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -100,6 +100,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+tokenizer_manager: TokenizerManager = None
+
+##### Native API endpoints #####
 
 
 @app.get("/health")
@@ -111,9 +115,16 @@ async def health() -> Response:
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
-    gri = GenerateReqInput(
-        text="s", sampling_params={"max_new_tokens": 1, "temperature": 0.7}
-    )
+
+    if tokenizer_manager.is_generation:
+        gri = GenerateReqInput(
+            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+        )
+    else:
+        gri = EmbeddingReqInput(
+            input_ids=[0], sampling_params={"max_new_tokens": 1, "temperature": 0.7}
+        )
+
     try:
         async for _ in tokenizer_manager.generate_request(gri, request):
             break
@@ -139,7 +150,7 @@ async def get_server_args():
     return dataclasses.asdict(tokenizer_manager.server_args)
 
 
-@app.get("/flush_cache")
+@app.post("/flush_cache")
 async def flush_cache():
     """Flush the radix cache."""
     tokenizer_manager.flush_cache()
@@ -177,14 +188,16 @@ async def get_memory_pool_size():
     """Get the memory pool size in number of tokens"""
     try:
         ret = await tokenizer_manager.get_memory_pool_size()
-        return ret.size
+
+        return ret
     except Exception as e:
-        return JSONResponse(
+        return ORJSONResponse(
             {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
         )
 
 
 @app.post("/update_weights")
+@time_func_latency
 async def update_weights(obj: UpdateWeightReqInput, request: Request):
     """Update the weights inplace without re-launching the server."""
     success, message = await tokenizer_manager.update_weights(obj, request)
@@ -201,7 +214,7 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
         )
 
 
-# fastapi implicitly converts json in the request to obj (dataclass)
+@time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if obj.stream:
@@ -234,10 +247,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             )
 
 
+# fastapi implicitly converts json in the request to obj (dataclass)
 app.post("/generate")(generate_request)
 app.put("/generate")(generate_request)
 
 
+@time_func_latency
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
@@ -253,8 +268,9 @@ app.post("/encode")(encode_request)
 app.put("/encode")(encode_request)
 
 
-async def judge_request(obj: RewardReqInput, request: Request):
-    """Handle a reward model request."""
+@time_func_latency
+async def classify_request(obj: EmbeddingReqInput, request: Request):
+    """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
         ret = await tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
@@ -264,21 +280,27 @@ async def judge_request(obj: RewardReqInput, request: Request):
         )
 
 
-app.post("/judge")(judge_request)
-app.put("/judge")(judge_request)
+app.post("/classify")(classify_request)
+app.put("/classify")(classify_request)
+
+
+##### OpenAI-compatible API endpoints #####
 
 
 @app.post("/v1/completions")
+@time_func_latency
 async def openai_v1_completions(raw_request: Request):
     return await v1_completions(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/chat/completions")
+@time_func_latency
 async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/embeddings", response_class=ORJSONResponse)
+@time_func_latency
 async def openai_v1_embeddings(raw_request: Request):
     response = await v1_embeddings(tokenizer_manager, raw_request)
     return response
@@ -432,12 +454,16 @@ def launch_server(
     1. The HTTP server and Tokenizer Manager both run in the main process.
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
-
     launch_engine(server_args=server_args)
 
     # Add api key authorization
     if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)
+
+    # add prometheus middleware
+    if server_args.enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
 
     # Send a warmup request
     t = threading.Thread(
@@ -474,6 +500,10 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+
+    # Set prometheus env vars
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
 
     # Set ulimit
     set_ulimit()
@@ -523,6 +553,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         return
 
     model_info = res.json()
+
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
@@ -559,6 +590,9 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
         pipe_finish_writer.send("ready")
+
+    if server_args.delete_ckpt_after_loading:
+        delete_directory(server_args.model_path)
 
 
 class Runtime:
@@ -696,24 +730,8 @@ class Runtime:
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
     ):
-        if isinstance(prompt, str) or isinstance(prompt[0], str):
-            # embedding
-            json_data = {
-                "text": prompt,
-            }
-            response = requests.post(
-                self.url + "/encode",
-                json=json_data,
-            )
-        else:
-            # reward
-            json_data = {
-                "conv": prompt,
-            }
-            response = requests.post(
-                self.url + "/judge",
-                json=json_data,
-            )
+        json_data = {"text": prompt}
+        response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
 
     def __del__(self):
@@ -736,6 +754,12 @@ class Engine:
 
         # before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
+
+        # runtime server default log level is log
+        # offline engine works in scripts, so we set it to error
+
+        if "log_level" not in kwargs:
+            kwargs["log_level"] = "error"
 
         server_args = ServerArgs(*args, **kwargs)
         launch_engine(server_args=server_args)
@@ -850,4 +874,12 @@ class Engine:
         else:
             return tokenizer_manager.tokenizer
 
-    # TODO (ByronHsu): encode
+    def encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+    ):
+        obj = EmbeddingReqInput(text=prompt)
+
+        # get the current event loop
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(encode_request(obj, None))

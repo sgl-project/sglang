@@ -7,6 +7,7 @@ import random
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
 from typing import Callable, List, Optional
@@ -26,6 +27,8 @@ from sglang.utils import get_exception_traceback
 
 DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
@@ -440,7 +443,7 @@ def popen_launch_server(
                 "Content-Type": "application/json; charset=utf-8",
                 "Authorization": f"Bearer {api_key}",
             }
-            response = requests.get(f"{base_url}/v1/models", headers=headers)
+            response = requests.get(f"{base_url}/health_generate", headers=headers)
             if response.status_code == 200:
                 return process
         except requests.RequestException:
@@ -635,8 +638,8 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
     return rouge_l_scores
 
 
-STDOUT_FILENAME = "stdout.txt"
 STDERR_FILENAME = "stderr.txt"
+STDOUT_FILENAME = "stdout.txt"
 
 
 def read_output(output_lines):
@@ -656,11 +659,12 @@ def read_output(output_lines):
         time.sleep(0.1)
 
 
-def run_mmlu_test(
+def run_and_check_memory_leak(
+    workload_func,
     disable_radix_cache,
-    enable_mixed_chunk=False,
-    enable_overlap=False,
-    chunked_prefill_size=32,
+    enable_mixed_chunk,
+    enable_overlap,
+    chunked_prefill_size,
 ):
     other_args = ["--chunked-prefill-size", str(chunked_prefill_size)]
     if disable_radix_cache:
@@ -690,21 +694,8 @@ def run_mmlu_test(
     t = threading.Thread(target=read_output, args=(output_lines,))
     t.start()
 
-    # Run the eval
-    args = SimpleNamespace(
-        base_url=base_url,
-        model=model,
-        eval_name="mmlu",
-        num_examples=128,
-        num_threads=128,
-    )
-
-    try:
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        assert metrics["score"] >= 0.65
-    finally:
-        pass
+    # Run the workload
+    workload_func(base_url, model)
 
     # Clean up everything
     kill_child_process(process.pid, include_self=True)
@@ -727,4 +718,75 @@ def run_mmlu_test(
             has_leak = True
 
     assert has_new_server
-    # assert not has_leak
+    assert not has_leak
+
+
+def run_mmlu_test(
+    disable_radix_cache=False,
+    enable_mixed_chunk=False,
+    enable_overlap=False,
+    chunked_prefill_size=32,
+):
+    def workload_func(base_url, model):
+        # Run the eval
+        args = SimpleNamespace(
+            base_url=base_url,
+            model=model,
+            eval_name="mmlu",
+            num_examples=128,
+            num_threads=128,
+        )
+
+        try:
+            metrics = run_eval(args)
+            print(f"{metrics=}")
+            assert metrics["score"] >= 0.65
+        finally:
+            pass
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        enable_overlap,
+        chunked_prefill_size,
+    )
+
+
+def run_mulit_request_test(
+    disable_radix_cache=False,
+    enable_mixed_chunk=False,
+    enable_overlap=False,
+    chunked_prefill_size=32,
+):
+
+    def workload_func(base_url, model):
+        def run_one(_):
+            prompt = """
+            System: You are a helpful assistant.
+            User: What is the capital of France?
+            Assistant: The capital of France is
+            """
+
+            response = requests.post(
+                f"{base_url}/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 8,
+                    },
+                },
+            )
+            ret = response.json()
+
+        with ThreadPoolExecutor(2) as executor:
+            list(executor.map(run_one, list(range(4))))
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        enable_overlap,
+        chunked_prefill_size,
+    )

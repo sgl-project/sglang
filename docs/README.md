@@ -20,6 +20,7 @@ make clean
 
 ### Serve (preview)
 Run an HTTP server and visit http://localhost:8000 in your browser.
+
 ```
 python3 -m http.server --d _build/html
 ```

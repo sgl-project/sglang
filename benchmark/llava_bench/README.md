@@ -4,7 +4,7 @@
 python3 download_images.py
 ```
 
-image benchmark source: https://huggingface.co/datasets/liuhaotian/llava-bench-in-the-wild 
+image benchmark source: https://huggingface.co/datasets/liuhaotian/llava-bench-in-the-wild
 
 ### Other Dependency
 ```

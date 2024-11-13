@@ -61,18 +61,27 @@ class TestJSONConstrained(unittest.TestCase):
                 "logprob_start_len": 0,
             },
         )
-        print(json.dumps(response.json()))
+        ret = response.json()
+        print(json.dumps(ret))
         print("=" * 100)
 
         if not json_schema:
             return
 
+        # Make sure the json output is valid
         try:
-            js_obj = json.loads(response.json()["text"])
+            js_obj = json.loads(ret["text"])
         except (TypeError, json.decoder.JSONDecodeError):
             raise
-        assert isinstance(js_obj["name"], str)
-        assert isinstance(js_obj["population"], int)
+
+        self.assertIsInstance(js_obj["name"], str)
+        self.assertIsInstance(js_obj["population"], int)
+
+        # Make sure jump forward is triggered
+        self.assertGreater(
+            ret["meta_info"]["completion_tokens"],
+            ret["meta_info"]["completion_tokens_wo_jump_forward"],
+        )
 
     def test_json_generate(self):
         self.run_decode(json_schema=self.json_schema)
@@ -100,8 +109,9 @@ class TestJSONConstrained(unittest.TestCase):
         except (TypeError, json.decoder.JSONDecodeError):
             print("JSONDecodeError", text)
             raise
-        assert isinstance(js_obj["name"], str)
-        assert isinstance(js_obj["population"], int)
+
+        self.assertIsInstance(js_obj["name"], str)
+        self.assertIsInstance(js_obj["population"], int)
 
     def test_mix_json_and_other(self):
         json_schemas = [None, None, self.json_schema, self.json_schema] * 10

@@ -1,9 +1,11 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/tree/v0.5.4/vllm/model_executor/layers/fused_moe
+import os
 from abc import abstractmethod
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -18,6 +20,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.utils import set_weight_attrs
 
+from sglang.srt.layers.fused_moe.fused_moe import padding_size
 from sglang.srt.utils import is_hip
 
 logger = init_logger(__name__)
@@ -506,6 +509,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+
+            # If ROCm, apply weight padding (min. Mem channel contention) only if set
+            if is_hip() and bool(int(os.getenv("MOE_PADDING", "0"))):
+                layer.w13_weight = torch.nn.Parameter(
+                    F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
+                    requires_grad=False,
+                )
+                torch.cuda.empty_cache()
+                layer.w2_weight = torch.nn.Parameter(
+                    F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
+                    requires_grad=False,
+                )
+                torch.cuda.empty_cache()
             return
 
         # If checkpoint is fp8, we need to handle that the
@@ -572,6 +588,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     start += shard_size
 
             layer.w13_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
+            # If ROCm, apply weight padding (min. Mem channel contention) only if set
+            if is_hip() and bool(int(os.getenv("MOE_PADDING", "0"))):
+                layer.w13_weight = torch.nn.Parameter(
+                    F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
+                    requires_grad=False,
+                )
+                torch.cuda.empty_cache()
+                layer.w2_weight = torch.nn.Parameter(
+                    F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
+                    requires_grad=False,
+                )
+                torch.cuda.empty_cache()
             return
 
     def apply(

@@ -28,10 +28,60 @@ extensions = [
     "sphinxcontrib.mermaid",
     "nbsphinx",
     "sphinx.ext.mathjax",
-    "sphinx.ext.autodoc",
 ]
 
+nbsphinx_allow_errors = True
+nbsphinx_execute = "never"
+
 autosectionlabel_prefix_document = True
+nbsphinx_allow_directives = True
+
+
+myst_enable_extensions = [
+    "dollarmath",
+    "amsmath",
+    "deflist",
+    "colon_fence",
+    "html_image",
+    "linkify",
+    "substitution",
+]
+
+myst_heading_anchors = 3
+
+nbsphinx_kernel_name = "python3"
+nbsphinx_execute_arguments = [
+    "--InlineBackend.figure_formats={'svg', 'pdf'}",
+    "--InlineBackend.rc={'figure.dpi': 96}",
+]
+
+
+nb_render_priority = {
+    "html": (
+        "application/vnd.jupyter.widget-view+json",
+        "application/javascript",
+        "text/html",
+        "image/svg+xml",
+        "image/png",
+        "image/jpeg",
+        "text/markdown",
+        "text/latex",
+        "text/plain",
+    )
+}
+
+myst_enable_extensions = [
+    "dollarmath",
+    "amsmath",
+    "deflist",
+    "colon_fence",
+    "html_image",
+    "linkify",
+    "substitution",
+]
+
+myst_heading_anchors = 3
+myst_ref_domains = ["std", "py"]
 
 templates_path = ["_templates"]
 
@@ -55,7 +105,7 @@ html_copy_source = True
 html_last_updated_fmt = ""
 
 html_theme_options = {
-    "repository_url": "https://github.com/sgl-project/sglang",
+    "repository_url": "https://github.com/sgl-project/sgl-project.github.io",
     "repository_branch": "main",
     "show_navbar_depth": 3,
     "max_navbar_depth": 4,
@@ -69,8 +119,21 @@ html_theme_options = {
     "show_toc_level": 2,
 }
 
+html_context = {
+    "display_github": True,
+    "github_user": "sgl-project",
+    "github_repo": "sgl-project.github.io",
+    "github_version": "main",
+    "conf_py_path": "/docs/",
+}
+
 html_static_path = ["_static"]
-html_css_files = ["css/readthedocs.css"]
+html_css_files = ["css/custom_log.css"]
+
+
+def setup(app):
+    app.add_css_file("css/custom_log.css")
+
 
 myst_enable_extensions = [
     "dollarmath",
@@ -127,3 +190,14 @@ intersphinx_mapping = {
 }
 
 html_theme = "sphinx_book_theme"
+
+
+nbsphinx_prolog = """
+.. raw:: html
+
+    <style>
+        .output_area.stderr, .output_area.stdout {
+            color: #d3d3d3 !important; /* light gray */
+        }
+    </style>
+"""

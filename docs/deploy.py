@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+# Deploy the documents
 
 import os
 from datetime import datetime

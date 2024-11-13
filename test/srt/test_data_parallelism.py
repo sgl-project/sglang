@@ -53,13 +53,22 @@ class TestDataParallelism(unittest.TestCase):
 
         # pause a few seconds then send again
         time.sleep(5)
-        
+
         response = requests.post(
             self.base_url + "/update_weights",
             json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
         )
 
         # check if the response is 200
+        assert response.status_code == 200
+
+    def test_get_memory_pool_size(self):
+        response = requests.get(self.base_url + "/get_memory_pool_size")
+        assert response.status_code == 200
+
+        time.sleep(5)
+
+        response = requests.get(self.base_url + "/get_memory_pool_size")
         assert response.status_code == 200
 
 
