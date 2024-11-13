@@ -23,11 +23,7 @@ from sglang.srt.constrained.outlines_jump_forward import (
     OutlinesJumpCache,
     OutlinesJumpForwardMap,
 )
-from sglang.srt.constrained.xgrammar_cache import (
-    GrammarMatcher,
-    XGrammarCache,
-    XGrammarJumpCache,
-)
+from sglang.srt.constrained.xgrammar_cache import XGrammarCache, XGrammarJumpCache
 
 logger = logging.getLogger(__name__)
 

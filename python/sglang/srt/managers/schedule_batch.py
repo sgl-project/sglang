@@ -816,6 +816,8 @@ class ScheduleBatch:
                     cur_all_ids = tuple(req.origin_input_ids + req.output_ids)[:-1]
                     cur_output_ids = req.output_ids
 
+                    print("jump")
+
                     req.output_ids.extend(suffix_ids)
                     decode_res, new_text = req.get_next_inc_detokenization()
                     if not decode_res:
