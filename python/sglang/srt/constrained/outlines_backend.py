@@ -59,8 +59,8 @@ class OutlinesGrammar(BaseGrammarObject):
         jump_forward_map: Union[OutlinesJumpForwardMap, None],
     ) -> None:
         self.guide = guide
-        self.state = 0
         self.jump_forward_map = jump_forward_map
+        self.state = 0
 
     def accept_token(self, token: int):
         self.state = self.guide.get_next_state(self.state, token)
@@ -101,6 +101,9 @@ class OutlinesGrammar(BaseGrammarObject):
     def fill_vocab_mask(self, vocab_mask: torch.Tensor):
         vocab_mask.fill_(1)
         vocab_mask[self.guide.get_next_instruction(self.state).tokens] = 0
+
+    def copy(self):
+        return OutlinesGrammar(self.guide, self.jump_forward_map)
 
 
 class OutlinesGrammarBackend(BaseGrammarBackend):

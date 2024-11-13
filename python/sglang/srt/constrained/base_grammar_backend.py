@@ -56,14 +56,14 @@ class BaseGrammarBackend:
         else:
             entry.value = self.init_value_impl(key)
             entry.event.set()
-        return entry.value
+        return entry.value.copy()
 
     def init_value_impl(self, key: Tuple[str, str]) -> BaseGrammarObject:
         raise NotImplementedError()
 
     def get_cached_value(self, key: Tuple[str, str]) -> BaseGrammarObject:
         with self.cache_lock:
-            return self.cache[key].value
+            return self.cache[key].value.copy()
 
     def get_future_value(self, key: Tuple[str, str]) -> Future:
         return self.executor.submit(self.init_value, key)
