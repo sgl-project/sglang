@@ -4,8 +4,10 @@ This script does not launch a server.
 It accepts the same arguments as bench_latency.py
 
 # Usage
+# TODO: is this runnable?
 python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --output-len 32 256 --result-filename out.jsonl
 
+# TODO: add running command for shared gpt, random, and gen-shared-prefix dataset
 """
 
 import argparse
@@ -32,16 +34,22 @@ from sglang.srt.server_args import ServerArgs
 
 @dataclasses.dataclass
 class BenchArgs:
+    # TODO: what does "before" mean
     run_name: str = "before"
     backend: str = "engine"
     result_filename: str = ""
     dataset_name: str = "sharegpt"
     dataset_path: str = ""
     num_prompts: int = 1000
-    sharegpt_output_len: Union[int, None] = None
-    random_input_len: Union[int, None] = None
-    random_output_len: Union[int, None] = None
-    random_range_ratio: Union[int, None] = None
+    # TODO: with None, the program crashes with
+    # bench_offline_throughput.py", line 101, in <dictcomp>
+    # **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
+    # TypeError: NoneType takes no arguments
+    # Ideally we want to make it easier to run with specified default values, so users dont have to keep trial and errors
+    sharegpt_output_len: int = 256
+    random_input_len: int = 256
+    random_output_len: int = 256
+    random_range_ratio: float = 0.0
     seed: int = 1
 
     @staticmethod
@@ -70,23 +78,25 @@ class BenchArgs:
         parser.add_argument(
             "--sharegpt-output-len",
             type=int,
-            default=None,
+            default=BenchArgs.sharegpt_output_len,
             help="Output length for each request. Overrides the output length from the ShareGPT dataset.",
         )
         parser.add_argument(
             "--random-input-len",
             type=int,
+            default=BenchArgs.random_input_len,
             help="Number of input tokens per request, used only for random dataset.",
         )
         parser.add_argument(
             "--random-output-len",
             type=int,
+            default=BenchArgs.random_output_len,
             help="Number of output tokens per request, used only for random dataset.",
         )
         parser.add_argument(
             "--random-range-ratio",
             type=float,
-            default=0.0,
+            default=BenchArgs.random_range_ratio,
             help="Range of sampled ratio of input/output length, "
             "used only for random dataset.",
         )
@@ -96,6 +106,7 @@ class BenchArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to case the args into correct types.
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
+        print(attrs)
         return cls(
             **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
         )
@@ -156,9 +167,6 @@ def throughput_test(
     np.random.seed(bench_args.seed)
 
     if bench_args.dataset_name == "sharegpt":
-        assert (
-            bench_args.random_input_len is None and bench_args.random_output_len is None
-        )
         input_requests = sample_sharegpt_requests(
             dataset_path=bench_args.dataset_path,
             num_requests=bench_args.num_prompts,
@@ -166,10 +174,6 @@ def throughput_test(
             fixed_output_len=bench_args.sharegpt_output_len,
         )
     elif bench_args.dataset_name == "random":
-        assert (
-            bench_args.random_input_len is not None
-            and bench_args.random_output_len is not None
-        )
         input_requests = sample_random_requests(
             input_len=bench_args.random_input_len,
             output_len=bench_args.random_output_len,
@@ -178,6 +182,7 @@ def throughput_test(
             tokenizer=tokenizer,
             dataset_path=bench_args.dataset_path,
         )
+    # TODO: gen-shared-prefix dataset
     else:
         raise ValueError(f"Unknown dataset: {bench_args.dataset_name}")
 
