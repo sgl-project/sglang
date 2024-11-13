@@ -30,7 +30,6 @@ import zmq
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.grammar import GrammarBackend
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
@@ -238,14 +237,22 @@ class Scheduler:
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
         if not server_args.skip_tokenizer_init:
-            self.grammar_backend_cache = GrammarBackend(
-                self.tokenizer,
-                whitespace_patterns=server_args.constrained_json_whitespace_pattern,
-                allow_jump_forward=not server_args.disable_jump_forward,
-                backend=server_args.grammar_backend,
-            )
+            if server_args.grammar_backend == "outlines":
+                from sglang.srt.constrained.outlines_backend import (
+                    OutlinesGrammarBackend,
+                )
+
+                self.grammar_backend = OutlinesGrammarBackend(
+                    self.tokenizer,
+                    whitespace_patterns=server_args.constrained_json_whitespace_pattern,
+                    allow_jump_forward=not server_args.disable_jump_forward,
+                )
+            else:
+                raise ValueError(
+                    f"Invalid grammar backend: {server_args.grammar_backend}"
+                )
         else:
-            self.grammar_backend_cache = None
+            self.grammar_backend = None
 
         # Init new token estimation
         assert (
@@ -457,13 +464,13 @@ class Scheduler:
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
         ):
-            assert self.grammar_backend_cache is not None
+            assert self.grammar_backend is not None
             if req.sampling_params.json_schema is not None:
-                req.grammar = self.grammar_backend_cache.query(
+                req.grammar = self.grammar_backend.query(
                     ("json", req.sampling_params.json_schema),
                 )
             elif req.sampling_params.regex is not None:
-                req.grammar = self.grammar_backend_cache.query(
+                req.grammar = self.grammar_backend.query(
                     ("regex", req.sampling_params.regex)
                 )
 
@@ -1137,8 +1144,8 @@ class Scheduler:
         ):
             self.tree_cache.reset()
             self.tree_cache_metrics = {"total": 0, "hit": 0}
-            if self.grammar_backend_cache is not None:
-                self.grammar_backend_cache.reset()
+            if self.grammar_backend is not None:
+                self.grammar_backend.reset()
             # TODO(dark): reset the bnf cache
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()

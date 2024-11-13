@@ -18,6 +18,7 @@ from typing import Dict, Optional, Union
 
 from pydantic import BaseModel
 
+# TODO(lmzheng): make outline an optional dependency.
 try:
     from outlines.fsm.json_schema import build_regex_from_object
 except ImportError:
