@@ -4,8 +4,14 @@ This script does not launch a server.
 It accepts the same arguments as bench_latency.py
 
 # Usage
-# TODO: is this runnable?
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --output-len 32 256 --result-filename out.jsonl
+## Sharegpt dataset with default args
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct
+
+## Random dataset with default args
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --backend random
+
+## Shared prefix dataset with default args
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --backend generated-shared-prefix
 
 # TODO: add running command for shared gpt, random, and gen-shared-prefix dataset
 """
@@ -26,6 +32,7 @@ from sglang.bench_serving import (
     get_tokenizer,
     sample_random_requests,
     sample_sharegpt_requests,
+    sample_generated_shared_prefix_requests,
     set_ulimit,
 )
 from sglang.srt.server import Engine, Runtime
@@ -34,27 +41,23 @@ from sglang.srt.server_args import ServerArgs
 
 @dataclasses.dataclass
 class BenchArgs:
-    # TODO: what does "before" mean
-    run_name: str = "before"
     backend: str = "engine"
     result_filename: str = ""
     dataset_name: str = "sharegpt"
     dataset_path: str = ""
     num_prompts: int = 1000
-    # TODO: with None, the program crashes with
-    # bench_offline_throughput.py", line 101, in <dictcomp>
-    # **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
-    # TypeError: NoneType takes no arguments
-    # Ideally we want to make it easier to run with specified default values, so users dont have to keep trial and errors
     sharegpt_output_len: int = 256
     random_input_len: int = 256
     random_output_len: int = 256
     random_range_ratio: float = 0.0
+    gen_num_groups: int = (8,)
+    gen_prompts_per_group: int = (16,)
+    gen_system_prompt_len: int = (128,)
+    gen_question_len: int = (256,)
     seed: int = 1
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-        parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
         parser.add_argument("--backend", type=str, default=BenchArgs.backend)
         parser.add_argument(
             "--result-filename", type=str, default=BenchArgs.result_filename
@@ -100,6 +103,32 @@ class BenchArgs:
             help="Range of sampled ratio of input/output length, "
             "used only for random dataset.",
         )
+        parser.add_argument(
+            "--gen-num-groups",
+            type=int,
+            default=BenchArgs.gen_num_groups,
+            help="Number of groups with shared prefix, used"
+            "only for generate-shared-prefix",
+        )
+        parser.add_argument(
+            "--gen-prompts-per-group",
+            type=int,
+            default=BenchArgs.gen_prompts_per_group,
+            help="Number of prompts per group of shared prefix, used"
+            "only for generate-shared-prefix",
+        )
+        parser.add_argument(
+            "--gen-system-prompt-len",
+            type=int,
+            default=BenchArgs.gen_system_prompt_len,
+            help="System prompt length, used" "only for generate-shared-prefix",
+        )
+        parser.add_argument(
+            "--gen-question-len",
+            type=int,
+            default=BenchArgs.gen_question_len,
+            help="Question length, used" "only for generate-shared-prefix",
+        )
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
 
     @classmethod
@@ -113,13 +142,11 @@ class BenchArgs:
 
 
 def throughput_test_once(
-    run_name: str,
     backend_name: str,
     backend: Union[Engine, Runtime],
     reqs: List[Tuple[str, int, int]],
 ):
     measurement_results = {
-        "run_name": run_name,
         "total_input_tokens": sum(r[1] for r in reqs),
     }
 
@@ -182,7 +209,15 @@ def throughput_test(
             tokenizer=tokenizer,
             dataset_path=bench_args.dataset_path,
         )
-    # TODO: gen-shared-prefix dataset
+    elif bench_args.dataset_name == "generated-shared-prefix":
+        input_requests = sample_generated_shared_prefix_requests(
+            num_groups=bench_args.gen_num_groups,
+            prompts_per_group=bench_args.gen_prompts_per_group,
+            system_prompt_len=bench_args.gen_system_prompt_len,
+            question_len=bench_args.gen_question_len,
+            output_len=bench_args.gen_output_len,
+            tokenizer=tokenizer,
+        )
     else:
         raise ValueError(f"Unknown dataset: {bench_args.dataset_name}")
 
@@ -197,14 +232,12 @@ def throughput_test(
 
     # Warm up
     throughput_test_once(
-        run_name="warmup",
         backend_name=bench_args.backend,
         backend=backend,
         reqs=warmup_requests,
     )
 
     result = throughput_test_once(
-        run_name=bench_args.run_name,
         backend_name=bench_args.backend,
         backend=backend,
         reqs=input_requests,
