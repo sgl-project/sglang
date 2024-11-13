@@ -39,7 +39,7 @@ class XGrammarJumpCache:
         pass
 
 
-class XGrammarBackend:
+class XGrammarCache:
     def __init__(
         self,
         tokenizer_path,

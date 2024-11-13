@@ -240,15 +240,11 @@ class Scheduler:
 
         if not server_args.skip_tokenizer_init:
             self.grammar_cache = GrammarBackend(
-                server_args.tokenizer_path,
-                {
-                    "tokenizer_mode": server_args.tokenizer_mode,
-                    "trust_remote_code": server_args.trust_remote_code,
-                },
-                skip_tokenizer_init=server_args.skip_tokenizer_init,
+                self.tokenizer,
+                self.model_config.vocab_size,
                 whitespace_patterns=server_args.constrained_json_whitespace_pattern,
-                backend=server_args.grammar_backend,
                 allow_jump=not server_args.disable_regex_jump_forward,
+                backend=server_args.grammar_backend,
             )
 
         # Init new token estimation

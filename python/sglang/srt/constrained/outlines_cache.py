@@ -19,7 +19,6 @@ import logging
 from interegular import InvalidSyntax, parse_pattern
 from outlines.fsm.guide import RegexGuide
 from outlines.models.transformers import TransformerTokenizer
-from transformers import AutoTokenizer
 
 from sglang.srt.constrained import build_regex_from_object
 from sglang.srt.constrained.base_tool_cache import BaseToolCache
@@ -30,24 +29,11 @@ logger = logging.getLogger(__name__)
 class OutlinesCache(BaseToolCache):
     def __init__(
         self,
-        tokenizer_path,
-        tokenizer_args_dict,
-        enable=True,
-        skip_tokenizer_init=False,
-        constrained_json_whitespace_pattern=None,
+        tokenizer,
+        whitespace_pattern=None,
     ):
-        super().__init__(enable=enable)
+        super().__init__(enable=True)
 
-        if (
-            skip_tokenizer_init
-            or tokenizer_path.endswith(".json")
-            or tokenizer_path.endswith(".model")
-        ):
-            # Do not support TiktokenTokenizer or SentencePieceTokenizer
-            return
-
-        tokenizer_args_dict.setdefault("padding_side", "left")
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_args_dict)
         try:
             self.outlines_tokenizer = TransformerTokenizer(tokenizer)
         except AttributeError:
@@ -69,7 +55,7 @@ class OutlinesCache(BaseToolCache):
             self.outlines_tokenizer.vocabulary = (
                 self.outlines_tokenizer.tokenizer.get_vocab()
             )
-        self.constrained_json_whitespace_pattern = constrained_json_whitespace_pattern
+        self.whitespace_pattern = whitespace_pattern
 
     def init_value(self, key):
         key_type, key_string = key
@@ -77,7 +63,7 @@ class OutlinesCache(BaseToolCache):
             try:
                 regex = build_regex_from_object(
                     key_string,
-                    whitespace_pattern=self.constrained_json_whitespace_pattern,
+                    whitespace_pattern=self.whitespace_pattern,
                 )
             except NotImplementedError as e:
                 logger.warning(
@@ -93,4 +79,6 @@ class OutlinesCache(BaseToolCache):
         except InvalidSyntax as e:
             logger.warning(f"skip invalid regex guide: {regex=}, {e=}")
             return None, regex
-        return RegexGuide(regex, self.outlines_tokenizer), regex
+
+        ret = RegexGuide(regex, self.outlines_tokenizer), regex
+        return ret

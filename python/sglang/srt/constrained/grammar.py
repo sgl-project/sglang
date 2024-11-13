@@ -25,7 +25,7 @@ from sglang.srt.constrained.outlines_jump_forward import (
 )
 from sglang.srt.constrained.xgrammar_cache import (
     GrammarMatcher,
-    XGrammarBackend,
+    XGrammarCache,
     XGrammarJumpCache,
 )
 
@@ -138,44 +138,36 @@ class GrammarBackend:
 
     def __init__(
         self,
-        tokenizer_path,
-        tokenizer_args_dict,
-        skip_tokenizer_init=False,
-        whitespace_patterns=None,
-        backend=None,
-        allow_jump=False,
+        tokenizer,
+        vocab_size: int,
+        whitespace_patterns: bool,
+        allow_jump_forward: bool,
+        backend: str,
     ):
         self.executor = ThreadPoolExecutor()
         self.backend = backend
 
         if backend == "xgrammar":
-            self.grammar_cache = XGrammarBackend(
-                tokenizer_path=tokenizer_path,
-                tokenizer_args_dict=tokenizer_args_dict,
-                skip_tokenizer_init=skip_tokenizer_init,
-                whitespace_patterns=whitespace_patterns,
-            )
-            self.jump_cache = XGrammarJumpCache() if allow_jump else None
+            self.grammar_cache = XGrammarCache(tokenizer, vocab_size)
+            self.jump_cache = XGrammarJumpCache() if allow_jump_forward else None
         else:
             assert backend == "outlines"
             self.grammar_cache = OutlinesCache(
-                tokenizer_path=tokenizer_path,
-                tokenizer_args_dict=tokenizer_args_dict,
-                skip_tokenizer_init=skip_tokenizer_init,
-                constrained_json_whitespace_pattern=whitespace_patterns,
+                tokenizer,
+                whitespace_pattern=whitespace_patterns,
             )
-            self.jump_cache = OutlinesJumpCache() if allow_jump else None
+            self.jump_cache = OutlinesJumpCache() if allow_jump_forward else None
 
-    def _query(self, key: Tuple[str, str], vocab_size: int) -> Grammar:
-        if isinstance(self.grammar_cache, XGrammarBackend):
-            return Grammar(self.grammar_cache.query(key, vocab_size), self.jump_cache)
+    def _query(self, key: Tuple[str, str]) -> Grammar:
+        if isinstance(self.grammar_cache, XGrammarCache):
+            return Grammar(self.grammar_cache.query(key), self.jump_cache)
         else:
             guide, regex = self.grammar_cache.query(key)
             jump_map = self.jump_cache.query(regex)
             return Grammar((guide, 0), jump_map)
 
-    def query(self, key: Tuple[str, str], vocab_size: int) -> Future:
-        return self.executor.submit(self._query, key, vocab_size)
+    def query(self, key: Tuple[str, str]) -> Future:
+        return self.executor.submit(self._query, key)
 
     def reset(self):
         self.grammar_cache.reset()
