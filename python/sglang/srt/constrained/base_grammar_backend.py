@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""The baseclass of backends for grammar-guided constrained decoding."""
+"""The baseclass of a backend for grammar-guided constrained decoding."""
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass

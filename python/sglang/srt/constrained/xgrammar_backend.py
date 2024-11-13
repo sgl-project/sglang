@@ -19,7 +19,16 @@ import logging
 from typing import List, Tuple
 
 import torch
-from xgrammar import CachedGrammarCompiler, CompiledGrammar, GrammarMatcher
+
+try:
+    from xgrammar import CachedGrammarCompiler, CompiledGrammar, GrammarMatcher
+
+    import_error = None
+except ImportError as e:
+    CachedGrammarCompiler = CompiledGrammar = GrammarMatcher = TokenizerInfo = (
+        ImportError
+    )
+    import_error = e
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
@@ -95,10 +104,21 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         vocab_size: int,
     ):
         super().__init__()
+
+        if import_error:
+            logger.warning(
+                f"Ignore import error for the grammar backend: {import_error}"
+            )
+            self.grammar_cache = None
+            return
+
         self.grammar_cache = CachedGrammarCompiler(tokenizer_or_vocab=tokenizer)
         self.vocab_size = vocab_size
 
     def init_value_impl(self, key: Tuple[str, str]) -> XGrammarGrammar:
+        if import_error:
+            raise import_error
+
         key_type, key_string = key
         if key_type == "json":
             try:
@@ -126,4 +146,5 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         return XGrammarGrammar(matcher, self.vocab_size, ctx)
 
     def reset(self):
-        self.grammar_cache.clear()
+        if self.grammar_cache:
+            self.grammar_cache.clear()
