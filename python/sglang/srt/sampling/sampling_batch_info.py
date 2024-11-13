@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
-from sglang.srt.constrained.grammar import Grammar
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
