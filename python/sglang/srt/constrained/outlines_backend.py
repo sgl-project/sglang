@@ -22,7 +22,9 @@ from typing import Dict, List, Optional, Tuple, Union
 import interegular
 import torch
 from outlines.fsm.guide import RegexGuide
+from outlines.fsm.json_schema import build_regex_from_schema
 from outlines.models.transformers import TransformerTokenizer
+from pydantic import BaseModel
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
@@ -31,26 +33,6 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
 
 logger = logging.getLogger(__name__)
-
-
-try:
-    from outlines.fsm.json_schema import build_regex_from_object
-except ImportError:
-    # Since outlines 0.0.32, build_regex_from_object is replaced by build_regex_from_schema,
-    # which only accepts string schema as input.
-    from outlines.fsm.json_schema import build_regex_from_schema
-    from pydantic import BaseModel
-
-    def build_regex_from_object(
-        object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
-    ):
-        if isinstance(object, type(BaseModel)):
-            schema = json.dumps(object.model_json_schema())
-        elif isinstance(object, Dict):
-            schema = json.dumps(object)
-        else:
-            schema = object
-        return build_regex_from_schema(schema, whitespace_pattern)
 
 
 class OutlinesGrammar(BaseGrammarObject):
@@ -169,3 +151,15 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
         else:
             jump_forward_map = None
         return OutlinesGrammar(guide, jump_forward_map)
+
+
+def build_regex_from_object(
+    object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
+):
+    if isinstance(object, type(BaseModel)):
+        schema = json.dumps(object.model_json_schema())
+    elif isinstance(object, Dict):
+        schema = json.dumps(object)
+    else:
+        schema = object
+    return build_regex_from_schema(schema, whitespace_pattern)
