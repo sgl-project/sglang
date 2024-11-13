@@ -247,6 +247,14 @@ class Scheduler:
                     whitespace_patterns=server_args.constrained_json_whitespace_pattern,
                     allow_jump_forward=not server_args.disable_jump_forward,
                 )
+            elif server_args.grammar_backend == "xgrammar":
+                from sglang.srt.constrained.xgrammar_backend import (
+                    XGrammarGrammarBackend,
+                )
+
+                self.grammar_backend = XGrammarGrammarBackend(
+                    self.tokenizer, vocab_size=self.model_config.vocab_size
+                )
             else:
                 raise ValueError(
                     f"Invalid grammar backend: {server_args.grammar_backend}"

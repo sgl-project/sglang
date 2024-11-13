@@ -31,7 +31,7 @@ class SamplingBatchInfo:
     logit_bias: torch.Tensor = None
     vocab_mask: Optional[torch.Tensor] = None
 
-    grammars: Optional[List[Optional[Grammar]]] = None
+    grammars: Optional[List] = None
 
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None

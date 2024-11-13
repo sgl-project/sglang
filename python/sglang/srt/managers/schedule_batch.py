@@ -37,7 +37,6 @@ import torch
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.grammar import Grammar
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -249,7 +248,7 @@ class Req:
         self.embedding = None
 
         # Constrained decoding
-        self.grammar: Optional[Grammar] = None
+        self.grammar = None
 
         # The number of cached tokens, that were already cached in the KV cache
         self.cached_tokens = 0

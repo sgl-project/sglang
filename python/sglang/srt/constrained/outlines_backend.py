@@ -13,7 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Cache for the compressed finite state machine."""
+"""Constrained decoding with outlines backend."""
+
 import json
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -67,7 +68,7 @@ class OutlinesGrammar:
     def accept_token(self, token: int):
         self.state = self.guide.get_next_state(self.state, token)
 
-    def try_jump_forward(self, tokenizer):
+    def try_jump_forward(self, tokenizer) -> Optional[Tuple]:
         if not self.jump_forward_map:
             return None
 
@@ -91,7 +92,7 @@ class OutlinesGrammar:
         suffix_ids = tokenizer.convert_tokens_to_ids(suffix_tokens)
         return suffix_ids, cur_state
 
-    def jump_forward_str_state(self, helper) -> Tuple[str, int]:
+    def jump_forward_str_state(self, helper: Tuple) -> Tuple[str, int]:
         return self.jump_forward_map.jump_forward_symbol(helper.cur_state)
 
     def jump_and_retokenize(
@@ -120,7 +121,7 @@ class OutlinesGrammarBackend:
             OutlinesJumpForwardCache() if allow_jump_forward else None
         )
 
-    def _query(self, key: Tuple[str, str]):
+    def _query(self, key: Tuple[str, str]) -> OutlinesGrammar:
         guide, regex = self.grammar_cache.query(key)
         jump_forward_map = (
             self.jump_forward_cache.query(regex) if self.jump_forward_cache else None
