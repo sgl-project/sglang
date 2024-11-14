@@ -26,6 +26,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For in
 * `max_new_tokens: int = 128` The maximum output length measured in tokens.
 * `stop: Optional[Union[str, List[str]]] = None` One or multiple [stop words](https://platform.openai.com/docs/api-reference/chat/create#chat-create-stop). Generation will stop if one of these words is sampled.
 * `stop_token_ids: Optional[List[int]] = None` Provide stop words in form of token ids. Generation will stop if one of these token ids is sampled.
+* `stop_regex: Optional[Union[str, List[str]]] = []` Stop when hitting any of the regex patterns in this list.
 * `temperature: float = 1.0` [Temperature](https://platform.openai.com/docs/api-reference/chat/create#chat-create-temperature) when sampling the next token. `temperature = 0` corresponds to greedy sampling, higher temperature leads to more diversity.
 * `top_p: float = 1.0` [Top-p](https://platform.openai.com/docs/api-reference/chat/create#chat-create-top_p) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens.
 * `top_k: int = -1` [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens.

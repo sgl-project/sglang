@@ -32,6 +32,7 @@ class SamplingParams:
         max_new_tokens: int = 128,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
+        stop_regex: Optional[Union[str, List[str]]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
@@ -57,6 +58,7 @@ class SamplingParams:
             self.stop_token_ids = set(stop_token_ids)
         else:
             self.stop_token_ids = None
+        self.stop_regex_strs = stop_regex
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
@@ -151,3 +153,8 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
+
+        if self.stop_regex_strs is None:
+            self.stop_regex_strs = []
+        elif isinstance(self.stop_regex_strs, str):
+            self.stop_regex_strs = [self.stop_regex_strs]
