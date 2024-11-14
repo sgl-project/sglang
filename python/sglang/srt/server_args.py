@@ -839,10 +839,8 @@ class PortArgs:
         while True:
             if is_port_available(port):
                 all_port.append(port)
-            if (
-                len(all_port) == 2
-                if server_args.speculative_algorithm is not None
-                else 1
+            if len(all_port) == (
+                2 if server_args.speculative_algorithm is not None else 1
             ):
                 break
             port += 42

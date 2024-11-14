@@ -214,9 +214,9 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch = None,
     ):
         decode_wrappers = []
-        for i in range(self.num_wrappers):
-            # speculative decodign verify stage
-            if spec_info is not None and not is_draft_runner:
+        # speculative decodign verify stage
+        if spec_info is not None and not is_draft_runner:
+            for i in range(self.num_wrappers):
                 decode_wrappers.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -230,9 +230,10 @@ class FlashInferAttnBackend(AttentionBackend):
                         qk_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
                     )
                 )
-                self.forward_metadata = (False, False, decode_wrappers)
+            self.forward_metadata = (False, False, decode_wrappers)
 
-            else:
+        else:
+            for i in range(self.num_wrappers):
                 decode_wrappers.append(
                     BatchDecodeWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -244,17 +245,17 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_token],
                     )
                 )
-                self.forward_metadata = (decode_wrappers,)
+            self.forward_metadata = (decode_wrappers,)
 
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_decode.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                decode_wrappers=decode_wrappers,
-                encoder_lens=encoder_lens,
-                forward_batch=forward_batch,
-            )
+        seq_lens_sum = seq_lens.sum().item()
+        self.indices_updater_decode.update(
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            decode_wrappers=decode_wrappers,
+            encoder_lens=encoder_lens,
+            forward_batch=forward_batch,
+        )
         self.cuda_graph_metadata[num_token] = decode_wrappers
 
     def init_forward_metadata_replay_cuda_graph(
@@ -523,7 +524,7 @@ class FlashInferIndicesUpdaterDecode:
         forward_batch=None,
     ):
 
-        if forward_batch.spec_info is not None:
+        if forward_batch is not None and forward_batch.spec_info is not None:
             bs = forward_batch.input_ids.numel()
             kv_indices, kv_indptr, kv_last_page_len, qo_indptr = (
                 forward_batch.spec_info.generate_attn_arg(
@@ -549,7 +550,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.max_context_len,
             )
 
-        if forward_batch.forward_mode.is_verify():
+        if forward_batch is not None and forward_batch.forward_mode.is_verify():
             bs = len(req_pool_indices)
             custom_mask = getattr(forward_batch.spec_info, "custom_mask", None)
             wrapper.end_forward()
@@ -736,7 +737,7 @@ class FlashInferIndicesUpdaterPrefill:
         forward_batch,
     ):
         bs = len(req_pool_indices)
-        if forward_batch.forward_mode.is_spec_extend():
+        if forward_batch is not None and forward_batch.forward_mode.is_spec_extend():
             # spec extend update generate arg
             kv_indices, kv_indptr, kv_last_page_len, qo_indptr = (
                 forward_batch.spec_info.generate_attn_arg_spec_extend(

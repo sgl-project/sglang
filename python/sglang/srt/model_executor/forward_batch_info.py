@@ -68,7 +68,7 @@ class ForwardMode(IntEnum):
     def is_extend(self):
         return self in (
             ForwardMode.EXTEND,
-            self == ForwardMode.MIXED,
+            ForwardMode.MIXED,
             ForwardMode.SPECEXTEND,
         )
 
