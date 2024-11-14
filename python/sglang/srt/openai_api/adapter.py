@@ -1166,7 +1166,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         is_first = False
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(role="assistant"),
+                            delta=DeltaMessage(role="assistant", content=""),
                             finish_reason=(
                                 finish_reason["type"] if finish_reason else ""
                             ),
