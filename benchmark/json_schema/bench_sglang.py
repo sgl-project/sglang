@@ -1,5 +1,6 @@
 import argparse
 import json
+import jsonschema
 import time
 
 from datasets import load_dataset
@@ -16,7 +17,7 @@ from sglang.utils import dump_state_text
 @sgl.function
 def schema_gen(s, message: str, json_schema: str):
     s += message
-    s += sgl.gen("json_output", max_tokens=256, json_schema=json_schema)
+    s += sgl.gen("json_output", temperature=0, max_tokens=256, json_schema=json_schema)
 
 
 def convert_dataset(path: str):
@@ -30,8 +31,7 @@ def convert_dataset(path: str):
         obj = json.loads(schema)
         if obj.get("type", None) is None:
             continue
-        message = tmpl.get_prompt(messages)
-
+        message = tmpl.get_prompt(messages) + "<|start_header_id|>assistant<|end_header_id|>\n\n"
         dataset.append(
             {
                 "message": message,
@@ -63,6 +63,18 @@ def bench_schema(args):
     )
     latency = time.time() - tic
 
+    # Check if the outputs are valid
+    indexs = []
+    for i, state in enumerate(states):
+        try:
+            schema = json.loads(arguments[i]["json_schema"])
+            obj = json.loads(state["json_output"])
+            assert jsonschema.validate(obj, schema) is None
+        except Exception as e:
+            print(e)
+            indexs.append(i)
+
+    assert len(indexs) == 0, f"Invalid json outputs: {indexs}"
     return states, latency
 
 
