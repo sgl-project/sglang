@@ -64,6 +64,7 @@ class ServerArgs:
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
+    download_dir: Optional[str] = None
 
     # Logging
     log_level: str = "info"
@@ -404,6 +405,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.watchdog_timeout,
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
+        parser.add_argument(
+            "--download-dir",
+            type=str,
+            default=ServerArgs.download_dir,
+            help="Model download directory.",
         )
 
         # Logging
