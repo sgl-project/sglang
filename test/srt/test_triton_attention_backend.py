@@ -48,7 +48,7 @@ class TestTritonAttnBackend(unittest.TestCase):
             )
 
             metrics = run_eval(args)
-            assert metrics["score"] >= 0.65
+            self.assertGreaterEqual(metrics["score"], 0.65)
         finally:
             kill_child_process(process.pid, include_self=True)
 
