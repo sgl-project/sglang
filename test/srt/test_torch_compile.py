@@ -49,8 +49,8 @@ class TestTorchCompile(unittest.TestCase):
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
                 },
-                "ignore_eos": True,
             },
         )
         return response.json()
