@@ -19,9 +19,12 @@ import json
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
+import interegular
 import torch
 from outlines.fsm.guide import RegexGuide
+from outlines.fsm.json_schema import build_regex_from_schema
 from outlines.models.transformers import TransformerTokenizer
+from pydantic import BaseModel
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
@@ -30,26 +33,6 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
 
 logger = logging.getLogger(__name__)
-
-
-try:
-    from outlines.fsm.json_schema import build_regex_from_object
-except ImportError:
-    # Since outlines 0.0.32, build_regex_from_object is replaced by build_regex_from_schema,
-    # which only accepts string schema as input.
-    from outlines.fsm.json_schema import build_regex_from_schema
-    from pydantic import BaseModel
-
-    def build_regex_from_object(
-        object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
-    ):
-        if isinstance(object, type(BaseModel)):
-            schema = json.dumps(object.model_json_schema())
-        elif isinstance(object, Dict):
-            schema = json.dumps(object)
-        else:
-            schema = object
-        return build_regex_from_schema(schema, whitespace_pattern)
 
 
 class OutlinesGrammar(BaseGrammarObject):
@@ -147,19 +130,36 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                     key_string,
                     whitespace_pattern=self.whitespace_pattern,
                 )
-            except NotImplementedError as e:
+            except (NotImplementedError, json.decoder.JSONDecodeError) as e:
                 logger.warning(
-                    f"skip invalid json schema: json_schema={key_string}, {e=}"
+                    f"Skip invalid json_schema: json_schema={key_string}, {e=}"
                 )
-                return None, key_string
+                return None
         elif key_type == "regex":
             regex = key_string
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
-        guide = RegexGuide(regex, self.outlines_tokenizer)
+        try:
+            guide = RegexGuide(regex, self.outlines_tokenizer)
+        except interegular.patterns.InvalidSyntax as e:
+            logger.warning(f"skip invalid regex schema: {regex=}, {e=}")
+            return None
+
         if self.allow_jump_forward:
             jump_forward_map = OutlinesJumpForwardMap(regex)
         else:
             jump_forward_map = None
         return OutlinesGrammar(guide, jump_forward_map)
+
+
+def build_regex_from_object(
+    object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
+):
+    if isinstance(object, type(BaseModel)):
+        schema = json.dumps(object.model_json_schema())
+    elif isinstance(object, Dict):
+        schema = json.dumps(object)
+    else:
+        schema = object
+    return build_regex_from_schema(schema, whitespace_pattern)
