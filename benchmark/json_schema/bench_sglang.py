@@ -1,8 +1,8 @@
 import argparse
 import json
-import jsonschema
 import time
 
+import jsonschema
 from datasets import load_dataset
 
 import sglang as sgl
@@ -31,7 +31,10 @@ def convert_dataset(path: str):
         obj = json.loads(schema)
         if obj.get("type", None) is None:
             continue
-        message = tmpl.get_prompt(messages) + "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        message = (
+            tmpl.get_prompt(messages)
+            + "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
         dataset.append(
             {
                 "message": message,
