@@ -27,6 +27,7 @@ suites = {
         "test_srt_engine.py",
         "test_srt_endpoint.py",
         "test_torch_compile.py",
+        "test_torch_compile_moe.py",
         "test_torchao.py",
         "test_triton_attention_kernels.py",
         "test_triton_attention_backend.py",

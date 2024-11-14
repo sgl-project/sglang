@@ -6,7 +6,7 @@ import requests
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -16,13 +16,13 @@ from sglang.test.test_utils import (
 class TestTorchCompile(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile"],
+            other_args=["--enable-torch-compile", "--torch-compile-max-bs", "1"],
         )
 
     @classmethod
@@ -39,7 +39,7 @@ class TestTorchCompile(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        self.assertGreaterEqual(metrics["score"], 0.50)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -63,10 +63,10 @@ class TestTorchCompile(unittest.TestCase):
         tic = time.time()
         res = self.run_decode(max_tokens)
         tok = time.time()
-        print(res["text"])
+        print(f"{res=}")
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
-        self.assertGreaterEqual(throughput, 152)
+        self.assertGreaterEqual(throughput, 290)
 
 
 if __name__ == "__main__":
