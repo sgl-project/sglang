@@ -1,4 +1,3 @@
-import time
 import unittest
 from types import SimpleNamespace
 
@@ -7,23 +6,23 @@ import requests
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
 
 
-class TestDataParallelism(unittest.TestCase):
+class TestTorchCompile(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--dp", "2"],
+            other_args=["--enable-torch-compile", "--torch-compile-max-bs", "1"],
         )
 
     @classmethod
@@ -42,34 +41,32 @@ class TestDataParallelism(unittest.TestCase):
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
 
-    def test_update_weight(self):
+    def run_decode(self, max_new_tokens):
         response = requests.post(
-            self.base_url + "/update_weights",
-            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                },
+                "ignore_eos": True,
+            },
         )
+        return response.json()
 
-        # check if the response is 200
-        assert response.status_code == 200
+    def test_throughput(self):
+        import time
 
-        # pause a few seconds then send again
-        time.sleep(5)
+        max_tokens = 256
 
-        response = requests.post(
-            self.base_url + "/update_weights",
-            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
-        )
-
-        # check if the response is 200
-        assert response.status_code == 200
-
-    def test_get_memory_pool_size(self):
-        response = requests.get(self.base_url + "/get_memory_pool_size")
-        assert response.status_code == 200
-
-        time.sleep(5)
-
-        response = requests.get(self.base_url + "/get_memory_pool_size")
-        assert response.status_code == 200
+        tic = time.time()
+        res = self.run_decode(max_tokens)
+        tok = time.time()
+        print(res["text"])
+        throughput = max_tokens / (tok - tic)
+        print(f"Throughput: {throughput} tokens/s")
+        self.assertGreaterEqual(throughput, 290)
 
 
 if __name__ == "__main__":
