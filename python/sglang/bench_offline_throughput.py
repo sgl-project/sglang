@@ -1,7 +1,7 @@
 """
 Benchmark the throughput of using the offline LLM engine.
 This script does not launch a server.
-It accepts the same arguments as bench_latency.py
+It accepts the same arguments as launch_server.py and additional benchmark arguments
 
 # Usage
 ## Sharegpt dataset with default args
@@ -154,19 +154,29 @@ def throughput_test_once(
     backend_name: str,
     backend: Union[Engine, Runtime],
     reqs: List[Tuple[str, int, int]],
-    output_len: int,
     ignore_eos: bool,
 ):
     measurement_results = {
+        "backend": backend_name,
+        "successful_requests": len(reqs),
+        "total_latency": -1,
         "total_input_tokens": sum(r[1] for r in reqs),
+        "total_output_tokens": -1,
+        "request_throughput": -1,
+        "input_throughput": -1,
+        "output_throughput": -1,
+        "total_throughput": -1,
     }
 
     prompt = [r[0] for r in reqs]
-    sampling_params = {
-        "temperature": 0,
-        "max_new_tokens": output_len,
-        "ignore_eos": ignore_eos,
-    }
+    sampling_params = [
+        {
+            "temperature": 0,
+            "max_new_tokens": r[2],
+            "ignore_eos": ignore_eos,
+        }
+        for r in reqs
+    ]
 
     st = time.perf_counter()
     gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
@@ -179,12 +189,20 @@ def throughput_test_once(
     measurement_results["total_output_tokens"] = sum(
         o["meta_info"]["completion_tokens"] for o in gen_out
     )
-    measurement_results["throughput"] = (
+    measurement_results["request_throughput"] = (
+        measurement_results["successful_requests"] / latency
+    )
+    measurement_results["input_throughput"] = (
+        measurement_results["total_input_tokens"] / latency
+    )
+    measurement_results["output_throughput"] = (
+        measurement_results["total_output_tokens"] / latency
+    )
+    measurement_results["total_throughput"] = (
         measurement_results["total_input_tokens"]
         + measurement_results["total_output_tokens"]
     ) / latency
 
-    print(f"Throughput: {measurement_results['throughput']} tokens/s")
     return measurement_results
 
 
@@ -258,6 +276,44 @@ if __name__ == "__main__":
     )
 
     try:
-        print(throughput_test(server_args, bench_args))
+        res = throughput_test(server_args, bench_args)
+        print(
+            "\n{s:{c}^{n}}".format(
+                s=" Offline Throughput Benchmark Result ", n=50, c="="
+            )
+        )
+        print("{:<40} {:<10}".format("Backend:", res["backend"]))
+        print(
+            "{:<40} {:<10}".format("Successful requests:", res["successful_requests"])
+        )
+        print(
+            "{:<40} {:<10.2f}".format("Benchmark duration (s):", res["total_latency"])
+        )
+        print("{:<40} {:<10}".format("Total input tokens:", res["total_input_tokens"]))
+        print(
+            "{:<40} {:<10}".format(
+                "Total generated tokens:", res["total_output_tokens"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Request throughput (req/s):", res["request_throughput"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Input token throughput (tok/s):", res["input_throughput"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Output token throughput (tok/s):", res["output_throughput"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Total token throughput (tok/s):", res["total_throughput"]
+            )
+        )
     except Exception as e:
         raise e
