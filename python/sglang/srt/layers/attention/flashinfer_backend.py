@@ -30,12 +30,17 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
+
+
+def _grouped_size_compiled_for_decode_kernels(
+    num_qo_heads: int, num_kv_heads: int
+) -> bool:  # TODO: Remove me! https://github.com/flashinfer-ai/flashinfer/issues/549
+    return (num_qo_heads // num_kv_heads) in [1, 2, 4, 8]
 
 
 class FlashInferAttnBackend(AttentionBackend):
