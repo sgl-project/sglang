@@ -233,7 +233,10 @@ class ModelRunner:
 
         # Prepare the vllm model config
         monkey_patch_vllm_dummy_weight_loader()
-        self.load_config = LoadConfig(load_format=self.server_args.load_format, download_dir=self.server_args.download_dir)
+        self.load_config = LoadConfig(
+            load_format=self.server_args.load_format,
+            download_dir=self.server_args.download_dir,
+        )
         self.vllm_model_config = VllmModelConfig(
             model=self.server_args.model_path,
             quantization=self.server_args.quantization,
