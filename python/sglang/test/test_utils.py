@@ -740,8 +740,7 @@ def run_mmlu_test(
 
         try:
             metrics = run_eval(args)
-            print(f"{metrics=}")
-            self.assertGreaterEqual(metrics["score"], 0.65)
+            assert metrics["score"] >= 0.65, f"{metrics=}"
         finally:
             pass
 
