@@ -800,7 +800,8 @@ def calculate_metrics(
         output_throughput=sum(output_lens) / dur_s,
         output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
         total_throughput=(total_input + sum(output_lens)) / dur_s,
-        total_throughput_retokenized=(total_input + sum(retokenized_output_lens)) / dur_s,
+        total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
+        / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
