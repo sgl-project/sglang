@@ -270,46 +270,33 @@ if __name__ == "__main__":
         format="%(message)s",
     )
 
-    try:
-        res = throughput_test(server_args, bench_args)
-        print(
-            "\n{s:{c}^{n}}".format(
-                s=" Offline Throughput Benchmark Result ", n=50, c="="
-            )
+    res = throughput_test(server_args, bench_args)
+    print(
+        "\n{s:{c}^{n}}".format(s=" Offline Throughput Benchmark Result ", n=50, c="=")
+    )
+    print("{:<40} {:<10}".format("Backend:", res["backend"]))
+    print("{:<40} {:<10}".format("Successful requests:", res["successful_requests"]))
+    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", res["total_latency"]))
+    print("{:<40} {:<10}".format("Total input tokens:", res["total_input_tokens"]))
+    print("{:<40} {:<10}".format("Total generated tokens:", res["total_output_tokens"]))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Request throughput (req/s):", res["request_throughput"]
         )
-        print("{:<40} {:<10}".format("Backend:", res["backend"]))
-        print(
-            "{:<40} {:<10}".format("Successful requests:", res["successful_requests"])
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Input token throughput (tok/s):", res["input_throughput"]
         )
-        print(
-            "{:<40} {:<10.2f}".format("Benchmark duration (s):", res["total_latency"])
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Output token throughput (tok/s):", res["output_throughput"]
         )
-        print("{:<40} {:<10}".format("Total input tokens:", res["total_input_tokens"]))
-        print(
-            "{:<40} {:<10}".format(
-                "Total generated tokens:", res["total_output_tokens"]
-            )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Total token throughput (tok/s):", res["total_throughput"]
         )
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Request throughput (req/s):", res["request_throughput"]
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Input token throughput (tok/s):", res["input_throughput"]
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Output token throughput (tok/s):", res["output_throughput"]
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Total token throughput (tok/s):", res["total_throughput"]
-            )
-        )
-        print("=" * 50)
-    except Exception as e:
-        raise e
+    )
+    print("=" * 50)
