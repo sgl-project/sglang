@@ -19,25 +19,22 @@ python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8
 
 import argparse
 import dataclasses
-import itertools
 import json
 import logging
 import random
 import time
-from typing import Dict, List, Tuple, Union
+from typing import List, Tuple
 
 import numpy as np
 
-from sglang.api import Engine as getEngine
+from sglang.api import Engine
 from sglang.bench_serving import (
     get_dataset,
     get_tokenizer,
-    sample_generated_shared_prefix_requests,
     sample_random_requests,
-    sample_sharegpt_requests,
     set_ulimit,
 )
-from sglang.srt.server import Engine, Runtime
+from sglang.srt.server import Runtime
 from sglang.srt.server_args import ServerArgs
 
 
@@ -152,7 +149,7 @@ class BenchArgs:
 
 def throughput_test_once(
     backend_name: str,
-    backend: Union[Engine, Runtime],
+    backend,
     reqs: List[Tuple[str, int, int]],
     ignore_eos: bool,
 ):
@@ -211,7 +208,7 @@ def throughput_test(
     bench_args: BenchArgs,
 ):
     if bench_args.backend == "engine":
-        backend = getEngine(**dataclasses.asdict(server_args))
+        backend = Engine(**dataclasses.asdict(server_args))
         if not backend:
             raise ValueError("Please provide valid engine arguments")
     elif bench_args.backend == "runtime":
