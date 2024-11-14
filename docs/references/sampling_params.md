@@ -55,6 +55,8 @@ The `sampling_params` follows this format
 max_new_tokens: int = 128,
 # Stop when hitting any of the strings in this list
 stop: Optional[Union[str, List[str]]] = None,
+# Stop when hitting any of the regex patterns in this list.
+stop_regex: Optional[Union[str, List[str]]] = None,
 # Stop when hitting any of the token_ids in this list
 stop_token_ids: Optional[List[int]] = [],
 # Sampling temperature
