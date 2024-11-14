@@ -243,7 +243,6 @@ def throughput_test(
         backend_name=bench_args.backend,
         backend=backend,
         reqs=warmup_requests,
-        output_len=output_len,
         ignore_eos=not bench_args.disable_ignore_eos,
     )
 
@@ -251,7 +250,6 @@ def throughput_test(
         backend_name=bench_args.backend,
         backend=backend,
         reqs=input_requests,
-        output_len=output_len,
         ignore_eos=not bench_args.disable_ignore_eos,
     )
 
@@ -315,5 +313,6 @@ if __name__ == "__main__":
                 "Total token throughput (tok/s):", res["total_throughput"]
             )
         )
+        print("=" * 50)
     except Exception as e:
         raise e

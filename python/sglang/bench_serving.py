@@ -429,7 +429,6 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
         )
-        output_len = args.sharegpt_output_len
     elif args.dataset_name == "random":
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
@@ -439,7 +438,6 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
         )
-        output_len = args.random_output_len
     elif args.dataset_name == "generated-shared-prefix":
         input_requests = sample_generated_shared_prefix_requests(
             num_groups=args.gen_num_groups,
@@ -449,10 +447,9 @@ def get_dataset(args, tokenizer):
             output_len=args.gen_output_len,
             tokenizer=tokenizer,
         )
-        output_len = args.gen_output_len
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
-    return output_len
+    return input_requests
 
 
 ASYNC_REQUEST_FUNCS = {
