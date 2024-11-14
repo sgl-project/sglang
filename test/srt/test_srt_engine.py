@@ -160,7 +160,7 @@ class TestSRTEngine(unittest.TestCase):
         )
         bench_args = BenchArgs(num_prompts=10)
         result = throughput_test(server_args=server_args, bench_args=bench_args)
-        self.assertTrue(result["throughput"] > 3000)
+        self.assertTrue(result["total_throughput"] > 3000)
 
 
 if __name__ == "__main__":
