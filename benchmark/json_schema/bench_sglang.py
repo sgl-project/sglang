@@ -1,22 +1,25 @@
 import argparse
 import json
 import time
+
 from datasets import load_dataset
 
 import sglang as sgl
+from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
 from sglang.utils import dump_state_text
-from sglang.lang.chat_template import get_chat_template_by_model_path
+
 
 @sgl.function
-def schema_gen(s, message : str, json_schema : str):
+def schema_gen(s, message: str, json_schema: str):
     s += message
     s += sgl.gen("json_output", max_tokens=256, json_schema=json_schema)
 
-def convert_dataset(path : str):
+
+def convert_dataset(path: str):
     tmpl = get_chat_template_by_model_path("Llama-3.1-8B-Instruct")
 
     raw_dataset = load_dataset(path)
@@ -29,12 +32,15 @@ def convert_dataset(path : str):
             continue
         message = tmpl.get_prompt(messages)
 
-        dataset.append({
-            "message": message,
-            "json_schema": schema,
-        })
+        dataset.append(
+            {
+                "message": message,
+                "json_schema": schema,
+            }
+        )
 
     return dataset
+
 
 def bench_schema(args):
     arguments = convert_dataset(args.data_path)
