@@ -5,6 +5,7 @@ import contextvars
 import copy
 import multiprocessing
 import queue
+import re
 import threading
 import uuid
 import warnings
@@ -459,13 +460,20 @@ class StreamExecutor:
                 self, sampling_params=sampling_params
             )
 
+        def _find_single_stop(speculated_text: str, stop: str) -> int:
+            match = re.search(stop, speculated_text)
+            if match is None:
+                return -1
+                
+            return match.span()[0]
+
         def find_stop():
             if isinstance(stop, str):
-                return self.speculated_text.find(stop)
+                return _find_single_stop(stop, self.speculated_text)
             elif isinstance(stop, (tuple, list)):
                 pos = -1
                 for stop_str in stop:
-                    stop_pos = self.speculated_text.find(stop_str)
+                    stop_pos = _find_single_stop(stop_str, self.speculated_text)
                     if stop_pos != -1 and (pos == -1 or stop_pos < pos):
                         pos = stop_pos
                 return pos
