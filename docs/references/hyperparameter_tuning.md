@@ -34,7 +34,6 @@ If you see out of memory (OOM) errors, you can try to tune the following paramet
 - To enable the experimental overlapped scheduler, add `--enable-overlap-schedule`. It overlaps CPU scheduler with GPU computation and can accelerate almost all workloads. This does not work for constrained decoding currently.
 - To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. This does not work for FP8 currently.
 
-
 ### Tune `--schedule-policy`
 If the workload has many shared prefixes, use the default `--schedule-policy lpm`. `lpm` stands for longest prefix match.
 When you have no shared prefixes at all or you always send the requests with the shared prefixes together,
