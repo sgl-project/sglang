@@ -166,7 +166,7 @@ class ServerArgs:
 
         # Adjust for GPUs with small memory capacities
         gpu_mem = get_gpu_memory_capacity()
-        if gpu_mem < 250000:
+        if gpu_mem < 25000:
             logger.warning(
                 "Automatically adjust --chunked-prefill-size for small GPUs."
             )
