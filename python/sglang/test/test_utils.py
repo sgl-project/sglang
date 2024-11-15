@@ -673,7 +673,7 @@ def run_and_check_memory_leak(
     if enable_mixed_chunk:
         other_args += ["--enable-mixed-chunk"]
     if enable_overlap:
-        other_args += ["--enable-overlap-scheduler"]
+        other_args += ["--enable-overlap-schedule"]
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
     port = random.randint(4000, 5000)
