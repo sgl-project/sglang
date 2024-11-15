@@ -22,7 +22,12 @@ import random
 import tempfile
 from typing import List, Optional
 
-from sglang.srt.utils import is_flashinfer_available, is_ipv6, is_port_available
+from sglang.srt.utils import (
+    get_gpu_memory_capacity,
+    is_flashinfer_available,
+    is_ipv6,
+    is_port_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +148,9 @@ class ServerArgs:
             # Disable chunked prefill
             self.chunked_prefill_size = None
 
+        if self.random_seed is None:
+            self.random_seed = random.randint(0, 1 << 30)
+
         # Mem fraction depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
@@ -156,8 +164,14 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
-        if self.random_seed is None:
-            self.random_seed = random.randint(0, 1 << 30)
+        # Adjust for GPUs with small memory capacities
+        gpu_mem = get_gpu_memory_capacity()
+        if gpu_mem < 25000:
+            logger.warning(
+                "Automatically adjust --chunked-prefill-size for small GPUs."
+            )
+            self.chunked_prefill_size //= 4  # make it 2048
+            self.cuda_graph_max_bs = 4
 
         # Deprecation warnings
         if self.disable_flashinfer:
