@@ -184,6 +184,16 @@ class ServerArgs:
         if self.sampling_backend is None:
             self.sampling_backend = "flashinfer"
 
+        if self.enable_dp_attention:
+            self.dp_size = self.tp_size
+            self.chunked_prefill_size = self.chunked_prefill_size // 2
+            self.disable_cuda_graph = True
+            self.enable_overlap_schedule = False
+            logger.warning(
+                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE workload issue. "
+                "The CUDA graph is disabled."
+            )
+
         if self.enable_overlap_schedule:
             logger.warning(
                 "Overlap scheduler mode is enabled. This is an experimental feature. "
@@ -193,10 +203,6 @@ class ServerArgs:
             )
             self.disable_penalizer = True
             self.disable_nan_detection = True
-
-        if self.enable_dp_attention:
-            self.dp_size = self.tp_size
-            self.chunked_prefill_size = 4096
 
         # Model-specific patches
         if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
