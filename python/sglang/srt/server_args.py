@@ -171,7 +171,7 @@ class ServerArgs:
                 "Automatically adjust --chunked-prefill-size for small GPUs."
             )
             self.chunked_prefill_size /= 4  # make it 2048
-            self.cuda_graph_max_bs = 8
+            self.cuda_graph_max_bs = 4
 
         # Deprecation warnings
         if self.disable_flashinfer:
