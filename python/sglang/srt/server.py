@@ -768,7 +768,7 @@ class Engine:
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
         prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Dict] = None,
+        sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
