@@ -1,7 +1,7 @@
 """
 Benchmark the throughput of using the offline LLM engine.
 This script does not launch a server.
-It accepts the same arguments as launch_server.py and additional benchmark arguments
+It accepts server arguments (the same as launch_server.py) and benchmark arguments (the same as bench_serving.py).
 
 # Usage
 ## Sharegpt dataset with default args
