@@ -158,7 +158,7 @@ class TestSRTEngine(unittest.TestCase):
         server_args = ServerArgs(
             model_path=DEFAULT_MODEL_NAME_FOR_TEST,
         )
-        bench_args = BenchArgs(num_prompts=10)
+        bench_args = BenchArgs(num_prompts=100)
         result = throughput_test(server_args=server_args, bench_args=bench_args)
         self.assertTrue(result["total_throughput"] > 3000)
 
