@@ -1,12 +1,12 @@
 import argparse
 import json
 import time
+from typing import Tuple
 
 import jsonschema
 from datasets import load_dataset
 
 import sglang as sgl
-from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -15,14 +15,16 @@ from sglang.utils import dump_state_text
 
 
 @sgl.function
-def schema_gen(s, message: str, json_schema: str):
-    s += message
-    s += sgl.gen("json_output", temperature=0, max_tokens=256, json_schema=json_schema)
+def schema_gen(s, message: Tuple[str, str], json_schema: str):
+    system, user = message
+    s += sgl.system(system)
+    s += sgl.user(user)
+    s += sgl.assistant(
+        sgl.gen("json_output", temperature=0, max_tokens=256, json_schema=json_schema)
+    )
 
 
 def convert_dataset(path: str):
-    tmpl = get_chat_template_by_model_path("Llama-3.1-8B-Instruct")
-
     raw_dataset = load_dataset(path)
     dataset = []
     for data in raw_dataset["train"]:
@@ -31,10 +33,12 @@ def convert_dataset(path: str):
         obj = json.loads(schema)
         if obj.get("type", None) is None:
             continue
-        message = (
-            tmpl.get_prompt(messages)
-            + "<|start_header_id|>assistant<|end_header_id|>\n\n"
-        )
+        system = messages[0]
+        user = messages[1]
+        assert system["role"] == "system", "invalid role"
+        assert user["role"] == "user", "invalid role"
+        assert len(messages) == 2, "invalid message length"
+        message = json.dumps(system["content"]), json.dumps(user["content"])
         dataset.append(
             {
                 "message": message,
