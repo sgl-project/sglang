@@ -17,6 +17,31 @@ limitations under the License.
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
+# PyTorch Tensor Parallel Available for This Model
+"""
+This model supports tensor parallelism (TP) using the PyTorch tensor parallel package.
+Reference: https://pytorch.org/docs/stable/distributed.tensor.parallel.html
+
+Here is a quick example to enable TP:
+```python
+from sglang.srt.model_parallel import tensor_parallel
+
+device_mesh = torch.distributed.init_device_mesh("cuda", (tp_size,))
+tensor_parallel(model, device_mesh)
+```
+
+An end-to-end example can be found in `python/sglang/bench_latency.py`.
+You can run it with the following command:
+```bash
+$ python3 -m sglang.bench_latency --correct \
+  --model meta-llama/Meta-Llama-3-8B \
+  --json-model-override-args '{"architectures": ["TorchNativeLlamaForCausalLM"]}' \
+  --tensor-parallel-size 2 \
+  --disable-cuda-graph
+```
+We will eanble CUDA Graph support soon.
+"""
+
 import types
 from typing import Any, Dict, Iterable, Optional, Tuple
 
