@@ -86,7 +86,7 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
 
-            if server_args.enable_dp_mla:
+            if server_args.enable_dp_attention:
                 # Share workers for DP and TP
                 send_to, reader = self.launch_tensor_parallel_process(
                     server_args,

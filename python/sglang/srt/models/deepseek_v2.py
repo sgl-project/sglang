@@ -532,33 +532,28 @@ class DeepseekV2AttentionMLA(nn.Module):
         return output
 
 
-def all_gather(input_tensor: torch.Tensor, rank, world_size, group):
+def all_gather(
+    input_tensor: torch.Tensor, forward_batch: ForwardBatch, rank, world_size, group
+):
     if world_size == 1:
         return input_tensor
 
-    seq_len = input_tensor.size(0)
-    local_len = torch.tensor([seq_len], dtype=torch.int64, device=input_tensor.device)
-    all_lens = [torch.zeros_like(local_len) for _ in range(world_size)]
+    all_lens = forward_batch.global_num_tokens
+    max_len = max(forward_batch.global_num_tokens)
 
-    torch.distributed.all_gather(all_lens, local_len, group=group)
+    padded_tensor = torch.nn.functional.pad(
+        input_tensor, (0, 0, 0, max_len - input_tensor.shape[0])
+    )
 
-    max_len = max(l.item() for l in all_lens)
-    all_lens = [l.item() for l in all_lens]
-
-    if len(input_tensor.size()) == 1:
-        padded_tensor = torch.nn.functional.pad(
-            input_tensor, (0, max_len - input_tensor.shape[0])
-        )
-    else:
-        padded_tensor = torch.nn.functional.pad(
-            input_tensor, (0, 0, 0, max_len - input_tensor.shape[0])
-        )
-
-    output_tensors = [torch.zeros_like(padded_tensor) for _ in range(world_size)]
-    torch.distributed.all_gather(output_tensors, padded_tensor, group=group)
+    torch.distributed.all_gather_into_tensor(
+        forward_batch.gathered_buffer, padded_tensor, group=group
+    )
 
     gathered_tensors = torch.concat(
-        [output_tensors[i][: all_lens[i]] for i in range(world_size)]
+        [
+            forward_batch.gathered_buffer[i * max_len : i * max_len + all_lens[i]]
+            for i in range(world_size)
+        ]
     )
 
     start_index = 0 if rank == 0 else sum(all_lens[:rank])
@@ -581,11 +576,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.enable_dp_mla = (
+        self.enable_dp_attention = (
             not global_server_args_dict["disable_mla"]
-            and global_server_args_dict["enable_dp_mla"]
+            and global_server_args_dict["enable_dp_attention"]
         )
-        if self.enable_dp_mla:
+        if self.enable_dp_attention:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
             self.tp_group = get_tp_group().device_group
@@ -607,7 +602,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 layer_id=layer_id,
-                use_dp=self.enable_dp_mla,
+                use_dp=self.enable_dp_attention,
             )
         else:
             self.self_attn = DeepseekV2Attention(
@@ -671,9 +666,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        if self.enable_dp_mla:
+        if self.enable_dp_attention:
             hidden_states, start_idx, end_idx = all_gather(
-                hidden_states, self.tp_rank, self.tp_size, self.tp_group
+                hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
             )
             hidden_states = self.mlp(hidden_states)
             hidden_states = hidden_states[start_idx:end_idx]
@@ -700,7 +695,7 @@ class DeepseekV2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_mla"],
+            enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.layers = nn.ModuleList(
             [
@@ -745,7 +740,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = DeepseekV2Model(config, cache_config, quant_config)
-        if global_server_args_dict["enable_dp_mla"]:
+        if global_server_args_dict["enable_dp_attention"]:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,
                 config.vocab_size,

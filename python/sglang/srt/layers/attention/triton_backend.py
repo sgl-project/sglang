@@ -29,7 +29,7 @@ class TritonAttnBackend(AttentionBackend):
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
 
-        if model_runner.server_args.enable_dp_mla:
+        if model_runner.server_args.enable_dp_attention:
             self.num_head = model_runner.model_config.num_attention_heads
         else:
             self.num_head = (

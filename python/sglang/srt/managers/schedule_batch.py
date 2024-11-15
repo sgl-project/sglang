@@ -56,7 +56,7 @@ global_server_args_dict = {
     "disable_mla": ServerArgs.disable_mla,
     "torchao_config": ServerArgs.torchao_config,
     "disable_nan_detection": ServerArgs.disable_nan_detection,
-    "enable_dp_mla": ServerArgs.enable_dp_mla,
+    "enable_dp_attention": ServerArgs.enable_dp_attention,
 }
 
 
@@ -452,6 +452,9 @@ class ScheduleBatch:
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
+
+    # For DP attention
+    global_num_tokens: Optional[List[int]] = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -1006,6 +1009,7 @@ class ScheduleBatch:
             req_to_token_pool_records=self.req_to_token_pool.get_write_records(),
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
+            global_num_tokens=self.global_num_tokens,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -1061,6 +1065,9 @@ class ModelWorkerBatch:
     # For logprob
     return_logprob: bool
     top_logprobs_nums: Optional[List[int]]
+
+    # For DP attention
+    global_num_tokens: Optional[List[int]]
 
     # For extend
     extend_num_tokens: Optional[int]

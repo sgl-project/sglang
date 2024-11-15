@@ -121,7 +121,7 @@ class ServerArgs:
     disable_nan_detection: bool = False
     enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
-    enable_dp_mla: bool = False
+    enable_dp_attention: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: int = 160
@@ -194,7 +194,7 @@ class ServerArgs:
             self.disable_penalizer = True
             self.disable_nan_detection = True
 
-        if self.enable_dp_mla:
+        if self.enable_dp_attention:
             self.dp_size = self.tp_size
             self.chunked_prefill_size = 4096
 
@@ -650,9 +650,9 @@ class ServerArgs:
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
         )
         parser.add_argument(
-            "--enable-dp-mla",
+            "--enable-dp-attention",
             action="store_true",
-            help="Enabling data parallelism for DeepSeek MLA and tensor parallelism for MoE. The dp size should be equal to the tp size",
+            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
         )
         parser.add_argument(
             "--enable-torch-compile",

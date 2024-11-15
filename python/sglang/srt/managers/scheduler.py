@@ -110,7 +110,7 @@ class Scheduler:
         # Init inter-process communication
         context = zmq.Context(2)
 
-        if self.tp_rank == 0 or self.server_args.enable_dp_mla:
+        if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name
             )
@@ -333,12 +333,8 @@ class Scheduler:
 
             batch = self.get_next_batch_to_run()
 
-            if (
-                self.server_args.enable_dp_mla
-                and self.check_dp_batch_running(batch)
-                and batch is None
-            ):
-                batch = self.get_idle_batch()
+            if self.server_args.enable_dp_attention:
+                batch = self.prepare_dp_attn_batch(batch)
 
             self.cur_batch = batch
 
@@ -354,16 +350,13 @@ class Scheduler:
                         self.update_running_batch()
                         if not self.running_batch:
                             break
-                        if self.server_args.enable_dp_mla:
-                            self.check_dp_batch_running(batch)
+                        if self.server_args.enable_dp_attention:
+                            batch = self.prepare_dp_attn_batch(batch)
                         result = self.run_batch(batch)
                         self.process_batch_result(batch, result)
             else:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
-
-            if batch and batch.forward_mode.is_idle():
-                continue
 
             self.last_batch = batch
 
@@ -394,17 +387,34 @@ class Scheduler:
 
             self.last_batch = batch
 
-    def check_dp_batch_running(self, local_batch):
+    def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
         # Check if other DP workers have running batches
-        local_value = torch.tensor(
-            [1 if local_batch is not None else 0], dtype=torch.int32, device=self.device
+        if local_batch is None:
+            num_tokens = 0
+        elif local_batch.forward_mode.is_decode():
+            num_tokens = local_batch.batch_size()
+        else:
+            num_tokens = local_batch.extend_num_tokens
+
+        local_num_tokens = torch.tensor(
+            num_tokens, dtype=torch.int64, device=self.device
         )
-        torch.distributed.all_reduce(
-            local_value,
-            op=torch.distributed.ReduceOp.MAX,
+        global_num_tokens = torch.empty(
+            self.tp_size, dtype=torch.int64, device=self.device
+        )
+        torch.distributed.all_gather_into_tensor(
+            global_num_tokens,
+            local_num_tokens,
             group=self.tp_worker.get_tp_device_group(),
         )
-        return local_value.item() == 1
+
+        if local_batch is None and global_num_tokens.max().item() > 0:
+            local_batch = self.get_idle_batch()
+
+        if local_batch is not None:
+            local_batch.global_num_tokens = global_num_tokens.tolist()
+
+        return local_batch
 
     def get_idle_batch(self):
         idle_batch = ScheduleBatch.init_new(
@@ -418,7 +428,7 @@ class Scheduler:
         return idle_batch
 
     def recv_requests(self):
-        if self.tp_rank == 0 or self.server_args.enable_dp_mla:
+        if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             recv_reqs = []
 
             while True:
@@ -430,7 +440,7 @@ class Scheduler:
         else:
             recv_reqs = None
 
-        if self.tp_size != 1 and not self.server_args.enable_dp_mla:
+        if self.tp_size != 1 and not self.server_args.enable_dp_attention:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs
 
