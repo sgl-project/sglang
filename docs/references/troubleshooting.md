@@ -11,4 +11,4 @@ If you see out of memory (OOM) errors, you can try to tune the following paramet
 ## CUDA error: an illegal memory access was encountered
 This error may be due to kernel errors or out-of-memory issues.
 - If it is a kernel error, it is not easy to fix. Please file an issue on the GitHub.
-- If it is out-of-memory, sometimes it will report this error instead of "Out-of-memory." Please refer to the above seciton to avoid the OOM.
+- If it is out-of-memory, sometimes it will report this error instead of "Out-of-memory." Please refer to the above section to avoid the OOM.
