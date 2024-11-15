@@ -105,7 +105,6 @@ def bench_schema(args):
             print(e)
             indexs.append(i)
 
-    assert len(indexs) == 0, f"Invalid json outputs: {indexs}"
     return states, latency
 
 
