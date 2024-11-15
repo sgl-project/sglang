@@ -47,7 +47,7 @@ def convert_dataset(path: str):
         )
 
     # skip a corrupted example
-    dataset = dataset[:53] + dataset[54:]
+    dataset = dataset[:54] + dataset[55:]
 
     return dataset
 
