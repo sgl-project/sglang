@@ -114,6 +114,9 @@ class Scheduler:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name
             )
+            self.send_to_tokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name
+            )
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the tokenizer/api
@@ -127,6 +130,7 @@ class Scheduler:
                 )
         else:
             self.recv_from_tokenizer = None
+            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init tokenizer
@@ -421,7 +425,7 @@ class Scheduler:
                 self.abort_request(recv_req)
             elif isinstance(recv_req, UpdateWeightReqInput):
                 success, message = self.update_weights(recv_req)
-                self.send_to_detokenizer.send_pyobj(
+                self.send_to_tokenizer.send_pyobj(
                     UpdateWeightReqOutput(success, message)
                 )
             elif isinstance(recv_req, ProfileReq):
@@ -430,7 +434,7 @@ class Scheduler:
                 else:
                     self.stop_profile()
             elif isinstance(recv_req, GetMemPoolSizeReq):
-                self.send_to_detokenizer.send_pyobj(
+                self.send_to_tokenizer.send_pyobj(
                     GetMemPoolSizeReqOutput(self.max_total_num_tokens)
                 )
             else:
