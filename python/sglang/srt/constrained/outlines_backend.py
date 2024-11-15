@@ -17,53 +17,33 @@ limitations under the License.
 
 import json
 import logging
-from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple, Union
 
+import interegular
 import torch
-from interegular import InvalidSyntax, parse_pattern
 from outlines.fsm.guide import RegexGuide
+from outlines.fsm.json_schema import build_regex_from_schema
 from outlines.models.transformers import TransformerTokenizer
 from pydantic import BaseModel
 
-from sglang.srt.constrained.base_tool_cache import BaseToolCache
-from sglang.srt.constrained.outlines_jump_forward import (
-    OutlinesJumpForwardCache,
-    OutlinesJumpForwardMap,
+from sglang.srt.constrained.base_grammar_backend import (
+    BaseGrammarBackend,
+    BaseGrammarObject,
 )
+from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
 
 logger = logging.getLogger(__name__)
 
 
-try:
-    from outlines.fsm.json_schema import build_regex_from_object
-except ImportError:
-    # Since outlines 0.0.32, build_regex_from_object is replaced by build_regex_from_schema,
-    # which only accepts string schema as input.
-    from outlines.fsm.json_schema import build_regex_from_schema
-
-    def build_regex_from_object(
-        object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
-    ):
-        if isinstance(object, type(BaseModel)):
-            schema = json.dumps(object.model_json_schema())
-        elif isinstance(object, Dict):
-            schema = json.dumps(object)
-        else:
-            schema = object
-        return build_regex_from_schema(schema, whitespace_pattern)
-
-
-class OutlinesGrammar:
+class OutlinesGrammar(BaseGrammarObject):
     def __init__(
         self,
         guide: RegexGuide,
-        state: int,
         jump_forward_map: Union[OutlinesJumpForwardMap, None],
     ) -> None:
         self.guide = guide
-        self.state = state
         self.jump_forward_map = jump_forward_map
+        self.state = 0
 
     def accept_token(self, token: int):
         self.state = self.guide.get_next_state(self.state, token)
@@ -105,46 +85,18 @@ class OutlinesGrammar:
         vocab_mask.fill_(1)
         vocab_mask[self.guide.get_next_instruction(self.state).tokens] = 0
 
+    def copy(self):
+        return OutlinesGrammar(self.guide, self.jump_forward_map)
 
-class OutlinesGrammarBackend:
+
+class OutlinesGrammarBackend(BaseGrammarBackend):
     def __init__(
         self,
         tokenizer,
-        whitespace_patterns: bool,
+        whitespace_pattern: bool,
         allow_jump_forward: bool,
     ):
-        self.executor = ThreadPoolExecutor()
-        self.grammar_cache = OutlinesCache(
-            tokenizer,
-            whitespace_pattern=whitespace_patterns,
-        )
-        self.jump_forward_cache = (
-            OutlinesJumpForwardCache() if allow_jump_forward else None
-        )
-
-    def _query(self, key: Tuple[str, str]) -> OutlinesGrammar:
-        guide, regex = self.grammar_cache.query(key)
-        jump_forward_map = (
-            self.jump_forward_cache.query(regex) if self.jump_forward_cache else None
-        )
-        return OutlinesGrammar(guide, 0, jump_forward_map)
-
-    def query(self, key: Tuple[str, str]) -> Future:
-        return self.executor.submit(self._query, key)
-
-    def reset(self):
-        self.grammar_cache.reset()
-        if self.jump_forward_cache:
-            self.jump_forward_cache.reset()
-
-
-class OutlinesCache(BaseToolCache):
-    def __init__(
-        self,
-        tokenizer,
-        whitespace_pattern=None,
-    ):
-        super().__init__(enable=True)
+        super().__init__()
 
         try:
             self.outlines_tokenizer = TransformerTokenizer(tokenizer)
@@ -167,9 +119,10 @@ class OutlinesCache(BaseToolCache):
             self.outlines_tokenizer.vocabulary = (
                 self.outlines_tokenizer.tokenizer.get_vocab()
             )
+        self.allow_jump_forward = allow_jump_forward
         self.whitespace_pattern = whitespace_pattern
 
-    def init_value(self, key):
+    def init_value_impl(self, key: Tuple[str, str]) -> OutlinesGrammar:
         key_type, key_string = key
         if key_type == "json":
             try:
@@ -177,27 +130,36 @@ class OutlinesCache(BaseToolCache):
                     key_string,
                     whitespace_pattern=self.whitespace_pattern,
                 )
-            except NotImplementedError as e:
+            except (NotImplementedError, json.decoder.JSONDecodeError) as e:
                 logger.warning(
-                    f"skip invalid json schema: json_schema={key_string}, {e=}"
+                    f"Skip invalid json_schema: json_schema={key_string}, {e=}"
                 )
-                return None, key_string
+                return None
         elif key_type == "regex":
             regex = key_string
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
+
         try:
-            parse_pattern(regex)
-        except InvalidSyntax as e:
-            logger.warning(f"skip invalid regex guide: {regex=}, {e=}")
-            return None, regex
+            guide = RegexGuide(regex, self.outlines_tokenizer)
+        except interegular.patterns.InvalidSyntax as e:
+            logger.warning(f"skip invalid regex schema: {regex=}, {e=}")
+            return None
 
-        ret = RegexGuide(regex, self.outlines_tokenizer), regex
-        return ret
+        if self.allow_jump_forward:
+            jump_forward_map = OutlinesJumpForwardMap(regex)
+        else:
+            jump_forward_map = None
+        return OutlinesGrammar(guide, jump_forward_map)
 
-    def _query(self, key: Tuple[str, str]):
-        guide, regex = self.grammar_cache.query(key)
-        jump_forward_map = (
-            self.jump_forward_cache.query(regex) if self.jump_forward_cache else None
-        )
-        return OutlinesGrammar(guide, 0, jump_forward_map)
+
+def build_regex_from_object(
+    object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
+):
+    if isinstance(object, type(BaseModel)):
+        schema = json.dumps(object.model_json_schema())
+    elif isinstance(object, Dict):
+        schema = json.dumps(object)
+    else:
+        schema = object
+    return build_regex_from_schema(schema, whitespace_pattern)

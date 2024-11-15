@@ -15,7 +15,7 @@ limitations under the License.
 
 """Constrained decoding with xgrammar backend."""
 
-from concurrent.futures import Future, ThreadPoolExecutor
+import logging
 from typing import List, Tuple
 
 import torch
@@ -25,28 +25,39 @@ try:
 
     import_error = None
 except ImportError as e:
+    CachedGrammarCompiler = CompiledGrammar = GrammarMatcher = TokenizerInfo = (
+        ImportError
+    )
     import_error = e
 
-    class Dummy:
-        pass
+from sglang.srt.constrained.base_grammar_backend import (
+    BaseGrammarBackend,
+    BaseGrammarObject,
+)
 
-    GrammarMatcher = CompiledGrammar = CachedGrammarCompiler = Dummy
+logger = logging.getLogger(__name__)
 
 
 MAX_ROLLBACK_TOKENS = 10
 
 
-class XGrammarGrammar:
+class XGrammarGrammar(BaseGrammarObject):
 
-    def __init__(self, matcher: GrammarMatcher, vocab_size: int) -> None:
+    def __init__(
+        self, matcher: GrammarMatcher, vocab_size: int, ctx: CompiledGrammar
+    ) -> None:
         self.matcher = matcher
         self.vocab_size = vocab_size
+        self.ctx = ctx
 
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
 
     def try_jump_forward(self, tokenizer) -> Tuple[List[int], str]:
-        return [], self.matcher.find_jump_forward_string()
+        s = self.matcher.find_jump_forward_string()
+        if s:
+            return [], s
+        return None
 
     def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
         _, data = helper
@@ -77,51 +88,63 @@ class XGrammarGrammar:
             self.matcher.get_rejected_tokens_from_bitmask(bitmask, self.vocab_size)
         ] = 1
 
+    def copy(self):
+        matcher = GrammarMatcher(
+            self.ctx,
+            max_rollback_tokens=MAX_ROLLBACK_TOKENS,
+            mask_vocab_size=self.vocab_size,
+        )
+        return XGrammarGrammar(matcher, self.vocab_size, self.ctx)
 
-class XGrammarGrammarBackend:
+
+class XGrammarGrammarBackend(BaseGrammarBackend):
     def __init__(
         self,
         tokenizer,
         vocab_size: int,
     ):
+        super().__init__()
+
         if import_error:
-            raise import_error
+            logger.warning(
+                f"Ignore import error for the grammar backend: {import_error}"
+            )
+            self.grammar_cache = None
+            return
 
-        self.executor = ThreadPoolExecutor()
-        self.grammar_cache = XGrammarCache(tokenizer, vocab_size)
-        self.vocab_size = vocab_size
-
-    def _query(self, key: Tuple[str, str]) -> XGrammarGrammar:
-        return XGrammarGrammar(self.grammar_cache.query(key), self.vocab_size)
-
-    def query(self, key: Tuple[str, str]) -> Future:
-        return self.executor.submit(self._query, key)
-
-    def reset(self):
-        self.grammar_cache.reset()
-
-
-class XGrammarCache:
-    def __init__(self, tokenizer, vocab_size: int):
         self.grammar_cache = CachedGrammarCompiler(tokenizer_or_vocab=tokenizer)
         self.vocab_size = vocab_size
 
-    def get_context(self, key: Tuple[str, str]) -> CompiledGrammar:
+    def init_value_impl(self, key: Tuple[str, str]) -> XGrammarGrammar:
+        if import_error:
+            raise import_error
+
         key_type, key_string = key
         if key_type == "json":
-            return self.grammar_cache.get_compiled_grammar_for_json_schema(key_string)
+            try:
+                ctx = self.grammar_cache.get_compiled_grammar_for_json_schema(
+                    key_string
+                )
+            except RuntimeError as e:
+                logging.warning(
+                    f"Skip invalid json_schema: json_schema={key_string}, {e=}"
+                )
+                return None
         elif key_type == "regex":
-            raise ValueError("regex hasn't been supported by xgrammar yet")
+            logger.warning(
+                "regex hasn't been supported by xgrammar yet. This is skipped."
+            )
+            return None
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
-    def query(self, key: Tuple[str, str]) -> GrammarMatcher:
-        ctx = self.get_context(key)
-        return GrammarMatcher(
+        matcher = GrammarMatcher(
             ctx,
             max_rollback_tokens=MAX_ROLLBACK_TOKENS,
             mask_vocab_size=self.vocab_size,
         )
+        return XGrammarGrammar(matcher, self.vocab_size, ctx)
 
     def reset(self):
-        self.grammar_cache.clear()
+        if self.grammar_cache:
+            self.grammar_cache.clear()

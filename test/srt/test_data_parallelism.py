@@ -40,7 +40,7 @@ class TestDataParallelism(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.65
+        self.assertGreaterEqual(metrics["score"], 0.65)
 
     def test_update_weight(self):
         response = requests.post(
