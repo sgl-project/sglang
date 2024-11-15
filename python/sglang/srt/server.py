@@ -139,6 +139,7 @@ async def get_model_info():
     """Get the model information."""
     result = {
         "model_path": tokenizer_manager.model_path,
+        "tokenizer_path": tokenizer_manager.server_args.tokenizer_path,
         "is_generation": tokenizer_manager.is_generation,
     }
     return result
