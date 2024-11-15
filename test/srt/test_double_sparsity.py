@@ -55,7 +55,7 @@ class TestDoubleSparsity(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.65
+        self.assertGreaterEqual(metrics["score"], 0.65)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,12 @@ import random
 import tempfile
 from typing import List, Optional
 
-from sglang.srt.utils import is_flashinfer_available, is_ipv6, is_port_available
+from sglang.srt.utils import (
+    get_gpu_memory_capacity,
+    is_flashinfer_available,
+    is_ipv6,
+    is_port_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +69,7 @@ class ServerArgs:
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
+    download_dir: Optional[str] = None
 
     # Logging
     log_level: str = "info"
@@ -111,7 +117,7 @@ class ServerArgs:
     disable_flashinfer: bool = False
     disable_flashinfer_sampling: bool = False
     disable_radix_cache: bool = False
-    disable_regex_jump_forward: bool = False
+    disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     disable_disk_cache: bool = False
@@ -143,6 +149,9 @@ class ServerArgs:
             # Disable chunked prefill
             self.chunked_prefill_size = None
 
+        if self.random_seed is None:
+            self.random_seed = random.randint(0, 1 << 30)
+
         # Mem fraction depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
@@ -156,8 +165,14 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
-        if self.random_seed is None:
-            self.random_seed = random.randint(0, 1 << 30)
+        # Adjust for GPUs with small memory capacities
+        gpu_mem = get_gpu_memory_capacity()
+        if gpu_mem < 25000:
+            logger.warning(
+                "Automatically adjust --chunked-prefill-size for small GPUs."
+            )
+            self.chunked_prefill_size //= 4  # make it 2048
+            self.cuda_graph_max_bs = 4
 
         # Deprecation warnings
         if self.disable_flashinfer:
@@ -416,6 +431,12 @@ class ServerArgs:
             default=ServerArgs.watchdog_timeout,
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
         )
+        parser.add_argument(
+            "--download-dir",
+            type=str,
+            default=ServerArgs.download_dir,
+            help="Model download directory.",
+        )
 
         # Logging
         parser.add_argument(
@@ -585,7 +606,7 @@ class ServerArgs:
             type=str,
             choices=["xgrammar", "outlines"],
             default=ServerArgs.grammar_backend,
-            help="Choose the backend for constrained decoding.",
+            help="Choose the backend for grammar-guided decoding.",
         )
 
         # Optimization/debug options
@@ -605,9 +626,9 @@ class ServerArgs:
             help="Disable RadixAttention for prefix caching.",
         )
         parser.add_argument(
-            "--disable-regex-jump-forward",
+            "--disable-jump-forward",
             action="store_true",
-            help="Disable regex jump-forward.",
+            help="Disable jump-forward for grammar-guided decoding.",
         )
         parser.add_argument(
             "--disable-cuda-graph",
@@ -627,7 +648,6 @@ class ServerArgs:
         parser.add_argument(
             "--disable-custom-all-reduce",
             action="store_true",
-            default=False,
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
@@ -704,7 +724,6 @@ class ServerArgs:
         )
         parser.add_argument(
             "--delete-ckpt-after-loading",
-            default=ServerArgs.delete_ckpt_after_loading,
             action="store_true",
             help="Delete the model checkpoint after loading the model.",
         )

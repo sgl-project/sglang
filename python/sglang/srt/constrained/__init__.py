@@ -13,30 +13,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import json
-from typing import Dict, Optional, Union
-
-from pydantic import BaseModel
-
-try:
-    from outlines.fsm.json_schema import build_regex_from_object
-except ImportError:
-    # Since outlines 0.0.32, build_regex_from_object is replaced by build_regex_from_schema,
-    # which only accepts string schema as input.
-    from outlines.fsm.json_schema import build_regex_from_schema
-
-    def build_regex_from_object(
-        object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
-    ):
-        if isinstance(object, type(BaseModel)):
-            schema = json.dumps(object.model_json_schema())
-        elif isinstance(object, Dict):
-            schema = json.dumps(object)
-        else:
-            schema = object
-        return build_regex_from_schema(schema, whitespace_pattern)
-
-
-__all__ = [
-    "build_regex_from_object",
-]
+# TODO(lmzheng): make this an optional dependency
+from sglang.srt.constrained.outlines_backend import build_regex_from_object
