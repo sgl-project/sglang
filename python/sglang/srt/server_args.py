@@ -64,6 +64,7 @@ class ServerArgs:
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
+    download_dir: Optional[str] = None
 
     # Logging
     log_level: str = "info"
@@ -111,7 +112,7 @@ class ServerArgs:
     disable_flashinfer: bool = False
     disable_flashinfer_sampling: bool = False
     disable_radix_cache: bool = False
-    disable_regex_jump_forward: bool = False
+    disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     disable_disk_cache: bool = False
@@ -405,6 +406,12 @@ class ServerArgs:
             default=ServerArgs.watchdog_timeout,
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
         )
+        parser.add_argument(
+            "--download-dir",
+            type=str,
+            default=ServerArgs.download_dir,
+            help="Model download directory.",
+        )
 
         # Logging
         parser.add_argument(
@@ -574,7 +581,7 @@ class ServerArgs:
             type=str,
             choices=["xgrammar", "outlines"],
             default=ServerArgs.grammar_backend,
-            help="Choose the backend for constrained decoding.",
+            help="Choose the backend for grammar-guided decoding.",
         )
 
         # Optimization/debug options
@@ -594,9 +601,9 @@ class ServerArgs:
             help="Disable RadixAttention for prefix caching.",
         )
         parser.add_argument(
-            "--disable-regex-jump-forward",
+            "--disable-jump-forward",
             action="store_true",
-            help="Disable regex jump-forward.",
+            help="Disable jump-forward for grammar-guided decoding.",
         )
         parser.add_argument(
             "--disable-cuda-graph",
@@ -616,7 +623,6 @@ class ServerArgs:
         parser.add_argument(
             "--disable-custom-all-reduce",
             action="store_true",
-            default=False,
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
@@ -688,7 +694,6 @@ class ServerArgs:
         )
         parser.add_argument(
             "--delete-ckpt-after-loading",
-            default=ServerArgs.delete_ckpt_after_loading,
             action="store_true",
             help="Delete the model checkpoint after loading the model.",
         )

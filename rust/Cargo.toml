@@ -24,3 +24,7 @@ futures-util = "0.3"
 serde_json = "1.0"
 pyo3 = { version = "0.22.5", features = ["extension-module"] }
 tokenizers = { version = "0.20.3", features = ["http"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

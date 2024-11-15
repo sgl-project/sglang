@@ -11,7 +11,9 @@ from types import SimpleNamespace
 import torch
 
 import sglang as sgl
+from sglang.bench_offline_throughput import BenchArgs, throughput_test
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.server_args import ServerArgs
 from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -151,6 +153,14 @@ class TestSRTEngine(unittest.TestCase):
         runtime.shutdown()
 
         self.assertTrue(torch.allclose(out1, out2, atol=1e-5, rtol=1e-3))
+
+    def test_7_engine_offline_throughput(self):
+        server_args = ServerArgs(
+            model_path=DEFAULT_MODEL_NAME_FOR_TEST,
+        )
+        bench_args = BenchArgs(num_prompts=100)
+        result = throughput_test(server_args=server_args, bench_args=bench_args)
+        self.assertTrue(result["total_throughput"] > 3000)
 
 
 if __name__ == "__main__":
