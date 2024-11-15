@@ -46,13 +46,16 @@ def convert_dataset(path: str):
             }
         )
 
+    # skip a corrupted example
+    dataset = dataset[:53] + dataset[54:]
+
     return dataset
 
 
 def bench_schema(args):
     arguments = convert_dataset(args.data_path)
 
-    if args.num_jsons == -1:
+    if args.num_jsons < 0 or args.num_jsons > len(arguments):
         args.num_jsons = len(arguments)
     arguments = arguments[: args.num_jsons]
 
