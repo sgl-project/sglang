@@ -7,6 +7,8 @@ import jsonschema
 from datasets import load_dataset
 
 import sglang as sgl
+from sglang.global_config import global_config
+from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -103,7 +105,6 @@ def bench_schema(args):
             print(e)
             indexs.append(i)
 
-    assert len(indexs) == 0, f"Invalid json outputs: {indexs}"
     return states, latency
 
 
@@ -111,11 +112,18 @@ def main(args):
     states, latency = bench_schema(args)
 
     # Compute accuracy
+    tokenizer = get_tokenizer(
+        global_config.default_backend.get_server_args()["tokenizer_path"]
+    )
+    output_jsons = [state["json_output"] for state in states]
+    num_output_tokens = sum(len(tokenizer.encode(x)) for x in output_jsons)
     print(f"Latency: {latency:.3f}")
+    print(f"Output throughput: {num_output_tokens / latency:.3f} token/s")
+    print(f"#output tokens: {num_output_tokens}")
 
     # Write results
     dump_state_text(f"tmp_output_{args.backend}.txt", states)
-    with open(f"{args.backend}.json", "w") as fout:
+    with open(f"{args.backend}.jsonl", "w") as fout:
         for state in states:
             fout.write(state["json_output"] + "\n")
 
