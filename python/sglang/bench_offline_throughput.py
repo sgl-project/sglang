@@ -1,20 +1,20 @@
 """
 Benchmark the throughput of using the offline LLM engine.
 This script does not launch a server.
-It accepts the same arguments as launch_server.py and additional benchmark arguments
+It accepts server arguments (the same as launch_server.py) and benchmark arguments (the same as bench_serving.py).
 
 # Usage
 ## Sharegpt dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct
 
 ## Random dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --dataset-name random
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name random
 
 ## Shared prefix dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --dataset-name generated-shared-prefix
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name generated-shared-prefix
 
 ## Sharegpt dataset on runtime backend
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3-8B-Instruct --backend runtime
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --backend runtime
 """
 
 import argparse
@@ -23,7 +23,7 @@ import json
 import logging
 import random
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -45,14 +45,15 @@ class BenchArgs:
     dataset_name: str = "sharegpt"
     dataset_path: str = ""
     num_prompts: int = 1000
-    sharegpt_output_len: int = 256
-    random_input_len: int = 256
-    random_output_len: int = 256
+    sharegpt_output_len: Optional[int] = None
+    random_input_len: int = 1024
+    random_output_len: int = 1024
     random_range_ratio: float = 0.0
-    gen_num_groups: int = 8
+    gen_num_groups: int = 64
     gen_prompts_per_group: int = 16
-    gen_system_prompt_len: int = 128
-    gen_question_len: int = 256
+    gen_system_prompt_len: int = 2048
+    gen_question_len: int = 128
+    gen_output_len: int = 256
     disable_ignore_eos: bool = False
     seed: int = 1
 
@@ -130,6 +131,12 @@ class BenchArgs:
             help="Question length, used" "only for generate-shared-prefix",
         )
         parser.add_argument(
+            "--gen-output-len",
+            type=int,
+            default=BenchArgs.gen_output_len,
+            help="Target length in tokens for outputs in generated-shared-prefix dataset",
+        )
+        parser.add_argument(
             "--disable-ignore-eos",
             type=bool,
             default=BenchArgs.disable_ignore_eos,
@@ -139,12 +146,8 @@ class BenchArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
-        # use the default value's type to case the args into correct types.
-        attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
-        print(attrs)
-        return cls(
-            **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
-        )
+        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
 def throughput_test_once(
@@ -224,6 +227,7 @@ def throughput_test(
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)
 
+    # Read dataset
     input_requests = get_dataset(bench_args, tokenizer)
 
     warmup_requests = sample_random_requests(

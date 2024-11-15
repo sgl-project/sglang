@@ -1241,10 +1241,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--random-input-len",
         type=int,
+        default=1024,
         help="Number of input tokens per request, used only for random dataset.",
     )
     parser.add_argument(
         "--random-output-len",
+        default=1024,
         type=int,
         help="Number of output tokens per request, used only for random dataset.",
     )
