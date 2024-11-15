@@ -1,5 +1,5 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.3.5.post1 -t testImage -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.3.5.post2 -t testImage -f Dockerfile.rocm .
 
 # default base image
 ARG BASE_IMAGE="rocm/vllm-dev:20241022"
