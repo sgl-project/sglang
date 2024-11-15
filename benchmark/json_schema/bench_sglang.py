@@ -1,7 +1,7 @@
 import argparse
 import json
 import time
-from typing import Tuple
+from typing import List, Tuple
 
 import jsonschema
 from datasets import load_dataset
@@ -24,6 +24,20 @@ def schema_gen(s, message: Tuple[str, str], json_schema: str):
     )
 
 
+def contains_formats(schema, formats: List[str]):
+    if isinstance(schema, dict):
+        if schema.get("format", None) in formats:
+            return True
+        for value in schema.values():
+            if contains_formats(value, formats):
+                return True
+    elif isinstance(schema, list):
+        for item in schema:
+            if contains_formats(item, formats):
+                return True
+    return False
+
+
 def convert_dataset(path: str):
     raw_dataset = load_dataset(path)
     dataset = []
@@ -31,8 +45,16 @@ def convert_dataset(path: str):
         messages = data["prompt"]
         schema = data["schema"]
         obj = json.loads(schema)
+
+        # skip some corrupted examples
         if obj.get("type", None) is None:
             continue
+
+        # skip schema with format "email"
+        # which is not supported by outlines for now
+        if contains_formats(obj, ["email"]):
+            continue
+
         system = messages[0]
         user = messages[1]
         assert system["role"] == "system", "invalid role"
@@ -45,9 +67,6 @@ def convert_dataset(path: str):
                 "json_schema": schema,
             }
         )
-
-    # skip a corrupted example
-    dataset = dataset[:54] + dataset[55:]
 
     return dataset
 
