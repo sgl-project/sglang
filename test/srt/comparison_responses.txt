@@ -1,0 +1,98 @@
+Text vs Embedding Response Comparison
+========================================
+Input Text: The capital of France is
+
+Text-based response:
+{"text":" Paris. It is the seat of the government of France. It is the capital of the country of France. It is the largest city in Europe. It is the largest city in the world. It is the capital of the department of Paris. It","meta_info":{"prompt_tokens":5,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"b4d64412a9f34f34b3221e1f527604ac"}}
+
+Embedding-based response:
+{"text":" Paris. It is the seat of the government of France. It is the capital of the country of France. It is the largest city in Europe. It is the largest city in the world. It is the capital of the department of Paris. It","meta_info":{"prompt_tokens":5,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"ac4a8f6195b34a9cb9930fe07fe46edd"}}
+--------------------------------------------------------------------------------
+Input Text: What is the best time of year to visit Japan for cherry blossoms?
+
+Text-based response:
+{"text":" The best time to visit Japan for cherry blossoms is during the cherry blossom season, which typically occurs from late March to early April. This is when the flowers bloom in full bloom, making it a popular destination for tourists and locals alike. The cherry","meta_info":{"prompt_tokens":15,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"3b274938737e4de291aab392d41932b6"}}
+
+Embedding-based response:
+{"text":" The best time to visit Japan for cherry blossoms is during the cherry blossom season, which typically occurs from late March to early April. This is when the flowers bloom in full bloom, making it a popular destination for tourists and locals alike. The cherry","meta_info":{"prompt_tokens":15,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"c792ab5a714f4411aba45839cf3efbe1"}}
+--------------------------------------------------------------------------------
+Input Text: How do I navigate the public transportation system in Tokyo?
+
+Text-based response:
+{"text":" Tokyo is a bustling city with a diverse range of public transportation options. Here's a general overview of how to navigate the public transportation system in Tokyo:\n\n**Public Transportation**\n\n1. **Bus**: Tokyo has a well-developed bus system, with over","meta_info":{"prompt_tokens":11,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"33f3e6a2c2874fc4aa005e2aa58e5bba"}}
+
+Embedding-based response:
+{"text":" Tokyo is a bustling city with a diverse range of public transportation options. Here's a general overview of how to navigate the public transportation system in Tokyo:\n\n**Public Transportation**\n\n1. **Bus**: Tokyo has a well-developed bus system, with over","meta_info":{"prompt_tokens":11,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"940fc3c4b0384172b010ef7bbd75949e"}}
+--------------------------------------------------------------------------------
+Input Text: What are some must-try traditional Japanese foods and where can I find them?
+
+Text-based response:
+{"text":" 1. Sushi: Sushi is a popular Japanese dish that consists of raw fish or vegetables served on a bed of rice. It is typically served with a variety of toppings such as pickled vegetables, soy sauce, and wasabi.\n\n2","meta_info":{"prompt_tokens":16,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"dbbe459a095146818918c5aa1416f73f"}}
+
+Embedding-based response:
+{"text":" 1. Sushi: Sushi is a popular Japanese dish that consists of raw fish or vegetables served on a bed of rice. It is typically served with a variety of toppings such as pickled vegetables, soy sauce, and wasabi.\n\n2","meta_info":{"prompt_tokens":16,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"49c41a582c7a40a9835bc0104bb8b6b3"}}
+--------------------------------------------------------------------------------
+Input Text: Is it necessary to learn Japanese to travel around Japan, or can I get by with English?
+
+Text-based response:
+{"text":" I'm a native English speaker, but I'm not sure if I can travel around Japan without learning Japanese. I'm planning to visit Japan for the first time in 2017, and I'm looking for a way to learn Japanese before","meta_info":{"prompt_tokens":19,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"ce71de79854f4a789517f4414843fd54"}}
+
+Embedding-based response:
+{"text":" I'm a native English speaker, but I'm not sure if I can travel around Japan without learning Japanese. I'm planning to visit Japan for the first time in 2017, and I'm looking for a way to learn Japanese before","meta_info":{"prompt_tokens":19,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"4c9fda05ea9b4d729a5e54afe8facd4a"}}
+--------------------------------------------------------------------------------
+Input Text: What are the most popular cultural sites and historical landmarks to visit in Kyoto?
+
+Text-based response:
+{"text":" Kyoto is a city with a rich cultural heritage, and there are many popular cultural sites and historical landmarks to visit. Here are some of the most popular ones:\n\n1. **Kiyomizu-dera Temple**: This is one of Kyoto's most","meta_info":{"prompt_tokens":15,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"48f0d6e52ae64b1a96c10acf32351f35"}}
+
+Embedding-based response:
+{"text":" Kyoto is a city with a rich cultural heritage, and there are many popular cultural sites and historical landmarks to visit. Here are some of the most popular ones:\n\n1. **Kiyomizu-dera Temple**: This is one of Kyoto's most","meta_info":{"prompt_tokens":15,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"a143f6b1194146f086afaefd6cfa56b5"}}
+--------------------------------------------------------------------------------
+Input Text: Are there any specific customs or etiquette I should be aware of when visiting temples and shrines?
+
+Text-based response:
+{"text":" Yes, there are several customs and etiquette you should be aware of when visiting temples and shrines:\n\n1. Respect the religious practices of the temple: When visiting a temple, it is important to respect the religious practices of the temple. Avoid touching the","meta_info":{"prompt_tokens":19,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"a63039f545aa4976ab1c1736f0d13a3e"}}
+
+Embedding-based response:
+{"text":" Yes, there are several customs and etiquette you should be aware of when visiting temples and shrines:\n\n1. Respect the religious practices of the temple: When visiting a temple, it is important to respect the religious practices of the temple. Avoid touching the","meta_info":{"prompt_tokens":19,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"bc566210239a44968780729919df000d"}}
+--------------------------------------------------------------------------------
+Input Text: What types of accommodations are available in Japan, and how do they differ from Western hotels?
+
+Text-based response:
+{"text":" Japan offers a wide range of accommodations that cater to different needs and preferences. Here are some of the most common types of accommodations in Japan:\n\n1. **Hostels**: Hostels are dormitories where you can stay with other students. They offer a","meta_info":{"prompt_tokens":18,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"f21860f4f9174e559de56a80320cacde"}}
+
+Embedding-based response:
+{"text":" Japan offers a wide range of accommodations that cater to different needs and preferences. Here are some of the most common types of accommodations in Japan:\n\n1. **Hostels**: Hostels are dormitories where you can stay with other students. They offer a","meta_info":{"prompt_tokens":18,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"bc355d3c587a487a883d94d348eb80d1"}}
+--------------------------------------------------------------------------------
+Input Text: How can I stay connected while traveling in Japan? Should I rent a pocket Wi-Fi or buy a SIM card?
+
+Text-based response:
+{"text":" What are the best places to stay in Japan? How can I find the best deals on accommodation in Japan? How can I find the best deals on accommodation in Japan? How can I find the best deals on accommodation in Japan? How can I find","meta_info":{"prompt_tokens":23,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"86d72aee213f472888fbe724036cd4e0"}}
+
+Embedding-based response:
+{"text":" What are the best places to stay in Japan? How can I find the best deals on accommodation in Japan? How can I find the best deals on accommodation in Japan? How can I find the best deals on accommodation in Japan? How can I find","meta_info":{"prompt_tokens":23,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"450af1b2d0c54614a0cd12d4a696733d"}}
+--------------------------------------------------------------------------------
+Input Text: What are some unique experiences or activities I shouldn’t miss while in Japan?
+
+Text-based response:
+{"text":" 1. Visit the Tokyo Skytree: This iconic skyscraper offers panoramic views of the city and is a must-see for anyone visiting Japan.\n\n2. Explore the historic district of Kyoto: Kyoto is known for its intricate temples, gardens, and","meta_info":{"prompt_tokens":15,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"fc56baf910f84432b666dc20cc06ea99"}}
+
+Embedding-based response:
+{"text":" 1. Visit the Tokyo Skytree: This iconic skyscraper offers panoramic views of the city and is a must-see for anyone visiting Japan.\n\n2. Explore the historic district of Kyoto: Kyoto is known for its intricate temples, gardens, and","meta_info":{"prompt_tokens":15,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"68cf4b73b9a74f55acc1d200c30013ca"}}
+--------------------------------------------------------------------------------
+Input Text: How do I handle cash and credit cards in Japan, and are there places where cards are not accepted?
+
+Text-based response:
+{"text":" I'm a Japanese student and I'm looking for a way to make money in Japan. I'm not sure if I should use cash or credit cards. I've heard that it's not recommended to use cash in Japan, but I'm not sure","meta_info":{"prompt_tokens":21,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"eb1653bd5e88470ca47346d22a1d77cf"}}
+
+Embedding-based response:
+{"text":" I'm a Japanese student and I'm looking for a way to make money in Japan. I'm not sure if I should use cash or credit cards. I've heard that it's not recommended to use cash in Japan, but I'm not sure","meta_info":{"prompt_tokens":21,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"dd5f1f64aeaf49cf84babeee634043ea"}}
+--------------------------------------------------------------------------------
+Input Text: When is the best time to see cherry blossoms in Japan?
+
+Text-based response:
+{"text":" The best time to see cherry blossoms in Japan is during the cherry blossom season, which typically runs from late March to early April. This is when the flowers bloom, and the trees are in full bloom. The cherry blossoms are a beautiful sight","meta_info":{"prompt_tokens":13,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"ac6dbc91733f489abcbd5b08901780ca"}}
+
+Embedding-based response:
+{"text":" The best time to see cherry blossoms in Japan is during the cherry blossom season, which typically runs from late March to early April. This is when the flowers bloom, and the trees are in full bloom. The cherry blossoms are a beautiful sight","meta_info":{"prompt_tokens":13,"completion_tokens":50,"completion_tokens_wo_jump_forward":50,"cached_tokens":0,"finish_reason":{"type":"length","length":50},"id":"701af1a4537543d5bb106f99ffd05e03"}}
+--------------------------------------------------------------------------------
