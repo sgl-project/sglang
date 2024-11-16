@@ -588,14 +588,14 @@ class ScheduleBatch:
         )
 
         if not decoder_out_cache_loc:
-            self.out_cache_loc = torch.empty(0, dtype=torch.int32).to(
+            self.out_cache_loc = torch.zeros(0, dtype=torch.int32).to(
                 self.device, non_blocking=True
             )
         else:
             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
 
         if not encoder_out_cache_loc:
-            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int32).to(
+            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int32).to(
                 self.device, non_blocking=True
             )
         else:
