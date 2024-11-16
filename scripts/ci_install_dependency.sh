@@ -8,3 +8,4 @@ pip install transformers==4.45.2 sentence_transformers accelerate peft
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
 cd flashinfer/python
 pip install -e .
+pip install ninja # Ninja is required to load C++ extensions
