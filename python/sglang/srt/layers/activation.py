@@ -38,6 +38,7 @@ from sglang.srt.utils import set_weight_attrs
 logger = logging.getLogger(__name__)
 
 
+@CustomOp.register("silu_and_mul")
 class SiluAndMul(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -51,6 +52,7 @@ class SiluAndMul(CustomOp):
         return out
 
 
+@CustomOp.register("gelu_and_mul")
 class GeluAndMul(CustomOp):
     def __init__(self, approximate="tanh"):
         super().__init__()
