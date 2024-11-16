@@ -271,6 +271,9 @@ class ModelRunner:
         self.vllm_config.model_config = self.vllm_model_config
         self.vllm_config.load_config = self.load_config
         self.vllm_config.device_config = DeviceConfig(self.device)
+        self.vllm_config.quant_config = VllmConfig._get_quantization_config(
+            self.vllm_config.model_config, self.vllm_config.load_config
+        )
 
         # Load the model
         self.model = get_model(
