@@ -6,6 +6,7 @@ import requests
 from sglang.srt.utils import kill_child_process
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
@@ -21,7 +22,7 @@ The story should span multiple events, challenges, and character developments ov
 class TestMatchedStop(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -39,6 +40,7 @@ class TestMatchedStop(unittest.TestCase):
         prompt=MANY_NEW_TOKENS_PROMPT,
         max_tokens=1,
         stop=None,
+        stop_regex=None,
         finish_reason=None,
         matched_stop=None,
     ):
@@ -52,6 +54,9 @@ class TestMatchedStop(unittest.TestCase):
 
         if stop is not None:
             payload["stop"] = stop
+
+        if stop_regex is not None:
+            payload["stop_regex"] = stop_regex
 
         response_completions = requests.post(
             self.base_url + "/v1/completions",
@@ -110,8 +115,12 @@ class TestMatchedStop(unittest.TestCase):
         )
 
     def test_finish_stop_regex_str(self):
+        stop_regex = r"and |or "
         self.run_completions_generation(
-            max_tokens=1000, stop_regex=r"\.", finish_reason="stop", matched_stop=r"\."
+            max_tokens=1000, stop_regex=stop_regex, finish_reason="stop", matched_stop=stop_regex
+        )
+        self.run_chat_completions_generation(
+            max_tokens=1000, stop_regex=stop_regex, finish_reason="stop", matched_stop=stop_regex
         )
 
     def test_finish_stop_eos(self):

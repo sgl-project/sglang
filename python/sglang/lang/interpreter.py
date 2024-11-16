@@ -678,6 +678,7 @@ class StreamExecutor:
             "max_new_tokens",
             "min_new_tokens",
             "stop",
+            "stop_regex",
             "stop_token_ids",
             "temperature",
             "top_p",
