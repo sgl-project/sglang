@@ -23,8 +23,10 @@ import tempfile
 from typing import List, Optional
 
 from sglang.srt.utils import (
-    get_gpu_memory_capacity,
+    get_amdgpu_memory_capacity,
+    get_nvgpu_memory_capacity,
     is_flashinfer_available,
+    is_hip,
     is_ipv6,
     is_port_available,
 )
@@ -166,7 +168,10 @@ class ServerArgs:
                 self.mem_fraction_static = 0.88
 
         # Adjust for GPUs with small memory capacities
-        gpu_mem = get_gpu_memory_capacity()
+        if is_hip():
+            gpu_mem = get_amdgpu_memory_capacity()
+        else:
+            gpu_mem = get_nvgpu_memory_capacity()
         if gpu_mem < 25000:
             logger.warning(
                 "Automatically adjust --chunked-prefill-size for small GPUs."

@@ -231,15 +231,16 @@ def throughput_test(
     input_requests = get_dataset(bench_args, tokenizer)
 
     warmup_requests = sample_random_requests(
-        input_len=20,
-        output_len=4,
-        num_prompts=2,
+        input_len=256,
+        output_len=16,
+        num_prompts=16,
         range_ratio=0.8,
         tokenizer=tokenizer,
         dataset_path=bench_args.dataset_path,
     )
 
     # Warm up
+    logging.info("\nWarmup...")
     throughput_test_once(
         backend_name=bench_args.backend,
         backend=backend,
@@ -247,6 +248,7 @@ def throughput_test(
         ignore_eos=not bench_args.disable_ignore_eos,
     )
 
+    logging.info("\nBenchmark...")
     result = throughput_test_once(
         backend_name=bench_args.backend,
         backend=backend,
