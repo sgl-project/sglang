@@ -794,7 +794,39 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
-def get_gpu_memory_capacity():
+def get_amdgpu_memory_capacity():
+    try:
+        # Run rocm-smi and capture the output
+        result = subprocess.run(
+            ["rocm-smi --showmeminfo vram | grep 'Total Memory' | awk '{print $NF}'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values in MiB
+        memory_values = [
+            float(mem) / 1024 / 1024
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
+        )
+
+
+def get_nvgpu_memory_capacity():
     try:
         # Run nvidia-smi and capture the output
         result = subprocess.run(
