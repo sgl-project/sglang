@@ -117,10 +117,16 @@ class TestMatchedStop(unittest.TestCase):
     def test_finish_stop_regex_str(self):
         stop_regex = r"and |or "
         self.run_completions_generation(
-            max_tokens=1000, stop_regex=stop_regex, finish_reason="stop", matched_stop=stop_regex
+            max_tokens=1000,
+            stop_regex=stop_regex,
+            finish_reason="stop",
+            matched_stop=stop_regex,
         )
         self.run_chat_completions_generation(
-            max_tokens=1000, stop_regex=stop_regex, finish_reason="stop", matched_stop=stop_regex
+            max_tokens=1000,
+            stop_regex=stop_regex,
+            finish_reason="stop",
+            matched_stop=stop_regex,
         )
 
     def test_finish_stop_eos(self):
