@@ -83,6 +83,7 @@ class DataParallelController:
         self.workers = []
         for dp_rank in range(server_args.dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
+            tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
 
             send_to = self.launch_tensor_parallel_group(
