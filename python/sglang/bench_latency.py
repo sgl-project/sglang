@@ -564,4 +564,4 @@ if __name__ == "__main__":
     except Exception as e:
         raise e
     finally:
-        kill_child_process(include_self=True)
+        kill_child_process()
