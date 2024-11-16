@@ -358,7 +358,7 @@ class Req:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
-        
+
         for stop_regex_str in self.sampling_params.stop_regex_strs:
             if re.search(stop_regex_str, self.decoded_text):
                 self.finished_reason = FINISH_MATCHED_STR(matched=stop_regex_str)
