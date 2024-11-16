@@ -31,6 +31,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
+import re
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -357,6 +358,11 @@ class Req:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
+        
+        for stop_regex_str in self.sampling_params.stop_regex_strs:
+            if re.search(stop_regex_str, self.decoded_text):
+                self.finished_reason = FINISH_MATCHED_STR(matched=stop_regex_str)
+                return
 
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
         if self.origin_input_text is None:
