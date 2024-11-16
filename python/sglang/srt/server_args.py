@@ -129,6 +129,7 @@ class ServerArgs:
     disable_nan_detection: bool = False
     enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
+    enable_dp_attention: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: int = 160
@@ -202,6 +203,16 @@ class ServerArgs:
 
         if self.sampling_backend is None:
             self.sampling_backend = "flashinfer"
+
+        if self.enable_dp_attention:
+            self.dp_size = self.tp_size
+            self.chunked_prefill_size = self.chunked_prefill_size // 2
+            self.disable_cuda_graph = True
+            self.enable_overlap_schedule = False
+            logger.warning(
+                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE workload issue. "
+                "The CUDA graph is disabled."
+            )
 
         if self.enable_overlap_schedule:
             logger.warning(
@@ -668,6 +679,11 @@ class ServerArgs:
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
+        )
+        parser.add_argument(
+            "--enable-dp-attention",
+            action="store_true",
+            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
         )
         parser.add_argument(
             "--enable-torch-compile",

@@ -56,6 +56,8 @@ class ForwardMode(IntEnum):
     DECODE = auto()
     # Contains both EXTEND and DECODE.
     MIXED = auto()
+    # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence allocated.
+    IDLE = auto()
 
     def is_prefill(self):
         return self == ForwardMode.PREFILL
@@ -68,6 +70,9 @@ class ForwardMode(IntEnum):
 
     def is_mixed(self):
         return self == ForwardMode.MIXED
+
+    def is_idle(self):
+        return self == ForwardMode.IDLE
 
 
 @dataclass
@@ -127,6 +132,10 @@ class ForwardBatch:
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
+
+    # For DP attention
+    global_num_tokens: Optional[List[int]] = None
+    gathered_buffer: Optional[torch.Tensor] = None
 
     def compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -209,9 +218,21 @@ class ForwardBatch:
             seq_lens_sum=batch.seq_lens_sum,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
+            global_num_tokens=batch.global_num_tokens,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
         )
+
+        if ret.global_num_tokens is not None:
+            max_len = max(ret.global_num_tokens)
+            ret.gathered_buffer = torch.zeros(
+                (max_len * model_runner.tp_size, model_runner.model_config.hidden_size),
+                dtype=model_runner.dtype,
+                device=device,
+            )
+
+        if ret.forward_mode.is_idle():
+            return ret
 
         # Init position information
         if not ret.forward_mode.is_decode():
