@@ -179,7 +179,8 @@ class CompletionRequest(BaseModel):
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+    stop_regex: Optional[Union[str, List[str]]] = Field(default_factory=list)
 
 
 class CompletionResponseChoice(BaseModel):
@@ -317,6 +318,7 @@ class ChatCompletionRequest(BaseModel):
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
+    stop_regex: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
