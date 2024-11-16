@@ -195,9 +195,13 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        input_embeds = None
         # Tokenize
         input_text = obj.text
-        if obj.input_ids is None:
+        if obj.input_embeds is not None:
+            input_embeds = obj.input_embeds
+            input_ids = obj.input_ids
+        elif obj.input_ids is None:
             input_ids = self.tokenizer.encode(input_text)
         else:
             input_ids = obj.input_ids
@@ -212,10 +216,11 @@ class TokenizerManager:
             logprob_start_len = obj.logprob_start_len
             top_logprobs_num = obj.top_logprobs_num
 
-        if len(input_ids) >= self.context_len:
-            raise ValueError(
-                f"The input ({len(input_ids)} tokens) is longer than the "
-                f"model's context length ({self.context_len} tokens)."
+        if obj.input_ids is not None:
+            if len(input_ids) >= self.context_len:
+                raise ValueError(
+                    f"The input ({len(input_ids)} tokens) is longer than the "
+                    f"model's context length ({self.context_len} tokens)."
             )
 
         # Parse sampling parameters
@@ -235,7 +240,8 @@ class TokenizerManager:
                 logprob_start_len,
                 top_logprobs_num,
                 obj.stream,
-                obj.lora_path,
+                input_embeds = input_embeds,
+                lora_path = obj.lora_path,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

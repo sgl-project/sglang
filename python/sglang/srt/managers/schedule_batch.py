@@ -177,6 +177,7 @@ class Req:
         origin_input_ids: Tuple[int],
         sampling_params: SamplingParams,
         lora_path: Optional[str] = None,
+        input_embeds: Optional = None,
     ):
         # Input and output info
         self.rid = rid
@@ -188,6 +189,7 @@ class Req:
 
         self.sampling_params = sampling_params
         self.lora_path = lora_path
+        self.input_embeds = input_embeds
 
         # Memory info
         self.req_pool_idx = None
@@ -442,6 +444,7 @@ class ScheduleBatch:
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
     # The output locations of the KV cache
@@ -620,6 +623,8 @@ class ScheduleBatch:
         req_pool_indices = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
+        input_embeds = []
+
         pt = 0
         for i, req in enumerate(reqs):
             already_computed = (
@@ -643,6 +648,11 @@ class ScheduleBatch:
                 out_cache_loc[pt : pt + req.extend_input_len],
             )
 
+            # If input_embeds are available, store them
+            if req.input_embeds is not None:
+                # If req.input_embeds is already a list, append its content directly
+                input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
+
             # Compute the relative logprob_start_len in an extend batch
             if req.logprob_start_len >= pre_len:
                 extend_logprob_start_len = min(
@@ -663,6 +673,10 @@ class ScheduleBatch:
             self.device, non_blocking=True
         )
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+
+        self.input_embeds = torch.tensor(input_embeds).to(
             self.device, non_blocking=True
         )
 
@@ -1022,6 +1036,7 @@ class ScheduleBatch:
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
+            input_embeds = self.input_embeds
         )
 
     def copy(self):
@@ -1090,6 +1105,9 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    # The input Embeds
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
     def copy(self):
         return dataclasses.replace(self, sampling_info=self.sampling_info.copy())
