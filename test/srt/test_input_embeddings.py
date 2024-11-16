@@ -64,7 +64,7 @@ for entry in embeddings_data:
     input_embeds = entry["embeddings"]
     # Prepare the payload for sending text
     text_input_data = {
-        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "model": "model": "Qwen/Qwen2.5-0.5B",
         "text": text,  # Using text for the first request
         "sampling_params": {
             "temperature": 0,
