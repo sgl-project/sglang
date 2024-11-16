@@ -21,7 +21,12 @@ from typing import List, Tuple
 import torch
 
 try:
-    from xgrammar import CachedGrammarCompiler, CompiledGrammar, GrammarMatcher
+    from xgrammar import (
+        CachedGrammarCompiler,
+        CompiledGrammar,
+        GrammarMatcher,
+        TokenizerInfo,
+    )
 
     import_error = None
 except ImportError as e:
@@ -80,19 +85,24 @@ class XGrammarGrammar(BaseGrammarObject):
         for i in range(k, len(new_output_ids)):
             assert self.matcher.accept_token(new_output_ids[i])
 
-    def fill_vocab_mask(self, vocab_mask: torch.Tensor):
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        return self.matcher.allocate_token_bitmask(vocab_size, batch_size)
+
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor, batch_id: int) -> None:
         # Note that this bitmask is a bitset, not bool
-        bitmask = self.matcher.get_next_token_bitmask()
-        # Mask the tokens that are not allowed
-        vocab_mask[
-            self.matcher.get_rejected_tokens_from_bitmask(bitmask, self.vocab_size)
-        ] = 1
+        self.matcher.fill_next_token_bitmask(vocab_mask, batch_id)
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        GrammarMatcher.apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
         matcher = GrammarMatcher(
             self.ctx,
             max_rollback_tokens=MAX_ROLLBACK_TOKENS,
-            mask_vocab_size=self.vocab_size,
+            vocab_size=self.vocab_size,
         )
         return XGrammarGrammar(matcher, self.vocab_size, self.ctx)
 
@@ -112,7 +122,8 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             self.grammar_cache = None
             return
 
-        self.grammar_cache = CachedGrammarCompiler(tokenizer_or_vocab=tokenizer)
+        tokenizer_info = TokenizerInfo.from_huggingface(tokenizer)
+        self.grammar_cache = CachedGrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size
 
     def init_value_impl(self, key: Tuple[str, str]) -> XGrammarGrammar:
@@ -122,9 +133,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         key_type, key_string = key
         if key_type == "json":
             try:
-                ctx = self.grammar_cache.get_compiled_grammar_for_json_schema(
-                    key_string
-                )
+                ctx = self.grammar_cache.compile_json_schema_grammar(schema=key_string)
             except RuntimeError as e:
                 logging.warning(
                     f"Skip invalid json_schema: json_schema={key_string}, {e=}"
@@ -141,7 +150,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         matcher = GrammarMatcher(
             ctx,
             max_rollback_tokens=MAX_ROLLBACK_TOKENS,
-            mask_vocab_size=self.vocab_size,
+            vocab_size=self.vocab_size,
         )
         return XGrammarGrammar(matcher, self.vocab_size, ctx)
 

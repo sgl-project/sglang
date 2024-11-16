@@ -640,7 +640,7 @@ class ModelRunner:
 
         # Apply regex vocab_mask
         if sampling_info.vocab_mask is not None:
-            logits = logits.masked_fill(sampling_info.vocab_mask, float("-inf"))
+            sampling_info.apply_mask(logits=logits, vocab_mask=sampling_info.vocab_mask)
 
         return logits
 
