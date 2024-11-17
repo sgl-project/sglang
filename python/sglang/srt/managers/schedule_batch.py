@@ -1036,7 +1036,7 @@ class ScheduleBatch:
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
-            input_embeds = self.input_embeds
+            input_embeds=self.input_embeds,
         )
 
     def copy(self):

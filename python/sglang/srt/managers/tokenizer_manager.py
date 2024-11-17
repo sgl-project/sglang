@@ -221,7 +221,7 @@ class TokenizerManager:
                 raise ValueError(
                     f"The input ({len(input_ids)} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens)."
-            )
+                )
 
         # Parse sampling parameters
         sampling_params = SamplingParams(**obj.sampling_params)
@@ -240,8 +240,8 @@ class TokenizerManager:
                 logprob_start_len,
                 top_logprobs_num,
                 obj.stream,
-                input_embeds = input_embeds,
-                lora_path = obj.lora_path,
+                input_embeds=input_embeds,
+                lora_path=obj.lora_path,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

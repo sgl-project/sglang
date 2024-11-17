@@ -1,9 +1,11 @@
 import json
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import tempfile
 import os
 import subprocess
+import tempfile
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 # Load the model and tokenizer
 model_name = "Qwen/Qwen2.5-0.5B"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -46,9 +48,9 @@ print(f"Embeddings successfully saved to {output_file}")
 
 
 
-# Test written with Qwen2.5 in mind, 
-# if wanting to test with other model 
-# please generate new embeddings by 
+# Test written with Qwen2.5 in mind,
+# if wanting to test with other model
+# please generate new embeddings by
 # altering embedding.py
 # Load the embeddings JSON file
 with open('./input_embeddings.json', 'r') as f:

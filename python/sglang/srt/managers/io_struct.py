@@ -59,10 +59,16 @@ class GenerateReqInput:
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     def normalize_batch_and_arguments(self):
-        if (self.text is None and self.input_ids is None and self.input_embeds is None) or (
-            self.text is not None and self.input_ids is not None and self.input_embeds is not None
+        if (
+            self.text is None and self.input_ids is None and self.input_embeds is None
+        ) or (
+            self.text is not None
+            and self.input_ids is not None
+            and self.input_embeds is not None
         ):
-            raise ValueError("Either text, input_ids or input_embeds should be provided.")
+            raise ValueError(
+                "Either text, input_ids or input_embeds should be provided."
+            )
 
         # Derive the batch size
         if self.text is not None:
