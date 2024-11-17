@@ -20,7 +20,8 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.torchao_utils import apply_torchao_config_
@@ -98,7 +99,6 @@ class Phi3SmallSelfAttention(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int = 0,
-        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -207,9 +207,6 @@ class Phi3SmallSelfAttention(nn.Module):
             self.head_dim,
             self.scale,
             num_kv_heads=self.num_kv_heads_per_partion,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            blocksparse_params=bs_params,
             layer_id=layer_id,
         )
 
@@ -249,7 +246,7 @@ class Phi3SmallDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Phi3SmallSelfAttention(
-            config, layer_id, cache_config=cache_config, quant_config=quant_config
+            config, layer_id, quant_config=quant_config
         )
         self.mlp = Phi3SmallMLP(config, quant_config)
 
@@ -366,6 +363,7 @@ class Phi3SmallForCausalLM(nn.Module):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "model"),
         )
+        self.torchao_config = global_server_args_dict["torchao_config"]
         self.vocab_size = config.vocab_size
         self.mup_width_multiplier = config.mup_width_multiplier
         self.lm_head = ParallelLMHead(
@@ -377,7 +375,8 @@ class Phi3SmallForCausalLM(nn.Module):
         )
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(config)
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -426,18 +425,24 @@ class Phi3SmallForCausalLM(nn.Module):
         input_ids: torch.LongTensor,
         positions: Optional[torch.LongTensor],
         forward_batch: ForwardBatch,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        output_hidden_states = self.model(
+        get_embedding: bool = False,
+    ) -> LogitsProcessorOutput:
+        hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
-            intermediate_tensors=intermediate_tensors,
+            intermediate_tensors=None,
             inputs_embeds=inputs_embeds,
         )
-        output_hidden_states = output_hidden_states
-        return output_hidden_states
+
+        if not get_embedding:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head.weight, forward_batch
+            )
+
+        else:
+            return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
 
