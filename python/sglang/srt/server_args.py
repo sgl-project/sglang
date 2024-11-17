@@ -159,7 +159,7 @@ class ServerArgs:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.79
             elif self.tp_size >= 8:
-                self.mem_fraction_static = 0.83
+                self.mem_fraction_static = 0.82
             elif self.tp_size >= 4:
                 self.mem_fraction_static = 0.85
             elif self.tp_size >= 2:
@@ -211,7 +211,7 @@ class ServerArgs:
             self.enable_overlap_schedule = False
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE workload issue. "
-                "The CUDA graph is disabled."
+                "The CUDA graph is disabled. Data parallel size is adjust to be the same as tensor parallel size."
             )
 
         if self.enable_overlap_schedule:
