@@ -182,8 +182,8 @@ class DataParallelController:
         send_to = get_zmq_socket(
             self.context, zmq.PUSH, port_args.scheduler_input_ipc_name
         )
-
-        return send_to, reader
+        reader.recv()
+        return send_to
 
     def round_robin_scheduler(self, req):
         self.workers[self.round_robin_counter].send_pyobj(req)

@@ -211,7 +211,7 @@ class ServerArgs:
             self.enable_overlap_schedule = False
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE workload issue. "
-                "The CUDA graph is disabled."
+                "The CUDA graph is disabled. Data parallel size is adjust to be the same as tensor parallel size."
             )
 
         if self.enable_overlap_schedule:
