@@ -207,11 +207,12 @@ class ServerArgs:
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
             self.chunked_prefill_size = self.chunked_prefill_size // 2
-            self.disable_cuda_graph = True
+            self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
             self.enable_overlap_schedule = False
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE workload issue. "
-                "The CUDA graph is disabled. Data parallel size is adjust to be the same as tensor parallel size."
+                f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
+                "Data parallel size is adjusted to be the same as tensor parallel size."
             )
 
         if self.enable_overlap_schedule:
