@@ -73,7 +73,7 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
-            is_all_greedy=top_ks.max().item() <= 1,
+            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             vocab_size=vocab_size,
             device=device,
         )
