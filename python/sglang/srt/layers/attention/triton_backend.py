@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
 
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
