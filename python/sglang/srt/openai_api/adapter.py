@@ -847,6 +847,7 @@ def v1_chat_generate_request(
     tokenizer_manager,
     request_ids: List[str] = None,
 ):
+    text = []
     input_ids = []
     sampling_params_list = []
     image_data_list = []
@@ -912,6 +913,8 @@ def v1_chat_generate_request(
             stop = request.stop
             image_data = None
             modalities = []
+            
+        text.append(tokenizer_manager.tokenizer.decode(prompt_ids))
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
@@ -942,10 +945,10 @@ def v1_chat_generate_request(
         image_data_list.append(image_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
-        if isinstance(input_ids[0], str):
-            prompt_kwargs = {"text": input_ids[0]}
-        else:
-            prompt_kwargs = {"input_ids": input_ids[0]}
+        prompt_kwargs = {
+            "text": text[0],
+            "input_ids": input_ids[0]
+        }
         sampling_params_list = sampling_params_list[0]
         image_data_list = image_data_list[0]
         return_logprobs = return_logprobs[0]
@@ -953,10 +956,10 @@ def v1_chat_generate_request(
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
     else:
-        if isinstance(input_ids[0], str):
-            prompt_kwargs = {"text": input_ids}
-        else:
-            prompt_kwargs = {"input_ids": input_ids}
+        prompt_kwargs = {
+            "text": text,
+            "input_ids": input_ids
+        }
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
