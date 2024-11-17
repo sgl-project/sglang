@@ -56,6 +56,7 @@ class BenchArgs:
     gen_output_len: int = 256
     disable_ignore_eos: bool = False
     seed: int = 1
+    do_not_exit: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -143,6 +144,11 @@ class BenchArgs:
             help="Disable ignore EOS token",
         )
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+        parser.add_argument(
+            "--do-not-exit",
+            action="store_true",
+            help="Do not exit the program. This is useful for nsys profile with --duration and --delay.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -309,3 +315,6 @@ if __name__ == "__main__":
     )
 
     throughput_test(server_args, bench_args)
+
+    while bench_args.do_not_exit:
+        pass

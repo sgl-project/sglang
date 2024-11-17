@@ -314,7 +314,6 @@ class FlashInferIndicesUpdaterDecode:
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        self.max_context_len = model_runner.req_to_token_pool.req_to_token.size(1)
         self.sliding_window_size = model_runner.sliding_window_size
 
         self.attn_backend = attn_backend
@@ -445,7 +444,7 @@ class FlashInferIndicesUpdaterDecode:
             kv_indptr,
             kv_start_idx,
             kv_indices,
-            self.max_context_len,
+            self.req_to_token.shape[1],
         )
 
         wrapper.end_forward()
@@ -474,7 +473,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        self.max_context_len = model_runner.req_to_token_pool.req_to_token.size(1)
         self.sliding_window_size = model_runner.sliding_window_size
 
         self.attn_backend = attn_backend
@@ -599,7 +597,7 @@ class FlashInferIndicesUpdaterPrefill:
             kv_indptr,
             kv_start_idx,
             kv_indices,
-            self.max_context_len,
+            self.req_to_token.shape[1],
         )
 
         qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
@@ -638,10 +636,11 @@ def create_flashinfer_kv_indices_triton(
     kv_indptr,
     kv_start_idx,
     kv_indices_ptr,
-    max_context_len: tl.constexpr,
+    req_to_token_ptr_stride: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
+
     req_pool_index = tl.load(req_pool_indices_ptr + pid)
     kv_indices_offset = tl.load(kv_indptr + pid)
 
@@ -652,15 +651,15 @@ def create_flashinfer_kv_indices_triton(
         kv_end = kv_start
     kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
 
-    req_to_token_ptr += req_pool_index * max_context_len
-    kv_indices_ptr += kv_indices_offset
-
-    ld_offset = kv_start + tl.arange(0, BLOCK_SIZE)
-    st_offset = tl.arange(0, BLOCK_SIZE)
     num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for _ in range(num_loop):
-        mask = ld_offset < kv_end
-        data = tl.load(req_to_token_ptr + ld_offset, mask=mask)
-        tl.store(kv_indices_ptr + st_offset, data, mask=mask)
-        ld_offset += BLOCK_SIZE
-        st_offset += BLOCK_SIZE
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < kv_end - kv_start
+        data = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + kv_start
+            + offset,
+            mask=mask,
+        )
+        tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
