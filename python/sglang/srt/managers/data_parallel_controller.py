@@ -98,7 +98,7 @@ class DataParallelController:
             # Create a thread for each worker
             thread = threading.Thread(
                 target=self.launch_worker_func,
-                args=(dp_rank, server_args, tmp_port_args, base_gpu_id),
+                args=(server_args, tmp_port_args, base_gpu_id, dp_rank),
             )
             threads.append(thread)
             base_gpu_id += (
@@ -115,7 +115,13 @@ class DataParallelController:
         for thread in threads:
             thread.join()
 
-    def launch_worker_func(self, dp_rank, server_args, tmp_port_args, base_gpu_id):
+    def launch_worker_func(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        base_gpu_id: int,
+        dp_rank: int,
+    ):
         logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
         launch_func_ = (
@@ -125,7 +131,7 @@ class DataParallelController:
         )
         self.workers[dp_rank] = launch_func_(
             server_args,
-            tmp_port_args,
+            port_args,
             base_gpu_id,
             dp_rank,
         )
