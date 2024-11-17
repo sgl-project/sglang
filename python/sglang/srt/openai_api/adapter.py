@@ -892,6 +892,7 @@ def v1_chat_generate_request(
                 )
                 if assistant_prefix:
                     prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
+                prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
                 image_data = None
                 modalities = []
@@ -909,12 +910,12 @@ def v1_chat_generate_request(
                 prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
-            prompt_ids = request.messages
+            prompt = request.messages
             stop = request.stop
             image_data = None
             modalities = []
 
-        text.append(tokenizer_manager.tokenizer.decode(prompt_ids))
+        text.append(prompt)
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
