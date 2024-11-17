@@ -312,6 +312,7 @@ class ModelRunner:
             # TODO: Use a better method to check this
             vllm_model_config = VllmModelConfig(
                 model=model_path,
+                task="generate" if self.model_config.is_generation else "embedding",
                 quantization=self.server_args.quantization,
                 tokenizer=None,
                 tokenizer_mode=None,
