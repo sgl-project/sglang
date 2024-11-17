@@ -66,7 +66,7 @@ class TestTorchCompile(unittest.TestCase):
         print(f"{res=}")
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
-        self.assertGreaterEqual(throughput, 289)
+        self.assertGreaterEqual(throughput, 290)
 
 
 if __name__ == "__main__":
