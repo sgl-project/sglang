@@ -834,6 +834,15 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
+def bind_port(port):
+    """Bind to a specific port, assuming it's available."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allows address reuse
+    sock.bind(("", port))
+    sock.listen(1)
+    return sock
+
+
 def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
