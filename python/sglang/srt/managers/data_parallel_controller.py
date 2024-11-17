@@ -91,9 +91,14 @@ class DataParallelController:
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
 
-            # This port is checked free in PortArgs.init_new.
-            # We hold it first so that the next dp worker gets a different port
-            sockets.append(bind_port(tmp_port_args.nccl_port))
+            if server_args.enable_dp_attention:
+                # Data parallelism resues the tensor parallelism group,
+                # so all dp ranks should use the same nccl port.
+                tmp_port_args.nccl_port = port_args.nccl_port
+            else:
+                # This port is checked free in PortArgs.init_new.
+                # We hold it first so that the next dp worker gets a different port
+                sockets.append(bind_port(tmp_port_args.nccl_port))
 
             # Create a thread for each worker
             thread = threading.Thread(
@@ -101,9 +106,7 @@ class DataParallelController:
                 args=(server_args, tmp_port_args, base_gpu_id, dp_rank),
             )
             threads.append(thread)
-            base_gpu_id += (
-                1 if self.server_args.enable_dp_attention else server_args.dp_size
-            )
+            base_gpu_id += 1 if server_args.enable_dp_attention else server_args.dp_size
 
         # Free all sockets before starting the threads to launch TP workers
         for sock in sockets:
@@ -126,7 +129,7 @@ class DataParallelController:
 
         launch_func_ = (
             self.launch_tensor_parallel_process
-            if self.server_args.enable_dp_attention
+            if server_args.enable_dp_attention
             else self.launch_tensor_parallel_group
         )
         self.workers[dp_rank] = launch_func_(
