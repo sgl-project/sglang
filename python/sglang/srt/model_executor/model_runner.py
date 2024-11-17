@@ -58,7 +58,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
-    monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
 )
 
@@ -242,7 +241,6 @@ class ModelRunner:
                     raise RuntimeError("SGLang only supports sm75 and above.")
 
         # Prepare the vllm model config
-        monkey_patch_vllm_dummy_weight_loader()
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
@@ -261,7 +259,6 @@ class ModelRunner:
             self.vllm_model_config.hf_config.update(
                 self.model_config.model_override_args
             )
-        self.dtype = self.vllm_model_config.dtype
 
         # Load the model
         self.model = get_model(
@@ -278,6 +275,7 @@ class ModelRunner:
             if hasattr(self.model, "get_attention_sliding_window_size")
             else None
         )
+        self.dtype = self.vllm_model_config.dtype
 
         logger.info(
             f"Load weight end. "

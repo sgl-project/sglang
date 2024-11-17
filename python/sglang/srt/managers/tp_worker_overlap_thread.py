@@ -141,7 +141,7 @@ class TpModelWorkerClient:
             self.launch_event.set()
             self.output_queue.put((copy_event, logits_output, next_token_ids))
 
-    def resulve_batch_result(self, bid: int):
+    def resolve_batch_result(self, bid: int):
         copy_event, logits_output, next_token_ids = self.output_queue.get()
         while not copy_event.query():
             time.sleep(1e-5)
