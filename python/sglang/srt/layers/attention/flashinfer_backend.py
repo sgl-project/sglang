@@ -8,7 +8,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 from enum import Enum, auto
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List
 
 import torch
 import triton
@@ -136,11 +136,12 @@ class FlashInferAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
 
             # Some heuristics to check whether to use ragged forward
-            use_ragged = False
             if forward_batch.extend_num_tokens >= 4096 and self.num_wrappers == 1:
                 use_ragged = True
-
-            extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+            else:
+                use_ragged = False
+                extend_no_prefix = False
 
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
