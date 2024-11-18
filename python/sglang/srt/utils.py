@@ -816,3 +816,8 @@ def get_nvgpu_memory_capacity():
         raise RuntimeError(
             "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
         )
+
+
+def crash_on_warnings():
+    # Crash on warning if we are running CI tests
+    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"
