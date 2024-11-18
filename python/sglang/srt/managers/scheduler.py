@@ -439,7 +439,7 @@ class Scheduler:
                 torch.distributed.all_reduce(
                     forward_mode_state,
                     op=torch.distributed.ReduceOp.MIN,
-                    group=self.tp_worker.get_tp_cpu_group(),
+                    group=self.tp_cpu_group,
                 )
                 local_batch.can_run_dp_cuda_graph = forward_mode_state.item() == 1
 
