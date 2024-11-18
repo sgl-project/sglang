@@ -302,7 +302,11 @@ class PrefillAdder:
             if (
                 self.rem_chunk_tokens is None
                 or input_tokens <= self.rem_chunk_tokens
-                or (req.return_logprob and req.normalized_prompt_logprob is None)
+                or (
+                    req.return_logprob
+                    and req.normalized_prompt_logprob is None
+                    and req.logprob_start_len != len(req.origin_input_ids) - 1
+                )
             ):
                 # Non-chunked prefill
                 self.can_run_list.append(req)
