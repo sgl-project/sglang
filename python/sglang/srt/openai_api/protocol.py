@@ -236,7 +236,7 @@ ChatCompletionMessageContentPart = Union[
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant"]
+    role: Literal["system", "assistant", "tool"]
     content: Union[str, List[ChatCompletionMessageContentTextPart]]
 
 
