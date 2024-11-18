@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import make_layers
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -267,11 +268,15 @@ class Gemma2Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.layers = nn.ModuleList(
-            [
-                Gemma2DecoderLayer(layer_id, config, cache_config, quant_config)
-                for layer_id in range(config.num_hidden_layers)
-            ]
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: Gemma2DecoderLayer(
+                layer_id=idx,
+                config=config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+            ),
+            prefix="",
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
