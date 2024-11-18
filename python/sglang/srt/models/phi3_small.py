@@ -8,12 +8,7 @@ from transformers.configuration_utils import PretrainedConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import (
-    make_empty_intermediate_tensors_factory,
-    make_layers,
-    maybe_prefix,
-)
-from vllm.sequence import IntermediateTensors
+from vllm.model_executor.models.utils import make_layers, maybe_prefix
 
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -307,9 +302,6 @@ class Phi3SmallModel(nn.Module):
         self.final_layernorm = nn.LayerNorm(
             config.hidden_size, eps=config.layer_norm_epsilon
         )
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], config.hidden_size
-        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -319,27 +311,23 @@ class Phi3SmallModel(nn.Module):
         input_ids: torch.LongTensor,
         positions: Optional[torch.LongTensor],
         forward_batch: ForwardBatch,
-        intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor],
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                hidden_states = self.get_input_embeddings(input_ids)
-            if (
-                self.mup_embedding_multiplier is not None
-                and self.mup_embedding_multiplier > 0.0
-            ):
-                hidden_states = hidden_states * self.mup_embedding_multiplier
+    ) -> Union[torch.Tensor]:
+
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
         else:
-            assert intermediate_tensors
-            hidden_states = intermediate_tensors["hidden_states"]
+            hidden_states = self.get_input_embeddings(input_ids)
+        if (
+            self.mup_embedding_multiplier is not None
+            and self.mup_embedding_multiplier > 0.0
+        ):
+            hidden_states = hidden_states * self.mup_embedding_multiplier
+
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states, forward_batch=forward_batch)
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states})
+
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
 
@@ -377,9 +365,6 @@ class Phi3SmallForCausalLM(nn.Module):
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
 
         # tokens in tiktoken but not used
         if hasattr(config, "dummy_token_indices"):
@@ -432,7 +417,6 @@ class Phi3SmallForCausalLM(nn.Module):
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
-            intermediate_tensors=None,
             inputs_embeds=inputs_embeds,
         )
 
