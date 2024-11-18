@@ -27,13 +27,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 10
         run: |
           cd test/lang
           python3 run_suite.py --suite minimal
@@ -47,13 +44,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
           python3 run_suite.py --suite minimal --range-begin 0 --range-end 5
@@ -67,16 +61,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 5 --range-end 17
+          python3 run_suite.py --suite minimal --range-begin 5 --range-end 14
 
   unit-test-backend-part-3:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -87,16 +78,30 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[dev]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
-          python3 run_suite.py --suite minimal --range-begin 17
+          python3 run_suite.py --suite minimal --range-begin 14 --range-end 21
+
+  unit-test-backend-part-4:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 25
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite minimal --range-begin 21
 
   performance-test-1-gpu-part-1:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -107,30 +112,27 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
-      - name: Benchmark Single Latency
+      - name: Benchmark single latency
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_latency.TestBenchLatency.test_default
 
-      - name: Benchmark Online Latency
+      - name: Benchmark online latency
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
 
-      - name: Benchmark Offline Throughput
+      - name: Benchmark offline throughput
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
 
-      - name: Benchmark Offline Throughput (Non-streaming, small batch size)
+      - name: Benchmark offline throughput (Non-streaming, small batch size)
         timeout-minutes: 10
         run: |
           cd test/srt
@@ -145,24 +147,21 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
-      - name: Benchmark Offline Throughput (w/o RadixAttention)
+      - name: Benchmark offline throughput (w/o RadixAttention)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
 
-      - name: Benchmark Offline Throughput (w/ Triton)
+      - name: Benchmark offline throughput (w/ Triton)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
 
-      - name: Benchmark Offline Throughput (w/ FP8)
+      - name: Benchmark offline throughput (w/ FP8)
         timeout-minutes: 10
         run: |
           cd test/srt
@@ -177,24 +176,21 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
-      - name: Benchmark Offline Throughput (TP=2)
+      - name: Benchmark offline throughput (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
 
-      - name: Benchmark Offline Throughput (w/o RadixAttention) (TP=2)
+      - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
-      - name: Benchmark Single Latency (TP=2)
+      - name: Benchmark single latency (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
@@ -209,16 +205,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
 
-      - name: Evaluate Accuracy
+      - name: Evaluate accuracy
         timeout-minutes: 20
         run: |
           cd test/srt
@@ -233,29 +226,27 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e "python[all]"
-          pip install transformers==4.45.2
-          pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/ --force-reinstall
+          bash scripts/ci_install_dependency.sh
 
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
 
-      - name: Evaluate Accuracy (TP=2)
+      - name: Evaluate accuracy (TP=2)
         timeout-minutes: 20
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
-      
-      - name: Evaluate MLA Accuracy (TP=2)
+
+      - name: Evaluate MLA accuracy (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 test_mla.py
           python3 test_mla_fp8.py
+          python3 test_dp_attention.py
 
-      - name: Evaluate Data Parallelism Accuracy (DP=2)
+      - name: Evaluate data parallelism accuracy (DP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
@@ -263,7 +254,7 @@ jobs:
 
   finish:
     needs: [
-      unit-test-frontend, unit-test-backend-part-1, unit-test-backend-part-2, unit-test-backend-part-3,
+      unit-test-frontend, unit-test-backend-part-1, unit-test-backend-part-2, unit-test-backend-part-3, unit-test-backend-part-4,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu
     ]

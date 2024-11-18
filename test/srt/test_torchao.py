@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestTorchCompile(unittest.TestCase):
+class TestTorchAO(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -27,7 +27,7 @@ class TestTorchCompile(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_child_process(cls.process.pid, include_self=True)
 
     def test_mmlu(self):
         args = SimpleNamespace(

@@ -33,17 +33,17 @@ class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     next_token_logits: torch.Tensor
     # The logprobs of the next tokens.     shape: [#seq, vocab_size]
-    next_token_logprobs: torch.Tensor
+    next_token_logprobs: torch.Tensor = None
 
     # The normlaized logprobs of prompts.  shape: [#seq]
-    normalized_prompt_logprobs: torch.Tensor
+    normalized_prompt_logprobs: torch.Tensor = None
     # The logprobs of input tokens.        shape: [#token, vocab_size]
-    input_token_logprobs: torch.Tensor
+    input_token_logprobs: torch.Tensor = None
 
     # The logprob and id of the top-k tokens in input positions.  shape [#seq, #token, k] of Tuple(logprob, token_id)
-    input_top_logprobs: List
+    input_top_logprobs: List = None
     # The logprob and id of the top-k tokens in output positions. shape [#seq, #token, k] of Tuple(logprob, token_id)
-    output_top_logprobs: List
+    output_top_logprobs: List = None
 
 
 @dataclasses.dataclass
@@ -62,21 +62,21 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
+        extend_logprob_pruned_lens_cpu = None
+
         if forward_batch.return_logprob:
             return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
+            if forward_batch.forward_mode.is_extend():
+                extend_logprob_pruned_lens_cpu = [
+                    extend_len - start_len
+                    for extend_len, start_len in zip(
+                        forward_batch.extend_seq_lens_cpu,
+                        forward_batch.extend_logprob_start_lens_cpu,
+                    )
+                ]
         else:
             return_top_logprob = False
 
-        if forward_batch.forward_mode.is_extend():
-            extend_logprob_pruned_lens_cpu = [
-                extend_len - start_len
-                for extend_len, start_len in zip(
-                    forward_batch.extend_seq_lens,
-                    forward_batch.extend_logprob_start_lens_cpu,
-                )
-            ]
-        else:
-            extend_logprob_pruned_lens_cpu = None
         return cls(
             forward_mode=forward_batch.forward_mode,
             top_logprobs_nums=forward_batch.top_logprobs_nums,

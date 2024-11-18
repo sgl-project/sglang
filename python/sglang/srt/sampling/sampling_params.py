@@ -34,13 +34,13 @@ class SamplingParams:
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
-        ignore_eos: bool = False,
-        skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
         regex: Optional[str] = None,
         n: int = 1,
         json_schema: Optional[str] = None,
         no_stop_trim: bool = False,
+        ignore_eos: bool = False,
+        skip_special_tokens: bool = True,
     ) -> None:
         self.temperature = temperature
         self.top_p = top_p
@@ -50,9 +50,10 @@ class SamplingParams:
         self.presence_penalty = presence_penalty
         self.repetition_penalty = repetition_penalty
         self.stop_strs = stop
-        if stop_token_ids is None:
-            stop_token_ids = []
-        self.stop_token_ids = {*stop_token_ids}
+        if stop_token_ids:
+            self.stop_token_ids = set(stop_token_ids)
+        else:
+            self.stop_token_ids = None
         self.max_new_tokens = max_new_tokens
         self.min_new_tokens = min_new_tokens
         self.ignore_eos = ignore_eos
@@ -119,10 +120,7 @@ class SamplingParams:
         # Process stop strings
         if self.stop_strs is None:
             self.stop_strs = []
-            if self.stop_token_ids is None:
-                self.stop_str_max_len = 0
-            else:
-                self.stop_str_max_len = 1
+            self.stop_str_max_len = 0
         else:
             if isinstance(self.stop_strs, str):
                 self.stop_strs = [self.stop_strs]
@@ -135,17 +133,3 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
-
-    def to_srt_kwargs(self):
-        return {
-            "max_new_tokens": self.max_new_tokens,
-            "stop": self.stop_strs,
-            "stop_token_ids": list(self.stop_token_ids),
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "top_k": self.top_k,
-            "frequency_penalty": self.frequency_penalty,
-            "presence_penalty": self.presence_penalty,
-            "ignore_eos": self.ignore_eos,
-            "regex": self.regex,
-        }

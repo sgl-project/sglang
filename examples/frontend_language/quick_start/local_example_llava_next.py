@@ -50,7 +50,7 @@ if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
 
     runtime = sgl.Runtime(model_path="lmms-lab/llama3-llava-next-8b")
-    runtime.endpoint.chat_template = get_chat_template("llama-3-instruct")
+    runtime.endpoint.chat_template = get_chat_template("llama-3-instruct-llava")
 
     # Or you can use the 72B model
     # runtime = sgl.Runtime(model_path="lmms-lab/llava-next-72b", tp_size=8)

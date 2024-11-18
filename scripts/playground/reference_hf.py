@@ -31,12 +31,12 @@ from transformers import AutoModelForCausalLM
 from sglang.srt.hf_transformers_utils import get_tokenizer
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def normal_text(args):
     t = get_tokenizer(args.model_path, trust_remote_code=True)
     m = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=torch.float16,
+        torch_dtype=args.dtype,
         low_cpu_mem_usage=True,
         device_map="auto",
         trust_remote_code=True,
@@ -47,7 +47,7 @@ def normal_text(args):
         "The capital of the United Kindom is",
         "Today is a sunny day and I like",
     ]
-    max_new_tokens = 16
+    max_new_tokens = args.max_new_tokens
 
     torch.cuda.set_device(0)
 
@@ -69,7 +69,7 @@ def normal_text(args):
         print(output_str)
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def synthetic_tokens(args):
     m = AutoModelForCausalLM.from_pretrained(
         args.model_path, torch_dtype=torch.float16, low_cpu_mem_usage=True
@@ -104,6 +104,10 @@ if __name__ == "__main__":
         default="TinyLlama/TinyLlama-1.1B-Chat-v0.4",
         # default="meta-llama/Llama-2-7b-chat-hf",
     )
+    parser.add_argument("--max-new-tokens", type=int, default=16)
+
+    parser.add_argument("--dtype", type=str, default="float16")
+
     args = parser.parse_args()
 
     normal_text(args)

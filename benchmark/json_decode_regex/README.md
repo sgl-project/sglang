@@ -20,7 +20,7 @@ outlines                  0.0.22
 Run Llama-7B
 
 ```
-python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 
+python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 ```
 
 Run Mixtral-8x7B

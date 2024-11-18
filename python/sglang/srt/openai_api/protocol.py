@@ -36,7 +36,7 @@ class ModelList(BaseModel):
     """Model list consists of model cards."""
 
     object: str = "list"
-    data: List[ModelCard] = []
+    data: List[ModelCard] = Field(default_factory=list)
 
 
 class ErrorResponse(BaseModel):
@@ -143,7 +143,7 @@ class BatchResponse(BaseModel):
     expired_at: Optional[int] = None
     cancelling_at: Optional[int] = None
     cancelled_at: Optional[int] = None
-    request_counts: dict = {"total": 0, "completed": 0, "failed": 0}
+    request_counts: Optional[dict] = None
     metadata: Optional[dict] = None
 
 
@@ -153,30 +153,31 @@ class CompletionRequest(BaseModel):
     model: str
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
-    echo: Optional[bool] = False
-    frequency_penalty: Optional[float] = 0.0
+    echo: bool = False
+    frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
-    max_tokens: Optional[int] = 16
+    max_tokens: int = 16
     n: int = 1
-    presence_penalty: Optional[float] = 0.0
+    presence_penalty: float = 0.0
     seed: Optional[int] = None
-    stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
-    stream: Optional[bool] = False
+    stop: Optional[Union[str, List[str]]] = None
+    stream: bool = False
     stream_options: Optional[StreamOptions] = None
     suffix: Optional[str] = None
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
+    temperature: float = 1.0
+    top_p: float = 1.0
     user: Optional[str] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
-    regex: Optional[str] = None
     json_schema: Optional[str] = None
-    ignore_eos: bool = False
+    regex: Optional[str] = None
     min_tokens: int = 0
-    repetition_penalty: Optional[float] = 1.0
-    stop_token_ids: Optional[List[int]] = Field(default_factory=list)
-    no_stop_trim: Union[bool, List[bool]] = False
+    repetition_penalty: float = 1.0
+    stop_token_ids: Optional[List[int]] = None
+    no_stop_trim: bool = False
+    ignore_eos: bool = False
+    skip_special_tokens: bool = True
 
 
 class CompletionResponseChoice(BaseModel):
@@ -235,7 +236,7 @@ ChatCompletionMessageContentPart = Union[
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant"]
+    role: Literal["system", "assistant", "tool"]
     content: Union[str, List[ChatCompletionMessageContentTextPart]]
 
 
@@ -259,28 +260,30 @@ class ChatCompletionRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
     model: str
-    frequency_penalty: Optional[float] = 0.0
+    frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
-    logprobs: Optional[bool] = False
+    logprobs: bool = False
     top_logprobs: Optional[int] = None
     max_tokens: Optional[int] = None
-    n: Optional[int] = 1
-    presence_penalty: Optional[float] = 0.0
+    n: int = 1
+    presence_penalty: float = 0.0
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = None
-    stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
-    stream: Optional[bool] = False
+    stop: Optional[Union[str, List[str]]] = None
+    stream: bool = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0
+    temperature: float = 0.7
+    top_p: float = 1.0
     user: Optional[str] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
-    min_tokens: Optional[int] = 0
-    repetition_penalty: Optional[float] = 1.0
-    stop_token_ids: Optional[List[int]] = Field(default_factory=list)
+    min_tokens: int = 0
+    repetition_penalty: float = 1.0
+    stop_token_ids: Optional[List[int]] = None
+    no_stop_trim: bool = False
     ignore_eos: bool = False
+    skip_special_tokens: bool = True
 
 
 class ChatMessage(BaseModel):

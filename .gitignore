@@ -167,7 +167,7 @@ cython_debug/
 *.swp
 
 # Documentation
-docs/en/_build
+docs/_build
 
 # SGL
 benchmark/mmlu/data

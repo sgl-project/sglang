@@ -14,6 +14,7 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 
 
 @triton.jit
@@ -53,6 +54,7 @@ def fused_moe_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_fp8: tl.constexpr,
+    even_Ks: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -129,16 +131,24 @@ def fused_moe_kernel(
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if even_Ks:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None],
+                other=0.0,
+            )
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+
         # We accumulate along the K dimension.
         if use_fp8:
             accumulator = tl.dot(a, b, acc=accumulator)
@@ -252,6 +262,12 @@ def invoke_fused_moe_kernel(
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
 
+    K = B.shape[2] - padding_size
+    if K % config["BLOCK_SIZE_K"] == 0:
+        even_ks = True
+    else:
+        even_ks = False
+
     fused_moe_kernel[grid](
         A,
         B,
@@ -263,7 +279,7 @@ def invoke_fused_moe_kernel(
         expert_ids,
         num_tokens_post_padded,
         B.shape[1],
-        B.shape[2],
+        B.shape[2] - padding_size,
         sorted_token_ids.shape[0],
         topk_ids.numel(),
         A.stride(0),
@@ -277,6 +293,7 @@ def invoke_fused_moe_kernel(
         top_k=top_k,
         compute_type=compute_type,
         use_fp8=use_fp8,
+        even_Ks=even_ks,
         **config,
     )
 
@@ -464,7 +481,7 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
 ):
     # Check constraints.
-    assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
+    assert hidden_states.shape[1] == w1.shape[2] - padding_size, "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -481,7 +498,7 @@ def fused_experts(
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
         w1.shape,
-        w2.shape,
+        (w2.shape[0], w2.shape[1], w2.shape[2] - padding_size),
         topk_ids.shape[1],
         "float8" if use_fp8 else None,
         override_config=override_config,

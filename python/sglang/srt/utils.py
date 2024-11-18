@@ -22,8 +22,13 @@ import logging
 import os
 import pickle
 import random
+import re
 import resource
+import shutil
+import signal
 import socket
+import subprocess
+import tempfile
 import time
 import warnings
 from importlib.metadata import PackageNotFoundError, version
@@ -35,8 +40,11 @@ import psutil
 import requests
 import torch
 import torch.distributed as dist
+import triton
+import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
+from starlette.routing import Mount
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 from triton.runtime.cache import (
@@ -63,6 +71,8 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
+    if os.environ.get("SGLANG_IS_FLASHINFER_AVAILABLE", "true") == "false":
+        return False
     return torch.cuda.is_available() and not is_hip()
 
 
@@ -203,34 +213,6 @@ def is_port_available(port):
             return False
 
 
-def is_multimodal_model(model_architectures):
-    if (
-        "LlavaLlamaForCausalLM" in model_architectures
-        or "LlavaQwenForCausalLM" in model_architectures
-        or "LlavaMistralForCausalLM" in model_architectures
-        or "LlavaVidForCausalLM" in model_architectures
-    ):
-        return True
-    else:
-        return False
-
-
-def is_generation_model(model_architectures, is_embedding: bool = False):
-    # We have two ways to determine whether a model is a generative model.
-    # 1. Check the model architectue
-    # 2. check the `is_embedding` server args
-
-    if (
-        "LlamaEmbeddingModel" in model_architectures
-        or "MistralModel" in model_architectures
-        or "LlamaForSequenceClassification" in model_architectures
-        or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
-    ):
-        return False
-    else:
-        return not is_embedding
-
-
 def decode_video_base64(video_base64):
     from PIL import Image
 
@@ -350,6 +332,7 @@ def suppress_other_loggers():
     )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
     logging.getLogger("vllm.utils").setLevel(logging.ERROR)
+    logging.getLogger("vllm.model_executor.model_loader.loader").setLevel(logging.ERROR)
 
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
@@ -375,17 +358,26 @@ def kill_parent_process():
     """Kill the parent process and all children of the parent process."""
     current_process = psutil.Process()
     parent_process = current_process.parent()
-    kill_child_process(parent_process.pid, skip_pid=current_process.pid)
-
-
-def kill_child_process(pid, including_parent=True, skip_pid=None):
-    """Kill the process and all its children process."""
+    kill_child_process(
+        parent_process.pid, include_self=True, skip_pid=current_process.pid
+    )
     try:
-        parent = psutil.Process(pid)
+        current_process.kill()
+    except psutil.NoSuchProcess:
+        pass
+
+
+def kill_child_process(pid=None, include_self=False, skip_pid=None):
+    """Kill the process and all its children process."""
+    if pid is None:
+        pid = os.getpid()
+
+    try:
+        itself = psutil.Process(pid)
     except psutil.NoSuchProcess:
         return
 
-    children = parent.children(recursive=True)
+    children = itself.children(recursive=True)
     for child in children:
         if child.pid == skip_pid:
             continue
@@ -394,11 +386,36 @@ def kill_child_process(pid, including_parent=True, skip_pid=None):
         except psutil.NoSuchProcess:
             pass
 
-    if including_parent:
+    if include_self:
         try:
-            parent.kill()
+            itself.kill()
+
+            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
+            # so we send an additional signal to kill them.
+            itself.send_signal(signal.SIGINT)
         except psutil.NoSuchProcess:
             pass
+
+
+def monkey_patch_vllm_model_config():
+    from vllm.config import ModelConfig
+
+    if not hasattr(ModelConfig, "_resolve_task"):
+        return
+
+    def _resolve_task(
+        self,
+        task_option,
+        hf_config,
+    ):
+        supported_tasks = {
+            "generate": True,
+            "embedding": False,
+        }
+        selected_task = "generate"
+        return supported_tasks, selected_task
+
+    setattr(ModelConfig, "_resolve_task", _resolve_task)
 
 
 def monkey_patch_vllm_p2p_access_check(gpu_id: int):
@@ -410,57 +427,6 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
-
-
-def monkey_patch_vllm_dummy_weight_loader():
-    """
-    Monkey patch the dummy weight loader in vllm to call process_weights_after_loading.
-    """
-
-    from vllm.model_executor.model_loader.loader import (
-        CacheConfig,
-        DeviceConfig,
-        DummyModelLoader,
-        LoRAConfig,
-        ModelConfig,
-        ParallelConfig,
-        SchedulerConfig,
-        _initialize_model,
-        initialize_dummy_weights,
-        nn,
-        set_default_torch_dtype,
-    )
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-        lora_config: Optional[LoRAConfig],
-        parallel_config: ParallelConfig,
-        scheduler_config: SchedulerConfig,
-        cache_config: CacheConfig,
-    ) -> nn.Module:
-        with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                    lora_config,
-                    cache_config,
-                )
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    quant_method.process_weights_after_loading(module)
-
-            # NOTE(woosuk): For accurate performance evaluation, we assign
-            # random values to the weights.
-            initialize_dummy_weights(model)
-        return model.eval()
-
-    setattr(DummyModelLoader, "load_model", load_model)
 
 
 vllm_all_gather_backup = None
@@ -698,3 +664,182 @@ def first_rank_print(*args, **kwargs):
         print(*args, **kwargs)
     else:
         pass
+
+
+def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
+    mem = psutil.virtual_memory()
+    total_mem = mem.total / 1024**3
+    available_mem = mem.available / 1024**3
+    if total_mem > 32 and available_mem > 16:
+        buf_size = int(0.5 * 1024**3)
+    else:
+        buf_size = -1
+
+    socket = context.socket(socket_type)
+    if socket_type == zmq.PUSH:
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDBUF, buf_size)
+        socket.connect(f"ipc://{endpoint}")
+    elif socket_type == zmq.PULL:
+        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVBUF, buf_size)
+        socket.bind(f"ipc://{endpoint}")
+    else:
+        raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    return socket
+
+
+def dump_to_file(dirpath, name, value):
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() != 0:
+        return
+
+    os.makedirs(dirpath, exist_ok=True)
+    if value.dtype is torch.bfloat16:
+        value = value.float()
+    value = value.cpu().numpy()
+    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
+    logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
+    np.save(output_filename, value)
+
+
+def is_triton_3():
+    return triton.__version__.startswith("3.")
+
+
+def maybe_torch_compile(*args, **kwargs):
+    """
+    torch.compile does not work for triton 2.2.0, which is needed in xlm1's jax.
+    Therefore, we disable it here.
+    """
+
+    def decorator(func):
+        if is_triton_3():
+            return torch.compile(*args, **kwargs)(func)
+        return func
+
+    return decorator
+
+
+def delete_directory(dirpath):
+    try:
+        # This will remove the directory and all its contents
+        shutil.rmtree(dirpath)
+    except OSError as e:
+        print(f"Warning: {dirpath} : {e.strerror}")
+
+
+# Temporary directory for prometheus multiprocess mode
+# Cleaned up automatically when this object is garbage collected
+prometheus_multiproc_dir: tempfile.TemporaryDirectory
+
+
+def set_prometheus_multiproc_dir():
+    # Set prometheus multiprocess directory
+    # sglang uses prometheus multiprocess mode
+    # we need to set this before importing prometheus_client
+    # https://prometheus.github.io/client_python/multiprocess/
+    global prometheus_multiproc_dir
+
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        )
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+def add_prometheus_middleware(app):
+    # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)
+
+
+def bind_port(port):
+    """Bind to a specific port, assuming it's available."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allows address reuse
+    sock.bind(("", port))
+    sock.listen(1)
+    return sock
+
+
+def get_amdgpu_memory_capacity():
+    try:
+        # Run rocm-smi and capture the output
+        result = subprocess.run(
+            ["rocm-smi --showmeminfo vram | grep 'Total Memory' | awk '{print $NF}'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values in MiB
+        memory_values = [
+            float(mem) / 1024 / 1024
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
+        )
+
+
+def get_nvgpu_memory_capacity():
+    try:
+        # Run nvidia-smi and capture the output
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values
+        memory_values = [
+            float(mem)
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
+        )
+
+
+def crash_on_warnings():
+    # Crash on warning if we are running CI tests
+    return os.getenv("SGLANG_IS_IN_CI", "false") == "true"

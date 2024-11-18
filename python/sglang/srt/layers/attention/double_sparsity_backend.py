@@ -10,6 +10,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -134,8 +135,13 @@ class DoubleSparseAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_capture_cuda_graph(
-        self, bs: int, req_pool_indices, seq_lens
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens=None,
     ):
+        # NOTE: encoder_lens expected to be zeros or None
         self.forward_metadata = (
             self.cuda_graph_start_loc,
             self.cuda_graph_attn_logits,
@@ -144,15 +150,23 @@ class DoubleSparseAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_replay_cuda_graph(
-        self, bs: int, req_pool_indices, seq_lens
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens=None,
     ):
+        # NOTE: encoder_lens expected to be zeros or None
         self.cuda_graph_start_loc.zero_()
         self.cuda_graph_start_loc[1:bs] = torch.cumsum(seq_lens[: bs - 1], dim=0)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
-    def forward_extend(self, q, k, v, layer: nn.Module, forward_batch: ForwardBatch):
+    def forward_extend(
+        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+    ):
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -168,7 +182,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
         )
 
         forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer.layer_id, forward_batch.out_cache_loc, k, v, k_label
+            layer, forward_batch.out_cache_loc, k, v, k_label
         )
 
         (
@@ -197,7 +211,9 @@ class DoubleSparseAttnBackend(AttentionBackend):
         )
         return o
 
-    def forward_decode(self, q, k, v, layer: nn.Module, forward_batch: ForwardBatch):
+    def forward_decode(
+        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+    ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -227,7 +243,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
         )
 
         forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer.layer_id, forward_batch.out_cache_loc, k, v, k_label
+            layer, forward_batch.out_cache_loc, k, v, k_label
         )
 
         # NOTE(Andy) shouldn't be used when max_len_in_batch < heavy_token_num
