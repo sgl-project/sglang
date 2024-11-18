@@ -36,6 +36,7 @@ from vllm.model_executor.custom_op import CustomOp
 logger = logging.getLogger(__name__)
 
 
+@CustomOp.register("sglang_rmsnorm")
 class RMSNorm(CustomOp):
     def __init__(
         self,
@@ -78,6 +79,7 @@ class RMSNorm(CustomOp):
             return x, residual
 
 
+@CustomOp.register("sglang_gemma_rmsnorm")
 class GemmaRMSNorm(CustomOp):
     def __init__(
         self,

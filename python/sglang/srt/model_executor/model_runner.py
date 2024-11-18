@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
+from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tp_group,
     init_distributed_environment,
@@ -60,6 +61,7 @@ from sglang.srt.utils import (
     crash_on_warnings,
     enable_show_time_cost,
     get_available_gpu_memory,
+    monkey_patch_vllm_model_config,
     monkey_patch_vllm_p2p_access_check,
 )
 
@@ -247,8 +249,10 @@ class ModelRunner:
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
         )
+        monkey_patch_vllm_model_config()
         self.vllm_model_config = VllmModelConfig(
             model=self.server_args.model_path,
+            task="",
             quantization=self.server_args.quantization,
             tokenizer=None,
             tokenizer_mode=None,
@@ -262,16 +266,19 @@ class ModelRunner:
                 self.model_config.model_override_args
             )
 
+        self.vllm_config = VllmConfig()
+        self.vllm_config.model_config = self.vllm_model_config
+        self.vllm_config.load_config = self.load_config
+        self.vllm_config.device_config = DeviceConfig(self.device)
+        self.vllm_config.quant_config = VllmConfig._get_quantization_config(
+            self.vllm_config.model_config, self.vllm_config.load_config
+        )
+
         # Load the model
         self.model = get_model(
-            model_config=self.vllm_model_config,
-            load_config=self.load_config,
-            device_config=DeviceConfig(self.device),
-            parallel_config=None,
-            scheduler_config=None,
-            lora_config=None,
-            cache_config=None,
+            vllm_config=self.vllm_config,
         )
+
         self.sliding_window_size = (
             self.model.get_attention_sliding_window_size()
             if hasattr(self.model, "get_attention_sliding_window_size")
@@ -306,6 +313,7 @@ class ModelRunner:
             # TODO: Use a better method to check this
             vllm_model_config = VllmModelConfig(
                 model=model_path,
+                task="",
                 quantization=self.server_args.quantization,
                 tokenizer=None,
                 tokenizer_mode=None,

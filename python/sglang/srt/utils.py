@@ -332,6 +332,7 @@ def suppress_other_loggers():
     )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
     logging.getLogger("vllm.utils").setLevel(logging.ERROR)
+    logging.getLogger("vllm.model_executor.model_loader.loader").setLevel(logging.ERROR)
 
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
@@ -394,6 +395,24 @@ def kill_child_process(pid=None, include_self=False, skip_pid=None):
             itself.send_signal(signal.SIGINT)
         except psutil.NoSuchProcess:
             pass
+
+
+def monkey_patch_vllm_model_config():
+    from vllm.config import ModelConfig
+
+    def _resolve_task(
+        self,
+        task_option,
+        hf_config,
+    ):
+        supported_tasks = {
+            "generate": True,
+            "embedding": False,
+        }
+        selected_task = "generate"
+        return supported_tasks, selected_task
+
+    setattr(ModelConfig, "_resolve_task", _resolve_task)
 
 
 def monkey_patch_vllm_p2p_access_check(gpu_id: int):
