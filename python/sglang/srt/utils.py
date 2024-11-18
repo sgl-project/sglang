@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import base64
+import importlib.util
 import ipaddress
 import json
 import logging
@@ -70,6 +71,8 @@ def is_flashinfer_available():
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
     if os.environ.get("SGLANG_IS_FLASHINFER_AVAILABLE", "true") == "false":
+        return False
+    if importlib.util.find_spec("flashinfer") is None:
         return False
     return torch.cuda.is_available() and not is_hip()
 
