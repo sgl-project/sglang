@@ -71,6 +71,8 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
+    if os.environ.get("SGLANG_IS_FLASHINFER_AVAILABLE", "true") == "false":
+        return False
     return torch.cuda.is_available() and not is_hip()
 
 
@@ -405,43 +407,6 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
 
-def monkey_patch_vllm_dummy_weight_loader():
-    """
-    Monkey patch the dummy weight loader in vllm to call process_weights_after_loading.
-    """
-
-    from vllm.config import VllmConfig
-    from vllm.model_executor.model_loader.loader import (
-        DummyModelLoader,
-        _initialize_model,
-        initialize_dummy_weights,
-        nn,
-        set_default_torch_dtype,
-    )
-
-    def load_model(self, *, vllm_config: VllmConfig) -> nn.Module:
-        with set_default_torch_dtype(vllm_config.model_config.dtype):
-            with torch.device(vllm_config.device_config.device):
-                model = _initialize_model(
-                    vllm_config.model_config,
-                    self.load_config,
-                    vllm_config.lora_config,
-                    vllm_config.cache_config,
-                )
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    quant_method.process_weights_after_loading(module)
-
-            # NOTE(woosuk): For accurate performance evaluation, we assign
-            # random values to the weights.
-            initialize_dummy_weights(model)
-        return model.eval()
-
-    setattr(DummyModelLoader, "load_model", load_model)
-
-
 vllm_all_gather_backup = None
 
 
@@ -496,60 +461,6 @@ def maybe_set_triton_cache_manager() -> None:
         manager = "sglang.srt.utils:CustomCacheManager"
         logger.debug("Setting Triton cache manager to: %s", manager)
         os.environ["TRITON_CACHE_MANAGER"] = manager
-
-
-def monkey_patch_vllm_model_config():
-    from typing import Dict, Set, Tuple, Union
-
-    from transformers import PretrainedConfig
-    from vllm.config import ModelConfig, TaskOption, _Task
-
-    def _resolve_task(
-        self,
-        task_option: Union[TaskOption, _Task],
-        hf_config: PretrainedConfig,
-    ) -> Tuple[Set[_Task], _Task]:
-
-        architectures = getattr(hf_config, "architectures", [])
-        if isinstance(architectures, str):
-            architectures = [architectures]
-
-        non_generation_models = {
-            "LlamaEmbeddingModel",
-            "MistralModel",
-            "LlamaForSequenceClassification",
-            "LlamaForSequenceClassificationWithNormal_Weights",
-            "InternLM2ForRewardModel",
-        }
-
-        is_generation = not any(arch in non_generation_models for arch in architectures)
-
-        auto_map = getattr(hf_config, "auto_map", {})
-        has_sequence_classification = any(
-            "ForSequenceClassification" in v for v in auto_map.values()
-        )
-
-        task_support: Dict[_Task, bool] = {
-            "generate": is_generation,
-            "embedding": (not is_generation) or has_sequence_classification,
-        }
-
-        supported_tasks_lst = [
-            task for task, is_supported in task_support.items() if is_supported
-        ]
-        supported_tasks = set(supported_tasks_lst)
-
-        if task_option not in supported_tasks:
-            msg = (
-                f"This model does not support the '{task_option}' task. "
-                f"Supported tasks: {supported_tasks}"
-            )
-            raise ValueError(msg)
-        selected_task = task_option
-
-        return supported_tasks, selected_task
-
-    setattr(ModelConfig, "_resolve_task", _resolve_task)
 
 
 class CustomCacheManager(FileCacheManager):
