@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.use_nan_detectioin = not global_server_args_dict["disable_nan_detection"]
+        self.use_nan_detectioin = global_server_args_dict["enable_nan_detection"]
 
     def forward(
         self,

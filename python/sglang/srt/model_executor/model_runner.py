@@ -139,7 +139,7 @@ class ModelRunner:
                 "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
                 "disable_penalizer": server_args.disable_penalizer,
-                "disable_nan_detection": server_args.disable_nan_detection,
+                "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
             }
         )
@@ -276,6 +276,10 @@ class ModelRunner:
             else None
         )
         self.dtype = self.vllm_model_config.dtype
+        if self.sliding_window_size:
+            assert (
+                self.server_args.attention_backend == "flashinfer"
+            ), "Only flashinfer supports window attention."
 
         logger.info(
             f"Load weight end. "

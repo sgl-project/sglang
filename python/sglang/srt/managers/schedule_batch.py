@@ -57,7 +57,7 @@ global_server_args_dict = {
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
     "disable_mla": ServerArgs.disable_mla,
     "torchao_config": ServerArgs.torchao_config,
-    "disable_nan_detection": ServerArgs.disable_nan_detection,
+    "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
 }
 
