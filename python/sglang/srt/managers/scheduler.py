@@ -390,6 +390,9 @@ class Scheduler:
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             if batch:
+                # We need a stream synchronization here. Otherwise, there will be cuda illegal memory access errors.
+                _ = batch.seq_lens[0].item()
+
                 result = self.run_batch(batch)
                 result_queue.append((batch.copy(), result))
 
