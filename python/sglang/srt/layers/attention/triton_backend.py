@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
 
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -29,9 +28,13 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
-        self.num_head = (
-            model_runner.model_config.num_attention_heads // model_runner.tp_size
-        )
+
+        if model_runner.server_args.enable_dp_attention:
+            self.num_head = model_runner.model_config.num_attention_heads
+        else:
+            self.num_head = (
+                model_runner.model_config.num_attention_heads // model_runner.tp_size
+            )
 
         if global_server_args_dict.get("triton_attention_reduce_in_fp32", False):
             self.reduce_dtype = torch.float32

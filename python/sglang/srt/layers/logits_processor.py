@@ -75,8 +75,18 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
+        extend_logprob_pruned_lens_cpu = None
+
         if forward_batch.return_logprob:
             return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
+            if forward_batch.forward_mode.is_extend():
+                extend_logprob_pruned_lens_cpu = [
+                    extend_len - start_len
+                    for extend_len, start_len in zip(
+                        forward_batch.extend_seq_lens_cpu,
+                        forward_batch.extend_logprob_start_lens_cpu,
+                    )
+                ]
         else:
             return_top_logprob = False
 

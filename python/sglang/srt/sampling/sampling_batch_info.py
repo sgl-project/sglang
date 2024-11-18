@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
-from sglang.srt.constrained.grammar import Grammar
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -30,8 +29,8 @@ class SamplingBatchInfo:
     vocab_size: int
     logit_bias: torch.Tensor = None
     vocab_mask: Optional[torch.Tensor] = None
-
-    grammars: Optional[List[Optional[Grammar]]] = None
+    apply_mask: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
+    grammars: Optional[List] = None
 
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
@@ -74,7 +73,7 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
-            is_all_greedy=top_ks.max().item() <= 1,
+            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             vocab_size=vocab_size,
             device=device,
         )
@@ -136,17 +135,23 @@ class SamplingBatchInfo:
     def update_regex_vocab_mask(self):
         if not self.grammars or not any(grammar for grammar in self.grammars):
             self.vocab_mask = None
+            self.apply_mask = None
             return
 
-        self.vocab_mask = torch.zeros(
-            len(self.temperatures),
-            self.vocab_size,
-            dtype=torch.bool,
+        # find a grammar from the list
+        grammar = next(grammar for grammar in self.grammars if grammar is not None)
+
+        # maybe we can reuse the existing mask?
+        self.vocab_mask = grammar.allocate_vocab_mask(
+            vocab_size=self.vocab_size,
+            batch_size=len(self.temperatures),
             device=self.device,
         )
+        self.apply_mask = type(grammar).apply_vocab_mask  # force to use static method
+
         for i, grammar in enumerate(self.grammars):
             if grammar is not None:
-                grammar.fill_vocab_mask(self.vocab_mask[i], self.vocab_size)
+                grammar.fill_vocab_mask(self.vocab_mask, i)
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
         if self.penalizer_orchestrator:

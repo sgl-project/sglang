@@ -28,8 +28,9 @@ from sglang.utils import get_exception_traceback
 DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
@@ -672,7 +673,7 @@ def run_and_check_memory_leak(
     if enable_mixed_chunk:
         other_args += ["--enable-mixed-chunk"]
     if enable_overlap:
-        other_args += ["--enable-overlap-scheduler"]
+        other_args += ["--enable-overlap-schedule"]
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
     port = random.randint(4000, 5000)
@@ -739,8 +740,7 @@ def run_mmlu_test(
 
         try:
             metrics = run_eval(args)
-            print(f"{metrics=}")
-            assert metrics["score"] >= 0.65
+            assert metrics["score"] >= 0.65, f"{metrics=}"
         finally:
             pass
 

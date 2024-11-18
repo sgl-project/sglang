@@ -244,6 +244,7 @@ jobs:
           cd test/srt
           python3 test_mla.py
           python3 test_mla_fp8.py
+          python3 test_dp_attention.py
 
       - name: Evaluate data parallelism accuracy (DP=2)
         timeout-minutes: 10

@@ -21,6 +21,7 @@ import threading
 import time
 import warnings
 from collections import deque
+from concurrent import futures
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -29,7 +30,6 @@ import zmq
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.grammar import GrammarCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
@@ -101,7 +101,7 @@ class Scheduler:
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
-        self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
+        self.disable_jump_forward = server_args.disable_jump_forward
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = server_args.enable_overlap_schedule
@@ -111,9 +111,12 @@ class Scheduler:
         # Init inter-process communication
         context = zmq.Context(2)
 
-        if self.tp_rank == 0:
+        if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name
+            )
+            self.send_to_tokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name
             )
 
             if server_args.skip_tokenizer_init:
@@ -128,6 +131,7 @@ class Scheduler:
                 )
         else:
             self.recv_from_tokenizer = None
+            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init tokenizer
@@ -250,21 +254,33 @@ class Scheduler:
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
 
-        # Init the FSM cache for constrained generation
-        self.grammar_cache = None
-
+        # Init the grammar backend for constrained generation
+        self.grammar_queue: List[Req] = []
         if not server_args.skip_tokenizer_init:
-            self.grammar_cache = GrammarCache(
-                server_args.tokenizer_path,
-                {
-                    "tokenizer_mode": server_args.tokenizer_mode,
-                    "trust_remote_code": server_args.trust_remote_code,
-                },
-                skip_tokenizer_init=server_args.skip_tokenizer_init,
-                whitespace_patterns=server_args.constrained_json_whitespace_pattern,
-                backend=server_args.grammar_backend,
-                allow_jump=not server_args.disable_regex_jump_forward,
-            )
+            if server_args.grammar_backend == "outlines":
+                from sglang.srt.constrained.outlines_backend import (
+                    OutlinesGrammarBackend,
+                )
+
+                self.grammar_backend = OutlinesGrammarBackend(
+                    self.tokenizer,
+                    whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+                    allow_jump_forward=not server_args.disable_jump_forward,
+                )
+            elif server_args.grammar_backend == "xgrammar":
+                from sglang.srt.constrained.xgrammar_backend import (
+                    XGrammarGrammarBackend,
+                )
+
+                self.grammar_backend = XGrammarGrammarBackend(
+                    self.tokenizer, vocab_size=self.model_config.vocab_size
+                )
+            else:
+                raise ValueError(
+                    f"Invalid grammar backend: {server_args.grammar_backend}"
+                )
+        else:
+            self.grammar_backend = None
 
         # Init new token estimation
         assert (
@@ -337,7 +353,7 @@ class Scheduler:
 
         kill_parent_process()
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def event_loop_normal(self):
         """A normal blocking scheduler loop."""
         self.last_batch = None
@@ -348,6 +364,10 @@ class Scheduler:
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
+
+            if self.server_args.enable_dp_attention:
+                batch = self.prepare_dp_attn_batch(batch)
+
             self.cur_batch = batch
 
             if batch:
@@ -362,6 +382,8 @@ class Scheduler:
                         self.update_running_batch()
                         if not self.running_batch:
                             break
+                        if self.server_args.enable_dp_attention:
+                            batch = self.prepare_dp_attn_batch(batch)
                         result = self.run_batch(batch)
                         self.process_batch_result(batch, result)
             else:
@@ -370,7 +392,7 @@ class Scheduler:
 
             self.last_batch = batch
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         result_queue = deque()
@@ -397,8 +419,62 @@ class Scheduler:
 
             self.last_batch = batch
 
+    def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
+        # Check if other DP workers have running batches
+        if local_batch is None:
+            num_tokens = 0
+        elif local_batch.forward_mode.is_decode():
+            num_tokens = local_batch.batch_size()
+        else:
+            num_tokens = local_batch.extend_num_tokens
+
+        local_num_tokens = torch.tensor([num_tokens], dtype=torch.int64)
+        global_num_tokens = torch.empty(self.tp_size, dtype=torch.int64)
+        torch.distributed.all_gather_into_tensor(
+            global_num_tokens,
+            local_num_tokens,
+            group=self.tp_cpu_group,
+        )
+
+        if local_batch is None and global_num_tokens.max().item() > 0:
+            local_batch = self.get_idle_batch()
+
+        if local_batch is not None:
+            local_batch.global_num_tokens = global_num_tokens.tolist()
+
+            # Check forward mode for cuda graph
+            if not self.server_args.disable_cuda_graph:
+                forward_mode_state = torch.tensor(
+                    (
+                        1
+                        if local_batch.forward_mode.is_decode()
+                        or local_batch.forward_mode.is_idle()
+                        else 0
+                    ),
+                    dtype=torch.int32,
+                )
+                torch.distributed.all_reduce(
+                    forward_mode_state,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.tp_cpu_group,
+                )
+                local_batch.can_run_dp_cuda_graph = forward_mode_state.item() == 1
+
+        return local_batch
+
+    def get_idle_batch(self):
+        idle_batch = ScheduleBatch.init_new(
+            [],
+            self.req_to_token_pool,
+            self.token_to_kv_pool,
+            self.tree_cache,
+            self.model_config,
+        )
+        idle_batch.prepare_for_idle()
+        return idle_batch
+
     def recv_requests(self):
-        if self.tp_rank == 0:
+        if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             recv_reqs = []
 
             while True:
@@ -410,7 +486,7 @@ class Scheduler:
         else:
             recv_reqs = None
 
-        if self.tp_size != 1:
+        if self.tp_size != 1 and not self.server_args.enable_dp_attention:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs
 
@@ -426,7 +502,7 @@ class Scheduler:
                 self.abort_request(recv_req)
             elif isinstance(recv_req, UpdateWeightReqInput):
                 success, message = self.update_weights(recv_req)
-                self.send_to_detokenizer.send_pyobj(
+                self.send_to_tokenizer.send_pyobj(
                     UpdateWeightReqOutput(success, message)
                 )
             elif isinstance(recv_req, ProfileReq):
@@ -435,7 +511,7 @@ class Scheduler:
                 else:
                     self.stop_profile()
             elif isinstance(recv_req, GetMemPoolSizeReq):
-                self.send_to_detokenizer.send_pyobj(
+                self.send_to_tokenizer.send_pyobj(
                     GetMemPoolSizeReqOutput(self.max_total_num_tokens)
                 )
             else:
@@ -472,22 +548,6 @@ class Scheduler:
             # By default, only return the logprobs for output tokens
             req.logprob_start_len = len(recv_req.input_ids) - 1
 
-        # Init regex FSM or BNF
-        if (
-            req.sampling_params.json_schema is not None
-            or req.sampling_params.regex is not None
-        ):
-            assert self.grammar_cache is not None
-            if req.sampling_params.json_schema is not None:
-                req.grammar = self.grammar_cache.query(
-                    ("json", req.sampling_params.json_schema),
-                    self.model_config.vocab_size,
-                )
-            elif req.sampling_params.regex is not None:
-                req.grammar = self.grammar_cache.query(
-                    ("regex", req.sampling_params.regex), self.model_config.vocab_size
-                )
-
         # Truncate prompts that are too long
         if len(req.origin_input_ids) > self.max_req_input_len:
             logger.warning(
@@ -505,7 +565,27 @@ class Scheduler:
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
-        self.waiting_queue.append(req)
+        # Init grammar cache for this request
+        add_to_grammar_queue = False
+        if (
+            req.sampling_params.json_schema is not None
+            or req.sampling_params.regex is not None
+        ):
+            assert self.grammar_backend is not None
+            if req.sampling_params.json_schema is not None:
+                key = ("json", req.sampling_params.json_schema)
+            elif req.sampling_params.regex is not None:
+                key = ("regex", req.sampling_params.regex)
+
+            req.grammar = self.grammar_backend.get_cached_value(key)
+            if not req.grammar:
+                req.grammar = self.grammar_backend.get_future_value(key)
+                add_to_grammar_queue = True
+
+        if add_to_grammar_queue:
+            self.grammar_queue.append(req)
+        else:
+            self.waiting_queue.append(req)
 
     def handle_embedding_request(
         self,
@@ -651,6 +731,10 @@ class Scheduler:
         return self.running_batch
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        # Check if the grammar is ready in the grammar queue
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
+
         # Handle the cases where prefill is not allowed
         if (
             self.batch_is_full or len(self.waiting_queue) == 0
@@ -797,7 +881,7 @@ class Scheduler:
             )
 
         # Check for jump-forward
-        if not self.disable_regex_jump_forward:
+        if not self.disable_jump_forward:
             jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
             self.waiting_queue.extend(jump_forward_reqs)
             if batch.is_empty():
@@ -821,6 +905,10 @@ class Scheduler:
                     logits_output, next_token_ids = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
+            elif batch.forward_mode.is_idle():
+                model_worker_batch = batch.get_model_worker_batch()
+                self.tp_worker.forward_batch_idle(model_worker_batch)
+                return
             else:
                 logits_output = None
                 if self.skip_tokenizer_init:
@@ -839,6 +927,8 @@ class Scheduler:
         return ret
 
     def process_batch_result(self, batch: ScheduleBatch, result):
+        if batch.forward_mode.is_idle():
+            return
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
             if batch.is_empty():
@@ -852,7 +942,7 @@ class Scheduler:
             logits_output, next_token_ids, bid = result
 
             if self.enable_overlap:
-                logits_output, next_token_ids = self.tp_worker.resulve_batch_result(bid)
+                logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             else:
                 # Move next_token_ids and logprobs to cpu
                 if batch.return_logprob:
@@ -927,7 +1017,7 @@ class Scheduler:
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
-            logits_output, next_token_ids = self.tp_worker.resulve_batch_result(bid)
+            logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             next_token_logprobs = logits_output.next_token_logprobs
         else:
             # Move next_token_ids and logprobs to cpu
@@ -1158,6 +1248,30 @@ class Scheduler:
                     )
                 )
 
+    def move_ready_grammar_requests(self):
+        """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
+        num_ready_reqs = 0
+        for req in self.grammar_queue:
+            try:
+                req.grammar = req.grammar.result(timeout=0.05)
+                num_ready_reqs += 1
+            except futures._base.TimeoutError:
+                break
+
+        if self.tp_size > 1:
+            # Sync across TP ranks to make sure they have the same number of ready requests
+            tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+            )
+            num_ready_reqs_max = tensor.item()
+            for i in range(num_ready_reqs, num_ready_reqs_max):
+                self.grammar_queue[i].grammar = self.grammar_queue[i].grammar.result()
+            num_ready_reqs = num_ready_reqs_max
+
+        self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
+        self.grammar_queue = self.grammar_queue[num_ready_reqs:]
+
     def flush_cache(self):
         """Flush the memory pool and cache."""
         if len(self.waiting_queue) == 0 and (
@@ -1165,9 +1279,8 @@ class Scheduler:
         ):
             self.tree_cache.reset()
             self.tree_cache_metrics = {"total": 0, "hit": 0}
-            if self.grammar_cache is not None:
-                self.grammar_cache.reset()
-            # TODO(dark): reset the bnf cache
+            if self.grammar_backend:
+                self.grammar_backend.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()

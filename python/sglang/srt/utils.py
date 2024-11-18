@@ -27,6 +27,7 @@ import resource
 import shutil
 import signal
 import socket
+import subprocess
 import tempfile
 import time
 import warnings
@@ -70,6 +71,8 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
+    if os.environ.get("SGLANG_IS_FLASHINFER_AVAILABLE", "true") == "false":
+        return False
     return torch.cuda.is_available() and not is_hip()
 
 
@@ -402,57 +405,6 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
-
-
-def monkey_patch_vllm_dummy_weight_loader():
-    """
-    Monkey patch the dummy weight loader in vllm to call process_weights_after_loading.
-    """
-
-    from vllm.model_executor.model_loader.loader import (
-        CacheConfig,
-        DeviceConfig,
-        DummyModelLoader,
-        LoRAConfig,
-        ModelConfig,
-        ParallelConfig,
-        SchedulerConfig,
-        _initialize_model,
-        initialize_dummy_weights,
-        nn,
-        set_default_torch_dtype,
-    )
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-        lora_config: Optional[LoRAConfig],
-        parallel_config: ParallelConfig,
-        scheduler_config: SchedulerConfig,
-        cache_config: CacheConfig,
-    ) -> nn.Module:
-        with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                    lora_config,
-                    cache_config,
-                )
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    quant_method.process_weights_after_loading(module)
-
-            # NOTE(woosuk): For accurate performance evaluation, we assign
-            # random values to the weights.
-            initialize_dummy_weights(model)
-        return model.eval()
-
-    setattr(DummyModelLoader, "load_model", load_model)
 
 
 vllm_all_gather_backup = None
@@ -791,3 +743,76 @@ def add_prometheus_middleware(app):
     # Workaround for 307 Redirect for /metrics
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
     app.routes.append(metrics_route)
+
+
+def bind_port(port):
+    """Bind to a specific port, assuming it's available."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allows address reuse
+    sock.bind(("", port))
+    sock.listen(1)
+    return sock
+
+
+def get_amdgpu_memory_capacity():
+    try:
+        # Run rocm-smi and capture the output
+        result = subprocess.run(
+            ["rocm-smi --showmeminfo vram | grep 'Total Memory' | awk '{print $NF}'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values in MiB
+        memory_values = [
+            float(mem) / 1024 / 1024
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
+        )
+
+
+def get_nvgpu_memory_capacity():
+    try:
+        # Run nvidia-smi and capture the output
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values
+        memory_values = [
+            float(mem)
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
+        )

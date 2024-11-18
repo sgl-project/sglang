@@ -116,6 +116,8 @@ class CudaGraphRunner:
         self.use_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = self.model_runner.model_config.is_encoder_decoder
+        self.enable_dp_attention = self.model_runner.server_args.enable_dp_attention
+        self.tp_size = self.model_runner.tp_size
 
         # Batch sizes to capture
         if model_runner.server_args.disable_cuda_graph_padding:
@@ -189,6 +191,16 @@ class CudaGraphRunner:
             else:
                 self.encoder_lens = None
 
+            if self.enable_dp_attention:
+                self.global_num_tokens = [0] * self.tp_size
+                self.gathered_buffer = torch.zeros(
+                    (
+                        self.max_bs * self.tp_size,
+                        self.model_runner.model_config.hidden_size,
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
+
         # Capture
         try:
             with self.model_capture_mode():
@@ -214,11 +226,21 @@ class CudaGraphRunner:
             self.model_runner.model.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
-        is_bs_supported = (
-            forward_batch.batch_size in self.graphs
-            if self.disable_padding
-            else forward_batch.batch_size <= self.max_bs
-        )
+        if self.enable_dp_attention:
+            min_num_tokens, max_num_tokens = min(forward_batch.global_num_tokens), max(
+                forward_batch.global_num_tokens
+            )
+            is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
+                (min_num_tokens == max_num_tokens and max_num_tokens in self.graphs)
+                if self.disable_padding
+                else max_num_tokens <= self.max_bs
+            )
+        else:
+            is_bs_supported = (
+                forward_batch.batch_size in self.graphs
+                if self.disable_padding
+                else forward_batch.batch_size <= self.max_bs
+            )
 
         # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
         # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
@@ -294,6 +316,13 @@ class CudaGraphRunner:
         seq_lens_sum = seq_lens.sum().item()
         mrope_positions = self.mrope_positions[:, :bs]
 
+        if self.enable_dp_attention:
+            self.global_num_tokens[:] = [bs] * self.tp_size
+            gathered_buffer = self.gathered_buffer[: bs * self.tp_size]
+        else:
+            self.global_num_tokens = None
+            gathered_buffer = None
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -309,10 +338,11 @@ class CudaGraphRunner:
             return_logprob=False,
             top_logprobs_nums=[0] * num_token,
             positions=positions,
-            # positions=clamp_position(seq_lens),
+            global_num_tokens=self.global_num_tokens,
+            mrope_positions=mrope_positions,
+            gathered_buffer=gathered_buffer,
             spec_info=spec_info,
             spec_algorithm=self.model_runner.server_args.speculative_algorithm,
-            mrope_positions=mrope_positions,
         )
 
         # Attention backend
@@ -359,7 +389,12 @@ class CudaGraphRunner:
         raw_num_token = forward_batch.input_ids.numel()
 
         # Pad
-        index = bisect.bisect_left(self.capture_bs, raw_bs)
+        if self.enable_dp_attention:
+            index = bisect.bisect_left(
+                self.capture_bs, max(forward_batch.global_num_tokens)
+            )
+        else:
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         num_token = self.num_tokens[index]
         if bs != raw_bs:
@@ -380,6 +415,8 @@ class CudaGraphRunner:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
+        if self.enable_dp_attention:
+            self.global_num_tokens[:] = [bs] * self.tp_size
 
         # EAGLE speculative decoding
         if isinstance(

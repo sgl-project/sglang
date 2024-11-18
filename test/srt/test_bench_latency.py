@@ -13,7 +13,7 @@ class TestBenchLatency(unittest.TestCase):
         output_throughput = run_bench_latency(DEFAULT_MODEL_NAME_FOR_TEST, [])
 
         if is_in_ci():
-            assert output_throughput > 130, f"{output_throughput=}"
+            self.assertGreater(output_throughput, 135)
 
     def test_moe_default(self):
         output_throughput = run_bench_latency(
@@ -21,7 +21,7 @@ class TestBenchLatency(unittest.TestCase):
         )
 
         if is_in_ci():
-            assert output_throughput > 125, f"{output_throughput=}"
+            self.assertGreater(output_throughput, 125)
 
 
 if __name__ == "__main__":

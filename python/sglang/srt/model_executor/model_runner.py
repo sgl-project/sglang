@@ -39,7 +39,6 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
-from sglang.srt.constrained import disable_cache
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -59,7 +58,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
-    monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
 )
 
@@ -131,6 +129,8 @@ class ModelRunner:
         if server_args.show_time_cost:
             enable_show_time_cost()
         if server_args.disable_disk_cache:
+            from outlines.caching import disable_cache
+
             disable_cache()
 
         global_server_args_dict.update(
@@ -141,7 +141,8 @@ class ModelRunner:
                 "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
                 "disable_penalizer": server_args.disable_penalizer,
-                "disable_nan_detection": server_args.disable_nan_detection,
+                "enable_nan_detection": server_args.enable_nan_detection,
+                "enable_dp_attention": server_args.enable_dp_attention,
             }
         )
 
@@ -149,6 +150,15 @@ class ModelRunner:
         min_per_gpu_memory = self.init_torch_distributed()
         self.sampler = Sampler()
         self.load_model()
+
+        # Apply torch TP if model supports it
+        supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
+        if self.tp_size > 1 and supports_torch_tp:
+            self.apply_torch_tp()
+            self.torch_tp_applied = True
+        else:
+            self.torch_tp_applied = False
+
         if server_args.lora_paths is not None:
             self.init_lora_manager()
         self.init_memory_pool(
@@ -237,8 +247,10 @@ class ModelRunner:
                     raise RuntimeError("SGLang only supports sm75 and above.")
 
         # Prepare the vllm model config
-        monkey_patch_vllm_dummy_weight_loader()
-        self.load_config = LoadConfig(load_format=self.server_args.load_format)
+        self.load_config = LoadConfig(
+            load_format=self.server_args.load_format,
+            download_dir=self.server_args.download_dir,
+        )
         self.vllm_model_config = VllmModelConfig(
             model=(
                 self.server_args.model_path
@@ -257,7 +269,6 @@ class ModelRunner:
             self.vllm_model_config.hf_config.update(
                 self.model_config.model_override_args
             )
-        self.dtype = self.vllm_model_config.dtype
 
         # Load the model
         self.model = get_model(
@@ -274,6 +285,11 @@ class ModelRunner:
             if hasattr(self.model, "get_attention_sliding_window_size")
             else None
         )
+        self.dtype = self.vllm_model_config.dtype
+        if self.sliding_window_size:
+            assert (
+                self.server_args.attention_backend == "flashinfer"
+            ), "Only flashinfer supports window attention."
 
         logger.info(
             f"Load weight end. "
@@ -568,6 +584,13 @@ class ModelRunner:
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
 
+    def apply_torch_tp(self):
+        logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
+        from sglang.srt.model_parallel import tensor_parallel
+
+        device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
+        tensor_parallel(self.model, device_mesh)
+
     def forward_decode(self, forward_batch: ForwardBatch):
 
         if (
@@ -602,11 +625,21 @@ class ModelRunner:
                 get_embedding=True,
             )
 
+    def forward_idle(self, forward_batch: ForwardBatch):
+        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
+            return self.cuda_graph_runner.replay(forward_batch)
+
+        return self.model.forward(
+            forward_batch.input_ids, forward_batch.positions, forward_batch
+        )
+
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
             return self.forward_extend(forward_batch)
+        elif forward_batch.forward_mode.is_idle():
+            return self.forward_idle(forward_batch)
         else:
             raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
 
@@ -642,7 +675,7 @@ class ModelRunner:
 
         # Apply regex vocab_mask
         if sampling_info.vocab_mask is not None:
-            logits = logits.masked_fill(sampling_info.vocab_mask, float("-inf"))
+            sampling_info.apply_mask(logits=logits, vocab_mask=sampling_info.vocab_mask)
 
         return logits
 
