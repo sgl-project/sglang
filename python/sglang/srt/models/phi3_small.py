@@ -1,14 +1,14 @@
 import math
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import Phi3Config
 from transformers.configuration_utils import PretrainedConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import make_layers, maybe_prefix
+from vllm.model_executor.models.utils import make_layers
 
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -339,7 +339,7 @@ class Phi3SmallForCausalLM(nn.Module):
         self,
         config: Phi3Config,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+        cache_config=None,
     ):
 
         super().__init__()
@@ -349,7 +349,7 @@ class Phi3SmallForCausalLM(nn.Module):
         self.model = Phi3SmallModel(
             config=config,
             quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "model"),
+            prefix="model",
         )
         self.torchao_config = global_server_args_dict["torchao_config"]
         self.vocab_size = config.vocab_size
