@@ -223,8 +223,8 @@ class OlmoModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                OlmoDecoderLayer(config, layer_idx, quant_config)
-                for layer_idx in range(config.num_hidden_layers)
+                OlmoDecoderLayer(config, layer_id, quant_config)
+                for layer_id in range(config.num_hidden_layers)
             ]
         )
         self.norm = nn.LayerNorm(
@@ -250,7 +250,7 @@ class OlmoModel(nn.Module):
             hidden_states = input_embeds
 
         # Apply blocks one-by-one.
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for layer_id, decoder_layer in enumerate(self.layers):
             # shape: (batch_size, seq_len, d_model)
             hidden_states = decoder_layer(
                 positions,
