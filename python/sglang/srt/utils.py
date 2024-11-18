@@ -71,6 +71,8 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
+    if os.environ.get("SGLANG_IS_FLASHINFER_AVAILABLE", "true") == "false":
+        return False
     return torch.cuda.is_available() and not is_hip()
 
 
