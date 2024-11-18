@@ -37,12 +37,6 @@ class WrapperDispatch(Enum):
     CROSS_ATTENTION = auto()
 
 
-def _grouped_size_compiled_for_decode_kernels(
-    num_qo_heads: int, num_kv_heads: int
-) -> bool:  # TODO: Remove me! https://github.com/flashinfer-ai/flashinfer/issues/549
-    return (num_qo_heads // num_kv_heads) in [1, 2, 4, 8]
-
-
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -50,13 +44,6 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
 
         # Parse constants
-        if not _grouped_size_compiled_for_decode_kernels(
-            model_runner.model_config.num_attention_heads // model_runner.tp_size,
-            model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
-        ):
-            self.decode_use_tensor_cores = True
-        else:
-            self.decode_use_tensor_cores = False
         self.max_context_len = model_runner.model_config.context_len
 
         assert not (
@@ -113,7 +100,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace_buffer,
                     "NHD",
-                    use_tensor_cores=self.decode_use_tensor_cores,
                 )
             )
 
@@ -183,7 +169,6 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.workspace_buffer,
                     "NHD",
                     use_cuda_graph=True,
-                    use_tensor_cores=self.decode_use_tensor_cores,
                     paged_kv_indptr_buffer=self.kv_indptr[i][: bs + 1],
                     paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
                     paged_kv_last_page_len_buffer=self.kv_last_page_len[:bs],
