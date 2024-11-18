@@ -90,6 +90,8 @@ def set_torch_compile_config():
 
     # FIXME: tmp workaround
     torch._dynamo.config.accumulated_cache_size_limit = 1024
+    if hasattr(torch._dynamo.config, "cache_size_limit"):
+        torch._dynamo.config.cache_size_limit = 1024
 
 
 @maybe_torch_compile(dynamic=True)
