@@ -32,6 +32,7 @@ class TestBenchServing(unittest.TestCase):
             random_input_len=None,
             random_output_len=None,
             disable_stream=True,
+            need_warmup=True,
         )
 
         if is_in_ci():

@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import copy
 import os
 import random
 import subprocess
@@ -529,6 +530,7 @@ def run_bench_serving(
     random_input_len=4096,
     random_output_len=2048,
     disable_stream=False,
+    need_warmup=False,
 ):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
@@ -565,6 +567,10 @@ def run_bench_serving(
     )
 
     try:
+        if need_warmup:
+            warmup_args = copy.deepcopy(args)
+            warmup_args.num_prompts = 16
+            run_benchmark(warmup_args)
         res = run_benchmark(args)
     finally:
         kill_child_process(process.pid, include_self=True)
