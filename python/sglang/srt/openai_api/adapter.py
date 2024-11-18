@@ -885,14 +885,13 @@ def v1_chat_generate_request(
                     openai_compatible_messages = openai_compatible_messages[:-1]
                 else:
                     assistant_prefix = None
-                prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                prompt = tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
-                    tokenize=True,
+                    tokenize=False,
                     add_generation_prompt=True,
                 )
                 if assistant_prefix:
-                    prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
-                prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
+                    prompt += assistant_prefix
                 stop = request.stop
                 image_data = None
                 modalities = []
@@ -907,7 +906,6 @@ def v1_chat_generate_request(
                         stop.append(request.stop)
                     else:
                         stop.extend(request.stop)
-                prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
             prompt = request.messages
@@ -915,6 +913,7 @@ def v1_chat_generate_request(
             image_data = None
             modalities = []
 
+        prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
         text.append(prompt)
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
