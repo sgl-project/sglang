@@ -81,9 +81,19 @@ class OutlinesGrammar(BaseGrammarObject):
     ):
         self.state = next_state
 
-    def fill_vocab_mask(self, vocab_mask: torch.Tensor):
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
+
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        vocab_mask = vocab_mask[idx]
         vocab_mask.fill_(1)
         vocab_mask[self.guide.get_next_instruction(self.state).tokens] = 0
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):
+        logits.masked_fill_(vocab_mask, float("-inf"))
 
     def copy(self):
         return OutlinesGrammar(self.guide, self.jump_forward_map)
