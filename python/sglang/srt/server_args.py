@@ -124,7 +124,6 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_penalizer: bool = False
-    disable_nan_detection: bool = False
     enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -132,6 +131,7 @@ class ServerArgs:
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: int = 160
     torchao_config: str = ""
+    enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     num_continuous_decode_steps: int = 1
@@ -171,11 +171,11 @@ class ServerArgs:
         else:
             gpu_mem = get_nvgpu_memory_capacity()
         if gpu_mem < 25000:
+            self.chunked_prefill_size //= 4  # make it 2048
+            self.cuda_graph_max_bs = 4
             logger.warning(
                 "Automatically adjust --chunked-prefill-size for small GPUs."
             )
-            self.chunked_prefill_size //= 4  # make it 2048
-            self.cuda_graph_max_bs = 4
 
         if not is_flashinfer_available():
             self.attention_backend = "triton"
@@ -194,7 +194,7 @@ class ServerArgs:
             self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
             self.enable_overlap_schedule = False
             logger.warning(
-                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE workload issue. "
+                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
                 f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size."
             )
@@ -204,21 +204,8 @@ class ServerArgs:
                 "Overlap scheduler mode is enabled. This is an experimental feature. "
                 "Sampling penalizer (e.g., frequency and repetition penalty), constrained decoding (e.g., regex, JSON), "
                 "and embedding APIs are not supported and will lead to wrong results. "
-                "The NaN detection is also disabled."
             )
             self.disable_penalizer = True
-            self.disable_nan_detection = True
-
-        # Model-specific patches
-        if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
-            logger.info(
-                "Not sure why, the tokenizer will add an additional token at the end of the prompt when trust_remote_mode=True"
-            )
-            self.trust_remote_code = False
-
-        if "gemma-2" in self.model_path.lower():
-            logger.info("When using sliding window in gemma-2, turn on flashinfer.")
-            self.attention_backend = "flashinfer"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -682,6 +669,11 @@ class ServerArgs:
             type=str,
             default=ServerArgs.torchao_config,
             help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo",
+        )
+        parser.add_argument(
+            "--enable-nan-detection",
+            action="store_true",
+            help="Enable the NaN detection for debugging purposes.",
         )
         parser.add_argument(
             "--enable-p2p-check",
