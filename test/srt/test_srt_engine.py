@@ -160,6 +160,38 @@ class TestSRTEngine(unittest.TestCase):
         result = throughput_test(server_args=server_args, bench_args=bench_args)
         self.assertGreater(result["total_throughput"], 3500)
 
+    def test_8_engine_cpu_offload(self):
+        prompt = "Today is a sunny day and I like"
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+
+        sampling_params = {"temperature": 0, "max_new_tokens": 8}
+
+        engine = sgl.Engine(
+            model_path=model_path,
+            random_seed=42,
+            max_total_tokens=128,
+            log_level="error",
+        )
+        out1 = engine.generate(prompt, sampling_params)["text"]
+        engine.shutdown()
+
+        engine = sgl.Engine(
+            model_path=model_path,
+            random_seed=42,
+            max_total_tokens=128,
+            log_level="error",
+            cpu_offload_gb=3,
+        )
+        out2 = engine.generate(prompt, sampling_params)["text"]
+        engine.shutdown()
+
+        print("==== Answer 1 ====")
+        print(out1)
+
+        print("==== Answer 2 ====")
+        print(out2)
+        self.assertEqual(out1, out2)
+
 
 if __name__ == "__main__":
     unittest.main()
