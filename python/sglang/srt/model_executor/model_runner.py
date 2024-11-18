@@ -276,6 +276,10 @@ class ModelRunner:
             else None
         )
         self.dtype = self.vllm_model_config.dtype
+        if self.sliding_window_size:
+            assert (
+                self.server_args.attention_backend == "flashinfer"
+            ), "Only flashinfer supports window attention."
 
         logger.info(
             f"Load weight end. "
