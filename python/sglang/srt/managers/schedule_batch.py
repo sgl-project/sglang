@@ -208,6 +208,7 @@ class Req:
         # 3: last token
         self.vid = 0  # version id to sync decode status with in detokenizer_manager
         self.decoded_text = ""
+        self.stop_check_text = ""
         self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
         self.read_offset = None
 
@@ -348,19 +349,23 @@ class Req:
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
             return
 
-        # Check stop strings
-        if len(self.sampling_params.stop_strs) > 0:
-            tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
-            )
+        if (
+            len(self.sampling_params.stop_strs) > 0
+            or len(self.sampling_params.stop_regex_strs) > 0
+        ):
+            self.stop_check_text += self.tokenizer.decode(last_token_id)
 
-            for stop_str in self.sampling_params.stop_strs:
-                if stop_str in tail_str or stop_str in self.decoded_text:
-                    self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                    return
+        # Check stop strings
+        for stop_str in self.sampling_params.stop_strs:
+            if stop_str in self.stop_check_text or stop_str in self.decoded_text:
+                self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                return
 
         for stop_regex_str in self.sampling_params.stop_regex_strs:
-            if re.search(stop_regex_str, self.decoded_text):
+            logger.error(
+                f"stop_regex='{stop_regex_str}' stop_check_text_length={len(self.stop_check_text)}, output_tokens={len(self.output_ids)}"
+            )
+            if re.search(stop_regex_str, self.stop_check_text):
                 self.finished_reason = FINISH_MATCHED_STR(matched=stop_regex_str)
                 return
 
