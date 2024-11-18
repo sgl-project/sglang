@@ -43,7 +43,7 @@ class TestSRTEngine(unittest.TestCase):
 
         print("==== Answer 2 ====")
         print(out2)
-        assert out1 == out2, f"{out1} != {out2}"
+        self.assertEqual(out1, out2)
 
     def test_2_engine_multiple_generate(self):
         # just to ensure there is no issue running multiple generate calls
@@ -113,7 +113,7 @@ class TestSRTEngine(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["accuracy"] > 0.7
+        self.assertGreater(metrics["accuracy"], 0.7)
 
     def test_5_prompt_input_ids_consistency(self):
         prompt = "The capital of UK is"
@@ -136,7 +136,7 @@ class TestSRTEngine(unittest.TestCase):
 
         print("==== Answer 2 ====")
         print(out2)
-        assert out1 == out2, f"{out1} != {out2}"
+        self.assertEqual(out1, out2)
 
     def test_6_engine_runtime_encode_consistency(self):
         prompt = "Today is a sunny day and I like"
@@ -160,7 +160,7 @@ class TestSRTEngine(unittest.TestCase):
         )
         bench_args = BenchArgs(num_prompts=100)
         result = throughput_test(server_args=server_args, bench_args=bench_args)
-        self.assertTrue(result["total_throughput"] > 3000)
+        self.assertGreater(result["total_throughput"], 3000)
 
 
 if __name__ == "__main__":

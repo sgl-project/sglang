@@ -1055,9 +1055,6 @@ class ScheduleBatch:
         )
 
     def copy(self):
-        # We need a stream synchronization here. Otherwise, there will be cuda illegal memory access errors.
-        _ = self.seq_lens[0].item()
-
         # Only contain fields that will be used by process_batch_result
         return ScheduleBatch(
             reqs=self.reqs,
