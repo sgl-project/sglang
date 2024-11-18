@@ -20,6 +20,7 @@ import importlib
 import importlib.resources
 import json
 import logging
+import os
 import pkgutil
 from functools import lru_cache
 from typing import Optional, Type
@@ -56,6 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    crash_on_warnings,
     enable_show_time_cost,
     get_available_gpu_memory,
     monkey_patch_vllm_p2p_access_check,
@@ -665,7 +667,9 @@ def import_model_classes():
             try:
                 module = importlib.import_module(name)
             except Exception as e:
-                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+                logger.warning(f"Ignore import error when loading {name}. {e}")
+                if crash_on_warnings():
+                    raise ValueError(f"Ignore import error when loading {name}. {e}")
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass

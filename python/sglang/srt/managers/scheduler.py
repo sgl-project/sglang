@@ -67,6 +67,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
+    crash_on_warnings,
     get_zmq_socket,
     kill_parent_process,
     set_random_seed,
@@ -75,10 +76,6 @@ from sglang.srt.utils import (
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-
-
-# Crash on warning if we are running CI tests
-crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
 
 # Test retract decode
 test_retract = os.getenv("SGLANG_TEST_RETRACT", "false") == "true"
@@ -662,21 +659,23 @@ class Scheduler:
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
         if available_size != self.max_total_num_tokens:
-            warnings.warn(
-                "Warning: "
-                f"available_size={available_size}, max_total_num_tokens={self.max_total_num_tokens}\n"
+            msg = (
                 "KV cache pool leak detected!"
+                f"{available_size=}, {self.max_total_num_tokens=}\n"
             )
-            exit(1) if crash_on_warning else None
+            warnings.warn(msg)
+            if crash_on_warnings():
+                raise ValueError(msg)
 
         if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
-            warnings.warn(
-                "Warning: "
-                f"available req slots={len(self.req_to_token_pool.free_slots)}, "
-                f"total slots={self.req_to_token_pool.size}\n"
+            msg = (
                 "Memory pool leak detected!"
+                f"available_size={len(self.req_to_token_pool.free_slots)}, "
+                f"total_size={self.req_to_token_pool.size}\n"
             )
-            exit(1) if crash_on_warning else None
+            warnings.warn(msg)
+            if crash_on_warnings():
+                raise ValueError(msg)
 
     def get_next_batch_to_run(self):
         # Merge the prefill batch into the running batch
