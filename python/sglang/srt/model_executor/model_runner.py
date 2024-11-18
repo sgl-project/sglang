@@ -329,8 +329,9 @@ class ModelRunner:
         target_device = torch.device(self.device)
 
         try:
-            # TODO: Use a better method to check this
-            vllm_model_config = VllmModelConfig(**self.get_model_config_params())
+            model_config_params = self.get_model_config_params()
+            model_config_params["model"] = model_path
+            vllm_model_config = VllmModelConfig(**model_config_params)
         except Exception as e:
             message = f"Failed to load model config: {e}."
             return False, message
