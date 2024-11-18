@@ -115,7 +115,11 @@ class TpModelWorkerClient:
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
 
             # Run forward
-            logits_output, next_token_ids = self.worker.forward_batch_generation(
+            (
+                logits_output,
+                next_token_ids,
+                next_token_embeds,
+            ) = self.worker.forward_batch_generation(
                 model_worker_batch, self.launch_done
             )
 
@@ -143,10 +147,22 @@ class TpModelWorkerClient:
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
 
-            self.output_queue.put((copy_done, logits_output, next_token_ids))
+            self.output_queue.put(
+                (
+                    copy_done,
+                    logits_output,
+                    next_token_ids,
+                    next_token_embeds,
+                )
+            )
 
     def resolve_batch_result(self, bid: int):
-        copy_done, logits_output, next_token_ids = self.output_queue.get()
+        (
+            copy_done,
+            logits_output,
+            next_token_ids,
+            next_token_embeds,
+        ) = self.output_queue.get()
         copy_done.synchronize()
         self.launch_done.wait()
 
@@ -162,7 +178,9 @@ class TpModelWorkerClient:
                     logits_output.normalized_prompt_logprobs.tolist()
                 )
         next_token_ids = next_token_ids.tolist()
-        return logits_output, next_token_ids
+        if next_token_embeds is not None:
+            next_token_embeds = next_token_embeds.tolist()
+        return logits_output, next_token_ids, next_token_embeds
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
@@ -193,7 +211,7 @@ class TpModelWorkerClient:
         self.future_token_ids_ct = (
             self.future_token_ids_ct + bs
         ) % self.future_token_ids_limit
-        return None, future_next_token_ids
+        return None, future_next_token_ids, None
 
     def update_weights(self, recv_req: UpdateWeightReqInput):
         success, message = self.worker.update_weights(recv_req)

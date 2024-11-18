@@ -915,9 +915,11 @@ class Scheduler:
         if self.is_generation:
             model_worker_batch = batch.get_model_worker_batch()
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-                    model_worker_batch
-                )
+                (
+                    logits_output,
+                    next_token_ids,
+                    next_token_embeds,
+                ) = self.tp_worker.forward_batch_generation(model_worker_batch)
             elif batch.forward_mode.is_idle():
                 model_worker_batch = batch.get_model_worker_batch()
                 self.tp_worker.forward_batch_idle(model_worker_batch)
@@ -930,8 +932,15 @@ class Scheduler:
                     )
                 else:
                     next_token_ids = torch.full((batch.batch_size(),), 0)
+                next_token_embeds = None
             batch.output_ids = next_token_ids
-            ret = logits_output, next_token_ids, model_worker_batch.bid
+            batch.output_embeds = next_token_embeds
+            ret = (
+                logits_output,
+                next_token_ids,
+                next_token_embeds,
+                model_worker_batch.bid,
+            )
         else:  # embedding or reward model
             assert batch.extend_num_tokens != 0
             model_worker_batch = batch.get_model_worker_batch()
@@ -954,10 +963,19 @@ class Scheduler:
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
 
         if self.is_generation:
-            logits_output, next_token_ids, bid = result
+            (
+                logits_output,
+                next_token_ids,
+                next_token_embeds,
+                bid,
+            ) = result
 
             if self.enable_overlap:
-                logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+                (
+                    logits_output,
+                    next_token_ids,
+                    next_token_embeds,
+                ) = self.tp_worker.resolve_batch_result(bid)
             else:
                 # Move next_token_ids and logprobs to cpu
                 if batch.return_logprob:
@@ -985,6 +1003,8 @@ class Scheduler:
                     # Inflight reqs' prefill is not finished
                     req.completion_tokens_wo_jump_forward += 1
                     req.output_ids.append(next_token_id)
+                    if next_token_embeds is not None:
+                        req.input_embeds.append(next_token_embeds[i])
                     req.check_finished()
 
                     if req.finished():
@@ -1033,11 +1053,20 @@ class Scheduler:
         self.stream_output(batch.reqs)
 
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
-        logits_output, next_token_ids, bid = result
+        (
+            logits_output,
+            next_token_ids,
+            next_token_embeds,
+            bid,
+        ) = result
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
-            logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+            (
+                logits_output,
+                next_token_ids,
+                next_token_embeds,
+            ) = self.tp_worker.resolve_batch_result(bid)
             next_token_logprobs = logits_output.next_token_logprobs
         else:
             # Move next_token_ids and logprobs to cpu
@@ -1050,8 +1079,17 @@ class Scheduler:
 
         self.token_to_kv_pool.free_group_begin()
 
+        if next_token_embeds is None:
+            next_token_embeds = [None] * len(next_token_ids)
+
         # Check finish condition
-        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+        for i, (req, next_token_id, next_token_embed) in enumerate(
+            zip(
+                batch.reqs,
+                next_token_ids,
+                next_token_embeds,
+            )
+        ):
             if req.is_retracted:
                 continue
 
@@ -1061,6 +1099,8 @@ class Scheduler:
 
             req.completion_tokens_wo_jump_forward += 1
             req.output_ids.append(next_token_id)
+            if next_token_embed is not None:
+                req.input_embeds.append(next_token_embed)
             req.check_finished()
 
             if req.grammar is not None:

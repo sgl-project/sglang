@@ -147,7 +147,13 @@ class TpModelWorker:
         if launch_done:
             launch_done.set()
         next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
-        return logits_output, next_token_ids
+        if forward_batch.input_embeds is not None:
+            next_token_embeds = self.model_runner.get_token_embeddings(
+                next_token_ids, forward_batch
+            )
+        else:
+            next_token_embeds = None
+        return logits_output, next_token_ids, next_token_embeds
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)

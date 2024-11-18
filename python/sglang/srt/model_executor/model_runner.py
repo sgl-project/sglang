@@ -591,6 +591,12 @@ class ModelRunner:
         device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
         tensor_parallel(self.model, device_mesh)
 
+    def get_token_embeddings(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Get embeddings for the input_ids."""
+        return self.model.embed_tokens(input_ids)
+
     def forward_decode(self, forward_batch: ForwardBatch):
         if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
             return self.cuda_graph_runner.replay(forward_batch)

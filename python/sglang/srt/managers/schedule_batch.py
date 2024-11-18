@@ -392,6 +392,7 @@ class Req:
             return False
 
         old_output_ids = self.output_ids
+        self.input_embeds = None
         self.output_ids = all_ids[prompt_tokens:]
         self.decoded_text = self.decoded_text + jump_forward_str
         self.surr_offset = prompt_tokens
@@ -458,6 +459,7 @@ class ScheduleBatch:
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None
     output_ids: torch.Tensor = None
+    output_embeds: Optional[torch.Tensor] = None
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
@@ -739,7 +741,7 @@ class ScheduleBatch:
         if self.input_embeds is not None:
             input_embeds = torch.cat([self.input_embeds, running_batch.input_embeds])
         else:
-            input_embeds = running_batch.input_embeds
+            input_embeds = None
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
         self.merge_batch(running_batch)
@@ -923,8 +925,8 @@ class ScheduleBatch:
     def prepare_for_decode(self, enable_overlap: bool = False):
         self.forward_mode = ForwardMode.DECODE
 
-        self.input_ids = self.output_ids
-        self.output_ids = None
+        self.input_ids, self.output_ids = self.output_ids, None
+        self.input_embeds, self.output_embeds = self.output_embeds, None
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(self.input_ids)
 
         # Alloc mem
