@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import copy
 import os
 import random
 import subprocess
@@ -529,6 +530,7 @@ def run_bench_serving(
     random_input_len=4096,
     random_output_len=2048,
     disable_stream=False,
+    need_warmup=False,
 ):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
@@ -565,6 +567,10 @@ def run_bench_serving(
     )
 
     try:
+        if need_warmup:
+            warmup_args = copy.deepcopy(args)
+            warmup_args.num_prompts = 16
+            run_benchmark(warmup_args)
         res = run_benchmark(args)
     finally:
         kill_child_process(process.pid, include_self=True)
@@ -673,7 +679,7 @@ def run_and_check_memory_leak(
     if enable_mixed_chunk:
         other_args += ["--enable-mixed-chunk"]
     if enable_overlap:
-        other_args += ["--enable-overlap-scheduler"]
+        other_args += ["--enable-overlap-schedule"]
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
     port = random.randint(4000, 5000)

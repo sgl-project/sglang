@@ -517,8 +517,9 @@ def v1_generate_request(
                 "regex": request.regex,
                 "json_schema": request.json_schema,
                 "n": request.n,
-                "ignore_eos": request.ignore_eos,
                 "no_stop_trim": request.no_stop_trim,
+                "ignore_eos": request.ignore_eos,
+                "skip_special_tokens": request.skip_special_tokens,
             }
         )
         return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
@@ -933,7 +934,9 @@ def v1_chat_generate_request(
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
             "n": request.n,
+            "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
+            "skip_special_tokens": request.skip_special_tokens,
         }
         if request.response_format and request.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(

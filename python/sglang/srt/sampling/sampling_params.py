@@ -35,13 +35,13 @@ class SamplingParams:
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
-        ignore_eos: bool = False,
-        skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
         regex: Optional[str] = None,
         n: int = 1,
         json_schema: Optional[str] = None,
         no_stop_trim: bool = False,
+        ignore_eos: bool = False,
+        skip_special_tokens: bool = True,
     ) -> None:
         self.temperature = temperature
         self.top_p = top_p

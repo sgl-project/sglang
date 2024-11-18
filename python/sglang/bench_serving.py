@@ -421,6 +421,37 @@ def get_tokenizer(
     )
 
 
+def get_dataset(args, tokenizer):
+    if args.dataset_name == "sharegpt":
+        input_requests = sample_sharegpt_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.sharegpt_output_len,
+        )
+    elif args.dataset_name == "random":
+        input_requests = sample_random_requests(
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            num_prompts=args.num_prompts,
+            range_ratio=args.random_range_ratio,
+            tokenizer=tokenizer,
+            dataset_path=args.dataset_path,
+        )
+    elif args.dataset_name == "generated-shared-prefix":
+        input_requests = sample_generated_shared_prefix_requests(
+            num_groups=args.gen_num_groups,
+            prompts_per_group=args.gen_prompts_per_group,
+            system_prompt_len=args.gen_system_prompt_len,
+            question_len=args.gen_question_len,
+            output_len=args.gen_output_len,
+            tokenizer=tokenizer,
+        )
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset_name}")
+    return input_requests
+
+
 ASYNC_REQUEST_FUNCS = {
     "sglang": async_request_sglang_generate,
     "sglang-native": async_request_sglang_generate,
@@ -443,6 +474,8 @@ class BenchmarkMetrics:
     input_throughput: float
     output_throughput: float
     output_throughput_retokenized: float
+    total_throughput: float
+    total_throughput_retokenized: float
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
@@ -590,7 +623,6 @@ def sample_random_requests(
             (data["conversations"][0]["value"], data["conversations"][1]["value"])
             for data in dataset
         ]
-
         # Shuffle the dataset.
         random.shuffle(dataset)
 
@@ -764,6 +796,9 @@ def calculate_metrics(
         input_throughput=total_input / dur_s,
         output_throughput=sum(output_lens) / dur_s,
         output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
+        total_throughput=(total_input + sum(output_lens)) / dur_s,
+        total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
+        / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
@@ -879,6 +914,11 @@ async def benchmark(
     print(
         "{:<40} {:<10.2f}".format(
             "Output token throughput (tok/s):", metrics.output_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Total token throughput (tok/s):", metrics.total_throughput
         )
     )
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
@@ -1098,35 +1138,7 @@ def run_benchmark(args_: argparse.Namespace):
 
     tokenizer = get_tokenizer(tokenizer_id)
 
-    if args.dataset_name == "sharegpt":
-        assert args.random_input_len is None and args.random_output_len is None
-        input_requests = sample_sharegpt_requests(
-            dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=args.sharegpt_output_len,
-        )
-    elif args.dataset_name == "random":
-        assert args.random_input_len is not None and args.random_output_len is not None
-        input_requests = sample_random_requests(
-            input_len=args.random_input_len,
-            output_len=args.random_output_len,
-            num_prompts=args.num_prompts,
-            range_ratio=args.random_range_ratio,
-            tokenizer=tokenizer,
-            dataset_path=args.dataset_path,
-        )
-    elif args.dataset_name == "generated-shared-prefix":
-        input_requests = sample_generated_shared_prefix_requests(
-            num_groups=args.gen_num_groups,
-            prompts_per_group=args.gen_prompts_per_group,
-            system_prompt_len=args.gen_system_prompt_len,
-            question_len=args.gen_question_len,
-            output_len=args.gen_output_len,
-            tokenizer=tokenizer,
-        )
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset_name}")
+    input_requests = get_dataset(args, tokenizer)
 
     if not args.multi:
         return asyncio.run(
@@ -1229,10 +1241,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--random-input-len",
         type=int,
+        default=1024,
         help="Number of input tokens per request, used only for random dataset.",
     )
     parser.add_argument(
         "--random-output-len",
+        default=1024,
         type=int,
         help="Number of output tokens per request, used only for random dataset.",
     )
