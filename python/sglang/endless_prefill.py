@@ -1,3 +1,14 @@
+# import torch
+# batch_size = 4
+# hidden_size = 4096
+# intermediate_size = 14336
+
+# input = torch.randn(batch_size,hidden_size).cuda()
+# weight = torch.randn(intermediate_size,hidden_size).cuda()
+
+# while True:
+#     torch.nn.functional.linear(input,weight)
+
 """
 Benchmark the latency of running a single static batch.
 This script does not launch a server and uses the low-level APIs.
@@ -237,7 +248,8 @@ def extend(reqs, model_runner):
     batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output = model_runner.forward(forward_batch)
+    while True:
+        logits_output = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
 
