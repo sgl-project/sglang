@@ -597,15 +597,35 @@ class ModelRunner:
 
         forward_batch.positions = (forward_batch.seq_lens - 1).to(torch.int64)
         self.attn_backend.init_forward_metadata(forward_batch)
+
+        if forward_batch.input_embeds is not None:
+            dtype = next(self.model.parameters()).dtype
+            input_embeds = forward_batch.input_embeds.to(dtype=dtype)
+        else:
+            input_embeds = None
+
         return self.model.forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            input_embeds=input_embeds,
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
+
+        if forward_batch.input_embeds is not None:
+            dtype = next(self.model.parameters()).dtype
+            input_embeds = forward_batch.input_embeds.to(dtype=dtype)
+        else:
+            input_embeds = None
+
         if self.is_generation:
             return self.model.forward(
-                forward_batch.input_ids, forward_batch.positions, forward_batch
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                input_embeds=input_embeds,
             )
         else:
             # Only embedding models have get_embedding parameter
@@ -620,8 +640,17 @@ class ModelRunner:
         if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
             return self.cuda_graph_runner.replay(forward_batch)
 
+        if forward_batch.input_embeds is not None:
+            dtype = next(self.model.parameters()).dtype
+            input_embeds = forward_batch.input_embeds.to(dtype=dtype)
+        else:
+            input_embeds = None
+
         return self.model.forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            input_embeds=input_embeds,
         )
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:

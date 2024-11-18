@@ -528,6 +528,7 @@ class Scheduler:
                 recv_req.input_ids,
                 recv_req.sampling_params,
                 lora_path=recv_req.lora_path,
+                input_embeds=recv_req.input_embeds,
             )
             req.tokenizer = self.tokenizer
             if recv_req.session_id is not None:
@@ -621,6 +622,7 @@ class Scheduler:
             recv_req.input_text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            input_embeds=recv_req.input_embeds,
         )
         req.tokenizer = self.tokenizer
 

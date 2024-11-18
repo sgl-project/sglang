@@ -201,8 +201,11 @@ class TokenizerManager:
     ):
         """Tokenize one request."""
         # Tokenize
+        input_embeds = obj.input_embeds
         input_text = obj.text
-        if obj.input_ids is None:
+        if obj.input_embeds is not None:
+            input_ids = None
+        elif obj.input_ids is None:
             input_ids = self.tokenizer.encode(input_text)
         else:
             input_ids = obj.input_ids
@@ -245,6 +248,7 @@ class TokenizerManager:
                 obj.lora_path,
                 session_id=session_id,
                 session_rid=session_rid,
+                input_embeds=input_embeds,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -252,6 +256,7 @@ class TokenizerManager:
                 input_text,
                 input_ids,
                 sampling_params,
+                input_embeds=input_embeds,
             )
 
         return tokenized_obj
