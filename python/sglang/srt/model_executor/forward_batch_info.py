@@ -29,7 +29,8 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import dataclasses
+import sys
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional
 
@@ -82,9 +83,12 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DUMMY_FIRST
 
 
-@dataclass
+@dataclasses.dataclass
 class ForwardBatch:
     """Store all inputs of a forward pass."""
+
+    if sys.version_info >= (3, 10):
+        _: dataclasses.KW_ONLY
 
     # The forward mode
     forward_mode: ForwardMode
@@ -101,6 +105,9 @@ class ForwardBatch:
 
     # The sum of all sequence lengths
     seq_lens_sum: int
+
+    # The input embeddings
+    input_embeds: Optional[torch.tensor] = None
 
     # For logprob
     return_logprob: bool = False
@@ -216,6 +223,11 @@ class ForwardBatch:
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
+            input_embeds=(
+                batch.input_embeds.clone().detach().to(device)
+                if batch.input_embeds is not None
+                else None
+            ),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,

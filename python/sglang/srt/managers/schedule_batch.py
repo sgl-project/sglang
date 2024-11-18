@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
+import sys
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -177,6 +178,8 @@ class Req:
         origin_input_text: str,
         origin_input_ids: Tuple[int],
         sampling_params: SamplingParams,
+        *,
+        input_embeds: Optional[List[float]] = None,
         lora_path: Optional[str] = None,
         session_id: Optional[str] = None,
     ):
@@ -190,6 +193,7 @@ class Req:
         self.session_id = session_id
 
         self.sampling_params = sampling_params
+        self.input_embeds = input_embeds
         self.lora_path = lora_path
 
         # Memory pool info
@@ -431,6 +435,9 @@ bid = 0
 class ScheduleBatch:
     """Store all inforamtion of a batch on the scheduler."""
 
+    if sys.version_info >= (3, 10):
+        _: dataclasses.KW_ONLY
+
     # Request, memory pool, and cache
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool = None
@@ -445,6 +452,7 @@ class ScheduleBatch:
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
+    input_embeds: Optional[torch.Tensor] = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
     # The output locations of the KV cache
@@ -614,9 +622,10 @@ class ScheduleBatch:
     def prepare_for_extend(self, enable_overlap_schedule: bool = False):
         self.forward_mode = ForwardMode.EXTEND
 
-        bs = len(self.reqs)
         reqs = self.reqs
+        bs = len(reqs)
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        input_embeds = [r.input_embeds for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = []
         pre_lens = []
@@ -659,6 +668,16 @@ class ScheduleBatch:
         self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
             self.device, non_blocking=True
         )
+        if len(input_embeds) > 0 and input_embeds[0] is not None:
+            if not all(ie is not None for ie in input_embeds):
+                raise ValueError("input_embeds contains None")
+            self.input_embeds = torch.tensor(sum(input_embeds, [])).to(
+                self.device, non_blocking=True
+            )
+        else:
+            if not all(ie is None for ie in input_embeds):
+                raise ValueError("input_embeds contains non-None")
+            self.input_embeds = None
         self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
@@ -717,10 +736,15 @@ class ScheduleBatch:
             req.extend_input_len = 1
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
+        if self.input_embeds is not None:
+            input_embeds = torch.cat([self.input_embeds, running_batch.input_embeds])
+        else:
+            input_embeds = running_batch.input_embeds
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
         self.merge_batch(running_batch)
         self.input_ids = input_ids
+        self.input_embeds = input_embeds
         self.out_cache_loc = out_cache_loc
         self.extend_num_tokens += running_bs
 
@@ -831,7 +855,7 @@ class ScheduleBatch:
 
     def check_for_jump_forward(self, pad_input_ids_func):
         jump_forward_reqs = []
-        keep_indices = set(i for i in range(len(self.reqs)))
+        keep_indices = set(range(len(self.reqs)))
 
         for i, req in enumerate(self.reqs):
             if req.grammar is not None:
@@ -878,7 +902,7 @@ class ScheduleBatch:
                     jump_forward_reqs.append(req)
                     keep_indices.remove(i)
 
-        self.filter_batch(keep_indices=list(keep_indices))
+        self.filter_batch(keep_indices=sorted(keep_indices))
 
         return jump_forward_reqs
 
@@ -889,6 +913,7 @@ class ScheduleBatch:
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.input_embeds = None
         self.seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
@@ -1023,6 +1048,7 @@ class ScheduleBatch:
             bid=bid,
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
+            input_embeds=self.input_embeds,
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
@@ -1065,12 +1091,17 @@ class ScheduleBatch:
 
 @dataclasses.dataclass
 class ModelWorkerBatch:
+    if sys.version_info >= (3, 10):
+        _: dataclasses.KW_ONLY
+
     # The batch id
     bid: int
     # The forward mode
     forward_mode: ForwardMode
     # The input ids
     input_ids: torch.Tensor
+    # The input embeddings
+    input_embeds: Optional[torch.Tensor]
     # The indices of requests in the req_to_token_pool
     req_pool_indices: torch.Tensor
     # The sequence length
