@@ -138,6 +138,7 @@ class ForwardBatch:
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     gathered_buffer: Optional[torch.Tensor] = None
+    can_run_dp_cuda_graph: bool = False
 
     def compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -221,6 +222,7 @@ class ForwardBatch:
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             global_num_tokens=batch.global_num_tokens,
+            can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
         )
