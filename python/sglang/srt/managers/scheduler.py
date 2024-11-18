@@ -416,7 +416,7 @@ class Scheduler:
         torch.distributed.all_gather_into_tensor(
             global_num_tokens,
             local_num_tokens,
-            group=self.tp_worker.get_tp_cpu_group(),
+            group=self.tp_cpu_group,
         )
 
         if local_batch is None and global_num_tokens.max().item() > 0:
