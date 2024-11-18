@@ -362,9 +362,6 @@ class Req:
                 return
 
         for stop_regex_str in self.sampling_params.stop_regex_strs:
-            logger.error(
-                f"stop_regex='{stop_regex_str}' stop_check_text_length={len(self.stop_check_text)}, output_tokens={len(self.output_ids)}"
-            )
             if re.search(stop_regex_str, self.stop_check_text):
                 self.finished_reason = FINISH_MATCHED_STR(matched=stop_regex_str)
                 return
