@@ -22,7 +22,7 @@ import json
 import logging
 import pkgutil
 from functools import lru_cache
-from typing import Optional, Type
+from typing import Any, Optional, Type, Union
 
 import torch
 import torch.nn as nn
@@ -58,6 +58,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
+    init_process_group,
     monkey_patch_vllm_p2p_access_check,
 )
 
@@ -653,6 +654,87 @@ class ModelRunner:
         if rope_scaling is None:
             return False
         return rope_scaling.get("type", None) == "mrope"
+
+    def init_process_group(
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend="nccl",
+    ):
+        """Init torch process group for model weights update at model worker."""
+        assert (
+            torch.distributed.is_initialized()
+        ), f"default torch process group must be initialized"
+        assert group_name != "", f"group name must not be empty"
+
+        rank = rank_offset + torch.distributed.get_rank()
+
+        self._model_update_group = init_process_group(
+            backend=backend,
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
+            rank=rank,
+            group_name=group_name,
+        )
+
+        print(
+            f"init_process_group: master_address={master_address}, master_port={master_port}, ",
+            f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}",
+        )
+
+    def update_parameter_online(self, name, dtype, shape, empty_cache=False):
+        """
+        Update specific parameter in the model weights online through the process group.
+
+        The `update_weights` method is used for update the whole weights of the model from the disk.
+        The `update_parameter_online` method broadcast a specific parameter to all model runners
+        from rank 0, the actor model.
+
+        name: the name of the parameter to be updated.
+        dtype: the data type of the parameter to be updated.
+        shape: the shape of the parameter to be updated.
+        empty_cache: whether to empty the cache after updating the parameter.
+        """
+
+        assert (
+            dtype == self.model_config.dtype
+        ), f"dtype mismatch: target={dtype} vs current model runner={self.model_config.dtype}"
+        assert (
+            self._model_update_group is not None
+        ), "model update group must be initialized"
+
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"update weights online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
+            )
+
+        weights = torch.empty(shape, dtype=dtype, device=self.device)
+
+        torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
+
+        try:
+            param = self.model.get_parameter(name)
+            if param is None:
+                raise ValueError(f"Parameter {name} not found in model")
+            param.data.copy_(weights)
+
+            if empty_cache and self.device == "cuda":
+                torch.cuda.empty_cache()
+
+            torch.distributed.barrier(group=self._model_update_group)
+            return True, f"Succeeded to update parameter {name} online."
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to update weights online: {e}."
+                f"The full weights of the ModelRunner are partially updated."
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
 
 
 @lru_cache()
