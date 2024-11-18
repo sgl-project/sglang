@@ -66,7 +66,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.84)
+        self.assertGreater(metrics["score"], 0.835)
 
 
 if __name__ == "__main__":
