@@ -91,7 +91,7 @@ class XGrammarGrammar(BaseGrammarObject):
         return self.matcher.allocate_token_bitmask(vocab_size, batch_size)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        self.matcher.fill_next_token_bitmask(vocab_mask, batch_id)
+        self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
