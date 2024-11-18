@@ -32,13 +32,14 @@ from vllm.distributed import (
 )
 from vllm.model_executor.custom_op import CustomOp
 
+from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
 
-@CustomOp.register("sglang_silu_and_mul")
+@register_custom_op("sglang_silu_and_mul")
 class SiluAndMul(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -52,7 +53,7 @@ class SiluAndMul(CustomOp):
         return out
 
 
-@CustomOp.register("sglang_gelu_and_mul")
+@register_custom_op("sglang_gelu_and_mul")
 class GeluAndMul(CustomOp):
     def __init__(self, approximate="tanh"):
         super().__init__()

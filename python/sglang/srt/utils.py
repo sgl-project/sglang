@@ -400,6 +400,9 @@ def kill_child_process(pid=None, include_self=False, skip_pid=None):
 def monkey_patch_vllm_model_config():
     from vllm.config import ModelConfig
 
+    if not hasattr(ModelConfig, "_resolve_task"):
+        return
+
     def _resolve_task(
         self,
         task_option,
