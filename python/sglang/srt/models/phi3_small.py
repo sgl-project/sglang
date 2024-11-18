@@ -339,7 +339,7 @@ class Phi3SmallForCausalLM(nn.Module):
         self,
         config: Phi3Config,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+        cache_config=None,
     ):
 
         super().__init__()
