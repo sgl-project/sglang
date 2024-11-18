@@ -71,6 +71,8 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
+    if os.environ.get("SGLANG_IS_FLASHINFER_AVAILABLE", "true") == "false":
+        return False
     return torch.cuda.is_available() and not is_hip()
 
 
@@ -403,57 +405,6 @@ def monkey_patch_vllm_p2p_access_check(gpu_id: int):
     import vllm.distributed.device_communicators.custom_all_reduce_utils as tgt
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
-
-
-def monkey_patch_vllm_dummy_weight_loader():
-    """
-    Monkey patch the dummy weight loader in vllm to call process_weights_after_loading.
-    """
-
-    from vllm.model_executor.model_loader.loader import (
-        CacheConfig,
-        DeviceConfig,
-        DummyModelLoader,
-        LoRAConfig,
-        ModelConfig,
-        ParallelConfig,
-        SchedulerConfig,
-        _initialize_model,
-        initialize_dummy_weights,
-        nn,
-        set_default_torch_dtype,
-    )
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-        lora_config: Optional[LoRAConfig],
-        parallel_config: ParallelConfig,
-        scheduler_config: SchedulerConfig,
-        cache_config: CacheConfig,
-    ) -> nn.Module:
-        with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                    lora_config,
-                    cache_config,
-                )
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    quant_method.process_weights_after_loading(module)
-
-            # NOTE(woosuk): For accurate performance evaluation, we assign
-            # random values to the weights.
-            initialize_dummy_weights(model)
-        return model.eval()
-
-    setattr(DummyModelLoader, "load_model", load_model)
 
 
 vllm_all_gather_backup = None

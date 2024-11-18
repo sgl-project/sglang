@@ -116,8 +116,6 @@ class ServerArgs:
     grammar_backend: Optional[str] = "outlines"
 
     # Optimization/debug options
-    disable_flashinfer: bool = False
-    disable_flashinfer_sampling: bool = False
     disable_radix_cache: bool = False
     disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
@@ -179,20 +177,6 @@ class ServerArgs:
             self.chunked_prefill_size //= 4  # make it 2048
             self.cuda_graph_max_bs = 4
 
-        # Deprecation warnings
-        if self.disable_flashinfer:
-            logger.warning(
-                "The option '--disable-flashinfer' will be deprecated in the next release. "
-                "Please use '--attention-backend triton' instead."
-            )
-            self.attention_backend = "triton"
-        if self.disable_flashinfer_sampling:
-            logger.warning(
-                "The option '--disable-flashinfer-sampling' will be deprecated in the next release. "
-                "Please use '--sampling-backend pytorch' instead. "
-            )
-            self.sampling_backend = "pytorch"
-
         if not is_flashinfer_available():
             self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
@@ -207,11 +191,12 @@ class ServerArgs:
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
             self.chunked_prefill_size = self.chunked_prefill_size // 2
-            self.disable_cuda_graph = True
+            self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
             self.enable_overlap_schedule = False
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE workload issue. "
-                "The CUDA graph is disabled. Data parallel size is adjust to be the same as tensor parallel size."
+                f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
+                "Data parallel size is adjusted to be the same as tensor parallel size."
             )
 
         if self.enable_overlap_schedule:
@@ -616,16 +601,6 @@ class ServerArgs:
 
         # Optimization/debug options
         parser.add_argument(
-            "--disable-flashinfer",
-            action="store_true",
-            help="Disable flashinfer attention kernels. This option will be deprecated in the next release. Please use '--attention-backend triton' instead.",
-        )
-        parser.add_argument(
-            "--disable-flashinfer-sampling",
-            action="store_true",
-            help="Disable flashinfer sampling kernels. This option will be deprecated in the next release. Please use '--sampling-backend pytorch' instead.",
-        )
-        parser.add_argument(
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
@@ -733,6 +708,18 @@ class ServerArgs:
             help="Delete the model checkpoint after loading the model.",
         )
 
+        # Deprecated arguments
+        parser.add_argument(
+            "--disable-flashinfer",
+            action=DeprecatedAction,
+            help="'--disable-flashinfer' is deprecated. Please use '--attention-backend triton' instead.",
+        )
+        parser.add_argument(
+            "--disable-flashinfer-sampling",
+            action=DeprecatedAction,
+            help="'--disable-flashinfer-sampling' is deprecated. Please use '--sampling-backend pytroch' instead.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -826,3 +813,13 @@ class LoRAPathAction(argparse.Action):
                 getattr(namespace, self.dest)[name] = path
             else:
                 getattr(namespace, self.dest)[lora_path] = lora_path
+
+
+class DeprecatedAction(argparse.Action):
+    def __init__(self, option_strings, dest, nargs=0, **kwargs):
+        super(DeprecatedAction, self).__init__(
+            option_strings, dest, nargs=nargs, **kwargs
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        raise ValueError(self.help)
