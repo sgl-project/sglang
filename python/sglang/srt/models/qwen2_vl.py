@@ -616,7 +616,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
 
             inputs_embeds = self.model.embed_tokens(input_ids)
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
-            prefix_lens_cpu = forward_batch.extend_prefix_lens.cpu().numpy()
+            prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
             for i, image in enumerate(forward_batch.image_inputs):
                 if image is None:
                     continue
