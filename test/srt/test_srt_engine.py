@@ -29,7 +29,7 @@ class TestSRTEngine(unittest.TestCase):
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
-        engine = sgl.Engine(model_path=model_path, random_seed=42, log_level="error")
+        engine = sgl.Engine(model_path=model_path, random_seed=42)
         out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 
@@ -51,7 +51,7 @@ class TestSRTEngine(unittest.TestCase):
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
-        engine = sgl.Engine(model_path=model_path, random_seed=42, log_level="error")
+        engine = sgl.Engine(model_path=model_path, random_seed=42)
         engine.generate(prompt, sampling_params)
         engine.generate(prompt, sampling_params)
         engine.shutdown()
@@ -74,7 +74,6 @@ class TestSRTEngine(unittest.TestCase):
         # Create an LLM.
         llm = sgl.Engine(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            log_level="error",
         )
 
         # 1. sync + non streaming
@@ -118,7 +117,9 @@ class TestSRTEngine(unittest.TestCase):
         prompt = "The capital of UK is"
 
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        engine = sgl.Engine(model_path=model_path, random_seed=42, log_level="error")
+        engine = sgl.Engine(
+            model_path=model_path, random_seed=42, disable_radix_cache=True
+        )
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
         out1 = engine.generate(prompt, sampling_params)["text"]
 
@@ -141,9 +142,7 @@ class TestSRTEngine(unittest.TestCase):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
 
-        engine = sgl.Engine(
-            model_path=model_path, is_embedding=True, random_seed=42, log_level="error"
-        )
+        engine = sgl.Engine(model_path=model_path, is_embedding=True, random_seed=42)
         out1 = torch.tensor(engine.encode(prompt)["embedding"])
         engine.shutdown()
 

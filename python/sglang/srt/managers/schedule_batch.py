@@ -1063,7 +1063,7 @@ class ScheduleBatch:
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
-            sampling_info=dataclasses.replace(self.sampling_info),
+            sampling_info=self.sampling_info,
         )
 
     def __str__(self):
