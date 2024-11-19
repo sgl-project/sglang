@@ -184,6 +184,7 @@ async def stop_profile():
         status_code=200,
     )
 
+
 @app.get("/get_max_total_num_tokens")
 async def get_max_total_num_tokens():
     try:
@@ -224,6 +225,7 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
 
 @time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
@@ -453,7 +455,7 @@ def launch_engine(
                 "Initialization failed. Please see the error messages above."
             )
         scheduler_info.append(data)
-    
+
     # Assume all schedulers have same max_total_num_tokens
     _max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
 
@@ -514,6 +516,7 @@ def launch_server(
         )
     finally:
         t.join()
+
 
 def _get_max_total_num_tokens():
     return _max_total_num_tokens
@@ -759,13 +762,15 @@ class Runtime:
         json_data = {"text": prompt}
         response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
-    
+
     def get_max_total_num_tokens(self):
         response = requests.get(f"{self.url}/get_max_total_num_tokens")
         if response.status_code == 200:
             return response.json()["max_total_num_tokens"]
         else:
-            raise RuntimeError(f"Failed to get max tokens. {response.json()['error']['message']}")
+            raise RuntimeError(
+                f"Failed to get max tokens. {response.json()['error']['message']}"
+            )
 
     def __del__(self):
         self.shutdown()
