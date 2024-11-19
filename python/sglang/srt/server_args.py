@@ -198,6 +198,9 @@ class ServerArgs:
                 "Data parallel size is adjusted to be the same as tensor parallel size."
             )
 
+        if self.enable_overlap_schedule:
+            self.disable_jump_forward = True
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and port args
