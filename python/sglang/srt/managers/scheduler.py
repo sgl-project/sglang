@@ -983,10 +983,6 @@ class Scheduler:
                 else:
                     self.tree_cache.cache_unfinished_req(req)
 
-        if batch.next_batch_sampling_info:
-            batch.next_batch_sampling_info.update_regex_vocab_mask()
-            batch.next_batch_sampling_info.sampling_info_done.set()
-
         self.stream_output(batch.reqs)
 
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
@@ -1032,6 +1028,10 @@ class Scheduler:
                 )
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
+
+        if batch.next_batch_sampling_info:
+            batch.next_batch_sampling_info.update_regex_vocab_mask()
+            batch.next_batch_sampling_info.sampling_info_done.set()
 
         self.stream_output(batch.reqs)
 
