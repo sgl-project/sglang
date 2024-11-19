@@ -18,7 +18,6 @@ limitations under the License.
 import dataclasses
 import logging
 import threading
-import time
 from queue import Queue
 from typing import Optional
 
