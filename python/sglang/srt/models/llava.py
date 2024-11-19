@@ -128,6 +128,7 @@ class LlavaBaseForCausalLM(nn.Module):
         input_ids: torch.LongTensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         image_inputs = forward_batch.image_inputs
 
@@ -146,7 +147,8 @@ class LlavaBaseForCausalLM(nn.Module):
                     max_image_offset.append(-1)
 
             # Embed text inputs
-            input_embeds = self.language_model.model.embed_tokens(input_ids)
+            if input_embeds is None:
+                input_embeds = self.language_model.model.embed_tokens(input_ids)
 
             start_positions = positions[forward_batch.extend_start_loc].cpu().numpy()
             need_vision = start_positions <= np.array(max_image_offset)
