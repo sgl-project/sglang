@@ -123,7 +123,6 @@ class ServerArgs:
     disable_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
-    disable_penalizer: bool = False
     enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -200,12 +199,7 @@ class ServerArgs:
             )
 
         if self.enable_overlap_schedule:
-            logger.warning(
-                "Overlap scheduler mode is enabled. This is an experimental feature. "
-                "Sampling penalizer (e.g., frequency and repetition penalty), constrained decoding (e.g., regex, JSON), "
-                "and embedding APIs are not supported and will lead to wrong results. "
-            )
-            self.disable_penalizer = True
+            self.disable_jump_forward = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -621,11 +615,6 @@ class ServerArgs:
             "--disable-mla",
             action="store_true",
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
-        )
-        parser.add_argument(
-            "--disable-penalizer",
-            action="store_true",
-            help="Disable the logit penalizers (e.g., frequency and repetition penalty) for better performance if they are not used in any requests.",
         )
         parser.add_argument(
             "--disable-nan-detection",
