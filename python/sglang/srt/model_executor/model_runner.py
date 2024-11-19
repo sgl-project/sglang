@@ -141,7 +141,6 @@ class ModelRunner:
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
-                "disable_penalizer": server_args.disable_penalizer,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
             }

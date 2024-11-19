@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import threading
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
@@ -28,6 +29,7 @@ class SamplingBatchInfo:
     # Bias Tensors
     vocab_size: int
     grammars: Optional[List] = None
+    sampling_info_done: Optional[threading.Event] = None
     logit_bias: torch.Tensor = None
     vocab_mask: Optional[torch.Tensor] = None
     apply_mask: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
