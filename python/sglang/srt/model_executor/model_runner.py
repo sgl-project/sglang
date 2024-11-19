@@ -116,7 +116,7 @@ class ModelRunner:
             )
 
         if self.is_multimodal:
-            logger.warning(
+            logger.info(
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
             )
             server_args.chunked_prefill_size = None

@@ -172,9 +172,7 @@ class ServerArgs:
         if gpu_mem < 25000:
             self.chunked_prefill_size //= 4  # make it 2048
             self.cuda_graph_max_bs = 4
-            logger.warning(
-                "Automatically adjust --chunked-prefill-size for small GPUs."
-            )
+            logger.info("Automatically adjust --chunked-prefill-size for small GPUs.")
 
         if not is_flashinfer_available():
             self.attention_backend = "triton"
