@@ -102,6 +102,7 @@ app.add_middleware(
 )
 
 tokenizer_manager: TokenizerManager = None
+_scheduler_max_tokens: Dict[int, int] = {}
 
 ##### Native API endpoints #####
 
@@ -183,6 +184,16 @@ async def stop_profile():
         status_code=200,
     )
 
+@app.get("/get_max_num_tokens")
+async def get_max_num_tokens(index: int):
+    try:
+        return {"max_tokens": _get_max_num_tokens(index)}
+
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
+
 
 @app.api_route("/get_memory_pool_size", methods=["GET", "POST"])
 async def get_memory_pool_size():
@@ -213,7 +224,6 @@ async def update_weights(obj: UpdateWeightReqInput, request: Request):
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
-
 
 @time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
@@ -366,6 +376,7 @@ def launch_engine(
     """
 
     global tokenizer_manager
+    global _scheduler_max_tokens
 
     # Configure global environment
     configure_logger(server_args)
@@ -431,9 +442,16 @@ def launch_engine(
     if server_args.chat_template:
         load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
 
-    # Wait for model to finish loading
+    # Wait for model to finish loading & get max token nums for each scheduler
+    scheduler_info = []
     for i in range(len(scheduler_pipe_readers)):
-        scheduler_pipe_readers[i].recv()
+        data = scheduler_pipe_readers[i].recv()
+        scheduler_info.append(data)
+    
+        if data["status"] != "ready":
+            raise RuntimeError(f"Scheduler {i} failed to initialize.")
+        
+        _scheduler_max_tokens[i] = data["max_total_num_tokens"]
 
 
 def launch_server(
@@ -492,6 +510,12 @@ def launch_server(
         )
     finally:
         t.join()
+
+def _get_max_num_tokens(scheduler_index: int):
+    try:
+        return _scheduler_max_tokens[scheduler_index]
+    except KeyError:
+        raise KeyError(f"No scheduler found with index {scheduler_index}")
 
 
 def _set_envs_and_config(server_args: ServerArgs):
@@ -734,6 +758,13 @@ class Runtime:
         json_data = {"text": prompt}
         response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
+    
+    def get_max_num_tokens(self, scheduler_index: int):
+        response = requests.get(f"{self.url}/get_max_num_tokens?index={scheduler_index}")
+        if response.status_code == 200:
+            return response.json()["max_tokens"]
+        else:
+            raise RuntimeError(f"Failed to get max tokens. {response.json()['error']['message']}")
 
     def __del__(self):
         self.shutdown()
@@ -884,3 +915,6 @@ class Engine:
         # get the current event loop
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(encode_request(obj, None))
+
+    def get_max_num_tokens(self, scheduler_index: int):
+        return _get_max_num_tokens(scheduler_index)
