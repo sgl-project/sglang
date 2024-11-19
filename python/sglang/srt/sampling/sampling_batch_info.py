@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import threading
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
+
+logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -86,6 +90,17 @@ class SamplingBatchInfo:
             penalizers = {
                 penaltylib.BatchedMinNewTokensPenalizer,
             }
+            if (
+                any(req.sampling_params.frequency_penalty != 0.0 for req in reqs)
+                or any(req.sampling_params.presence_penalty != 0.0 for req in reqs)
+                or any(req.sampling_params.repetition_penalty != 1.0 for req in reqs)
+            ):
+                logger.warning(
+                    "frequency_penalty, presence_penalty, and repetition_penalty are not supported "
+                    "when using the default overlap scheduler. They will be ignored. "
+                    "Please add `--disable-overlap` when launching the server if you need these features. "
+                    "The speed will be slower in that case."
+                )
         else:
             penalizers = {
                 penaltylib.BatchedFrequencyPenalizer,

@@ -357,7 +357,7 @@ class Scheduler:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                # Self-check and re-init some states
+                # Self-check and re-init some states when the server is idle
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
@@ -379,8 +379,8 @@ class Scheduler:
                 result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
-                    # A dummy first batch to fill the pipeline for overlap scheduler.
-                    # It is now used for trigger the sampling_info_done
+                    # A dummy first batch to start the pipeline for overlap scheduler.
+                    # It is now used for triggering the sampling_info_done event.
                     tmp_batch = ScheduleBatch(
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
@@ -395,6 +395,7 @@ class Scheduler:
                 )
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
+                # Self-check and re-init some states when the server is idle
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
