@@ -637,7 +637,6 @@ class ModelRunner:
             # Overlap mode: the function update_regex_vocab_mask was executed
             # in process_batch_result of the last batch.
             if sampling_info.grammars:
-                print(f"Wait on {id(sampling_info)=}")
                 sampling_info.sampling_info_done.wait()
             sampling_info.update_penalties()
         else:
