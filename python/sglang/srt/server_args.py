@@ -782,7 +782,7 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args) -> "PortArgs":
-        port = server_args.port + 42
+        port = server_args.port + random.randint(100, 1000)
         while True:
             if is_port_available(port):
                 break

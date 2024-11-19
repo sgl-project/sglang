@@ -1,3 +1,8 @@
+"""
+Usage:
+python3 -m unittest test_srt_backend.TestSRTBackend.test_gen_min_new_tokens
+"""
+
 import unittest
 
 import sglang as sgl
@@ -68,7 +73,7 @@ class TestSRTBackend(unittest.TestCase):
         # Run twice to capture more bugs
         for _ in range(2):
             accuracy, latency = test_hellaswag_select()
-            assert accuracy > 0.71, f"{accuracy=}"
+            self.assertGreater(accuracy, 0.71)
 
     def test_gen_min_new_tokens(self):
         test_gen_min_new_tokens()
