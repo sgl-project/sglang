@@ -184,10 +184,10 @@ async def stop_profile():
         status_code=200,
     )
 
-@app.get("/get_max_num_tokens")
-async def get_max_num_tokens():
+@app.get("/get_max_total_num_tokens")
+async def get_max_total_num_tokens():
     try:
-        return {"max_tokens": _get_max_num_tokens()}
+        return {"max_total_num_tokens": _get_max_total_num_tokens()}
 
     except Exception as e:
         return ORJSONResponse(
@@ -515,7 +515,7 @@ def launch_server(
     finally:
         t.join()
 
-def _get_max_num_tokens():
+def _get_max_total_num_tokens():
     return _max_total_num_tokens
 
 
@@ -760,10 +760,10 @@ class Runtime:
         response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
     
-    def get_max_num_tokens(self):
-        response = requests.get(f"{self.url}/get_max_num_tokens")
+    def get_max_total_num_tokens(self):
+        response = requests.get(f"{self.url}/get_max_total_num_tokens")
         if response.status_code == 200:
-            return response.json()["max_tokens"]
+            return response.json()["max_total_num_tokens"]
         else:
             raise RuntimeError(f"Failed to get max tokens. {response.json()['error']['message']}")
 
@@ -917,5 +917,5 @@ class Engine:
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(encode_request(obj, None))
 
-    def get_max_num_tokens(self):
-        return _get_max_num_tokens()
+    def get_max_total_num_tokens(self):
+        return _get_max_total_num_tokens()
