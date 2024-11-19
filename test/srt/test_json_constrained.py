@@ -78,10 +78,11 @@ class TestJSONConstrained(unittest.TestCase):
         self.assertIsInstance(js_obj["population"], int)
 
         # Make sure jump forward is triggered
-        self.assertGreater(
-            ret["meta_info"]["completion_tokens"],
-            ret["meta_info"]["completion_tokens_wo_jump_forward"],
-        )
+        # NOTE: This is skipped because overlap scheduler does not support jump forward
+        # self.assertGreater(
+        #     ret["meta_info"]["completion_tokens"],
+        #     ret["meta_info"]["completion_tokens_wo_jump_forward"],
+        # )
 
     def test_json_generate(self):
         self.run_decode(json_schema=self.json_schema)

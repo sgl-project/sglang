@@ -636,7 +636,6 @@ class ModelRunner:
         self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         sampling_info = forward_batch.sampling_info
-
         if sampling_info.sampling_info_done:
             # Overlap mode: the function update_regex_vocab_mask was executed
             # in process_batch_result of the last batch.
