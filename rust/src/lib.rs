@@ -1,8 +1,10 @@
 // Python Binding
 use pyo3::prelude::*;
 pub mod router;
-mod server;
+pub mod server;
 pub mod tree;
+pub mod multi_tenant_tree;
+pub mod multi_tenant_tree_single;
 
 #[pyclass(eq)]
 #[derive(Clone, PartialEq)]
@@ -18,7 +20,6 @@ struct Router {
     port: u16,
     worker_urls: Vec<String>,
     policy: PolicyType,
-    tokenizer_path: Option<String>,
     cache_threshold: Option<f32>,
 }
 
@@ -30,7 +31,6 @@ impl Router {
         policy = PolicyType::RoundRobin,
         host = String::from("127.0.0.1"),
         port = 3001,
-        tokenizer_path = None,
         cache_threshold = Some(0.50)
     ))]
     fn new(
@@ -38,24 +38,14 @@ impl Router {
         policy: PolicyType,
         host: String,
         port: u16,
-        tokenizer_path: Option<String>,
         cache_threshold: Option<f32>,
     ) -> PyResult<Self> {
-        // Validate required parameters for approx_tree policy
-        if matches!(policy, PolicyType::ApproxTree) {
-            if tokenizer_path.is_none() {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "tokenizer_path is required for approx_tree policy",
-                ));
-            }
-        }
 
         Ok(Router {
             host,
             port,
             worker_urls,
             policy,
-            tokenizer_path,
             cache_threshold,
         })
     }
@@ -69,10 +59,6 @@ impl Router {
             PolicyType::Random => router::PolicyConfig::RandomConfig,
             PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig,
             PolicyType::ApproxTree => router::PolicyConfig::ApproxTreeConfig {
-                tokenizer_path: self
-                    .tokenizer_path
-                    .clone()
-                    .expect("tokenizer_path is required for approx_tree policy"),
                 cache_threshold: self
                     .cache_threshold
                     .expect("cache_threshold is required for approx_tree policy"),

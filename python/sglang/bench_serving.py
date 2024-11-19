@@ -635,11 +635,43 @@ def sample_random_requests(
     return input_requests
 
 
+# random_words = [
+#     "whisper", "eclipse", "cascade", "harmony", "breeze", "velvet", "thunder", "crystal",
+#     "meadow", "cipher", "autumn", "vision", "journey", "silence", "rhythm", "wonder",
+#     "mirror", "shadow", "garden", "spirit", "ocean", "wisdom", "beacon", "valley",
+#     "forget", "canvas", "sunset", "melody", "winter", "ripple", "anchor", "forest",
+#     "horizon", "feather", "destiny", "marble", "puzzle", "prism", "compass", "essence",
+#     "heaven", "stellar", "moment", "bridge", "legacy", "castle", "radiant", "secret",
+#     "phoenix", "hollow", "temple", "rainbow", "silver", "harbor", "summit", "gentle",
+#     "dream", "enigma", "stream", "oracle", "zenith", "virtue", "spring", "eternal"
+# ]
+
+
 def gen_prompt(tokenizer, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = list(tokenizer.get_vocab().values())
     selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
+    ret = tokenizer.decode(selected_tokens)
+
+    # randomly select token_num words and concatenate them
+    # selected_words = random.choices(random_words, k=token_num)
+    # ret = " ".join(selected_words)
+    return ret
+
+
+def get_cache_path(args) -> str:
+    """Generate a unique cache path based on benchmark parameters."""
+    from pathlib import Path
+
+    # Create cache directory under ~/.cache/sglang/bench_datasets
+    cache_dir = Path.home() / ".cache" / "sglang" / "bench_datasets"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create a unique cache filename based on the arguments that affect generation
+    cache_key = (
+        f"shared_prefix_{args.gen_num_groups}_{args.gen_prompts_per_group}_"
+        f"{args.gen_system_prompt_len}_{args.gen_question_len}_{args.gen_output_len}.json"
+    )
+    return str(cache_dir / cache_key)
 
 
 def sample_generated_shared_prefix_requests(
@@ -650,16 +682,62 @@ def sample_generated_shared_prefix_requests(
     output_len: int,
     tokenizer: PreTrainedTokenizerBase,
 ) -> List[Tuple[str, int, int]]:
-    """Generate benchmark requests with shared system prompts using random tokens."""
+    """Generate benchmark requests with shared system prompts using random tokens.
+
+    Args:
+        num_groups: Number of system prompt groups
+        prompts_per_group: Number of prompts per system prompt group
+        system_prompt_len: Target length in tokens for system prompts
+        question_len: Target length in tokens for questions
+        output_len: Target length in tokens for outputs
+        tokenizer: Tokenizer to use for generating prompts
+
+    Returns:
+        List of (prompt, prompt_len, output_len) tuples
+    """
+    # Try to load from cache first
+    cache_file = get_cache_path(
+        argparse.Namespace(
+            gen_num_groups=num_groups,
+            gen_prompts_per_group=prompts_per_group,
+            gen_system_prompt_len=system_prompt_len,
+            gen_question_len=question_len,
+            gen_output_len=output_len,
+        )
+    )
+
+    if os.path.exists(cache_file):
+        print(f"Loading cached dataset from {cache_file}")
+        with open(cache_file) as f:
+            cached_data = json.load(f)
+            input_requests = [
+                (prompt, prompt_len, output_len)
+                for prompt, prompt_len, output_len in cached_data
+            ]
+
+            # Print statistics
+            total_input_tokens = sum(x[1] for x in input_requests)
+            total_output_tokens = sum(x[2] for x in input_requests)
+            print(f"\nLoaded shared prefix dataset statistics:")
+            print(f"Number of groups: {num_groups}")
+            print(f"Prompts per group: {prompts_per_group}")
+            print(f"Total prompts: {len(input_requests)}")
+            print(f"Total input tokens: {total_input_tokens}")
+            print(f"Total output tokens: {total_output_tokens}\n")
+
+            return input_requests
+
+    print("Generating new dataset...")
+
     # Generate system prompts for each group
     system_prompts = []
-    for _ in range(num_groups):
+    for _ in tqdm(range(num_groups), desc="Generating system prompts"):
         system_prompt = gen_prompt(tokenizer, system_prompt_len)
         system_prompts.append(system_prompt)
 
     # Generate questions
     questions = []
-    for _ in range(num_groups * prompts_per_group):
+    for _ in tqdm(range(num_groups * prompts_per_group), desc="Generating questions"):
         question = gen_prompt(tokenizer, question_len)
         questions.append(question)
 
@@ -672,25 +750,25 @@ def sample_generated_shared_prefix_requests(
         system_prompt = system_prompts[group_idx]
         for prompt_idx in range(prompts_per_group):
             question = questions[group_idx * prompts_per_group + prompt_idx]
-            full_prompt = f"{system_prompt}\n\n{question}"
+            # full_prompt = f"{system_prompt}\n\n{question}" # REVRET ME
+            full_prompt = f"{system_prompt} {question}"
             prompt_len = len(tokenizer.encode(full_prompt))
 
             input_requests.append((full_prompt, prompt_len, output_len))
             total_input_tokens += prompt_len
             total_output_tokens += output_len
 
+    # Save to cache
+    print(f"Saving dataset to cache: {cache_file}")
+    with open(cache_file, "w") as f:
+        json.dump(input_requests, f)
+
     print(f"\nGenerated shared prefix dataset statistics:")
     print(f"Number of groups: {num_groups}")
     print(f"Prompts per group: {prompts_per_group}")
     print(f"Total prompts: {len(input_requests)}")
     print(f"Total input tokens: {total_input_tokens}")
-    print(f"Total output tokens: {total_output_tokens}")
-    print(
-        f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens"
-    )
-    print(
-        f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
-    )
+    print(f"Total output tokens: {total_output_tokens}\n")
 
     return input_requests
 

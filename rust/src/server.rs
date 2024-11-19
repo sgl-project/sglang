@@ -43,6 +43,42 @@ async fn forward_request(
     }
 }
 
+async fn mock_forward_request(route: &str) -> HttpResponse {
+    match route {
+        "/v1/models" => {
+            let mock_response = serde_json::json!({
+                "object": "list",
+                "data": [{
+                    "id": "mock_model",
+                    "object": "model",
+                    "created": (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64),
+                    "owned_by": "sglang",
+                    "root": "mock_model"
+                }]
+            });
+
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .body(serde_json::to_vec(&mock_response).unwrap_or_default())
+        }
+        "/get_model_info" => {
+            let mock_response = serde_json::json!({
+                "model_path": "/path/to/mock/model",
+                "is_generation": true
+            });
+
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .body(serde_json::to_vec(&mock_response).unwrap_or_default())
+        }
+        _ => HttpResponse::NotFound().finish()
+    }
+}
+
+
 #[get("/v1/models")]
 async fn v1_model(data: web::Data<AppState>) -> impl Responder {
     let worker_url = match data.router.get_first() {
@@ -51,6 +87,7 @@ async fn v1_model(data: web::Data<AppState>) -> impl Responder {
     };
 
     forward_request(&data.client, worker_url, "/v1/models".to_string()).await
+    // mock_forward_request("/v1/models").await
 }
 
 #[get("/get_model_info")]
@@ -61,6 +98,7 @@ async fn get_model_info(data: web::Data<AppState>) -> impl Responder {
     };
 
     forward_request(&data.client, worker_url, "/get_model_info".to_string()).await
+    // mock_forward_request("/get_model_info").await
 }
 
 #[post("/generate")]

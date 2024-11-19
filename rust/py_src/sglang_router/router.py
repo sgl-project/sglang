@@ -16,7 +16,6 @@ class Router:
             - PolicyType.ApproxTree: Tree-based routing using tokenizer similarity
         host: Host address to bind the router server
         port: Port number to bind the router server
-        tokenizer_path: Path to tokenizer model file (required for ApproxTree policy)
         cache_threshold: Caching threshold value between 0-1
 
     """
@@ -27,7 +26,6 @@ class Router:
         policy: PolicyType = PolicyType.RoundRobin,
         host: str = "127.0.0.1",
         port: int = 3001,
-        tokenizer_path: Optional[str] = None,
         cache_threshold: float = 0.50,
     ):
 
@@ -36,7 +34,6 @@ class Router:
             policy=policy,
             host=host,
             port=port,
-            tokenizer_path=tokenizer_path,
             cache_threshold=cache_threshold,
         )
 

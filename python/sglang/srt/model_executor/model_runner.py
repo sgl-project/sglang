@@ -416,6 +416,9 @@ class ModelRunner:
             )
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+
+        print(f"[BYRON] max_total_num_tokens={self.max_total_num_tokens}")
+
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(

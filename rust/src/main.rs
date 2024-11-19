@@ -2,13 +2,18 @@
 use clap::Parser;
 use clap::ValueEnum;
 // declare child modules
-mod router;
-mod server;
-mod tree;
-
-use crate::router::PolicyConfig;
+// Import from lib instead of declaring modules
+use sglang_router_rs::{
+    router::PolicyConfig,
+    router,
+    server,
+    tree,
+    multi_tenant_tree,
+    multi_tenant_tree_single,
+};
 
 #[derive(Debug, Clone, ValueEnum)]
+
 pub enum PolicyType {
     Random,
     RoundRobin,
@@ -43,13 +48,6 @@ struct Args {
     )]
     policy: PolicyType,
 
-    #[arg(
-        long,
-        requires = "policy",
-        required_if_eq("policy", "approx_tree"),
-        help = "Path to the tokenizer file, required when using approx_tree policy"
-    )]
-    tokenizer_path: Option<String>,
 
     #[arg(
         long,
@@ -67,10 +65,6 @@ impl Args {
             PolicyType::Random => PolicyConfig::RandomConfig,
             PolicyType::RoundRobin => PolicyConfig::RoundRobinConfig,
             PolicyType::ApproxTree => PolicyConfig::ApproxTreeConfig {
-                tokenizer_path: self
-                    .tokenizer_path
-                    .clone()
-                    .expect("tokenizer_path is required for approx_tree policy"),
                 cache_threshold: self
                     .cache_threshold
                     .expect("cache_threshold is required for approx_tree policy"),

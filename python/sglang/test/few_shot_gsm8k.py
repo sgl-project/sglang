@@ -48,9 +48,13 @@ def run_eval(args):
     # Select backend
     set_default_backend(RuntimeEndpoint(f"{args.host}:{args.port}"))
 
-    # Read data
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    filename = download_and_cache_file(url)
+    if args.data_path is None:
+        # Read data
+        url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+        filename = download_and_cache_file(url)
+    else:
+        filename = args.data_path
+
     lines = list(read_jsonl(filename))
 
     # Construct prompts

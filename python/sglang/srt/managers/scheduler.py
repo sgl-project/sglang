@@ -1084,6 +1084,13 @@ class Scheduler:
                     )
                     output_no_stop_trim.append(req.sampling_params.no_stop_trim)
 
+                    import os
+                    from datetime import datetime
+
+                    dp_rank = os.getenv("DP_RANK", -1)
+
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+
                     meta_info = {
                         "prompt_tokens": len(req.origin_input_ids),
                         "completion_tokens": len(req.output_ids),
@@ -1094,6 +1101,8 @@ class Scheduler:
                             if req.finished_reason is not None
                             else None
                         ),
+                        "dp_rank": str(dp_rank),
+                        "finish_time": timestamp,
                     }
                     if req.return_logprob:
                         (
@@ -1221,6 +1230,10 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # if env var "DP_RANK" exist, set dp_rank to the value of the env var
+    if dp_rank is None:
+        dp_rank = int(os.getenv("DP_RANK", -1))
+
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
     else:
