@@ -1321,7 +1321,6 @@ def run_scheduler_process(
             "status": "ready",
             "max_total_num_tokens": scheduler.max_total_num_tokens
         })
-        # pipe_writer.send("ready")
         if scheduler.enable_overlap:
             scheduler.event_loop_overlap()
         else:
