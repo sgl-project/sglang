@@ -26,7 +26,6 @@ import torch
 from sglang.srt.managers.io_struct import UpdateWeightReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -83,9 +82,6 @@ class TpModelWorkerClient:
     def get_tp_cpu_group(self):
         return self.worker.get_tp_cpu_group()
 
-    def get_tp_device_group(self):
-        return self.worker.get_tp_device_group()
-
     def get_memory_pool(self):
         return (
             self.worker.model_runner.req_to_token_pool,
@@ -96,7 +92,7 @@ class TpModelWorkerClient:
         with torch.cuda.stream(self.forward_stream):
             self.forward_thread_func_()
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward_thread_func_(self):
         while True:
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
@@ -141,7 +137,7 @@ class TpModelWorkerClient:
             self.launch_event.set()
             self.output_queue.put((copy_event, logits_output, next_token_ids))
 
-    def resulve_batch_result(self, bid: int):
+    def resolve_batch_result(self, bid: int):
         copy_event, logits_output, next_token_ids = self.output_queue.get()
         while not copy_event.query():
             time.sleep(1e-5)
@@ -179,16 +175,8 @@ class TpModelWorkerClient:
         ) % self.future_token_ids_limit
         return None, future_next_token_ids
 
-    def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch)
-        embeddings = logits_output.embeddings
-        return embeddings
-
     def update_weights(self, recv_req: UpdateWeightReqInput):
-        success, message = self.model_runner.update_weights(
-            recv_req.model_path, recv_req.load_format
-        )
+        success, message = self.worker.update_weights(recv_req)
         return success, message
 
     def __delete__(self):

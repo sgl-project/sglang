@@ -57,7 +57,7 @@ global_server_args_dict = {
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
     "disable_mla": ServerArgs.disable_mla,
     "torchao_config": ServerArgs.torchao_config,
-    "disable_nan_detection": ServerArgs.disable_nan_detection,
+    "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
 }
 
@@ -455,6 +455,7 @@ class ScheduleBatch:
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
+    can_run_dp_cuda_graph: bool = False
 
     # For processing logprobs
     return_logprob: bool = False
@@ -891,6 +892,13 @@ class ScheduleBatch:
         self.seq_lens = torch.empty(0, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
+        self.out_cache_loc = torch.empty(0, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        self.req_pool_indices = torch.empty(0, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens_sum = 0
         self.extend_num_tokens = 0
 
     def prepare_for_decode(self, enable_overlap: bool = False):
@@ -1032,6 +1040,7 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             global_num_tokens=self.global_num_tokens,
+            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -1046,9 +1055,6 @@ class ScheduleBatch:
         )
 
     def copy(self):
-        # We need a stream synchronization here. Otherwise, there will be cuda illegal memory access errors.
-        _ = self.seq_lens[0].item()
-
         # Only contain fields that will be used by process_batch_result
         return ScheduleBatch(
             reqs=self.reqs,
@@ -1093,6 +1099,7 @@ class ModelWorkerBatch:
 
     # For DP attention
     global_num_tokens: Optional[List[int]]
+    can_run_dp_cuda_graph: bool
 
     # For extend
     extend_num_tokens: Optional[int]

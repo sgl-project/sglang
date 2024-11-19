@@ -109,6 +109,7 @@ class ForwardBatch:
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
     extend_start_loc: Optional[torch.Tensor] = None
+    extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
 
@@ -138,6 +139,7 @@ class ForwardBatch:
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     gathered_buffer: Optional[torch.Tensor] = None
+    can_run_dp_cuda_graph: bool = False
 
     def compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -221,6 +223,7 @@ class ForwardBatch:
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             global_num_tokens=batch.global_num_tokens,
+            can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
         )
@@ -248,6 +251,7 @@ class ForwardBatch:
             ret.positions, ret.extend_start_loc = compute_position_triton(
                 ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
             )
+            ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 

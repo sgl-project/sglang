@@ -33,9 +33,12 @@ if is_flashinfer_available():
 
 from vllm.model_executor.custom_op import CustomOp
 
+from sglang.srt.layers.custom_op_util import register_custom_op
+
 logger = logging.getLogger(__name__)
 
 
+@register_custom_op("sglang_rmsnorm")
 class RMSNorm(CustomOp):
     def __init__(
         self,
@@ -78,6 +81,7 @@ class RMSNorm(CustomOp):
             return x, residual
 
 
+@register_custom_op("sglang_gemma_rmsnorm")
 class GemmaRMSNorm(CustomOp):
     def __init__(
         self,

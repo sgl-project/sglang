@@ -116,8 +116,6 @@ class ServerArgs:
     grammar_backend: Optional[str] = "outlines"
 
     # Optimization/debug options
-    disable_flashinfer: bool = False
-    disable_flashinfer_sampling: bool = False
     disable_radix_cache: bool = False
     disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
@@ -126,7 +124,6 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_penalizer: bool = False
-    disable_nan_detection: bool = False
     enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -134,6 +131,7 @@ class ServerArgs:
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: int = 160
     torchao_config: str = ""
+    enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     num_continuous_decode_steps: int = 1
@@ -173,25 +171,11 @@ class ServerArgs:
         else:
             gpu_mem = get_nvgpu_memory_capacity()
         if gpu_mem < 25000:
+            self.chunked_prefill_size //= 4  # make it 2048
+            self.cuda_graph_max_bs = 4
             logger.warning(
                 "Automatically adjust --chunked-prefill-size for small GPUs."
             )
-            self.chunked_prefill_size //= 4  # make it 2048
-            self.cuda_graph_max_bs = 4
-
-        # Deprecation warnings
-        if self.disable_flashinfer:
-            logger.warning(
-                "The option '--disable-flashinfer' will be deprecated in the next release. "
-                "Please use '--attention-backend triton' instead."
-            )
-            self.attention_backend = "triton"
-        if self.disable_flashinfer_sampling:
-            logger.warning(
-                "The option '--disable-flashinfer-sampling' will be deprecated in the next release. "
-                "Please use '--sampling-backend pytorch' instead. "
-            )
-            self.sampling_backend = "pytorch"
 
         if not is_flashinfer_available():
             self.attention_backend = "triton"
@@ -207,11 +191,12 @@ class ServerArgs:
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
             self.chunked_prefill_size = self.chunked_prefill_size // 2
-            self.disable_cuda_graph = True
+            self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
             self.enable_overlap_schedule = False
             logger.warning(
-                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE workload issue. "
-                "The CUDA graph is disabled. Data parallel size is adjust to be the same as tensor parallel size."
+                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+                f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
+                "Data parallel size is adjusted to be the same as tensor parallel size."
             )
 
         if self.enable_overlap_schedule:
@@ -219,21 +204,8 @@ class ServerArgs:
                 "Overlap scheduler mode is enabled. This is an experimental feature. "
                 "Sampling penalizer (e.g., frequency and repetition penalty), constrained decoding (e.g., regex, JSON), "
                 "and embedding APIs are not supported and will lead to wrong results. "
-                "The NaN detection is also disabled."
             )
             self.disable_penalizer = True
-            self.disable_nan_detection = True
-
-        # Model-specific patches
-        if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
-            logger.info(
-                "Not sure why, the tokenizer will add an additional token at the end of the prompt when trust_remote_mode=True"
-            )
-            self.trust_remote_code = False
-
-        if "gemma-2" in self.model_path.lower():
-            logger.info("When using sliding window in gemma-2, turn on flashinfer.")
-            self.attention_backend = "flashinfer"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -616,16 +588,6 @@ class ServerArgs:
 
         # Optimization/debug options
         parser.add_argument(
-            "--disable-flashinfer",
-            action="store_true",
-            help="Disable flashinfer attention kernels. This option will be deprecated in the next release. Please use '--attention-backend triton' instead.",
-        )
-        parser.add_argument(
-            "--disable-flashinfer-sampling",
-            action="store_true",
-            help="Disable flashinfer sampling kernels. This option will be deprecated in the next release. Please use '--sampling-backend pytorch' instead.",
-        )
-        parser.add_argument(
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
@@ -709,6 +671,11 @@ class ServerArgs:
             help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo",
         )
         parser.add_argument(
+            "--enable-nan-detection",
+            action="store_true",
+            help="Enable the NaN detection for debugging purposes.",
+        )
+        parser.add_argument(
             "--enable-p2p-check",
             action="store_true",
             help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
@@ -731,6 +698,18 @@ class ServerArgs:
             "--delete-ckpt-after-loading",
             action="store_true",
             help="Delete the model checkpoint after loading the model.",
+        )
+
+        # Deprecated arguments
+        parser.add_argument(
+            "--disable-flashinfer",
+            action=DeprecatedAction,
+            help="'--disable-flashinfer' is deprecated. Please use '--attention-backend triton' instead.",
+        )
+        parser.add_argument(
+            "--disable-flashinfer-sampling",
+            action=DeprecatedAction,
+            help="'--disable-flashinfer-sampling' is deprecated. Please use '--sampling-backend pytroch' instead.",
         )
 
     @classmethod
@@ -826,3 +805,13 @@ class LoRAPathAction(argparse.Action):
                 getattr(namespace, self.dest)[name] = path
             else:
                 getattr(namespace, self.dest)[lora_path] = lora_path
+
+
+class DeprecatedAction(argparse.Action):
+    def __init__(self, option_strings, dest, nargs=0, **kwargs):
+        super(DeprecatedAction, self).__init__(
+            option_strings, dest, nargs=nargs, **kwargs
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        raise ValueError(self.help)

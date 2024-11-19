@@ -67,6 +67,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
+    crash_on_warnings,
     get_zmq_socket,
     kill_parent_process,
     set_random_seed,
@@ -75,10 +76,6 @@ from sglang.srt.utils import (
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-
-
-# Crash on warning if we are running CI tests
-crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
 
 # Test retract decode
 test_retract = os.getenv("SGLANG_TEST_RETRACT", "false") == "true"
@@ -337,7 +334,7 @@ class Scheduler:
 
         kill_parent_process()
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def event_loop_normal(self):
         """A normal blocking scheduler loop."""
         self.last_batch = None
@@ -375,7 +372,7 @@ class Scheduler:
 
             self.last_batch = batch
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         result_queue = deque()
@@ -390,6 +387,9 @@ class Scheduler:
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             if batch:
+                # We need a stream synchronization here. Otherwise, there will be cuda illegal memory access errors.
+                _ = batch.seq_lens[0].item()
+
                 result = self.run_batch(batch)
                 result_queue.append((batch.copy(), result))
 
@@ -411,16 +411,12 @@ class Scheduler:
         else:
             num_tokens = local_batch.extend_num_tokens
 
-        local_num_tokens = torch.tensor(
-            num_tokens, dtype=torch.int64, device=self.device
-        )
-        global_num_tokens = torch.empty(
-            self.tp_size, dtype=torch.int64, device=self.device
-        )
+        local_num_tokens = torch.tensor([num_tokens], dtype=torch.int64)
+        global_num_tokens = torch.empty(self.tp_size, dtype=torch.int64)
         torch.distributed.all_gather_into_tensor(
             global_num_tokens,
             local_num_tokens,
-            group=self.tp_worker.get_tp_device_group(),
+            group=self.tp_cpu_group,
         )
 
         if local_batch is None and global_num_tokens.max().item() > 0:
@@ -428,6 +424,24 @@ class Scheduler:
 
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens.tolist()
+
+            # Check forward mode for cuda graph
+            if not self.server_args.disable_cuda_graph:
+                forward_mode_state = torch.tensor(
+                    (
+                        1
+                        if local_batch.forward_mode.is_decode()
+                        or local_batch.forward_mode.is_idle()
+                        else 0
+                    ),
+                    dtype=torch.int32,
+                )
+                torch.distributed.all_reduce(
+                    forward_mode_state,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.tp_cpu_group,
+                )
+                local_batch.can_run_dp_cuda_graph = forward_mode_state.item() == 1
 
         return local_batch
 
@@ -645,21 +659,23 @@ class Scheduler:
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
         if available_size != self.max_total_num_tokens:
-            warnings.warn(
-                "Warning: "
-                f"available_size={available_size}, max_total_num_tokens={self.max_total_num_tokens}\n"
+            msg = (
                 "KV cache pool leak detected!"
+                f"{available_size=}, {self.max_total_num_tokens=}\n"
             )
-            exit(1) if crash_on_warning else None
+            warnings.warn(msg)
+            if crash_on_warnings():
+                raise ValueError(msg)
 
         if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
-            warnings.warn(
-                "Warning: "
-                f"available req slots={len(self.req_to_token_pool.free_slots)}, "
-                f"total slots={self.req_to_token_pool.size}\n"
+            msg = (
                 "Memory pool leak detected!"
+                f"available_size={len(self.req_to_token_pool.free_slots)}, "
+                f"total_size={self.req_to_token_pool.size}\n"
             )
-            exit(1) if crash_on_warning else None
+            warnings.warn(msg)
+            if crash_on_warnings():
+                raise ValueError(msg)
 
     def get_next_batch_to_run(self):
         # Merge the prefill batch into the running batch
@@ -895,7 +911,7 @@ class Scheduler:
             logits_output, next_token_ids, bid = result
 
             if self.enable_overlap:
-                logits_output, next_token_ids = self.tp_worker.resulve_batch_result(bid)
+                logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             else:
                 # Move next_token_ids and logprobs to cpu
                 if batch.return_logprob:
@@ -970,7 +986,7 @@ class Scheduler:
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
-            logits_output, next_token_ids = self.tp_worker.resulve_batch_result(bid)
+            logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             next_token_logprobs = logits_output.next_token_logprobs
         else:
             # Move next_token_ids and logprobs to cpu
@@ -988,7 +1004,7 @@ class Scheduler:
             if req.is_retracted:
                 continue
 
-            if self.server_args.enable_overlap_schedule and (req.finished()):
+            if self.enable_overlap and req.finished():
                 self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
                 continue
 
@@ -1305,7 +1321,7 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
         pipe_writer.send("ready")
-        if server_args.enable_overlap_schedule:
+        if scheduler.enable_overlap:
             scheduler.event_loop_overlap()
         else:
             scheduler.event_loop_normal()

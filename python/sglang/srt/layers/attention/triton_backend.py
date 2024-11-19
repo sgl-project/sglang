@@ -64,8 +64,7 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = None
         else:
             start_loc = attn_logits = max_seq_len = None
-            prefix_lens = forward_batch.extend_prefix_lens
-            max_extend_len = torch.max(forward_batch.seq_lens - prefix_lens).item()
+            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
 
         self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len
 
