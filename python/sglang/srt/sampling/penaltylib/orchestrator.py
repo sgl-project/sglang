@@ -204,6 +204,8 @@ class _TokenIDs:
                 :, : self.orchestrator.vocab_size
             ]
         else:
+            # TODO: optimize this part. We do not need to create this big tensor every time.
+            # We can directly apply the results on the logits.
             self.cached_counts = torch.zeros(
                 size=(self.orchestrator.batch_size(), self.orchestrator.vocab_size),
                 device=self.orchestrator.device,

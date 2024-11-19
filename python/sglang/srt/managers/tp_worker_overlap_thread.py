@@ -139,9 +139,9 @@ class TpModelWorkerClient:
 
     def resolve_batch_result(self, bid: int):
         copy_event, logits_output, next_token_ids = self.output_queue.get()
-        self.launch_event.wait()
         while not copy_event.query():
             time.sleep(1e-5)
+        self.launch_event.wait()
 
         if logits_output.next_token_logprobs is not None:
             logits_output.next_token_logprobs = (
