@@ -42,10 +42,7 @@ class SamplingBatchInfo:
 
     @classmethod
     def from_schedule_batch(
-        cls,
-        batch: ScheduleBatch,
-        vocab_size: int,
-        disable_penalizer: bool,
+        cls, batch: ScheduleBatch, vocab_size: int, enable_overlap_schedule: bool
     ):
         reqs = batch.reqs
         device = batch.device
@@ -79,6 +76,22 @@ class SamplingBatchInfo:
         )
         # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
 
+        if enable_overlap_schedule:
+            # TODO (lianmin): Some penalizers such as frequency and presence depend on model outputs,
+            # so it is kind of tricky to make it work with overlap scheduler.
+            # It requires correcly updating the penalty logits before the sampling and syncing the events.
+            # We will support them later.
+            penalizers = {
+                penaltylib.BatchedMinNewTokensPenalizer,
+            }
+        else:
+            penalizers = {
+                penaltylib.BatchedFrequencyPenalizer,
+                penaltylib.BatchedMinNewTokensPenalizer,
+                penaltylib.BatchedPresencePenalizer,
+                penaltylib.BatchedRepetitionPenalizer,
+            }
+
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
         # should not add hefty computation overhead other than simple checks.
@@ -86,20 +99,12 @@ class SamplingBatchInfo:
         # While we choose not to even create the class instances if they are not required, this
         # could add additional complexity to the {ScheduleBatch} class, especially we need to
         # handle {filter_batch()} and {merge_batch()} cases as well.
-        if disable_penalizer:
-            ret.penalizer_orchestrator = None
-        else:
-            ret.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
-                vocab_size=vocab_size,
-                batch=batch,
-                device=batch.device,
-                Penalizers={
-                    penaltylib.BatchedFrequencyPenalizer,
-                    penaltylib.BatchedMinNewTokensPenalizer,
-                    penaltylib.BatchedPresencePenalizer,
-                    penaltylib.BatchedRepetitionPenalizer,
-                },
-            )
+        ret.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
+            vocab_size=vocab_size,
+            batch=batch,
+            device=batch.device,
+            Penalizers=penalizers,
+        )
 
         # Handle logit bias but only allocate when needed
         ret.logit_bias = None
@@ -133,13 +138,13 @@ class SamplingBatchInfo:
                 self.linear_penalties = penalizer.apply(self.linear_penalties)
 
     def update_regex_vocab_mask(self):
-        if not self.grammars or not any(grammar for grammar in self.grammars):
+        if not self.grammars:
             self.vocab_mask = None
             self.apply_mask = None
             return
 
         # find a grammar from the list
-        grammar = next(grammar for grammar in self.grammars if grammar is not None)
+        grammar = next(grammar for grammar in self.grammars if grammar)
 
         # maybe we can reuse the existing mask?
         self.vocab_mask = grammar.allocate_vocab_mask(

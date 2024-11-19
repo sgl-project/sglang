@@ -52,14 +52,18 @@ if TYPE_CHECKING:
 class ForwardMode(IntEnum):
     # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
     PREFILL = auto()
-    # Extend a sequence. The KV cache of the first part of the sequence is already computed (e.g., system prompt).
+    # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     EXTEND = auto()
     # Decode one token.
     DECODE = auto()
-    # Contains both EXTEND and DECODE.
+    # Contains both EXTEND and DECODE when doing chunked prefill.
     MIXED = auto()
-    # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence allocated.
+    # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
     IDLE = auto()
+
+    # A dummy first batch to start the pipeline for overlap scheduler.
+    # It is now used for triggering the sampling_info_done event for the first prefill batch.
+    DUMMY_FIRST = auto()
 
     def is_prefill(self):
         return self == ForwardMode.PREFILL
@@ -75,6 +79,9 @@ class ForwardMode(IntEnum):
 
     def is_idle(self):
         return self == ForwardMode.IDLE
+
+    def is_dummy_first(self):
+        return self == ForwardMode.DUMMY_FIRST
 
 
 @dataclass
