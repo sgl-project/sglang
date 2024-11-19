@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     crash_on_warnings,
     enable_show_time_cost,
     get_available_gpu_memory,
+    is_hip,
     monkey_patch_vllm_model_config,
     monkey_patch_vllm_p2p_access_check,
 )
@@ -440,7 +441,10 @@ class ModelRunner:
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
-            self.kv_cache_dtype = torch.float8_e5m2
+            if is_hip():  # Using natively supported format
+                self.kv_cache_dtype = torch.float8_e5m2fnuz
+            else:
+                self.kv_cache_dtype = torch.float8_e5m2
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
