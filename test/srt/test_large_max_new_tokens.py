@@ -38,7 +38,7 @@ class TestLargeMaxNewTokens(unittest.TestCase):
             api_key=cls.api_key,
             other_args=(
                 "--max-total-token",
-                "1024",
+                "1536",
                 "--context-len",
                 "8192",
                 "--decode-log-interval",
