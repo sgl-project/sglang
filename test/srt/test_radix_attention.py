@@ -107,7 +107,7 @@ class TestRadixCacheLPM(TestRadixCacheFCFS):
         )
 
 
-class TestRadixCacheNoOverlapLPM(TestRadixCacheFCFS):
+class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
