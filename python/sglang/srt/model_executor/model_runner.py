@@ -116,7 +116,7 @@ class ModelRunner:
             )
 
         if self.is_multimodal:
-            logger.warning(
+            logger.info(
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
             )
             server_args.chunked_prefill_size = None
@@ -636,13 +636,11 @@ class ModelRunner:
         self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         sampling_info = forward_batch.sampling_info
-
         if sampling_info.sampling_info_done:
             # Overlap mode: the function update_regex_vocab_mask was executed
             # in process_batch_result of the last batch.
             if sampling_info.grammars:
                 sampling_info.sampling_info_done.wait()
-            sampling_info.update_penalties()
         else:
             # Normal mode: Put CPU-heavy tasks here. They will be overlapped with the forward pass.
             sampling_info.update_regex_vocab_mask()

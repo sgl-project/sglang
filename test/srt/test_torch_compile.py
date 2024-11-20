@@ -1,3 +1,4 @@
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -56,14 +57,14 @@ class TestTorchCompile(unittest.TestCase):
         return response.json()
 
     def test_throughput(self):
-        import time
+        # Warmup
+        res = self.run_decode(16)
 
         max_tokens = 256
-
         tic = time.time()
         res = self.run_decode(max_tokens)
         tok = time.time()
-        print(res["text"])
+        print(f"{res=}")
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
         self.assertGreaterEqual(throughput, 152)

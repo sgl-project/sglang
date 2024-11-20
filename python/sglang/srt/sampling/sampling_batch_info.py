@@ -132,9 +132,6 @@ class SamplingBatchInfo:
         return len(self.temperatures)
 
     def update_penalties(self):
-        if not self.penalizer_orchestrator:
-            return
-
         self.scaling_penalties = None
         self.linear_penalties = None
 
@@ -176,8 +173,7 @@ class SamplingBatchInfo:
                 grammar.fill_vocab_mask(self.vocab_mask, i)
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
-        if self.penalizer_orchestrator:
-            self.penalizer_orchestrator.filter(unfinished_indices, new_indices)
+        self.penalizer_orchestrator.filter(unfinished_indices, new_indices)
 
         for item in [
             "temperatures",
@@ -216,8 +212,7 @@ class SamplingBatchInfo:
         return None
 
     def merge_batch(self, other: "SamplingBatchInfo"):
-        if self.penalizer_orchestrator:
-            self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         for item in [
             "temperatures",

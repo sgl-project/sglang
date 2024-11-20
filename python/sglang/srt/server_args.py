@@ -123,7 +123,7 @@ class ServerArgs:
     disable_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
-    enable_overlap_schedule: bool = False
+    disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_torch_compile: bool = False
@@ -172,9 +172,7 @@ class ServerArgs:
         if gpu_mem < 25000:
             self.chunked_prefill_size //= 4  # make it 2048
             self.cuda_graph_max_bs = 4
-            logger.warning(
-                "Automatically adjust --chunked-prefill-size for small GPUs."
-            )
+            logger.info("Automatically adjust --chunked-prefill-size for small GPUs.")
 
         if not is_flashinfer_available():
             self.attention_backend = "triton"
@@ -192,15 +190,22 @@ class ServerArgs:
             self.chunked_prefill_size = self.chunked_prefill_size // 2
             self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
-            self.enable_overlap_schedule = False
-            logger.warning(
+            self.disable_overlap_schedule = True
+            logger.info(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
                 f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
-                "Data parallel size is adjusted to be the same as tensor parallel size."
+                "Data parallel size is adjusted to be the same as tensor parallel size. "
+                "Overlap schedule is disabled."
             )
 
-        if self.enable_overlap_schedule:
+        if self.enable_mixed_chunk:
+            logger.info(
+                "Overlap schedule is disabled because mixed-style chunked prefill is enabled."
+            )
+            self.disable_overlap_schedule = True
+
+        if not self.disable_overlap_schedule:
             self.disable_jump_forward = True
 
     @staticmethod
@@ -624,9 +629,9 @@ class ServerArgs:
             help="Disable the NaN detection for better performance.",
         )
         parser.add_argument(
-            "--enable-overlap-schedule",
+            "--disable-overlap-schedule",
             action="store_true",
-            help="Overlap the CPU scheduler with GPU model worker. Experimental feature.",
+            help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",
@@ -692,6 +697,11 @@ class ServerArgs:
         )
 
         # Deprecated arguments
+        parser.add_argument(
+            "--enable-overlap-schedule",
+            action=DeprecatedAction,
+            help="'--enable-overlap-schedule' is deprecated. It is enabled by default now. Please drop this argument.",
+        )
         parser.add_argument(
             "--disable-flashinfer",
             action=DeprecatedAction,
