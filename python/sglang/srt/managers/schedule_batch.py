@@ -180,6 +180,7 @@ class Req:
         origin_input_ids: Tuple[int],
         sampling_params: SamplingParams,
         lora_path: Optional[str] = None,
+        session_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -188,6 +189,8 @@ class Req:
         self.origin_input_ids = origin_input_ids
         self.output_ids = []  # Each decode stage's output ids
         self.fill_ids = None  # fill_ids = origin_input_ids + output_ids
+        self.session_id = session_id
+
         self.sampling_params = sampling_params
         self.lora_path = lora_path
 
