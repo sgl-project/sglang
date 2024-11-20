@@ -670,7 +670,7 @@ def run_and_check_memory_leak(
     workload_func,
     disable_radix_cache,
     enable_mixed_chunk,
-    enable_overlap,
+    disable_overlap,
     chunked_prefill_size,
 ):
     other_args = ["--chunked-prefill-size", str(chunked_prefill_size)]
@@ -678,8 +678,8 @@ def run_and_check_memory_leak(
         other_args += ["--disable-radix-cache"]
     if enable_mixed_chunk:
         other_args += ["--enable-mixed-chunk"]
-    if enable_overlap:
-        other_args += ["--enable-overlap-schedule"]
+    if disable_overlap:
+        other_args += ["--disable-overlap-schedule"]
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
     port = random.randint(4000, 5000)
@@ -731,7 +731,7 @@ def run_and_check_memory_leak(
 def run_mmlu_test(
     disable_radix_cache=False,
     enable_mixed_chunk=False,
-    enable_overlap=False,
+    disable_overlap=False,
     chunked_prefill_size=32,
 ):
     def workload_func(base_url, model):
@@ -754,7 +754,7 @@ def run_mmlu_test(
         workload_func,
         disable_radix_cache,
         enable_mixed_chunk,
-        enable_overlap,
+        disable_overlap,
         chunked_prefill_size,
     )
 

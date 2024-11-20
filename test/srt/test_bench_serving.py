@@ -97,8 +97,8 @@ class TestBenchServing(unittest.TestCase):
 
         if is_in_ci():
             self.assertLess(res["median_e2e_latency_ms"], 12000)
-            self.assertLess(res["median_ttft_ms"], 80)
-            self.assertLess(res["median_itl_ms"], 11)
+            self.assertLess(res["median_ttft_ms"], 86)
+            self.assertLess(res["median_itl_ms"], 10)
 
     def test_moe_offline_throughput_default(self):
         res = run_bench_serving(
