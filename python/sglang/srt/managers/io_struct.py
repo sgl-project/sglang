@@ -56,6 +56,10 @@ class GenerateReqInput:
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
+    # Session id info for continual prompting
+    session_id: Optional[Union[List[str], str]] = None
+    session_rid: Optional[Union[List[str], str]] = None
+
     def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
             self.text is not None and self.input_ids is not None
@@ -200,6 +204,10 @@ class TokenizedGenerateReqInput:
     # LoRA related
     lora_path: Optional[str] = None  # None means just use the base model
 
+    # Session id info for continual prompting
+    session_id: Optional[int] = None
+    session_rid: Optional[str] = None
+
 
 @dataclass
 class EmbeddingReqInput:
@@ -293,6 +301,8 @@ class BatchTokenIDOut:
     meta_info: List[Dict]
     finished_reason: List[BaseFinishReason]
     no_stop_trim: List[bool]
+    # The updated session unique id
+    session_ids: List[str]
 
 
 @dataclass
@@ -305,6 +315,8 @@ class BatchStrOut:
     meta_info: List[Dict]
     # The finish reason
     finished_reason: List[BaseFinishReason]
+    # The update session unique id
+    session_ids: List[str]
 
 
 @dataclass
@@ -357,3 +369,18 @@ class GetMemPoolSizeReq:
 @dataclass
 class GetMemPoolSizeReqOutput:
     size: int
+
+
+@dataclass
+class OpenSessionReqInput:
+    capacity_of_str_len: int
+
+
+@dataclass
+class CloseSessionReqInput:
+    session_id: str
+
+
+@dataclass
+class OpenSessionReqOutput:
+    session_id: str
