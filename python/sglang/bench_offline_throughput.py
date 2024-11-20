@@ -57,6 +57,7 @@ class BenchArgs:
     disable_ignore_eos: bool = False
     extra_request_body: Optional[str] = None
     seed: int = 1
+    skip_warmup: bool = False
     do_not_exit: bool = False
 
     @staticmethod
@@ -152,6 +153,11 @@ class BenchArgs:
             "additional generate params like sampling params.",
         )
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+        parser.add_argument(
+            "--skip-warmup",
+            action="store_true",
+            help="Skip the warmup batches.",
+        )
         parser.add_argument(
             "--do-not-exit",
             action="store_true",
@@ -261,14 +267,15 @@ def throughput_test(
     )
 
     # Warm up
-    logging.info("\nWarmup...")
-    throughput_test_once(
-        backend_name=bench_args.backend,
-        backend=backend,
-        reqs=warmup_requests,
-        ignore_eos=not bench_args.disable_ignore_eos,
-        extra_request_body=extra_request_body,
-    )
+    if not bench_args.skip_warmup:
+        logging.info("\nWarmup...")
+        throughput_test_once(
+            backend_name=bench_args.backend,
+            backend=backend,
+            reqs=warmup_requests,
+            ignore_eos=not bench_args.disable_ignore_eos,
+            extra_request_body=extra_request_body,
+        )
 
     logging.info("\nBenchmark...")
     result = throughput_test_once(
