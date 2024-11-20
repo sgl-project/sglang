@@ -196,7 +196,7 @@ class ServerArgs:
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
                 f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
-                f"The scheduler conservativeness is adjusted to {self.schedule_conservativeness}. "
+                f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size."
             )
 
