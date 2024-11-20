@@ -731,7 +731,7 @@ def run_and_check_memory_leak(
 def run_mmlu_test(
     disable_radix_cache=False,
     enable_mixed_chunk=False,
-    enable_overlap=False,
+    disable_overlap=False,
     chunked_prefill_size=32,
 ):
     def workload_func(base_url, model):
@@ -754,7 +754,7 @@ def run_mmlu_test(
         workload_func,
         disable_radix_cache,
         enable_mixed_chunk,
-        enable_overlap,
+        disable_overlap,
         chunked_prefill_size,
     )
 
