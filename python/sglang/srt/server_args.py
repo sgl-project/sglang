@@ -180,7 +180,7 @@ class ServerArgs:
             self.sampling_backend = "pytorch"
 
         if self.attention_backend is None:
-            self.attention_backend = "triton"
+            self.attention_backend = "flashinfer"
         if self.sampling_backend is None:
             self.sampling_backend = "flashinfer"
 
