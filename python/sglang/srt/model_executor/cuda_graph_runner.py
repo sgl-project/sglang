@@ -326,9 +326,6 @@ class CudaGraphRunner:
         assert forward_batch.out_cache_loc is not None
         raw_bs = forward_batch.batch_size
 
-        # A cuda stream sync here to avoid the cuda illegal memory access error w/ overlap scheduler.
-        torch.cuda.current_stream().synchronize()
-
         # Pad
         if self.enable_dp_attention:
             index = bisect.bisect_left(
