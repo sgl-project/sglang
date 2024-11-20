@@ -159,12 +159,17 @@ class TpModelWorkerClient:
         # A cuda stream sync here to avoid the cuda illegal memory access error.
         _ = model_worker_batch.seq_lens[0].item()
 
-        # Push a new batch to the queue
-        model_worker_batch.sampling_info = dataclasses.replace(
-            model_worker_batch.sampling_info,
+        # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
+        sampling_info = model_worker_batch.sampling_info
+        sampling_info.update_penalties()
+        model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
+            sampling_info,
             sampling_info_done=threading.Event(),
+            scaling_penalties=sampling_info.scaling_penalties,
+            linear_penalties=sampling_info.linear_penalties,
         )
-        self.cur_sampling_info = model_worker_batch.sampling_info
+
+        # Push a new batch to the queue
         self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
 
         # Allocate output future objects
