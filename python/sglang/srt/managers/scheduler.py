@@ -170,18 +170,9 @@ class Scheduler:
         if not self.is_generation:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
-        if (
-            server_args.attention_backend == "triton"
-            or server_args.enable_double_sparsity
-            or (
-                self.model_config.attention_arch == AttentionArch.MLA
-                and not self.server_args.disable_mla
-            )
-        ):
-            self.enable_overlap = False
-            logger.info(
-                "Overlap scheduler is disabled if using triton attention backend."
-            )
+
+        if self.enable_overlap:
+            self.disable_jump_forward = True
 
         # Launch a tensor parallel worker
         if self.enable_overlap:
