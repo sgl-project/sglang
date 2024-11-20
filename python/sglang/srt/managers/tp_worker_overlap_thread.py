@@ -157,7 +157,7 @@ class TpModelWorkerClient:
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         # A cuda stream sync here to avoid the cuda illegal memory access error.
-        _ = model_worker_batch.seq_lens[0].item()
+        torch.cuda.current_stream().synchronize()
 
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = model_worker_batch.sampling_info
