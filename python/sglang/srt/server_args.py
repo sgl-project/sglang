@@ -202,6 +202,7 @@ class ServerArgs:
         if self.enable_mixed_chunk:
             logger.info(
                 "Overlap schedule is disabled because mixed-style chunked prefill is enabled."
+            )
             self.disable_overlap_schedule = True
 
         if not self.disable_overlap_schedule:
