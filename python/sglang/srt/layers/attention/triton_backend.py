@@ -53,7 +53,7 @@ class TritonAttnBackend(AttentionBackend):
             start_loc = torch.zeros_like(forward_batch.seq_lens, dtype=torch.int32)
             start_loc[1:] = torch.cumsum(forward_batch.seq_lens[:-1], dim=0)
 
-            total_num_tokens = torch.sum(forward_batch.seq_lens).item()
+            total_num_tokens = forward_batch.seq_lens_sum
             attn_logits = torch.empty(
                 (self.num_head, total_num_tokens),
                 dtype=self.reduce_dtype,

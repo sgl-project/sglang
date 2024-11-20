@@ -174,17 +174,17 @@ class ServerArgs:
             self.cuda_graph_max_bs = 4
             logger.info("Automatically adjust --chunked-prefill-size for small GPUs.")
 
+        # Choose kernel backends
         if not is_flashinfer_available():
             self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
 
-        # Default kernel backends
         if self.attention_backend is None:
-            self.attention_backend = "flashinfer"
-
+            self.attention_backend = "triton"
         if self.sampling_backend is None:
             self.sampling_backend = "flashinfer"
 
+        # Others
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
             self.chunked_prefill_size = self.chunked_prefill_size // 2
@@ -204,9 +204,6 @@ class ServerArgs:
                 "Overlap schedule is disabled because mixed-style chunked prefill is enabled."
             )
             self.disable_overlap_schedule = True
-
-        if not self.disable_overlap_schedule:
-            self.disable_jump_forward = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

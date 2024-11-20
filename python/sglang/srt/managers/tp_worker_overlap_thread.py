@@ -94,10 +94,17 @@ class TpModelWorkerClient:
 
     @torch.no_grad()
     def forward_thread_func_(self):
+        self.batch_ct = 0
+        self.batch_lists = [None] * 2
+
         while True:
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
             if not model_worker_batch:
                 break
+
+            self.batch_lists[self.batch_ct % len(self.batch_lists)] = model_worker_batch
+            self.batch_ct += 1
+
             self.launch_done = threading.Event()
             copy_done = torch.cuda.Event()
 
