@@ -80,6 +80,8 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
+        self.num_cascade_levels = 1
+
         # Allocate buffers
         self.workspace_buffer = torch.empty(
             global_config.flashinfer_workspace_size,
@@ -121,7 +123,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.decode_wrappers.append(
                 MultiLevelCascadeAttentionWrapper(
-                    1,
+                    self.num_cascade_levels,
                     self.workspace_buffer,
                     "NHD",
                 )
@@ -235,9 +237,10 @@ class FlashInferAttnBackend(AttentionBackend):
             for i in range(self.num_wrappers):
                 decode_wrappers.append(
                         MultiLevelCascadeAttentionWrapper(
-                    1,
+                    self.num_cascade_levels,
                     self.workspace_buffer,
                     "NHD",
+                    # Pass below args once flashinfer version is bumped
                     # use_cuda_graph=True,
                     # qo_indptr_buf_arr=[self.qo_indptr[i][: bs + 1]],
                     # paged_kv_indptr_buf_arr=[self.kv_indptr[i][: bs + 1]],
@@ -347,13 +350,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-            o = prefill_wrapper_paged.forward(
+            _update_layer_args(
+                layer_args,
+                {
+                    "causal": not layer.is_cross_attention,
+                    "sm_scale": layer.scaling,
+                    "window_left": layer.sliding_window_size,
+                    "logits_soft_cap": layer.logit_cap,
+                },
+                plan_args,
+                prefill_wrapper_paged,
+            )
+            o = prefill_wrapper_paged.run(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                # causal=not layer.is_cross_attention,
-                # sm_scale=layer.scaling,
-                # window_left=layer.sliding_window_size,
-                # logits_soft_cap=layer.logit_cap,
             )
         else:
             o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
@@ -368,12 +378,19 @@ class FlashInferAttnBackend(AttentionBackend):
             if self.forward_metadata.extend_no_prefix:
                 o = o1
             else:
-                o = prefill_wrapper_paged.forward(
+                _update_layer_args(
+                    layer_args,
+                    {
+                        "causal": False,
+                        "sm_scale": layer.scaling,
+                        "logits_soft_cap": layer.logit_cap,
+                    },
+                    plan_args,
+                    prefill_wrapper_paged,
+                )
+                o = prefill_wrapper_paged.run(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    # causal=False,
-                    # sm_scale=layer.scaling,
-                    # logits_soft_cap=layer.logit_cap,
                 )
 
             if save_kv_cache:
@@ -399,16 +416,26 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
+        plan_args = self.indices_updater_decode.plan_args
+        layer_args = self.indices_updater_decode.layer_args
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-        o = decode_wrapper.forward(
+        _update_layer_args(
+            layer_args,
+            {
+                "sm_scale": layer.scaling,
+                "logits_soft_cap": layer.logit_cap,
+            },
+            plan_args,
+            decode_wrapper,
+        )
+        o = decode_wrapper.run(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            # sm_scale=layer.scaling,
-            # logits_soft_cap=layer.logit_cap,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -439,6 +466,9 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+
+        self.plan_args = {}
+        self.layer_args = {}
 
         # Buffers and wrappers
         self.qo_indptr = attn_backend.qo_indptr
@@ -596,17 +626,18 @@ class FlashInferIndicesUpdaterDecode:
         qo_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
         qo_indptr = qo_indptr[: bs + 1]
 
-        wrapper.plan(
-            [qo_indptr],
-            [kv_indptr],
-            [kv_indices],
-            [self.kv_last_page_len[:bs]],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            q_data_type=self.q_data_type,
-        )
+        self.plan_args = {
+            "qo_indptr_arr": [qo_indptr],
+            "paged_kv_indptr_arr": [kv_indptr],
+            "paged_kv_indices_arr": [kv_indices],
+            "paged_kv_last_page_len": [self.kv_last_page_len[:bs]],
+            "num_qo_heads": self.num_qo_heads,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
+            "page_size": 1,
+            "q_data_type": self.q_data_type,
+        }
+        wrapper.plan(**self.plan_args, **self.layer_args)
 
 
 class FlashInferIndicesUpdaterPrefill:
@@ -623,6 +654,9 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+
+        self.plan_args = {}
+        self.layer_args = {}
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -824,18 +858,18 @@ class FlashInferIndicesUpdaterPrefill:
                 q_data_type=self.q_data_type,
             )
 
-        wrapper.plan(
-            [qo_indptr],
-            [kv_indptr],
-            [kv_indices],
-            [self.kv_last_page_len[:bs]],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            q_data_type=self.q_data_type,
-            custom_mask=custom_mask,
-        )
+        self.plan_args = {
+            "qo_indptr_arr": [qo_indptr],
+            "paged_kv_indptr_arr": [kv_indptr],
+            "paged_kv_indices_arr": [kv_indices],
+            "paged_kv_last_page_len": [self.kv_last_page_len[:bs]],
+            "num_qo_heads": self.num_qo_heads,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
+            "page_size": 1,
+            "q_data_type": self.q_data_type,
+        }
+        wrapper.plan(**self.plan_args, **self.layer_args)
 
 
 @triton.jit
