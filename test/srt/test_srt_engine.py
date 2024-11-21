@@ -11,10 +11,11 @@ from types import SimpleNamespace
 import torch
 
 import sglang as sgl
+from sglang.bench_offline_throughput import BenchArgs, throughput_test
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.server_args import ServerArgs
 from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
 )
@@ -28,7 +29,7 @@ class TestSRTEngine(unittest.TestCase):
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
-        engine = sgl.Engine(model_path=model_path, random_seed=42, log_level="error")
+        engine = sgl.Engine(model_path=model_path, random_seed=42)
         out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 
@@ -41,7 +42,7 @@ class TestSRTEngine(unittest.TestCase):
 
         print("==== Answer 2 ====")
         print(out2)
-        assert out1 == out2, f"{out1} != {out2}"
+        self.assertEqual(out1, out2)
 
     def test_2_engine_multiple_generate(self):
         # just to ensure there is no issue running multiple generate calls
@@ -50,7 +51,7 @@ class TestSRTEngine(unittest.TestCase):
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
-        engine = sgl.Engine(model_path=model_path, random_seed=42, log_level="error")
+        engine = sgl.Engine(model_path=model_path, random_seed=42)
         engine.generate(prompt, sampling_params)
         engine.generate(prompt, sampling_params)
         engine.shutdown()
@@ -73,7 +74,6 @@ class TestSRTEngine(unittest.TestCase):
         # Create an LLM.
         llm = sgl.Engine(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            log_level="error",
         )
 
         # 1. sync + non streaming
@@ -104,20 +104,22 @@ class TestSRTEngine(unittest.TestCase):
     def test_4_gsm8k(self):
 
         args = SimpleNamespace(
-            model_path=DEFAULT_MODEL_NAME_FOR_TEST,
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             local_data_path=None,
             num_shots=5,
             num_questions=200,
         )
 
         metrics = run_eval(args)
-        assert metrics["accuracy"] > 0.7
+        self.assertGreater(metrics["accuracy"], 0.3)
 
     def test_5_prompt_input_ids_consistency(self):
         prompt = "The capital of UK is"
 
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        engine = sgl.Engine(model_path=model_path, random_seed=42, log_level="error")
+        engine = sgl.Engine(
+            model_path=model_path, random_seed=42, disable_radix_cache=True
+        )
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
         out1 = engine.generate(prompt, sampling_params)["text"]
 
@@ -134,15 +136,13 @@ class TestSRTEngine(unittest.TestCase):
 
         print("==== Answer 2 ====")
         print(out2)
-        assert out1 == out2, f"{out1} != {out2}"
+        self.assertEqual(out1, out2)
 
     def test_6_engine_runtime_encode_consistency(self):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
 
-        engine = sgl.Engine(
-            model_path=model_path, is_embedding=True, random_seed=42, log_level="error"
-        )
+        engine = sgl.Engine(model_path=model_path, is_embedding=True, random_seed=42)
         out1 = torch.tensor(engine.encode(prompt)["embedding"])
         engine.shutdown()
 
@@ -151,6 +151,14 @@ class TestSRTEngine(unittest.TestCase):
         runtime.shutdown()
 
         self.assertTrue(torch.allclose(out1, out2, atol=1e-5, rtol=1e-3))
+
+    def test_7_engine_offline_throughput(self):
+        server_args = ServerArgs(
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+        )
+        bench_args = BenchArgs(num_prompts=10)
+        result = throughput_test(server_args=server_args, bench_args=bench_args)
+        self.assertGreater(result["total_throughput"], 3500)
 
 
 if __name__ == "__main__":

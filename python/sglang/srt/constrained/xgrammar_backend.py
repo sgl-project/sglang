@@ -15,15 +15,33 @@ limitations under the License.
 
 """Constrained decoding with xgrammar backend."""
 
+import logging
 from typing import List, Tuple
 
 import torch
-from xgrammar import CachedGrammarCompiler, CompiledGrammar, GrammarMatcher
+
+try:
+    from xgrammar import (
+        CachedGrammarCompiler,
+        CompiledGrammar,
+        GrammarMatcher,
+        TokenizerInfo,
+    )
+
+    import_error = None
+except ImportError as e:
+    CachedGrammarCompiler = CompiledGrammar = GrammarMatcher = TokenizerInfo = (
+        ImportError
+    )
+    import_error = e
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+
+logger = logging.getLogger(__name__)
+
 
 MAX_ROLLBACK_TOKENS = 10
 
@@ -67,19 +85,23 @@ class XGrammarGrammar(BaseGrammarObject):
         for i in range(k, len(new_output_ids)):
             assert self.matcher.accept_token(new_output_ids[i])
 
-    def fill_vocab_mask(self, vocab_mask: torch.Tensor):
-        # Note that this bitmask is a bitset, not bool
-        bitmask = self.matcher.get_next_token_bitmask()
-        # Mask the tokens that are not allowed
-        vocab_mask[
-            self.matcher.get_rejected_tokens_from_bitmask(bitmask, self.vocab_size)
-        ] = 1
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        return self.matcher.allocate_token_bitmask(vocab_size, batch_size)
+
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        GrammarMatcher.apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
         matcher = GrammarMatcher(
             self.ctx,
             max_rollback_tokens=MAX_ROLLBACK_TOKENS,
-            mask_vocab_size=self.vocab_size,
+            vocab_size=self.vocab_size,
         )
         return XGrammarGrammar(matcher, self.vocab_size, self.ctx)
 
@@ -91,24 +113,46 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         vocab_size: int,
     ):
         super().__init__()
-        self.grammar_cache = CachedGrammarCompiler(tokenizer_or_vocab=tokenizer)
+
+        if import_error:
+            logger.warning(
+                f"Ignore import error for the grammar backend: {import_error}"
+            )
+            self.grammar_cache = None
+            return
+
+        tokenizer_info = TokenizerInfo.from_huggingface(tokenizer)
+        self.grammar_cache = CachedGrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size
 
     def init_value_impl(self, key: Tuple[str, str]) -> XGrammarGrammar:
+        if import_error:
+            raise import_error
+
         key_type, key_string = key
         if key_type == "json":
-            ctx = self.grammar_cache.get_compiled_grammar_for_json_schema(key_string)
+            try:
+                ctx = self.grammar_cache.compile_json_schema_grammar(schema=key_string)
+            except RuntimeError as e:
+                logging.warning(
+                    f"Skip invalid json_schema: json_schema={key_string}, {e=}"
+                )
+                return None
         elif key_type == "regex":
-            raise ValueError("regex hasn't been supported by xgrammar yet")
+            logger.warning(
+                "regex hasn't been supported by xgrammar yet. This is skipped."
+            )
+            return None
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
 
         matcher = GrammarMatcher(
             ctx,
             max_rollback_tokens=MAX_ROLLBACK_TOKENS,
-            mask_vocab_size=self.vocab_size,
+            vocab_size=self.vocab_size,
         )
         return XGrammarGrammar(matcher, self.vocab_size, ctx)
 
     def reset(self):
-        self.grammar_cache.clear()
+        if self.grammar_cache:
+            self.grammar_cache.clear()

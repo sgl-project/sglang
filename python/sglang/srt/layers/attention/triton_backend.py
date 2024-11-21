@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
 
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -28,9 +27,13 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
-        self.num_head = (
-            model_runner.model_config.num_attention_heads // model_runner.tp_size
-        )
+
+        if model_runner.server_args.enable_dp_attention:
+            self.num_head = model_runner.model_config.num_attention_heads
+        else:
+            self.num_head = (
+                model_runner.model_config.num_attention_heads // model_runner.tp_size
+            )
 
         if global_server_args_dict.get("triton_attention_reduce_in_fp32", False):
             self.reduce_dtype = torch.float32
@@ -50,7 +53,7 @@ class TritonAttnBackend(AttentionBackend):
             start_loc = torch.zeros_like(forward_batch.seq_lens, dtype=torch.int32)
             start_loc[1:] = torch.cumsum(forward_batch.seq_lens[:-1], dim=0)
 
-            total_num_tokens = torch.sum(forward_batch.seq_lens).item()
+            total_num_tokens = forward_batch.seq_lens_sum
             attn_logits = torch.empty(
                 (self.num_head, total_num_tokens),
                 dtype=self.reduce_dtype,
@@ -61,8 +64,7 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = None
         else:
             start_loc = attn_logits = max_seq_len = None
-            prefix_lens = forward_batch.extend_prefix_lens
-            max_extend_len = torch.max(forward_batch.seq_lens - prefix_lens).item()
+            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
 
         self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len
 

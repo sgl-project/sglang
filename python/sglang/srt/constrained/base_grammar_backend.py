@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""The baseclass of backends for grammar-guided constrained decoding."""
+"""The baseclass of a backend for grammar-guided constrained decoding."""
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -52,7 +52,7 @@ class BaseGrammarBackend:
         else:
             entry.value = self.init_value_impl(key)
             entry.event.set()
-        return entry.value.copy()
+        return entry.value.copy() if entry.value else None
 
     def init_value_impl(self, key: Tuple[str, str]) -> BaseGrammarObject:
         raise NotImplementedError()
@@ -62,7 +62,8 @@ class BaseGrammarBackend:
             entry = self.cache.get(key)
             if not entry or not entry.event.is_set():
                 return None
-            return self.cache[key].value.copy()
+            val = self.cache[key].value
+            return val.copy() if val else None
 
     def get_future_value(self, key: Tuple[str, str]) -> Future:
         return self.executor.submit(self.init_value, key)

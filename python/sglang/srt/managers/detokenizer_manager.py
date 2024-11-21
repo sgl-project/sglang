@@ -100,20 +100,6 @@ class DetokenizerManager:
 
             if isinstance(recv_obj, BatchEmbeddingOut):
                 # If it is embedding model, no detokenization is needed.
-                self.send_to_tokenizer.send_pyobj(
-                    BatchEmbeddingOut(
-                        rids=recv_obj.rids,
-                        embeddings=recv_obj.embeddings,
-                        meta_info=recv_obj.meta_info,
-                        finished_reason=recv_obj.finished_reason,
-                    )
-                )
-                continue
-            elif isinstance(recv_obj, UpdateWeightReqOutput):
-                # If it is a weight update request, no detokenization is needed.
-                self.send_to_tokenizer.send_pyobj(recv_obj)
-                continue
-            elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
                 self.send_to_tokenizer.send_pyobj(recv_obj)
                 continue
             else:
@@ -189,6 +175,7 @@ class DetokenizerManager:
                     output_strs=output_strs,
                     meta_info=recv_obj.meta_info,
                     finished_reason=recv_obj.finished_reason,
+                    session_ids=recv_obj.session_ids,
                 )
             )
 

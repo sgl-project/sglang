@@ -8,7 +8,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 from enum import Enum, auto
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 import torch
 import triton
@@ -136,15 +136,17 @@ class FlashInferAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
 
             # Some heuristics to check whether to use ragged forward
-            use_ragged = False
             if forward_batch.extend_num_tokens >= 4096 and self.num_wrappers == 1:
                 use_ragged = True
-
-            extend_no_prefix = not torch.any(forward_batch.extend_prefix_lens).item()
+                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+            else:
+                use_ragged = False
+                extend_no_prefix = False
 
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
                 prefix_lens,
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
@@ -314,7 +316,6 @@ class FlashInferIndicesUpdaterDecode:
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        self.max_context_len = model_runner.req_to_token_pool.req_to_token.size(1)
         self.sliding_window_size = model_runner.sliding_window_size
 
         self.attn_backend = attn_backend
@@ -335,7 +336,12 @@ class FlashInferIndicesUpdaterDecode:
             self.update = self.update_single_wrapper
 
     def update(
-        self, req_pool_indices, seq_lens, seq_lens_sum, decode_wrappers, encoder_lens
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        decode_wrappers: List,
+        encoder_lens: torch.Tensor,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -345,8 +351,8 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        decode_wrappers=None,
-        encoder_lens=None,
+        decode_wrappers: List,
+        encoder_lens: torch.Tensor,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -363,8 +369,8 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        decode_wrappers=None,
-        encoder_lens=None,
+        decode_wrappers: List,
+        encoder_lens: torch.Tensor,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
 
@@ -394,11 +400,11 @@ class FlashInferIndicesUpdaterDecode:
 
     def update_cross_attention(
         self,
-        req_pool_indices,
-        seq_lens,
-        seq_lens_sum,
-        decode_wrappers=None,
-        encoder_lens=None,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        decode_wrappers: List,
+        encoder_lens: torch.Tensor,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
 
@@ -425,11 +431,11 @@ class FlashInferIndicesUpdaterDecode:
     def call_begin_forward(
         self,
         wrapper,
-        req_pool_indices,
-        paged_kernel_lens,
-        paged_kernel_lens_sum,
-        kv_indptr,
-        kv_start_idx,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
+        kv_indptr: torch.Tensor,
+        kv_start_idx: torch.Tensor,
     ):
         bs = len(req_pool_indices)
         kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -445,7 +451,7 @@ class FlashInferIndicesUpdaterDecode:
             kv_indptr,
             kv_start_idx,
             kv_indices,
-            self.max_context_len,
+            self.req_to_token.shape[1],
         )
 
         wrapper.end_forward()
@@ -474,7 +480,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        self.max_context_len = model_runner.req_to_token_pool.req_to_token.size(1)
         self.sliding_window_size = model_runner.sliding_window_size
 
         self.attn_backend = attn_backend
@@ -496,23 +501,40 @@ class FlashInferIndicesUpdaterPrefill:
             assert self.attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
 
-    def update(self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens):
+    def update(
+        self,
+        req_pool_indices: torch.Tnesor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        prefix_lens: torch.Tensor,
+        use_ragged: bool,
+        encoder_lens: torch.Tensor,
+    ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
 
     def update_single_wrapper(
-        self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens
+        self,
+        req_pool_indices: torch.Tnesor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        prefix_lens: torch.Tensor,
+        use_ragged: bool,
+        encoder_lens: torch.Tensor,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
+            paged_kernel_lens_sum = paged_kernel_lens.sum().item()
         else:
             paged_kernel_lens = seq_lens
+            paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
             self.wrapper_ragged,
             self.wrappers_paged[0],
             req_pool_indices,
             paged_kernel_lens,
+            paged_kernel_lens_sum,
             seq_lens,
             prefix_lens,
             None,
@@ -522,7 +544,13 @@ class FlashInferIndicesUpdaterPrefill:
         )
 
     def update_sliding_window(
-        self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        prefix_lens: torch.Tensor,
+        use_ragged: bool,
+        encoder_lens: torch.Tensor,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -531,9 +559,12 @@ class FlashInferIndicesUpdaterPrefill:
                     seq_lens,
                     torch.tensor(self.sliding_window_size) + seq_lens - prefix_lens,
                 )
+                paged_kernel_lens_sum = paged_kernel_lens.sum().item()
             else:
                 # full attention
                 paged_kernel_lens = seq_lens
+                paged_kernel_lens_sum = seq_lens_sum
+
             kv_start_idx = seq_lens - paged_kernel_lens
 
             self.call_begin_forward(
@@ -541,6 +572,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.wrappers_paged[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
+                paged_kernel_lens_sum,
                 seq_lens,
                 prefix_lens,
                 kv_start_idx,
@@ -550,23 +582,32 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
     def update_cross_attention(
-        self, req_pool_indices, seq_lens, prefix_lens, use_ragged, encoder_lens
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        prefix_lens: torch.Tensor,
+        use_ragged: bool,
+        encoder_lens: torch.Tensor,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # normal attention
                 paged_kernel_lens = seq_lens
                 kv_start_idx = encoder_lens
+                paged_kernel_lens_sum = seq_lens_sum
             else:
                 # cross attention
                 paged_kernel_lens = encoder_lens
                 kv_start_idx = torch.zeros_like(encoder_lens)
+                paged_kernel_lens_sum = paged_kernel_lens.sum().item()
 
             self.call_begin_forward(
                 self.wrapper_ragged,
                 self.wrappers_paged[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
+                paged_kernel_lens_sum,
                 seq_lens,
                 prefix_lens,
                 kv_start_idx,
@@ -579,19 +620,22 @@ class FlashInferIndicesUpdaterPrefill:
         self,
         wrapper_ragged,
         wrapper_paged,
-        req_pool_indices,
-        paged_kernel_lens,
-        seq_lens,
-        prefix_lens,
-        kv_start_idx,
-        kv_indptr,
-        qo_indptr,
-        use_ragged,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        kv_start_idx: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        use_ragged: bool,
     ):
         bs = len(req_pool_indices)
         kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
         kv_indptr = kv_indptr[: bs + 1]
-        kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+        )
         create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
             req_pool_indices,
@@ -599,7 +643,7 @@ class FlashInferIndicesUpdaterPrefill:
             kv_indptr,
             kv_start_idx,
             kv_indices,
-            self.max_context_len,
+            self.req_to_token.shape[1],
         )
 
         qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
@@ -638,10 +682,11 @@ def create_flashinfer_kv_indices_triton(
     kv_indptr,
     kv_start_idx,
     kv_indices_ptr,
-    max_context_len: tl.constexpr,
+    req_to_token_ptr_stride: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
+
     req_pool_index = tl.load(req_pool_indices_ptr + pid)
     kv_indices_offset = tl.load(kv_indptr + pid)
 
@@ -652,15 +697,15 @@ def create_flashinfer_kv_indices_triton(
         kv_end = kv_start
     kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
 
-    req_to_token_ptr += req_pool_index * max_context_len
-    kv_indices_ptr += kv_indices_offset
-
-    ld_offset = kv_start + tl.arange(0, BLOCK_SIZE)
-    st_offset = tl.arange(0, BLOCK_SIZE)
     num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for _ in range(num_loop):
-        mask = ld_offset < kv_end
-        data = tl.load(req_to_token_ptr + ld_offset, mask=mask)
-        tl.store(kv_indices_ptr + st_offset, data, mask=mask)
-        ld_offset += BLOCK_SIZE
-        st_offset += BLOCK_SIZE
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < kv_end - kv_start
+        data = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + kv_start
+            + offset,
+            mask=mask,
+        )
+        tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)

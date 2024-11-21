@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import copy
 import os
 import random
 import subprocess
@@ -28,8 +29,9 @@ from sglang.utils import get_exception_traceback
 DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
@@ -528,6 +530,7 @@ def run_bench_serving(
     random_input_len=4096,
     random_output_len=2048,
     disable_stream=False,
+    need_warmup=False,
 ):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
@@ -564,6 +567,10 @@ def run_bench_serving(
     )
 
     try:
+        if need_warmup:
+            warmup_args = copy.deepcopy(args)
+            warmup_args.num_prompts = 16
+            run_benchmark(warmup_args)
         res = run_benchmark(args)
     finally:
         kill_child_process(process.pid, include_self=True)
@@ -663,7 +670,7 @@ def run_and_check_memory_leak(
     workload_func,
     disable_radix_cache,
     enable_mixed_chunk,
-    enable_overlap,
+    disable_overlap,
     chunked_prefill_size,
 ):
     other_args = ["--chunked-prefill-size", str(chunked_prefill_size)]
@@ -671,8 +678,8 @@ def run_and_check_memory_leak(
         other_args += ["--disable-radix-cache"]
     if enable_mixed_chunk:
         other_args += ["--enable-mixed-chunk"]
-    if enable_overlap:
-        other_args += ["--enable-overlap-scheduler"]
+    if disable_overlap:
+        other_args += ["--disable-overlap-schedule"]
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
     port = random.randint(4000, 5000)
@@ -724,7 +731,7 @@ def run_and_check_memory_leak(
 def run_mmlu_test(
     disable_radix_cache=False,
     enable_mixed_chunk=False,
-    enable_overlap=False,
+    disable_overlap=False,
     chunked_prefill_size=32,
 ):
     def workload_func(base_url, model):
@@ -739,8 +746,7 @@ def run_mmlu_test(
 
         try:
             metrics = run_eval(args)
-            print(f"{metrics=}")
-            assert metrics["score"] >= 0.65
+            assert metrics["score"] >= 0.65, f"{metrics=}"
         finally:
             pass
 
@@ -748,7 +754,7 @@ def run_mmlu_test(
         workload_func,
         disable_radix_cache,
         enable_mixed_chunk,
-        enable_overlap,
+        disable_overlap,
         chunked_prefill_size,
     )
 

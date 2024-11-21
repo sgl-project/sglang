@@ -516,8 +516,9 @@ def v1_generate_request(
                 "regex": request.regex,
                 "json_schema": request.json_schema,
                 "n": request.n,
-                "ignore_eos": request.ignore_eos,
                 "no_stop_trim": request.no_stop_trim,
+                "ignore_eos": request.ignore_eos,
+                "skip_special_tokens": request.skip_special_tokens,
             }
         )
         return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
@@ -928,7 +929,9 @@ def v1_chat_generate_request(
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
             "n": request.n,
+            "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
+            "skip_special_tokens": request.skip_special_tokens,
         }
         if request.response_format and request.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
@@ -986,11 +989,15 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
                 output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
             )
             token_logprobs = []
-            for token, logprob in zip(logprobs.tokens, logprobs.token_logprobs):
+            for token_idx, (token, logprob) in enumerate(
+                zip(logprobs.tokens, logprobs.token_logprobs)
+            ):
                 token_bytes = list(token.encode("utf-8"))
                 top_logprobs = []
                 if logprobs.top_logprobs:
-                    for top_token, top_logprob in logprobs.top_logprobs[0].items():
+                    for top_token, top_logprob in logprobs.top_logprobs[
+                        token_idx
+                    ].items():
                         top_token_bytes = list(top_token.encode("utf-8"))
                         top_logprobs.append(
                             TopLogprob(
@@ -1166,7 +1173,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         is_first = False
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(role="assistant"),
+                            delta=DeltaMessage(role="assistant", content=""),
                             finish_reason=(
                                 finish_reason["type"] if finish_reason else ""
                             ),

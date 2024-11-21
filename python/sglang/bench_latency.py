@@ -220,7 +220,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
     return reqs
 
 
-@torch.inference_mode()
+@torch.no_grad
 def extend(reqs, model_runner):
     batch = ScheduleBatch.init_new(
         reqs=reqs,
@@ -237,7 +237,7 @@ def extend(reqs, model_runner):
     return next_token_ids, logits_output.next_token_logits, batch
 
 
-@torch.inference_mode()
+@torch.no_grad
 def decode(input_token_ids, batch, model_runner):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
