@@ -238,7 +238,6 @@ class Qwen2Model(nn.Module):
                 config=config,
                 quant_config=quant_config,
             ),
-            prefix="",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

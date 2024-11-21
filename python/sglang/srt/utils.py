@@ -269,7 +269,7 @@ class LayerFn(Protocol):
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
-    prefix: str,
+    prefix: str = "",
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
     modules = torch.nn.ModuleList(
