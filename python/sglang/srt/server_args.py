@@ -72,6 +72,7 @@ class ServerArgs:
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
     download_dir: Optional[str] = None
+    base_gpu_id: int = 0
 
     # Logging
     log_level: str = "info"
@@ -412,6 +413,12 @@ class ServerArgs:
             default=ServerArgs.download_dir,
             help="Model download directory.",
         )
+        parser.add_argument(
+            "--base-gpu-id",
+            type=int,
+            default=ServerArgs.base_gpu_id,
+            help="The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine.",
+        )
 
         # Logging
         parser.add_argument(
@@ -736,6 +743,7 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
+        assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
 
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths
