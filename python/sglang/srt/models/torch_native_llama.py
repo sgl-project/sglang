@@ -72,7 +72,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 tp_size = get_tensor_model_parallel_world_size()
 tp_rank = get_tensor_model_parallel_rank()
 
-
 def gate_up_proj_weight_loader(
     self,
     param: Parameter,
@@ -400,6 +399,10 @@ class TorchNativeLlamaForCausalLM(nn.Module):
         self.model = LlamaModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
+
+        # turning off autotune for fp8dq since it doesn't give speedup and
+        # increases compile time significantly
+        torch._inductor.config.max_autotune_gemm_backends = "ATEN"
 
     @torch.no_grad()
     def forward(
