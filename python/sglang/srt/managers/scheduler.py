@@ -562,9 +562,9 @@ class Scheduler:
                     "Image request length is longer than the KV cache pool size or "
                     "the max context length aborting because you cannot truncate the image embeds"
                 )
+                req.sampling_params.max_new_tokens = 0
                 self.waiting_queue.append(req)
                 return
-
 
         req.return_logprob = recv_req.return_logprob
         req.top_logprobs_num = recv_req.top_logprobs_num

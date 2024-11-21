@@ -380,12 +380,10 @@ class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
                 "qwen2-vl",
                 "--context-length",
                 "300",
-
-                # TODO Remove this later
                 "--mem-fraction-static=0.80",
             ],
         )
-        cls.base_url += "/v1"    
+        cls.base_url += "/v1"
 
     @classmethod
     def tearDownClass(cls):
@@ -416,18 +414,12 @@ class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
             temperature=0,
         )
 
-        print(response)
-
-        assert response.choices[0].message.role == "assistant"
-        text = response.choices[0].message.content
-        assert isinstance(text, str)
-        assert "man" in text or "cab" in text, text
+        assert response.choices[0].finish_reason == "abort"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
-    
 
 
 class TestMllamaServer(TestOpenAIVisionServer):
