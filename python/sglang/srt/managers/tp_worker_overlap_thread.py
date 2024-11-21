@@ -18,7 +18,6 @@ limitations under the License.
 import dataclasses
 import logging
 import threading
-import time
 from queue import Queue
 from typing import Optional
 
@@ -95,12 +94,21 @@ class TpModelWorkerClient:
 
     @torch.no_grad()
     def forward_thread_func_(self):
+        batch_pt = 0
+        batch_lists = [None] * 2
+
         while True:
-            model_worker_batch, future_token_ids_ct, compute_info_done = (
-                self.input_queue.get()
-            )
+            model_worker_batch, future_token_ids_ct = self.input_queue.get()
             if not model_worker_batch:
                 break
+
+            # Keep a reference of model_worker_batch by storing it into a list.
+            # Otherwise, the tensor members of model_worker_batch will be released
+            # by pytorch and cause CUDA illegal memory access errors.
+            batch_lists[batch_pt % 2] = model_worker_batch
+            batch_pt += 1
+
+            # Create event
             self.launch_done = threading.Event()
             copy_done = torch.cuda.Event()
 
@@ -109,7 +117,6 @@ class TpModelWorkerClient:
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
 
             # Run forward
-            compute_info_done.wait()
             logits_output, next_token_ids = self.worker.forward_batch_generation(
                 model_worker_batch, self.launch_done
             )
@@ -160,15 +167,21 @@ class TpModelWorkerClient:
         return logits_output, next_token_ids
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
+        sampling_info = model_worker_batch.sampling_info
+        sampling_info.update_penalties()
+        model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
+            sampling_info,
+            sampling_info_done=threading.Event(),
+            scaling_penalties=sampling_info.scaling_penalties,
+            linear_penalties=sampling_info.linear_penalties,
+        )
+
+        # A cuda stream sync here to avoid the cuda illegal memory access error.
+        torch.cuda.current_stream().synchronize()
+
         # Push a new batch to the queue
-        model_worker_batch.sampling_info = dataclasses.replace(
-            model_worker_batch.sampling_info
-        )
-        compute_info_done = torch.cuda.Event()
-        compute_info_done.record()
-        self.input_queue.put(
-            (model_worker_batch, self.future_token_ids_ct, compute_info_done)
-        )
+        self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
 
         # Allocate output future objects
         bs = len(model_worker_batch.seq_lens)

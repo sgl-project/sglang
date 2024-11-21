@@ -123,8 +123,7 @@ class ServerArgs:
     disable_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
-    disable_penalizer: bool = False
-    enable_overlap_schedule: bool = False
+    disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_torch_compile: bool = False
@@ -173,39 +172,38 @@ class ServerArgs:
         if gpu_mem < 25000:
             self.chunked_prefill_size //= 4  # make it 2048
             self.cuda_graph_max_bs = 4
-            logger.warning(
-                "Automatically adjust --chunked-prefill-size for small GPUs."
-            )
+            logger.info("Automatically adjust --chunked-prefill-size for small GPUs.")
 
+        # Choose kernel backends
         if not is_flashinfer_available():
             self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
 
-        # Default kernel backends
         if self.attention_backend is None:
             self.attention_backend = "flashinfer"
-
         if self.sampling_backend is None:
             self.sampling_backend = "flashinfer"
 
+        # Others
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
             self.chunked_prefill_size = self.chunked_prefill_size // 2
             self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
-            self.enable_overlap_schedule = False
-            logger.warning(
+            self.schedule_conservativeness = self.schedule_conservativeness * 0.3
+            self.disable_overlap_schedule = True
+            logger.info(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
                 f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
-                "Data parallel size is adjusted to be the same as tensor parallel size."
+                f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
+                "Data parallel size is adjusted to be the same as tensor parallel size. "
+                "Overlap schedule is disabled."
             )
 
-        if self.enable_overlap_schedule:
-            logger.warning(
-                "Overlap scheduler mode is enabled. This is an experimental feature. "
-                "Sampling penalizer (e.g., frequency and repetition penalty), constrained decoding (e.g., regex, JSON), "
-                "and embedding APIs are not supported and will lead to wrong results. "
+        if self.enable_mixed_chunk:
+            logger.info(
+                "Overlap schedule is disabled because mixed-style chunked prefill is enabled."
             )
-            self.disable_penalizer = True
+            self.disable_overlap_schedule = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -623,19 +621,14 @@ class ServerArgs:
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
-            "--disable-penalizer",
-            action="store_true",
-            help="Disable the logit penalizers (e.g., frequency and repetition penalty) for better performance if they are not used in any requests.",
-        )
-        parser.add_argument(
             "--disable-nan-detection",
             action="store_true",
             help="Disable the NaN detection for better performance.",
         )
         parser.add_argument(
-            "--enable-overlap-schedule",
+            "--disable-overlap-schedule",
             action="store_true",
-            help="Overlap the CPU scheduler with GPU model worker. Experimental feature.",
+            help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",
@@ -668,7 +661,7 @@ class ServerArgs:
             "--torchao-config",
             type=str,
             default=ServerArgs.torchao_config,
-            help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo",
+            help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
         )
         parser.add_argument(
             "--enable-nan-detection",
@@ -701,6 +694,11 @@ class ServerArgs:
         )
 
         # Deprecated arguments
+        parser.add_argument(
+            "--enable-overlap-schedule",
+            action=DeprecatedAction,
+            help="'--enable-overlap-schedule' is deprecated. It is enabled by default now. Please drop this argument.",
+        )
         parser.add_argument(
             "--disable-flashinfer",
             action=DeprecatedAction,

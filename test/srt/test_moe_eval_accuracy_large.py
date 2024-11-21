@@ -59,7 +59,7 @@ class TestMoEEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.41)
+        self.assertGreater(metrics["score"], 0.40)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(

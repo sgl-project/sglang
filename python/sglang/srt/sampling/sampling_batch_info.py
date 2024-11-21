@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
+import threading
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
+
+logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -28,6 +33,7 @@ class SamplingBatchInfo:
     # Bias Tensors
     vocab_size: int
     grammars: Optional[List] = None
+    sampling_info_done: Optional[threading.Event] = None
     logit_bias: torch.Tensor = None
     vocab_mask: Optional[torch.Tensor] = None
     apply_mask: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
@@ -42,10 +48,7 @@ class SamplingBatchInfo:
 
     @classmethod
     def from_schedule_batch(
-        cls,
-        batch: ScheduleBatch,
-        vocab_size: int,
-        disable_penalizer: bool,
+        cls, batch: ScheduleBatch, vocab_size: int, enable_overlap_schedule: bool
     ):
         reqs = batch.reqs
         device = batch.device
@@ -79,6 +82,33 @@ class SamplingBatchInfo:
         )
         # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
 
+        if enable_overlap_schedule:
+            # TODO (lianmin): Some penalizers such as frequency and presence depend on model outputs,
+            # so it is kind of tricky to make it work with overlap scheduler.
+            # It requires correcly updating the penalty logits before the sampling and syncing the events.
+            # We will support them later.
+            penalizers = {
+                penaltylib.BatchedMinNewTokensPenalizer,
+            }
+            if (
+                any(req.sampling_params.frequency_penalty != 0.0 for req in reqs)
+                or any(req.sampling_params.presence_penalty != 0.0 for req in reqs)
+                or any(req.sampling_params.repetition_penalty != 1.0 for req in reqs)
+            ):
+                logger.warning(
+                    "frequency_penalty, presence_penalty, and repetition_penalty are not supported "
+                    "when using the default overlap scheduler. They will be ignored. "
+                    "Please add `--disable-overlap` when launching the server if you need these features. "
+                    "The speed will be slower in that case."
+                )
+        else:
+            penalizers = {
+                penaltylib.BatchedFrequencyPenalizer,
+                penaltylib.BatchedMinNewTokensPenalizer,
+                penaltylib.BatchedPresencePenalizer,
+                penaltylib.BatchedRepetitionPenalizer,
+            }
+
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
         # should not add hefty computation overhead other than simple checks.
@@ -86,20 +116,12 @@ class SamplingBatchInfo:
         # While we choose not to even create the class instances if they are not required, this
         # could add additional complexity to the {ScheduleBatch} class, especially we need to
         # handle {filter_batch()} and {merge_batch()} cases as well.
-        if disable_penalizer:
-            ret.penalizer_orchestrator = None
-        else:
-            ret.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
-                vocab_size=vocab_size,
-                batch=batch,
-                device=batch.device,
-                Penalizers={
-                    penaltylib.BatchedFrequencyPenalizer,
-                    penaltylib.BatchedMinNewTokensPenalizer,
-                    penaltylib.BatchedPresencePenalizer,
-                    penaltylib.BatchedRepetitionPenalizer,
-                },
-            )
+        ret.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
+            vocab_size=vocab_size,
+            batch=batch,
+            device=batch.device,
+            Penalizers=penalizers,
+        )
 
         # Handle logit bias but only allocate when needed
         ret.logit_bias = None
@@ -110,9 +132,6 @@ class SamplingBatchInfo:
         return len(self.temperatures)
 
     def update_penalties(self):
-        if not self.penalizer_orchestrator:
-            return
-
         self.scaling_penalties = None
         self.linear_penalties = None
 
@@ -133,13 +152,13 @@ class SamplingBatchInfo:
                 self.linear_penalties = penalizer.apply(self.linear_penalties)
 
     def update_regex_vocab_mask(self):
-        if not self.grammars or not any(grammar for grammar in self.grammars):
+        if not self.grammars:
             self.vocab_mask = None
             self.apply_mask = None
             return
 
         # find a grammar from the list
-        grammar = next(grammar for grammar in self.grammars if grammar is not None)
+        grammar = next(grammar for grammar in self.grammars if grammar)
 
         # maybe we can reuse the existing mask?
         self.vocab_mask = grammar.allocate_vocab_mask(
@@ -154,8 +173,7 @@ class SamplingBatchInfo:
                 grammar.fill_vocab_mask(self.vocab_mask, i)
 
     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
-        if self.penalizer_orchestrator:
-            self.penalizer_orchestrator.filter(unfinished_indices, new_indices)
+        self.penalizer_orchestrator.filter(unfinished_indices, new_indices)
 
         for item in [
             "temperatures",
@@ -194,8 +212,7 @@ class SamplingBatchInfo:
         return None
 
     def merge_batch(self, other: "SamplingBatchInfo"):
-        if self.penalizer_orchestrator:
-            self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         for item in [
             "temperatures",
