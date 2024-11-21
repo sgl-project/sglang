@@ -401,6 +401,10 @@ class TorchNativeLlamaForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
 
+        # turning off autotune for fp8dq since it doesn't give speedup and
+        # increases compile time significantly
+        torch._inductor.config.max_autotune_gemm_backends = "ATEN"
+
     @torch.no_grad()
     def forward(
         self,

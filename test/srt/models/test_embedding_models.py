@@ -25,6 +25,7 @@ from sglang.test.test_utils import get_similarities
 MODELS = [
     ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, 1e-5),
     ("intfloat/e5-mistral-7b-instruct", 1, 1e-5),
+    ("marco/mcdse-2b-v1", 1, 1e-5),
 ]
 TORCH_DTYPES = [torch.float16]
 
