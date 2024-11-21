@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
+import torch
+
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -337,7 +339,7 @@ class FlushCacheReq:
 
 
 @dataclass
-class UpdateWeightReqInput:
+class UpdateWeightFromDistReqInput:
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -345,13 +347,13 @@ class UpdateWeightReqInput:
 
 
 @dataclass
-class UpdateWeightReqOutput:
+class UpdateWeightFromDistReqOutput:
     success: bool
     message: str
 
 
 @dataclass
-class UpdateParameterOnlineReqInput:
+class UpdateParameteFromDistributedReqInput:
     name: str
     dtype: str
     shape: List[int]
@@ -359,7 +361,7 @@ class UpdateParameterOnlineReqInput:
 
 
 @dataclass
-class UpdateParameterOnlineReqOutput:
+class UpdateParameteFromDistributedReqOutput:
     success: bool
     message: str
 
@@ -378,6 +380,17 @@ class InitParameterUpdateGroupReqInput:
     group_name: str
     # The backend
     backend: str = "nccl"
+
+
+@dataclass
+class GetParameterByNameReqInput:
+    name: str
+    truncate_size: int = 100
+
+
+@dataclass
+class GetParameterByNameReqOutput:
+    parameter: Optional[torch.Tensor]
 
 
 @dataclass

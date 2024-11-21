@@ -30,6 +30,8 @@ import time
 from http import HTTPStatus
 from typing import AsyncIterator, Dict, List, Optional, Union
 
+import torch
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -53,10 +55,11 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    GetParameterByNameReqInput,
     InitParameterUpdateGroupReqInput,
     OpenSessionReqInput,
-    UpdateParameterOnlineReqInput,
-    UpdateWeightReqInput,
+    UpdateParameteFromDistributedReqInput,
+    UpdateWeightFromDistReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -203,8 +206,8 @@ async def get_memory_pool_size():
 
 @app.post("/update_weights_from_disk")
 @time_func_latency
-async def update_weights_from_disk(obj: UpdateWeightReqInput, request: Request):
-    """Update the weights inplace without re-launching the server."""
+async def update_weights_from_disk(obj: UpdateWeightFromDistReqInput, request: Request):
+    """Update the weights from disk inplace without re-launching the server."""
     success, message = await tokenizer_manager.update_weights_from_disk(obj, request)
     content = {"success": success, "message": message}
     if success:
@@ -230,9 +233,9 @@ async def init_parameter_update_group(
 
 @app.post("/update_parameter_from_distributed")
 async def update_parameter_from_distributed(
-    obj: UpdateParameterOnlineReqInput, request: Request
+    obj: UpdateParameteFromDistributedReqInput, request: Request
 ):
-    """Update a parameter online."""
+    """Update model parameter from distributed online."""
     success, message = await tokenizer_manager.update_parameter_from_distributed(
         obj, request
     )
@@ -241,6 +244,18 @@ async def update_parameter_from_distributed(
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.api_route("/get_parameter_by_name", methods=["GET", "POST"])
+async def get_parameter_by_name(obj: GetParameterByNameReqInput, request: Request):
+    """Get model parameter by name."""
+    try:
+        ret = await tokenizer_manager.get_parameter_by_name(obj, request)
+        return ORJSONResponse(ret, status_code=200)
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])

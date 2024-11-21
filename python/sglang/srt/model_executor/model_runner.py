@@ -57,13 +57,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    HEAD,
     crash_on_warnings,
     enable_show_time_cost,
     get_available_gpu_memory,
     init_process_group,
     is_hip,
-    main,
     monkey_patch_vllm_model_config,
     monkey_patch_vllm_p2p_access_check,
 )
@@ -316,7 +314,7 @@ class ModelRunner:
         )
 
     def update_weights_from_disk(self, model_path: str, load_format: str):
-        """Update weights in-place."""
+        """Update engine weights online from disk."""
         from vllm.model_executor.model_loader.loader import (
             DefaultModelLoader,
             device_loading_context,
@@ -325,7 +323,7 @@ class ModelRunner:
         from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
         logger.info(
-            f"Update weights begin. "
+            f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
@@ -405,14 +403,15 @@ class ModelRunner:
         group_name,
         backend="nccl",
     ):
-        """Init torch process group for model weights update at model worker.
+        """Init torch process group for model parameter update at model worker.
 
-        This function is used in RLHF workflow, where rank 0 is the actor model
-        in the training engine, and SGLang inference engine are used for rollout.
+        The `_model_update_group` is used in RLHF workflow, where rank 0 is
+        the actor model in the training engine, and SGLang inference engine are
+        used for rollout.
 
         In RLHF workflow, the training engine continuously updates the model
-        weights and broadcast them to inference engine through the
-        `_model_update_group` process group.
+        weights / parameters and broadcast them to inference engine through
+        the `_model_update_group` process group.
         """
         assert (
             torch.distributed.is_initialized()
@@ -461,7 +460,7 @@ class ModelRunner:
 
         if rank == 0:
             logger.info(
-                f"update weights online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
+                f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
             )
 
         assert weights.dtype == dtype and weights.shape == shape, (
@@ -471,12 +470,11 @@ class ModelRunner:
         )
 
         # every rank of the inference engine needs to have a empty tensor
-        # to receive the broadcasted parameter from the actor model
+        # to receive the broadcasted parameter from the actor model / rank 0
+
         weights = torch.empty(shape, dtype=dtype, device=self.device)
 
-        # broadcast the parameter from rank 0 to all ranks in the `_model_update_group`
-
-        # TODO: redundant weights been broadcasted here
+        # TODO CHENYANG: redundant weights been broadcasted here
         torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
 
         try:
@@ -490,12 +488,41 @@ class ModelRunner:
 
         except Exception as e:
             error_msg = (
-                f"Failed to update weights online: {e}. "
+                f"Failed to update parameter online: {e}. "
                 f"The full weights of the ModelRunner are partially updated. "
                 f"Please discard the whole weights."
             )
             logger.error(error_msg)
             return False, error_msg
+
+    def get_parameter_by_name(
+        self, name: str, truncate_size: int = 100
+    ) -> Optional[torch.Tensor]:
+        """
+        Get the parameter from model weights by its name.
+        Args:
+            name: parameter name
+
+        Returns:
+            If found, return the corresponding tensor; otherwise, return None.
+
+        Example:
+            >>> param = model_runner.get_parameter_by_name("model.layers.0.self_attn.qkv_proj.weight", 100)
+        """
+        try:
+
+            for param_name, param in self.model.named_parameters():
+                if param_name == name:
+                    return (
+                        param.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
+                    )
+
+            logger.warning(f"Parameter {name} not found in model.")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error when getting parameter {name}: {e}")
+            return None
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(

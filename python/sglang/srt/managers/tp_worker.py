@@ -22,9 +22,10 @@ from typing import Optional
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
+    GetParameterByNameReqInput,
     InitParameterUpdateGroupReqInput,
-    UpdateParameterOnlineReqInput,
-    UpdateWeightReqInput,
+    UpdateParameteFromDistributedReqInput,
+    UpdateWeightFromDistReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -161,7 +162,7 @@ class TpModelWorker:
         embeddings = logits_output.embeddings
         return embeddings
 
-    def update_weights_from_disk(self, recv_req: UpdateWeightReqInput):
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDistReqInput):
         success, message = self.model_runner.update_weights_from_disk(
             recv_req.model_path, recv_req.load_format
         )
@@ -178,9 +179,15 @@ class TpModelWorker:
         )
 
     def update_parameter_from_distributed(
-        self, recv_req: UpdateParameterOnlineReqInput
+        self, recv_req: UpdateParameteFromDistributedReqInput
     ):
         success, message = self.model_runner.update_parameter_from_distributed(
             recv_req.name, recv_req.dtype, recv_req.shape, recv_req.empty_cache
         )
         return success, message
+
+    def get_parameter_by_name(self, recv_req: GetParameterByNameReqInput):
+        parameter = self.model_runner.get_parameter_by_name(
+            recv_req.name, recv_req.truncate_size
+        )
+        return parameter

@@ -28,7 +28,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
     BatchTokenIDOut,
     GetMemPoolSizeReqOutput,
-    UpdateWeightReqOutput,
+    UpdateWeightFromDistReqOutput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR, FINISH_MATCHED_TOKEN
 from sglang.srt.server_args import PortArgs, ServerArgs

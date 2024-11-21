@@ -41,16 +41,18 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReq,
     GetMemPoolSizeReq,
     GetMemPoolSizeReqOutput,
+    GetParameterByNameReqInput,
+    GetParameterByNameReqOutput,
     InitParameterUpdateGroupReqInput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateParameterOnlineReqInput,
-    UpdateParameterOnlineReqOutput,
-    UpdateWeightReqInput,
-    UpdateWeightReqOutput,
+    UpdateParameteFromDistributedReqInput,
+    UpdateParameteFromDistributedReqOutput,
+    UpdateWeightFromDistReqInput,
+    UpdateWeightFromDistReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -500,17 +502,22 @@ class Scheduler:
                 self.flush_cache()
             elif isinstance(recv_req, AbortReq):
                 self.abort_request(recv_req)
-            elif isinstance(recv_req, UpdateWeightReqInput):
+            elif isinstance(recv_req, UpdateWeightFromDistReqInput):
                 success, message = self.update_weights_from_disk(recv_req)
                 self.send_to_tokenizer.send_pyobj(
-                    UpdateWeightReqOutput(success, message)
+                    UpdateWeightFromDistReqOutput(success, message)
+                )
+            elif isinstance(recv_req, GetParameterByNameReqInput):
+                parameter = self.get_parameter_by_name(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    GetParameterByNameReqOutput(parameter)
                 )
             elif isinstance(recv_req, InitParameterUpdateGroupReqInput):
                 self.init_parameter_update_group(recv_req)
-            elif isinstance(recv_req, UpdateParameterOnlineReqInput):
+            elif isinstance(recv_req, UpdateParameteFromDistributedReqInput):
                 success, message = self.update_parameter_from_distributed(recv_req)
                 self.send_to_tokenizer.send_pyobj(
-                    UpdateParameterOnlineReqOutput(success, message)
+                    UpdateParameteFromDistributedReqOutput(success, message)
                 )
             elif isinstance(recv_req, ProfileReq):
                 if recv_req == ProfileReq.START_PROFILE:
@@ -1338,7 +1345,7 @@ class Scheduler:
                     self.tree_cache.cache_finished_req(req)
                     break
 
-    def update_weights_from_disk(self, recv_req: UpdateWeightReqInput):
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDistReqInput):
         """In-place update of the weights."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
@@ -1353,7 +1360,7 @@ class Scheduler:
         self.tp_worker.init_parameter_update_group(recv_req)
 
     def update_parameter_from_distributed(
-        self, recv_req: UpdateParameterOnlineReqInput
+        self, recv_req: UpdateParameteFromDistributedReqInput
     ):
         """Update the online model parameter."""
         success, message = self.tp_worker.update_parameter_from_distributed(recv_req)
@@ -1363,6 +1370,10 @@ class Scheduler:
         else:
             logger.error(message)
         return success, message
+
+    def get_parameter_by_name(self, recv_req: GetParameterByNameReqInput):
+        parameter = self.tp_worker.get_parameter_by_name(recv_req)
+        return self.tp_worker.get_parameter_by_name(recv_req)
 
     def start_profile(self) -> None:
         if self.profiler is None:

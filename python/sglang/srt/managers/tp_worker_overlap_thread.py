@@ -24,9 +24,10 @@ from typing import Optional
 import torch
 
 from sglang.srt.managers.io_struct import (
+    GetParameterByNameReqInput,
     InitParameterUpdateGroupReqInput,
-    UpdateParameterOnlineReqInput,
-    UpdateWeightReqInput,
+    UpdateParameteFromDistributedReqInput,
+    UpdateWeightFromDistReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -201,7 +202,7 @@ class TpModelWorkerClient:
         ) % self.future_token_ids_limit
         return None, future_next_token_ids
 
-    def update_weights_from_disk(self, recv_req: UpdateWeightReqInput):
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDistReqInput):
         success, message = self.worker.update_weights_from_disk(recv_req)
         return success, message
 
@@ -209,10 +210,13 @@ class TpModelWorkerClient:
         self.worker.init_parameter_update_group(recv_req)
 
     def update_parameter_from_distributed(
-        self, recv_req: UpdateParameterOnlineReqInput
+        self, recv_req: UpdateParameteFromDistributedReqInput
     ):
         success, message = self.worker.update_parameter_from_distributed(recv_req)
         return success, message
+
+    def get_parameter_by_name(self, recv_req: GetParameterByNameReqInput):
+        return self.worker.get_parameter_by_name(recv_req)
 
     def __delete__(self):
         self.input_queue.put((None, None))

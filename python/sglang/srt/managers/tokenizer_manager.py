@@ -49,16 +49,18 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetMemPoolSizeReq,
     GetMemPoolSizeReqOutput,
+    GetParameterByNameReqInput,
+    GetParameterByNameReqOutput,
     InitParameterUpdateGroupReqInput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateParameterOnlineReqInput,
-    UpdateParameterOnlineReqOutput,
-    UpdateWeightReqInput,
-    UpdateWeightReqOutput,
+    UpdateParameteFromDistributedReqInput,
+    UpdateParameteFromDistributedReqOutput,
+    UpdateWeightFromDistReqInput,
+    UpdateWeightFromDistReqOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -420,7 +422,9 @@ class TokenizerManager:
             return ret
 
     async def update_weights_from_disk(
-        self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
+        self,
+        obj: UpdateWeightFromDistReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         if self.to_create_loop:
             self.create_handle_loop()
@@ -476,7 +480,7 @@ class TokenizerManager:
 
     async def update_parameter_from_distributed(
         self,
-        obj: UpdateParameterOnlineReqInput,
+        obj: UpdateParameteFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ):
         if self.to_create_loop:
@@ -512,6 +516,25 @@ class TokenizerManager:
                 False,
                 "Another parameter update is in progress. Please try again later.",
             )
+
+    async def get_parameter_by_name(
+        self, obj: GetParameterByNameReqInput, request: Optional[fastapi.Request] = None
+    ):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        self.send_to_scheduler.send_pyobj(obj)
+        self.get_parameter_by_name_result = asyncio.Future()
+        if self.server_args.dp_size == 1:
+            result = await self.get_parameter_by_name_result
+            return result.parameter
+        else:
+            self.get_parameter_by_name_tmp = []
+            result = await self.get_parameter_by_name_result
+            # logger.warning(f"result in tokenizer_manager: {len(result)}")
+            # logger.warning(f"result in tokenizer_manager: {len(result[0])}")
+            all_parameters = [r.parameter for r in result]
+            return all_parameters
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
@@ -585,11 +608,12 @@ class TokenizerManager:
                 BatchStrOut,
                 BatchEmbeddingOut,
                 BatchTokenIDOut,
-                UpdateWeightReqOutput,
-                UpdateParameterOnlineReqOutput,
+                UpdateWeightFromDistReqOutput,
+                UpdateParameteFromDistributedReqOutput,
+                GetParameterByNameReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
-            if isinstance(recv_obj, UpdateWeightReqOutput):
+            if isinstance(recv_obj, UpdateWeightFromDistReqOutput):
                 if self.server_args.dp_size == 1:
                     self.model_update_result.set_result(recv_obj)
                 else:  # self.server_args.dp_size > 1
@@ -598,7 +622,7 @@ class TokenizerManager:
                     if len(self.model_update_tmp) == self.server_args.dp_size:
                         self.model_update_result.set_result(self.model_update_tmp)
                 continue
-            elif isinstance(recv_obj, UpdateParameterOnlineReqOutput):
+            elif isinstance(recv_obj, UpdateParameteFromDistributedReqOutput):
                 if self.server_args.dp_size == 1:
                     self.model_update_result.set_result(recv_obj)
                 else:  # self.server_args.dp_size > 1
@@ -606,6 +630,16 @@ class TokenizerManager:
                     # set future if the all results are recevied
                     if len(self.model_update_tmp) == self.server_args.dp_size:
                         self.model_update_result.set_result(self.model_update_tmp)
+                continue
+            elif isinstance(recv_obj, GetParameterByNameReqOutput):
+                if self.server_args.dp_size == 1:
+                    self.get_parameter_by_name_result.set_result(recv_obj)
+                else:
+                    self.get_parameter_by_name_tmp.append(recv_obj)
+                    if len(self.get_parameter_by_name_tmp) == self.server_args.dp_size:
+                        self.get_parameter_by_name_result.set_result(
+                            self.get_parameter_by_name_tmp
+                        )
                 continue
             elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
                 if self.server_args.dp_size == 1:
