@@ -62,6 +62,8 @@ def torchao_quantize_param_data(param: torch.Tensor, torchao_config: str):
                 granularity=GRANULARITY_MAP[granularity]
             ),
         )
+    else:
+        raise ValueError(f"Unexpected config: {torchao_config}")
 
     return dummy_linear.weight
 
