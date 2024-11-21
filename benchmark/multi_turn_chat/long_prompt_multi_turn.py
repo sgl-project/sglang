@@ -99,17 +99,6 @@ def main(args):
     )
     latency = time.time() - tic
 
-    for i, turn_state in enumerate(states):
-        print(f"QA {i}")
-        for gen_id in [str(i) for i in range(args.turns)]:
-            meta_info = turn_state.get_meta_info(gen_id)
-            hit_rate = meta_info["cached_tokens"] / meta_info["prompt_tokens"] * 100
-            dp_rank = meta_info["dp_rank"]
-            timestamp = meta_info["finish_time"]
-            print(
-                f"Turn  {gen_id}: hit rate={hit_rate:.1f}%, dp_rank={dp_rank}, timestamp={timestamp}"
-            )
-
     print(f"Latency: {latency:.3f}")
 
     dump_state_text(f"tmp_output_{args.backend}.txt", states)
@@ -131,7 +120,7 @@ def main(args):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--turns", type=int, default=8)
-    parser.add_argument("--num-qa", type=int, default=128)
+    parser.add_argument("--num-qa", type=int, default=128 // 8)
     parser.add_argument("--system-prompt-len", type=int, default=2048)
     parser.add_argument("--len-q", type=int, default=32)
     parser.add_argument("--len-a", type=int, default=128)

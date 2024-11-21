@@ -412,6 +412,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.download_dir,
             help="Model download directory.",
+        )
+
+        parser.add_argument(
             "--base-gpu-id",
             type=int,
             default=ServerArgs.base_gpu_id,

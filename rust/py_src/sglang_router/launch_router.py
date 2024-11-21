@@ -149,10 +149,10 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             policy=policy_from_str(router_args.policy),
             host=router_args.host,
             port=router_args.port,
-            # cache_threshold=router_args.cache_threshold,
-            # cache_routing_prob=router_args.cache_routing_prob,
-            # eviction_interval_secs=router_args.eviction_interval,
-            # max_tree_size=router_args.max_tree_size,
+            cache_threshold=router_args.cache_threshold,
+            cache_routing_prob=router_args.cache_routing_prob,
+            eviction_interval_secs=router_args.eviction_interval,
+            max_tree_size=router_args.max_tree_size,
         )
 
         router.start()

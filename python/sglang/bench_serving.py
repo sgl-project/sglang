@@ -727,9 +727,9 @@ def sample_generated_shared_prefix_requests(
     total_input_tokens = 0
     total_output_tokens = 0
 
-    for group_idx in range(num_groups):
+    for group_idx in tqdm(range(num_groups), desc="Generating system prompt"):
         system_prompt = system_prompts[group_idx]
-        for prompt_idx in range(prompts_per_group):
+        for prompt_idx in tqdm(range(prompts_per_group), desc="Generating questions"):
             question = questions[group_idx * prompts_per_group + prompt_idx]
             full_prompt = f"{system_prompt}\n\n{question}"
             prompt_len = len(tokenizer.encode(full_prompt))
