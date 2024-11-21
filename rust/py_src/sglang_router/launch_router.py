@@ -176,7 +176,7 @@ Examples:
   python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000
   python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000
     --cache-threshold 0.7 --cache-routing-prob 0.5""",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     RouterArgs.add_cli_args(parser, use_router_prefix=False)

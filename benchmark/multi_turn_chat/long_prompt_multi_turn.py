@@ -79,7 +79,7 @@ def multi_turns(s, system_prompt, qas):
 
     for i, qa in enumerate(qas):
         s += qa["prompt"]
-        s += sgl.gen(name=str(i), max_tokens=qa["new_tokens"], ignore_eos=True)
+        s += sgl.gen(max_tokens=qa["new_tokens"], ignore_eos=True)
 
 
 def main(args):
@@ -120,7 +120,7 @@ def main(args):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--turns", type=int, default=8)
-    parser.add_argument("--num-qa", type=int, default=128 // 8)
+    parser.add_argument("--num-qa", type=int, default=128)
     parser.add_argument("--system-prompt-len", type=int, default=2048)
     parser.add_argument("--len-q", type=int, default=32)
     parser.add_argument("--len-a", type=int, default=128)

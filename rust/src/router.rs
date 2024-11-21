@@ -237,13 +237,13 @@ impl Router {
                     if matched_rate > *cache_threshold {
                         matched_worker.to_string()
                     } else {
-                        // let m_map: HashMap<String, usize> = tree
-                        //     .tenant_char_count
-                        //     .iter()
-                        //     .map(|entry| (entry.key().clone(), *entry.value()))
-                        //     .collect();
+                        let m_map: HashMap<String, usize> = tree
+                            .tenant_char_count
+                            .iter()
+                            .map(|entry| (entry.key().clone(), *entry.value()))
+                            .collect();
 
-                        // println!("map: {:?}, mmap: {:?}", tree.get_tenant_char_count(), m_map);
+                        println!("map: {:?}, mmap: {:?}", tree.get_tenant_char_count(), m_map);
 
 
                         tree.get_smallest_tenant()
