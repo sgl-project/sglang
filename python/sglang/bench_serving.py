@@ -147,8 +147,8 @@ async def async_request_openai_completions(
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     assert api_url.endswith(
-        "completions"
-    ), "OpenAI Completions API URL must end with 'completions'."
+        ("completions", "profile")
+    ), "OpenAI Completions API URL must end with 'completions' or 'profile'."
 
     prompt = request_func_input.prompt
 
@@ -836,12 +836,14 @@ def calculate_metrics(
 async def benchmark(
     backend: str,
     api_url: str,
+    base_url: str,
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
     disable_tqdm: bool,
     extra_request_body: Dict[str, Any],
+    profile: bool,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -869,6 +871,18 @@ async def benchmark(
 
     time.sleep(1.5)
 
+    if profile:
+        print("Starting profiler...")
+        profile_input = RequestFuncInput(model=model_id,
+                                        prompt=test_prompt,
+                                        api_url=base_url + "/start_profile",
+                                        prompt_len=test_prompt_len,
+                                        output_len=test_output_len,
+                                        extra_request_body=extra_request_body)
+        profile_output = await request_func(request_func_input=profile_input)
+        if profile_output.success:
+            print("Profiler started")
+
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
     benchmark_start_time = time.perf_counter()
@@ -889,6 +903,18 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+    if profile:
+        print("Stopping profiler...")
+        profile_input = RequestFuncInput(model=model_id,
+                                        prompt=test_prompt,
+                                        api_url=base_url + "/stop_profile",
+                                        prompt_len=test_prompt_len,
+                                        output_len=test_output_len,
+                                        extra_request_body=extra_request_body)
+        profile_output = await request_func(request_func_input=profile_input)
+        if profile_output.success:
+            print("Profiler stopped")
 
     if pbar is not None:
         pbar.close()
@@ -1114,7 +1140,8 @@ def run_benchmark(args_: argparse.Namespace):
             if args.base_url
             else f"http://{args.host}:{args.port}/v1/models/model:predict"
         )
-
+    base_url = f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
+    
     # Get model name
     if args.model is None:
         if args.backend == "truss":
@@ -1159,12 +1186,14 @@ def run_benchmark(args_: argparse.Namespace):
             benchmark(
                 backend=backend,
                 api_url=api_url,
+                base_url=base_url,
                 model_id=model_id,
                 tokenizer=tokenizer,
                 input_requests=input_requests,
                 request_rate=args.request_rate,
                 disable_tqdm=args.disable_tqdm,
                 extra_request_body=extra_request_body,
+                profile=args.profile,
             )
         )
     else:
@@ -1176,12 +1205,14 @@ def run_benchmark(args_: argparse.Namespace):
                 benchmark(
                     backend=backend,
                     api_url=api_url,
+                    base_url=base_url,
                     model_id=model_id,
                     tokenizer=tokenizer,
                     input_requests=input_requests,
                     request_rate=rate,
                     disable_tqdm=args.disable_tqdm,
                     extra_request_body=extra_request_body,
+                    profile=args.profile,
                 )
             )
 
@@ -1355,6 +1386,11 @@ if __name__ == "__main__":
         type=str,
         help="Path to load previously generated input data",
     )
-
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Use Torch Profiler. The endpoint must be launched with "
+        "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
     args = parser.parse_args()
     run_benchmark(args)
