@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
-pub mod tree;
 pub mod router;
 pub mod server;
+pub mod tree;
 
 #[pyclass(eq)]
 #[derive(Clone, PartialEq)]

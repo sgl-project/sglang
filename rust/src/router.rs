@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-
 #[derive(Debug)]
 pub enum Router {
     RoundRobin {
@@ -244,7 +243,6 @@ impl Router {
                             .collect();
 
                         println!("map: {:?}, mmap: {:?}", tree.get_tenant_char_count(), m_map);
-
 
                         tree.get_smallest_tenant()
                     }

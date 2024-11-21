@@ -163,6 +163,14 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         return None
 
 
+class CustomHelpFormatter(
+    argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter
+):
+    """Custom formatter that preserves both description formatting and shows defaults"""
+
+    pass
+
+
 def parse_router_args(args: List[str]) -> RouterArgs:
     """Parse command line arguments and return RouterArgs instance."""
     parser = argparse.ArgumentParser(
@@ -174,9 +182,10 @@ multi-node setups or when you want to start workers and router separately.
 
 Examples:
   python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000
-  python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000
-    --cache-threshold 0.7 --cache-routing-prob 0.5""",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+  python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000 --cache-threshold 0.7 --cache-routing-prob 0.5
+
+    """,
+        formatter_class=CustomHelpFormatter,
     )
 
     RouterArgs.add_cli_args(parser, use_router_prefix=False)
