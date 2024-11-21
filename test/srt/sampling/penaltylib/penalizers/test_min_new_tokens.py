@@ -1,5 +1,5 @@
-import typing
 import unittest
+from typing import List
 
 import torch
 
@@ -143,7 +143,7 @@ class TestBatchedMinNewTokensPenalizer(BaseBatchedPenalizerTest):
             ],
         )
 
-    def create_test_subjects(self) -> typing.List[Subject]:
+    def create_test_subjects(self) -> List[Subject]:
         self.enabled = self._create_subject(min_new_tokens=MIN_NEW_TOKENS)
         self.disabled = self._create_subject(min_new_tokens=0.0)
 

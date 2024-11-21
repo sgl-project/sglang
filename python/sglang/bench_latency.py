@@ -220,7 +220,8 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
     return reqs
 
 
-def _extend(reqs, model_runner):
+@torch.no_grad
+def extend(reqs, model_runner):
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
@@ -236,15 +237,8 @@ def _extend(reqs, model_runner):
     return next_token_ids, logits_output.next_token_logits, batch
 
 
-def extend(reqs, model_runner):
-    # Disable inference mode for now when torch TP is applied. We can remove
-    # this workaround once DTensor adds support for inference mode.
-    use_inf_mode = not model_runner.torch_tp_applied
-    with torch.inference_mode(use_inf_mode):
-        return _extend(reqs, model_runner)
-
-
-def _decode(input_token_ids, batch, model_runner):
+@torch.no_grad
+def decode(input_token_ids, batch, model_runner):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
     model_worker_batch = batch.get_model_worker_batch()
@@ -252,14 +246,6 @@ def _decode(input_token_ids, batch, model_runner):
     logits_output = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
-
-
-def decode(input_token_ids, batch, model_runner):
-    # Disable inference mode for now when torch TP is applied. We can remove
-    # this workaround once DTensor adds support for inference mode.
-    use_inf_mode = not model_runner.torch_tp_applied
-    with torch.inference_mode(use_inf_mode):
-        return _decode(input_token_ids, batch, model_runner)
 
 
 def correctness_test(

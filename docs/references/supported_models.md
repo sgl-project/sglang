@@ -28,6 +28,7 @@
 - XVERSE / XVERSE MoE
 - SmolLM
 - GLM-4
+- Phi-3-Small
 
 ## Embedding Models
 

@@ -1,4 +1,8 @@
-import subprocess
+"""
+Usage:
+python3 -m unittest test_triton_attention_backend.TestTritonAttnBackend.test_mmlu
+"""
+
 import unittest
 from types import SimpleNamespace
 

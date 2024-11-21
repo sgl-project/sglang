@@ -18,6 +18,7 @@ limitations under the License.
 import gc
 import importlib
 import importlib.resources
+import inspect
 import json
 import logging
 import pkgutil
@@ -56,9 +57,14 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    HEAD,
+    crash_on_warnings,
     enable_show_time_cost,
     get_available_gpu_memory,
     init_process_group,
+    is_hip,
+    main,
+    monkey_patch_vllm_model_config,
     monkey_patch_vllm_p2p_access_check,
 )
 
@@ -113,7 +119,7 @@ class ModelRunner:
             )
 
         if self.is_multimodal:
-            logger.warning(
+            logger.info(
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
             )
             server_args.chunked_prefill_size = None
@@ -139,8 +145,7 @@ class ModelRunner:
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
-                "disable_penalizer": server_args.disable_penalizer,
-                "disable_nan_detection": server_args.disable_nan_detection,
+                "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
             }
         )
@@ -225,6 +230,47 @@ class ModelRunner:
 
         return min_per_gpu_memory
 
+    def setup_model(self):
+        try:
+            from vllm.config import VllmConfig
+
+            vllm_config = VllmConfig()
+            vllm_config.model_config = self.vllm_model_config
+            vllm_config.load_config = self.load_config
+            vllm_config.device_config = DeviceConfig(self.device)
+            vllm_config.quant_config = VllmConfig._get_quantization_config(
+                vllm_config.model_config, vllm_config.load_config
+            )
+            return get_model(vllm_config=vllm_config)
+        except ImportError:
+            return get_model(
+                model_config=self.vllm_model_config,
+                load_config=self.load_config,
+                device_config=DeviceConfig(self.device),
+                parallel_config=None,
+                scheduler_config=None,
+                lora_config=None,
+                cache_config=None,
+            )
+
+    def get_model_config_params(self):
+        sig = inspect.signature(VllmModelConfig.__init__)
+        params = {
+            "model": self.server_args.model_path,
+            "quantization": self.server_args.quantization,
+            "tokenizer": None,
+            "tokenizer_mode": None,
+            "trust_remote_code": self.server_args.trust_remote_code,
+            "dtype": self.server_args.dtype,
+            "seed": self.server_args.random_seed,
+            "skip_tokenizer_init": True,
+        }
+
+        if "task" in sig.parameters:
+            params["task"] = ""
+
+        return params
+
     def load_model(self):
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -246,31 +292,15 @@ class ModelRunner:
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
         )
-        self.vllm_model_config = VllmModelConfig(
-            model=self.server_args.model_path,
-            quantization=self.server_args.quantization,
-            tokenizer=None,
-            tokenizer_mode=None,
-            trust_remote_code=self.server_args.trust_remote_code,
-            dtype=self.server_args.dtype,
-            seed=self.server_args.random_seed,
-            skip_tokenizer_init=True,
-        )
+        monkey_patch_vllm_model_config()
+        self.vllm_model_config = VllmModelConfig(**self.get_model_config_params())
         if self.model_config.model_override_args is not None:
             self.vllm_model_config.hf_config.update(
                 self.model_config.model_override_args
             )
 
-        # Load the model
-        self.model = get_model(
-            model_config=self.vllm_model_config,
-            load_config=self.load_config,
-            device_config=DeviceConfig(self.device),
-            parallel_config=None,
-            scheduler_config=None,
-            lora_config=None,
-            cache_config=None,
-        )
+        self.model = self.setup_model()
+
         self.sliding_window_size = (
             self.model.get_attention_sliding_window_size()
             if hasattr(self.model, "get_attention_sliding_window_size")
@@ -285,7 +315,7 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-    def update_weights(self, model_path: str, load_format: str):
+    def update_weights_from_disk(self, model_path: str, load_format: str):
         """Update weights in-place."""
         from vllm.model_executor.model_loader.loader import (
             DefaultModelLoader,
@@ -302,17 +332,9 @@ class ModelRunner:
         target_device = torch.device(self.device)
 
         try:
-            # TODO: Use a better method to check this
-            vllm_model_config = VllmModelConfig(
-                model=model_path,
-                quantization=self.server_args.quantization,
-                tokenizer=None,
-                tokenizer_mode=None,
-                trust_remote_code=self.server_args.trust_remote_code,
-                dtype=self.server_args.dtype,
-                seed=self.server_args.random_seed,
-                skip_tokenizer_init=True,
-            )
+            model_config_params = self.get_model_config_params()
+            model_config_params["model"] = model_path
+            vllm_model_config = VllmModelConfig(**model_config_params)
         except Exception as e:
             message = f"Failed to load model config: {e}."
             return False, message
@@ -374,6 +396,107 @@ class ModelRunner:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
+    def init_parameter_update_group(
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend="nccl",
+    ):
+        """Init torch process group for model weights update at model worker.
+
+        This function is used in RLHF workflow, where rank 0 is the actor model
+        in the training engine, and SGLang inference engine are used for rollout.
+
+        In RLHF workflow, the training engine continuously updates the model
+        weights and broadcast them to inference engine through the
+        `_model_update_group` process group.
+        """
+        assert (
+            torch.distributed.is_initialized()
+        ), f"default torch process group must be initialized"
+        assert group_name != "", f"group name must not be empty"
+
+        rank = rank_offset + self.tp_rank
+
+        self._model_update_group = init_process_group(
+            backend=backend,
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
+            rank=rank,
+            group_name=group_name,
+        )
+
+        print(
+            f"init_process_group: master_address={master_address}, master_port={master_port}, ",
+            f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}",
+        )
+
+    def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
+        """
+        Update specific parameter in the model weights online through the process group.
+
+        The `update_weights_from_disk` updates the whole weights of the model from the disk.
+
+        Args:
+            name: the name of the parameter to be updated.
+            dtype: the data type of the parameter to be updated.
+            shape: the shape of the parameter to be updated.
+            empty_cache: whether to empty the cache after updating the parameter.
+        """
+
+        assert (
+            dtype == self.model_config.dtype
+        ), f"dtype mismatch: target={dtype} vs current model runner={self.model_config.dtype}"
+
+        assert (
+            self._model_update_group is not None
+        ), "model update group must be initialized"
+
+        # This is the global rank of the inference engine in the default process group.
+
+        rank = self.tp_rank
+
+        if rank == 0:
+            logger.info(
+                f"update weights online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
+            )
+
+        assert weights.dtype == dtype and weights.shape == shape, (
+            f"Parameter shape/dtype mismatch: "
+            f"expected shape={shape}, dtype={dtype}, "
+            f"got shape={weights.shape}, dtype={weights.dtype}"
+        )
+
+        # every rank of the inference engine needs to have a empty tensor
+        # to receive the broadcasted parameter from the actor model
+        weights = torch.empty(shape, dtype=dtype, device=self.device)
+
+        # broadcast the parameter from rank 0 to all ranks in the `_model_update_group`
+
+        # TODO: redundant weights been broadcasted here
+        torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
+
+        try:
+            self.model.load_weights([name, weights])
+
+            if empty_cache and self.device == "cuda":
+                torch.cuda.empty_cache()
+
+            torch.distributed.barrier(group=self._model_update_group)
+            return True, f"Succeeded to update parameter {name} online."
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to update weights online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
@@ -421,7 +544,10 @@ class ModelRunner:
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
-            self.kv_cache_dtype = torch.float8_e5m2
+            if is_hip():  # Using natively supported format
+                self.kv_cache_dtype = torch.float8_e5m2fnuz
+            else:
+                self.kv_cache_dtype = torch.float8_e5m2
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -613,10 +739,16 @@ class ModelRunner:
     def sample(
         self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        # Put CPU-heavy tasks here. They will be overlapped with the forward pass.
         sampling_info = forward_batch.sampling_info
-        sampling_info.update_regex_vocab_mask()
-        sampling_info.update_penalties()
+        if sampling_info.sampling_info_done:
+            # Overlap mode: the function update_regex_vocab_mask was executed
+            # in process_batch_result of the last batch.
+            if sampling_info.grammars:
+                sampling_info.sampling_info_done.wait()
+        else:
+            # Normal mode: Put CPU-heavy tasks here. They will be overlapped with the forward pass.
+            sampling_info.update_regex_vocab_mask()
+            sampling_info.update_penalties()
         logits = self.apply_logits_bias(logits_output.next_token_logits, sampling_info)
 
         # Sample the next tokens.
@@ -642,7 +774,7 @@ class ModelRunner:
 
         # Apply regex vocab_mask
         if sampling_info.vocab_mask is not None:
-            logits = logits.masked_fill(sampling_info.vocab_mask, float("-inf"))
+            sampling_info.apply_mask(logits=logits, vocab_mask=sampling_info.vocab_mask)
 
         return logits
 
@@ -655,87 +787,6 @@ class ModelRunner:
             return False
         return rope_scaling.get("type", None) == "mrope"
 
-    def init_process_group(
-        self,
-        master_address,
-        master_port,
-        rank_offset,
-        world_size,
-        group_name,
-        backend="nccl",
-    ):
-        """Init torch process group for model weights update at model worker."""
-        assert (
-            torch.distributed.is_initialized()
-        ), f"default torch process group must be initialized"
-        assert group_name != "", f"group name must not be empty"
-
-        rank = rank_offset + torch.distributed.get_rank()
-
-        self._model_update_group = init_process_group(
-            backend=backend,
-            init_method=f"tcp://{master_address}:{master_port}",
-            world_size=world_size,
-            rank=rank,
-            group_name=group_name,
-        )
-
-        print(
-            f"init_process_group: master_address={master_address}, master_port={master_port}, ",
-            f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}",
-        )
-
-    def update_parameter_online(self, name, dtype, shape, empty_cache=False):
-        """
-        Update specific parameter in the model weights online through the process group.
-
-        The `update_weights` method is used for update the whole weights of the model from the disk.
-        The `update_parameter_online` method broadcast a specific parameter to all model runners
-        from rank 0, the actor model.
-
-        name: the name of the parameter to be updated.
-        dtype: the data type of the parameter to be updated.
-        shape: the shape of the parameter to be updated.
-        empty_cache: whether to empty the cache after updating the parameter.
-        """
-
-        assert (
-            dtype == self.model_config.dtype
-        ), f"dtype mismatch: target={dtype} vs current model runner={self.model_config.dtype}"
-        assert (
-            self._model_update_group is not None
-        ), "model update group must be initialized"
-
-        if torch.distributed.get_rank() == 0:
-            print(
-                f"update weights online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
-            )
-
-        weights = torch.empty(shape, dtype=dtype, device=self.device)
-
-        torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-
-        try:
-            param = self.model.get_parameter(name)
-            if param is None:
-                raise ValueError(f"Parameter {name} not found in model")
-            param.data.copy_(weights)
-
-            if empty_cache and self.device == "cuda":
-                torch.cuda.empty_cache()
-
-            torch.distributed.barrier(group=self._model_update_group)
-            return True, f"Succeeded to update parameter {name} online."
-
-        except Exception as e:
-            error_msg = (
-                f"Failed to update weights online: {e}."
-                f"The full weights of the ModelRunner are partially updated."
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
-
 
 @lru_cache()
 def import_model_classes():
@@ -747,7 +798,9 @@ def import_model_classes():
             try:
                 module = importlib.import_module(name)
             except Exception as e:
-                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+                logger.warning(f"Ignore import error when loading {name}. {e}")
+                if crash_on_warnings():
+                    raise ValueError(f"Ignore import error when loading {name}. {e}")
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass

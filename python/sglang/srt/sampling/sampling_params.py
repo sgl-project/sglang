@@ -24,7 +24,6 @@ class SamplingParams:
     def __init__(
         self,
         max_new_tokens: int = 128,
-        min_new_tokens: int = 0,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
@@ -34,6 +33,7 @@ class SamplingParams:
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
+        min_new_tokens: int = 0,
         spaces_between_special_tokens: bool = True,
         regex: Optional[str] = None,
         n: int = 1,

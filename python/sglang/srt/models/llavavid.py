@@ -169,7 +169,7 @@ class LlavaVidForCausalLM(nn.Module):
 
                 # Fill in the placeholder for the image
                 extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
-                prefix_lens_cpu = forward_batch.extend_prefix_lens.cpu().numpy()
+                prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
                 pt = 0
                 for i in range(bs):
                     if not need_vision[i]:

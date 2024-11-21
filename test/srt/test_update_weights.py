@@ -49,7 +49,7 @@ class TestUpdateWeights(unittest.TestCase):
 
     def run_update_weights(self, model_path):
         response = requests.post(
-            self.base_url + "/update_weights",
+            self.base_url + "/update_weights_from_disk",
             json={
                 "model_path": model_path,
             },
