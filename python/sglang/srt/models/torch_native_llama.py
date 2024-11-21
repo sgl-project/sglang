@@ -72,6 +72,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 tp_size = get_tensor_model_parallel_world_size()
 tp_rank = get_tensor_model_parallel_rank()
 
+
 def gate_up_proj_weight_loader(
     self,
     param: Parameter,
