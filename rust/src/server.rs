@@ -76,6 +76,7 @@ pub async fn startup(
 ) -> std::io::Result<()> {
     println!("Starting server on {}:{}", host, port);
     println!("Worker URLs: {:?}", worker_urls);
+    println!("Policy Config: {:?}", policy_config);
 
     // Create client once with configuration
     let client = reqwest::Client::builder()

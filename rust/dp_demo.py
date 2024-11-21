@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument(
         "--local-tokenizer-path",
         type=str,
-        required=True,
+        required=False,
         help="Path to the local tokenizer",
     )
     return parser.parse_args()
@@ -69,9 +69,8 @@ def launch_workers(args) -> tuple[List[subprocess.Popen], List[str]]:
         port = args.port + i
         url = f"http://{args.host}:{port}"
         worker_urls.append(url)
-        # TODO: replace this with launch_server, and move this file to sglang/ because it depends on sglang
-        # We don't
-        command = f"export CUDA_VISIBLE_DEVICES={i}; python -m sglang.launch_server --model-path {args.model_path} --host {args.host} --port {port}"
+        # TODO: replace this with launch_server, and move this file to sglang/ and let sglang depends on sglang router
+        command = f"export CUDA_VISIBLE_DEVICES={i}; DP_RANK={i} python -m sglang.launch_server --model-path {args.model_path} --host {args.host} --port {port}"
         print(command)
         process = subprocess.Popen(command, shell=True)
         processes.append(process)
@@ -129,8 +128,8 @@ def main():
         # Initialize and start the router
         router = Router(
             worker_urls=worker_urls,
-            policy=PolicyType.ApproxTree,
-            tokenizer_path=args.local_tokenizer_path,
+            policy=PolicyType.CacheAware,
+            # cache_routing_prob=0.5,
         )
 
         print("Starting router...")

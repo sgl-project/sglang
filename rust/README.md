@@ -46,6 +46,9 @@ pip install <path-to-wheel>
 #### Option B: Development Mode
 
 For development purposes, you can install the package in editable mode:
+
+Warning: Using editable python binding can suffer from performance degradation!! Please build a fresh wheel for every update if you want to test performance.
+
 ```bash
 pip install -e .
 ```
