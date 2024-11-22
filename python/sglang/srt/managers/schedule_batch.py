@@ -42,7 +42,7 @@ from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, ForwardBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -473,6 +473,11 @@ class ScheduleBatch:
 
     # device
     device: str = "cuda"
+
+    # split prefill
+    split_index: int
+    split_forward_batch: ForwardBatch = None
+    split_prefill_finished: bool = False
 
     @classmethod
     def init_new(

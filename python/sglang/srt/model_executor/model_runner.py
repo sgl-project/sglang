@@ -583,9 +583,11 @@ class ModelRunner:
     
     def forward_split_prefill(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
-        return self.model.forward_split_prefill(
+        ret = self.model.forward_split_prefill(
             forward_batch.input_ids, forward_batch.positions, forward_batch, forward_batch.split_index
         )
+        forward_batch.split_index = forward_batch.split_index + 1
+        return ret
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         if forward_batch.forward_mode.is_decode():

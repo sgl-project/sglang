@@ -212,6 +212,7 @@ class Scheduler:
         self.waiting_queue: List[Req] = []
         self.running_batch: Optional[ScheduleBatch] = None
         self.cur_batch: Optional[ScheduleBatch] = None
+        self.split_prefill_batch: Optional[ScheduleBatch] = None
         self.decode_forward_ct = 0
         self.stream_interval = server_args.stream_interval
         self.num_generated_tokens = 0
@@ -267,6 +268,34 @@ class Scheduler:
                 with_stack=True,
             )
 
+
+    @torch.inference_mode()
+    def event_loop_overlap(self):
+        """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        result_queue = deque()
+
+        self.last_batch = None
+        self.running_batch = None
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+            if batch:
+                result = self.run_batch(batch)
+                result_queue.append((batch.copy(), result))
+
+            if self.last_batch:
+                tmp_batch, tmp_result = result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+            elif batch is None:
+                self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
+
+            self.last_batch = batch
+
     @torch.inference_mode()
     def event_loop_normal(self):
         """A normal blocking scheduler loop."""
@@ -298,63 +327,33 @@ class Scheduler:
 
             self.last_batch = batch
 
-    @torch.inference_mode()
-    def event_loop_overlap(self):
-        """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        result_queue = deque()
-
-        self.last_batch = None
-        self.running_batch = None
-
-        while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
-
-            batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
-            if batch:
-                result = self.run_batch(batch)
-                result_queue.append((batch.copy(), result))
-
-            if self.last_batch:
-                tmp_batch, tmp_result = result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
-            elif batch is None:
-                self.check_memory()
-                self.new_token_ratio = global_config.init_new_token_ratio
-
-            self.last_batch = batch
     
     @torch.inference_mode()
     def event_loop_pdmux(self):
         """A scheduler loop for pd multiplexing."""
-        self.last_batch = None
+        self.running_batch = None
+        self.split_prefill_batch = None
 
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
-            batch = self.get_next_batch_to_run()
+            self.update_split_prefill_batch()
 
-            if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
-
-                # Decode multiple steps to reduce the overhead
-                if batch.forward_mode.is_decode():
-                    for _ in range(self.server_args.num_continuous_decode_steps - 1):
-                        if not self.running_batch:
-                            break
-                        self.update_running_batch()
-                        if not self.running_batch:
-                            break
-                        result = self.run_batch(batch)
-                        self.process_batch_result(batch, result)
-            else:
+            if not self.running_batch and not self.split_prefill_batch:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
+                continue
+            self.update_running_batch()
+            if self.running_batch:
+                result = self.run_batch(self.running_batch)
+                self.process_batch_result(self.running_batch, result)
+            if self.split_prefill_batch:
+                result = self.run_batch(self.split_prefill_batch)
+                if self.split_prefill_batch.split_prefill_finished:
+                    self.process_batch_result(self.split_prefill_batch, result)
 
-            self.last_batch = batch
+
 
     def recv_requests(self):
         if self.tp_rank == 0:
@@ -714,6 +713,19 @@ class Scheduler:
             new_batch.decoding_reqs = None
 
         return new_batch
+    
+    def update_split_prefil_batch(self):
+        # merge prefill batch to decode batch
+        if self.split_prefill_batch and not self.split_prefill_batch.is_empty() and self.split_prefill_batch.split_prefill_finished:
+            if self.running_batch:
+                self.running_batch.merge_batch(self.split_prefill_batch)
+            else:
+                self.running_batch = self.split_prefill_batch
+
+        
+        
+
+        
 
     def update_running_batch(self):
         """Update the current running decoding batch."""
@@ -758,7 +770,11 @@ class Scheduler:
     def run_batch(self, batch: ScheduleBatch):
         """Run a batch."""
         if self.is_generation:
-            if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
+            if batch.forward_mode.is_split_prefill():
+                logits_output, next_token_ids = self.tp_worker.forward_batch_split_prefill(
+                    batch
+                )
+            elif batch.forward_mode.is_decode()  or batch.extend_num_tokens != 0:
                 model_worker_batch = batch.get_model_worker_batch()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch

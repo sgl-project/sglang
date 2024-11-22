@@ -22,7 +22,7 @@ from typing import Optional
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import UpdateWeightReqInput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import ScheduleBatch, ModelWorkerBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
@@ -145,6 +145,21 @@ class TpModelWorker:
         logits_output = self.model_runner.forward(forward_batch)
         embeddings = logits_output.embeddings
         return embeddings
+    
+    def forward_batch_split_prefill(self, schedule_batch: ScheduleBatch):
+        if schedule_batch == 0:
+            model_worker_batch = schedule_batch.get_model_worker_batch()
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            schedule_batch.split_forward_batch = forward_batch
+        logits_output = self.model_runner.forward(schedule_batch.split_forward_batch)
+        next_token_ids = None
+        schedule_batch.split_index = schedule_batch.split_forward_batch.split_index
+        if logits_output:
+            schedule_batch.split_prefill_finished = True
+            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+        return logits_output, next_token_ids
+        
+
 
     def update_weights(self, recv_req: UpdateWeightReqInput):
         success, message = self.model_runner.update_weights(
