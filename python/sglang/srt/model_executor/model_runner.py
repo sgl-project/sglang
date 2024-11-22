@@ -650,13 +650,19 @@ class ModelRunner:
             return self.cuda_graph_runner.replay(forward_batch)
 
         forward_batch.positions = (forward_batch.seq_lens - 1).to(torch.int64)
-        self.attn_backend.init_forward_metadata(forward_batch, self.model_layer)
+        if isinstance(self.attn_backend, FlashInferAttnBackend):
+            self.attn_backend.init_forward_metadata(forward_batch, self.model_layer)
+        else:
+            self.attn_backend.init_forward_metadata(forward_batch)
         return self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):
-        self.attn_backend.init_forward_metadata(forward_batch, self.model_layer)
+        if isinstance(self.attn_backend, FlashInferAttnBackend):
+            self.attn_backend.init_forward_metadata(forward_batch, self.model_layer)
+        else:
+            self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
             if forward_batch.input_embeds is None:
                 return self.model.forward(
