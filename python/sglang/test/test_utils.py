@@ -568,6 +568,7 @@ def run_bench_serving(
         disable_stream=disable_stream,
         disable_ignore_eos=False,
         extra_request_body=None,
+        profile=None,
     )
 
     try:
@@ -583,11 +584,11 @@ def run_bench_serving(
     return res
 
 
-def run_bench_latency(model, other_args):
+def run_bench_one_batch(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_latency",
+        "sglang.bench_one_batch",
         "--model-path",
         model,
         "--batch-size",

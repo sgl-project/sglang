@@ -59,7 +59,7 @@ drun -p 30000:30000 \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 
 # Till flashinfer backend available, --attention-backend triton --sampling-backend pytorch are set by default
-drun v0.3.5.post2-rocm620 python3 -m sglang.bench_latency --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
+drun v0.3.5.post2-rocm620 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
 ```
 
 ## Method 4: Using docker compose

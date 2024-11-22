@@ -1,11 +1,16 @@
 # Benchmark and Profiling
 
 ## Benchmark
-- Benchmark a single static batch by running the following command without launching a server. The arguments are the same as for `launch_server.py`. Note that this is not a dynamic batching server, so it may run out of memory for a batch size that a real server can handle. A real server truncates the prefill into several batches, while this unit test does not. For accurate large batch testing, consider using `sglang.bench_serving`.
+- Benchmark the latency of running a single static batch without a server. The arguments are the same as for `launch_server.py`.
+  Note that this is a simplified test script without a dynamic batching server, so it may run out of memory for a batch size that a real server can handle. A real server truncates the prefill into several batches, while this simplified script does not.
   ```
-  python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 32 --input-len 256 --output-len 32
+  python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch 32 --input-len 256 --output-len 32
   ```
-- Benchmark online serving. Launch a server first and run the following command.
+- Benchmark offline processing. This script will start an offline engine and run the benchmark.
+  ```
+  python3 -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
+  ```
+- Benchmark online serving. Please use `sglang.launch_server` to launch a server first and run the following command.
   ```
   python3 -m sglang.bench_serving --backend sglang --num-prompt 10
   ```
@@ -23,7 +28,7 @@ apt update
 apt install nsight-systems-cli
 ```
 
-1. To profile a single batch, use `nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node python3 -m sglang.bench_latency --model meta-llama/Meta-Llama-3-8B --batch-size 64 --input-len 512`
+1. To profile a single batch, use `nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node python3 -m sglang.bench_one_batch --model meta-llama/Meta-Llama-3-8B --batch-size 64 --input-len 512`
 
 2. To profile a server, e.g.
 
@@ -33,7 +38,7 @@ apt install nsight-systems-cli
 nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node -o sglang.out --delay 60 --duration 70 python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disable-radix-cache
 
 # client
-python3 -m sglang.bench_serving --backend sglang --num-prompts 6000 --dataset-name random --random-input 4096 --random-output 2048
+python3 -m sglang.bench_serving --backend sglang --num-prompts 1000 --dataset-name random --random-input 1024 --random-output 512
 ```
 
 3. Use NVTX, e.g.

@@ -30,10 +30,10 @@ device_mesh = torch.distributed.init_device_mesh("cuda", (tp_size,))
 tensor_parallel(model, device_mesh)
 ```
 
-An end-to-end example can be found in `python/sglang/bench_latency.py`.
+An end-to-end example can be found in `python/sglang/bench_one_batch.py`.
 You can run it with the following command:
 ```bash
-$ python3 -m sglang.bench_latency --correct \
+$ python3 -m sglang.bench_one_batch --correct \
   --model meta-llama/Meta-Llama-3-8B \
   --json-model-override-args '{"architectures": ["TorchNativeLlamaForCausalLM"]}' \
   --tensor-parallel-size 2 \
@@ -400,6 +400,10 @@ class TorchNativeLlamaForCausalLM(nn.Module):
         self.model = LlamaModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
+
+        # turning off autotune for fp8dq since it doesn't give speedup and
+        # increases compile time significantly
+        torch._inductor.config.max_autotune_gemm_backends = "ATEN"
 
     @torch.no_grad()
     def forward(
