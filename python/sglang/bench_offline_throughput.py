@@ -304,8 +304,8 @@ def throughput_test(
             reqs=warmup_requests,
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
-            profile=bench_args.profile,
-            profile_dir=False,
+            profile=False,
+            profile_dir=bench_args.profile_dir,
         )
 
     logging.info("\nBenchmark...")
