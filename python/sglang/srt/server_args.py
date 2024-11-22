@@ -20,6 +20,7 @@ import random
 import tempfile
 from typing import List, Optional
 
+from sglang.srt.model_executor.forward_batch_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_nvgpu_memory_capacity,
@@ -62,6 +63,7 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
+    split_prefill_batch: bool = False
 
     # Other runtime options
     tp_size: int = 1
@@ -90,7 +92,7 @@ class ServerArgs:
     load_balance_method: str = "round_robin"
 
     # Multi-node distributed serving
-    dist_init_addr: Optional[str] = None
+    dist_init_addr: Optional[List[str]] = None
     nnodes: int = 1
     node_rank: int = 0
 
@@ -134,6 +136,18 @@ class ServerArgs:
     triton_attention_reduce_in_fp32: bool = False
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
+
+    # speculative decoding
+    draft_model_path: Optional[str] = None
+    speculative_algorithm: SpeculativeAlgorithm = None
+    num_speculative_steps: int = None
+    # should been set as 2^n
+    num_draft_tokens: int = None
+    # should been set as [1, 2, 4, 8]
+    eagle_topk: int = None
+    # should not been set by cli, it is only a placeholder
+    # which would be set and used in model_runner
+    draft_runner_cache_size: int = None
 
     def __post_init__(self):
         # Set missing default values
@@ -203,6 +217,21 @@ class ServerArgs:
                 "Overlap schedule is disabled because mixed-style chunked prefill is enabled."
             )
             self.disable_overlap_schedule = True
+
+        # Speculative Decoding
+        self.speculative_algorithm = SpeculativeAlgorithm.get_algorithm(
+            self.speculative_algorithm
+        )
+        if self.speculative_algorithm.is_eagle():
+            self.split_prefill_batch = True
+            # EAGLE don't support it currently.
+            self.disable_cuda_graph_padding = True
+            self.disable_radix_cache = True
+            self.disable_overlap_schedule = True
+            self.chunked_prefill_size = None
+            logger.info(
+                "EAGLE2 is not suppport radix cache and chunked_prefill currently."
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -496,7 +525,8 @@ class ServerArgs:
             "--dist-init-addr",
             "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
             type=str,
-            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
+            help="""The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). Shoule provide
+                two host address if use speculative decoding""",
         )
         parser.add_argument(
             "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
@@ -693,6 +723,56 @@ class ServerArgs:
             "The default value is 1, meaning only run one decoding step at a time.",
         )
         parser.add_argument(
+            "--draft-model-path",
+            type=str,
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+            required=False,
+        )
+        parser.add_argument(
+            "--speculative-algorithm",
+            type=str,
+            choices=["EAGLE"],
+            help="Speculative algorithm.",
+            required=False,
+        )
+        parser.add_argument(
+            "--num-speculative-steps",
+            type=int,
+            help="The number of steps sampled from draft model in Speculative Decoding.",
+            required=False,
+            default=5,
+        )
+        parser.add_argument(
+            "--num-draft-tokens",
+            type=int,
+            help="The number of token sampled from draft model in Speculative Decoding.",
+            required=False,
+            default=64,
+        )
+        parser.add_argument(
+            "--eagle-topk",
+            type=int,
+            help="The number of token sampled from draft model in eagle2 each step.",
+            required=False,
+            choices=[1, 2, 4, 8],
+            default=8,
+        )
+        parser.add_argument(
+            "--split-prefill-batch",
+            type=bool,
+            help="Whether to inference prefill sample one by one.",
+            required=False,
+            default=False,
+        )
+        parser.add_argument(
+            "--draft-runner-cache-size",
+            type=int,
+            help="""It should not been set by cli, it is only a placeholder which
+            would be set and used in model_runner when using speculative inference.""",
+            required=False,
+            default=-1,
+        )
+        parser.add_argument(
             "--delete-ckpt-after-loading",
             action="store_true",
             help="Delete the model checkpoint after loading the model.",
@@ -782,13 +862,19 @@ class PortArgs:
     detokenizer_ipc_name: str
 
     # The port for nccl initialization (torch.dist)
-    nccl_port: int
+    # [port] if don't use speculative decoding else [tp worker port, draft worker, port]
+    nccl_port: List[int]
 
     @staticmethod
     def init_new(server_args) -> "PortArgs":
+        all_port = []
         port = server_args.port + random.randint(100, 1000)
         while True:
             if is_port_available(port):
+                all_port.append(port)
+            if len(all_port) == (
+                2 if server_args.speculative_algorithm.is_not_none() else 1
+            ):
                 break
             port += 42
 
@@ -796,7 +882,7 @@ class PortArgs:
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
             scheduler_input_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
             detokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
-            nccl_port=port,
+            nccl_port=all_port,
         )
 
 
