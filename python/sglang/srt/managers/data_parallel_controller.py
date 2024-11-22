@@ -98,7 +98,7 @@ class DataParallelController:
             else:
                 # This port is checked free in PortArgs.init_new.
                 # We hold it first so that the next dp worker gets a different port
-                sockets.append(bind_port(tmp_port_args.nccl_port))
+                sockets.append(bind_port(tmp_port_args.nccl_port[0]))
 
             # Create a thread for each worker
             thread = threading.Thread(
