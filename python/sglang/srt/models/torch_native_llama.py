@@ -30,10 +30,10 @@ device_mesh = torch.distributed.init_device_mesh("cuda", (tp_size,))
 tensor_parallel(model, device_mesh)
 ```
 
-An end-to-end example can be found in `python/sglang/bench_latency.py`.
+An end-to-end example can be found in `python/sglang/bench_one_batch.py`.
 You can run it with the following command:
 ```bash
-$ python3 -m sglang.bench_latency --correct \
+$ python3 -m sglang.bench_one_batch --correct \
   --model meta-llama/Meta-Llama-3-8B \
   --json-model-override-args '{"architectures": ["TorchNativeLlamaForCausalLM"]}' \
   --tensor-parallel-size 2 \
