@@ -1,11 +1,13 @@
 import os
 import time
 import unittest
+
 import requests
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
+
 from sglang.srt.utils import init_custom_process_group, kill_child_process
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -14,6 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+
 class TestParameterUpdateGroup(unittest.TestCase):
     @classmethod
     def init_process(cls, rank, world_size, base_url, model_name, server_pid):
@@ -21,14 +24,14 @@ class TestParameterUpdateGroup(unittest.TestCase):
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "29500"
         torch.cuda.set_device(rank)
-        
+
         if rank == 0:
             print(f"[Rank 0] Starting initialization")
             hf_model = AutoModelForCausalLM.from_pretrained(model_name).to(
                 f"cuda:{rank}"
             )
             print(f"[Rank 0] HF model loaded")
-            
+
             group = init_custom_process_group(
                 backend="nccl",
                 init_method="tcp://localhost:29500",
@@ -52,18 +55,18 @@ class TestParameterUpdateGroup(unittest.TestCase):
             )
             server_pid = process.pid
             print(f"[Rank 1] Server launched with pid {process.pid}")
-            
+
             response = requests.post(
-                    f"{base_url}/init_parameter_update_group",
-                    json={
-                        "master_address": "localhost",
-                        "master_port": "29500",
-                        "rank_offset": 1,
-                        "world_size": world_size,
-                        "group_name": "test_parameter_update_group",
-                        "backend": "nccl"
-                    },
-                timeout=30
+                f"{base_url}/init_parameter_update_group",
+                json={
+                    "master_address": "localhost",
+                    "master_port": "29500",
+                    "rank_offset": 1,
+                    "world_size": world_size,
+                    "group_name": "test_parameter_update_group",
+                    "backend": "nccl",
+                },
+                timeout=30,
             )
 
     @classmethod
@@ -77,8 +80,8 @@ class TestParameterUpdateGroup(unittest.TestCase):
             cls.init_process,
             args=(cls.world_size, cls.base_url, cls.model_name, cls.server_pid),
             nprocs=cls.world_size,
-            join=True
-    )
+            join=True,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -91,6 +94,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
 
     def test_init_parameter_update_group(self):
         pass
+
 
 if __name__ == "__main__":
     unittest.main()
