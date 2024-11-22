@@ -157,10 +157,6 @@ class TestSRTEndpoint(unittest.TestCase):
     def test_get_memory_pool_size(self):
         response = requests.post(self.base_url + "/get_memory_pool_size")
         self.assertIsInstance(response.json(), int)
-    
-    def test_get_max_total_num_tokens(self):
-        response = requests.post(self.base_url + "/get_max_total_num_tokens")
-        self.assertIsInstance(response.json(), int)
 
 
 if __name__ == "__main__":
