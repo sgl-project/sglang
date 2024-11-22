@@ -27,14 +27,14 @@ jobs:
           bash scripts/ci_install_dependency.sh
           pip install --upgrade "evalplus[vllm] @ git+https://github.com/evalplus/evalplus"
 
-      - name: Test human eval
-        timeout-minutes: 120
-        run: |
-          cd test/srt
-          python3 test_nightly_human_eval.py
-
       - name: Test gsm8k
         timeout-minutes: 120
         run: |
           cd test/srt
           python3 test_nightly_gsm8k_eval.py
+
+      - name: Test human eval
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 test_nightly_human_eval.py
