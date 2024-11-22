@@ -23,7 +23,11 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 
 
 @dataclasses.dataclass
@@ -32,6 +36,13 @@ class LogitsProcessorOutput:
     next_token_logits: torch.Tensor
     # The logprobs of the next tokens.     shape: [#seq, vocab_size]
     next_token_logprobs: torch.Tensor = None
+
+    # Used by speculative inference (eagle)
+    # The output of transformer layers
+    hidden_states: Optional[torch.Tensor] = None
+    # backup of next_token_logits when use cuda graph
+    # id(next_token_logits_bak) == id(next_token_logits)
+    next_token_logits_bak: Optional[torch.Tensor] = None
 
     # The normlaized logprobs of prompts.  shape: [#seq]
     normalized_prompt_logprobs: torch.Tensor = None
@@ -58,6 +69,8 @@ class LogitsMetadata:
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
 
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         extend_logprob_pruned_lens_cpu = None
@@ -75,6 +88,10 @@ class LogitsMetadata:
         else:
             return_top_logprob = False
 
+        if forward_batch.spec_info is not None:
+            capture_hidden_mode = forward_batch.spec_info.capture_hidden_mode
+        else:
+            capture_hidden_mode = CaptureHiddenMode.NULL
         return cls(
             forward_mode=forward_batch.forward_mode,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
@@ -84,6 +101,9 @@ class LogitsMetadata:
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
+            capture_hidden_mode=getattr(
+                forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+            ),
         )
 
 
@@ -189,7 +209,10 @@ class LogitsProcessor(nn.Module):
             last_logits.mul_(self.config.final_logit_softcapping)
 
         # Return only last_logits if logprob is not requested
-        if not logits_metadata.return_logprob:
+        if (
+            not logits_metadata.return_logprob
+            or logits_metadata.capture_hidden_mode.need_capture()
+        ):
             return LogitsProcessorOutput(
                 next_token_logits=last_logits,
                 next_token_logprobs=None,
@@ -197,6 +220,16 @@ class LogitsProcessor(nn.Module):
                 input_token_logprobs=None,
                 input_top_logprobs=None,
                 output_top_logprobs=None,
+                hidden_states=(
+                    hidden_states
+                    if logits_metadata.capture_hidden_mode.is_full()
+                    else (
+                        last_hidden
+                        if logits_metadata.capture_hidden_mode.is_last()
+                        else None
+                    )
+                ),
+                next_token_logits_bak=last_logits,
             )
         else:
             last_logprobs = torch.nn.functional.log_softmax(last_logits, dim=-1)

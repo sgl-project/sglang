@@ -11,6 +11,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.speculative_utils import SpecInput
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -86,9 +87,13 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
+        num_token: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens=None,
+        encoder_lens: torch.Tensor = None,
+        spec_info: SpecInput = None,
+        is_draft_runner: bool = False,
+        forward_batch: ForwardBatch = None,
     ):
         # NOTE: encoder_lens expected to be zeros or None
         self.forward_metadata = (
@@ -101,10 +106,12 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
+        num_token: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         encoder_lens=None,
+        forward_batch=None,
     ):
         # NOTE: encoder_lens expected to be zeros or None
         self.cuda_graph_start_loc.zero_()

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,8 +29,6 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
   It contains low-level tensor data. Most of the data consists of GPU tensors.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional
@@ -45,6 +45,28 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.speculative_utils import SpecInput
+
+
+class SpeculativeAlgorithm(IntEnum):
+    NONE = auto()
+    EAGLE = auto()
+
+    def is_not_none(self):
+        return self != SpeculativeAlgorithm.NONE
+
+    def is_eagle(self):
+        return self == SpeculativeAlgorithm.EAGLE
+
+    @staticmethod
+    def get_algorithm(algorithm):
+        if isinstance(algorithm, SpeculativeAlgorithm):
+            return algorithm
+        algorithm_map = {
+            "EAGLE": SpeculativeAlgorithm.EAGLE,
+            None: SpeculativeAlgorithm.NONE,
+        }
+        return algorithm_map[algorithm]
 
 
 class ForwardMode(IntEnum):
@@ -56,6 +78,10 @@ class ForwardMode(IntEnum):
     DECODE = auto()
     # Contains both EXTEND and DECODE when doing chunked prefill.
     MIXED = auto()
+    # Speculative Verify stage
+    SPEC_VERIFY = auto()
+    # Speculative draft Extend stage which after verify stage
+    SPEC_EXTEND = auto()
     # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
     IDLE = auto()
 
@@ -67,19 +93,47 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.PREFILL
 
     def is_extend(self):
-        return self == ForwardMode.EXTEND or self == ForwardMode.MIXED
+        return self in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+            ForwardMode.SPEC_EXTEND,
+        )
 
     def is_decode(self):
-        return self == ForwardMode.DECODE
+        return self in (ForwardMode.DECODE, ForwardMode.SPEC_VERIFY)
 
     def is_mixed(self):
         return self == ForwardMode.MIXED
+
+    def is_spec_verify(self):
+        return self == ForwardMode.SPEC_VERIFY
+
+    def is_spec_extend(self):
+        return self == ForwardMode.SPEC_EXTEND
+
+    def is_cuda_graph(self):
+        return self in (ForwardMode.DECODE, ForwardMode.SPEC_VERIFY)
 
     def is_idle(self):
         return self == ForwardMode.IDLE
 
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
+
+
+class CaptureHiddenMode(IntEnum):
+    NULL = auto()
+    FULL = auto()
+    LAST = auto()
+
+    def need_capture(self):
+        return self != CaptureHiddenMode.NULL
+
+    def is_full(self):
+        return self == CaptureHiddenMode.FULL
+
+    def is_last(self):
+        return self == CaptureHiddenMode.LAST
 
 
 @dataclass
@@ -137,6 +191,10 @@ class ForwardBatch:
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: BaseTokenToKVPool = None
     attn_backend: AttentionBackend = None
+
+    # Speculative decoding
+    spec_info: SpecInput = None
+    spec_algorithm: SpeculativeAlgorithm = SpeculativeAlgorithm.NONE
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -231,7 +289,15 @@ class ForwardBatch:
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
+            spec_algorithm=batch.spec_algorithm,
+            spec_info=batch.spec_info,
         )
+
+        if (
+            ret.spec_info is not None
+            and getattr(ret.spec_info, "positions", None) is not None
+        ):
+            ret.positions = ret.spec_info.positions
 
         if ret.global_num_tokens is not None:
             max_len = max(ret.global_num_tokens)

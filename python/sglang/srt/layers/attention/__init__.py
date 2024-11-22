@@ -1,11 +1,14 @@
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import nn
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.speculative_utils import SpecInput
 
 
 class AttentionBackend(ABC):
@@ -23,9 +26,13 @@ class AttentionBackend(ABC):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
+        num_token: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor] = None,
+        encoder_lens: torch.Tensor = None,
+        spec_info: "SpecInput" = None,
+        is_draft_runner: bool = False,
+        forward_batch: ForwardBatch = None,
     ):
         """Init the metadata for a forward pass for capturing a cuda graph."""
         raise NotImplementedError()
@@ -33,10 +40,12 @@ class AttentionBackend(ABC):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
+        num_token: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor] = None,
+        encoder_lens=None,
+        forward_batch=None,
     ):
         """Init the metadata for a forward pass for replying a cuda graph."""
         raise NotImplementedError()
@@ -54,7 +63,9 @@ class AttentionBackend(ABC):
         forward_batch: ForwardBatch,
     ):
         """Run forward on an attention layer."""
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_spec_verify():
+            return self.forward_extend(q, k, v, layer, forward_batch)
+        elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(q, k, v, layer, forward_batch)
         else:
             return self.forward_extend(q, k, v, layer, forward_batch)
