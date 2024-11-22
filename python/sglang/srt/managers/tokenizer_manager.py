@@ -52,6 +52,7 @@ from sglang.srt.managers.io_struct import (
     GetParameterByNameReqInput,
     GetParameterByNameReqOutput,
     InitParameterUpdateGroupReqInput,
+    InitParameterUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -474,18 +475,25 @@ class TokenizerManager:
         obj: InitParameterUpdateGroupReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> bool:
+        if self.to_create_loop:
+            self.create_handle_loop()
+
         if obj.backend is None:
             obj.backend = "nccl"
         self.send_to_scheduler.send_pyobj(obj)
 
-        # 添加一个Future来等待scheduler的响应
-        self.parameter_update_result = asyncio.Future()
-        try:
-            result = await self.parameter_update_result
-            return result.success
-        except Exception as e:
-            logger.error(f"Error in init_parameter_update_group: {e}")
-            return False
+        self.init_parameter_update_group_result = asyncio.Future()
+
+        if self.server_args.dp_size == 1:
+            result = await self.init_parameter_update_group_result
+            return result.success, result.message
+        else:
+            self.init_parameter_update_group_tmp = []
+            result = await self.init_parameter_update_group_result
+            all_success = all([r.success for r in result])
+            all_message = [r.message for r in result]
+            all_message = " | ".join(all_message)
+            return all_success, all_message
 
     async def update_parameter_from_distributed(
         self,
@@ -540,8 +548,6 @@ class TokenizerManager:
         else:
             self.get_parameter_by_name_tmp = []
             result = await self.get_parameter_by_name_result
-            # logger.warning(f"result in tokenizer_manager: {len(result)}")
-            # logger.warning(f"result in tokenizer_manager: {len(result[0])}")
             all_parameters = [r.parameter for r in result]
             return all_parameters
 
@@ -620,6 +626,7 @@ class TokenizerManager:
                 UpdateWeightFromDistReqOutput,
                 UpdateParameteFromDistributedReqOutput,
                 GetParameterByNameReqOutput,
+                InitParameterUpdateGroupReqOutput,
             ] = await self.recv_from_detokenizer.recv_pyobj()
 
             if isinstance(recv_obj, UpdateWeightFromDistReqOutput):
@@ -648,6 +655,19 @@ class TokenizerManager:
                     if len(self.get_parameter_by_name_tmp) == self.server_args.dp_size:
                         self.get_parameter_by_name_result.set_result(
                             self.get_parameter_by_name_tmp
+                        )
+                continue
+            elif isinstance(recv_obj, InitParameterUpdateGroupReqOutput):
+                if self.server_args.dp_size == 1:
+                    self.init_parameter_update_group_result.set_result(recv_obj)
+                else:
+                    self.init_parameter_update_group_tmp.append(recv_obj)
+                    if (
+                        len(self.init_parameter_update_group_tmp)
+                        == self.server_args.dp_size
+                    ):
+                        self.init_parameter_update_group_result.set_result(
+                            self.init_parameter_update_group_tmp
                         )
                 continue
             elif isinstance(recv_obj, GetMemPoolSizeReqOutput):

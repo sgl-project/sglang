@@ -383,6 +383,12 @@ class InitParameterUpdateGroupReqInput:
 
 
 @dataclass
+class InitParameterUpdateGroupReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
 class GetParameterByNameReqInput:
     name: str
     truncate_size: int = 100

@@ -169,7 +169,7 @@ class TpModelWorker:
         return success, message
 
     def init_parameter_update_group(self, recv_req: InitParameterUpdateGroupReqInput):
-        self.model_runner.init_parameter_update_group(
+        success, message = self.model_runner.init_parameter_update_group(
             recv_req.master_address,
             recv_req.master_port,
             recv_req.rank_offset,
@@ -177,6 +177,7 @@ class TpModelWorker:
             recv_req.group_name,
             recv_req.backend,
         )
+        return success, message
 
     def update_parameter_from_distributed(
         self, recv_req: UpdateParameteFromDistributedReqInput

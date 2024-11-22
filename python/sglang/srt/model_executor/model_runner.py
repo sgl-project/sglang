@@ -423,15 +423,19 @@ class ModelRunner:
             f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
 
-        self._model_update_group = init_custom_process_group(
-            backend=backend,
-            init_method=f"tcp://{master_address}:{master_port}",
-            world_size=world_size,
-            rank=rank,
-            group_name=group_name,
-        )
-
-        logger.info("`_model_update_group` initialized.")
+        try:
+            self._model_update_group = init_custom_process_group(
+                backend=backend,
+                init_method=f"tcp://{master_address}:{master_port}",
+                world_size=world_size,
+                rank=rank,
+                group_name=group_name,
+            )
+            logger.info("`_model_update_group` initialized.")
+            return True, "Succeeded to initialize custom process group."
+        except Exception as e:
+            message = f"Failed to initialize custom process group: {e}."
+            return False, message
 
     def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
         """

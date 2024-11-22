@@ -44,6 +44,7 @@ from sglang.srt.managers.io_struct import (
     GetParameterByNameReqInput,
     GetParameterByNameReqOutput,
     InitParameterUpdateGroupReqInput,
+    InitParameterUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -513,7 +514,10 @@ class Scheduler:
                     GetParameterByNameReqOutput(parameter)
                 )
             elif isinstance(recv_req, InitParameterUpdateGroupReqInput):
-                self.init_parameter_update_group(recv_req)
+                success, message = self.init_parameter_update_group(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    InitParameterUpdateGroupReqOutput(success, message)
+                )
             elif isinstance(recv_req, UpdateParameteFromDistributedReqInput):
                 success, message = self.update_parameter_from_distributed(recv_req)
                 self.send_to_tokenizer.send_pyobj(
@@ -1357,7 +1361,8 @@ class Scheduler:
 
     def init_parameter_update_group(self, recv_req: InitParameterUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
-        self.tp_worker.init_parameter_update_group(recv_req)
+        success, message = self.tp_worker.init_parameter_update_group(recv_req)
+        return success, message
 
     def update_parameter_from_distributed(
         self, recv_req: UpdateParameteFromDistributedReqInput
@@ -1373,7 +1378,7 @@ class Scheduler:
 
     def get_parameter_by_name(self, recv_req: GetParameterByNameReqInput):
         parameter = self.tp_worker.get_parameter_by_name(recv_req)
-        return self.tp_worker.get_parameter_by_name(recv_req)
+        return parameter
 
     def start_profile(self) -> None:
         if self.profiler is None:

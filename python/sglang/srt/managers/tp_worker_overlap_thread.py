@@ -207,7 +207,8 @@ class TpModelWorkerClient:
         return success, message
 
     def init_parameter_update_group(self, recv_req: InitParameterUpdateGroupReqInput):
-        self.worker.init_parameter_update_group(recv_req)
+        success, message = self.worker.init_parameter_update_group(recv_req)
+        return success, message
 
     def update_parameter_from_distributed(
         self, recv_req: UpdateParameteFromDistributedReqInput

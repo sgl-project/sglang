@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 
 class TestParameterUpdateGroup(unittest.TestCase):
     @classmethod
-    def init_process(cls, rank, world_size, base_url, model_name, server_pid):
+    def init_process(cls, rank, world_size, base_url, model_name, server_pid_container):
         # 设置分布式环境
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "29500"
@@ -53,7 +53,7 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 env=server_env,
             )
-            server_pid = process.pid
+            server_pid_container[0] = process.pid
             print(f"[Rank 1] Server launched with pid {process.pid}")
 
             response = requests.post(
@@ -69,30 +69,37 @@ class TestParameterUpdateGroup(unittest.TestCase):
                 timeout=30,
             )
 
+        print("test_init_parameter_update_group")
+
     @classmethod
     def setUpClass(cls):
         cls.world_size = 2
         cls.model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.server_pid = None
+        cls.server_pid_container = [None]
 
         mp.spawn(
             cls.init_process,
-            args=(cls.world_size, cls.base_url, cls.model_name, cls.server_pid),
+            args=(cls.world_size, cls.base_url, cls.model_name, cls.server_pid_container),
             nprocs=cls.world_size,
             join=True,
         )
+        cls.server_pid = cls.server_pid_container[0]
 
     @classmethod
     def tearDownClass(cls):
-        if cls.server_pid != 0:
-            kill_child_process(cls.server_pid, include_self=True)
-        for p in cls.processes:
-            p.join()
+        # 先清理分布式进程组
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
+        
+        # 然后清理服务器进程
+        if cls.server_pid is not None:
+            kill_child_process(cls.server_pid, include_self=True)
+        
+        time.sleep(1)  # 给进程一些清理的时间
 
     def test_init_parameter_update_group(self):
+        print("pass over")
         pass
 
 

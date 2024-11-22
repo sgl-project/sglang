@@ -227,8 +227,12 @@ async def init_parameter_update_group(
     obj: InitParameterUpdateGroupReqInput, request: Request
 ):
     """Initialize the parameter update group."""
-    await tokenizer_manager.init_parameter_update_group(obj, request)
-    return Response(status_code=200)
+    success, message = await tokenizer_manager.init_parameter_update_group(obj, request)
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/update_parameter_from_distributed")
