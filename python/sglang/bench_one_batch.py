@@ -278,10 +278,7 @@ def correctness_test(
 
 
 def synchronize(device):
-    if device == "cuda":
-        torch.cuda.synchronize()
-    elif device == "xpu":
-        torch.xpu.synchronize()
+    torch.get_device_module(device).synchronize()
 
 
 def latency_test_run_once(
