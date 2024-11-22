@@ -118,7 +118,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_bench_latency.TestBenchLatency.test_default
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_default
 
       - name: Benchmark online latency
         timeout-minutes: 10
@@ -194,7 +194,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_bench_latency.TestBenchLatency.test_moe_default
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_default
 
   accuracy-test-1-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
