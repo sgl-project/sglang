@@ -557,6 +557,15 @@ class Scheduler:
                 req.origin_input_ids_unpadded, req.image_inputs
             )
 
+            if len(req.origin_input_ids) > self.max_req_input_len:
+                req.finished_reason = FINISH_ABORT(
+                    "Image request length is longer than the KV cache pool size or "
+                    "the max context length aborting because you cannot truncate the image embeds"
+                )
+                req.sampling_params.max_new_tokens = 0
+                self.waiting_queue.append(req)
+                return
+
         req.return_logprob = recv_req.return_logprob
         req.top_logprobs_num = recv_req.top_logprobs_num
         req.stream = recv_req.stream
@@ -1380,6 +1389,10 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # [For Router] if env var "DP_RANK" exist, set dp_rank to the value of the env var
+    if dp_rank is None:
+        dp_rank = int(os.getenv("DP_RANK", -1))
+
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
     else:
