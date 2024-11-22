@@ -388,9 +388,7 @@ async def async_request_gserver(
     raise NotImplementedError()
 
 
-async def async_request_profile(
-    api_url: str
-) -> RequestFuncOutput:
+async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         output = RequestFuncOutput()
         try:
@@ -893,7 +891,9 @@ async def benchmark(
 
     if profile:
         print("Starting profiler...")
-        profile_output = await async_request_profile(api_url=base_url + "/start_profile")
+        profile_output = await async_request_profile(
+            api_url=base_url + "/start_profile"
+        )
         if profile_output.success:
             print("Profiler started")
 
@@ -1148,8 +1148,10 @@ def run_benchmark(args_: argparse.Namespace):
             if args.base_url
             else f"http://{args.host}:{args.port}/v1/models/model:predict"
         )
-    base_url = f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
-    
+    base_url = (
+        f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
+    )
+
     # Get model name
     if args.model is None:
         if args.backend == "truss":
