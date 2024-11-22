@@ -854,7 +854,7 @@ def get_nvgpu_memory_capacity():
 
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
-def init_process_group(
+def init_custom_process_group(
     backend: Union[str, Backend] = None,
     init_method: Optional[str] = None,
     timeout: Optional[timedelta] = None,
