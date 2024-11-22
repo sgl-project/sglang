@@ -413,13 +413,6 @@ class ServerArgs:
             default=ServerArgs.download_dir,
             help="Model download directory.",
         )
-
-        parser.add_argument(
-            "--base-gpu-id",
-            type=int,
-            default=ServerArgs.base_gpu_id,
-            help="The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine.",
-        )
         parser.add_argument(
             "--base-gpu-id",
             type=int,
