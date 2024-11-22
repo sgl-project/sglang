@@ -658,6 +658,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        extend_no_prefix: bool,
         model_layer: RadixAttention,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
@@ -673,6 +674,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        extend_no_prefix: bool,
         model_layer: RadixAttention,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
@@ -697,6 +699,7 @@ class FlashInferIndicesUpdaterPrefill:
             None,
             self.kv_indptr[0],
             self.qo_indptr[0],
+            extend_no_prefix,
             model_layer,
             use_ragged,
             spec_info,
@@ -708,6 +711,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        extend_no_prefix: bool,
         model_layer: RadixAttention,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
@@ -740,6 +744,7 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_start_idx,
                 self.kv_indptr[wrapper_id],
                 self.qo_indptr[wrapper_id],
+                extend_no_prefix,
                 model_layer,
                 use_ragged,
                 spec_info,
@@ -751,6 +756,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        extend_no_prefix: bool,
         model_layer: RadixAttention,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
@@ -780,6 +786,8 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_start_idx,
                 self.kv_indptr[wrapper_id],
                 self.qo_indptr[wrapper_id],
+                forward_metadata,
+                extend_no_prefix,
                 model_layer,
                 use_ragged,
                 spec_info,
@@ -797,6 +805,7 @@ class FlashInferIndicesUpdaterPrefill:
         kv_start_idx: torch.Tensor,
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
+        extend_no_prefix: bool,
         model_layer: RadixAttention,
         use_ragged: bool,
         spec_info: Optional[SpecInfo],
@@ -843,6 +852,16 @@ class FlashInferIndicesUpdaterPrefill:
             "q_data_type": self.q_data_type,
         }
 
+        if not use_ragged:
+            plan_args.update(
+                {
+                    "causal": not model_layer.is_cross_attention,
+                    "sm_scale": model_layer.scaling,
+                    "window_left": model_layer.sliding_window_size,
+                    "logits_soft_cap": model_layer.logit_cap,
+                }
+            )
+
         # extend part
         if use_ragged:
             wrapper_ragged.end_forward()
@@ -854,22 +873,14 @@ class FlashInferIndicesUpdaterPrefill:
                 self.head_dim,
                 q_data_type=self.q_data_type,
             )
-            plan_args.update(
-                {
-                    "causal": False,
-                    "sm_scale": model_layer.scaling,
-                    "logits_soft_cap": model_layer.logit_cap,
-                }
-            )
-        else:
-            plan_args.update(
-                {
-                    "causal": not model_layer.is_cross_attention,
-                    "sm_scale": model_layer.scaling,
-                    "window_left": model_layer.sliding_window_size,
-                    "logits_soft_cap": model_layer.logit_cap,
-                }
-            )
+            if not extend_no_prefix:
+                plan_args.update(
+                    {
+                        "causal": False,
+                        "sm_scale": model_layer.scaling,
+                        "logits_soft_cap": model_layer.logit_cap,
+                    }
+                )
 
         wrapper.plan(**plan_args)
 
