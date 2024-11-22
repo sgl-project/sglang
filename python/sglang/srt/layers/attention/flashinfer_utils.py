@@ -232,7 +232,7 @@ class FlashinferUpdater:
 
     def _update_indicess_single_wrapper(self):
         self._get_indices()
-        if self.forward_mode.is_verify():
+        if self.forward_mode.is_spec_verify():
             if self.use_cuda_graph:
                 self._update_verify_indices(self.decode_wrappers[0])
             else:

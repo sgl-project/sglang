@@ -39,7 +39,7 @@ class LogitsProcessorOutput:
     # The logprobs of the next tokens.     shape: [#seq, vocab_size]
     next_token_logprobs: torch.Tensor = None
 
-    # Used by speculative inference
+    # Used by speculative inference (eagle)
     # The output of transformer layers
     hidden_states: Optional[torch.Tensor] = None
     # backup of next_token_logits when use cuda graph
@@ -90,19 +90,10 @@ class LogitsMetadata:
         else:
             return_top_logprob = False
 
-        if forward_batch.forward_mode.is_extend() and hasattr(
-            forward_batch, "spec_info"
-        ):
-            extend_logprob_pruned_lens_cpu = [
-                extend_len - start_len
-                for extend_len, start_len in zip(
-                    forward_batch.extend_seq_lens,
-                    forward_batch.extend_logprob_start_lens_cpu,
-                )
-            ]
-
+        if forward_batch.spec_info is not None:
+            capture_hidden_mode = forward_batch.spec_info.capture_hidden_mode
         else:
-            extend_logprob_pruned_lens_cpu = None
+            capture_hidden_mode = CaptureHiddenMode.NULL
         return cls(
             forward_mode=forward_batch.forward_mode,
             top_logprobs_nums=forward_batch.top_logprobs_nums,

@@ -50,6 +50,25 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.speculative_utils import SpecInput
 
 
+class SpeculativeAlgorithm(IntEnum):
+    NONE = auto()
+    EAGLE = auto()
+
+    def is_not_none(self):
+        return self != SpeculativeAlgorithm.NONE
+
+    def is_eagle(self):
+        return self == SpeculativeAlgorithm.EAGLE
+
+    @staticmethod
+    def get_algorithm(algorithm):
+        algorithm_map = {
+            "EAGLE": SpeculativeAlgorithm.EAGLE,
+            None: SpeculativeAlgorithm.NONE,
+        }
+        return algorithm_map[algorithm]
+
+
 class ForwardMode(IntEnum):
     # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
     PREFILL = auto()
@@ -60,9 +79,9 @@ class ForwardMode(IntEnum):
     # Contains both EXTEND and DECODE when doing chunked prefill.
     MIXED = auto()
     # Speculative Verify stage
-    SPECVERIFY = auto()
+    SPEC_VERIFY = auto()
     # Speculative draft Extend stage which after verify stage
-    SPECEXTEND = auto()
+    SPEC_EXTEND = auto()
     # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
     IDLE = auto()
 
@@ -77,23 +96,23 @@ class ForwardMode(IntEnum):
         return self in (
             ForwardMode.EXTEND,
             ForwardMode.MIXED,
-            ForwardMode.SPECEXTEND,
+            ForwardMode.SPEC_EXTEND,
         )
 
     def is_decode(self):
-        return self in (ForwardMode.DECODE, ForwardMode.SPECVERIFY)
+        return self in (ForwardMode.DECODE, ForwardMode.SPEC_VERIFY)
 
     def is_mixed(self):
         return self == ForwardMode.MIXED
 
-    def is_verify(self):
-        return self == ForwardMode.SPECVERIFY
+    def is_spec_verify(self):
+        return self == ForwardMode.SPEC_VERIFY
 
     def is_spec_extend(self):
-        return self == ForwardMode.SPECEXTEND
+        return self == ForwardMode.SPEC_EXTEND
 
     def is_cuda_graph(self):
-        return self in (ForwardMode.DECODE, ForwardMode.SPECVERIFY)
+        return self in (ForwardMode.DECODE, ForwardMode.SPEC_VERIFY)
 
     def is_idle(self):
         return self == ForwardMode.IDLE
@@ -175,7 +194,7 @@ class ForwardBatch:
 
     # Speculative decoding
     spec_info: SpecInput = None
-    spec_algorithm: str = None
+    spec_algorithm: SpeculativeAlgorithm = SpeculativeAlgorithm.NONE
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None

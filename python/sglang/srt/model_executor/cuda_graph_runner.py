@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    SpeculativeAlgorithm,
 )
 from sglang.srt.speculative.speculative_utils import DraftInfoFactory
 from sglang.srt.utils import maybe_torch_compile, monkey_patch_vllm_all_gather
@@ -133,11 +134,11 @@ class CudaGraphRunner:
             and bs <= model_runner.server_args.cuda_graph_max_bs
         ]
         self.capture_forward_mode = ForwardMode.DECODE
-        if model_runner.server_args.speculative_algorithm == "EAGLE":
+        if model_runner.server_args.speculative_algorithm.is_eagle():
             if self.model_runner.is_draft_runner:
                 expand_num = self.model_runner.server_args.eagle_topk
             else:
-                self.capture_forward_mode = ForwardMode.SPECVERIFY
+                self.capture_forward_mode = ForwardMode.SPEC_VERIFY
                 expand_num = self.model_runner.server_args.num_draft_tokens
             self.num_tokens = [bs * expand_num for bs in self.capture_bs]
         else:
@@ -179,7 +180,7 @@ class CudaGraphRunner:
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int32)
 
             # speculative_inference
-            if self.model_runner.server_args.speculative_algorithm == "EAGLE":
+            if self.model_runner.server_args.speculative_algorithm.is_eagle():
                 self.hidden_states = torch.zeros(
                     (self.max_num_token, self.model_runner.model_config.hidden_size),
                     dtype=self.model_runner.dtype,
@@ -251,7 +252,11 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else True
         )
-        return is_bs_supported and is_encoder_lens_supported
+        return (
+            is_bs_supported
+            and is_encoder_lens_supported
+            and forward_batch.forward_mode.is_cuda_graph()
+        )
 
     def capture(self):
         with graph_capture() as graph_capture_context:
@@ -281,7 +286,7 @@ class CudaGraphRunner:
         positions = self.positions[:num_token]
 
         spec_info = None
-        if self.model_runner.server_args.speculative_algorithm == "EAGLE":
+        if self.model_runner.server_args.speculative_algorithm.is_eagle():
             if self.model_runner.is_draft_runner:
                 spec_info = DraftInfoFactory.get(
                     self.model_runner.server_args.speculative_algorithm, "DraftInput"
@@ -419,7 +424,8 @@ class CudaGraphRunner:
 
         # EAGLE speculative decoding
         if isinstance(
-            forward_batch.spec_info, DraftInfoFactory.get("EAGLE", "DraftInput")
+            forward_batch.spec_info,
+            DraftInfoFactory.get(SpeculativeAlgorithm.EAGLE, "DraftInput"),
         ):
             self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
 

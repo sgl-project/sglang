@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 class TpModelWorker:
     """A tensor parallel model worker."""
 
+    is_draft_worker = False
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -48,7 +50,7 @@ class TpModelWorker:
         # Parse args
         self.tp_rank = tp_rank
         self.server_args = server_args
-        is_draft_worker = getattr(self, "is_draft_worker", False)
+        is_draft_worker = self.is_draft_worker
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -154,16 +156,16 @@ class TpModelWorker:
         self,
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
-        need_token_id: bool = True,
+        skip_sample: bool = False,
     ):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
         if launch_done:
             launch_done.set()
-        if need_token_id:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
-        else:
+        if skip_sample:
             next_token_ids = None
+        else:
+            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         model_worker_batch.spec_info = forward_batch.spec_info
         return logits_output, next_token_ids
 

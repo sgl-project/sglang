@@ -190,7 +190,7 @@ class Scheduler:
         )
 
         # Launch Speculative worker if need
-        if self.server_args.speculative_algorithm is not None:
+        if self.server_args.speculative_algorithm.is_not_none():
             self.draft_worker = spec_worker_factory.get(
                 self.server_args.speculative_algorithm
             )(
@@ -890,9 +890,9 @@ class Scheduler:
 
         # Check if decode out of memory
         buf_multiplier = (
-            1
-            if self.server_args.speculative_algorithm is None
-            else self.server_args.num_draft_tokens
+            self.server_args.num_draft_tokens
+            if self.server_args.speculative_algorithm.is_not_none()
+            else 1
         )
         if not batch.check_decode_mem(buf_multiplier) or (
             test_retract and batch.batch_size() > 10
@@ -932,7 +932,7 @@ class Scheduler:
         self.forward_ct += 1
         if self.is_generation:
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                if self.server_args.speculative_algorithm:
+                if self.server_args.speculative_algorithm.is_not_none():
                     logits_output, next_token_ids, model_worker_batch = (
                         self.draft_worker.forward_batch_speculative_generate(batch)
                     )
@@ -1084,7 +1084,7 @@ class Scheduler:
 
             req.completion_tokens_wo_jump_forward += 1
             if (
-                batch.spec_algorithm is None
+                not batch.spec_algorithm.is_not_none()
             ):  # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
             req.check_finished()

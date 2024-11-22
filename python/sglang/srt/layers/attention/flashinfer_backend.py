@@ -131,7 +131,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode():
             wrappers = (
                 self.prefill_wrappers_verify
-                if forward_batch.forward_mode.is_verify()
+                if forward_batch.forward_mode.is_spec_verify()
                 else self.decode_wrappers
             )
             self.indices_updater_decode.update(
@@ -142,7 +142,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=forward_batch.encoder_lens,
                 forward_batch=forward_batch,
             )
-            if forward_batch.forward_mode.is_verify():
+            if forward_batch.forward_mode.is_spec_verify():
                 self.forward_metadata = (False, False, None)
             else:
                 self.forward_metadata = (wrappers,)
@@ -167,7 +167,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if (
                 forward_batch.extend_num_tokens >= 4096
                 and self.num_wrappers == 1
-                and not forward_batch.forward_mode.is_verify()
+                and not forward_batch.forward_mode.is_spec_verify()
             ):
                 use_ragged = True
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
@@ -286,7 +286,7 @@ class FlashInferAttnBackend(AttentionBackend):
     def forward_extend(
         self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
     ):
-        if forward_batch.forward_mode.is_verify():
+        if forward_batch.forward_mode.is_spec_verify():
             prefill_wrapper_paged = self.prefill_wrappers_verify[
                 self._get_wrapper_idx(layer)
             ]
@@ -306,7 +306,10 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is not None:
                 assert v is not None
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-            if graph_wrapper is not None and forward_batch.forward_mode.is_verify():
+            if (
+                graph_wrapper is not None
+                and forward_batch.forward_mode.is_spec_verify()
+            ):
                 o = graph_wrapper[self._get_wrapper_idx(layer)].forward(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
@@ -552,7 +555,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
             )
 
-        if forward_batch is not None and forward_batch.forward_mode.is_verify():
+        if forward_batch is not None and forward_batch.forward_mode.is_spec_verify():
             bs = len(req_pool_indices)
             custom_mask = getattr(forward_batch.spec_info, "custom_mask", None)
             wrapper.end_forward()

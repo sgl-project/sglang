@@ -2,17 +2,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Type
 
-import torch
-import triton
-import triton.language as tl
-
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
-from .build_eagle_tree import build_tree_kernel
-
 if TYPE_CHECKING:
-    from python.sglang.srt.layers.sampler import SampleOutput
-    from python.sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.server_args import ServerArgs
 

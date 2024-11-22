@@ -45,7 +45,10 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardMode,
+    SpeculativeAlgorithm,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -492,7 +495,7 @@ class ScheduleBatch:
 
     # speculative decoding
     spec_info: SpecInput = None
-    spec_algorithm: str = None
+    spec_algorithm: SpeculativeAlgorithm = SpeculativeAlgorithm.NONE
 
     @classmethod
     def init_new(
@@ -502,7 +505,7 @@ class ScheduleBatch:
         token_to_kv_pool,
         tree_cache,
         model_config,
-        speculative_algorithm=None,
+        speculative_algorithm=SpeculativeAlgorithm.NONE,
     ):
         return cls(
             reqs=reqs,
@@ -910,7 +913,7 @@ class ScheduleBatch:
 
     def prepare_for_decode(self, enable_overlap: bool = False):
         self.forward_mode = ForwardMode.DECODE
-        if self.spec_algorithm == "EAGLE":
+        if self.spec_algorithm.is_eagle():
             return
 
         self.input_ids = self.output_ids
@@ -1133,7 +1136,7 @@ class ModelWorkerBatch:
     sampling_info: SamplingBatchInfo
 
     # Speclulative decoding
-    spec_algorithm: str = None
+    spec_algorithm: SpeculativeAlgorithm = SpeculativeAlgorithm.NONE
     spec_info: SpecInput = None
 
 

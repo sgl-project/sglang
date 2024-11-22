@@ -6,14 +6,17 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    SpeculativeAlgorithm,
+)
+from sglang.srt.speculative.build_eagle_tree import build_tree_kernel
 from sglang.srt.speculative.speculative_utils import (
     DraftInfoFactory,
     SpecDraftInput,
     SpecVerifyInput,
 )
-
-from .build_eagle_tree import build_tree_kernel
 
 if TYPE_CHECKING:
     from python.sglang.srt.layers.sampler import SampleOutput
@@ -218,7 +221,7 @@ def generate_draft_decode_kv_indices(
     tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)
 
 
-@DraftInfoFactory.register("EAGLE", "DraftInput")
+@DraftInfoFactory.register(SpeculativeAlgorithm.EAGLE, "DraftInput")
 class EAGLEDraftInput(SpecDraftInput):
     hidden_states: torch.Tensor = None
     verified_id: torch.Tensor = None
@@ -320,7 +323,7 @@ class EAGLEDraftInput(SpecDraftInput):
                 topk_cs_index + (self.topk**2 * (self.iter - 1) + self.topk)
             )  # b, topk
 
-        elif self.prev_mode in (ForwardMode.EXTEND, ForwardMode.SPECEXTEND):
+        elif self.prev_mode in (ForwardMode.EXTEND, ForwardMode.SPEC_EXTEND):
             self.scores = topk_p  # b, top_k
             self.score_list.append(topk_p.unsqueeze(1))
             self.token_list.append(topk_index)
@@ -509,7 +512,7 @@ class EAGLEDraftInput(SpecDraftInput):
         self.sample_output = torch.cat([self.sample_output, spec_info.sample_output])
 
 
-@DraftInfoFactory.register("EAGLE", "VerifyInput")
+@DraftInfoFactory.register(SpeculativeAlgorithm.EAGLE, "VerifyInput")
 class EagleVerifyInput(SpecVerifyInput):
     def __init__(
         self,

@@ -8,6 +8,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    SpeculativeAlgorithm,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_utils import EAGLEDraftInput, EagleVerifyInput
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-@spec_worker_factory.register("EAGLE")
+@spec_worker_factory.register(SpeculativeAlgorithm.EAGLE)
 class EAGLEWorker(SpeculativeWorker):
     def __init__(
         self,
@@ -103,13 +104,13 @@ class EAGLEWorker(SpeculativeWorker):
 
     def verify(self, batch: ScheduleBatch):
         verify_input = batch.spec_info.prepare_for_verify(batch)
-        batch.forward_mode = ForwardMode.SPECVERIFY
+        batch.forward_mode = ForwardMode.SPEC_VERIFY
         verify_input.prepare_for_verify(batch)
         batch.spec_info = verify_input
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch = batch.get_model_worker_batch()
         logits_output, _ = self.target_worker.forward_batch_generation(
-            model_worker_batch, need_token_id=False
+            model_worker_batch, skip_sample=True
         )
         verify_input.hidden_states = logits_output.hidden_states
         res = verify_input.verify(batch, logits_output)
@@ -122,7 +123,7 @@ class EAGLEWorker(SpeculativeWorker):
 
     def forward_extend_after_decode(self, batch: ScheduleBatch):
         self._swap_mem_pool(batch, self.model_runner)
-        batch.forward_mode = ForwardMode.SPECEXTEND
+        batch.forward_mode = ForwardMode.SPEC_EXTEND
         if batch.spec_info.has_finished:
             index = batch.spec_info.unfinished_index
             seq_lens = batch.seq_lens

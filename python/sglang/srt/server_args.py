@@ -22,6 +22,7 @@ import random
 import tempfile
 from typing import List, Optional
 
+from sglang.srt.model_executor.forward_batch_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_nvgpu_memory_capacity,
@@ -139,8 +140,8 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
 
     # speculative decoding
-    draft_model_path: str = None
-    speculative_algorithm: str = None
+    draft_model_path: Optional[str] = None
+    speculative_algorithm: SpeculativeAlgorithm = None
     num_speculative_steps: int = None
     # should been set as 2^n
     num_draft_tokens: int = None
@@ -220,10 +221,19 @@ class ServerArgs:
             self.disable_overlap_schedule = True
 
         # Speculative Decoding
-        if self.speculative_algorithm == "EAGLE":
+        self.speculative_algorithm = SpeculativeAlgorithm.get_algorithm(
+            self.speculative_algorithm
+        )
+        if self.speculative_algorithm.is_eagle():
             self.split_prefill_batch = True
             # EAGLE don't support it currently.
             self.disable_cuda_graph_padding = True
+            self.disable_radix_cache = True
+            self.disable_overlap_schedule = True
+            self.chunked_prefill_size = None
+            logger.info(
+                "EAGLE2 is not suppport radix cache and chunked_prefill currently."
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -516,7 +526,7 @@ class ServerArgs:
         parser.add_argument(
             "--dist-init-addr",
             "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
-            type=List[str],
+            type=str,
             help="""The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). Shoule provide
                 two host address if use speculative decoding""",
         )
@@ -865,7 +875,7 @@ class PortArgs:
             if is_port_available(port):
                 all_port.append(port)
             if len(all_port) == (
-                2 if server_args.speculative_algorithm is not None else 1
+                2 if server_args.speculative_algorithm.is_not_none() else 1
             ):
                 break
             port += 42
