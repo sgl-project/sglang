@@ -134,8 +134,8 @@ class Scheduler:
                 )
         else:
             self.recv_from_tokenizer = None
-            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda _: None)
-            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda _: None)
+            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init tokenizer
         self.model_config = ModelConfig(
@@ -1028,8 +1028,7 @@ class Scheduler:
                 else:
                     self.tree_cache.cache_unfinished_req(req)
 
-        if self.tp_rank == 0:
-            self.stream_output(batch.reqs)
+        self.stream_output(batch.reqs)
 
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
         logits_output, next_token_ids, bid = result
@@ -1080,8 +1079,7 @@ class Scheduler:
             torch.cuda.current_stream().synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
-        if self.tp_rank == 0:
-            self.stream_output(batch.reqs)
+        self.stream_output(batch.reqs)
 
         self.token_to_kv_pool.free_group_end()
 
