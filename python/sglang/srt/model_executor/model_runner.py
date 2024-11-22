@@ -656,7 +656,7 @@ class ModelRunner:
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):
-        self.attn_backend.init_forward_metadata(forward_batch)
+        self.attn_backend.init_forward_metadata(forward_batch, self.model_layer)
         if self.is_generation:
             if forward_batch.input_embeds is None:
                 return self.model.forward(
