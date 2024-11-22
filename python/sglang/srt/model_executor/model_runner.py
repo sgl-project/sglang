@@ -60,7 +60,7 @@ from sglang.srt.utils import (
     crash_on_warnings,
     enable_show_time_cost,
     get_available_gpu_memory,
-    init_process_group,
+    init_custom_process_group,
     is_hip,
     monkey_patch_vllm_model_config,
     monkey_patch_vllm_p2p_access_check,
@@ -403,25 +403,27 @@ class ModelRunner:
         group_name,
         backend="nccl",
     ):
-        """初始化用于模型参数更新的Torch进程组。
+        """Initialize the Torch process group for model parameter updates.
 
-        `_model_update_group`在RLHF工作流程中使用，其中rank 0是训练引擎中的actor模型，
-        而推理引擎用于rollout。
+        `_model_update_group` is used in the RLHF workflow, where rank 0 is the actor model in the training engine,
+        and the inference engine is used for rollout.
 
-        在RLHF工作流程中，训练引擎不断更新模型权重/参数，并通过`_model_update_group`进程组将其广播给推理引擎。
+        In the RLHF workflow, the training engine updates the model weights/parameters online,
+        and broadcasts them to the inference engine through the `_model_update_group` process group.
         """
-        assert torch.distributed.is_initialized(), "默认的torch进程组必须已初始化"
-        assert group_name != "", "组名不能为空"
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
 
         rank = rank_offset + self.tp_rank
 
         logger.info(
-            f"init process group: master_address={master_address}, master_port={master_port}, "
+            f"init custom process group: master_address={master_address}, master_port={master_port}, "
             f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
 
-        # 使用 new_group 而不是再次初始化默认进程组
-        self._model_update_group = init_process_group(
+        self._model_update_group = init_custom_process_group(
             backend=backend,
             init_method=f"tcp://{master_address}:{master_port}",
             world_size=world_size,
@@ -429,7 +431,7 @@ class ModelRunner:
             group_name=group_name,
         )
 
-        logger.info("init_process_group completed.")
+        logger.info("`_model_update_group` initialized.")
 
     def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
         """

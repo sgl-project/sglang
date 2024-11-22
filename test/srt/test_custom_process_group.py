@@ -7,7 +7,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
-from sglang.srt.utils import init_process_group, kill_child_process
+from sglang.srt.utils import init_custom_process_group, kill_child_process
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -29,9 +29,9 @@ class TestParameterUpdateDistributed(unittest.TestCase):
             torch.cuda.set_device(rank)
 
             group_name = "test_group_for_custom_process_group"
-            group = init_process_group(
+            group = init_custom_process_group(
                 backend="nccl",
-                init_method="env://",
+                init_method="tcp://localhost:29500",
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name,
