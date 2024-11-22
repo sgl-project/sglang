@@ -163,7 +163,7 @@ class BenchArgs:
         parser.add_argument(
             "--profile",
             action="store_true",
-            help="profile the generation process of a single batch",
+            help="Use Torch Profiler",
         )
         parser.add_argument(
             "--profile-dir",
@@ -217,7 +217,7 @@ def throughput_test_once(
     if profile:
         if not profile_dir:
             profile_dir = (
-                Path(".") / "vllm_benchmark_result" / f"latency_result_{time.time()}"
+                Path(".") / "sglang_benchmark_result" / f"latency_result_{time.time()}"
             )
         print(f"Profiling (results will be saved to '{profile_dir}')...")
         with torch.profiler.profile(
@@ -305,7 +305,7 @@ def throughput_test(
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
             profile=bench_args.profile,
-            profile_dir=bench_args.profile_dir,
+            profile_dir=False,
         )
 
     logging.info("\nBenchmark...")
