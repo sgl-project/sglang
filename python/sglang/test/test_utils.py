@@ -564,6 +564,7 @@ def run_bench_serving(
         disable_stream=disable_stream,
         disable_ignore_eos=False,
         extra_request_body=None,
+        profile=None,
     )
 
     try:
