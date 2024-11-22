@@ -16,9 +16,11 @@ import json
 import logging
 import random
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 
 from sglang.api import Engine
 from sglang.bench_serving import (
@@ -52,6 +54,8 @@ class BenchArgs:
     seed: int = 1
     skip_warmup: bool = False
     do_not_exit: bool = False
+    profile: bool = False
+    profile_dir: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -156,6 +160,20 @@ class BenchArgs:
             action="store_true",
             help="Do not exit the program. This is useful for nsys profile with --duration and --delay.",
         )
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="profile the generation process of a single batch",
+        )
+        parser.add_argument(
+            "--profile-dir",
+            type=str,
+            default=None,
+            help=(
+                "path to save the pytorch profiler output. Can be visualized "
+                "with ui.perfetto.dev or Tensorboard."
+            ),
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -169,6 +187,8 @@ def throughput_test_once(
     reqs: List[Tuple[str, int, int]],
     ignore_eos: bool,
     extra_request_body: Dict,
+    profile: bool,
+    profile_dir: str,
 ):
     measurement_results = {
         "backend": backend_name,
@@ -194,7 +214,23 @@ def throughput_test_once(
     ]
 
     st = time.perf_counter()
-    gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+    if profile:
+        if not profile_dir:
+            profile_dir = (
+                Path(".") / "vllm_benchmark_result" / f"latency_result_{time.time()}"
+            )
+        print(f"Profiling (results will be saved to '{profile_dir}')...")
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            with_stack=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profile_dir)),
+        ) as p:
+            gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+    else:
+        gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
     latency = time.perf_counter() - st
 
     if backend_name == "runtime":
@@ -268,6 +304,8 @@ def throughput_test(
             reqs=warmup_requests,
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
+            profile=bench_args.profile,
+            profile_dir=bench_args.profile_dir,
         )
 
     logging.info("\nBenchmark...")
@@ -277,6 +315,8 @@ def throughput_test(
         reqs=input_requests,
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
+        profile=bench_args.profile,
+        profile_dir=bench_args.profile_dir,
     )
 
     if bench_args.result_filename:
