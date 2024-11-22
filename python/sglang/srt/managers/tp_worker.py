@@ -19,6 +19,7 @@ limitations under the License.
 
 
 import logging
+import threading
 from typing import Optional
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -150,10 +151,15 @@ class TpModelWorker:
         self.model_runner.forward(forward_batch)
 
     def forward_batch_generation(
-        self, model_worker_batch: ModelWorkerBatch, need_token_id=True
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        launch_done: Optional[threading.Event] = None,
+        need_token_id: bool = True,
     ):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
+        if launch_done:
+            launch_done.set()
         if need_token_id:
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         else:

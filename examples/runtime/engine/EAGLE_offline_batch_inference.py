@@ -17,11 +17,12 @@ def main():
         model_path="meta-llama/Llama-2-7b-chat-hf",
         draft_model_path="kavio/Sglang-EAGLE-llama2-chat-7B",
         disable_radix_cache=True,
+        disable_overlap_schedule=True,
         num_speculative_steps=3,
         eagle_topk=4,
         num_draft_tokens=16,
         speculative_algorithm="EAGLE",
-        mem_fraction_static=0.65,
+        mem_fraction_static=0.70,
     )
 
     outputs = llm.generate(prompts, sampling_params)

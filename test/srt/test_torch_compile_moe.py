@@ -1,3 +1,4 @@
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -56,10 +57,10 @@ class TestTorchCompile(unittest.TestCase):
         return response.json()
 
     def test_throughput(self):
-        import time
+        # Warmup
+        res = self.run_decode(16)
 
         max_tokens = 256
-
         tic = time.time()
         res = self.run_decode(max_tokens)
         tok = time.time()

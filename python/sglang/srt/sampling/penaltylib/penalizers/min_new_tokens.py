@@ -1,8 +1,8 @@
-import typing
+from typing import List
 
 import torch
 
-from ..orchestrator import _BatchedPenalizer, _TokenIDs
+from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer, _TokenIDs
 
 
 class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
@@ -70,10 +70,6 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         )
 
     def _teardown(self):
-        del self.min_new_tokens
-        del self.stop_token_penalties
-        del self.len_output_tokens
-
         self.min_new_tokens = None
         self.stop_token_penalties = None
         self.len_output_tokens = None
@@ -89,9 +85,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         logits[mask] += self.stop_token_penalties[mask]
         return logits
 
-    def _filter(
-        self, indices_to_keep: typing.List[int], indices_tensor_to_keep: torch.Tensor
-    ):
+    def _filter(self, indices_to_keep: List[int], indices_tensor_to_keep: torch.Tensor):
         self.min_new_tokens = self.min_new_tokens[indices_tensor_to_keep]
         self.stop_token_penalties = self.stop_token_penalties[indices_tensor_to_keep]
         self.len_output_tokens = self.len_output_tokens[indices_tensor_to_keep]
