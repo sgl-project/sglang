@@ -123,6 +123,7 @@ class ServerArgs:
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     num_continuous_decode_steps: int = 1
+    pd_policy:str = ""
 
     def __post_init__(self):
         # Set missing default values
@@ -640,6 +641,13 @@ class ServerArgs:
             help="Run multiple continuous decoding steps to reduce scheduling overhead. "
             "This can potentially increase throughput but may also increase time-to-first-token latency. "
             "The default value is 1, meaning only run one decoding step at a time.",
+        )
+        parser.add_argument(
+            "--pd-policy",
+            type=str,
+            choices=["pdmux", "pddis"],
+            default=ServerArgs.pd_policy,
+            help="Choose pd disaggregate policy",           
         )
 
     @classmethod

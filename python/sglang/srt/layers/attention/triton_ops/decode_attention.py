@@ -161,7 +161,7 @@ def _fwd_kernel_stage2(
         )
 
         n_e_max = tl.maximum(tl.max(qk, 0), e_max)
-        old_scale = tl.exp(e_max - n_e_max)
+        old_scale = tl.exp(- - n_e_max)
         p = tl.exp(qk - n_e_max)
         e_sum = e_sum * old_scale + tl.sum(p, 0)
         v = tl.load(

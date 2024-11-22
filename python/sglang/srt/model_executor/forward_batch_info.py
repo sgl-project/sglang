@@ -56,6 +56,8 @@ class ForwardMode(IntEnum):
     DECODE = auto()
     # Contains both EXTEND and DECODE.
     MIXED = auto()
+    # Split Prefill for PD multiplexing
+    SPLIT_PREFILL = auto()
 
     def is_prefill(self):
         return self == ForwardMode.PREFILL
@@ -68,6 +70,9 @@ class ForwardMode(IntEnum):
 
     def is_mixed(self):
         return self == ForwardMode.MIXED
+    
+    def is_split_prefill(self):
+        return self == ForwardMode.SPLIT_PREFILL
 
 
 @dataclass
@@ -127,6 +132,12 @@ class ForwardBatch:
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
+
+    # For split prefill
+    hidden_states: torch.Tensor = None
+    residual: torch.Tensor = None
+    split_index: int
+
 
     def compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch

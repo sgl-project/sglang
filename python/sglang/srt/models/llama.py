@@ -316,6 +316,45 @@ class LlamaForCausalLM(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
+    
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_index: int,
+        input_embeds: torch.Tensor = None
+    ) -> Optional[LogitsProcessorOutput]:
+        # embed
+        if split_index == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                forward_batch.hidden_states = input_embeds            
+            return
+        # decoder layer
+        if split_index < self.config.num_hidden_layers + 1:
+            layer = self.model.layers[split_index - 1]
+            hidden_states, residual = layer(
+                positions,
+                forward_batch.hidden_states,
+                forward_batch,
+                forward_batch.residual,
+            )
+            forward_batch.hidden_states = hidden_states
+            forward_batch.residual = residual
+            return
+        # norm
+        if split_index == self.config.num_hidden_layers + 1:
+            hidden_states, _ = self.model.norm(forward_batch.hidden_states, forward_batch.residual)
+            forward_batch.hidden_states = hidden_states
+            return
+        # logits process
+        return self.logits_processor(
+            input_ids, forward_batch.hidden_states, self.lm_head.weight, forward_batch
+        )
+
 
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim

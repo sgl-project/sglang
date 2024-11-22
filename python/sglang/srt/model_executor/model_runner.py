@@ -231,7 +231,7 @@ class ModelRunner:
             if torch.cuda.get_device_capability()[0] < 8:
                 logger.info(
                     "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
-                )
+                ) 
                 self.server_args.dtype = "float16"
                 if torch.cuda.get_device_capability()[1] < 5:
                     raise RuntimeError("SGLang only supports sm75 and above.")
@@ -580,12 +580,20 @@ class ModelRunner:
                 forward_batch,
                 get_embedding=True,
             )
+    
+    def forward_split_prefill(self, forward_batch: ForwardBatch):
+        self.attn_backend.init_forward_metadata(forward_batch)
+        return self.model.forward_split_prefill(
+            forward_batch.input_ids, forward_batch.positions, forward_batch, forward_batch.split_index
+        )
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
             return self.forward_extend(forward_batch)
+        elif forward_batch.forward_mode.is_split_prefill():
+            return self.forward_split_prefill(forward_batch)
         else:
             raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
 

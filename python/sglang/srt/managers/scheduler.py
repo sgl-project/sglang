@@ -324,6 +324,37 @@ class Scheduler:
                 self.new_token_ratio = global_config.init_new_token_ratio
 
             self.last_batch = batch
+    
+    @torch.inference_mode()
+    def event_loop_pdmux(self):
+        """A scheduler loop for pd multiplexing."""
+        self.last_batch = None
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+
+            batch = self.get_next_batch_to_run()
+
+            if batch:
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
+
+                # Decode multiple steps to reduce the overhead
+                if batch.forward_mode.is_decode():
+                    for _ in range(self.server_args.num_continuous_decode_steps - 1):
+                        if not self.running_batch:
+                            break
+                        self.update_running_batch()
+                        if not self.running_batch:
+                            break
+                        result = self.run_batch(batch)
+                        self.process_batch_result(batch, result)
+            else:
+                self.check_memory()
+                self.new_token_ratio = global_config.init_new_token_ratio
+
+            self.last_batch = batch
 
     def recv_requests(self):
         if self.tp_rank == 0:
@@ -478,7 +509,7 @@ class Scheduler:
             f"#queue-req: {len(self.waiting_queue)}"
         )
 
-    def check_memory(self):
+    def check_memory(self): 
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
@@ -1135,6 +1166,8 @@ def run_scheduler_process(
         pipe_writer.send("ready")
         if server_args.enable_overlap_schedule:
             scheduler.event_loop_overlap()
+        elif server_args.pd_policy == "pdmux":
+            scheduler.event_loop_pdmux()
         else:
             scheduler.event_loop_normal()
     except Exception:
