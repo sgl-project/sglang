@@ -181,7 +181,7 @@ class ModelRunner:
         if self.device == "cuda":
             torch.cuda.set_device(self.gpu_id)
             backend = "nccl"
-        # ToDO(liangan1):Just use gloo to bypass the initilization fail
+        # TODO(liangan1): Just use gloo to bypass the initilization fail
         # Need to use xccl for xpu backend in the future
         elif self.device == "xpu":
             torch.xpu.set_device(self.gpu_id)
