@@ -469,14 +469,23 @@ class TokenizerManager:
         else:
             return False, "Another update is in progress. Please try again later."
 
-    def init_parameter_update_group(
+    async def init_parameter_update_group(
         self,
         obj: InitParameterUpdateGroupReqInput,
         request: Optional[fastapi.Request] = None,
-    ):
+    ) -> bool:
         if obj.backend is None:
             obj.backend = "nccl"
         self.send_to_scheduler.send_pyobj(obj)
+
+        # 添加一个Future来等待scheduler的响应
+        self.parameter_update_result = asyncio.Future()
+        try:
+            result = await self.parameter_update_result
+            return result.success
+        except Exception as e:
+            logger.error(f"Error in init_parameter_update_group: {e}")
+            return False
 
     async def update_parameter_from_distributed(
         self,

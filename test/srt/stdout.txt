@@ -1,0 +1,25 @@
+INFO 11-22 03:08:21 weight_utils.py:243] Using model weights format ['*.safetensors']
+[2024-11-22 03:08:33] INFO:     127.0.0.1:48830 - "GET /health_generate HTTP/1.1" 200 OK
+[2024-11-22 03:08:33] INFO:     127.0.0.1:48842 - "GET /get_model_info HTTP/1.1" 200 OK
+[2024-11-22 03:08:33] INFO:     127.0.0.1:48850 - "POST /generate HTTP/1.1" 200 OK
+[2024-11-22 03:08:37] INFO:     127.0.0.1:49414 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:37] INFO:     127.0.0.1:49154 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:38] INFO:     127.0.0.1:49516 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:38] INFO:     127.0.0.1:49490 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:38] INFO:     127.0.0.1:49246 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:38] INFO:     127.0.0.1:48994 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:38] INFO:     127.0.0.1:49828 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:38] INFO:     127.0.0.1:49954 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:48882 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:48872 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:48938 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:49526 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:48866 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:49542 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:49606 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:48958 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:49742 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:48924 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:49126 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:39] INFO:     127.0.0.1:49276 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2024-11-22 03:08:40] INFO:     127.0.0.1:49608 - "POST /v1/chat/completions HTTP/1.1" 200 OK

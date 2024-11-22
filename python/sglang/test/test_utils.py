@@ -424,6 +424,10 @@ def popen_launch_server(
         port,
         *other_args,
     ]
+
+    if api_key:
+        command += ["--api-key", api_key]
+
     if api_key:
         command += ["--api-key", api_key]
 

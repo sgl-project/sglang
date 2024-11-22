@@ -11,6 +11,7 @@ suites = {
         "models/test_reward_models.py",
         "sampling/penaltylib",
         "test_chunked_prefill.py",
+        "test_custom_process_group.py",
         "test_double_sparsity.py",
         "test_embedding_openai_server.py",
         "test_eval_accuracy_mini.py",

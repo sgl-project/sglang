@@ -1,0 +1,447 @@
+/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/transformers/utils/hub.py:128: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+[2024-11-22 03:08:11] server_args=ServerArgs(model_path='meta-llama/Llama-3.1-8B-Instruct', tokenizer_path='meta-llama/Llama-3.1-8B-Instruct', tokenizer_mode='auto', skip_tokenizer_init=False, load_format='auto', trust_remote_code=False, dtype='auto', kv_cache_dtype='auto', quantization=None, context_length=None, device='cuda', served_model_name='meta-llama/Llama-3.1-8B-Instruct', chat_template=None, is_embedding=False, host='127.0.0.1', port=4254, mem_fraction_static=0.88, max_running_requests=None, max_total_tokens=None, chunked_prefill_size=32, max_prefill_tokens=16384, schedule_policy='lpm', schedule_conservativeness=1.0, tp_size=1, stream_interval=1, random_seed=668455020, constrained_json_whitespace_pattern=None, watchdog_timeout=300, download_dir=None, log_level='info', log_level_http=None, log_requests=False, show_time_cost=False, enable_metrics=False, decode_log_interval=40, api_key=None, file_storage_pth='SGLang_storage', enable_cache_report=False, dp_size=1, load_balance_method='round_robin', dist_init_addr=None, nnodes=1, node_rank=0, json_model_override_args='{}', enable_double_sparsity=False, ds_channel_config_path=None, ds_heavy_channel_num=32, ds_heavy_token_num=256, ds_heavy_channel_type='qk', ds_sparse_decode_threshold=4096, lora_paths=None, max_loras_per_batch=8, attention_backend='flashinfer', sampling_backend='flashinfer', grammar_backend='outlines', disable_radix_cache=False, disable_jump_forward=False, disable_cuda_graph=False, disable_cuda_graph_padding=False, disable_disk_cache=False, disable_custom_all_reduce=False, disable_mla=False, disable_overlap_schedule=True, enable_mixed_chunk=True, enable_dp_attention=False, enable_torch_compile=False, torch_compile_max_bs=32, cuda_graph_max_bs=160, torchao_config='', enable_nan_detection=False, enable_p2p_check=False, triton_attention_reduce_in_fp32=False, num_continuous_decode_steps=1, delete_ckpt_after_loading=False)
+/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/transformers/utils/hub.py:128: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/transformers/utils/hub.py:128: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+[2024-11-22 03:08:19 TP0] Init torch distributed begin.
+[2024-11-22 03:08:20 TP0] Load weight begin. avail mem=78.50 GB
+[2024-11-22 03:08:21 TP0] lm_eval is not installed, GPTQ may not be usable
+Loading safetensors checkpoint shards:   0% Completed | 0/4 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:  25% Completed | 1/4 [00:00<00:01,  1.65it/s]
+Loading safetensors checkpoint shards:  50% Completed | 2/4 [00:01<00:01,  1.45it/s]
+Loading safetensors checkpoint shards:  75% Completed | 3/4 [00:02<00:00,  1.38it/s]
+Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:02<00:00,  1.78it/s]
+Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:02<00:00,  1.65it/s]
+
+[2024-11-22 03:08:24 TP0] Load weight end. type=LlamaForCausalLM, dtype=torch.bfloat16, avail mem=63.41 GB
+[2024-11-22 03:08:24 TP0] Memory pool end. avail mem=8.41 GB
+[2024-11-22 03:08:24 TP0] Capture cuda graph begin. This can take up to several minutes.
+[2024-11-22 03:08:32 TP0] max_total_num_tokens=442300, max_prefill_tokens=16384, max_running_requests=2049, context_len=131072
+[2024-11-22 03:08:32] INFO:     Started server process [3057147]
+[2024-11-22 03:08:32] INFO:     Waiting for application startup.
+[2024-11-22 03:08:32] INFO:     Application startup complete.
+[2024-11-22 03:08:32] INFO:     Uvicorn running on http://127.0.0.1:4254 (Press CTRL+C to quit)
+[2024-11-22 03:08:33 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, cache hit rate: 0.00%, token usage: 0.00, #running-req: 0, #queue-req: 0
+[2024-11-22 03:08:33 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 0, cache hit rate: 0.00%, token usage: 0.00, #running-req: 0, #queue-req: 0
+[2024-11-22 03:08:33] The server is fired up and ready to roll!
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 1, cache hit rate: 2.44%, token usage: 0.00, #running-req: 0, #queue-req: 0
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 33, cache hit rate: 32.08%, token usage: 0.00, #running-req: 0, #queue-req: 14
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 65, cache hit rate: 48.77%, token usage: 0.00, #running-req: 0, #queue-req: 16
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 97, cache hit rate: 59.04%, token usage: 0.00, #running-req: 0, #queue-req: 28
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 2, #new-token: 32, #cached-token: 206, cache hit rate: 70.53%, token usage: 0.00, #running-req: 0, #queue-req: 32
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 2, #new-token: 31, #cached-token: 179, cache hit rate: 74.49%, token usage: 0.00, #running-req: 1, #queue-req: 39
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 30, #cached-token: 90, cache hit rate: 74.56%, token usage: 0.00, #running-req: 2, #queue-req: 48
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 2, #new-token: 30, #cached-token: 197, cache hit rate: 77.02%, token usage: 0.00, #running-req: 2, #queue-req: 53
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 2, #new-token: 29, #cached-token: 170, cache hit rate: 78.28%, token usage: 0.00, #running-req: 3, #queue-req: 61
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 28, #cached-token: 88, cache hit rate: 78.09%, token usage: 0.00, #running-req: 4, #queue-req: 69
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 2, #new-token: 28, #cached-token: 193, cache hit rate: 79.31%, token usage: 0.00, #running-req: 4, #queue-req: 73
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 27, #cached-token: 82, cache hit rate: 79.06%, token usage: 0.00, #running-req: 5, #queue-req: 82
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 2, #new-token: 27, #cached-token: 186, cache hit rate: 79.95%, token usage: 0.00, #running-req: 5, #queue-req: 90
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 26, #cached-token: 94, cache hit rate: 79.86%, token usage: 0.00, #running-req: 6, #queue-req: 98
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 25, #cached-token: 77, cache hit rate: 79.66%, token usage: 0.00, #running-req: 7, #queue-req: 104
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 2, #new-token: 25, #cached-token: 179, cache hit rate: 80.34%, token usage: 0.00, #running-req: 7, #queue-req: 112
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 24, #cached-token: 79, cache hit rate: 80.19%, token usage: 0.00, #running-req: 8, #queue-req: 120
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 24, #cached-token: 103, cache hit rate: 80.23%, token usage: 0.00, #running-req: 8, #queue-req: 120
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 2, #new-token: 24, #cached-token: 204, cache hit rate: 80.97%, token usage: 0.00, #running-req: 8, #queue-req: 119
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 2, #new-token: 23, #cached-token: 177, cache hit rate: 81.46%, token usage: 0.00, #running-req: 9, #queue-req: 118
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 22, #cached-token: 84, cache hit rate: 81.39%, token usage: 0.00, #running-req: 10, #queue-req: 118
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 22, #cached-token: 106, cache hit rate: 81.44%, token usage: 0.00, #running-req: 10, #queue-req: 118
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 1, #new-token: 22, #cached-token: 128, cache hit rate: 81.61%, token usage: 0.00, #running-req: 10, #queue-req: 118
+[2024-11-22 03:08:34 TP0] Prefill batch. #new-seq: 2, #new-token: 22, #cached-token: 227, cache hit rate: 82.25%, token usage: 0.00, #running-req: 10, #queue-req: 117
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 21, #cached-token: 175, cache hit rate: 82.61%, token usage: 0.00, #running-req: 11, #queue-req: 116
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 20, #cached-token: 78, cache hit rate: 82.53%, token usage: 0.00, #running-req: 12, #queue-req: 116
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 20, #cached-token: 98, cache hit rate: 82.55%, token usage: 0.00, #running-req: 12, #queue-req: 116
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 20, #cached-token: 118, cache hit rate: 82.64%, token usage: 0.00, #running-req: 12, #queue-req: 116
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 20, #cached-token: 138, cache hit rate: 82.81%, token usage: 0.00, #running-req: 12, #queue-req: 116
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 20, #cached-token: 235, cache hit rate: 83.32%, token usage: 0.00, #running-req: 12, #queue-req: 115
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 19, #cached-token: 78, cache hit rate: 83.26%, token usage: 0.00, #running-req: 13, #queue-req: 115
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 19, #cached-token: 97, cache hit rate: 83.27%, token usage: 0.00, #running-req: 13, #queue-req: 115
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 19, #cached-token: 193, cache hit rate: 83.60%, token usage: 0.00, #running-req: 13, #queue-req: 114
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 18, #cached-token: 89, cache hit rate: 83.59%, token usage: 0.00, #running-req: 14, #queue-req: 114
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 18, #cached-token: 107, cache hit rate: 83.63%, token usage: 0.00, #running-req: 14, #queue-req: 114
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 18, #cached-token: 201, cache hit rate: 83.96%, token usage: 0.00, #running-req: 14, #queue-req: 113
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 17, #cached-token: 78, cache hit rate: 83.92%, token usage: 0.00, #running-req: 15, #queue-req: 113
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 17, #cached-token: 95, cache hit rate: 83.94%, token usage: 0.00, #running-req: 15, #queue-req: 113
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 17, #cached-token: 192, cache hit rate: 84.22%, token usage: 0.00, #running-req: 15, #queue-req: 112
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 16, #cached-token: 92, cache hit rate: 84.24%, token usage: 0.00, #running-req: 16, #queue-req: 112
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 16, #cached-token: 108, cache hit rate: 84.29%, token usage: 0.00, #running-req: 16, #queue-req: 112
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 16, #cached-token: 124, cache hit rate: 84.39%, token usage: 0.00, #running-req: 16, #queue-req: 112
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 16, #cached-token: 223, cache hit rate: 84.71%, token usage: 0.00, #running-req: 16, #queue-req: 111
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 15, #cached-token: 91, cache hit rate: 84.73%, token usage: 0.00, #running-req: 17, #queue-req: 111
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 15, #cached-token: 106, cache hit rate: 84.78%, token usage: 0.00, #running-req: 17, #queue-req: 111
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 15, #cached-token: 203, cache hit rate: 85.04%, token usage: 0.00, #running-req: 17, #queue-req: 110
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 14, #cached-token: 89, cache hit rate: 85.06%, token usage: 0.00, #running-req: 18, #queue-req: 110
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 14, #cached-token: 186, cache hit rate: 85.28%, token usage: 0.00, #running-req: 18, #queue-req: 109
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 13, #cached-token: 87, cache hit rate: 85.30%, token usage: 0.00, #running-req: 19, #queue-req: 109
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 13, #cached-token: 100, cache hit rate: 85.35%, token usage: 0.00, #running-req: 19, #queue-req: 109
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 13, #cached-token: 113, cache hit rate: 85.42%, token usage: 0.00, #running-req: 19, #queue-req: 109
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 13, #cached-token: 208, cache hit rate: 85.67%, token usage: 0.00, #running-req: 19, #queue-req: 108
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 12, #cached-token: 90, cache hit rate: 85.70%, token usage: 0.00, #running-req: 20, #queue-req: 108
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 12, #cached-token: 183, cache hit rate: 85.89%, token usage: 0.00, #running-req: 20, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 83, cache hit rate: 85.92%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 94, cache hit rate: 85.97%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 105, cache hit rate: 86.03%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 116, cache hit rate: 86.11%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 127, cache hit rate: 86.20%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 138, cache hit rate: 86.31%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 149, cache hit rate: 86.43%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 160, cache hit rate: 86.56%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 171, cache hit rate: 86.70%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 182, cache hit rate: 86.85%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 193, cache hit rate: 87.02%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 204, cache hit rate: 87.18%, token usage: 0.00, #running-req: 21, #queue-req: 107
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 11, #cached-token: 296, cache hit rate: 87.46%, token usage: 0.00, #running-req: 21, #queue-req: 106
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 91, cache hit rate: 87.48%, token usage: 0.00, #running-req: 22, #queue-req: 106
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 101, cache hit rate: 87.52%, token usage: 0.00, #running-req: 22, #queue-req: 106
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 111, cache hit rate: 87.57%, token usage: 0.00, #running-req: 22, #queue-req: 106
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 121, cache hit rate: 87.63%, token usage: 0.01, #running-req: 22, #queue-req: 106
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 131, cache hit rate: 87.70%, token usage: 0.01, #running-req: 22, #queue-req: 106
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 141, cache hit rate: 87.77%, token usage: 0.01, #running-req: 22, #queue-req: 106
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 151, cache hit rate: 87.86%, token usage: 0.01, #running-req: 22, #queue-req: 106
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 10, #cached-token: 243, cache hit rate: 88.04%, token usage: 0.01, #running-req: 22, #queue-req: 105
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 88, cache hit rate: 88.06%, token usage: 0.01, #running-req: 23, #queue-req: 105
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 97, cache hit rate: 88.09%, token usage: 0.01, #running-req: 23, #queue-req: 105
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 106, cache hit rate: 88.13%, token usage: 0.01, #running-req: 23, #queue-req: 105
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 115, cache hit rate: 88.18%, token usage: 0.01, #running-req: 23, #queue-req: 105
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 2, #new-token: 9, #cached-token: 205, cache hit rate: 88.31%, token usage: 0.01, #running-req: 23, #queue-req: 104
+[2024-11-22 03:08:35 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 86, cache hit rate: 88.34%, token usage: 0.01, #running-req: 24, #queue-req: 104
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 94, cache hit rate: 88.37%, token usage: 0.01, #running-req: 24, #queue-req: 104
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 102, cache hit rate: 88.41%, token usage: 0.01, #running-req: 24, #queue-req: 104
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 110, cache hit rate: 88.45%, token usage: 0.01, #running-req: 24, #queue-req: 104
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 118, cache hit rate: 88.51%, token usage: 0.01, #running-req: 24, #queue-req: 104
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 126, cache hit rate: 88.56%, token usage: 0.01, #running-req: 24, #queue-req: 104
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 134, cache hit rate: 88.63%, token usage: 0.01, #running-req: 24, #queue-req: 104
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 2, #new-token: 8, #cached-token: 222, cache hit rate: 88.76%, token usage: 0.01, #running-req: 24, #queue-req: 103
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 81, cache hit rate: 88.79%, token usage: 0.01, #running-req: 25, #queue-req: 103
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 88, cache hit rate: 88.81%, token usage: 0.01, #running-req: 25, #queue-req: 103
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 95, cache hit rate: 88.85%, token usage: 0.01, #running-req: 25, #queue-req: 103
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 102, cache hit rate: 88.88%, token usage: 0.01, #running-req: 25, #queue-req: 103
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 109, cache hit rate: 88.93%, token usage: 0.01, #running-req: 25, #queue-req: 103
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 2, #new-token: 7, #cached-token: 196, cache hit rate: 89.04%, token usage: 0.01, #running-req: 25, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 83, cache hit rate: 89.06%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 89, cache hit rate: 89.10%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 95, cache hit rate: 89.13%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 101, cache hit rate: 89.17%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 107, cache hit rate: 89.21%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 113, cache hit rate: 89.26%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 119, cache hit rate: 89.31%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 125, cache hit rate: 89.36%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 131, cache hit rate: 89.42%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 137, cache hit rate: 89.48%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 143, cache hit rate: 89.55%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 149, cache hit rate: 89.61%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 155, cache hit rate: 89.68%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 161, cache hit rate: 89.75%, token usage: 0.01, #running-req: 26, #queue-req: 102
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 2, #new-token: 6, #cached-token: 248, cache hit rate: 89.88%, token usage: 0.01, #running-req: 26, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 85, cache hit rate: 89.90%, token usage: 0.01, #running-req: 27, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 90, cache hit rate: 89.93%, token usage: 0.01, #running-req: 27, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 95, cache hit rate: 89.96%, token usage: 0.01, #running-req: 27, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 100, cache hit rate: 90.00%, token usage: 0.01, #running-req: 27, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 105, cache hit rate: 90.03%, token usage: 0.01, #running-req: 27, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 110, cache hit rate: 90.07%, token usage: 0.01, #running-req: 27, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 115, cache hit rate: 90.11%, token usage: 0.01, #running-req: 27, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 120, cache hit rate: 90.16%, token usage: 0.01, #running-req: 27, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 125, cache hit rate: 90.20%, token usage: 0.01, #running-req: 27, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 130, cache hit rate: 90.25%, token usage: 0.01, #running-req: 27, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 135, cache hit rate: 90.30%, token usage: 0.01, #running-req: 27, #queue-req: 101
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 2, #new-token: 5, #cached-token: 220, cache hit rate: 90.40%, token usage: 0.01, #running-req: 27, #queue-req: 100
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 81, cache hit rate: 90.42%, token usage: 0.01, #running-req: 28, #queue-req: 100
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 85, cache hit rate: 90.45%, token usage: 0.01, #running-req: 28, #queue-req: 100
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 89, cache hit rate: 90.47%, token usage: 0.01, #running-req: 28, #queue-req: 100
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 93, cache hit rate: 90.50%, token usage: 0.01, #running-req: 28, #queue-req: 100
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 97, cache hit rate: 90.54%, token usage: 0.01, #running-req: 28, #queue-req: 100
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 101, cache hit rate: 90.57%, token usage: 0.01, #running-req: 28, #queue-req: 100
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 105, cache hit rate: 90.60%, token usage: 0.01, #running-req: 28, #queue-req: 100
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 109, cache hit rate: 90.64%, token usage: 0.01, #running-req: 28, #queue-req: 100
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 113, cache hit rate: 90.68%, token usage: 0.01, #running-req: 28, #queue-req: 100
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 117, cache hit rate: 90.72%, token usage: 0.01, #running-req: 28, #queue-req: 100
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 2, #new-token: 4, #cached-token: 201, cache hit rate: 90.80%, token usage: 0.01, #running-req: 28, #queue-req: 99
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 81, cache hit rate: 90.82%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 84, cache hit rate: 90.85%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 87, cache hit rate: 90.88%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 90, cache hit rate: 90.90%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:36 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 93, cache hit rate: 90.93%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 96, cache hit rate: 90.97%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 99, cache hit rate: 91.00%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 102, cache hit rate: 91.03%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 105, cache hit rate: 91.07%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 108, cache hit rate: 91.10%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 111, cache hit rate: 91.14%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 114, cache hit rate: 91.17%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 117, cache hit rate: 91.21%, token usage: 0.01, #running-req: 29, #queue-req: 99
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 2, #new-token: 3, #cached-token: 200, cache hit rate: 91.28%, token usage: 0.01, #running-req: 29, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 82, cache hit rate: 91.31%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 84, cache hit rate: 91.34%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 86, cache hit rate: 91.37%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 88, cache hit rate: 91.39%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 90, cache hit rate: 91.42%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 92, cache hit rate: 91.45%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 94, cache hit rate: 91.48%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 96, cache hit rate: 91.51%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 98, cache hit rate: 91.54%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 100, cache hit rate: 91.57%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 102, cache hit rate: 91.61%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 104, cache hit rate: 91.64%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 106, cache hit rate: 91.67%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 108, cache hit rate: 91.70%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 110, cache hit rate: 91.74%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 112, cache hit rate: 91.77%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 114, cache hit rate: 91.81%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 116, cache hit rate: 91.84%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 118, cache hit rate: 91.88%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 120, cache hit rate: 91.91%, token usage: 0.01, #running-req: 30, #queue-req: 98
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 2, #new-token: 2, #cached-token: 202, cache hit rate: 91.98%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 81, cache hit rate: 92.00%, token usage: 0.01, #running-req: 31, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 82, cache hit rate: 92.02%, token usage: 0.01, #running-req: 31, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 83, cache hit rate: 92.05%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 85, cache hit rate: 92.07%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 87, cache hit rate: 92.09%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 89, cache hit rate: 92.11%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 91, cache hit rate: 92.14%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 93, cache hit rate: 92.16%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 95, cache hit rate: 92.18%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 97, cache hit rate: 92.21%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 99, cache hit rate: 92.23%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 101, cache hit rate: 92.26%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 103, cache hit rate: 92.28%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 105, cache hit rate: 92.31%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 107, cache hit rate: 92.34%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 109, cache hit rate: 92.36%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 111, cache hit rate: 92.39%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 113, cache hit rate: 92.42%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 115, cache hit rate: 92.45%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 117, cache hit rate: 92.48%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 119, cache hit rate: 92.50%, token usage: 0.01, #running-req: 30, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 121, cache hit rate: 92.53%, token usage: 0.01, #running-req: 29, #queue-req: 97
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 80, cache hit rate: 92.55%, token usage: 0.01, #running-req: 30, #queue-req: 95
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 82, cache hit rate: 92.56%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 84, cache hit rate: 92.58%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 86, cache hit rate: 92.60%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:37 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 88, cache hit rate: 92.62%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 90, cache hit rate: 92.64%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 92, cache hit rate: 92.66%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 94, cache hit rate: 92.68%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 96, cache hit rate: 92.70%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 98, cache hit rate: 92.72%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 100, cache hit rate: 92.74%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 102, cache hit rate: 92.76%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 104, cache hit rate: 92.78%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 106, cache hit rate: 92.80%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 108, cache hit rate: 92.83%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 110, cache hit rate: 92.85%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 112, cache hit rate: 92.87%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 114, cache hit rate: 92.90%, token usage: 0.01, #running-req: 30, #queue-req: 96
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 78, cache hit rate: 92.91%, token usage: 0.01, #running-req: 31, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 79, cache hit rate: 92.93%, token usage: 0.01, #running-req: 31, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 80, cache hit rate: 92.95%, token usage: 0.01, #running-req: 31, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 81, cache hit rate: 92.97%, token usage: 0.01, #running-req: 31, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 82, cache hit rate: 92.98%, token usage: 0.01, #running-req: 31, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 83, cache hit rate: 93.00%, token usage: 0.01, #running-req: 31, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 84, cache hit rate: 93.02%, token usage: 0.01, #running-req: 31, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 85, cache hit rate: 93.04%, token usage: 0.01, #running-req: 31, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 86, cache hit rate: 93.06%, token usage: 0.01, #running-req: 31, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 87, cache hit rate: 93.08%, token usage: 0.01, #running-req: 31, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 88, cache hit rate: 93.10%, token usage: 0.01, #running-req: 31, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 89, cache hit rate: 93.11%, token usage: 0.01, #running-req: 30, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 91, cache hit rate: 93.13%, token usage: 0.01, #running-req: 30, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 93, cache hit rate: 93.14%, token usage: 0.01, #running-req: 30, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 95, cache hit rate: 93.16%, token usage: 0.01, #running-req: 30, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 97, cache hit rate: 93.18%, token usage: 0.01, #running-req: 30, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 99, cache hit rate: 93.19%, token usage: 0.01, #running-req: 29, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 102, cache hit rate: 93.21%, token usage: 0.01, #running-req: 29, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 105, cache hit rate: 93.22%, token usage: 0.01, #running-req: 29, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 108, cache hit rate: 93.24%, token usage: 0.01, #running-req: 29, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 111, cache hit rate: 93.25%, token usage: 0.01, #running-req: 29, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 114, cache hit rate: 93.27%, token usage: 0.01, #running-req: 29, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 117, cache hit rate: 93.29%, token usage: 0.01, #running-req: 29, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 120, cache hit rate: 93.31%, token usage: 0.01, #running-req: 29, #queue-req: 95
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 2, #new-token: 3, #cached-token: 200, cache hit rate: 93.34%, token usage: 0.01, #running-req: 29, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 79, cache hit rate: 93.35%, token usage: 0.01, #running-req: 30, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 81, cache hit rate: 93.37%, token usage: 0.01, #running-req: 30, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 83, cache hit rate: 93.38%, token usage: 0.01, #running-req: 30, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 85, cache hit rate: 93.39%, token usage: 0.01, #running-req: 30, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 87, cache hit rate: 93.41%, token usage: 0.01, #running-req: 30, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 89, cache hit rate: 93.42%, token usage: 0.02, #running-req: 30, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 91, cache hit rate: 93.43%, token usage: 0.02, #running-req: 30, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 2, #cached-token: 93, cache hit rate: 93.45%, token usage: 0.02, #running-req: 30, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 95, cache hit rate: 93.46%, token usage: 0.01, #running-req: 29, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 98, cache hit rate: 93.47%, token usage: 0.01, #running-req: 29, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 101, cache hit rate: 93.48%, token usage: 0.01, #running-req: 29, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 104, cache hit rate: 93.50%, token usage: 0.01, #running-req: 29, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 107, cache hit rate: 93.51%, token usage: 0.02, #running-req: 29, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 3, #cached-token: 110, cache hit rate: 93.52%, token usage: 0.02, #running-req: 29, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 113, cache hit rate: 93.54%, token usage: 0.01, #running-req: 28, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 117, cache hit rate: 93.55%, token usage: 0.01, #running-req: 28, #queue-req: 94
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 2, #new-token: 4, #cached-token: 197, cache hit rate: 93.58%, token usage: 0.01, #running-req: 28, #queue-req: 93
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 77, cache hit rate: 93.58%, token usage: 0.01, #running-req: 28, #queue-req: 93
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 4, #cached-token: 81, cache hit rate: 93.59%, token usage: 0.01, #running-req: 28, #queue-req: 93
+[2024-11-22 03:08:38 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 85, cache hit rate: 93.59%, token usage: 0.01, #running-req: 27, #queue-req: 93
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 90, cache hit rate: 93.59%, token usage: 0.01, #running-req: 27, #queue-req: 93
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 95, cache hit rate: 93.60%, token usage: 0.01, #running-req: 27, #queue-req: 93
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 100, cache hit rate: 93.60%, token usage: 0.01, #running-req: 27, #queue-req: 93
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 5, #cached-token: 105, cache hit rate: 93.61%, token usage: 0.01, #running-req: 27, #queue-req: 93
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 110, cache hit rate: 93.61%, token usage: 0.01, #running-req: 26, #queue-req: 93
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 116, cache hit rate: 93.62%, token usage: 0.01, #running-req: 25, #queue-req: 93
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 123, cache hit rate: 93.62%, token usage: 0.01, #running-req: 25, #queue-req: 93
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 2, #new-token: 7, #cached-token: 207, cache hit rate: 93.64%, token usage: 0.01, #running-req: 25, #queue-req: 92
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 79, cache hit rate: 93.64%, token usage: 0.01, #running-req: 25, #queue-req: 92
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 86, cache hit rate: 93.63%, token usage: 0.01, #running-req: 25, #queue-req: 92
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 93, cache hit rate: 93.63%, token usage: 0.01, #running-req: 25, #queue-req: 92
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 100, cache hit rate: 93.63%, token usage: 0.01, #running-req: 25, #queue-req: 92
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 2, #new-token: 7, #cached-token: 184, cache hit rate: 93.65%, token usage: 0.01, #running-req: 25, #queue-req: 91
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 80, cache hit rate: 93.64%, token usage: 0.01, #running-req: 26, #queue-req: 91
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 86, cache hit rate: 93.64%, token usage: 0.01, #running-req: 26, #queue-req: 91
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 92, cache hit rate: 93.64%, token usage: 0.01, #running-req: 26, #queue-req: 91
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 98, cache hit rate: 93.65%, token usage: 0.01, #running-req: 26, #queue-req: 91
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 104, cache hit rate: 93.65%, token usage: 0.01, #running-req: 26, #queue-req: 91
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 2, #new-token: 6, #cached-token: 187, cache hit rate: 93.67%, token usage: 0.01, #running-req: 26, #queue-req: 90
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 80, cache hit rate: 93.67%, token usage: 0.01, #running-req: 26, #queue-req: 90
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 86, cache hit rate: 93.67%, token usage: 0.01, #running-req: 26, #queue-req: 90
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 92, cache hit rate: 93.67%, token usage: 0.01, #running-req: 26, #queue-req: 90
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 98, cache hit rate: 93.67%, token usage: 0.01, #running-req: 26, #queue-req: 90
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 104, cache hit rate: 93.67%, token usage: 0.01, #running-req: 25, #queue-req: 90
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 2, #new-token: 7, #cached-token: 188, cache hit rate: 93.68%, token usage: 0.01, #running-req: 25, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 6, #cached-token: 79, cache hit rate: 93.68%, token usage: 0.01, #running-req: 26, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 85, cache hit rate: 93.68%, token usage: 0.01, #running-req: 24, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 93, cache hit rate: 93.67%, token usage: 0.01, #running-req: 24, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 101, cache hit rate: 93.67%, token usage: 0.01, #running-req: 24, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 109, cache hit rate: 93.66%, token usage: 0.01, #running-req: 23, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 118, cache hit rate: 93.66%, token usage: 0.01, #running-req: 23, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 127, cache hit rate: 93.66%, token usage: 0.01, #running-req: 23, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 136, cache hit rate: 93.66%, token usage: 0.01, #running-req: 23, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 145, cache hit rate: 93.66%, token usage: 0.01, #running-req: 22, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 155, cache hit rate: 93.66%, token usage: 0.01, #running-req: 22, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 165, cache hit rate: 93.66%, token usage: 0.01, #running-req: 22, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 175, cache hit rate: 93.67%, token usage: 0.01, #running-req: 21, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 186, cache hit rate: 93.67%, token usage: 0.01, #running-req: 21, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 197, cache hit rate: 93.68%, token usage: 0.01, #running-req: 21, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 208, cache hit rate: 93.68%, token usage: 0.01, #running-req: 21, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 11, #cached-token: 219, cache hit rate: 93.69%, token usage: 0.01, #running-req: 21, #queue-req: 89
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 77, cache hit rate: 93.68%, token usage: 0.01, #running-req: 22, #queue-req: 87
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 87, cache hit rate: 93.67%, token usage: 0.01, #running-req: 22, #queue-req: 88
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 97, cache hit rate: 93.66%, token usage: 0.01, #running-req: 22, #queue-req: 88
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 2, #new-token: 11, #cached-token: 184, cache hit rate: 93.67%, token usage: 0.01, #running-req: 21, #queue-req: 87
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 83, cache hit rate: 93.66%, token usage: 0.01, #running-req: 22, #queue-req: 87
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 93, cache hit rate: 93.65%, token usage: 0.01, #running-req: 22, #queue-req: 87
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 103, cache hit rate: 93.64%, token usage: 0.01, #running-req: 22, #queue-req: 87
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 10, #cached-token: 113, cache hit rate: 93.63%, token usage: 0.01, #running-req: 22, #queue-req: 87
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 2, #new-token: 10, #cached-token: 200, cache hit rate: 93.64%, token usage: 0.01, #running-req: 22, #queue-req: 86
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 84, cache hit rate: 93.63%, token usage: 0.01, #running-req: 23, #queue-req: 86
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 93, cache hit rate: 93.63%, token usage: 0.01, #running-req: 23, #queue-req: 86
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 102, cache hit rate: 93.62%, token usage: 0.01, #running-req: 23, #queue-req: 86
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 2, #new-token: 9, #cached-token: 190, cache hit rate: 93.63%, token usage: 0.01, #running-req: 23, #queue-req: 85
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 80, cache hit rate: 93.62%, token usage: 0.01, #running-req: 24, #queue-req: 85
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 88, cache hit rate: 93.62%, token usage: 0.01, #running-req: 24, #queue-req: 85
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 96, cache hit rate: 93.62%, token usage: 0.01, #running-req: 24, #queue-req: 85
+[2024-11-22 03:08:39 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 104, cache hit rate: 93.61%, token usage: 0.01, #running-req: 23, #queue-req: 85
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 2, #new-token: 9, #cached-token: 189, cache hit rate: 93.62%, token usage: 0.01, #running-req: 23, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 77, cache hit rate: 93.61%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 85, cache hit rate: 93.61%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 93, cache hit rate: 93.61%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 101, cache hit rate: 93.60%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 109, cache hit rate: 93.60%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 117, cache hit rate: 93.60%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 125, cache hit rate: 93.60%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 133, cache hit rate: 93.61%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 141, cache hit rate: 93.61%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 149, cache hit rate: 93.61%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 157, cache hit rate: 93.62%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 165, cache hit rate: 93.63%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 173, cache hit rate: 93.64%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 181, cache hit rate: 93.65%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 189, cache hit rate: 93.66%, token usage: 0.01, #running-req: 24, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 197, cache hit rate: 93.67%, token usage: 0.01, #running-req: 23, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 206, cache hit rate: 93.68%, token usage: 0.01, #running-req: 23, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 215, cache hit rate: 93.69%, token usage: 0.01, #running-req: 23, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 9, #cached-token: 224, cache hit rate: 93.71%, token usage: 0.01, #running-req: 23, #queue-req: 84
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 2, #new-token: 9, #cached-token: 311, cache hit rate: 93.73%, token usage: 0.01, #running-req: 23, #queue-req: 83
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 86, cache hit rate: 93.73%, token usage: 0.01, #running-req: 24, #queue-req: 83
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 94, cache hit rate: 93.72%, token usage: 0.01, #running-req: 24, #queue-req: 83
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 102, cache hit rate: 93.72%, token usage: 0.01, #running-req: 24, #queue-req: 83
+[2024-11-22 03:08:40 TP0] Prefill batch. #new-seq: 1, #new-token: 8, #cached-token: 110, cache hit rate: 93.72%, token usage: 0.01, #running-req: 24, #queue-req: 83
+Process Process-1:
+Process Process-2:
+Traceback (most recent call last):
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/managers/detokenizer_manager.py", line 204, in run_detokenizer_process
+    manager.event_loop()
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/managers/detokenizer_manager.py", line 99, in event_loop
+    recv_obj = self.recv_from_scheduler.recv_pyobj()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/zmq/sugar/socket.py", line 972, in recv_pyobj
+    msg = self.recv(flags)
+          ^^^^^^^^^^^^^^^^
+  File "_zmq.py", line 1156, in zmq.backend.cython._zmq.Socket.recv
+  File "_zmq.py", line 1191, in zmq.backend.cython._zmq.Socket.recv
+  File "_zmq.py", line 1278, in zmq.backend.cython._zmq._recv_copy
+  File "_zmq.py", line 160, in zmq.backend.cython._zmq._check_rc
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/managers/scheduler.py", line 1433, in run_scheduler_process
+    scheduler.event_loop_normal()
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/managers/scheduler.py", line 377, in event_loop_normal
+    result = self.run_batch(batch)
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/managers/scheduler.py", line 926, in run_batch
+    logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/managers/tp_worker.py", line 153, in forward_batch_generation
+    logits_output = self.model_runner.forward(forward_batch)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/model_executor/model_runner.py", line 756, in forward
+    return self.forward_extend(forward_batch)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/model_executor/model_runner.py", line 732, in forward_extend
+    return self.model.forward(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/models/llama.py", line 318, in forward
+    hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/models/llama.py", line 283, in forward
+    hidden_states, residual = layer(
+                              ^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/models/llama.py", line 233, in forward
+    hidden_states = self.self_attn(
+                    ^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/sglang/srt/models/llama.py", line 168, in forward
+    q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/dlami/nvme/chenyang/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/_tensor.py", line 917, in split
+    return torch._VF.split_with_sizes(self, split_size, dim)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+[2024-11-22 03:08:40] INFO:     Shutting down
+[2024-11-22 03:08:40] INFO:     Waiting for connections to close. (CTRL+C to force quit)

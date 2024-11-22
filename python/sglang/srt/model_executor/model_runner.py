@@ -403,23 +403,24 @@ class ModelRunner:
         group_name,
         backend="nccl",
     ):
-        """Init torch process group for model parameter update at model worker.
+        """初始化用于模型参数更新的Torch进程组。
 
-        The `_model_update_group` is used in RLHF workflow, where rank 0 is
-        the actor model in the training engine, and SGLang inference engine are
-        used for rollout.
+        `_model_update_group`在RLHF工作流程中使用，其中rank 0是训练引擎中的actor模型，
+        而推理引擎用于rollout。
 
-        In RLHF workflow, the training engine continuously updates the model
-        weights / parameters and broadcast them to inference engine through
-        the `_model_update_group` process group.
+        在RLHF工作流程中，训练引擎不断更新模型权重/参数，并通过`_model_update_group`进程组将其广播给推理引擎。
         """
-        assert (
-            torch.distributed.is_initialized()
-        ), f"default torch process group must be initialized"
-        assert group_name != "", f"group name must not be empty"
+        assert torch.distributed.is_initialized(), "默认的torch进程组必须已初始化"
+        assert group_name != "", "组名不能为空"
 
         rank = rank_offset + self.tp_rank
 
+        logger.info(
+            f"init process group: master_address={master_address}, master_port={master_port}, "
+            f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}"
+        )
+
+        # 使用 new_group 而不是再次初始化默认进程组
         self._model_update_group = init_process_group(
             backend=backend,
             init_method=f"tcp://{master_address}:{master_port}",
@@ -428,10 +429,7 @@ class ModelRunner:
             group_name=group_name,
         )
 
-        print(
-            f"init_process_group: master_address={master_address}, master_port={master_port}, ",
-            f"rank_offset={rank_offset}, world_size={world_size}, group_name={group_name}, backend={backend}",
-        )
+        logger.info("init_process_group completed.")
 
     def update_parameter_from_distributed(self, name, dtype, shape, empty_cache=False):
         """
