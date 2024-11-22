@@ -62,6 +62,8 @@ class SpeculativeAlgorithm(IntEnum):
 
     @staticmethod
     def get_algorithm(algorithm):
+        if isinstance(algorithm, SpeculativeAlgorithm):
+            return algorithm
         algorithm_map = {
             "EAGLE": SpeculativeAlgorithm.EAGLE,
             None: SpeculativeAlgorithm.NONE,
