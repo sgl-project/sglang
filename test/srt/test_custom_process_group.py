@@ -1,11 +1,13 @@
 import os
+import time
+import unittest
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import unittest
-import time
 from transformers import AutoModelForCausalLM
-from sglang.srt.utils import kill_child_process, init_process_group
+
+from sglang.srt.utils import init_process_group, kill_child_process
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
