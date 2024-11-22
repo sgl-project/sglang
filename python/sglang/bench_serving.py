@@ -388,6 +388,26 @@ async def async_request_gserver(
     raise NotImplementedError()
 
 
+async def async_request_profile(
+    api_url: str
+) -> RequestFuncOutput:
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        output = RequestFuncOutput()
+        try:
+            async with session.post(url=api_url) as response:
+                if response.status == 200:
+                    output.success = True
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    return output
+
+
 def get_model(pretrained_model_name_or_path: str) -> str:
     if os.getenv("SGLANG_USE_MODELSCOPE", "False").lower() == "true":
         import huggingface_hub.constants
@@ -873,13 +893,7 @@ async def benchmark(
 
     if profile:
         print("Starting profiler...")
-        profile_input = RequestFuncInput(model=model_id,
-                                        prompt=test_prompt,
-                                        api_url=base_url + "/start_profile",
-                                        prompt_len=test_prompt_len,
-                                        output_len=test_output_len,
-                                        extra_request_body=extra_request_body)
-        profile_output = await request_func(request_func_input=profile_input)
+        profile_output = await async_request_profile(api_url=base_url + "/start_profile")
         if profile_output.success:
             print("Profiler started")
 
@@ -906,13 +920,7 @@ async def benchmark(
 
     if profile:
         print("Stopping profiler...")
-        profile_input = RequestFuncInput(model=model_id,
-                                        prompt=test_prompt,
-                                        api_url=base_url + "/stop_profile",
-                                        prompt_len=test_prompt_len,
-                                        output_len=test_output_len,
-                                        extra_request_body=extra_request_body)
-        profile_output = await request_func(request_func_input=profile_input)
+        profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
         if profile_output.success:
             print("Profiler stopped")
 
