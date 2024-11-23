@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
 import gc
@@ -181,14 +179,15 @@ class ModelRunner:
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
         # Init torch distributed
+        torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
-            torch.cuda.set_device(self.gpu_id)
             backend = "nccl"
         # ToDO(liangan1):Just use gloo to bypass the initilization fail
         # Need to use xccl for xpu backend in the future
         elif self.device == "xpu":
-            torch.xpu.set_device(self.gpu_id)
             backend = "gloo"
+        elif self.device == "hpu":
+            backend = "hccl"
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)

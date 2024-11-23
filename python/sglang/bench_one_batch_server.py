@@ -1,10 +1,10 @@
 """
-Benchmark the latency of serving a single batch with a real server.
+Benchmark the latency of running a single batch with a server.
+
 This script launches a server and uses the HTTP interface.
-It accepts arguments similar to those of launch_server.py.
+It accepts server arguments (the same as launch_server.py) and benchmark arguments (e.g., batch size, input lengths).
 
 Usage:
-
 python3 -m sglang.bench_server_latency --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
 
 python3 -m sglang.bench_server_latency --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8

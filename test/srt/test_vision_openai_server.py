@@ -364,6 +364,64 @@ class TestQWen2VLServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
+class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen2-VL-7B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--chat-template",
+                "qwen2-vl",
+                "--context-length",
+                "300",
+                "--mem-fraction-static=0.80",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_child_process(cls.process.pid, include_self=True)
+
+    def test_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Give a lengthy description of this picture",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+        )
+
+        assert response.choices[0].finish_reason == "abort"
+        assert response.id
+        assert response.created
+        assert response.usage.prompt_tokens > 0
+        assert response.usage.completion_tokens > 0
+        assert response.usage.total_tokens > 0
+
+
 class TestMllamaServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):

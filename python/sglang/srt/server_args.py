@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """The arguments of the server."""
 
 import argparse
@@ -73,6 +71,7 @@ class ServerArgs:
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
     download_dir: Optional[str] = None
+    base_gpu_id: int = 0
 
     # Logging
     log_level: str = "info"
@@ -308,7 +307,7 @@ class ServerArgs:
             "--device",
             type=str,
             default="cuda",
-            choices=["cuda", "xpu"],
+            choices=["cuda", "xpu", "hpu"],
             help="The device type.",
         )
         parser.add_argument(
@@ -419,6 +418,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.download_dir,
             help="Model download directory.",
+        )
+        parser.add_argument(
+            "--base-gpu-id",
+            type=int,
+            default=ServerArgs.base_gpu_id,
+            help="The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine.",
         )
 
         # Logging
@@ -744,6 +749,7 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
+        assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
 
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths
