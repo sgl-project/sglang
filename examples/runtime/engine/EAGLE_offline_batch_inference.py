@@ -24,6 +24,7 @@ def main():
 
     outputs = llm.generate(prompts, sampling_params)
     # Print the outputs.
+
     for prompt, output in zip(prompts, outputs):
         print("===============================")
         print(f"Prompt: {prompt}\nGenerated text: {output['text']}")
