@@ -448,44 +448,54 @@ class ModelRunner:
             empty_cache: whether to empty the cache after updating the parameter.
         """
 
-        assert (
-            dtype == self.model_config.dtype
-        ), f"dtype mismatch: target={dtype} vs current model runner={self.model_config.dtype}"
+        logger.warning(
+            f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
+        )
+
+        # 统一 dtype 格式
+        target_dtype = (
+            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+        )
+        current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
+
+        assert str(target_dtype) == str(
+            current_dtype
+        ), f"dtype mismatch: target={dtype} vs current model runner={self.dtype}"
 
         assert (
             self._model_update_group is not None
         ), "model update group must be initialized"
 
-        # This is the global rank of the inference engine in the default process group.
-
         rank = self.tp_rank
-
+        logger.warning(f"rank={rank}")
         if rank == 0:
             logger.info(
                 f"update parameter online: parameter name={name}, dtype={dtype}, shape={shape}, empty_cache={empty_cache}"
             )
 
-        assert weights.dtype == dtype and weights.shape == shape, (
-            f"Parameter shape/dtype mismatch: "
-            f"expected shape={shape}, dtype={dtype}, "
-            f"got shape={weights.shape}, dtype={weights.dtype}"
-        )
-
-        # every rank of the inference engine needs to have a empty tensor
-        # to receive the broadcasted parameter from the actor model / rank 0
-
-        weights = torch.empty(shape, dtype=dtype, device=self.device)
-
-        # TODO CHENYANG: redundant weights been broadcasted here
-        torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-
         try:
+            # 确保在正确的设备上创建tensor并同步
+            print(f"[Rank {rank}] Barrier")
+            print(f"[Rank {rank}] Barrier done")
+            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
+            logger.warning(f"weights is created")
+
+            # 执行广播
+            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
+            logger.warning(f"weights is broadcasted")
+
+            # 加载权重
             self.model.load_weights([name, weights])
 
             if empty_cache and self.device == "cuda":
                 torch.cuda.empty_cache()
 
+            logger.warning(f"weights is loaded")
+
+            # 最后同步确保所有进程完成更新
             torch.distributed.barrier(group=self._model_update_group)
+            logger.warning(f"barrier is called")
+
             return True, f"Succeeded to update parameter {name} online."
 
         except Exception as e:

@@ -107,6 +107,7 @@ app.add_middleware(
 )
 
 tokenizer_manager: TokenizerManager = None
+_max_total_num_tokens = None
 
 ##### Native API endpoints #####
 
@@ -187,6 +188,17 @@ async def stop_profile():
         content="Stop profiling. This will take some time.\n",
         status_code=200,
     )
+
+
+@app.get("/get_max_total_num_tokens")
+async def get_max_total_num_tokens():
+    try:
+        return {"max_total_num_tokens": _get_max_total_num_tokens()}
+
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        )
 
 
 @app.api_route("/get_memory_pool_size", methods=["GET", "POST"])
@@ -435,6 +447,7 @@ def launch_engine(
     """
 
     global tokenizer_manager
+    global _max_total_num_tokens
 
     # Configure global environment
     configure_logger(server_args)
@@ -500,9 +513,20 @@ def launch_engine(
     if server_args.chat_template:
         load_chat_template_for_openai_api(tokenizer_manager, server_args.chat_template)
 
-    # Wait for model to finish loading
+    # Wait for model to finish loading & get max token nums
+    scheduler_info = []
     for i in range(len(scheduler_pipe_readers)):
-        scheduler_pipe_readers[i].recv()
+        data = scheduler_pipe_readers[i].recv()
+
+        if data["status"] != "ready":
+            self.shutdown()
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        scheduler_info.append(data)
+
+    # Assume all schedulers have same max_total_num_tokens
+    _max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
 
 
 def launch_server(
@@ -561,6 +585,10 @@ def launch_server(
         )
     finally:
         t.join()
+
+
+def _get_max_total_num_tokens():
+    return _max_total_num_tokens
 
 
 def _set_envs_and_config(server_args: ServerArgs):
@@ -804,6 +832,15 @@ class Runtime:
         response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
 
+    def get_max_total_num_tokens(self):
+        response = requests.get(f"{self.url}/get_max_total_num_tokens")
+        if response.status_code == 200:
+            return response.json()["max_total_num_tokens"]
+        else:
+            raise RuntimeError(
+                f"Failed to get max tokens. {response.json()['error']['message']}"
+            )
+
     def __del__(self):
         self.shutdown()
 
@@ -953,3 +990,6 @@ class Engine:
         # get the current event loop
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(encode_request(obj, None))
+
+    def get_max_total_num_tokens(self):
+        return _get_max_total_num_tokens()
