@@ -145,15 +145,17 @@ async def get_model_info():
     }
     return result
 
+
 @app.get("/get_server_info")
 async def get_server_info():
     try:
         return await _get_server_info()
-    
+
     except Exception as e:
         return ORJSONResponse(
             {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
         )
+
 
 @app.post("/flush_cache")
 async def flush_cache():
@@ -186,6 +188,7 @@ async def stop_profile():
         content="Stop profiling. This will take some time.\n",
         status_code=200,
     )
+
 
 @app.post("/update_weights")
 @time_func_latency
@@ -519,12 +522,14 @@ def launch_server(
     finally:
         t.join()
 
+
 async def _get_server_info():
     return {
-        **dataclasses.asdict(tokenizer_manager.server_args),                # server args
-        "memory_pool_size": await tokenizer_manager.get_memory_pool_size(), # memory pool size
-        "max_total_num_tokens": _max_total_num_tokens                       # max total num tokens
+        **dataclasses.asdict(tokenizer_manager.server_args),  # server args
+        "memory_pool_size": await tokenizer_manager.get_memory_pool_size(),  # memory pool size
+        "max_total_num_tokens": _max_total_num_tokens,  # max total num tokens
     }
+
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
@@ -766,7 +771,7 @@ class Runtime:
         json_data = {"text": prompt}
         response = requests.post(self.url + "/encode", json=json_data)
         return json.dumps(response.json())
-    
+
     async def get_server_info(self):
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{self.url}/get_server_info") as response:
