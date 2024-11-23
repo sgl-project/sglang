@@ -179,7 +179,6 @@ class TestSRTEngine(unittest.TestCase):
             model_path=model_path,
             random_seed=42,
             max_total_tokens=128,
-            log_level="error",
             cpu_offload_gb=3,
         )
         out2 = engine.generate(prompt, sampling_params)["text"]
